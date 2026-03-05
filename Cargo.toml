@@ -1,0 +1,10 @@
+[package]
+name = "infer-profiler"
+version = "0.1.0"
+edition = "2021"
+authors = ["Perry <you@example.com>"]
+description = "Rust-based CLI tool for profiling vLLM GPU and other metrics."
+license = "MIT"
+
+[dependencies]
+
