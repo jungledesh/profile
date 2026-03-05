@@ -2,9 +2,16 @@
 name = "infer-profiler"
 version = "0.1.0"
 edition = "2021"
-authors = ["Perry <you@example.com>"]
+authors = ["Perry <jungledesh@gmail.com>"]
 description = "Rust-based CLI tool for profiling vLLM GPU and other metrics."
-license = "MIT"
+
+[[bin]]
+name = "profile"
+path = "src/main.rs"
 
 [dependencies]
+clap = { version = "4.5", features = ["derive"] }
+anyhow = "1.0"
 
+[dev-dependencies]
+assert_cmd = "2.0"
