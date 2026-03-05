@@ -1,8 +1,8 @@
 use clap::{Parser, Subcommand};
 
-/// Command-line interface definition for the `infer-profiler` CLI.
+/// Command-line interface definition for the `infer-pro` CLI.
 #[derive(Debug, Parser)]
-#[command(name = "profile")]
+#[command(name = "infer-pro")]
 #[command(about = "CLI tool for profiling vLLM GPU and system metrics", long_about = None)]
 pub struct Cli {
     /// Increase output verbosity (can be used multiple times)
@@ -39,7 +39,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             }
         }
         Commands::Info => {
-            println!("infer-profiler: Rust CLI for profiling vLLM GPU and system metrics (scaffold)");
+            println!("infer-pro: Rust CLI for profiling vLLM GPU and system metrics (scaffold)");
         }
     }
 
