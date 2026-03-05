@@ -6,7 +6,7 @@ authors = ["Perry <jungledesh@gmail.com>"]
 description = "Rust-based CLI tool for profiling vLLM GPU and other metrics."
 
 [[bin]]
-name = "profile"
+name = "infer-pro"
 path = "src/main.rs"
 
 [dependencies]
