@@ -1,23 +1,35 @@
 use assert_cmd::Command;
+use predicates::prelude::*;
 
-/// Ensure `infer-pro --help` runs successfully and prints usage.
 #[test]
-fn help_works() {
-    let mut cmd = Command::cargo_bin("infer-pro").unwrap();
-    cmd.arg("--help").assert().success();
+fn help_exits_success() {
+    Command::cargo_bin("infer-pro").unwrap()
+        .arg("--help")
+        .assert()
+        .success();
 }
 
-/// Basic smoke test for the `profile` subcommand.
 #[test]
-fn profile_subcommand_works() {
-    let mut cmd = Command::cargo_bin("infer-pro").unwrap();
-    cmd.arg("profile").assert().success();
+fn profile_exits_success() {
+    Command::cargo_bin("infer-pro").unwrap()
+        .arg("profile")
+        .assert()
+        .success();
 }
 
-/// Basic smoke test for the `info` subcommand.
 #[test]
-fn info_subcommand_works() {
-    let mut cmd = Command::cargo_bin("infer-pro").unwrap();
-    cmd.arg("info").assert().success();
+fn profile_with_config_prints_path() {
+    Command::cargo_bin("infer-pro").unwrap()
+        .args(["profile", "--config", "/path/to/config"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("/path/to/config"));
 }
 
+#[test]
+fn info_exits_success() {
+    Command::cargo_bin("infer-pro").unwrap()
+        .arg("info")
+        .assert()
+        .success();
+}
