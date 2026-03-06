@@ -1,12 +1,12 @@
 [package]
-name = "infer-profiler"
+name = "profile"
 version = "0.1.0"
 edition = "2021"
 authors = ["Perry <jungledesh@gmail.com>"]
 description = "Rust-based CLI tool for profiling vLLM GPU and other metrics."
 
 [[bin]]
-name = "infer-pro"
+name = "profile"
 path = "src/main.rs"
 
 [dependencies]
