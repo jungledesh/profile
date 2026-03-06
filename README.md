@@ -1,3 +1,49 @@
-## infer-profiler
+# profile
 
-**infer-profiler** is a Rust-based CLI tool intended to profile vLLM inference runs, focusing on GPU and related system metrics.
+A Rust CLI for profiling vLLM inference performance and GPU efficiency.
+
+---
+
+## Context
+
+AI teams running vLLM often lack simple tools to answer questions about request latency, GPU utilization, batching, KV cache effectiveness, and cost per request. Most tooling exposes system metrics or logs, not per-request inference efficiency.
+
+---
+
+## Problem
+
+The tool addresses the gap between raw system metrics and actionable inference insights: request latency, GPU utilization, power efficiency, cost per request, and where bottlenecks occur in the inference pipeline.
+
+---
+
+## Roadmap
+
+### V1 — Core Profiling
+
+- [ ] Request efficiency: prompt tokens, output tokens, latency
+- [ ] GPU metrics: utilization, power draw
+- [ ] Derived metrics: tokens/sec, tokens/watt, estimated cost
+- [ ] `profile request`
+- [ ] `profile batch`
+
+### V2 — Cache Efficiency
+
+- [ ] KV cache hit rate
+- [ ] KV cache miss rate
+- [ ] Prefix reuse metrics
+
+### V3 — Transformer Pipeline Metrics
+
+- [ ] Prefill vs decode latency
+- [ ] Prefill tokens/sec, decode tokens/sec
+
+### V4 — Scheduler Diagnostics
+
+- [ ] Queue delay
+- [ ] Batch wait time
+- [ ] Scheduler delay
+
+### V5 — Live Dashboard
+
+- [ ] `profile watch`
+- [ ] Real-time throughput, queue time, batch size, GPU efficiency

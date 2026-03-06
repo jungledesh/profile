@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use infer_profiler::{run, Cli};
+use profile::{run, Cli};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
