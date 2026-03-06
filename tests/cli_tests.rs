@@ -3,7 +3,7 @@ use predicates::prelude::*;
 
 #[test]
 fn help_exits_success() {
-    Command::cargo_bin("infer-pro").unwrap()
+    Command::cargo_bin("profile").unwrap()
         .arg("--help")
         .assert()
         .success();
@@ -11,7 +11,7 @@ fn help_exits_success() {
 
 #[test]
 fn profile_exits_success() {
-    Command::cargo_bin("infer-pro").unwrap()
+    Command::cargo_bin("profile").unwrap()
         .arg("profile")
         .assert()
         .success();
@@ -19,7 +19,7 @@ fn profile_exits_success() {
 
 #[test]
 fn profile_with_config_prints_path() {
-    Command::cargo_bin("infer-pro").unwrap()
+    Command::cargo_bin("profile").unwrap()
         .args(["profile", "--config", "/path/to/config"])
         .assert()
         .success()
@@ -28,7 +28,7 @@ fn profile_with_config_prints_path() {
 
 #[test]
 fn info_exits_success() {
-    Command::cargo_bin("infer-pro").unwrap()
+    Command::cargo_bin("profile").unwrap()
         .arg("info")
         .assert()
         .success();

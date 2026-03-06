@@ -1,11 +1,11 @@
-//! infer-pro — CLI for profiling vLLM GPU and system metrics.
+//! profile — CLI for profiling vLLM GPU and system metrics.
 
 mod cmd;
 
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
-#[command(name = "infer-pro")]
+#[command(name = "profile")]
 #[command(about = "CLI tool for profiling vLLM GPU and system metrics", long_about = None)]
 pub struct Cli {
     #[arg(short, long, action = clap::ArgAction::Count)]
