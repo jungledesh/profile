@@ -1,9 +1,5 @@
-//! Power draw collector.
-//!
-//! Will be backed by NVML (or remote profile-agent) later.
+//! Power draw in watts (stub until NVML/agent).
 
-/// Read current power draw in watts. Returns None if unavailable.
-pub fn power_draw() -> Option<f32> {
-    // Stub: no NVML yet.
+pub(super) fn power_draw() -> Option<f32> {
     None
 }

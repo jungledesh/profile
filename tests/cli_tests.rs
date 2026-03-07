@@ -10,18 +10,18 @@ fn help_exits_success() {
 }
 
 #[test]
-fn profile_exits_success() {
+fn run_exits_success() {
     Command::cargo_bin("profile").unwrap()
-        .arg("profile")
+        .arg("run")
         .assert()
         .success()
         .stdout(predicate::str::contains("(dry-run) would profile vLLM with default configuration"));
 }
 
 #[test]
-fn profile_with_config_prints_path() {
+fn run_with_config_prints_path() {
     Command::cargo_bin("profile").unwrap()
-        .args(["profile", "--config", "/path/to/config"])
+        .args(["run", "--config", "/path/to/config"])
         .assert()
         .success()
         .stdout(predicate::str::contains("(dry-run) would profile vLLM using config at: /path/to/config"));
@@ -40,7 +40,7 @@ fn info_exits_success() {
 fn verbose_prints_level_to_stderr() {
     // -vv must come before the subcommand so it's parsed as a global flag
     Command::cargo_bin("profile").unwrap()
-        .args(["-vv", "profile"])
+        .args(["-vv", "run"])
         .assert()
         .success()
         .stderr(predicate::str::contains("Verbose level: 2"));
