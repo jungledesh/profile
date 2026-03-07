@@ -1,9 +1,4 @@
-//! profile — CLI for profiling vLLM GPU and system metrics.
-//!
-//! Layout:
-//! - **cli**: command parsing, print results
-//! - **profiler**: run requests, measure latency, compute metrics
-//! - **collectors**: GPU util, power draw, token stats
+//! CLI for profiling vLLM GPU and system metrics. Layout: cli, profiler, collectors.
 
 pub mod cli;
 pub mod collectors;

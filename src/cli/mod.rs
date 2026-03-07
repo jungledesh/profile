@@ -1,13 +1,13 @@
-//! CLI: command parsing and result printing.
+//! CLI: parse commands, print results.
 
 mod info;
-mod profile;
+mod run;
 
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(name = "profile")]
-#[command(about = "CLI tool for profiling vLLM GPU and system metrics", long_about = None)]
+#[command(about = "Profile vLLM GPU and system metrics")]
 pub struct Cli {
     #[arg(short, long, action = clap::ArgAction::Count)]
     pub verbose: u8,
@@ -18,10 +18,10 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    /// Perform a dry-run profile (no real GPU work yet).
-    Profile(ProfileArgs),
+    /// Run a profile (dry-run for now).
+    Run(ProfileArgs),
 
-    /// Print basic information about the tool.
+    /// Print tool information.
     Info,
 }
 
@@ -31,10 +31,9 @@ pub struct ProfileArgs {
     pub config: Option<String>,
 }
 
-/// Entry point: parse CLI and run the chosen subcommand.
 pub fn run(cli: Cli) -> anyhow::Result<()> {
     match &cli.command {
-        Commands::Profile(args) => profile::execute(args, cli.verbose)?,
+        Commands::Run(args) => run::execute(args, cli.verbose)?,
         Commands::Info => info::execute(cli.verbose)?,
     }
 
