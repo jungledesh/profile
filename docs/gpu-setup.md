@@ -20,10 +20,10 @@ Confirm the GPU is visible and drivers are installed.
 
 ```bash
 apt update && apt upgrade -y
-apt install -y git curl wget build-essential tmux python3-venv python3-pip
+apt install -y git curl wget build-essential tmux python3-venv python3-pip openssh-client
 ```
 
-Git is needed to clone the repo; the rest are for general use and the vLLM venv.
+Git and OpenSSH are needed to clone the repo (private repo uses SSH); the rest are for general use and the vLLM venv.
 
 ---
 
@@ -39,16 +39,36 @@ cargo --version   # Should show e.g., cargo 1.78.0
 
 ---
 
-## 4. Clone the repo
+## 4. SSH (for private repo)
+
+Generate a key on the GPU machine and add the public key to GitHub so you can clone over SSH.
 
 ```bash
-git clone https://github.com/jungledesh/profile
+# Generate SSH key (no passphrase for automation; use a passphrase if you prefer)
+ssh-keygen -t ed25519 -C "gpu-machine" -f "$HOME/.ssh/id_ed25519" -N ""
+
+# Show the public key — add this to GitHub
+cat ~/.ssh/id_ed25519.pub
+```
+
+1. Copy the line that starts with `ssh-ed25519`.
+2. On GitHub: **Profile (top right) → Settings → SSH and GPG keys → New SSH key**. Paste the key, give it a title (e.g. `GPU box`), save.
+3. Test: `ssh -T git@github.com` — you should see “Hi jungledesh! You've successfully authenticated.”
+
+---
+
+## 5. Clone the repo
+
+Use the SSH URL so the private repo is accessible:
+
+```bash
+git clone git@github.com:jungledesh/profile.git
 cd profile
 ```
 
 ---
 
-## 5. Python virtual environment and vLLM
+## 6. Python virtual environment and vLLM
 
 ```bash
 python3 -m venv vllm-env
@@ -60,7 +80,7 @@ pip install vllm --extra-index-url https://download.pytorch.org/whl/cu128
 
 ---
 
-## 6. Verify vLLM
+## 7. Verify vLLM
 
 ```bash
 python -c "import vllm; print(vllm.__version__)"
@@ -68,7 +88,7 @@ python -c "import vllm; print(vllm.__version__)"
 
 ---
 
-## 7. Hugging Face login and model download (optional)
+## 8. Hugging Face login and model download (optional)
 
 vLLM includes Hugging Face Hub support; no separate `pip install huggingface-hub` is needed.
 
@@ -84,7 +104,7 @@ After login, the Llama 3 8B Instruct model will be in `/workspace/models/llama3-
 
 ---
 
-## 8. Run vLLM OpenAI-compatible server
+## 9. Run vLLM OpenAI-compatible server
 
 Make sure you are in the vLLM Python environment (`source vllm-env/bin/activate`), then:
 
@@ -104,7 +124,7 @@ The server listens on port 8000. Detach from the session with `Ctrl+b` then `d`;
 
 ---
 
-## 9. Calling the model (from inside the server)
+## 10. Calling the model (from inside the server)
 
 Run these from the same machine where the server is running (or use the server’s hostname instead of `localhost`).
 
