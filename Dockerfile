@@ -16,7 +16,7 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 COPY target/release/profile /workspace/profile
 
 # Scripts
-COPY scripts/start.sh /workspace/start.sh
+COPY ./scripts/start.sh /workspace/start.sh
 RUN chmod +x /workspace/start.sh
 
 # Models directory
