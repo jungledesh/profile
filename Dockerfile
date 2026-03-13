@@ -1,43 +1,61 @@
-FROM nvidia/cuda:12.4.1-devel-ubuntu22.04
+# Stage 1 — Builder: Rust + Python + vLLM
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV MODELS_DIR=/workspace/models
-ENV VENV_DIR=/workspace/vllm-env
+ENV VENV_DIR=/tmp/venv
 
 WORKDIR /workspace
 
-# system deps
+# System dependencies
 RUN apt-get update && apt-get install -y \
-    curl \
-    wget \
-    build-essential \
-    tmux \
     python3 \
     python3-venv \
     python3-pip \
+    build-essential \
+    curl \
+    wget \
+    tmux \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# rust
+# Install Rust
 RUN curl https://sh.rustup.rs -sSf | sh -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-# python venv
+# Build Rust binary
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN cargo build --release
+
+# Python environment + vLLM
 RUN python3 -m venv $VENV_DIR
 ENV PATH="$VENV_DIR/bin:$PATH"
 
 RUN pip install --upgrade pip
+RUN pip install vllm --extra-index-url https://download.pytorch.org/whl/cu124 \
+    && rm -rf /root/.cache/pip
 
-# vLLM
-RUN pip install vllm --extra-index-url https://download.pytorch.org/whl/cu124
+# Stage 2 — Final runtime image
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
 
-# HF CLI
-RUN pip install huggingface_hub
+ENV MODELS_DIR=/workspace/models
+ENV VENV_DIR=/workspace/venv
+ENV PATH="$VENV_DIR/bin:$PATH"
 
-RUN mkdir -p $MODELS_DIR
+WORKDIR /workspace
 
-COPY target/release/profile /workspace/profile
-COPY ./scripts/start.sh /workspace/start.sh
+# Copy Rust binary
+COPY --from=builder /workspace/target/release/profile /workspace/profile
+
+# Copy vLLM venv
+COPY --from=builder /tmp/venv /workspace/venv
+
+# Copy start script
+COPY scripts/start.sh /workspace/start.sh
 RUN chmod +x /workspace/start.sh
+
+# Create models directory
+RUN mkdir -p $MODELS_DIR
 
 CMD ["/workspace/start.sh"]
