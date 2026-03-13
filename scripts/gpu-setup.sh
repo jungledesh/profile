@@ -19,13 +19,34 @@ source "$HOME/.cargo/env"
 rustc --version
 cargo --version
 
-echo "==> SSH key for private repo (skip if you already have access)..."
+echo "==> SSH key for private repo..."
+mkdir -p "$HOME/.ssh"
+chmod 700 "$HOME/.ssh"
 if [[ ! -f "$HOME/.ssh/id_ed25519" ]]; then
-  mkdir -p "$HOME/.ssh"
   ssh-keygen -t ed25519 -C "gpu-profile-setup" -f "$HOME/.ssh/id_ed25519" -N ""
-  echo "    Add this public key to GitHub (https://github.com/settings/keys), then press Enter to continue."
+  echo "    Add this public key to GitHub: https://github.com/settings/keys"
+  echo "    (New SSH key -> paste below, then Save)"
   cat "$HOME/.ssh/id_ed25519.pub"
-  read -r
+  echo ""
+  read -r -p "After adding the key to GitHub, press Enter to continue..."
+fi
+chmod 600 "$HOME/.ssh/id_ed25519" 2>/dev/null || true
+
+echo "==> Adding github.com to known_hosts..."
+ssh-keyscan -t ed25519 github.com >> "$HOME/.ssh/known_hosts" 2>/dev/null || true
+chmod 600 "$HOME/.ssh/known_hosts" 2>/dev/null || true
+
+echo "==> Testing SSH access to GitHub (using $HOME/.ssh/id_ed25519)..."
+SSH_OUT=$(ssh -i "$HOME/.ssh/id_ed25519" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 git@github.com 2>&1) || true
+if echo "$SSH_OUT" | grep -qi "successfully authenticated\|Hi .*! You've successfully"; then
+  echo "    SSH access OK."
+else
+  echo "    SSH test failed. GitHub said:"
+  echo "    $SSH_OUT"
+  echo ""
+  echo "    If you added the key: use the same GitHub account that can open jungledesh/profile."
+  echo "    Try manually: ssh -i $HOME/.ssh/id_ed25519 -o IdentitiesOnly=yes git@github.com"
+  exit 1
 fi
 
 echo "==> Cloning profile repo (SSH)..."
