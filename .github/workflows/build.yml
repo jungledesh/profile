@@ -18,19 +18,34 @@ jobs:
 
     - uses: actions/checkout@v4
 
-    - name: install rust
+    # Cache Rust build artifacts
+    - name: Cache Rust
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
 
-    - name: build binary
+    - name: Build binary
       run: cargo build --release
 
-    - name: login to ghcr
-      run: echo ${{ secrets.GHCR_TOKEN }} | docker login ghcr.io -u jungledesh --password-stdin
+    - name: Login to GHCR
+      run: echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u jungledesh --password-stdin
 
-    - name: build image
-      run: |
-        docker build -t ghcr.io/jungledesh/inference:latest .
+    # Enable docker layer caching
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
 
-    - name: push image
-      run: |
-        docker push ghcr.io/jungledesh/inference:latest
+    - name: Build and push image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: ghcr.io/jungledesh/inference:latest
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
