@@ -1,9 +1,11 @@
 FROM nvidia/cuda:12.4.1-devel-ubuntu22.04
 
+# Environment
 ENV MODELS_DIR=/workspace/models
 ENV VENV_DIR=/workspace/vllm-env
+ENV APP_DIR=/root/app
 
-WORKDIR /workspace
+WORKDIR $APP_DIR
 
 # System dependencies
 RUN apt-get update && apt-get install -y \
@@ -13,13 +15,11 @@ RUN apt-get update && apt-get install -y \
 # Rust + binary
 RUN curl https://sh.rustup.rs -sSf | sh -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
-COPY target/release/profile /workspace/profile
 
-# Scripts
-COPY ./scripts/start.sh /workspace/start.sh
-RUN chmod +x /workspace/start.sh
+# Copy Rust binary and start script to safe location
+COPY target/release/profile ./profile
+COPY scripts/start.sh ./start.sh
+RUN chmod +x ./start.sh
 
-# Models directory
-RUN mkdir -p $MODELS_DIR
-
-CMD ["/workspace/start.sh"]
+# CMD to start your app
+CMD ["./start.sh"]
