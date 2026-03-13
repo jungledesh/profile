@@ -2,7 +2,7 @@
 
 Use these steps to set up a GPU machine for vLLM and profile development.
 
-**Automated setup:** From the repo root, run `./scripts/gpu-setup.sh` (after `nvidia-smi` works). It installs packages, creates the venv, installs vLLM, runs HF login and Llama download, and starts the server in a detached tmux session. The steps below match what the script does and are useful for manual runs or reference.
+**Automated setup:** From the repo root, run `./scripts/gpu-setup.sh` (after `nvidia-smi` works). It installs packages, creates the venv, installs vLLM, runs HF login and Llama download, and starts the server in a detached tmux session. To test a **PR** instead of main, set `PROFILE_REF` to the PR number before running (e.g. `PROFILE_REF=42 ./scripts/gpu-setup.sh`). You can also set it to a branch name or commit SHA. The steps below match what the script does and are useful for manual runs or reference.
 
 ---
 
@@ -64,6 +64,30 @@ Use the SSH URL so the private repo is accessible:
 ```bash
 git clone git@github.com:jungledesh/profile.git
 cd profile
+```
+
+**Clone a specific ref (PR, branch, or commit):** The setup script respects `PROFILE_REF`. Use it to run the GPU setup against a PR or a branch/commit instead of the default branch.
+
+| Goal | Set before running the script |
+|------|--------------------------------|
+| Default branch (main) | (omit, or `PROFILE_REF=` ) |
+| A pull request (e.g. PR #42) | `PROFILE_REF=42` |
+| A branch | `PROFILE_REF=my-feature` |
+| A commit SHA | `PROFILE_REF=abc123def...` |
+
+Example — setup using the code from PR #42:
+
+```bash
+PROFILE_REF=42 ./scripts/gpu-setup.sh
+```
+
+Example — manual clone then checkout a PR:
+
+```bash
+git clone git@github.com:jungledesh/profile.git
+cd profile
+git fetch origin pull/42/head:pr-42
+git checkout pr-42
 ```
 
 ---

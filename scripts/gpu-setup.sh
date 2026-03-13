@@ -51,11 +51,25 @@ fi
 
 echo "==> Cloning profile repo (SSH)..."
 REPO_DIR="${REPO_DIR:-/workspace/profile}"
+# Optional: PROFILE_REF=42 (PR number), branch name, or commit SHA. Empty = default branch.
+PROFILE_REF="${PROFILE_REF:-}"
 if [[ -d "$REPO_DIR/.git" ]]; then
   echo "    (repo already exists at $REPO_DIR, skipping clone)"
 else
   mkdir -p "$(dirname "$REPO_DIR")"
   git clone git@github.com:jungledesh/profile.git "$REPO_DIR"
+fi
+if [[ -n "$PROFILE_REF" ]]; then
+  echo "==> Checking out ref: $PROFILE_REF..."
+  if [[ "$PROFILE_REF" =~ ^[0-9]+$ ]]; then
+    git -C "$REPO_DIR" fetch origin "pull/$PROFILE_REF/head:pr-$PROFILE_REF"
+    git -C "$REPO_DIR" checkout "pr-$PROFILE_REF"
+    echo "    (checked out PR #$PROFILE_REF)"
+  else
+    git -C "$REPO_DIR" fetch origin
+    git -C "$REPO_DIR" checkout "$PROFILE_REF"
+    echo "    (checked out $PROFILE_REF)"
+  fi
 fi
 
 echo "==> Creating vLLM virtual environment..."
