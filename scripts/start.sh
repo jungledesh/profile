@@ -6,6 +6,16 @@ MODEL_PATH="$MODELS_DIR/llama3-8b"
 
 echo "Starting container..."
 
+# create Python venv if missing
+if [[ ! -d "$VENV_DIR" ]]; then
+    python3 -m venv "$VENV_DIR"
+fi
+source "$VENV_DIR/bin/activate"
+
+# Install vLLM (CUDA) at container start
+pip install --upgrade pip
+pip install vllm --extra-index-url https://download.pytorch.org/whl/cu124
+
 mkdir -p "$MODELS_DIR"
 
 # Authenticate with HuggingFace if token provided
