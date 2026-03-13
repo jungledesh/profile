@@ -22,4 +22,4 @@ COPY scripts/start.sh ./start.sh
 RUN chmod +x ./start.sh
 
 # CMD to start your app
-CMD ["./start.sh"]
+CMD ["/root/app/start.sh"]
