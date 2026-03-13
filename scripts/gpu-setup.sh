@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Automate GPU machine setup for vLLM + profile development.
 # Run on a fresh Debian/Ubuntu GPU host (after nvidia-smi works).
-# Requires interactive HF token when huggingface-cli login runs.
+# Requires interactive HF token when hf auth login runs.
 
 set -euo pipefail
 
@@ -12,10 +12,11 @@ echo "==> Updating system and installing packages (git, openssh-client, curl, wg
 apt-get update -qq && apt-get upgrade -y -qq
 apt-get install -y git openssh-client curl wget build-essential tmux python3-venv python3-pip
 
-echo "==> Installing Rust (rustup)..."
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+echo "==> Installing Rust and Cargo (rustup, latest stable)..."
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
 # shellcheck source=/dev/null
 source "$HOME/.cargo/env"
+rustup update stable
 rustc --version
 cargo --version
 
@@ -93,10 +94,11 @@ echo "==> Creating models directory..."
 mkdir -p "$MODELS_DIR"
 
 echo "==> Hugging Face login (paste your token when prompted)..."
-huggingface-cli login
+pip install -q -U huggingface_hub
+hf auth login
 
 echo "==> Downloading Meta-Llama-3-8B-Instruct..."
-huggingface-cli download meta-llama/Meta-Llama-3-8B-Instruct --local-dir "$MODELS_DIR/llama3-8b"
+hf download meta-llama/Meta-Llama-3-8B-Instruct --local-dir "$MODELS_DIR/llama3-8b"
 
 echo "==> Starting vLLM server in detached tmux session 'vllm'..."
 tmux new-session -d -s vllm "source '$VENV_DIR/bin/activate' && python -m vllm.entrypoints.openai.api_server --model $MODELS_DIR/llama3-8b --served-model-name llama3 --port 8000 --dtype auto --gpu-memory-utilization 0.8 --tensor-parallel-size 1"
@@ -104,3 +106,10 @@ tmux new-session -d -s vllm "source '$VENV_DIR/bin/activate' && python -m vllm.e
 echo ""
 echo "Done. Server is running in tmux session 'vllm'. Attach with: tmux attach -t vllm"
 echo "See docs/gpu-setup.md for API examples (e.g. curl http://localhost:8000/health)."
+echo ""
+echo "To use Rust/Cargo and the vLLM venv in a new shell, run:"
+echo "  source \$HOME/.cargo/env"
+echo "  source $VENV_DIR/bin/activate"
+# Source Cargo env so the current shell has cargo/rust in PATH (e.g. if script was sourced)
+# shellcheck source=/dev/null
+source "$HOME/.cargo/env"
