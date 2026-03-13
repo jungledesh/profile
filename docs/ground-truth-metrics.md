@@ -43,4 +43,3 @@ Formulas come from theory, research, and actual usage.
   - Solves: token length variance and total decode efficiency.  
 - **Token_Event**: The live stream delta (Δt) for real-time TPOT.  
 - **Token_Type / Static_Config**: Classification (speculative vs. target) and model ceilings.  
-
