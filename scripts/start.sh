@@ -35,9 +35,9 @@ mkdir -p "$MODELS_DIR"
 # --------------------------
 if [[ -n "${HF_TOKEN:-}" ]]; then
   echo "Logging into HuggingFace..."
-  echo "$HF_TOKEN" | huggingface-cli login --token --stdin
+  huggingface-cli login --token "$HF_TOKEN"
+  # Optional: add --add-to-git-credential if you need git push/pull too
 fi
-
 # --------------------------
 # Download model if missing
 # --------------------------
