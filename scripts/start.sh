@@ -57,6 +57,7 @@ tmux new-session -d -s vllm \
 "source $VENV_DIR/bin/activate && python -m vllm.entrypoints.openai.api_server \
  --model $MODEL_PATH \
  --served-model-name llama3 \
+ --host 0.0.0.0 \
  --port 8000 \
  --dtype auto \
  --gpu-memory-utilization 0.8 \
