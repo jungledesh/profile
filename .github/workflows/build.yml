@@ -1,0 +1,36 @@
+name: Build Image
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+
+    - uses: actions/checkout@v4
+
+    - name: install rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: build binary
+      run: cargo build --release
+
+    - name: login to ghcr
+      run: echo ${{ secrets.GHCR_TOKEN }} | docker login ghcr.io -u jungledesh --password-stdin
+
+    - name: build image
+      run: |
+        docker build -t ghcr.io/jungledesh/inference:latest .
+
+    - name: push image
+      run: |
+        docker push ghcr.io/jungledesh/inference:latest

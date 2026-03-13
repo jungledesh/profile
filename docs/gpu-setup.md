@@ -4,6 +4,8 @@ Use these steps to set up a GPU machine for vLLM and profile development.
 
 **Automated setup:** From the repo root, run `./scripts/gpu-setup.sh` (after `nvidia-smi` works). It installs packages, creates the venv, installs vLLM, runs HF login and Llama download, and starts the server in a detached tmux session. To test a **PR** instead of main, set `PROFILE_REF` to the PR number before running (e.g. `PROFILE_REF=42 ./scripts/gpu-setup.sh`). You can also set it to a branch name or commit SHA. The steps below match what the script does and are useful for manual runs or reference.
 
+**Script defaults:** `REPO_DIR=/workspace/profile`, `MODELS_DIR=/workspace/models`, `VENV_DIR=./vllm-env`. Override with env vars if needed.
+
 ---
 
 ## 1. Verify GPU and drivers
@@ -19,51 +21,63 @@ Confirm the GPU is visible and drivers are installed.
 ## 2. System packages (including git)
 
 ```bash
-apt update && apt upgrade -y
-apt install -y git curl wget build-essential tmux python3-venv python3-pip openssh-client
+apt-get update -qq && apt-get upgrade -y -qq
+apt-get install -y git openssh-client curl wget build-essential tmux python3-venv python3-pip
 ```
 
 Git and OpenSSH are needed to clone the repo (private repo uses SSH); the rest are for general use and the vLLM venv.
 
 ---
 
-## 3. Rust
+## 3. Rust and Cargo
+
+rustup installs both the Rust compiler (`rustc`) and the Cargo build tool. The profile project needs **Rust 1.85+** (for current dependencies; older Cargo fails with `edition2024` required).
 
 ```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source $HOME/.cargo/env
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+source "$HOME/.cargo/env"
+rustup update stable   # ensure latest stable (avoids "edition2024" / Cargo too old)
 
-rustc --version   # Should show e.g., rustc 1.78.0
-cargo --version   # Should show e.g., cargo 1.78.0
+rustc --version   # Should show e.g., rustc 1.85.x or newer
+cargo --version   # Should show e.g., cargo 1.85.x or newer
 ```
+
+If you already had Rust installed and see `feature edition2024 is required` or similar, run `rustup update stable` and try again.
 
 ---
 
 ## 4. SSH (for private repo)
 
-Generate a key on the GPU machine and add the public key to GitHub so you can clone over SSH.
+Generate a key on the GPU machine and add the public key to GitHub so you can clone over SSH. The script uses this key with `-i` and `IdentitiesOnly=yes` when cloning.
 
 ```bash
-# Generate SSH key (no passphrase for automation; use a passphrase if you prefer)
-ssh-keygen -t ed25519 -C "gpu-machine" -f "$HOME/.ssh/id_ed25519" -N ""
+mkdir -p "$HOME/.ssh"
+chmod 700 "$HOME/.ssh"
+ssh-keygen -t ed25519 -C "gpu-profile-setup" -f "$HOME/.ssh/id_ed25519" -N ""
 
 # Show the public key — add this to GitHub
-cat ~/.ssh/id_ed25519.pub
+cat "$HOME/.ssh/id_ed25519.pub"
 ```
 
 1. Copy the line that starts with `ssh-ed25519`.
 2. On GitHub: **Profile (top right) → Settings → SSH and GPG keys → New SSH key**. Paste the key, give it a title (e.g. `GPU box`), save.
-3. Test: `ssh -T git@github.com` — you should see “Hi jungledesh! You've successfully authenticated.”
+3. Add github.com to known_hosts and test:
+   ```bash
+   ssh-keyscan -t ed25519 github.com >> "$HOME/.ssh/known_hosts" 2>/dev/null
+   ssh -i "$HOME/.ssh/id_ed25519" -o IdentitiesOnly=yes git@github.com
+   ```
+   You should see “Hi …! You've successfully authenticated, but GitHub does not provide shell access.”
 
 ---
 
 ## 5. Clone the repo
 
-Use the SSH URL so the private repo is accessible:
+Use the SSH URL so the private repo is accessible. The script clones into `REPO_DIR` (default `/workspace/profile`).
 
 ```bash
-git clone git@github.com:jungledesh/profile.git
-cd profile
+# Default: clone into /workspace/profile
+git clone git@github.com:jungledesh/profile.git /workspace/profile
+cd /workspace/profile
 ```
 
 **Clone a specific ref (PR, branch, or commit):** The setup script respects `PROFILE_REF`. Use it to run the GPU setup against a PR or a branch/commit instead of the default branch.
@@ -94,6 +108,8 @@ git checkout pr-42
 
 ## 6. Python virtual environment and vLLM
 
+The script uses `VENV_DIR` (default `./vllm-env`). Create and activate, then install vLLM (CUDA 12.8):
+
 ```bash
 python3 -m venv vllm-env
 source vllm-env/bin/activate
@@ -107,21 +123,23 @@ pip install vllm --extra-index-url https://download.pytorch.org/whl/cu128
 ## 7. Verify vLLM
 
 ```bash
-python -c "import vllm; print(vllm.__version__)"
+python -c "import vllm; print('vLLM', vllm.__version__)"
 ```
 
 ---
 
-## 8. Hugging Face login and model download (optional)
+## 8. Hugging Face login and model download
 
-vLLM includes Hugging Face Hub support; no separate `pip install huggingface-hub` is needed.
+The script uses `MODELS_DIR` (default `/workspace/models`). Log in with `hf auth login`, then download the model:
 
 ```bash
 mkdir -p /workspace/models
 
-huggingface-cli login
+# Use current HF CLI (hf auth login / hf download)
+pip install -q -U huggingface_hub
+hf auth login
 
-huggingface-cli download meta-llama/Meta-Llama-3-8B-Instruct --local-dir /workspace/models/llama3-8b
+hf download meta-llama/Meta-Llama-3-8B-Instruct --local-dir /workspace/models/llama3-8b
 ```
 
 After login, the Llama 3 8B Instruct model will be in `/workspace/models/llama3-8b`.
@@ -130,9 +148,11 @@ After login, the Llama 3 8B Instruct model will be in `/workspace/models/llama3-
 
 ## 9. Run vLLM OpenAI-compatible server
 
-Make sure you are in the vLLM Python environment (`source vllm-env/bin/activate`), then:
+The script starts the server in a **detached** tmux session (`tmux new-session -d -s vllm`). Manually, you can run it in a new session:
 
 ```bash
+source vllm-env/bin/activate
+
 tmux new -s vllm
 
 python -m vllm.entrypoints.openai.api_server \
@@ -145,6 +165,13 @@ python -m vllm.entrypoints.openai.api_server \
 ```
 
 The server listens on port 8000. Detach from the session with `Ctrl+b` then `d`; reattach with `tmux attach -t vllm`.
+
+**After setup (new shell):** To use Rust/Cargo and the vLLM venv in a new terminal, run:
+
+```bash
+source $HOME/.cargo/env
+source vllm-env/bin/activate   # or path from VENV_DIR if you overrode it
+```
 
 ---
 
