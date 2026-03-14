@@ -95,15 +95,3 @@ pub fn start_sampler() -> SamplerHandle {
         join_handle: Some(join_handle),
     }
 }
-
-// Helper to get current snapshot from buffer (average of last 1s or latest)
-pub fn get_latest_snapshot(buffer: &Arc<Mutex<VecDeque<GpuSample>>>) -> Option<(f32, f32)> {
-    let buf = buffer.lock().unwrap();
-    if buf.is_empty() {
-        return None;
-    }
-
-    // For V1: just return latest (we'll add rolling avg later)
-    let latest = buf.back()?;
-    Some((latest.sm_util, latest.power_w))
-}
