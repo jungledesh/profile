@@ -142,6 +142,18 @@ hf auth login
 hf download meta-llama/Meta-Llama-3-8B-Instruct --local-dir /workspace/models/llama3-8b
 ```
 
+**Token-based login (e.g. containers / CI):** If you have `HF_TOKEN` set and want non-interactive login:
+
+```bash
+huggingface-cli login --token "$HF_TOKEN"
+```
+
+**Alternative download (same result):** You can use `huggingface-cli download` instead of `hf download`:
+
+```bash
+huggingface-cli download meta-llama/Meta-Llama-3-8B-Instruct --local-dir /workspace/models/llama3-8b
+```
+
 After login, the Llama 3 8B Instruct model will be in `/workspace/models/llama3-8b`.
 
 ---
@@ -158,13 +170,31 @@ tmux new -s vllm
 python -m vllm.entrypoints.openai.api_server \
   --model /workspace/models/llama3-8b \
   --served-model-name llama3 \
+  --host 0.0.0.0 \
   --port 8000 \
   --dtype auto \
   --gpu-memory-utilization 0.8 \
   --tensor-parallel-size 1
 ```
 
-The server listens on port 8000. Detach from the session with `Ctrl+b` then `d`; reattach with `tmux attach -t vllm`.
+Use `--host 0.0.0.0` so the server listens on all interfaces (needed in containers or remote access). The server listens on port 8000. Detach from the session with `Ctrl+b` then `d`; reattach with `tmux attach -t vllm`.
+
+**Start in detached session (same as start.sh):**
+
+```bash
+source vllm-env/bin/activate
+
+tmux new-session -d -s vllm "source vllm-env/bin/activate && python -m vllm.entrypoints.openai.api_server \
+  --model /workspace/models/llama3-8b \
+  --served-model-name llama3 \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --dtype auto \
+  --gpu-memory-utilization 0.8 \
+  --tensor-parallel-size 1"
+```
+
+Then attach with: `tmux attach -t vllm`.
 
 **After setup (new shell):** To use Rust/Cargo and the vLLM venv in a new terminal, run:
 
