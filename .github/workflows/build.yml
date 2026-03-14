@@ -1,4 +1,4 @@
-name: Security & Correctness + Build Image
+name: Build & Security
 
 on:
   push:
@@ -9,12 +9,15 @@ on:
 permissions:
   contents: read
   packages: write
+  pull-requests: write
 
 jobs:
   build-and-scan:
     runs-on: ubuntu-latest
+    outputs:
+      images: ${{ steps.tags.outputs.taglist }}
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain
@@ -22,66 +25,35 @@ jobs:
         with:
           components: clippy
 
-      - name: Cache Cargo & build artifacts
+      - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
 
-      # ── Dependency Scans: continue on low/medium, fail only on high/critical ──
-
-      - name: cargo audit (RustSec) - warn on findings, continue
+      - name: cargo audit
         uses: actions-rust-lang/audit@v1
-        continue-on-error: true  # Low/medium won't block; use audit.toml for ignores
-        # with:
-        #   token: ${{ secrets.GITHUB_TOKEN }}  # Uncomment if you want auto GitHub Issues
 
-      - name: OSV-Scanner - fail only on HIGH/CRITICAL (CVSS >=7.0)
-        continue-on-error: true  # Lets us check manually without step failing early
+      - name: OSV-Scanner (fail on HIGH/CRITICAL)
         run: |
-          # Install latest osv-scanner binary (reliable, no deps)
           curl -sSfL https://github.com/google/osv-scanner/releases/latest/download/osv-scanner_linux_amd64 \
             -o /usr/local/bin/osv-scanner
           chmod +x /usr/local/bin/osv-scanner
-          osv-scanner --version
-
-          # Install jq (ubuntu-latest usually has it, but ensure)
           sudo apt-get update -qq && sudo apt-get install -y jq
-
-          # Scan → JSON
           osv-scanner --lockfile Cargo.lock --format json > osv-results.json || true
-
-          # Count HIGH (>=7.0) or CRITICAL (>=9.0) vulns
-          HIGH_CRIT_COUNT=$(jq '[.results[]?.vulnerabilities[]?.severity[]? 
-            | select(.type == "CVSS_V3" and (.score | tonumber >= 7.0))] | length' osv-results.json)
-
+          HIGH_CRIT_COUNT=$(jq '[.results[]?.vulnerabilities[]?.severity[]? | select(.type == "CVSS_V3" and (.score | tonumber >= 7.0))] | length' osv-results.json)
           if [ "$HIGH_CRIT_COUNT" -gt 0 ]; then
             echo "ERROR: Found $HIGH_CRIT_COUNT HIGH or CRITICAL vulnerabilities!"
-            jq . osv-results.json  # Pretty-print for logs
+            jq . osv-results.json
             exit 1
-          else
-            echo "No HIGH/CRITICAL vulnerabilities found (low/medium OK)."
-            jq . osv-results.json || echo "No results."
           fi
+          echo "No HIGH/CRITICAL vulnerabilities found."
 
-      # ── Code Quality & SAST ──
-
-      - name: Clippy - correctness & safety (fail on warnings)
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-      - name: Semgrep SAST Scan - via Docker (publishes automatically with token)
+      - name: Semgrep SAST
         env:
           SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
         run: |
-          # Pull official image (already done in your log, but explicit for safety)
           docker pull returntocorp/semgrep:latest
-
-          # Run semgrep ci
-          # - No --publish needed → automatic upload + PR comments when token set
-          # - --config=auto: pulls good defaults (Rust + security rules)
-          # - Add --error later to fail CI on findings (after you review/tune)
-          # - --suppress-errors: default behavior (CI passes on internal errors, fails only on blocking findings if configured in dashboard)
-          docker run \
-            --rm \
+          docker run --rm \
             -v "${{ github.workspace }}:/src" \
             -e SEMGREP_APP_TOKEN \
             -e GITHUB_EVENT_NAME="${{ github.event_name }}" \
@@ -90,24 +62,35 @@ jobs:
             returntocorp/semgrep:latest \
             semgrep ci
 
-      # ── Build & Push (only proceeds if above didn't hard-fail) ──
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: Build binary
+      - name: Build
         run: cargo build --release
 
       - name: Login to GHCR
-        if: github.event_name != 'pull_request'
         run: echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u ${{ github.repository_owner }} --password-stdin
+
+      - name: Set image tags
+        id: tags
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "taglist=ghcr.io/jungledesh/inference:latest,ghcr.io/jungledesh/inference:${{ github.sha }}" >> $GITHUB_OUTPUT
+          else
+            echo "taglist=ghcr.io/jungledesh/inference:pr-${{ github.event.pull_request.number }},ghcr.io/jungledesh/inference:pr-${{ github.event.pull_request.number }}-${{ github.sha }}" >> $GITHUB_OUTPUT
+          fi
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and push Docker image
-        if: github.event_name != 'pull_request'
+      - name: Build and push image
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: ghcr.io/jungledesh/inference:latest
+          tags: ${{ steps.tags.outputs.taglist }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Log image
+        run: echo "Pushed image(s): ${{ steps.tags.outputs.taglist }}"
