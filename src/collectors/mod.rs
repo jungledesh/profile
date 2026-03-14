@@ -35,7 +35,7 @@ pub fn snapshot() -> Snapshot {
     {
         let mut handle_guard = SAMPLER_HANDLE.lock().unwrap();
         if handle_guard.is_none() {
-            let handle = start_sampler();
+            let handle = start_sampler(SAMPLER_BUFFER.clone());
             *handle_guard = Some(handle);
         }
     }

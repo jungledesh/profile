@@ -2,9 +2,11 @@
 
 Use these steps to set up a GPU machine for vLLM and profile development.
 
-**Automated setup:** From the repo root, run `./scripts/gpu-setup.sh` (after `nvidia-smi` works). It installs packages, creates the venv, installs vLLM, runs HF login and Llama download, and starts the server in a detached tmux session. To test a **PR** instead of main, set `PROFILE_REF` to the PR number before running (e.g. `PROFILE_REF=42 ./scripts/gpu-setup.sh`). You can also set it to a branch name or commit SHA. The steps below match what the script does and are useful for manual runs or reference.
+**CI image (GHCR):** 
 
-**Script defaults:** `REPO_DIR=/workspace/profile`, `MODELS_DIR=/workspace/models`, `VENV_DIR=./vllm-env`. Override with env vars if needed.
+`ghcr.io/jungledesh/inference` — tags: `latest`, `<sha>` (push to main); `pr-<N>`, `pr-<N>-<sha>` (PRs). 
+
+E.g. `ghcr.io/jungledesh/inference:latest` or `ghcr.io/jungledesh/inference:pr-17`.
 
 ---
 

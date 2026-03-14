@@ -34,11 +34,8 @@ impl Drop for SamplerHandle {
     }
 }
 
-pub fn start_sampler() -> SamplerHandle {
-    let buffer = Arc::new(Mutex::new(VecDeque::<GpuSample>::with_capacity(
-        BUFFER_CAPACITY,
-    )));
-    let buffer_clone = buffer.clone();
+pub fn start_sampler(buffer: Arc<Mutex<VecDeque<GpuSample>>>) -> SamplerHandle {
+    let buffer_clone = buffer;
 
     let (shutdown_tx, shutdown_rx) = bounded(1); // small bounded channel for shutdown
 
