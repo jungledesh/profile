@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{bounded, Sender};
+use crossbeam_channel::{bounded, RecvTimeoutError, Sender};
 use nvml_wrapper::Nvml;
 
 const SAMPLE_INTERVAL_MS: u64 = 50;
@@ -54,10 +54,10 @@ pub fn start_sampler() -> SamplerHandle {
 
         loop {
             match shutdown_rx.recv_timeout(Duration::from_millis(SAMPLE_INTERVAL_MS)) {
-                Ok(_) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                Ok(_) | Err(RecvTimeoutError::Disconnected) => {
                     break;
                 }
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                Err(RecvTimeoutError::Timeout) => {
                     let ts = Instant::now();
 
                     let util = device
