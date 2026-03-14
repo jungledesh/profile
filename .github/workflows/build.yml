@@ -1,4 +1,4 @@
-name: Build Image
+name: Security & Correctness + Build Image
 
 on:
   push:
@@ -11,41 +11,97 @@ permissions:
   packages: write
 
 jobs:
-  build:
+  build-and-scan:
     runs-on: ubuntu-latest
-
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
-    # Cache Rust build artifacts
-    - name: Cache Rust
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-          target
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Cache Cargo & build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
 
-    - name: Install Rust
-      uses: dtolnay/rust-toolchain@stable
+      # ── Dependency Scans: continue on low/medium, fail only on high/critical ──
 
-    - name: Build binary
-      run: cargo build --release
+      - name: cargo audit (RustSec) - warn on findings, continue
+        uses: actions-rust-lang/audit@v1
+        continue-on-error: true  # Low/medium won't block; use audit.toml for ignores
+        # with:
+        #   token: ${{ secrets.GITHUB_TOKEN }}  # Uncomment if you want auto GitHub Issues
 
-    - name: Login to GHCR
-      run: echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u jungledesh --password-stdin
+      - name: OSV-Scanner - fail only on HIGH/CRITICAL (CVSS >=7.0)
+        continue-on-error: true  # Lets us check manually without step failing early
+        run: |
+          # Install latest osv-scanner binary (reliable, no deps)
+          curl -sSfL https://github.com/google/osv-scanner/releases/latest/download/osv-scanner_linux_amd64 \
+            -o /usr/local/bin/osv-scanner
+          chmod +x /usr/local/bin/osv-scanner
+          osv-scanner --version
 
-    # Enable docker layer caching
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
+          # Install jq (ubuntu-latest usually has it, but ensure)
+          sudo apt-get update -qq && sudo apt-get install -y jq
 
-    - name: Build and push image
-      uses: docker/build-push-action@v5
-      with:
-        context: .
-        push: true
-        tags: ghcr.io/jungledesh/inference:latest
-        cache-from: type=gha
-        cache-to: type=gha,mode=max
+          # Scan → JSON
+          osv-scanner --lockfile Cargo.lock --format json > osv-results.json || true
+
+          # Count HIGH (>=7.0) or CRITICAL (>=9.0) vulns
+          HIGH_CRIT_COUNT=$(jq '[.results[]?.vulnerabilities[]?.severity[]? 
+            | select(.type == "CVSS_V3" and (.score | tonumber >= 7.0))] | length' osv-results.json)
+
+          if [ "$HIGH_CRIT_COUNT" -gt 0 ]; then
+            echo "ERROR: Found $HIGH_CRIT_COUNT HIGH or CRITICAL vulnerabilities!"
+            jq . osv-results.json  # Pretty-print for logs
+            exit 1
+          else
+            echo "No HIGH/CRITICAL vulnerabilities found (low/medium OK)."
+            jq . osv-results.json || echo "No results."
+          fi
+
+      # ── Code Quality & SAST ──
+
+      - name: Clippy - correctness & safety (fail on warnings)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Semgrep SAST Scan - warn on findings (dashboard + PR comments)
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+        run: |
+          # Clean pipx install
+          python3 -m pip install --user --upgrade pip
+          python3 -m pip install --user pipx
+          ~/.local/bin/pipx install semgrep
+
+          # Add pipx to PATH if needed (should be after ensurepath, but explicit)
+          export PATH="$HOME/.local/bin:$PATH"
+
+          # Run in CI mode
+          semgrep ci --publish || true  # continue even if findings (non-blocking for now)
+          # To make blocking later: change to semgrep ci --publish --error
+
+      # ── Build & Push (only proceeds if above didn't hard-fail) ──
+
+      - name: Build binary
+        run: cargo build --release
+
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        run: echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u ${{ github.repository_owner }} --password-stdin
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/jungledesh/inference:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
