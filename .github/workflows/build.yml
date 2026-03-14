@@ -68,24 +68,27 @@ jobs:
       - name: Clippy - correctness & safety (fail on warnings)
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: Semgrep SAST Scan - via Docker (recommended, no PATH issues)
+      - name: Semgrep SAST Scan - via Docker (publishes automatically with token)
         env:
           SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
         run: |
-          # Pull and run official Semgrep Docker image
+          # Pull official image (already done in your log, but explicit for safety)
           docker pull returntocorp/semgrep:latest
 
           # Run semgrep ci
-          # --publish: sends to dashboard + enables PR comments (needs token)
-          # --config=auto: good defaults incl. Rust/security rules
-          # Add --error to fail on findings later (after tuning)
+          # - No --publish needed → automatic upload + PR comments when token set
+          # - --config=auto: pulls good defaults (Rust + security rules)
+          # - Add --error later to fail CI on findings (after you review/tune)
+          # - --suppress-errors: default behavior (CI passes on internal errors, fails only on blocking findings if configured in dashboard)
           docker run \
             --rm \
             -v "${{ github.workspace }}:/src" \
             -e SEMGREP_APP_TOKEN \
+            -e GITHUB_EVENT_NAME="${{ github.event_name }}" \
+            -e GITHUB_SHA="${{ github.sha }}" \
+            -e GITHUB_REF="${{ github.ref }}" \
             returntocorp/semgrep:latest \
-            semgrep ci --publish --config=auto
-          # Alternative configs: --config=p/security-audit --config=p/rust
+            semgrep ci --config=auto
 
       # ── Build & Push (only proceeds if above didn't hard-fail) ──
 
