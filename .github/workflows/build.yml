@@ -68,21 +68,24 @@ jobs:
       - name: Clippy - correctness & safety (fail on warnings)
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: Semgrep SAST Scan - warn on findings (dashboard + PR comments)
+      - name: Semgrep SAST Scan - via Docker (recommended, no PATH issues)
         env:
           SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
         run: |
-          # Clean pipx install
-          python3 -m pip install --user --upgrade pip
-          python3 -m pip install --user pipx
-          ~/.local/bin/pipx install semgrep
+          # Pull and run official Semgrep Docker image
+          docker pull returntocorp/semgrep:latest
 
-          # Add pipx to PATH if needed (should be after ensurepath, but explicit)
-          export PATH="$HOME/.local/bin:$PATH"
-
-          # Run in CI mode
-          semgrep ci --publish || true  # continue even if findings (non-blocking for now)
-          # To make blocking later: change to semgrep ci --publish --error
+          # Run semgrep ci
+          # --publish: sends to dashboard + enables PR comments (needs token)
+          # --config=auto: good defaults incl. Rust/security rules
+          # Add --error to fail on findings later (after tuning)
+          docker run \
+            --rm \
+            -v "${{ github.workspace }}:/src" \
+            -e SEMGREP_APP_TOKEN \
+            returntocorp/semgrep:latest \
+            semgrep ci --publish --config=auto
+          # Alternative configs: --config=p/security-audit --config=p/rust
 
       # ── Build & Push (only proceeds if above didn't hard-fail) ──
 
