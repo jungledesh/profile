@@ -1,0 +1,18 @@
+# audit.toml
+# Configuration for cargo-audit (RustSec advisories)
+# Place this file at repo root or ~/.cargo/audit.toml
+
+[advisories]
+# List advisory IDs (RUSTSEC-YYYY-NNNN) to ignore (false positives, accepted risks, etc.)
+# Example: uncomment and add real IDs when needed
+# ignore = [
+#   "RUSTSEC-2023-0052",
+#   "RUSTSEC-2024-0001",
+# ]
+
+# Optional: fail on these categories even if not vulnerable
+# deny = ["unmaintained", "yanked"]
+
+[output]
+# Optional: quiet mode, etc.
+# vulnerability = "full"   # or "short", "terminal"
