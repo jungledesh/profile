@@ -13,7 +13,11 @@ path = "src/main.rs"
 clap = { version = "4.5", features = ["derive"] }
 anyhow = "1.0"
 nvml-wrapper = "0.12"
+crossbeam-channel = "0.5"
+once_cell = "1.19"
 
 [dev-dependencies]
 assert_cmd = "2.0"
 predicates = "3"
+crossbeam-channel = "0.5"
+once_cell = "1.19"
