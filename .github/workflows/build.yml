@@ -88,7 +88,7 @@ jobs:
             -e GITHUB_SHA="${{ github.sha }}" \
             -e GITHUB_REF="${{ github.ref }}" \
             returntocorp/semgrep:latest \
-            semgrep ci --config=auto
+            semgrep ci
 
       # ── Build & Push (only proceeds if above didn't hard-fail) ──
 
