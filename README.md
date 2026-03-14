@@ -10,7 +10,7 @@ Profile reveals where GPU capacity, power, and inference pipelines are wasting m
 
 ---
 
-![X ms, Y joules, Z dollars](assets/inference-metrics.png)
+![X ms, Y joules, Z dollars](assets/inference-metrics.jpeg)
 
 
 **per request.**
