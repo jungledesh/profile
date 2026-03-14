@@ -10,7 +10,10 @@ Profile reveals where GPU capacity, power, and inference pipelines are wasting m
 
 ---
 
-**X ms, Y joules, Z dollars** per request.
+![X ms, Y joules, Z dollars](assets/inference-metrics.png)
+
+
+**per request.**
 
 For automated tuning and configuration changes, see NVIDIA’s AIConfigurator. Profile is the **truth layer** for AI serving economics.
 
