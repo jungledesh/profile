@@ -1,314 +1,261 @@
-# Profile Roadmap
+# Profile
 
-**Pain → Metric → Action**
+**Pain → Metric → Diagnosis → Cause → Evidence → Fix**
+
+- Metrics (and Waste) surface the pain
+- Top Issues rank what matters
+- Each issue carries Diagnosis, Cause, and Evidence
+- Confidence qualifies certainty
+- Recommended Plan is the prioritized Fix (Impact Transparency + Basis)
+- Do Nothing is the clean case when no major issue applies
+
+---
+
+## Value in 1 minute
+
+1-minute install → metrics, issues, and fixes
 
 ---
 
 ## Summary
 
-| Version | Focus | Question |
-|---------|--------|----------|
-| **V1** | Waste Detection | *Is my cluster inefficient?* |
-| **V2** | Pipeline Cause | *Where (prefill/decode) is the bottleneck?* |
-| **V3** | Memory Diagnostics | *Why is memory wasting / KV inefficient?* |
-| **V4** | Scheduler Diagnostics | *Why aren't we batching effectively?* |
-| **V5** | Hardware Physics | *Deeper hardware limitation?* |
-| **V6** | Optimization Engine | *How do I fix it?* |
-| **V7** | Integrations | *Production fit?* |
-| **V8** | Autonomous (future) | *Can it self-optimize?* |
-
-**Flow:** Waste → Cause → Deep cause (optional) → Hardware cause (optional) → Fix → Integrate → Automate
-
----
-
-## V1 — Waste Detection [CLI + TUI]
-
-**Goal:** Reveal obvious inefficiencies in the inference stack.
-
-Should include KV cache and all other version metrics to give users the surface-level symptom of their problem—tempting them to go deeper for more versions (premium tiers).
-
-### Metrics
-
-- Tokens/sec (TPS)
-- Time to First Token (TTFT)
-- Time per Output Token (TPOT)
-- GPU utilization
-- GPU power draw
-- Cost per token
-- Joules / request
-- Tokens / watt
-- P99
-- Cost ≈ `(total_tokens / TPS / 3600) × hourly_rate` (user-supplied)
-
-### Example
-
-| Metric | Value |
-|--------|--------|
-| Model | Llama-3-8B |
-| GPU | A100 |
-| Tokens/sec | 420 |
-| TTFT | 1.9s |
-| TPOT | 85ms |
-| GPU Utilization | 29% |
-| Power | 310W |
-| Cost / 1K tokens | $0.0072 |
-
-**Insight:** GPU utilization extremely low. You are paying for idle compute.
-
-**Purpose of V1 demo:** *Your cluster is inefficient.*
+| Version | Focus | Minute 1 Value Delivered | Rules in Engine | Question Answered | MVP Priority |
+|---------|--------|--------------------------|-----------------|-------------------|--------------|
+| **v1** | Full Core Diagnostics | Complete trusted story (4 surface rules + do-nothing) | 5 rules | Is my cluster inefficient? | MVP (Week 1–2) |
+| **v2** | Full Core + Pipeline Depth | Complete story + prefill/decode rules | 7 rules | Where is the bottleneck? | MVP (Week 1–2) |
+| **v4** | Full Core + Scheduler Depth | Complete story + batching rules | 8 rules | Why aren't we batching effectively? | MVP (Week 2–3) |
+| **v3** | Full Core + Memory Depth | Complete story + KV/memory rules | 10 rules | Why is memory wasting / KV inefficient? | Post-MVP |
+| **v5** | Full Core + Hardware Physics | Complete story + low-level hardware rules | 12 rules | Deeper hardware limitation? | Post-MVP |
+| **v6** | Full Core + Richest Optimization Engine | Complete story + all rules + quantization sensitivity | All rules | How do I fix it? | MVP core (Week 2–4) |
+| **v7** | Full Core + Integrations | Complete story + exportable JSON/OTLP fix blobs | All rules | Production fit? | Post-MVP |
+| **v8** | Full Core + Autonomous | Complete story + self-optimizing fixes | All rules | Can it self-optimize? | Future |
+| **v9** | Full Core + Cluster Level | Complete story + cross-node aggregation & imbalance rules | +6 cluster rules | Why is my cluster underperforming at scale? | post-v8 |
 
 ---
 
-## V2 — Pipeline Cause Detection
-
-**Goal:** Identify which stage of inference is inefficient.
-
-### Metrics
-
-- Prefill latency
-- Decode latency
-- Prefill tokens/sec
-- Decode tokens/sec
-- Weight load time
-- KV cache init time
-
-### Example
-
-| Metric | Value |
-|--------|--------|
-| Prefill latency | 1.6s |
-| Decode latency | 0.3s |
-
-**Insight:** TTFT dominated by prefill stage. Large prompt processing slowing requests.
-
-**Purpose:** *Which stage of inference is inefficient?*
+**Note:** For vLLM, data comes from **vLLM `/metrics`** + **DCGM/NVIDIA-SMI** (per node). Cluster mode aggregates via config file.
 
 ---
 
-## V4 — Scheduler Diagnostics
+## Output Format
 
-**Goal:** Identify batching and scheduling inefficiencies.
+```text
+=== PROFILE DIAGNOSE ===
 
-### Metrics
+Metrics:
+GPU util: 29%
+TPS: 420
+TTFT: 1.9s
+...
 
-- Active batch size
-- Maximum batch size
-- Queue delay
-- Batch wait time
+Waste:
+~70% GPU idle
 
-### Example A
+Top Issues (ranked):
+1. Batch collapse (High confidence: 0.91)
+2. Prefill overhead (Medium: 0.63)
 
-| Metric | Value |
-|--------|--------|
-| Average batch size | 2 / max 16 |
-| Queue delay | 0ms |
-| Batch wait | 0ms |
+Diagnosis:
+Requests are not batching effectively
 
-**Insight:** Batch collapse detected. Requests are not batching together.
+Cause:
+GPU underutilized — batch occupancy stays low relative to capacity
 
-### Example B
+Evidence:
+- Avg batch size: 2 / 16
+- Queue delay: 0ms
 
-| Metric | Value |
-|--------|--------|
-| Queue delay | 450ms |
-| Batch wait | 300ms |
+Recommended Plan:
+[1] Enable continuous batching
+   Impact: +40–60% TPS (typical), up to +100% in ideal batching conditions
+   Basis: Batch scaling curve + current utilization
 
-**Insight:** Scheduler bottleneck. Requests waiting too long before execution.
-
-**Purpose:** *Why GPUs are underutilized.*
-
----
-
-## V3 — Memory Diagnostics *(only if demand exists; after V2)*
-
-**Goal:** Diagnose memory inefficiencies.
-
-### Metrics
-
-- KV cache usage
-- KV cache fragmentation
-- Prefix reuse rate
-
-### Example A
-
-| Metric | Value |
-|--------|--------|
-| KV cache utilization | 92% |
-| KV fragmentation | 38% |
-| Prefix reuse rate | 3% |
-
-**Insight:** KV cache fragmentation high. Memory blocks are inefficiently used.
-
-### Example B
-
-| Metric | Value |
-|--------|--------|
-| Prompt tokens | 1200 |
-| Prefix reuse | 0% |
-
-**Insight:** Prefix caching disabled. Large prompts repeatedly recomputed.
-
-**Purpose:** *Explain memory inefficiencies.*
+[2] Enable prefix caching
+   Impact: TTFT -30–45% (typical), up to -60% in high-reuse workloads
 
 ---
-
-## V5 — Hardware Physics (advanced)
-
-**Goal:** Identify low-level GPU bottlenecks.
-
-### Metrics
-
-- HBM bandwidth usage
-- Memory stall cycles
-- **Arithmetic Intensity** — Formula: *Arithmetic Intensity = Floating Point Operations / Bytes of Memory Accessed*  
-  *Why:* Memory-wall detector. If low, proves the customer needs quantization (V6), not more GPUs.
-- PCIe/NVLink throughput
-- **PCIe/NVLink Saturation**  
-  *Why:* For multi-GPU setups, reveals if the bottleneck is the bridge between cards rather than the model.
-- GPU clock throttling
-
-### Example A
-
-| Metric | Value |
-|--------|--------|
-| HBM bandwidth | 92% |
-| Memory stall cycles | high |
-| SM utilization | 40% |
-
-**Insight:** Memory wall detected. GPU waiting on memory reads.
-
-### Example B
-
-| Metric | Value |
-|--------|--------|
-| NVLink throughput | 85GB/s |
-| PCIe | saturation detected |
-
-**Insight:** Multi-GPU communication bottleneck.
-
-**Purpose:** *Explain hardware-level inefficiencies.*
-
----
-
-## V6 — Optimization Engine
-
-**Goal:** Turn diagnostics into clear recommendations.
-
-**Structure:** Insight → Diagnosis → Action → Expected Impact
-
-### Example 1: Batch collapse
-
-| Step | Content |
-|------|---------|
-| **Insight** | GPU utilization = 29%. Tokens/sec below expected baseline. |
-| **Diagnosis** | Batch collapse detected. Average batch size = 2 / 16. |
-| **Action** | Enable continuous batching. Set batching window to 15ms. |
-| **Expected impact** | GPU util: 29% → ~60%. Tokens/sec: +40–50%. Cost/token: -25–35%. |
-
-### Example 2: Prefill-dominated TTFT
-
-| Step | Content |
-|------|---------|
-| **Insight** | TTFT = 2.1s. Prefill latency dominates. |
-| **Diagnosis** | Large prompts repeatedly recomputed. Prefix reuse rate = 0%. |
-| **Action** | Enable prefix caching. |
-| **Expected impact** | TTFT: -40%. Energy per request: -20%. |
-
-### Example 3: KV / prefix caching
-
-| Step | Content |
-|------|---------|
-| **Insight** | High KV fragmentation + low prefix reuse. |
-| **Diagnosis** | External fragmentation from variable-length requests or disabled prefix caching. |
-| **Action** | Enable `--enable-prefix-caching` + tune `--max-num-seqs` / `gpu-memory-utilization` for more KV space. |
-| **Expected** | TTFT -30–60%, joules/request -20–40%, effective context 2–3× larger. |
-
-### Example 4: Memory wall + quantization
-
-| Step | Content |
-|------|---------|
-| **Insight** | Memory wall (low arithmetic intensity + high stall cycles). |
-| **Diagnosis** | Decode phase dominated by memory bandwidth, not compute. |
-| **Action** | Apply quantization (e.g. FP8/AWQ) + check if continuous batching is enabled. |
-| **Expected** | Tokens/sec +50–150%, cost/token -30–50% (with &lt;1–2% accuracy hit on most tasks). |
-
-**Addition: Quantization Sensitivity.** When recommending INT8/FP8, provide a reasoning layer that weighs $J/req$ savings against potential hit to model accuracy.
-
-**Purpose:** *Tell users how to fix inefficiencies.*
-
----
-
-## V7 — Integrations
-
-**Goal:** Fit into existing observability infrastructure.
-
-Emit **Insight / Diagnosis / Action / Expected** JSON blobs via REST or OTLP so agentic platforms can ingest and act (e.g. auto-tune batch window).
-
-### Export interfaces
-
-- OpenTelemetry
-- Prometheus
-- StatsD
-- JSON / REST API
-
-### Example
-
-```bash
-profile export prometheus
-profile export otlp
-profile export statsd
+Status: Issues detected (or “No major inefficiencies detected”)
 ```
 
-**Prometheus metric example:**
-
-```
-profile_gpu_utilization 0.32
-profile_tokens_per_second 410
-profile_cost_per_1k_tokens 0.007
-```
-
-### Usage
-
-- Grafana dashboards
-- Datadog alerts
-- OpenTelemetry pipelines
-
-**Purpose:** *Allow teams to integrate Profile into production monitoring.*
+*(Cluster mode in v9 adds aggregate view + per-node drill-down + cross-node issues.)*
 
 ---
 
-## V8 — Autonomous Optimization (future)
+## v1 — Full Core Diagnostics [CLI + TUI]
 
-**Goal:** Automatically tune inference configuration.
+**Goal:** One command → complete, trusted, production-ready story.
 
-**Structure:** Insight → Diagnosis → Action → Result
+### Work
 
-### Example
+- **CLI:** `profile diagnose --url http://localhost:8000` (Rust binary via Maturin → `pip install profile`)
+- Scrape vLLM Prometheus + DCGM
+- Central decision engine with **exactly the 5 rules** below
+- Unified TUI + live refresh + `--export json`
 
-| Step | Content |
-|------|---------|
-| **Insight** | GPU utilization = 24%. Queue depth = 15. Average batch size = 1. |
-| **Diagnosis** | Batch collapse due to strict latency target. Batch window effectively disabled. |
-| **Action** | Batch window increased from 0ms → 12ms. Max batch size set to 16. |
-| **Result** | Tokens/sec: +52%. Cost/token: -34%. |
+### Rule engine
 
-**Purpose:** *Automatically optimize inference systems.*
+#### 1. Batch collapse
+
+| Field | Detail |
+|-------|--------|
+| **Condition** | `avg_batch_size < 0.5 × max_num_seqs` **and** `gpu_util < 50%` |
+| **Confidence** | `0.95 - (avg_batch_size / max_num_seqs)` (clamped 0.6–0.95) |
+| **Evidence** | Avg batch size, queue delay, GPU util |
+| **Fix** | Enable continuous batching + 15 ms window |
+| **Impact** | +40–60% TPS (typical), up to +100% in ideal batching conditions |
+| **Basis** | Batch scaling curve on A100/H100-class GPUs |
+
+#### 2. Low GPU utilization (idle compute)
+
+| Field | Detail |
+|-------|--------|
+| **Condition** | `gpu_util < 40%` for >30s **and** `queue_delay < 50ms` |
+| **Confidence** | 0.92 (if power < 60% TDP) |
+| **Evidence** | GPU util, power draw, TPS vs baseline |
+| **Fix** | Enable continuous batching |
+| **Impact** | GPU util → 55–70% (typical), TPS +35–55% (typical), up to +80% in ideal conditions |
+| **Basis** | vLLM production benchmarks (same hardware class) |
+
+#### 3. Prefill bottleneck
+
+| Field | Detail |
+|-------|--------|
+| **Condition** | `prefill_latency / TTFT > 0.7` **and** `prompt_tokens > 512` |
+| **Confidence** | 0.88 (if prefix reuse < 10%) |
+| **Evidence** | Prefill % of TTFT, prompt tokens |
+| **Fix** | Enable `--enable-prefix-caching` |
+| **Impact** | TTFT -30–45% (typical), up to -60% in high-reuse workloads |
+| **Basis** | Prefix-cache hit-rate scaling from vLLM logs |
+
+#### 4. Low throughput vs baseline
+
+| Field | Detail |
+|-------|--------|
+| **Condition** | `tps < 0.65 × expected_baseline(model, gpu, avg_batch)` |
+| **Confidence** | 0.82 |
+| **Evidence** | Current TPS vs baseline gap |
+| **Fix** | Prioritized batching + prefix caching |
+| **Impact** | TPS +40–70% (typical), up to +120% in ideal conditions |
+| **Basis** | Calibrated on 12 public vLLM benchmarks |
+
+#### 5. Do-nothing / optimal case (always last)
+
+| Field | Detail |
+|-------|--------|
+| **Condition** | No rules trigger **and** `gpu_util > 65%` **and** `tps > 0.85 × baseline` |
+| **Output** | “No major inefficiencies detected. System is near optimal. Monitor under 2× load.” |
+
+_Note — Issue(s) handling: rules ranked by **confidence × estimated_impact**. Top **2–3** shown in Recommended Plan._
 
 ---
 
-## The Product Narrative
+## v2–v9 — Same engine, same output
 
-Each version answers a deeper question:
+**v2 through v9** are unchanged in product shape: each version **extends the same central decision engine** and uses the **same output format**. Higher versions **add rules**; they do not fork the UX or duplicate vLLM.
 
-| Version | Question |
-|---------|----------|
-| **V1** | Is my cluster inefficient? |
-| **V2 / V4** | Where is the bottleneck? |
-| **V3 / V5** | What deeper system limitation is causing it? |
-| **V6** | How do I fix it? |
-| **V7** | How do I integrate this into production? |
-| **V8** | Can this be optimized automatically? |
+---
 
-This roadmap keeps Profile focused on the core value:
+## v2 — Full Core + Pipeline Depth
 
-**Reveal waste → Explain cause → Fix inefficiency**
+**Goal:** Same output + deeper prefill/decode rules added to engine.
+
+### Work
+
+Add **2 pipeline rules** to the shared engine. Same unified TUI.
+
+---
+
+## v4 — Full Core + Scheduler Depth
+
+**Goal:** Same output + explicit batching rules.
+
+### Work
+
+Add **scheduler rules** to engine. Same unified output.
+
+---
+
+## v3 — Full Core + Memory Depth (post-MVP)
+
+**Goal:** Same output + KV fragmentation & prefix reuse rules.
+
+### Work
+
+Extend engine (small vLLM PR recommended for clean metrics). Same unified TUI.
+
+---
+
+## v5 — Full Core + Hardware Physics (post-MVP)
+
+**Goal:** Same output + arithmetic intensity / memory-wall rules (DCGM).
+
+### Work
+
+Extend engine with DCGM data. Optional `--advanced` flag.
+
+---
+
+## v6 — Full Core + Richest Optimization Engine
+
+**Goal:** Same output powered by the **complete** engine.
+
+### Work
+
+Central decision-tree + **quantization sensitivity** layer (J/req savings vs accuracy risk). All original examples now live here with updated impact phrasing.
+
+---
+
+## v7 — Full Core + Production Integrations (post-MVP)
+
+**Goal:** Same output + export enriched blobs.
+
+### Work
+
+`profile export` otlp/prometheus/json with full `{metrics, waste, diagnosis, cause, evidence, action, impact, basis, confidence}`.
+
+**Cause** is its own key (not folded into `diagnosis`) so Grafana, agents, and ticket systems can show, route on, and store “what we think is wrong” vs “why it’s happening” without splitting one text field.
+
+---
+
+## v8 — Full Core + Autonomous (future)
+
+**Goal:** Same output + safe auto-apply loop (with `--dry-run` first).
+
+---
+
+## v9 — Full Core + Cluster Level Diagnostics (post-v8)
+
+**Goal:** Same complete trusted story + cross-node / cluster-scale causes & fixes.
+
+### Work
+
+- **New CLI:** `profile diagnose --cluster config.yaml` (or `--nodes node1:8000,node2:8000`)
+- Aggregate metrics across nodes
+- Add **6 new cluster rules** to the shared engine
+- Unified TUI shows cluster summary + per-node drill-down
+
+### Cluster-specific rules (added in v9)
+
+| Rule | Condition / notes | Fix / impact |
+|------|-------------------|--------------|
+| **Load imbalance** | TPS variance > 25% across nodes | **Fix:** Adjust router weights / enable consistent hashing. **Impact:** Cluster TPS +25–45% (typical), up to +70% in ideal balanced conditions |
+| **Straggler nodes** | One node’s P99 > 2× cluster median | **Impact:** P99 latency -30–50% (typical), up to -70% after straggler elimination |
+| **Cross-node routing inefficiency** | Some nodes idle while queue > 0 on others | **Impact:** Overall cluster util +20–40% (typical), up to +60% in ideal routing |
+| **Cluster-wide batching collapse** | Aggregate avg batch size across all nodes | **Impact:** Cluster TPS +35–55% (typical), up to +90% in ideal conditions |
+| **Prefix / KV inefficiency at scale** | Low global prefix reuse | **Impact:** TTFT -25–40% (typical), up to -55% with cross-node caching |
+| **Network / communication bottleneck** | High NCCL/InfiniBand saturation | **Impact:** End-to-end throughput +15–35% (typical), up to +50% after network tuning |
+
+### Example cluster output addition
+
+```text
+Cluster Summary (3 nodes):
+Node1 TPS: 500   Node2 TPS: 220   Node3 TPS: 480
+
+Top Cluster Issues:
+1. Load imbalance (High confidence: 0.93)
+   Evidence: TPS variance 45%, Node2 underutilized
+
+Recommended Plan:
+[1] Rebalance router (consistent hashing)
+   Impact: Cluster TPS +25–45% (typical), up to +70% in ideal balanced conditions
+```
