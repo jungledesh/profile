@@ -23,10 +23,7 @@ pub fn collect_gpu_metrics() -> Result<GpuRawMetrics> {
     let memory_used_mb = mem.as_ref().map(|i| i.used / MIB);
     let memory_total_mb = mem.as_ref().map(|i| i.total / MIB);
 
-    let power_watts = device
-        .power_usage()
-        .ok()
-        .map(|mw| mw as f64 / 1000.0);
+    let power_watts = device.power_usage().ok().map(|mw| mw as f64 / 1000.0);
     let power_limit_watts = device
         .power_management_limit()
         .ok()
