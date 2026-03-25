@@ -4,6 +4,8 @@ use nvml_wrapper::Nvml;
 
 use super::GpuRawMetrics;
 
+const MIB: u64 = 1024 * 1024;
+
 pub fn collect_gpu_metrics() -> Result<GpuRawMetrics> {
     let Ok(nvml) = Nvml::init() else {
         return Ok(GpuRawMetrics::default());
@@ -12,26 +14,36 @@ pub fn collect_gpu_metrics() -> Result<GpuRawMetrics> {
         return Ok(GpuRawMetrics::default());
     };
 
-    let mut m = GpuRawMetrics::default();
-    m.gpu_name = device.name().ok();
-    if let Ok(u) = device.utilization_rates() {
-        m.gpu_util_pct = Some(u.gpu as f64);
-        m.mem_util_pct = Some(u.memory as f64);
-    }
-    if let Ok(info) = device.memory_info() {
-        let mb = 1024 * 1024;
-        m.memory_used_mb = Some(info.used / mb);
-        m.memory_total_mb = Some(info.total / mb);
-    }
-    if let Ok(mw) = device.power_usage() {
-        m.power_watts = Some(mw as f64 / 1000.0);
-    }
-    if let Ok(lim) = device.power_management_limit() {
-        m.power_limit_watts = Some(lim as f64 / 1000.0);
-    }
-    if let Ok(t) = device.temperature(TemperatureSensor::Gpu) {
-        m.temperature_c = Some(t as f64);
-    }
+    let gpu_name = device.name().ok();
+    let util = device.utilization_rates().ok();
+    let gpu_util_pct = util.as_ref().map(|u| u.gpu as f64);
+    let mem_util_pct = util.as_ref().map(|u| u.memory as f64);
 
-    Ok(m)
+    let mem = device.memory_info().ok();
+    let memory_used_mb = mem.as_ref().map(|i| i.used / MIB);
+    let memory_total_mb = mem.as_ref().map(|i| i.total / MIB);
+
+    let power_watts = device
+        .power_usage()
+        .ok()
+        .map(|mw| mw as f64 / 1000.0);
+    let power_limit_watts = device
+        .power_management_limit()
+        .ok()
+        .map(|lim| lim as f64 / 1000.0);
+    let temperature_c = device
+        .temperature(TemperatureSensor::Gpu)
+        .ok()
+        .map(|t| t as f64);
+
+    Ok(GpuRawMetrics {
+        gpu_name,
+        gpu_util_pct,
+        mem_util_pct,
+        memory_used_mb,
+        memory_total_mb,
+        power_watts,
+        power_limit_watts,
+        temperature_c,
+    })
 }
