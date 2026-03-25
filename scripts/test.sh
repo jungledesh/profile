@@ -22,7 +22,7 @@ for i in {1..5}; do
 
     # Run your profile binary
     echo "Running profile..."
-    ./profile run
+    ./profile diagnose
     
     echo "Nvidia-smi..."
     nvidia-smi

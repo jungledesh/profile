@@ -1,22 +1,18 @@
-//! Collectors: GPU util, power draw, token stats. Stubs until vLLM/NVML (or agent).
+//! GPU + optional vLLM `/metrics` scrape.
 
-mod gpu;
-mod power;
-mod tokens;
+pub mod gpu;
+pub mod types;
+pub mod vllm;
 
-#[derive(Debug, Default, Clone)]
-pub struct Snapshot {
-    pub gpu_name: Option<String>, // NEW: V1 table header (friendly name only)
-    pub gpu_util: Option<f32>,
-    pub power_w: Option<f32>,
-    pub tokens_per_sec: Option<f32>,
-}
+pub use types::{GpuRawMetrics, RawSnapshot, VllmRawMetrics};
 
-pub fn snapshot() -> Snapshot {
-    Snapshot {
-        gpu_name: gpu::gpu_name(),
-        gpu_util: gpu::gpu_utilization(),
-        power_w: power::power_draw(),
-        tokens_per_sec: tokens::token_stats(),
-    }
+pub fn collect_snapshot(vllm_base_url: &str) -> anyhow::Result<RawSnapshot> {
+    let vllm = vllm::collect_vllm_metrics(vllm_base_url)?;
+    let gpu = gpu::collect_gpu_metrics()?;
+
+    Ok(RawSnapshot {
+        timestamp: std::time::SystemTime::now(),
+        vllm,
+        gpu,
+    })
 }
