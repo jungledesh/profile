@@ -21,7 +21,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && /usr/sbin/useradd -m -u 1000 -s /bin/bash appuser \
     && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p "${APP_DIR}" "${MODELS_DIR}" "${VENV_DIR}" /workspace && \
+# Do not mkdir VENV_DIR — an empty dir breaks start.sh's "create venv if missing" check
+RUN mkdir -p "${APP_DIR}" "${MODELS_DIR}" /workspace && \
     chown -R appuser:appuser /home/appuser /workspace
 
 WORKDIR ${APP_DIR}
