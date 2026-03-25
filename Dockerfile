@@ -1,36 +1,42 @@
 FROM nvidia/cuda:12.4.1-devel-ubuntu22.04
 
-# Environment
-ENV MODELS_DIR=/workspace/models
-ENV VENV_DIR=/workspace/vllm-env
-ENV APP_DIR=/home/appuser/app
+ENV DEBIAN_FRONTEND=noninteractive
 
-# ---- create non-root user ----
+# Stable paths
+ENV APP_DIR=/home/appuser/app
+ENV MODELS_DIR=/workspace/models
+ENV VENV_DIR=/home/appuser/vllm-env
+ENV PATH="${VENV_DIR}/bin:/usr/local/bin:/usr/bin:/bin"
+
+# Create non-root user
 RUN useradd -m -u 1000 -s /bin/bash appuser
 
-WORKDIR $APP_DIR
-
-# System dependencies
-RUN apt-get update && apt-get install -y \
-    python3 python3-venv python3-pip build-essential tmux curl wget jq vim \
+# System packages
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-venv \
+    python3-pip \
+    tmux \
+    curl \
+    wget \
+    jq \
+    ca-certificates \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
-# Rust + binary
-RUN curl https://sh.rustup.rs -sSf | sh -s -- -y
-ENV PATH="/root/.cargo/bin:${PATH}"
+# Create runtime dirs
+RUN mkdir -p "${APP_DIR}" "${MODELS_DIR}" "/home/appuser" && \
+    chown -R appuser:appuser /home/appuser /workspace
 
-# Copy Rust binary and scripts
-COPY target/release/profile ./profile
-COPY scripts/start.sh ./start.sh
-COPY scripts/test.sh ./test.sh
+WORKDIR ${APP_DIR}
 
-RUN chmod +x ./start.sh ./test.sh
+# Copy only what is needed at runtime
+COPY --chown=appuser:appuser scripts/start.sh ./start.sh
+COPY --chown=appuser:appuser scripts/test.sh ./test.sh
+COPY --chown=appuser:appuser target/release/profile ./profile
 
-# give ownership to user
-RUN chown -R appuser:appuser /home/appuser
+RUN chmod 0755 ./start.sh ./test.sh ./profile
 
-# switch user
 USER appuser
 
-# start
 CMD ["/home/appuser/app/start.sh"]
