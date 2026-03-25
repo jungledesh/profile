@@ -8,11 +8,9 @@ ENV MODELS_DIR=/workspace/models
 ENV VENV_DIR=/home/appuser/vllm-env
 ENV PATH="${VENV_DIR}/bin:/usr/local/bin:/usr/bin:/bin"
 
-# Create non-root user
-RUN useradd -m -u 1000 -s /bin/bash appuser
-
-# System packages
+# System packages + non-root user (minimal CUDA bases omit useradd until passwd is installed)
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    passwd \
     python3 \
     python3-venv \
     python3-pip \
@@ -22,6 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     jq \
     ca-certificates \
     git \
+    && useradd -m -u 1000 -s /bin/bash appuser \
     && rm -rf /var/lib/apt/lists/*
 
 # Create runtime dirs
