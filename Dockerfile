@@ -8,6 +8,7 @@ ENV VENV_DIR=/home/appuser/vllm-env
 ENV PATH="${VENV_DIR}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash \
     passwd \
     python3 \
     python3-venv \
@@ -35,4 +36,4 @@ RUN chmod 0755 ./start.sh ./test.sh ./profile
 
 USER appuser
 
-CMD ["/home/appuser/app/start.sh"]
+CMD ["bash", "-lc", "/home/appuser/app/start.sh"]

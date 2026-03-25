@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-set -euo pipefail
+
+set -Eeuo pipefail
+trap 'echo "FAILED at line $LINENO"' ERR
 
 # --------------------------
 # Paths
