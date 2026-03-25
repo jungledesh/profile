@@ -34,22 +34,26 @@ source "$VENV_DIR/bin/activate"
 python -m pip install --upgrade pip
 python -m pip install --upgrade uv
 uv pip install -U vllm --torch-backend=auto
-python -m pip install -U huggingface_hub
+# Same resolver as vLLM — keeps transformers happy (hub<1) and installs huggingface-cli into the venv
+uv pip install "huggingface-hub>=0.34,<1.0"
 
-# --------------------------
-# Hugging Face login if token provided
-# --------------------------
 if [[ -n "${HF_TOKEN:-}" ]]; then
-    echo "Logging into Hugging Face..."
-    huggingface-cli login --token "$HF_TOKEN"
+    export HF_TOKEN
 fi
+
+HF_CLI="${VENV_DIR}/bin/huggingface-cli"
 
 # --------------------------
 # Download model if missing
 # --------------------------
-if [[ ! -d "$MODEL_PATH" ]]; then
+if [[ ! -d "$MODEL_PATH" ]] || [[ -z "$(ls -A "$MODEL_PATH" 2>/dev/null)" ]]; then
     echo "Downloading model..."
-    huggingface-cli download \
+    mkdir -p "$MODEL_PATH"
+    [[ -x "$HF_CLI" ]] || {
+        echo "missing $HF_CLI after hub install" >&2
+        exit 1
+    }
+    "$HF_CLI" download \
         meta-llama/Meta-Llama-3-8B-Instruct \
         --local-dir "$MODEL_PATH"
 else
