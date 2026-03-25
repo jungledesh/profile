@@ -1,13 +1,13 @@
 //! CLI: parse commands, print results.
 
+mod diagnose;
 mod info;
-mod run;
 
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(name = "profile")]
-#[command(about = "Profile vLLM GPU and system metrics")]
+#[command(about = "Diagnose vLLM GPU and inference efficiency")]
 pub struct Cli {
     #[arg(short, long, action = clap::ArgAction::Count)]
     pub verbose: u8,
@@ -18,22 +18,23 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    /// Run a profile (dry-run for now).
-    Run(ProfileArgs),
+    /// Collect metrics and surface issues (v1).
+    Diagnose(DiagnoseArgs),
 
     /// Print tool information.
     Info,
 }
 
 #[derive(Debug, clap::Args)]
-pub struct ProfileArgs {
-    #[arg(short, long)]
-    pub config: Option<String>,
+pub struct DiagnoseArgs {
+    /// vLLM server base URL
+    #[arg(long, default_value = "http://127.0.0.1:8000")]
+    pub url: String,
 }
 
 pub fn run(cli: Cli) -> anyhow::Result<()> {
     match &cli.command {
-        Commands::Run(args) => run::execute(args, cli.verbose)?,
+        Commands::Diagnose(args) => diagnose::execute(args)?,
         Commands::Info => info::execute(cli.verbose)?,
     }
 

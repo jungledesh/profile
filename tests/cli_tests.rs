@@ -11,23 +11,13 @@ fn help_exits_success() {
 }
 
 #[test]
-fn run_exits_success() {
+fn diagnose_exits_success() {
     Command::cargo_bin("profile")
         .unwrap()
-        .arg("run")
+        .arg("diagnose")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Profile v1").and(predicate::str::contains("GPU")));
-}
-
-#[test]
-fn run_with_config_succeeds() {
-    Command::cargo_bin("profile")
-        .unwrap()
-        .args(["run", "--config", "/path/to/config"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Profile v1"));
+        .stdout(predicate::str::contains("PROFILE DIAGNOSE").and(predicate::str::contains("GPU")));
 }
 
 #[test]
@@ -47,7 +37,7 @@ fn verbose_prints_level_to_stderr() {
     // -vv must come before the subcommand so it's parsed as a global flag
     Command::cargo_bin("profile")
         .unwrap()
-        .args(["-vv", "run"])
+        .args(["-vv", "diagnose"])
         .assert()
         .success()
         .stderr(predicate::str::contains("Verbose level: 2"));
