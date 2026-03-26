@@ -3,38 +3,26 @@
 set -Eeuo pipefail
 trap 'echo "FAILED at line $LINENO"' ERR
 
-# --------------------------
-# Paths
-# --------------------------
 APP_DIR="${APP_DIR:-/home/appuser/app}"
 VENV_DIR="${VENV_DIR:-/home/appuser/vllm-env}"
 MODELS_DIR="${MODELS_DIR:-/workspace/models}"
 MODEL_PATH="${MODEL_PATH:-$MODELS_DIR/llama3-8b}"
 TMUX_SESSION="${TMUX_SESSION:-vllm}"
+LOG_FILE="${APP_DIR}/vllm.log"
 
 echo "Starting container..."
 
-# --------------------------
-# Ensure required dirs exist
-# --------------------------
 mkdir -p "$APP_DIR" "$MODELS_DIR"
 
-# --------------------------
-# Create / activate Python venv
-# --------------------------
 if [[ ! -f "$VENV_DIR/bin/activate" ]]; then
     rm -rf "$VENV_DIR"
     python3 -m venv "$VENV_DIR"
 fi
 source "$VENV_DIR/bin/activate"
 
-# --------------------------
-# Install latest stable vLLM
-# --------------------------
 python -m pip install --upgrade pip
 python -m pip install --upgrade uv
 uv pip install -U vllm --torch-backend=auto
-# Same resolver as vLLM — keeps transformers happy (hub<1) and installs huggingface-cli into the venv
 uv pip install "huggingface-hub>=0.34,<1.0"
 
 if [[ -n "${HF_TOKEN:-}" ]]; then
@@ -43,9 +31,6 @@ fi
 
 HF_CLI="${VENV_DIR}/bin/huggingface-cli"
 
-# --------------------------
-# Download model if missing
-# --------------------------
 if [[ ! -d "$MODEL_PATH" ]] || [[ -z "$(ls -A "$MODEL_PATH" 2>/dev/null)" ]]; then
     echo "Downloading model..."
     mkdir -p "$MODEL_PATH"
@@ -60,19 +45,13 @@ else
     echo "Model already present."
 fi
 
-# --------------------------
-# Restart tmux session cleanly
-# --------------------------
 if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
     echo "Killing existing tmux session: $TMUX_SESSION"
     tmux kill-session -t "$TMUX_SESSION"
 fi
 
-# --------------------------
-# Start vLLM server
-# --------------------------
 tmux new-session -d -s "$TMUX_SESSION" \
-"source \"$VENV_DIR/bin/activate\" && \
+"bash -lc 'source \"$VENV_DIR/bin/activate\" && \
 python -m vllm.entrypoints.openai.api_server \
   --model \"$MODEL_PATH\" \
   --served-model-name llama3 \
@@ -80,13 +59,11 @@ python -m vllm.entrypoints.openai.api_server \
   --port 8000 \
   --dtype auto \
   --gpu-memory-utilization 0.8 \
-  --tensor-parallel-size 1"
+  --tensor-parallel-size 1 \
+  2>&1 | tee \"$LOG_FILE\"'"
 
 echo
 echo "vLLM running in tmux session '$TMUX_SESSION'"
 echo "Attach with: tmux attach -t $TMUX_SESSION"
 
-# --------------------------
-# Keep container alive
-# --------------------------
 tail -f /dev/null
