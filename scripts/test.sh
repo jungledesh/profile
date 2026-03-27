@@ -21,7 +21,6 @@ for i in {1..5}; do
     echo ""
 
     # Run your profile binary
-    echo "Running profile..."
     ./profile diagnose
     
     echo "Nvidia-smi..."

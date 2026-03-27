@@ -4,10 +4,8 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::thread;
 
-/// Minimal exposition text so `prometheus_parse::Scrape::parse` succeeds without vLLM series.
 const MINIMAL_SCRAPE: &str = "# TYPE noop gauge\nnoop 0\n";
 
-/// Bind `127.0.0.1:0`, serve one `GET /metrics` response, then finish (for `profile diagnose` tests).
 fn spawn_one_shot_metrics_server(body: &'static str) -> (String, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test metrics server");
     let port = listener.local_addr().expect("local_addr").port();
@@ -50,15 +48,64 @@ fn help_exits_success() {
 #[test]
 fn diagnose_exits_success() {
     let (url, server) = spawn_one_shot_metrics_server(MINIMAL_SCRAPE);
-    Command::cargo_bin("profile")
+    let output = Command::cargo_bin("profile")
         .unwrap()
         .arg("diagnose")
         .arg("--url")
         .arg(&url)
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("PROFILE DIAGNOSE").and(predicate::str::contains("GPU")));
+        .output()
+        .expect("run profile diagnose");
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let out = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        out.contains("GPU name"),
+        "stdout should list GPU name; got:\n{out}"
+    );
+    assert!(
+        out.lines()
+            .any(|line| line.contains("GPU name") && line.contains(" : ")),
+        "expected aligned `label : value` line for GPU name; got:\n{out}"
+    );
+
     server.join().expect("metrics server thread");
+}
+
+#[test]
+fn diagnose_long_help_lists_example_metrics() {
+    let output = Command::cargo_bin("profile")
+        .unwrap()
+        .args(["diagnose", "--help"])
+        .output()
+        .expect("run profile diagnose --help");
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let out = String::from_utf8_lossy(&output.stdout).into_owned();
+    for needle in [
+        "Example:",
+        "GPU util %",
+        "Mem ctrl util %",
+        "VRAM",
+        "Power draw",
+        "SM clock",
+        "TTFT (est. ms)",
+        "Gen tokens",
+    ] {
+        assert!(
+            out.contains(needle),
+            "diagnose --help should mention {needle:?}; got:\n{out}"
+        );
+    }
 }
 
 #[test]
@@ -75,7 +122,6 @@ fn info_exits_success() {
 
 #[test]
 fn verbose_prints_level_to_stderr() {
-    // -vv must come before the subcommand so it's parsed as a global flag
     let (url, server) = spawn_one_shot_metrics_server(MINIMAL_SCRAPE);
     Command::cargo_bin("profile")
         .unwrap()
