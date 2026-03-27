@@ -42,13 +42,18 @@ impl VllmRawMetrics {
 #[derive(Debug, Clone, Default)]
 pub struct GpuRawMetrics {
     pub gpu_name: Option<String>,
+    /// Device index on this host (`CUDA_VISIBLE_DEVICES` / NVML ordering).
+    pub gpu_index: Option<u32>,
+    /// Stable per-device identifier from the driver (e.g. `GPU-xxxxxxxx-xxxx-...`).
+    pub gpu_uuid: Option<String>,
     pub gpu_util_pct: Option<f64>,
     pub mem_util_pct: Option<f64>,
     pub power_watts: Option<f64>,
     pub power_limit_watts: Option<f64>,
-    pub memory_used_mb: Option<u64>,
-    pub memory_total_mb: Option<u64>,
+    pub vram_used_mb: Option<u64>,
+    pub vram_total_mb: Option<u64>,
     pub temperature_c: Option<f64>,
+    pub sm_clock_mhz: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
