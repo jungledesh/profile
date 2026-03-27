@@ -39,7 +39,7 @@ pub fn execute(args: &DiagnoseArgs) -> anyhow::Result<()> {
             "\n(No metrics in snapshot — NVML unavailable or vLLM scrape not implemented yet.)"
         );
     } else {
-        println!("\nSnapshot collected; rule engine + vLLM /metrics parse still TODO.");
+        println!("\nSnapshot collected; rule engine and richer /metrics fields still TODO.");
     }
 
     Ok(())

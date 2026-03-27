@@ -1,4 +1,6 @@
-FROM nvidia/cuda:12.4.1-devel-ubuntu22.04
+# Immutable digest for nvidia/cuda:12.4.1-devel-ubuntu22.04 (CUDA 12.4.1, Ubuntu 22.04).
+# Re-resolve with: docker buildx imagetools inspect nvidia/cuda:12.4.1-devel-ubuntu22.04 --format '{{json .Manifest.Digest}}'
+FROM nvidia/cuda@sha256:da6791294b0b04d7e65d87b7451d6f2390b4d36225ab0701ee7dfec5769829f5
 
 ENV DEBIAN_FRONTEND=noninteractive
 
