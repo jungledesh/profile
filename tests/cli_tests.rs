@@ -93,8 +93,8 @@ fn diagnose_long_help_lists_example_metrics() {
     let out = String::from_utf8_lossy(&output.stdout).into_owned();
     for needle in [
         "Example:",
-        "GPU Utilization",
-        "Memory util",
+        "GPU util %",
+        "Mem ctrl util %",
         "VRAM",
         "Power draw",
         "SM clock",

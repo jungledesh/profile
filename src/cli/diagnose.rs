@@ -26,13 +26,13 @@ pub fn execute(args: &DiagnoseArgs) -> anyhow::Result<()> {
     }
 
     match result.snapshot.gpu.gpu_util_pct {
-        Some(util) => row("GPU Utilization", format!("{:.1}%", util)),
-        None => row("GPU Utilization", "(no GPU / NVML not ready)"),
+        Some(util) => row("GPU util %", format!("{:.1}%", util)),
+        None => row("GPU util %", "(no GPU / NVML not ready)"),
     }
 
     match result.snapshot.gpu.mem_util_pct {
-        Some(pct) => row("Memory util", format!("{:.1}%", pct)),
-        None => row("Memory util", "(no GPU / NVML not ready)"),
+        Some(pct) => row("Mem ctrl util %", format!("{:.1}%", pct)),
+        None => row("Mem ctrl util %", "(no GPU / NVML not ready)"),
     }
 
     match (
@@ -93,8 +93,8 @@ pub fn execute(args: &DiagnoseArgs) -> anyhow::Result<()> {
 #[cfg(test)]
 #[test]
 fn metric_line_padding_matches_longest_label() {
-    let s = format!("  {:<w$} : {}", "GPU Utilization", "45.0%", w = LABEL_W);
-    assert_eq!(s, "  GPU Utilization : 45.0%");
+    let s = format!("  {:<w$} : {}", "Mem ctrl util %", "12.0%", w = LABEL_W);
+    assert_eq!(s, "  Mem ctrl util % : 12.0%");
     assert_eq!(s.find(" : ").unwrap(), 2 + LABEL_W);
 }
 
