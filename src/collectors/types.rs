@@ -4,15 +4,38 @@ use std::time::SystemTime;
 #[derive(Debug, Clone, Default)]
 pub struct VllmRawMetrics {
     pub model_name: Option<String>,
-    pub tps: Option<f64>,
+
+    // Raw gauges
+    pub num_requests_running: Option<f64>,
+    pub num_requests_waiting: Option<f64>,
+    pub kv_cache_usage_perc: Option<f64>,
+
+    // Histogram means (ms)
     pub ttft_ms: Option<f64>,
     pub tpot_ms: Option<f64>,
     pub prefill_latency_ms: Option<f64>,
-    pub avg_batch_size: Option<f64>,
-    pub max_num_seqs: Option<u32>,
     pub queue_delay_ms: Option<f64>,
-    pub num_requests_waiting: Option<f64>,
-    pub kv_cache_usage_pct: Option<f64>,
+
+    // Raw counter for TPS calculation later
+    pub generation_tokens_total: Option<f64>,
+
+    // Not always available
+    pub max_num_seqs: Option<u32>,
+}
+
+impl VllmRawMetrics {
+    pub fn has_scrape_data(&self) -> bool {
+        self.model_name.is_some()
+            || self.num_requests_running.is_some()
+            || self.num_requests_waiting.is_some()
+            || self.kv_cache_usage_perc.is_some()
+            || self.ttft_ms.is_some()
+            || self.tpot_ms.is_some()
+            || self.prefill_latency_ms.is_some()
+            || self.queue_delay_ms.is_some()
+            || self.generation_tokens_total.is_some()
+            || self.max_num_seqs.is_some()
+    }
 }
 
 /// NVML / DCGM / nvidia-smi scrape
@@ -37,6 +60,6 @@ pub struct RawSnapshot {
 
 impl RawSnapshot {
     pub fn is_empty(&self) -> bool {
-        self.vllm.tps.is_none() && self.gpu.gpu_util_pct.is_none()
+        !self.vllm.has_scrape_data() && self.gpu.gpu_util_pct.is_none()
     }
 }

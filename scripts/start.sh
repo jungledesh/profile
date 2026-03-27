@@ -1,73 +1,77 @@
 #!/usr/bin/env bash
-set -euo pipefail
 
-# --------------------------
-# Paths
-# --------------------------
-APP_DIR="/root/app"                  # safe location for Rust binary + script
-VENV_DIR="${VENV_DIR:-$APP_DIR/vllm-env}"  # Python venv inside app dir
-MODELS_DIR="${MODELS_DIR:-/workspace/models}"  # ephemeral mount for models
-MODEL_PATH="$MODELS_DIR/llama3-8b"
+set -Eeuo pipefail
+trap 'echo "FAILED at line $LINENO"' ERR
+
+# Pinned Python stack (override via env if needed). PyTorch wheels use cu126; CUDA image is 12.4.1 (12.x compatible).
+PIP_VERSION="${PIP_VERSION:-26.0.1}"
+UV_VERSION="${UV_VERSION:-0.11.1}"
+VLLM_VERSION="${VLLM_VERSION:-0.18.0}"
+HUGGINGFACE_HUB_VERSION="${HUGGINGFACE_HUB_VERSION:-0.36.2}"
+TORCH_BACKEND="${TORCH_BACKEND:-cu126}"
+
+APP_DIR="${APP_DIR:-/home/appuser/app}"
+VENV_DIR="${VENV_DIR:-/home/appuser/vllm-env}"
+MODELS_DIR="${MODELS_DIR:-/workspace/models}"
+MODEL_PATH="${MODEL_PATH:-$MODELS_DIR/llama3-8b}"
+TMUX_SESSION="${TMUX_SESSION:-vllm}"
+LOG_FILE="${APP_DIR}/vllm.log"
 
 echo "Starting container..."
 
-# --------------------------
-# Create Python venv if missing
-# --------------------------
-if [[ ! -d "$VENV_DIR" ]]; then
+mkdir -p "$APP_DIR" "$MODELS_DIR"
+
+if [[ ! -f "$VENV_DIR/bin/activate" ]]; then
+    rm -rf "$VENV_DIR"
     python3 -m venv "$VENV_DIR"
 fi
 source "$VENV_DIR/bin/activate"
 
-# --------------------------
-# Install vLLM (CUDA) at container start
-# --------------------------
-pip install --upgrade pip
-pip install vllm --extra-index-url https://download.pytorch.org/whl/cu124
+python -m pip install "pip==${PIP_VERSION}"
+python -m pip install "uv==${UV_VERSION}"
+uv pip install "vllm==${VLLM_VERSION}" --torch-backend="${TORCH_BACKEND}"
+uv pip install "huggingface-hub==${HUGGINGFACE_HUB_VERSION}"
 
-# --------------------------
-# Ensure models directory exists
-# --------------------------
-mkdir -p "$MODELS_DIR"
-
-# --------------------------
-# HuggingFace login if token provided
-# --------------------------
 if [[ -n "${HF_TOKEN:-}" ]]; then
-  echo "Logging into HuggingFace..."
-  huggingface-cli login --token "$HF_TOKEN"
-  # Optional: add --add-to-git-credential if you need git push/pull too
+    export HF_TOKEN
 fi
-# --------------------------
-# Download model if missing
-# --------------------------
-if [[ ! -d "$MODEL_PATH" ]]; then
-  echo "Downloading model..."
-  huggingface-cli download \
-    meta-llama/Meta-Llama-3-8B-Instruct \
-    --local-dir "$MODEL_PATH"
+
+HF_CLI="${VENV_DIR}/bin/huggingface-cli"
+
+if [[ ! -d "$MODEL_PATH" ]] || [[ -z "$(ls -A "$MODEL_PATH" 2>/dev/null)" ]]; then
+    echo "Downloading model..."
+    mkdir -p "$MODEL_PATH"
+    [[ -x "$HF_CLI" ]] || {
+        echo "missing $HF_CLI after hub install" >&2
+        exit 1
+    }
+    "$HF_CLI" download \
+        meta-llama/Meta-Llama-3-8B-Instruct \
+        --local-dir "$MODEL_PATH"
 else
-  echo "Model already present."
+    echo "Model already present."
 fi
 
-# --------------------------
-# Start vLLM server
-# --------------------------
-tmux new-session -d -s vllm \
-"source $VENV_DIR/bin/activate && python -m vllm.entrypoints.openai.api_server \
- --model $MODEL_PATH \
- --served-model-name llama3 \
- --host 0.0.0.0 \
- --port 8000 \
- --dtype auto \
- --gpu-memory-utilization 0.8 \
- --tensor-parallel-size 1"
+if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+    echo "Killing existing tmux session: $TMUX_SESSION"
+    tmux kill-session -t "$TMUX_SESSION"
+fi
 
-echo ""
-echo "vLLM running in tmux session 'vllm'"
-echo "Attach with: tmux attach -t vllm"
+tmux new-session -d -s "$TMUX_SESSION" \
+"bash -lc 'source \"$VENV_DIR/bin/activate\" && \
+python -m vllm.entrypoints.openai.api_server \
+  --model \"$MODEL_PATH\" \
+  --served-model-name llama3 \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --dtype auto \
+  --gpu-memory-utilization 0.8 \
+  --tensor-parallel-size 1 \
+  --enforce-eager \
+  2>&1 | tee \"$LOG_FILE\"'"
 
-# --------------------------
-# Keep container alive
-# --------------------------
+echo
+echo "vLLM running in tmux session '$TMUX_SESSION'"
+echo "Attach with: tmux attach -t $TMUX_SESSION"
+
 tail -f /dev/null

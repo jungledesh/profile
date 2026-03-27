@@ -24,17 +24,22 @@ pub fn execute(args: &DiagnoseArgs) -> anyhow::Result<()> {
         None => println!("Power Draw      : (no GPU / NVML not ready)"),
     }
 
-    match result.snapshot.vllm.tps {
-        Some(tps) => println!("Tokens/sec      : {:.1}", tps),
-        None => println!("Tokens/sec      : (not parsed yet)"),
+    match result.snapshot.vllm.ttft_ms {
+        Some(ms) => println!("TTFT (est. ms)  : {:.1}", ms),
+        None => println!("TTFT (est. ms)  : (not available)"),
     }
 
-    if result.snapshot.gpu.gpu_util_pct.is_none() && result.snapshot.vllm.tps.is_none() {
+    match result.snapshot.vllm.generation_tokens_total {
+        Some(n) => println!("Gen tokens      : {:.0} (counter)", n),
+        None => println!("Gen tokens      : (not parsed)"),
+    }
+
+    if result.snapshot.gpu.gpu_util_pct.is_none() && !result.snapshot.vllm.has_scrape_data() {
         println!(
             "\n(No metrics in snapshot — NVML unavailable or vLLM scrape not implemented yet.)"
         );
     } else {
-        println!("\nSnapshot collected; rule engine + vLLM /metrics parse still TODO.");
+        println!("\nSnapshot collected; rule engine and richer /metrics fields still TODO.");
     }
 
     Ok(())

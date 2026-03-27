@@ -69,8 +69,24 @@ jobs:
       - name: Build
         run: cargo build --release
 
+      - name: Docker tags and whether to push
+        id: docker_meta
+        run: |
+          REG="ghcr.io/jungledesh/inference"
+          SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "push=true" >> "$GITHUB_OUTPUT"
+            echo "tags=${REG}:latest,${REG}:sha-${SHA}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "pull_request" ] && [ "${{ github.event.pull_request.head.repo.full_name }}" = "${{ github.repository }}" ]; then
+            echo "push=true" >> "$GITHUB_OUTPUT"
+            echo "tags=${REG}:pr-${{ github.event.pull_request.number }},${REG}:sha-${SHA}" >> "$GITHUB_OUTPUT"
+          else
+            echo "push=false" >> "$GITHUB_OUTPUT"
+            echo "tags=${REG}:sha-${SHA}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Login to GHCR
-        if: github.event_name != 'pull_request'
+        if: steps.docker_meta.outputs.push == 'true'
         run: echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u ${{ github.repository_owner }} --password-stdin
 
       - name: Set up Docker Buildx
@@ -80,7 +96,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ghcr.io/jungledesh/inference:latest
+          push: ${{ steps.docker_meta.outputs.push == 'true' }}
+          tags: ${{ steps.docker_meta.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
