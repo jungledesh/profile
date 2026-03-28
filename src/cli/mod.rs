@@ -11,9 +11,9 @@ Example:
   GPU name        : NVIDIA GeForce RTX 4090
   GPU index       : 0
   GPU ID (UUID)   : GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-  GPU util %      : 45.0%
-  Mem ctrl util % : 12.0%
-  VRAM            : 12000 / 24564 MiB (48.8%)
+  GPU util %      : 45.0
+  Mem ctrl util % : 12.0
+  VRAM % used     : 12000 / 24564 MiB (48.8)
   Power draw      : 220 / 450 W
   SM clock        : 2100 MHz
   TTFT (est. ms)  : 120.0

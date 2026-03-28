@@ -26,12 +26,12 @@ pub fn execute(args: &DiagnoseArgs) -> anyhow::Result<()> {
     }
 
     match result.snapshot.gpu.gpu_util_pct {
-        Some(util) => row("GPU util %", format!("{:.1}%", util)),
+        Some(util) => row("GPU util %", format!("{:.1}", util)),
         None => row("GPU util %", "(no GPU / NVML not ready)"),
     }
 
     match result.snapshot.gpu.mem_util_pct {
-        Some(pct) => row("Mem ctrl util %", format!("{:.1}%", pct)),
+        Some(pct) => row("Mem ctrl util %", format!("{:.1}", pct)),
         None => row("Mem ctrl util %", "(no GPU / NVML not ready)"),
     }
 
@@ -42,14 +42,17 @@ pub fn execute(args: &DiagnoseArgs) -> anyhow::Result<()> {
         (Some(used), Some(total)) => {
             if total > 0 {
                 let pct = (used as f64 / total as f64) * 100.0;
-                row("VRAM", format!("{} / {} MiB ({:.1}%)", used, total, pct));
+                row(
+                    "VRAM % used",
+                    format!("{} / {} MiB ({:.1})", used, total, pct),
+                );
             } else {
-                row("VRAM", format!("{} / {} MiB", used, total));
+                row("VRAM % used", format!("{} / {} MiB", used, total));
             }
         }
-        (Some(used), None) => row("VRAM", format!("{} MiB used (total n/a)", used)),
-        (None, Some(total)) => row("VRAM", format!("(n/a) / {} MiB", total)),
-        (None, None) => row("VRAM", "(no GPU / NVML not ready)"),
+        (Some(used), None) => row("VRAM % used", format!("{} MiB used (total n/a)", used)),
+        (None, Some(total)) => row("VRAM % used", format!("(n/a) / {} MiB", total)),
+        (None, None) => row("VRAM % used", "(no GPU / NVML not ready)"),
     }
 
     match (
@@ -93,14 +96,14 @@ pub fn execute(args: &DiagnoseArgs) -> anyhow::Result<()> {
 #[cfg(test)]
 #[test]
 fn metric_line_padding_matches_longest_label() {
-    let s = format!("  {:<w$} : {}", "Mem ctrl util %", "12.0%", w = LABEL_W);
-    assert_eq!(s, "  Mem ctrl util % : 12.0%");
+    let s = format!("  {:<w$} : {}", "Mem ctrl util %", "12.0", w = LABEL_W);
+    assert_eq!(s, "  Mem ctrl util % : 12.0");
     assert_eq!(s.find(" : ").unwrap(), 2 + LABEL_W);
 }
 
 #[cfg(test)]
 #[test]
 fn metric_line_shorter_label_pads_before_colon() {
-    let s = format!("  {:<w$} : {}", "VRAM", "1 / 2 MiB", w = LABEL_W);
-    assert!(s.starts_with("  VRAM") && s.contains(" : ") && s.ends_with("1 / 2 MiB"));
+    let s = format!("  {:<w$} : {}", "VRAM % used", "1 / 2 MiB", w = LABEL_W);
+    assert!(s.starts_with("  VRAM % used") && s.contains(" : ") && s.ends_with("1 / 2 MiB"));
 }

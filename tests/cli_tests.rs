@@ -95,7 +95,7 @@ fn diagnose_long_help_lists_example_metrics() {
         "Example:",
         "GPU util %",
         "Mem ctrl util %",
-        "VRAM",
+        "VRAM % used",
         "Power draw",
         "SM clock",
         "TTFT (est. ms)",
