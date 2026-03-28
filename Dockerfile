@@ -21,6 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     wget \
     jq \
+    gawk \
     ca-certificates \
     git \
     && /usr/sbin/useradd -m -u 1000 -s /bin/bash appuser \

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# OS packages for scripts/test.sh (curl, jq, gawk, etc.) are installed in the Dockerfile; this script runs as appuser and does not apt-get.
 
 set -Eeuo pipefail
 trap 'echo "FAILED at line $LINENO"' ERR
