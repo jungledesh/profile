@@ -80,9 +80,9 @@ for ((i=1;i<=ITERATIONS;i++)); do
         print "  (no samples collected)"
         exit
       }
-      printf "  GPU util %%      : %.1f%%\n", gpu_sum / count
-      printf "  Mem ctrl util %% : %.1f%%\n", mem_sum / count
-      printf "  VRAM            : %d / %d MiB\n", used, total
+      printf "  %-15s : %.1f\n", "GPU util %", gpu_sum / count
+      printf "  %-15s : %.1f\n", "Mem ctrl util %", mem_sum / count
+      printf "  %-15s : %d / %d MiB (%.1f)\n", "VRAM % used", used, total, used * 100.0 / total
       printf "  Power draw      : %.0f W\n", pwr_sum / count
       printf "  Temp            : %d C\n", temp
       printf "  SM clock        : %d MHz\n", sm
