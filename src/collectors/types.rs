@@ -16,8 +16,12 @@ pub struct VllmRawMetrics {
     pub prefill_latency_ms: Option<f64>,
     pub queue_delay_ms: Option<f64>,
 
-    // Raw counter for TPS calculation later
+    /// Cumulative generation tokens (last scrape), summed over label sets.
     pub generation_tokens_total: Option<f64>,
+    /// Δ generation tokens / s over the first→last scrape window (output throughput).
+    pub generation_tokens_per_sec: Option<f64>,
+    /// Δ hits / Δ queries over the same window (0.0–1.0 when defined).
+    pub prefix_cache_hit_rate: Option<f64>,
 
     // Not always available
     pub max_num_seqs: Option<u32>,
@@ -34,6 +38,8 @@ impl VllmRawMetrics {
             || self.prefill_latency_ms.is_some()
             || self.queue_delay_ms.is_some()
             || self.generation_tokens_total.is_some()
+            || self.generation_tokens_per_sec.is_some()
+            || self.prefix_cache_hit_rate.is_some()
     }
 }
 

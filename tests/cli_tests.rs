@@ -44,6 +44,45 @@ fn spawn_metrics_server(
     (url, handle)
 }
 
+/// One response body per GET; must match [`VLLM_SCRAPE_COUNT`].
+fn spawn_metrics_server_seq(bodies: &[&'static str]) -> (String, thread::JoinHandle<()>) {
+    assert_eq!(
+        bodies.len(),
+        VLLM_SCRAPE_COUNT,
+        "vLLM collector performs exactly {VLLM_SCRAPE_COUNT} scrapes"
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test metrics server");
+    let port = listener.local_addr().expect("local_addr").port();
+    let url = format!("http://127.0.0.1:{port}");
+    let bodies: Vec<&'static str> = bodies.to_vec();
+
+    let handle = thread::spawn(move || {
+        for body in bodies {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 4096];
+            let mut n = 0usize;
+            while n < buf.len() {
+                let got = stream.read(&mut buf[n..]).expect("read");
+                if got == 0 {
+                    break;
+                }
+                n += got;
+                if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(resp.as_bytes()).expect("write response");
+        }
+    });
+
+    (url, handle)
+}
+
 #[test]
 fn help_exits_success() {
     Command::cargo_bin("profile")
@@ -85,6 +124,62 @@ fn diagnose_exits_success() {
 }
 
 #[test]
+fn diagnose_shows_gen_tok_per_sec_when_counters_increase() {
+    const G100: &str = "vllm_generation_tokens_total 100\n";
+    const G250: &str = "vllm_generation_tokens_total 250\n";
+    let bodies = [G100, G100, G100, G100, G100, G100, G100, G250];
+    let (url, server) = spawn_metrics_server_seq(&bodies);
+    let output = Command::cargo_bin("profile")
+        .unwrap()
+        .arg("diagnose")
+        .arg("--url")
+        .arg(&url)
+        .output()
+        .expect("run profile diagnose");
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let out = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        out.lines()
+            .any(|line| line.contains("Gen tok/s") && !line.contains("(n/a)")),
+        "expected Gen tok/s with a numeric rate; got:\n{out}"
+    );
+    server.join().expect("metrics server thread");
+}
+
+#[test]
+fn diagnose_gen_tok_per_sec_na_when_counter_resets() {
+    const G100: &str = "vllm_generation_tokens_total 100\n";
+    const G500: &str = "vllm_generation_tokens_total 500\n";
+    let bodies = [G500, G500, G500, G500, G500, G500, G500, G100];
+    let (url, server) = spawn_metrics_server_seq(&bodies);
+    let output = Command::cargo_bin("profile")
+        .unwrap()
+        .arg("diagnose")
+        .arg("--url")
+        .arg(&url)
+        .output()
+        .expect("run profile diagnose");
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let out = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        out.lines()
+            .any(|line| line.contains("Gen tok/s") && line.contains("(n/a)")),
+        "expected Gen tok/s (n/a) after negative delta; got:\n{out}"
+    );
+    server.join().expect("metrics server thread");
+}
+
+#[test]
 fn diagnose_long_help_lists_example_metrics() {
     let output = Command::cargo_bin("profile")
         .unwrap()
@@ -110,6 +205,8 @@ fn diagnose_long_help_lists_example_metrics() {
         "Waiting reqs",
         "Max seqs",
         "TTFT (est. ms)",
+        "Gen tok/s",
+        "Prefix hit %",
         "Gen tokens",
     ] {
         assert!(

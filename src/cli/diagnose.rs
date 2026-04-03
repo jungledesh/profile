@@ -92,8 +92,18 @@ pub fn execute(args: &DiagnoseArgs) -> anyhow::Result<()> {
         None => row("TTFT (est. ms)", "(not available)"),
     }
 
+    match result.snapshot.vllm.generation_tokens_per_sec {
+        Some(tps) => row("Gen tok/s", format!("{:.1} (window)", tps)),
+        None => row("Gen tok/s", "(n/a)"),
+    }
+
+    match result.snapshot.vllm.prefix_cache_hit_rate {
+        Some(r) => row("Prefix hit %", format!("{:.1}", r * 100.0)),
+        None => row("Prefix hit %", "(n/a)"),
+    }
+
     match result.snapshot.vllm.generation_tokens_total {
-        Some(n) => row("Gen tokens", format!("{:.0} (counter)", n)),
+        Some(n) => row("Gen tokens", format!("{:.0} (total)", n)),
         None => row("Gen tokens", "(not parsed)"),
     }
 

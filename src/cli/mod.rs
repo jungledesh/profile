@@ -23,7 +23,9 @@ Example:
   Waiting reqs    : 0.0 (avg 2s)
   Max seqs        : 256
   TTFT (est. ms)  : 120.0
-  Gen tokens      : 1000 (counter)
+  Gen tok/s       : 42.0 (window)
+  Prefix hit %    : 12.5
+  Gen tokens      : 1000 (total)
 "#;
 
 #[derive(Debug, Parser)]
