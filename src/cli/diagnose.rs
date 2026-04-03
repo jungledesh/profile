@@ -72,6 +72,21 @@ pub fn execute(args: &DiagnoseArgs) -> anyhow::Result<()> {
         None => row("SM clock", "(not available)"),
     }
 
+    match result.snapshot.vllm.num_requests_running {
+        Some(n) => row("In-batch reqs", format!("{:.1} (avg 2s)", n)),
+        None => row("In-batch reqs", "(not parsed)"),
+    }
+
+    match result.snapshot.vllm.num_requests_waiting {
+        Some(n) => row("Waiting reqs", format!("{:.1} (avg 2s)", n)),
+        None => row("Waiting reqs", "(not parsed)"),
+    }
+
+    match result.snapshot.vllm.max_num_seqs {
+        Some(n) => row("Max seqs", n),
+        None => row("Max seqs", "(not parsed)"),
+    }
+
     match result.snapshot.vllm.ttft_ms {
         Some(ms) => row("TTFT (est. ms)", format!("{:.1}", ms)),
         None => row("TTFT (est. ms)", "(not available)"),

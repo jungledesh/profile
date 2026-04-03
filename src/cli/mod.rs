@@ -16,6 +16,9 @@ Example:
   VRAM % used     : 12000 / 24564 MiB (48.8)
   Power draw      : 220 / 450 W
   SM clock        : 2100 MHz
+  In-batch reqs   : 4.0 (avg 2s)
+  Waiting reqs    : 0.0 (avg 2s)
+  Max seqs        : 256
   TTFT (est. ms)  : 120.0
   Gen tokens      : 1000 (counter)
 "#;
