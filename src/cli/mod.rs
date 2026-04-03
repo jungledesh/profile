@@ -5,6 +5,9 @@ mod info;
 
 use clap::{Parser, Subcommand};
 
+/// Matches vLLM engine default when `--max-num-seqs` is omitted.
+pub const DEFAULT_MAX_NUM_SEQS: u32 = 256;
+
 const DIAGNOSE_LONG_HELP: &str = r#"Print GPU (NVML) and vLLM /metrics in one view.
 
 Example:
@@ -48,6 +51,10 @@ pub struct DiagnoseArgs {
     /// vLLM server base URL
     #[arg(long, default_value = "http://127.0.0.1:8000")]
     pub url: String,
+
+    /// Engine `max_num_seqs` if absent on `/metrics` (Prometheus gauge still wins when present)
+    #[arg(long, default_value_t = DEFAULT_MAX_NUM_SEQS)]
+    pub max_num_seqs: u32,
 }
 
 pub fn run(cli: Cli) -> anyhow::Result<()> {

@@ -8,7 +8,7 @@ fn row(label: &str, value: impl std::fmt::Display) {
 }
 
 pub fn execute(args: &DiagnoseArgs) -> anyhow::Result<()> {
-    let result = profiler::run_diagnose(&args.url)?;
+    let result = profiler::run_diagnose(&args.url, args.max_num_seqs)?;
 
     match &result.snapshot.gpu.gpu_name {
         Some(name) => row("GPU name", name),
@@ -84,7 +84,7 @@ pub fn execute(args: &DiagnoseArgs) -> anyhow::Result<()> {
 
     match result.snapshot.vllm.max_num_seqs {
         Some(n) => row("Max seqs", n),
-        None => row("Max seqs", "(not parsed)"),
+        None => row("Max seqs", "—"),
     }
 
     match result.snapshot.vllm.ttft_ms {

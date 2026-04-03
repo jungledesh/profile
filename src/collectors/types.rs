@@ -34,7 +34,6 @@ impl VllmRawMetrics {
             || self.prefill_latency_ms.is_some()
             || self.queue_delay_ms.is_some()
             || self.generation_tokens_total.is_some()
-            || self.max_num_seqs.is_some()
     }
 }
 
