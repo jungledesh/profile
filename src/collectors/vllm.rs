@@ -51,12 +51,14 @@ fn scrape_from_body(body: &str) -> Result<Scrape> {
 }
 
 fn first_gauge(scrape: &Scrape, name: &str) -> Option<f64> {
-    scrape.samples.iter().find(|s| s.metric == name).and_then(|s| {
-        match s.value {
+    scrape
+        .samples
+        .iter()
+        .find(|s| s.metric == name)
+        .and_then(|s| match s.value {
             Value::Gauge(v) | Value::Untyped(v) => Some(v),
             _ => None,
-        }
-    })
+        })
 }
 
 fn mean_option(values: &[Option<f64>]) -> Option<f64> {
