@@ -116,15 +116,31 @@ fn sum_two_metric_series(scrape: &Scrape, a: &str, b: &str) -> Option<f64> {
     }
 }
 
+/// Prefer `*_total` counter names (current vLLM); fall back to legacy names without `_total`.
+fn sum_two_metric_series_prefix(
+    scrape: &Scrape,
+    a_total: &str,
+    b_total: &str,
+    a_legacy: &str,
+    b_legacy: &str,
+) -> Option<f64> {
+    sum_two_metric_series(scrape, a_total, b_total)
+        .or_else(|| sum_two_metric_series(scrape, a_legacy, b_legacy))
+}
+
 /// `(hits, queries)` summed over internal + external prefix cache counters.
 fn prefix_counter_totals(scrape: &Scrape) -> (Option<f64>, Option<f64>) {
-    let hits = sum_two_metric_series(
+    let hits = sum_two_metric_series_prefix(
         scrape,
+        "vllm_prefix_cache_hits_total",
+        "vllm_external_prefix_cache_hits_total",
         "vllm_prefix_cache_hits",
         "vllm_external_prefix_cache_hits",
     );
-    let queries = sum_two_metric_series(
+    let queries = sum_two_metric_series_prefix(
         scrape,
+        "vllm_prefix_cache_queries_total",
+        "vllm_external_prefix_cache_queries_total",
         "vllm_prefix_cache_queries",
         "vllm_external_prefix_cache_queries",
     );
@@ -601,6 +617,21 @@ vllm_prefix_cache_queries 10
             1.0,
         );
         assert!((hit_rate.unwrap() - 0.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn compute_counter_rates_prefix_reads_total_suffix_counters() {
+        let first = "vllm_num_requests_running 1\n";
+        let last = r#"
+vllm_prefix_cache_hits_total{model_name="llama3"} 448
+vllm_prefix_cache_queries_total{model_name="llama3"} 615
+"#;
+        let (_, hit_rate) = compute_counter_rates(
+            &scrape_from_body(first).unwrap(),
+            &scrape_from_body(last).unwrap(),
+            1.0,
+        );
+        assert!((hit_rate.unwrap() - (448.0 / 615.0)).abs() < 1e-9);
     }
 
     #[test]
