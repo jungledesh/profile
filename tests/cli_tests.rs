@@ -205,8 +205,12 @@ fn diagnose_long_help_lists_example_metrics() {
         "Waiting reqs",
         "Max seqs",
         "TTFT (est. ms)",
+        "Prefill ms",
+        "Queue ms",
+        "TPOT ms",
+        "Prompt mean",
         "Gen tok/s",
-        "Prefix hit %",
+        "Prefix reuse (2s window)",
         "Gen tokens",
     ] {
         assert!(

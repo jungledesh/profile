@@ -11,21 +11,25 @@ pub const DEFAULT_MAX_NUM_SEQS: u32 = 256;
 const DIAGNOSE_LONG_HELP: &str = r#"Print GPU (NVML) and vLLM /metrics in one view.
 
 Example:
-  GPU name        : NVIDIA GeForce RTX 4090
-  GPU index       : 0
-  GPU ID (UUID)   : GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-  GPU util %      : 45.0
-  Mem ctrl util % : 12.0
-  VRAM % used     : 12000 / 24564 MiB (48.8)
-  Power draw      : 220 / 450 W
-  SM clock        : 2100 MHz
-  In-batch reqs   : 4.0 (avg 2s)
-  Waiting reqs    : 0.0 (avg 2s)
-  Max seqs        : 256
-  TTFT (est. ms)  : 120.0
-  Gen tok/s       : 42.0 (window)
-  Prefix hit %    : 12.5
-  Gen tokens      : 1000 (total)
+  GPU name                 : NVIDIA GeForce RTX 4090
+  GPU index                : 0
+  GPU ID (UUID)            : GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+  GPU util %               : 45.0
+  Mem ctrl util %          : 12.0
+  VRAM % used              : 12000 / 24564 MiB (48.8)
+  Power draw               : 220 / 450 W
+  SM clock                 : 2100 MHz
+  In-batch reqs            : 4.0 (avg 2s)
+  Waiting reqs             : 0.0 (avg 2s)
+  Max seqs                 : 256
+  TTFT (est. ms)           : 120.0 (window)
+  Prefill ms               : 80.0 (window)
+  Queue ms                 : 2.0 (window)
+  TPOT ms                  : 12.0 (window)
+  Prompt mean              : 128.0 tok (window)
+  Gen tok/s                : 42.0 (window)
+  Prefix reuse (2s window) : 12.5%
+  Gen tokens               : 1000 (total)
 "#;
 
 #[derive(Debug, Parser)]
