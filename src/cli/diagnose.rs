@@ -1,10 +1,24 @@
 use super::DiagnoseArgs;
+use crate::collectors::PrefixCacheScrapeSample;
 use crate::profiler;
 
 const LABEL_W: usize = 24;
 
 fn row(label: &str, value: impl std::fmt::Display) {
     println!("  {:<w$} : {}", label, value, w = LABEL_W);
+}
+
+fn format_prefix_scrape_sample(s: &PrefixCacheScrapeSample) -> String {
+    let fmt = |o: Option<f64>| {
+        o.map(|v| format!("{v:.0}"))
+            .unwrap_or_else(|| "n/a".to_string())
+    };
+    format!(
+        "hits={} queries={} misses={}",
+        fmt(s.hits),
+        fmt(s.queries),
+        fmt(s.misses)
+    )
 }
 
 pub fn execute(args: &DiagnoseArgs) -> anyhow::Result<()> {
@@ -115,6 +129,18 @@ pub fn execute(args: &DiagnoseArgs) -> anyhow::Result<()> {
     match result.snapshot.vllm.generation_tokens_per_sec {
         Some(tps) => row("Gen tok/s", format!("{:.1} (window)", tps)),
         None => row("Gen tok/s", "(n/a)"),
+    }
+
+    let prefix_n = result.snapshot.vllm.prefix_cache_scrape_samples.len();
+    for (i, s) in result
+        .snapshot
+        .vllm
+        .prefix_cache_scrape_samples
+        .iter()
+        .enumerate()
+    {
+        let label = format!("Prefix cache [{}/{}]", i + 1, prefix_n);
+        row(&label, format_prefix_scrape_sample(s));
     }
 
     match result.snapshot.vllm.prefix_cache_hit_rate {

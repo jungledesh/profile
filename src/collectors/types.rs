@@ -1,5 +1,13 @@
 use std::time::SystemTime;
 
+/// One `/metrics` scrape: cumulative prefix cache counters (internal + external).
+#[derive(Debug, Clone, Default)]
+pub struct PrefixCacheScrapeSample {
+    pub hits: Option<f64>,
+    pub queries: Option<f64>,
+    pub misses: Option<f64>,
+}
+
 /// vLLM Prometheus scrape
 #[derive(Debug, Clone, Default)]
 pub struct VllmRawMetrics {
@@ -25,6 +33,8 @@ pub struct VllmRawMetrics {
     pub generation_tokens_per_sec: Option<f64>,
     /// Cumulative hits / queries from the last scrape (internal + external; 0.0–1.0).
     pub prefix_cache_hit_rate: Option<f64>,
+    /// Cumulative prefix counters per scrape (same order as collector: 8 × ~250ms).
+    pub prefix_cache_scrape_samples: Vec<PrefixCacheScrapeSample>,
 
     // Not always available
     pub max_num_seqs: Option<u32>,

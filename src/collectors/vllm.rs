@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use prometheus_parse::{Scrape, Value};
 
-use super::types::VllmRawMetrics;
+use super::types::{PrefixCacheScrapeSample, VllmRawMetrics};
 
 const SAMPLE_COUNT: usize = 8;
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
@@ -116,19 +116,44 @@ fn sum_two_metric_series(scrape: &Scrape, a: &str, b: &str) -> Option<f64> {
     }
 }
 
-/// Cumulative `hits / queries` on the last scrape (internal + external), matching vLLM's logged
-/// prefix cache hit rate. Counter resets between scrapes are not detected here; missing series → 0%.
-fn prefix_cumulative_hit_rate(scrape: &Scrape) -> Option<f64> {
+/// `(hits, queries)` summed over internal + external prefix cache counters.
+fn prefix_counter_totals(scrape: &Scrape) -> (Option<f64>, Option<f64>) {
     let hits = sum_two_metric_series(
         scrape,
         "vllm_prefix_cache_hits",
         "vllm_external_prefix_cache_hits",
-    )?;
+    );
     let queries = sum_two_metric_series(
         scrape,
         "vllm_prefix_cache_queries",
         "vllm_external_prefix_cache_queries",
-    )?;
+    );
+    (hits, queries)
+}
+
+fn prefix_misses_token_estimate(hits: Option<f64>, queries: Option<f64>) -> Option<f64> {
+    match (hits, queries) {
+        (Some(h), Some(q)) if q >= h => Some(q - h),
+        _ => None,
+    }
+}
+
+fn prefix_scrape_sample(scrape: &Scrape) -> PrefixCacheScrapeSample {
+    let (hits, queries) = prefix_counter_totals(scrape);
+    let misses = prefix_misses_token_estimate(hits, queries);
+    PrefixCacheScrapeSample {
+        hits,
+        queries,
+        misses,
+    }
+}
+
+/// Cumulative `hits / queries` on the last scrape (internal + external), matching vLLM's logged
+/// prefix cache hit rate. Counter resets between scrapes are not detected here; missing series → 0%.
+fn prefix_cumulative_hit_rate(scrape: &Scrape) -> Option<f64> {
+    let (hits, queries) = prefix_counter_totals(scrape);
+    let hits = hits?;
+    let queries = queries?;
     if queries <= 0.0 {
         return None;
     }
@@ -237,6 +262,7 @@ pub fn collect_vllm_metrics(base_url: &str) -> Result<VllmRawMetrics> {
     let url = metrics_url(base_url);
     let mut running_samples = Vec::with_capacity(SAMPLE_COUNT);
     let mut waiting_samples = Vec::with_capacity(SAMPLE_COUNT);
+    let mut prefix_samples = Vec::with_capacity(SAMPLE_COUNT);
     let mut window_start: Option<Instant> = None;
     let mut first_scrape: Option<Scrape> = None;
     let mut last_scrape: Option<Scrape> = None;
@@ -244,6 +270,7 @@ pub fn collect_vllm_metrics(base_url: &str) -> Result<VllmRawMetrics> {
     for i in 0..SAMPLE_COUNT {
         let body = fetch_metrics_body(&url)?;
         let scrape = scrape_from_body(&body)?;
+        prefix_samples.push(prefix_scrape_sample(&scrape));
 
         if i == 0 {
             window_start = Some(Instant::now());
@@ -274,6 +301,7 @@ pub fn collect_vllm_metrics(base_url: &str) -> Result<VllmRawMetrics> {
     let (gen_per_sec, prefix_hit) = compute_counter_rates(&first_scrape, &last_scrape, window_secs);
     m.generation_tokens_per_sec = gen_per_sec;
     m.prefix_cache_hit_rate = prefix_hit;
+    m.prefix_cache_scrape_samples = prefix_samples;
 
     apply_histogram_window(&first_scrape, &last_scrape, &mut m);
 
@@ -322,6 +350,7 @@ fn parse_vllm_metrics(scrape: &Scrape) -> Result<VllmRawMetrics> {
         generation_tokens_total,
         generation_tokens_per_sec: None,
         prefix_cache_hit_rate: None,
+        prefix_cache_scrape_samples: vec![],
         max_num_seqs,
     })
 }
