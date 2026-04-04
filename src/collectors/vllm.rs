@@ -140,34 +140,6 @@ fn prefix_hit_rate_window(
     Some(dh / dq)
 }
 
-fn prefix_scrape_has_any_counter(scrape: &Scrape) -> bool {
-    scrape.samples.iter().any(|s| {
-        matches!(
-            s.metric.as_str(),
-            "vllm_prefix_cache_hits"
-                | "vllm_prefix_cache_queries"
-                | "vllm_external_prefix_cache_hits"
-                | "vllm_external_prefix_cache_queries"
-        )
-    })
-}
-
-fn prefix_family_reset(first: &Scrape, last: &Scrape, hits: &str, queries: &str) -> bool {
-    match (
-        sum_metric_samples(first, queries),
-        sum_metric_samples(last, queries),
-    ) {
-        (Some(fq), Some(lq)) => {
-            let dq = lq - fq;
-            let fh = sum_metric_samples(first, hits).unwrap_or(0.0);
-            let lh = sum_metric_samples(last, hits).unwrap_or(0.0);
-            let dh = lh - fh;
-            dq < 0.0 || (dq > 0.0 && dh < 0.0)
-        }
-        _ => false,
-    }
-}
-
 fn prefix_rate_from_scrapes(first: &Scrape, last: &Scrape) -> Option<f64> {
     let internal = prefix_hit_rate_window(
         sum_metric_samples(first, "vllm_prefix_cache_hits"),
@@ -181,26 +153,8 @@ fn prefix_rate_from_scrapes(first: &Scrape, last: &Scrape) -> Option<f64> {
         sum_metric_samples(last, "vllm_external_prefix_cache_hits"),
         sum_metric_samples(last, "vllm_external_prefix_cache_queries"),
     );
-    if let Some(r) = internal.or(external) {
-        return Some(r);
-    }
-    if prefix_family_reset(
-        first,
-        last,
-        "vllm_prefix_cache_hits",
-        "vllm_prefix_cache_queries",
-    ) || prefix_family_reset(
-        first,
-        last,
-        "vllm_external_prefix_cache_hits",
-        "vllm_external_prefix_cache_queries",
-    ) {
-        return None;
-    }
-    if prefix_scrape_has_any_counter(first) || prefix_scrape_has_any_counter(last) {
-        return Some(0.0);
-    }
-    None
+    // No valid Δ from counters (missing series, reset-shaped deltas, etc.): show 0% in diagnose.
+    Some(internal.or(external).unwrap_or(0.0))
 }
 
 /// Same logic as the first→last `/metrics` window in [`collect_vllm_metrics`].
@@ -239,7 +193,6 @@ fn histogram_mean_tokens_from_scrape(scrape: &Scrape, base: &str) -> Option<f64>
 
 /// Aggregated `(Δsum)/(Δcount)` across all series for `base` (histogram `_sum` / `_count`).
 /// Units match the histogram (seconds vs tokens). `None` if no new observations or reset.
-#[cfg(test)]
 fn histogram_window_mean(first: &Scrape, last: &Scrape, base: &str) -> Option<f64> {
     let sum_key = format!("{base}_sum");
     let count_key = format!("{base}_count");
@@ -255,21 +208,18 @@ fn histogram_window_mean(first: &Scrape, last: &Scrape, base: &str) -> Option<f6
     Some(ds / dc)
 }
 
-#[cfg(test)]
 fn histogram_window_mean_ms(first: &Scrape, last: &Scrape, base: &str) -> Option<f64> {
     histogram_window_mean(first, last, base).map(|sec| sec * 1000.0)
 }
 
-#[cfg(test)]
 fn tpot_window_ms(first: &Scrape, last: &Scrape) -> Option<f64> {
     histogram_window_mean_ms(first, last, "vllm_request_time_per_output_token_seconds")
         .or_else(|| histogram_window_mean_ms(first, last, "vllm_time_per_output_token_seconds"))
 }
 
-#[cfg(test)]
+/// `first` = scrape from sample 1, `last` = scrape from sample [`SAMPLE_COUNT`] (~2s later).
 fn apply_histogram_window(first: &Scrape, last: &Scrape, m: &mut VllmRawMetrics) {
-    // Prefer first→last window; when no new histogram observations in that window (common during
-    // steady decode), fall back to cumulative mean from the last scrape.
+    // Prefer Δsum/Δcount over that window; if no new observations, use last-scrape mean.
     m.ttft_ms = histogram_window_mean_ms(first, last, "vllm_time_to_first_token_seconds")
         .or_else(|| histogram_mean_ms_from_scrape(last, "vllm_time_to_first_token_seconds"));
     m.tpot_ms = tpot_window_ms(first, last).or_else(|| {
@@ -345,6 +295,8 @@ pub fn collect_vllm_metrics(base_url: &str) -> Result<VllmRawMetrics> {
     let (gen_per_sec, prefix_hit) = compute_counter_rates(&first_scrape, &last_scrape, window_secs);
     m.generation_tokens_per_sec = gen_per_sec;
     m.prefix_cache_hit_rate = prefix_hit;
+
+    apply_histogram_window(&first_scrape, &last_scrape, &mut m);
 
     Ok(m)
 }
@@ -571,7 +523,7 @@ vllm_iteration_tokens_total_sum 999
             1.5,
         );
         assert!((tps.unwrap() - 100.0).abs() < 1e-9);
-        assert!(prefix.is_none());
+        assert_eq!(prefix, Some(0.0));
     }
 
     #[test]
@@ -616,7 +568,7 @@ vllm_prefix_cache_queries 10
     }
 
     #[test]
-    fn compute_counter_rates_prefix_hits_drop_treated_as_reset() {
+    fn compute_counter_rates_prefix_invalid_delta_falls_back_to_zero() {
         let a = r#"
 vllm_prefix_cache_hits 10
 vllm_prefix_cache_queries 20
@@ -630,7 +582,7 @@ vllm_prefix_cache_queries 30
             &scrape_from_body(b).unwrap(),
             1.0,
         );
-        assert!(hit_rate.is_none());
+        assert_eq!(hit_rate, Some(0.0));
     }
 
     #[test]

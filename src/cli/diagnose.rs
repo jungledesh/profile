@@ -88,27 +88,27 @@ pub fn execute(args: &DiagnoseArgs) -> anyhow::Result<()> {
     }
 
     match result.snapshot.vllm.ttft_ms {
-        Some(ms) => row("TTFT (est. ms)", format!("{:.1} (last sample)", ms)),
+        Some(ms) => row("TTFT (est. ms)", format!("{:.1} (window)", ms)),
         None => row("TTFT (est. ms)", "(n/a)"),
     }
 
     match result.snapshot.vllm.prefill_latency_ms {
-        Some(ms) => row("Prefill ms", format!("{:.1} (last sample)", ms)),
+        Some(ms) => row("Prefill ms", format!("{:.1} (window)", ms)),
         None => row("Prefill ms", "(n/a)"),
     }
 
     match result.snapshot.vllm.queue_delay_ms {
-        Some(ms) => row("Queue ms", format!("{:.1} (last sample)", ms)),
+        Some(ms) => row("Queue ms", format!("{:.1} (window)", ms)),
         None => row("Queue ms", "(n/a)"),
     }
 
     match result.snapshot.vllm.tpot_ms {
-        Some(ms) => row("TPOT ms", format!("{:.1} (last sample)", ms)),
+        Some(ms) => row("TPOT ms", format!("{:.1} (window)", ms)),
         None => row("TPOT ms", "(n/a)"),
     }
 
     match result.snapshot.vllm.prompt_tokens_mean {
-        Some(t) => row("Prompt mean", format!("{:.1} tok (last sample)", t)),
+        Some(t) => row("Prompt mean", format!("{:.1} tok (window)", t)),
         None => row("Prompt mean", "(n/a)"),
     }
 
