@@ -8,7 +8,16 @@ pub struct PrefixCacheScrapeSample {
     pub misses: Option<f64>,
 }
 
-/// vLLM Prometheus scrape
+/// vLLM Prometheus scrape.
+///
+/// **`Option<f64>`:** `Some` values are defined; `None` means that quantity could not be computed
+/// (missing series, zero denominator, reset, or zero-length window). `Some(0.0)` is a real zero where
+/// applicable (e.g. 0% prefix hits in-window), not “missing data.”
+///
+/// - **Histogram means** (TTFT, TPOT, prefill, queue, prompt mean): `None` if no observations or
+///   **Δcount ≤ 0** in the window.
+/// - **`generation_tokens_per_sec`:** `None` if missing counters, negative Δ, or zero time window.
+/// - **`prefix_cache_hit_rate`:** `None` if **`Δqueries ≤ 0`** or invalid deltas; `Some(0.0)` means 0% hits in-window.
 #[derive(Debug, Clone, Default)]
 pub struct VllmRawMetrics {
     pub model_name: Option<String>,
@@ -31,7 +40,7 @@ pub struct VllmRawMetrics {
     pub generation_tokens_total: Option<f64>,
     /// Δ generation tokens / s over the first→last scrape window (output throughput).
     pub generation_tokens_per_sec: Option<f64>,
-    /// Cumulative hits / queries from the last scrape (internal + external; 0.0–1.0).
+    /// Prefix cache hit rate: `(Δhits)/(Δqueries)` over first→last scrape (internal + external).
     pub prefix_cache_hit_rate: Option<f64>,
     /// Cumulative prefix counters per scrape (same order as collector: 8 × ~250ms).
     pub prefix_cache_scrape_samples: Vec<PrefixCacheScrapeSample>,

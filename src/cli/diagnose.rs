@@ -144,12 +144,12 @@ pub fn execute(args: &DiagnoseArgs) -> anyhow::Result<()> {
     }
 
     match result.snapshot.vllm.prefix_cache_hit_rate {
-        Some(0.0) => row("Prefix cache hit rate (last scrape)", "0%"),
+        Some(0.0) => row("Prefix cache hit rate (window)", "0%"),
         Some(r) => row(
-            "Prefix cache hit rate (last scrape)",
+            "Prefix cache hit rate (window)",
             format!("{:.1}%", r * 100.0),
         ),
-        None => row("Prefix cache hit rate (last scrape)", "(n/a)"),
+        None => row("Prefix cache hit rate (window)", "(n/a)"),
     }
 
     match result.snapshot.vllm.generation_tokens_total {
@@ -162,7 +162,7 @@ pub fn execute(args: &DiagnoseArgs) -> anyhow::Result<()> {
             "\n  (No metrics in snapshot — NVML unavailable or vLLM scrape not implemented yet.)"
         );
     } else {
-        println!("\n  Snapshot collected; rule engine and richer /metrics fields still TODO.");
+        println!("\n  Snapshot collected; richer /metrics coverage still TODO.");
     }
 
     Ok(())
