@@ -1,10 +1,24 @@
 use super::DiagnoseArgs;
+use crate::collectors::PrefixCacheScrapeSample;
 use crate::profiler;
 
 const LABEL_W: usize = 24;
 
 fn row(label: &str, value: impl std::fmt::Display) {
     println!("  {:<w$} : {}", label, value, w = LABEL_W);
+}
+
+fn format_prefix_scrape_sample(s: &PrefixCacheScrapeSample) -> String {
+    let fmt = |o: Option<f64>| {
+        o.map(|v| format!("{v:.0}"))
+            .unwrap_or_else(|| "n/a".to_string())
+    };
+    format!(
+        "hits={} queries={} misses={}",
+        fmt(s.hits),
+        fmt(s.queries),
+        fmt(s.misses)
+    )
 }
 
 pub fn execute(args: &DiagnoseArgs) -> anyhow::Result<()> {
@@ -117,13 +131,25 @@ pub fn execute(args: &DiagnoseArgs) -> anyhow::Result<()> {
         None => row("Gen tok/s", "(n/a)"),
     }
 
+    let prefix_n = result.snapshot.vllm.prefix_cache_scrape_samples.len();
+    for (i, s) in result
+        .snapshot
+        .vllm
+        .prefix_cache_scrape_samples
+        .iter()
+        .enumerate()
+    {
+        let label = format!("Prefix cache [{}/{}]", i + 1, prefix_n);
+        row(&label, format_prefix_scrape_sample(s));
+    }
+
     match result.snapshot.vllm.prefix_cache_hit_rate {
-        Some(0.0) => row("Prefix cache hit rate (last scrape)", "0%"),
+        Some(0.0) => row("Prefix cache hit rate (window)", "0%"),
         Some(r) => row(
-            "Prefix cache hit rate (last scrape)",
+            "Prefix cache hit rate (window)",
             format!("{:.1}%", r * 100.0),
         ),
-        None => row("Prefix cache hit rate (last scrape)", "(n/a)"),
+        None => row("Prefix cache hit rate (window)", "(n/a)"),
     }
 
     match result.snapshot.vllm.generation_tokens_total {
@@ -136,7 +162,7 @@ pub fn execute(args: &DiagnoseArgs) -> anyhow::Result<()> {
             "\n  (No metrics in snapshot — NVML unavailable or vLLM scrape not implemented yet.)"
         );
     } else {
-        println!("\n  Snapshot collected; rule engine and richer /metrics fields still TODO.");
+        println!("\n  Snapshot collected; richer /metrics coverage still TODO.");
     }
 
     Ok(())

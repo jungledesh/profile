@@ -4,7 +4,7 @@ pub mod gpu;
 pub mod types;
 pub mod vllm;
 
-pub use types::{GpuRawMetrics, RawSnapshot, VllmRawMetrics};
+pub use types::{GpuRawMetrics, PrefixCacheScrapeSample, RawSnapshot, VllmRawMetrics};
 
 pub fn collect_snapshot(
     vllm_base_url: &str,
