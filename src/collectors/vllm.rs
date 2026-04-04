@@ -107,28 +107,100 @@ fn counter_delta_per_sec(first: Option<f64>, last: Option<f64>, window_secs: f64
     Some(d / window_secs)
 }
 
-/// Δhits / Δqueries when both query totals exist and counters did not reset.
-/// `Some(0.0)` when Δqueries == 0 (no new queries in the window). `None` when query totals are
-/// missing, Δqueries < 0, or hits decreased (reset).
+/// Δhits / Δqueries for one counter family (internal or external). See [`prefix_rate_from_scrapes`].
+///
+/// When only one scrape has query counters, the missing side is treated as equal to the other
+/// (no change in the window), so Δqueries == 0 → `Some(0.0)` instead of `None`.
+/// `None` when both lack query totals, Δqueries < 0, or hits decreased while Δqueries > 0.
 fn prefix_hit_rate_window(
     first_hits: Option<f64>,
     first_queries: Option<f64>,
     last_hits: Option<f64>,
     last_queries: Option<f64>,
 ) -> Option<f64> {
-    let fq = first_queries?;
-    let lq = last_queries?;
-    let dq = lq - fq;
+    let (fq, lq) = match (first_queries, last_queries) {
+        (Some(f), Some(l)) => (f, l),
+        (None, Some(l)) => (l, l),
+        (Some(f), None) => (f, f),
+        (None, None) => return None,
+    };
     let fh = first_hits.unwrap_or(0.0);
     let lh = last_hits.unwrap_or(0.0);
+    let dq = lq - fq;
     let dh = lh - fh;
-    if dq < 0.0 || dh < 0.0 {
+    if dq < 0.0 {
         return None;
     }
     if dq == 0.0 {
         return Some(0.0);
     }
+    if dh < 0.0 {
+        return None;
+    }
     Some(dh / dq)
+}
+
+fn prefix_scrape_has_any_counter(scrape: &Scrape) -> bool {
+    scrape.samples.iter().any(|s| {
+        matches!(
+            s.metric.as_str(),
+            "vllm_prefix_cache_hits"
+                | "vllm_prefix_cache_queries"
+                | "vllm_external_prefix_cache_hits"
+                | "vllm_external_prefix_cache_queries"
+        )
+    })
+}
+
+fn prefix_family_reset(first: &Scrape, last: &Scrape, hits: &str, queries: &str) -> bool {
+    match (
+        sum_metric_samples(first, queries),
+        sum_metric_samples(last, queries),
+    ) {
+        (Some(fq), Some(lq)) => {
+            let dq = lq - fq;
+            let fh = sum_metric_samples(first, hits).unwrap_or(0.0);
+            let lh = sum_metric_samples(last, hits).unwrap_or(0.0);
+            let dh = lh - fh;
+            dq < 0.0 || (dq > 0.0 && dh < 0.0)
+        }
+        _ => false,
+    }
+}
+
+fn prefix_rate_from_scrapes(first: &Scrape, last: &Scrape) -> Option<f64> {
+    let internal = prefix_hit_rate_window(
+        sum_metric_samples(first, "vllm_prefix_cache_hits"),
+        sum_metric_samples(first, "vllm_prefix_cache_queries"),
+        sum_metric_samples(last, "vllm_prefix_cache_hits"),
+        sum_metric_samples(last, "vllm_prefix_cache_queries"),
+    );
+    let external = prefix_hit_rate_window(
+        sum_metric_samples(first, "vllm_external_prefix_cache_hits"),
+        sum_metric_samples(first, "vllm_external_prefix_cache_queries"),
+        sum_metric_samples(last, "vllm_external_prefix_cache_hits"),
+        sum_metric_samples(last, "vllm_external_prefix_cache_queries"),
+    );
+    if let Some(r) = internal.or(external) {
+        return Some(r);
+    }
+    if prefix_family_reset(
+        first,
+        last,
+        "vllm_prefix_cache_hits",
+        "vllm_prefix_cache_queries",
+    ) || prefix_family_reset(
+        first,
+        last,
+        "vllm_external_prefix_cache_hits",
+        "vllm_external_prefix_cache_queries",
+    ) {
+        return None;
+    }
+    if prefix_scrape_has_any_counter(first) || prefix_scrape_has_any_counter(last) {
+        return Some(0.0);
+    }
+    None
 }
 
 /// Same logic as the first→last `/metrics` window in [`collect_vllm_metrics`].
@@ -142,17 +214,32 @@ fn compute_counter_rates(
         total_generation_tokens(last),
         window_secs,
     );
-    let prefix = prefix_hit_rate_window(
-        sum_metric_samples(first, "vllm_prefix_cache_hits"),
-        sum_metric_samples(first, "vllm_prefix_cache_queries"),
-        sum_metric_samples(last, "vllm_prefix_cache_hits"),
-        sum_metric_samples(last, "vllm_prefix_cache_queries"),
-    );
+    let prefix = prefix_rate_from_scrapes(first, last);
     (gen_per_sec, prefix)
+}
+
+/// Cumulative mean from a single scrape (`sum`/`count` across labeled series).
+fn histogram_mean_ms_from_scrape(scrape: &Scrape, base: &str) -> Option<f64> {
+    let sum = sum_metric_samples(scrape, &format!("{base}_sum"));
+    let count = sum_metric_samples(scrape, &format!("{base}_count"));
+    match (sum, count) {
+        (Some(s), Some(c)) if c > 0.0 => Some((s / c) * 1000.0),
+        _ => None,
+    }
+}
+
+fn histogram_mean_tokens_from_scrape(scrape: &Scrape, base: &str) -> Option<f64> {
+    let sum = sum_metric_samples(scrape, &format!("{base}_sum"));
+    let count = sum_metric_samples(scrape, &format!("{base}_count"));
+    match (sum, count) {
+        (Some(s), Some(c)) if c > 0.0 => Some(s / c),
+        _ => None,
+    }
 }
 
 /// Aggregated `(Δsum)/(Δcount)` across all series for `base` (histogram `_sum` / `_count`).
 /// Units match the histogram (seconds vs tokens). `None` if no new observations or reset.
+#[cfg(test)]
 fn histogram_window_mean(first: &Scrape, last: &Scrape, base: &str) -> Option<f64> {
     let sum_key = format!("{base}_sum");
     let count_key = format!("{base}_count");
@@ -168,22 +255,34 @@ fn histogram_window_mean(first: &Scrape, last: &Scrape, base: &str) -> Option<f6
     Some(ds / dc)
 }
 
+#[cfg(test)]
 fn histogram_window_mean_ms(first: &Scrape, last: &Scrape, base: &str) -> Option<f64> {
     histogram_window_mean(first, last, base).map(|sec| sec * 1000.0)
 }
 
+#[cfg(test)]
 fn tpot_window_ms(first: &Scrape, last: &Scrape) -> Option<f64> {
     histogram_window_mean_ms(first, last, "vllm_request_time_per_output_token_seconds")
         .or_else(|| histogram_window_mean_ms(first, last, "vllm_time_per_output_token_seconds"))
 }
 
+#[cfg(test)]
 fn apply_histogram_window(first: &Scrape, last: &Scrape, m: &mut VllmRawMetrics) {
-    m.ttft_ms = histogram_window_mean_ms(first, last, "vllm_time_to_first_token_seconds");
-    m.tpot_ms = tpot_window_ms(first, last);
+    // Prefer first→last window; when no new histogram observations in that window (common during
+    // steady decode), fall back to cumulative mean from the last scrape.
+    m.ttft_ms = histogram_window_mean_ms(first, last, "vllm_time_to_first_token_seconds")
+        .or_else(|| histogram_mean_ms_from_scrape(last, "vllm_time_to_first_token_seconds"));
+    m.tpot_ms = tpot_window_ms(first, last).or_else(|| {
+        histogram_mean_ms_from_scrape(last, "vllm_request_time_per_output_token_seconds")
+            .or_else(|| histogram_mean_ms_from_scrape(last, "vllm_time_per_output_token_seconds"))
+    });
     m.prefill_latency_ms =
-        histogram_window_mean_ms(first, last, "vllm_request_prefill_time_seconds");
-    m.queue_delay_ms = histogram_window_mean_ms(first, last, "vllm_request_queue_time_seconds");
-    m.prompt_tokens_mean = histogram_window_mean(first, last, "vllm_request_prompt_tokens");
+        histogram_window_mean_ms(first, last, "vllm_request_prefill_time_seconds")
+            .or_else(|| histogram_mean_ms_from_scrape(last, "vllm_request_prefill_time_seconds"));
+    m.queue_delay_ms = histogram_window_mean_ms(first, last, "vllm_request_queue_time_seconds")
+        .or_else(|| histogram_mean_ms_from_scrape(last, "vllm_request_queue_time_seconds"));
+    m.prompt_tokens_mean = histogram_window_mean(first, last, "vllm_request_prompt_tokens")
+        .or_else(|| histogram_mean_tokens_from_scrape(last, "vllm_request_prompt_tokens"));
 }
 
 fn max_num_seqs_from_gauge(scrape: &Scrape) -> Option<u32> {
@@ -247,22 +346,11 @@ pub fn collect_vllm_metrics(base_url: &str) -> Result<VllmRawMetrics> {
     m.generation_tokens_per_sec = gen_per_sec;
     m.prefix_cache_hit_rate = prefix_hit;
 
-    apply_histogram_window(&first_scrape, &last_scrape, &mut m);
-
     Ok(m)
 }
 
 fn parse_vllm_metrics(body: &str) -> Result<VllmRawMetrics> {
     let scrape = scrape_from_body(body)?;
-
-    let get_histogram_mean_ms = |base: &str| -> Option<f64> {
-        let sum = sum_metric_samples(&scrape, &format!("{base}_sum"));
-        let count = sum_metric_samples(&scrape, &format!("{base}_count"));
-        match (sum, count) {
-            (Some(s), Some(c)) if c > 0.0 => Some((s / c) * 1000.0),
-            _ => None,
-        }
-    };
 
     let model_name = scrape
         .samples
@@ -276,10 +364,17 @@ fn parse_vllm_metrics(body: &str) -> Result<VllmRawMetrics> {
         .or_else(|| first_gauge(&scrape, "vllm_gpu_cache_usage_perc"))
         .map(|v| v * 100.0);
 
-    let ttft_ms = get_histogram_mean_ms("vllm_time_to_first_token_seconds");
-    let tpot_ms = get_histogram_mean_ms("vllm_time_per_output_token_seconds");
-    let prefill_latency_ms = get_histogram_mean_ms("vllm_request_prefill_time_seconds");
-    let queue_delay_ms = get_histogram_mean_ms("vllm_request_queue_time_seconds");
+    let ttft_ms = histogram_mean_ms_from_scrape(&scrape, "vllm_time_to_first_token_seconds");
+    let tpot_ms =
+        histogram_mean_ms_from_scrape(&scrape, "vllm_request_time_per_output_token_seconds")
+            .or_else(|| {
+                histogram_mean_ms_from_scrape(&scrape, "vllm_time_per_output_token_seconds")
+            });
+    let prefill_latency_ms =
+        histogram_mean_ms_from_scrape(&scrape, "vllm_request_prefill_time_seconds");
+    let queue_delay_ms = histogram_mean_ms_from_scrape(&scrape, "vllm_request_queue_time_seconds");
+    let prompt_tokens_mean =
+        histogram_mean_tokens_from_scrape(&scrape, "vllm_request_prompt_tokens");
 
     let generation_tokens_total = total_generation_tokens(&scrape);
 
@@ -294,7 +389,7 @@ fn parse_vllm_metrics(body: &str) -> Result<VllmRawMetrics> {
         tpot_ms,
         prefill_latency_ms,
         queue_delay_ms,
-        prompt_tokens_mean: None,
+        prompt_tokens_mean,
         generation_tokens_total,
         generation_tokens_per_sec: None,
         prefix_cache_hit_rate: None,
@@ -413,6 +508,18 @@ vllm_max_num_seqs 256
         assert_eq!(
             prefix_hit_rate_window(Some(5.0), Some(10.0), Some(3.0), Some(20.0)),
             None
+        );
+    }
+
+    #[test]
+    fn prefix_hit_rate_window_queries_on_one_scrape_yield_zero_rate() {
+        assert_eq!(
+            prefix_hit_rate_window(Some(0.0), None, Some(10.0), Some(100.0)),
+            Some(0.0)
+        );
+        assert_eq!(
+            prefix_hit_rate_window(Some(1.0), Some(50.0), Some(2.0), None),
+            Some(0.0)
         );
     }
 
@@ -538,7 +645,19 @@ vllm_prefix_cache_queries 100
             &scrape_from_body(b).unwrap(),
             1.0,
         );
-        assert!(hit_rate.is_none());
+        assert_eq!(hit_rate, Some(0.0));
+    }
+
+    #[test]
+    fn compute_counter_rates_prefix_hits_only_still_zero_not_na() {
+        let a = "vllm_prefix_cache_hits 1\n";
+        let b = "vllm_prefix_cache_hits 2\n";
+        let (_, hit_rate) = compute_counter_rates(
+            &scrape_from_body(a).unwrap(),
+            &scrape_from_body(b).unwrap(),
+            1.0,
+        );
+        assert_eq!(hit_rate, Some(0.0));
     }
 
     #[test]
@@ -663,5 +782,51 @@ vllm_prefix_cache_queries 20
         .unwrap();
         let ms = tpot_window_ms(&fa, &fb).unwrap();
         assert!((ms - 500.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn apply_histogram_fallback_when_window_has_no_new_observations() {
+        let body = r#"
+vllm_time_to_first_token_seconds_sum 1.0
+vllm_time_to_first_token_seconds_count 2
+vllm_request_time_per_output_token_seconds_sum 0.5
+vllm_request_time_per_output_token_seconds_count 4
+vllm_request_prompt_tokens_sum 100
+vllm_request_prompt_tokens_count 5
+"#;
+        let s = scrape_from_body(body).unwrap();
+        let mut m = VllmRawMetrics::default();
+        apply_histogram_window(&s, &s, &mut m);
+        assert!((m.ttft_ms.unwrap() - 500.0).abs() < 1e-6);
+        assert!((m.tpot_ms.unwrap() - 125.0).abs() < 1e-6);
+        assert!((m.prompt_tokens_mean.unwrap() - 20.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parse_tpot_prefers_request_time_per_output_token_seconds() {
+        let body = r#"
+vllm_request_time_per_output_token_seconds_sum 0.5
+vllm_request_time_per_output_token_seconds_count 4
+"#;
+        let m = parse_vllm_metrics(body).unwrap();
+        assert!((m.tpot_ms.unwrap() - 125.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn compute_counter_rates_prefix_external_totals() {
+        let a = r#"
+vllm_external_prefix_cache_hits 1
+vllm_external_prefix_cache_queries 10
+"#;
+        let b = r#"
+vllm_external_prefix_cache_hits 3
+vllm_external_prefix_cache_queries 14
+"#;
+        let (_, hit_rate) = compute_counter_rates(
+            &scrape_from_body(a).unwrap(),
+            &scrape_from_body(b).unwrap(),
+            1.0,
+        );
+        assert!((hit_rate.unwrap() - 0.5).abs() < 1e-9);
     }
 }

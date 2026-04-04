@@ -22,11 +22,11 @@ Example:
   In-batch reqs            : 4.0 (avg 2s)
   Waiting reqs             : 0.0 (avg 2s)
   Max seqs                 : 256
-  TTFT (est. ms)           : 120.0 (window)
-  Prefill ms               : 80.0 (window)
-  Queue ms                 : 2.0 (window)
-  TPOT ms                  : 12.0 (window)
-  Prompt mean              : 128.0 tok (window)
+  TTFT (est. ms)           : 120.0 (last sample)
+  Prefill ms               : 80.0 (last sample)
+  Queue ms                 : 2.0 (last sample)
+  TPOT ms                  : 12.0 (last sample)
+  Prompt mean              : 128.0 tok (last sample)
   Gen tok/s                : 42.0 (window)
   Prefix reuse (2s window) : 12.5%
   Gen tokens               : 1000 (total)

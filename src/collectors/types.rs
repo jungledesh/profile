@@ -10,12 +10,12 @@ pub struct VllmRawMetrics {
     pub num_requests_waiting: Option<f64>,
     pub kv_cache_usage_perc: Option<f64>,
 
-    // Histogram window means: Δsum/Δcount over first→last scrape (ms for latency histograms).
+    // Histogram means from sum/count on the **last** `/metrics` scrape (final of the sample loop).
     pub ttft_ms: Option<f64>,
     pub tpot_ms: Option<f64>,
     pub prefill_latency_ms: Option<f64>,
     pub queue_delay_ms: Option<f64>,
-    /// `request_prompt_tokens` histogram: mean prompt tokens in the same window (not ms).
+    /// `request_prompt_tokens` histogram mean (tokens, not ms).
     pub prompt_tokens_mean: Option<f64>,
 
     /// Cumulative generation tokens (last scrape), summed over label sets.
