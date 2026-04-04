@@ -210,7 +210,7 @@ fn diagnose_long_help_lists_example_metrics() {
         "TPOT ms",
         "Prompt mean",
         "Gen tok/s",
-        "Prefix reuse (2s window)",
+        "Prefix cache hit rate (last scrape)",
         "Gen tokens",
     ] {
         assert!(

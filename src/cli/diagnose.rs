@@ -118,16 +118,12 @@ pub fn execute(args: &DiagnoseArgs) -> anyhow::Result<()> {
     }
 
     match result.snapshot.vllm.prefix_cache_hit_rate {
-        Some(r) => {
-            let pct = r * 100.0;
-            let s = if r == 0.0 {
-                "0%".to_string()
-            } else {
-                format!("{:.1}%", pct)
-            };
-            row("Prefix reuse (2s window)", s);
-        }
-        None => row("Prefix reuse (2s window)", "(n/a)"),
+        Some(0.0) => row("Prefix cache hit rate (last scrape)", "0%"),
+        Some(r) => row(
+            "Prefix cache hit rate (last scrape)",
+            format!("{:.1}%", r * 100.0),
+        ),
+        None => row("Prefix cache hit rate (last scrape)", "(n/a)"),
     }
 
     match result.snapshot.vllm.generation_tokens_total {

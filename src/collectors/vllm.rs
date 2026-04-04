@@ -107,54 +107,36 @@ fn counter_delta_per_sec(first: Option<f64>, last: Option<f64>, window_secs: f64
     Some(d / window_secs)
 }
 
-/// Δhits / Δqueries for one counter family (internal or external). See [`prefix_rate_from_scrapes`].
-///
-/// When only one scrape has query counters, the missing side is treated as equal to the other
-/// (no change in the window), so Δqueries == 0 → `Some(0.0)` instead of `None`.
-/// `None` when both lack query totals, Δqueries < 0, or hits decreased while Δqueries > 0.
-fn prefix_hit_rate_window(
-    first_hits: Option<f64>,
-    first_queries: Option<f64>,
-    last_hits: Option<f64>,
-    last_queries: Option<f64>,
-) -> Option<f64> {
-    let (fq, lq) = match (first_queries, last_queries) {
-        (Some(f), Some(l)) => (f, l),
-        (None, Some(l)) => (l, l),
-        (Some(f), None) => (f, f),
-        (None, None) => return None,
-    };
-    let fh = first_hits.unwrap_or(0.0);
-    let lh = last_hits.unwrap_or(0.0);
-    let dq = lq - fq;
-    let dh = lh - fh;
-    if dq < 0.0 {
-        return None;
+fn sum_two_metric_series(scrape: &Scrape, a: &str, b: &str) -> Option<f64> {
+    match (sum_metric_samples(scrape, a), sum_metric_samples(scrape, b)) {
+        (None, None) => None,
+        (Some(x), None) => Some(x),
+        (None, Some(y)) => Some(y),
+        (Some(x), Some(y)) => Some(x + y),
     }
-    if dq == 0.0 {
-        return Some(0.0);
-    }
-    if dh < 0.0 {
-        return None;
-    }
-    Some(dh / dq)
 }
 
-fn prefix_rate_from_scrapes(first: &Scrape, last: &Scrape) -> Option<f64> {
-    let internal = prefix_hit_rate_window(
-        sum_metric_samples(first, "vllm_prefix_cache_hits"),
-        sum_metric_samples(first, "vllm_prefix_cache_queries"),
-        sum_metric_samples(last, "vllm_prefix_cache_hits"),
-        sum_metric_samples(last, "vllm_prefix_cache_queries"),
-    );
-    let external = prefix_hit_rate_window(
-        sum_metric_samples(first, "vllm_external_prefix_cache_hits"),
-        sum_metric_samples(first, "vllm_external_prefix_cache_queries"),
-        sum_metric_samples(last, "vllm_external_prefix_cache_hits"),
-        sum_metric_samples(last, "vllm_external_prefix_cache_queries"),
-    );
-    // No valid Δ from counters (missing series, reset-shaped deltas, etc.): show 0% in diagnose.
-    Some(internal.or(external).unwrap_or(0.0))
+/// Cumulative `hits / queries` on the last scrape (internal + external), matching vLLM's logged
+/// prefix cache hit rate. Counter resets between scrapes are not detected here; missing series → 0%.
+fn prefix_cumulative_hit_rate(scrape: &Scrape) -> Option<f64> {
+    let hits = sum_two_metric_series(
+        scrape,
+        "vllm_prefix_cache_hits",
+        "vllm_external_prefix_cache_hits",
+    )?;
+    let queries = sum_two_metric_series(
+        scrape,
+        "vllm_prefix_cache_queries",
+        "vllm_external_prefix_cache_queries",
+    )?;
+    if queries <= 0.0 {
+        return None;
+    }
+    Some(hits / queries)
+}
+
+fn prefix_rate_from_scrapes(last: &Scrape) -> Option<f64> {
+    Some(prefix_cumulative_hit_rate(last).unwrap_or(0.0))
 }
 
 /// Same logic as the first→last `/metrics` window in [`collect_vllm_metrics`].
@@ -168,7 +150,7 @@ fn compute_counter_rates(
         total_generation_tokens(last),
         window_secs,
     );
-    let prefix = prefix_rate_from_scrapes(first, last);
+    let prefix = prefix_rate_from_scrapes(last);
     (gen_per_sec, prefix)
 }
 
@@ -255,9 +237,9 @@ pub fn collect_vllm_metrics(base_url: &str) -> Result<VllmRawMetrics> {
     let url = metrics_url(base_url);
     let mut running_samples = Vec::with_capacity(SAMPLE_COUNT);
     let mut waiting_samples = Vec::with_capacity(SAMPLE_COUNT);
-    let mut last_body: Option<String> = None;
     let mut window_start: Option<Instant> = None;
-    let mut first_body: Option<String> = None;
+    let mut first_scrape: Option<Scrape> = None;
+    let mut last_scrape: Option<Scrape> = None;
 
     for i in 0..SAMPLE_COUNT {
         let body = fetch_metrics_body(&url)?;
@@ -265,30 +247,27 @@ pub fn collect_vllm_metrics(base_url: &str) -> Result<VllmRawMetrics> {
 
         if i == 0 {
             window_start = Some(Instant::now());
-            first_body = Some(body.clone());
         }
-
         running_samples.push(first_gauge(&scrape, "vllm_num_requests_running"));
         waiting_samples.push(first_gauge(&scrape, "vllm_num_requests_waiting"));
-        last_body = Some(body);
+        if i == 0 {
+            first_scrape = Some(scrape);
+        } else {
+            last_scrape = Some(scrape);
+        }
 
         if i + 1 < SAMPLE_COUNT {
             thread::sleep(SAMPLE_INTERVAL);
         }
     }
 
-    let last_body = last_body.context("vLLM gauge window produced no scrapes")?;
     let window_secs = window_start
         .map(|t| t.elapsed().as_secs_f64())
         .unwrap_or(0.0);
 
-    let first_scrape = scrape_from_body(
-        first_body
-            .as_deref()
-            .context("vLLM gauge window missing first body")?,
-    )?;
-    let last_scrape = scrape_from_body(&last_body)?;
-    let mut m = parse_vllm_metrics(&last_body)?;
+    let first_scrape = first_scrape.context("vLLM gauge window missing first scrape")?;
+    let last_scrape = last_scrape.context("vLLM gauge window missing last scrape")?;
+    let mut m = parse_vllm_metrics(&last_scrape)?;
     m.num_requests_running = mean_option(&running_samples);
     m.num_requests_waiting = mean_option(&waiting_samples);
 
@@ -301,36 +280,34 @@ pub fn collect_vllm_metrics(base_url: &str) -> Result<VllmRawMetrics> {
     Ok(m)
 }
 
-fn parse_vllm_metrics(body: &str) -> Result<VllmRawMetrics> {
-    let scrape = scrape_from_body(body)?;
-
+fn parse_vllm_metrics(scrape: &Scrape) -> Result<VllmRawMetrics> {
     let model_name = scrape
         .samples
         .iter()
         .find(|s| s.metric.starts_with("vllm_"))
         .and_then(|s| s.labels.get("model_name").map(str::to_string));
 
-    let num_requests_running = first_gauge(&scrape, "vllm_num_requests_running");
-    let num_requests_waiting = first_gauge(&scrape, "vllm_num_requests_waiting");
-    let kv_cache_usage_perc = first_gauge(&scrape, "vllm_kv_cache_usage_perc")
-        .or_else(|| first_gauge(&scrape, "vllm_gpu_cache_usage_perc"))
+    let num_requests_running = first_gauge(scrape, "vllm_num_requests_running");
+    let num_requests_waiting = first_gauge(scrape, "vllm_num_requests_waiting");
+    let kv_cache_usage_perc = first_gauge(scrape, "vllm_kv_cache_usage_perc")
+        .or_else(|| first_gauge(scrape, "vllm_gpu_cache_usage_perc"))
         .map(|v| v * 100.0);
 
-    let ttft_ms = histogram_mean_ms_from_scrape(&scrape, "vllm_time_to_first_token_seconds");
+    let ttft_ms = histogram_mean_ms_from_scrape(scrape, "vllm_time_to_first_token_seconds");
     let tpot_ms =
-        histogram_mean_ms_from_scrape(&scrape, "vllm_request_time_per_output_token_seconds")
+        histogram_mean_ms_from_scrape(scrape, "vllm_request_time_per_output_token_seconds")
             .or_else(|| {
-                histogram_mean_ms_from_scrape(&scrape, "vllm_time_per_output_token_seconds")
+                histogram_mean_ms_from_scrape(scrape, "vllm_time_per_output_token_seconds")
             });
     let prefill_latency_ms =
-        histogram_mean_ms_from_scrape(&scrape, "vllm_request_prefill_time_seconds");
-    let queue_delay_ms = histogram_mean_ms_from_scrape(&scrape, "vllm_request_queue_time_seconds");
+        histogram_mean_ms_from_scrape(scrape, "vllm_request_prefill_time_seconds");
+    let queue_delay_ms = histogram_mean_ms_from_scrape(scrape, "vllm_request_queue_time_seconds");
     let prompt_tokens_mean =
-        histogram_mean_tokens_from_scrape(&scrape, "vllm_request_prompt_tokens");
+        histogram_mean_tokens_from_scrape(scrape, "vllm_request_prompt_tokens");
 
-    let generation_tokens_total = total_generation_tokens(&scrape);
+    let generation_tokens_total = total_generation_tokens(scrape);
 
-    let max_num_seqs = max_num_seqs_from_gauge(&scrape);
+    let max_num_seqs = max_num_seqs_from_gauge(scrape);
 
     Ok(VllmRawMetrics {
         model_name,
@@ -354,6 +331,35 @@ mod tests {
     use super::*;
     use crate::collectors::types::VllmRawMetrics;
 
+    /// Legacy Δhits/Δqueries window helper (tests only; production uses cumulative prefix rate).
+    fn prefix_hit_rate_window(
+        first_hits: Option<f64>,
+        first_queries: Option<f64>,
+        last_hits: Option<f64>,
+        last_queries: Option<f64>,
+    ) -> Option<f64> {
+        let (fq, lq) = match (first_queries, last_queries) {
+            (Some(f), Some(l)) => (f, l),
+            (None, Some(l)) => (l, l),
+            (Some(f), None) => (f, f),
+            (None, None) => return None,
+        };
+        let fh = first_hits.unwrap_or(0.0);
+        let lh = last_hits.unwrap_or(0.0);
+        let dq = lq - fq;
+        let dh = lh - fh;
+        if dq < 0.0 {
+            return None;
+        }
+        if dq == 0.0 {
+            return Some(0.0);
+        }
+        if dh < 0.0 {
+            return None;
+        }
+        Some(dh / dq)
+    }
+
     #[test]
     fn colon_prefixed_vllm_metrics_parse_after_normalize() {
         let body = r#"
@@ -362,7 +368,8 @@ vllm:time_to_first_token_seconds_sum{model_name="llama3"} 0.5
 vllm:time_to_first_token_seconds_count{model_name="llama3"} 4
 vllm:generation_tokens_total{model_name="llama3"} 99
 "#;
-        let m = parse_vllm_metrics(body).unwrap();
+        let scrape = scrape_from_body(body).unwrap();
+        let m = parse_vllm_metrics(&scrape).unwrap();
         assert!((m.ttft_ms.unwrap() - 125.0).abs() < 1e-6);
         assert_eq!(m.generation_tokens_total, Some(99.0));
         assert_eq!(m.model_name.as_deref(), Some("llama3"));
@@ -564,11 +571,11 @@ vllm_prefix_cache_queries 10
             &scrape_from_body(b).unwrap(),
             1.0,
         );
-        assert_eq!(hit_rate, Some(0.0));
+        assert!((hit_rate.unwrap() - 0.3).abs() < 1e-9);
     }
 
     #[test]
-    fn compute_counter_rates_prefix_invalid_delta_falls_back_to_zero() {
+    fn compute_counter_rates_prefix_cumulative_ignores_first_scrape_shape() {
         let a = r#"
 vllm_prefix_cache_hits 10
 vllm_prefix_cache_queries 20
@@ -582,7 +589,7 @@ vllm_prefix_cache_queries 30
             &scrape_from_body(b).unwrap(),
             1.0,
         );
-        assert_eq!(hit_rate, Some(0.0));
+        assert!((hit_rate.unwrap() - (2.0 / 30.0)).abs() < 1e-9);
     }
 
     #[test]
@@ -597,7 +604,7 @@ vllm_prefix_cache_queries 100
             &scrape_from_body(b).unwrap(),
             1.0,
         );
-        assert_eq!(hit_rate, Some(0.0));
+        assert!((hit_rate.unwrap() - 0.05).abs() < 1e-9);
     }
 
     #[test]
@@ -627,7 +634,7 @@ vllm_prefix_cache_queries 20
             &scrape_from_body(b).unwrap(),
             1.0,
         );
-        assert!((hit_rate.unwrap() - 0.3).abs() < 1e-9);
+        assert!((hit_rate.unwrap() - 0.25).abs() < 1e-9);
     }
 
     #[test]
@@ -760,7 +767,8 @@ vllm_request_prompt_tokens_count 5
 vllm_request_time_per_output_token_seconds_sum 0.5
 vllm_request_time_per_output_token_seconds_count 4
 "#;
-        let m = parse_vllm_metrics(body).unwrap();
+        let scrape = scrape_from_body(body).unwrap();
+        let m = parse_vllm_metrics(&scrape).unwrap();
         assert!((m.tpot_ms.unwrap() - 125.0).abs() < 1e-6);
     }
 
@@ -779,6 +787,6 @@ vllm_external_prefix_cache_queries 14
             &scrape_from_body(b).unwrap(),
             1.0,
         );
-        assert!((hit_rate.unwrap() - 0.5).abs() < 1e-9);
+        assert!((hit_rate.unwrap() - (3.0 / 14.0)).abs() < 1e-9);
     }
 }

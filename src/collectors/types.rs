@@ -23,7 +23,7 @@ pub struct VllmRawMetrics {
     pub generation_tokens_total: Option<f64>,
     /// Δ generation tokens / s over the first→last scrape window (output throughput).
     pub generation_tokens_per_sec: Option<f64>,
-    /// Δ hits / Δ queries over the same window (0.0–1.0 when defined).
+    /// Cumulative hits / queries from the last scrape (internal + external; 0.0–1.0).
     pub prefix_cache_hit_rate: Option<f64>,
 
     // Not always available

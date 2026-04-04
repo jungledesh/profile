@@ -28,7 +28,7 @@ Example:
   TPOT ms                  : 12.0 (window)
   Prompt mean              : 128.0 tok (window)
   Gen tok/s                : 42.0 (window)
-  Prefix reuse (2s window) : 12.5%
+  Prefix cache hit rate (last scrape) : 82.0%
   Gen tokens               : 1000 (total)
 "#;
 
