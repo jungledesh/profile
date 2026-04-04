@@ -1,9 +1,15 @@
-//! `diagnose` subcommand: render snapshot as a compact table (metrics + stub WASTE/FIX).
+//! `diagnose` subcommand: render snapshot as a boxed table (metrics + stub WASTE/FIX).
+//!
+//! Layout: **GPU =>** (NVML); **vLLM:** REQUESTS / LATENCY / PROMPT / THROUGHPUT rows (aligned labels).
 
 use crate::collectors::{GpuRawMetrics, RawSnapshot, VllmRawMetrics};
 use crate::profiler;
 
-const DIVIDER: &str = "---------------------------------------------------------------------------";
+/// Width for REQUESTS / LATENCY / PROMPT / THROUGHPUT label column (matches **THROUGHPUT**).
+const VLLM_LABEL_W: usize = 10;
+
+/// Space between label column and metric values (after `vLLM:` block labels).
+const VLLM_LABEL_METRICS_GAP: &str = "  ";
 
 /// Placeholder until the rule engine fills WASTE/FIX dynamically.
 const WASTE_FIX_STUB: &str = r"WASTE
@@ -13,7 +19,7 @@ const WASTE_FIX_STUB: &str = r"WASTE
 FIX
 +-----------------------------------------------------------------------+
 | ENABLE CONTINUOUS BATCHING                                            |
-| +45% TPS   | decode underutilized   | queue 200ms → 0ms               |
+| +45% TPS   | decode underutilized   | queue 200ms => 0ms              |
 +-----------------------------------------------------------------------+
 | INCREASE BATCH WINDOW (15ms)                                          |
 | -12% cost/token   | small prompt overhead                             |
@@ -27,29 +33,69 @@ pub fn execute(vllm_metrics_input: &str, max_num_seqs: u32) -> anyhow::Result<()
 }
 
 fn print_diagnose_table(snapshot: &RawSnapshot) {
+    let lines = build_diagnose_lines(snapshot);
+    print_boxed(&lines);
+}
+
+fn build_diagnose_lines(snapshot: &RawSnapshot) -> Vec<String> {
     let v = &snapshot.vllm;
     let g = &snapshot.gpu;
 
     let model = v.model_name.as_deref().unwrap_or("(unknown model)");
     let gpu_label = g.gpu_name.as_deref().unwrap_or("(no GPU)");
 
-    println!(
+    let mut lines = vec![format!(
         "PROFILE v{} [{}] [{}]",
         env!("CARGO_PKG_VERSION"),
         model,
         gpu_label
-    );
-    println!("{DIVIDER}");
-    println!("{}", gauges_line(g));
-    println!("{}", counters_line(v));
-    println!("{}", histograms_line(v));
-    println!("{DIVIDER}");
-    println!();
-    println!("{WASTE_FIX_STUB}");
+    )];
+
+    lines.push(format!("GPU => {}", gpu_gauges_line(g)));
+    lines.push(String::new());
+    lines.push("vLLM:".to_string());
+    lines.push(vllm_label_row("REQUESTS", &vllm_requests_value(v)));
+    lines.push(vllm_label_row("LATENCY", &vllm_latency_value(v)));
+    lines.push(vllm_label_row("PROMPT", &vllm_prompt_value(v)));
+    lines.push(vllm_label_row("THROUGHPUT", &vllm_throughput_value(v)));
+
+    lines.push(String::new());
+    for stub_line in WASTE_FIX_STUB.lines() {
+        lines.push(stub_line.to_string());
+    }
+
+    lines
 }
 
-/// Row 2 — gauges (GPU util, power, VRAM).
-fn gauges_line(g: &GpuRawMetrics) -> String {
+fn vllm_label_row(label: &str, value: &str) -> String {
+    format!(
+        "{:<width$}{}{}",
+        label,
+        VLLM_LABEL_METRICS_GAP,
+        value,
+        width = VLLM_LABEL_W
+    )
+}
+
+/// Print `lines` in a single ASCII box (inner width = longest line).
+fn print_boxed(lines: &[String]) {
+    let inner = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    let border = format!("+{}+", "-".repeat(inner));
+    println!("{}", border);
+    for line in lines {
+        let w = line.chars().count();
+        let padded = if w < inner {
+            format!("{}{}", line, " ".repeat(inner - w))
+        } else {
+            line.clone()
+        };
+        println!("|{}|", padded);
+    }
+    println!("{}", border);
+}
+
+/// GPU row: UTIL | POWER | MEM (NVML).
+fn gpu_gauges_line(g: &GpuRawMetrics) -> String {
     let util = g
         .gpu_util_pct
         .map(|u| format!("UTIL {:.0}%", u))
@@ -76,26 +122,36 @@ fn gauges_line(g: &GpuRawMetrics) -> String {
     format!("{util} | {power} | {mem}")
 }
 
-/// Row 3 — counters (throughput, TTFT, P99 placeholder).
-fn counters_line(v: &VllmRawMetrics) -> String {
-    let tps = v
-        .generation_tokens_per_sec
-        .map(|t| format!("TPS {:.0}", t))
-        .unwrap_or_else(|| "TPS —".to_string());
+/// #1 / #2 / #9 — `run | wait | max`
+fn vllm_requests_value(v: &VllmRawMetrics) -> String {
+    let run = v
+        .num_requests_running
+        .map(fmt_gauge)
+        .map(|s| format!("run {s}"))
+        .unwrap_or_else(|| "run —".to_string());
+    let wait = v
+        .num_requests_waiting
+        .map(fmt_gauge)
+        .map(|s| format!("wait {s}"))
+        .unwrap_or_else(|| "wait —".to_string());
+    let max_seq = v
+        .max_num_seqs
+        .map(|n| format!("max {n}"))
+        .unwrap_or_else(|| "max —".to_string());
 
-    let ttft = v
-        .ttft_ms
-        .map(fmt_seconds_from_ms)
-        .map(|s| format!("TTFT {s}"))
-        .unwrap_or_else(|| "TTFT —".to_string());
-
-    let p99 = "P99 —";
-
-    format!("{tps} | {ttft} | {p99}")
+    format!("{run} | {wait} | {max_seq}")
 }
 
-/// Row 4 — histogram window means (same fields as vLLM window estimates).
-fn histograms_line(v: &VllmRawMetrics) -> String {
+fn fmt_gauge(x: f64) -> String {
+    if (x - x.round()).abs() < 1e-6 {
+        format!("{:.0}", x)
+    } else {
+        format!("{:.1}", x)
+    }
+}
+
+/// Histogram means — `ttft | tpot | prefill | queue`
+fn vllm_latency_value(v: &VllmRawMetrics) -> String {
     let ttft = v
         .ttft_ms
         .map(fmt_seconds_from_ms)
@@ -113,17 +169,42 @@ fn histograms_line(v: &VllmRawMetrics) -> String {
         .map(fmt_seconds_from_ms)
         .unwrap_or_else(|| "—".to_string());
 
-    let prefix_cache_use = prefix_cache_use_pct(v);
-
-    format!("HIST TTFT {ttft} | TPOT {tpot} | PREF {prefill} | QUEUE {queue} | {prefix_cache_use}")
+    format!("ttft {ttft} | tpot {tpot} | prefill {prefill} | queue {queue}")
 }
 
-/// Prefix cache: window hit rate only (no per-scrape hits/queries).
-fn prefix_cache_use_pct(v: &VllmRawMetrics) -> String {
+/// Prompt mean (#10) — `512 tok`
+fn vllm_prompt_value(v: &VllmRawMetrics) -> String {
+    let n = v
+        .prompt_tokens_mean
+        .map(fmt_tok)
+        .unwrap_or_else(|| "—".to_string());
+    format!("{n} tok")
+}
+
+fn fmt_tok(t: f64) -> String {
+    if (t - t.round()).abs() < 1e-6 {
+        format!("{:.0}", t)
+    } else {
+        format!("{:.1}", t)
+    }
+}
+
+/// #6 TPS + #7/#8 cache hit rate — `59 tok/s | cache 72.8%`
+fn vllm_throughput_value(v: &VllmRawMetrics) -> String {
+    let tps = v
+        .generation_tokens_per_sec
+        .map(|t| format!("{:.0} tok/s", t))
+        .unwrap_or_else(|| "— tok/s".to_string());
+    let cache = cache_use_fragment(v);
+    format!("{tps} | {cache}")
+}
+
+/// Prefix cache use % from #7/#8 (Δhits/Δqueries).
+fn cache_use_fragment(v: &VllmRawMetrics) -> String {
     match v.prefix_cache_hit_rate {
-        Some(0.0) => "prefix cache use 0%".to_string(),
-        Some(r) => format!("prefix cache use {:.1}%", r * 100.0),
-        None => "prefix cache use —".to_string(),
+        Some(0.0) => "cache 0%".to_string(),
+        Some(r) => format!("cache {:.1}%", r * 100.0),
+        None => "cache —".to_string(),
     }
 }
 
@@ -146,29 +227,26 @@ mod tests {
     }
 
     #[test]
-    fn prefix_cache_use_pct_formats_hit_rate_only() {
+    fn cache_use_fragment_formats_hit_rate_only() {
+        assert_eq!(cache_use_fragment(&VllmRawMetrics::default()), "cache —");
         assert_eq!(
-            prefix_cache_use_pct(&VllmRawMetrics::default()),
-            "prefix cache use —"
-        );
-        assert_eq!(
-            prefix_cache_use_pct(&VllmRawMetrics {
+            cache_use_fragment(&VllmRawMetrics {
                 prefix_cache_hit_rate: Some(0.0),
                 ..Default::default()
             }),
-            "prefix cache use 0%"
+            "cache 0%"
         );
         assert_eq!(
-            prefix_cache_use_pct(&VllmRawMetrics {
+            cache_use_fragment(&VllmRawMetrics {
                 prefix_cache_hit_rate: Some(0.728),
                 ..Default::default()
             }),
-            "prefix cache use 72.8%"
+            "cache 72.8%"
         );
     }
 
     #[test]
-    fn gauges_line_formats_mem_gb() {
+    fn gpu_gauges_line_formats_mem_gb() {
         let g = GpuRawMetrics {
             gpu_util_pct: Some(28.0),
             power_watts: Some(310.0),
@@ -177,9 +255,40 @@ mod tests {
             vram_total_mb: Some(80 * 1024),
             ..Default::default()
         };
-        let s = gauges_line(&g);
+        let s = gpu_gauges_line(&g);
         assert!(s.contains("UTIL 28%"));
         assert!(s.contains("POWER 310W"));
         assert!(s.contains("MEM 72/80GB"));
+    }
+
+    #[test]
+    fn vllm_requests_value_run_wait_max() {
+        let v = VllmRawMetrics {
+            num_requests_running: Some(2.0),
+            num_requests_waiting: Some(1.0),
+            max_num_seqs: Some(256),
+            ..Default::default()
+        };
+        assert_eq!(vllm_requests_value(&v), "run 2 | wait 1 | max 256");
+    }
+
+    #[test]
+    fn vllm_throughput_value_tok_s_and_cache() {
+        let v = VllmRawMetrics {
+            generation_tokens_per_sec: Some(59.0),
+            prefix_cache_hit_rate: Some(0.5),
+            ..Default::default()
+        };
+        assert_eq!(vllm_throughput_value(&v), "59 tok/s | cache 50.0%");
+    }
+
+    #[test]
+    fn vllm_label_row_aligns_labels_and_gap_before_metrics() {
+        let line = vllm_label_row("REQUESTS", "run 2 | wait 1 | max 256");
+        assert!(line.starts_with("REQUESTS"));
+        assert!(line.contains("  run 2"));
+        let t = vllm_label_row("THROUGHPUT", "59 tok/s | cache 72.8%");
+        assert!(t.starts_with("THROUGHPUT"));
+        assert!(t.contains("  59 tok/s"));
     }
 }

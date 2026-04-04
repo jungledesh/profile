@@ -115,12 +115,40 @@ fn diagnose_exits_success() {
         "stdout should show PROFILE header with model/GPU brackets; got:\n{out}"
     );
     assert!(
+        out.contains("GPU =>") && out.contains("UTIL"),
+        "stdout should include GPU => row; got:\n{out}"
+    );
+    assert!(
+        out.contains("vLLM:"),
+        "stdout should include vLLM: header; got:\n{out}"
+    );
+    assert!(
+        out.contains("REQUESTS") && out.contains("run "),
+        "stdout should include REQUESTS row; got:\n{out}"
+    );
+    assert!(
+        out.contains("LATENCY") && out.contains("ttft "),
+        "stdout should include LATENCY row; got:\n{out}"
+    );
+    assert!(
+        out.contains("PROMPT") && out.contains(" tok"),
+        "stdout should include PROMPT row; got:\n{out}"
+    );
+    assert!(
+        out.contains("THROUGHPUT") && out.contains("tok/s"),
+        "stdout should include THROUGHPUT row; got:\n{out}"
+    );
+    assert!(
+        out.contains("cache "),
+        "stdout should include cache % on THROUGHPUT row; got:\n{out}"
+    );
+    assert!(
         out.contains("WASTE"),
         "stdout should include WASTE stub; got:\n{out}"
     );
     assert!(
-        out.contains("UTIL"),
-        "stdout should include gauges row; got:\n{out}"
+        out.lines().any(|l| l.starts_with('+') && l.ends_with('+')),
+        "stdout should be ASCII-boxed; got:\n{out}"
     );
 
     server.join().expect("metrics server thread");
@@ -147,9 +175,10 @@ fn diagnose_shows_gen_tok_per_sec_when_counters_increase() {
     );
     let out = String::from_utf8_lossy(&output.stdout).into_owned();
     assert!(
-        out.lines()
-            .any(|line| line.contains("TPS ") && !line.contains("TPS —")),
-        "expected TPS with a numeric rate; got:\n{out}"
+        out.lines().any(|line| {
+            line.contains("THROUGHPUT") && line.contains("tok/s") && !line.contains("— tok/s")
+        }),
+        "expected THROUGHPUT row with numeric tok/s; got:\n{out}"
     );
     server.join().expect("metrics server thread");
 }
@@ -175,8 +204,9 @@ fn diagnose_gen_tok_per_sec_na_when_counter_resets() {
     );
     let out = String::from_utf8_lossy(&output.stdout).into_owned();
     assert!(
-        out.lines().any(|line| line.contains("TPS —")),
-        "expected TPS — after invalid delta; got:\n{out}"
+        out.lines()
+            .any(|line| line.contains("THROUGHPUT") && line.contains("— tok/s")),
+        "expected THROUGHPUT row with — tok/s after invalid delta; got:\n{out}"
     );
     server.join().expect("metrics server thread");
 }
