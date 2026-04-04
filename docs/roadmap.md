@@ -9,6 +9,8 @@
 - Recommended Plan is the prioritized Fix (Impact Transparency + Basis)
 - Do Nothing is the clean case when no major issue applies
 
+**Metric integrity:** Ship a number only when the metric’s documented meaning equals the claim; otherwise omit or label “unavailable.”
+
 ---
 
 ## Value in 1 minute
@@ -91,6 +93,36 @@ Status: Issues detected (or “No major inefficiencies detected”)
 - Scrape vLLM Prometheus + DCGM
 - Central decision engine with **exactly the 5 rules** below
 - Unified TUI + live refresh + `--export json`
+
+### vLLM `/metrics` scrape list (v1)
+
+**Authority:** `# HELP` (and `# TYPE`) on the **live** `/metrics` response for the scraped version override web docs when wording differs.
+
+| # | Metric | Type | Use in Profile |
+|---|--------|------|------------------|
+| 1 | `vllm:num_requests_running` | Gauge | HELP defines this as *Number of requests in model execution batches.* Treat each scrape as **one instant** of batch occupancy; compare to `max_num_seqs` in batch-collapse logic. **Evidence / UI copy:** use that HELP wording verbatim. (Time-averaged “batch size” only if you explicitly average across scrapes.) |
+| 2 | `vllm:num_requests_waiting` | Gauge | Queue pressure (per HELP on scrape). |
+| 3 | `vllm:time_to_first_token_seconds` | Histogram | TTFT (sum/count or quantiles per parsing rules). |
+| 4 | `vllm:request_queue_time_seconds` | Histogram | Queue delay. |
+| 5 | `vllm:request_prefill_time_seconds` | Histogram | Prefill latency. |
+| 6 | `vllm:generation_tokens_total` | Counter | Output TPS = Δcounter / Δt over a **fixed** scrape/window definition. |
+| 7 | `vllm:prefix_cache_hits` | Counter | Prefix reuse numerator (if exposed; else unavailable). |
+| 8 | `vllm:prefix_cache_queries` | Counter | Prefix reuse denominator (if exposed; else unavailable). |
+| 9 | `max_num_seqs` | Config / gauge | Configured max concurrent seqs (prefer startup config or documented API; scrape only if HELP proves a gauge). |
+| 10 | `vllm:request_prompt_tokens` | Histogram | Prompt tokens **per request** (per HELP on scrape). With **5** + **3**, supports high-confidence prefill story: prefill/TTFT **and** long-prompt distribution (e.g. mass above 512). Exact series name must match target binary. |
+
+### GPU metrics (v1)
+
+From **NVML** on the node (not `/metrics`). Same integrity rule: only claim what the API reports.
+
+| # | Signal | Use in Profile |
+|---|--------|----------------|
+| G1 | GPU util % | Batch collapse, low util, do-nothing |
+| G2 | Power draw (W) | Low-GPU-util evidence; optional ratio to limit |
+| G3 | Power limit (W) | Denominator for “% of cap” (not marketing TDP) |
+| G4 | VRAM used / total | Context / evidence where useful |
+
+**Not scraped:** `expected_baseline(model, gpu, avg_batch)` — calibrated table inside Profile, not a Prometheus series.
 
 ### Rule engine
 

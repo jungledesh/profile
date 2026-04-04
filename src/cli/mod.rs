@@ -5,19 +5,31 @@ mod info;
 
 use clap::{Parser, Subcommand};
 
+/// Matches vLLM engine default when `--max-num-seqs` is omitted.
+pub const DEFAULT_MAX_NUM_SEQS: u32 = 256;
+
 const DIAGNOSE_LONG_HELP: &str = r#"Print GPU (NVML) and vLLM /metrics in one view.
 
 Example:
-  GPU name        : NVIDIA GeForce RTX 4090
-  GPU index       : 0
-  GPU ID (UUID)   : GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-  GPU util %      : 45.0
-  Mem ctrl util % : 12.0
-  VRAM % used     : 12000 / 24564 MiB (48.8)
-  Power draw      : 220 / 450 W
-  SM clock        : 2100 MHz
-  TTFT (est. ms)  : 120.0
-  Gen tokens      : 1000 (counter)
+  GPU name                 : NVIDIA GeForce RTX 4090
+  GPU index                : 0
+  GPU ID (UUID)            : GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+  GPU util %               : 45.0
+  Mem ctrl util %          : 12.0
+  VRAM % used              : 12000 / 24564 MiB (48.8)
+  Power draw               : 220 / 450 W
+  SM clock                 : 2100 MHz
+  In-batch reqs            : 4.0 (avg 2s)
+  Waiting reqs             : 0.0 (avg 2s)
+  Max seqs                 : 256
+  TTFT (est. ms)           : 120.0 (window)
+  Prefill ms               : 80.0 (window)
+  Queue ms                 : 2.0 (window)
+  TPOT ms                  : 12.0 (window)
+  Prompt mean              : 128.0 tok (window)
+  Gen tok/s                : 42.0 (window)
+  Prefix cache hit rate (last scrape) : 82.0%
+  Gen tokens               : 1000 (total)
 "#;
 
 #[derive(Debug, Parser)]
@@ -45,6 +57,10 @@ pub struct DiagnoseArgs {
     /// vLLM server base URL
     #[arg(long, default_value = "http://127.0.0.1:8000")]
     pub url: String,
+
+    /// Engine `max_num_seqs` if absent on `/metrics` (Prometheus gauge still wins when present)
+    #[arg(long, default_value_t = DEFAULT_MAX_NUM_SEQS)]
+    pub max_num_seqs: u32,
 }
 
 pub fn run(cli: Cli) -> anyhow::Result<()> {

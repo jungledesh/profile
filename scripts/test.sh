@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Optional: override --max-num-seqs (default 256 matches vLLM when omitted)
 INFER_DELAY="${PROFILE_TEST_INFER_DELAY:-0.2}"
 SMI_WINDOW_SEC="${PROFILE_TEST_SMI_WINDOW_SEC:-2}"
 ITERATIONS="${PROFILE_TEST_ITERATIONS:-5}"
@@ -49,7 +50,12 @@ for ((i=1;i<=ITERATIONS;i++)); do
 
   sleep "$INFER_DELAY"
 
-  ./profile diagnose &
+  MAX_SEQ_ARGS=()
+  if [[ -n "${PROFILE_MAX_NUM_SEQS:-}" ]]; then
+    MAX_SEQ_ARGS=(--max-num-seqs "$PROFILE_MAX_NUM_SEQS")
+  fi
+
+  ./profile diagnose "${MAX_SEQ_ARGS[@]}" &
   PROFILE_PID=$!
 
   timeout "${SMI_WINDOW_SEC}s" nvidia-smi --id="${GPU_ID}" \
