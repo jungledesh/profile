@@ -111,13 +111,44 @@ fn diagnose_exits_success() {
 
     let out = String::from_utf8_lossy(&output.stdout).into_owned();
     assert!(
-        out.contains("GPU name"),
-        "stdout should list GPU name; got:\n{out}"
+        out.contains("PROFILE v") && out.contains('['),
+        "stdout should show PROFILE header with model/GPU brackets; got:\n{out}"
     );
     assert!(
-        out.lines()
-            .any(|line| line.contains("GPU name") && line.contains(" : ")),
-        "expected aligned `label : value` line for GPU name; got:\n{out}"
+        out.contains("GPU =>") && out.contains("UTIL"),
+        "stdout should include GPU => row; got:\n{out}"
+    );
+    assert!(
+        out.contains("vLLM:"),
+        "stdout should include vLLM: header; got:\n{out}"
+    );
+    assert!(
+        out.contains("REQUESTS") && out.contains("run "),
+        "stdout should include REQUESTS row; got:\n{out}"
+    );
+    assert!(
+        out.contains("LATENCY") && out.contains("ttft "),
+        "stdout should include LATENCY row; got:\n{out}"
+    );
+    assert!(
+        out.contains("PROMPT") && out.contains(" tok"),
+        "stdout should include PROMPT row; got:\n{out}"
+    );
+    assert!(
+        out.contains("THROUGHPUT") && out.contains("tok/s"),
+        "stdout should include THROUGHPUT row; got:\n{out}"
+    );
+    assert!(
+        out.contains("cache "),
+        "stdout should include cache % on THROUGHPUT row; got:\n{out}"
+    );
+    assert!(
+        out.contains("WASTE"),
+        "stdout should include WASTE stub; got:\n{out}"
+    );
+    assert!(
+        out.lines().any(|l| l.starts_with('+') && l.ends_with('+')),
+        "stdout should be ASCII-boxed; got:\n{out}"
     );
 
     server.join().expect("metrics server thread");
@@ -144,9 +175,10 @@ fn diagnose_shows_gen_tok_per_sec_when_counters_increase() {
     );
     let out = String::from_utf8_lossy(&output.stdout).into_owned();
     assert!(
-        out.lines()
-            .any(|line| line.contains("Gen tok/s") && !line.contains("(n/a)")),
-        "expected Gen tok/s with a numeric rate; got:\n{out}"
+        out.lines().any(|line| {
+            line.contains("THROUGHPUT") && line.contains("tok/s") && !line.contains("— tok/s")
+        }),
+        "expected THROUGHPUT row with numeric tok/s; got:\n{out}"
     );
     server.join().expect("metrics server thread");
 }
@@ -173,14 +205,14 @@ fn diagnose_gen_tok_per_sec_na_when_counter_resets() {
     let out = String::from_utf8_lossy(&output.stdout).into_owned();
     assert!(
         out.lines()
-            .any(|line| line.contains("Gen tok/s") && line.contains("(n/a)")),
-        "expected Gen tok/s (n/a) after negative delta; got:\n{out}"
+            .any(|line| line.contains("THROUGHPUT") && line.contains("— tok/s")),
+        "expected THROUGHPUT row with — tok/s after invalid delta; got:\n{out}"
     );
     server.join().expect("metrics server thread");
 }
 
 #[test]
-fn diagnose_long_help_lists_example_metrics() {
+fn diagnose_help_lists_usage_and_options() {
     let output = Command::cargo_bin("profile")
         .unwrap()
         .args(["diagnose", "--help"])
@@ -195,41 +227,22 @@ fn diagnose_long_help_lists_example_metrics() {
 
     let out = String::from_utf8_lossy(&output.stdout).into_owned();
     for needle in [
-        "Example:",
-        "GPU util %",
-        "Mem ctrl util %",
-        "VRAM % used",
-        "Power draw",
-        "SM clock",
-        "In-batch reqs",
-        "Waiting reqs",
-        "Max seqs",
-        "TTFT (est. ms)",
-        "Prefill ms",
-        "Queue ms",
-        "TPOT ms",
-        "Prompt mean",
-        "Gen tok/s",
-        "Prefix cache hit rate (window)",
-        "Gen tokens",
+        "Collects metrics. Detects inefficiencies. Suggests fixes.",
+        "Usage: profile diagnose [OPTIONS]",
+        "-u, --url",
+        "vLLM metrics endpoint",
+        "[default: http://localhost:8000/metrics]",
+        "-m, --max-num-seqs",
+        "Engine max_num_seqs if absent on /metrics",
+        "[default: 256]",
+        "-h, --help",
+        "Display this message",
     ] {
         assert!(
             out.contains(needle),
             "diagnose --help should mention {needle:?}; got:\n{out}"
         );
     }
-}
-
-#[test]
-fn info_exits_success() {
-    Command::cargo_bin("profile")
-        .unwrap()
-        .arg("info")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains(
-            "profile: Rust CLI for profiling vLLM GPU and system metrics (scaffold)",
-        ));
 }
 
 #[test]

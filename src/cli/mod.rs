@@ -1,42 +1,68 @@
 //! CLI: parse commands, print results.
 
 mod diagnose;
-mod info;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 /// Matches vLLM engine default when `--max-num-seqs` is omitted.
 pub const DEFAULT_MAX_NUM_SEQS: u32 = 256;
 
-const DIAGNOSE_LONG_HELP: &str = r#"Print GPU (NVML) and vLLM /metrics in one view.
+/// Default `-u` / `--url` value (full `/metrics` URL; base URLs are also accepted).
+pub const DEFAULT_METRICS_URL: &str = "http://localhost:8000/metrics";
 
-Example:
-  GPU name                 : NVIDIA GeForce RTX 4090
-  GPU index                : 0
-  GPU ID (UUID)            : GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-  GPU util %               : 45.0
-  Mem ctrl util %          : 12.0
-  VRAM % used              : 12000 / 24564 MiB (48.8)
-  Power draw               : 220 / 450 W
-  SM clock                 : 2100 MHz
-  In-batch reqs            : 4.0 (avg 2s)
-  Waiting reqs             : 0.0 (avg 2s)
-  Max seqs                 : 256
-  TTFT (est. ms)           : 120.0 (window)
-  Prefill ms               : 80.0 (window)
-  Queue ms                 : 2.0 (window)
-  TPOT ms                  : 12.0 (window)
-  Prompt mean              : 128.0 tok (window)
-  Gen tok/s                : 42.0 (window)
-  Prefix cache hit rate (window) : 72.8%
-  Gen tokens               : 1000 (total)
-"#;
+const ABOUT: &str = "Detects inefficiencies. Suggests fixes.";
+
+/// Shown for `profile diagnose --help` only (root help omits options via template).
+const DIAGNOSE_ABOUT: &str = "Collects metrics. Detects inefficiencies. Suggests fixes.";
 
 #[derive(Debug, Parser)]
-#[command(name = "profile")]
-#[command(about = "Diagnose vLLM GPU and inference efficiency")]
+#[command(
+    name = "profile",
+    about = ABOUT,
+    arg_required_else_help = true,
+    disable_help_subcommand = true,
+    override_usage = "profile <COMMAND> [OPTIONS]",
+    help_template = "\n\n{about}\n\n{usage-heading} {usage}\n\nCommands:\n{subcommands}\n",
+    disable_help_flag = true,
+)]
 pub struct Cli {
-    #[arg(short, long, action = clap::ArgAction::Count)]
+    #[arg(
+        short = 'h',
+        long = "help",
+        global = true,
+        action = clap::ArgAction::Help,
+        help = "Display this message",
+        display_order = 2
+    )]
+    pub help_flag: Option<bool>,
+
+    #[arg(
+        short = 'm',
+        long = "max-num-seqs",
+        global = true,
+        default_value_t = DEFAULT_MAX_NUM_SEQS,
+        help = "Engine max_num_seqs if absent on /metrics",
+        display_order = 1
+    )]
+    pub max_num_seqs: u32,
+
+    #[arg(
+        short = 'u',
+        long,
+        global = true,
+        default_value = DEFAULT_METRICS_URL,
+        help = "vLLM metrics endpoint",
+        display_order = 0
+    )]
+    pub url: String,
+
+    #[arg(
+        short,
+        long,
+        action = clap::ArgAction::Count,
+        global = true,
+        hide = true
+    )]
     pub verbose: u8,
 
     #[command(subcommand)]
@@ -45,28 +71,26 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    #[command(about = "Print GPU (NVML) and vLLM /metrics in one view.", long_about = DIAGNOSE_LONG_HELP)]
-    Diagnose(DiagnoseArgs),
+    #[command(
+        about = "Run diagnostics",
+        long_about = DIAGNOSE_ABOUT,
+        override_usage = "profile diagnose [OPTIONS]",
+        help_template = "\n\n{about}\n\n{usage-heading} {usage}\n\n{all-args}\n",
+        display_order = 0
+    )]
+    Diagnose,
 
-    /// Print tool information.
-    Info,
-}
-
-#[derive(Debug, clap::Args)]
-pub struct DiagnoseArgs {
-    /// vLLM server base URL
-    #[arg(long, default_value = "http://127.0.0.1:8000")]
-    pub url: String,
-
-    /// Engine `max_num_seqs` if absent on `/metrics` (Prometheus gauge still wins when present)
-    #[arg(long, default_value_t = DEFAULT_MAX_NUM_SEQS)]
-    pub max_num_seqs: u32,
+    #[command(about = "Display this message", display_order = 1)]
+    Help,
 }
 
 pub fn run(cli: Cli) -> anyhow::Result<()> {
     match &cli.command {
-        Commands::Diagnose(args) => diagnose::execute(args)?,
-        Commands::Info => info::execute(cli.verbose)?,
+        Commands::Diagnose => diagnose::execute(&cli.url, cli.max_num_seqs)?,
+        Commands::Help => {
+            Cli::command().print_long_help()?;
+            println!();
+        }
     }
 
     if cli.verbose > 0 {

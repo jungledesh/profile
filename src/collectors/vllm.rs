@@ -28,8 +28,14 @@ fn http_client() -> &'static reqwest::blocking::Client {
     })
 }
 
-fn metrics_url(base_url: &str) -> String {
-    format!("{}/metrics", base_url.trim_end_matches('/'))
+/// Resolves the GET URL for Prometheus text. Accepts a server base URL or a URL that already ends with `/metrics`.
+fn metrics_url(input: &str) -> String {
+    let t = input.trim().trim_end_matches('/');
+    if t.ends_with("/metrics") {
+        t.to_string()
+    } else {
+        format!("{}/metrics", t)
+    }
 }
 
 fn fetch_metrics_body(url: &str) -> Result<String> {
@@ -300,9 +306,11 @@ fn max_num_seqs_from_gauge(scrape: &Scrape) -> Option<u32> {
     })
 }
 
-/// Fetch raw metrics from vLLM /metrics endpoint.
-pub fn collect_vllm_metrics(base_url: &str) -> Result<VllmRawMetrics> {
-    let url = metrics_url(base_url);
+/// Fetch raw metrics from vLLM `/metrics` endpoint.
+///
+/// `input` may be a server base URL (e.g. `http://localhost:8000`) or the full metrics URL.
+pub fn collect_vllm_metrics(input: &str) -> Result<VllmRawMetrics> {
+    let url = metrics_url(input);
     let mut running_samples = Vec::with_capacity(SAMPLE_COUNT);
     let mut waiting_samples = Vec::with_capacity(SAMPLE_COUNT);
     let mut prefix_samples = Vec::with_capacity(SAMPLE_COUNT);
@@ -880,5 +888,25 @@ vllm_external_prefix_cache_queries 14
             1.0,
         );
         assert!((hit_rate.unwrap() - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn metrics_url_appends_when_base() {
+        assert_eq!(
+            metrics_url("http://localhost:8000"),
+            "http://localhost:8000/metrics"
+        );
+        assert_eq!(
+            metrics_url("http://localhost:8000/"),
+            "http://localhost:8000/metrics"
+        );
+    }
+
+    #[test]
+    fn metrics_url_preserves_full_metrics_path() {
+        assert_eq!(
+            metrics_url("http://localhost:8000/metrics"),
+            "http://localhost:8000/metrics"
+        );
     }
 }

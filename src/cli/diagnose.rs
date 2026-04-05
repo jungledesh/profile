@@ -1,184 +1,294 @@
-use super::DiagnoseArgs;
-use crate::collectors::PrefixCacheScrapeSample;
+//! `diagnose` subcommand: render snapshot as a boxed table (metrics + stub WASTE/FIX).
+//!
+//! Layout: **GPU =>** (NVML); **vLLM:** REQUESTS / LATENCY / PROMPT / THROUGHPUT rows (aligned labels).
+
+use crate::collectors::{GpuRawMetrics, RawSnapshot, VllmRawMetrics};
 use crate::profiler;
 
-const LABEL_W: usize = 24;
+/// Width for REQUESTS / LATENCY / PROMPT / THROUGHPUT label column (matches **THROUGHPUT**).
+const VLLM_LABEL_W: usize = 10;
 
-fn row(label: &str, value: impl std::fmt::Display) {
-    println!("  {:<w$} : {}", label, value, w = LABEL_W);
-}
+/// Space between label column and metric values (after `vLLM:` block labels).
+const VLLM_LABEL_METRICS_GAP: &str = "  ";
 
-fn format_prefix_scrape_sample(s: &PrefixCacheScrapeSample) -> String {
-    let fmt = |o: Option<f64>| {
-        o.map(|v| format!("{v:.0}"))
-            .unwrap_or_else(|| "n/a".to_string())
-    };
-    format!(
-        "hits={} queries={} misses={}",
-        fmt(s.hits),
-        fmt(s.queries),
-        fmt(s.misses)
-    )
-}
+/// Placeholder until the rule engine fills WASTE/FIX dynamically.
+const WASTE_FIX_STUB: &str = r"WASTE
+01 MOVEMENT   70% GPU idle (decode)
+02 SCHEDULER  batch collapse (2/16)
 
-pub fn execute(args: &DiagnoseArgs) -> anyhow::Result<()> {
-    let result = profiler::run_diagnose(&args.url, args.max_num_seqs)?;
+FIX
++-----------------------------------------------------------------------+
+| ENABLE CONTINUOUS BATCHING                                            |
+| +45% TPS   | decode underutilized   | queue 200ms => 0ms              |
++-----------------------------------------------------------------------+
+| INCREASE BATCH WINDOW (15ms)                                          |
+| -12% cost/token   | small prompt overhead                             |
++-----------------------------------------------------------------------+
+";
 
-    match &result.snapshot.gpu.gpu_name {
-        Some(name) => row("GPU name", name),
-        None => row("GPU name", "(no GPU / NVML not ready)"),
-    }
-
-    match result.snapshot.gpu.gpu_index {
-        Some(i) => row("GPU index", i),
-        None => row("GPU index", "(no GPU / NVML not ready)"),
-    }
-
-    match &result.snapshot.gpu.gpu_uuid {
-        Some(id) => row("GPU ID (UUID)", id),
-        None => row("GPU ID (UUID)", "(no GPU / NVML not ready)"),
-    }
-
-    match result.snapshot.gpu.gpu_util_pct {
-        Some(util) => row("GPU util %", format!("{:.1}", util)),
-        None => row("GPU util %", "(no GPU / NVML not ready)"),
-    }
-
-    match result.snapshot.gpu.mem_util_pct {
-        Some(pct) => row("Mem ctrl util %", format!("{:.1}", pct)),
-        None => row("Mem ctrl util %", "(no GPU / NVML not ready)"),
-    }
-
-    match (
-        result.snapshot.gpu.vram_used_mb,
-        result.snapshot.gpu.vram_total_mb,
-    ) {
-        (Some(used), Some(total)) => {
-            if total > 0 {
-                let pct = (used as f64 / total as f64) * 100.0;
-                row(
-                    "VRAM % used",
-                    format!("{} / {} MiB ({:.1})", used, total, pct),
-                );
-            } else {
-                row("VRAM % used", format!("{} / {} MiB", used, total));
-            }
-        }
-        (Some(used), None) => row("VRAM % used", format!("{} MiB used (total n/a)", used)),
-        (None, Some(total)) => row("VRAM % used", format!("(n/a) / {} MiB", total)),
-        (None, None) => row("VRAM % used", "(no GPU / NVML not ready)"),
-    }
-
-    match (
-        result.snapshot.gpu.power_watts,
-        result.snapshot.gpu.power_limit_watts,
-    ) {
-        (Some(draw), Some(limit)) => {
-            row("Power draw", format!("{:.0} / {:.0} W", draw, limit));
-        }
-        (Some(draw), None) => row("Power draw", format!("{:.1} W (limit n/a)", draw)),
-        (None, Some(limit)) => row("Power draw", format!("(n/a) / {:.0} W", limit)),
-        (None, None) => row("Power draw", "(no GPU / NVML not ready)"),
-    }
-
-    match result.snapshot.gpu.sm_clock_mhz {
-        Some(mhz) => row("SM clock", format!("{} MHz", mhz)),
-        None => row("SM clock", "(not available)"),
-    }
-
-    match result.snapshot.vllm.num_requests_running {
-        Some(n) => row("In-batch reqs", format!("{:.1} (avg 2s)", n)),
-        None => row("In-batch reqs", "(not parsed)"),
-    }
-
-    match result.snapshot.vllm.num_requests_waiting {
-        Some(n) => row("Waiting reqs", format!("{:.1} (avg 2s)", n)),
-        None => row("Waiting reqs", "(not parsed)"),
-    }
-
-    match result.snapshot.vllm.max_num_seqs {
-        Some(n) => row("Max seqs", n),
-        None => row("Max seqs", "—"),
-    }
-
-    match result.snapshot.vllm.ttft_ms {
-        Some(ms) => row("TTFT (est. ms)", format!("{:.1} (window)", ms)),
-        None => row("TTFT (est. ms)", "(n/a)"),
-    }
-
-    match result.snapshot.vllm.prefill_latency_ms {
-        Some(ms) => row("Prefill ms", format!("{:.1} (window)", ms)),
-        None => row("Prefill ms", "(n/a)"),
-    }
-
-    match result.snapshot.vllm.queue_delay_ms {
-        Some(ms) => row("Queue ms", format!("{:.1} (window)", ms)),
-        None => row("Queue ms", "(n/a)"),
-    }
-
-    match result.snapshot.vllm.tpot_ms {
-        Some(ms) => row("TPOT ms", format!("{:.1} (window)", ms)),
-        None => row("TPOT ms", "(n/a)"),
-    }
-
-    match result.snapshot.vllm.prompt_tokens_mean {
-        Some(t) => row("Prompt mean", format!("{:.1} tok (window)", t)),
-        None => row("Prompt mean", "(n/a)"),
-    }
-
-    match result.snapshot.vllm.generation_tokens_per_sec {
-        Some(tps) => row("Gen tok/s", format!("{:.1} (window)", tps)),
-        None => row("Gen tok/s", "(n/a)"),
-    }
-
-    let prefix_n = result.snapshot.vllm.prefix_cache_scrape_samples.len();
-    for (i, s) in result
-        .snapshot
-        .vllm
-        .prefix_cache_scrape_samples
-        .iter()
-        .enumerate()
-    {
-        let label = format!("Prefix cache [{}/{}]", i + 1, prefix_n);
-        row(&label, format_prefix_scrape_sample(s));
-    }
-
-    match result.snapshot.vllm.prefix_cache_hit_rate {
-        Some(0.0) => row("Prefix cache hit rate (window)", "0%"),
-        Some(r) => row(
-            "Prefix cache hit rate (window)",
-            format!("{:.1}%", r * 100.0),
-        ),
-        None => row("Prefix cache hit rate (window)", "(n/a)"),
-    }
-
-    match result.snapshot.vllm.generation_tokens_total {
-        Some(n) => row("Gen tokens", format!("{:.0} (total)", n)),
-        None => row("Gen tokens", "(not parsed)"),
-    }
-
-    if result.snapshot.gpu.gpu_util_pct.is_none() && !result.snapshot.vllm.has_scrape_data() {
-        println!(
-            "\n  (No metrics in snapshot — NVML unavailable or vLLM scrape not implemented yet.)"
-        );
-    } else {
-        println!("\n  Snapshot collected; richer /metrics coverage still TODO.");
-    }
-
+pub fn execute(vllm_metrics_input: &str, max_num_seqs: u32) -> anyhow::Result<()> {
+    let result = profiler::run_diagnose(vllm_metrics_input, max_num_seqs)?;
+    print_diagnose_table(&result.snapshot);
     Ok(())
 }
 
-#[cfg(test)]
-#[test]
-fn metric_line_padding_matches_longest_label() {
-    let s = format!("  {:<w$} : {}", "Mem ctrl util %", "12.0", w = LABEL_W);
-    assert_eq!(s.find(" : ").unwrap(), 2 + LABEL_W);
-    assert_eq!(s[2..2 + LABEL_W].trim_end(), "Mem ctrl util %");
+fn print_diagnose_table(snapshot: &RawSnapshot) {
+    let lines = build_diagnose_lines(snapshot);
+    print_boxed(&lines);
+}
+
+fn build_diagnose_lines(snapshot: &RawSnapshot) -> Vec<String> {
+    let v = &snapshot.vllm;
+    let g = &snapshot.gpu;
+
+    let model = v.model_name.as_deref().unwrap_or("(unknown model)");
+    let gpu_label = g.gpu_name.as_deref().unwrap_or("(no GPU)");
+
+    let mut lines = vec![format!(
+        "PROFILE v{} [{}] [{}]",
+        env!("CARGO_PKG_VERSION"),
+        model,
+        gpu_label
+    )];
+
+    lines.push(format!("GPU => {}", gpu_gauges_line(g)));
+    lines.push(String::new());
+    lines.push("vLLM:".to_string());
+    lines.push(vllm_label_row("REQUESTS", &vllm_requests_value(v)));
+    lines.push(vllm_label_row("LATENCY", &vllm_latency_value(v)));
+    lines.push(vllm_label_row("PROMPT", &vllm_prompt_value(v)));
+    lines.push(vllm_label_row("THROUGHPUT", &vllm_throughput_value(v)));
+
+    lines.push(String::new());
+    for stub_line in WASTE_FIX_STUB.lines() {
+        lines.push(stub_line.to_string());
+    }
+
+    lines
+}
+
+fn vllm_label_row(label: &str, value: &str) -> String {
+    format!(
+        "{:<width$}{}{}",
+        label,
+        VLLM_LABEL_METRICS_GAP,
+        value,
+        width = VLLM_LABEL_W
+    )
+}
+
+/// Print `lines` in a single ASCII box (inner width = longest line).
+fn print_boxed(lines: &[String]) {
+    let inner = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    let border = format!("+{}+", "-".repeat(inner));
+    println!("{}", border);
+    for line in lines {
+        let w = line.chars().count();
+        let padded = if w < inner {
+            format!("{}{}", line, " ".repeat(inner - w))
+        } else {
+            line.clone()
+        };
+        println!("|{}|", padded);
+    }
+    println!("{}", border);
+}
+
+/// GPU row: UTIL | POWER | MEM (NVML).
+fn gpu_gauges_line(g: &GpuRawMetrics) -> String {
+    let util = g
+        .gpu_util_pct
+        .map(|u| format!("UTIL {:.0}%", u))
+        .unwrap_or_else(|| "UTIL —".to_string());
+
+    let power = match (g.power_watts, g.power_limit_watts) {
+        (Some(draw), Some(limit)) if limit > 0.0 => {
+            let pct = (draw / limit) * 100.0;
+            format!("POWER {:.0}W ({:.0}%)", draw, pct)
+        }
+        (Some(draw), _) => format!("POWER {:.0}W", draw),
+        _ => "POWER —".to_string(),
+    };
+
+    let mem = match (g.vram_used_mb, g.vram_total_mb) {
+        (Some(used), Some(total)) if total > 0 => {
+            let u_gb = used as f64 / 1024.0;
+            let t_gb = total as f64 / 1024.0;
+            format!("MEM {:.0}/{:.0}GB", u_gb, t_gb)
+        }
+        _ => "MEM —".to_string(),
+    };
+
+    format!("{util} | {power} | {mem}")
+}
+
+/// #1 / #2 / #9 — `run | wait | max`
+fn vllm_requests_value(v: &VllmRawMetrics) -> String {
+    let run = v
+        .num_requests_running
+        .map(fmt_gauge)
+        .map(|s| format!("run {s}"))
+        .unwrap_or_else(|| "run —".to_string());
+    let wait = v
+        .num_requests_waiting
+        .map(fmt_gauge)
+        .map(|s| format!("wait {s}"))
+        .unwrap_or_else(|| "wait —".to_string());
+    let max_seq = v
+        .max_num_seqs
+        .map(|n| format!("max {n}"))
+        .unwrap_or_else(|| "max —".to_string());
+
+    format!("{run} | {wait} | {max_seq}")
+}
+
+fn fmt_gauge(x: f64) -> String {
+    if (x - x.round()).abs() < 1e-6 {
+        format!("{:.0}", x)
+    } else {
+        format!("{:.1}", x)
+    }
+}
+
+/// Histogram means — `ttft | tpot | prefill | queue`
+fn vllm_latency_value(v: &VllmRawMetrics) -> String {
+    let ttft = v
+        .ttft_ms
+        .map(fmt_seconds_from_ms)
+        .unwrap_or_else(|| "—".to_string());
+    let tpot = v
+        .tpot_ms
+        .map(fmt_seconds_from_ms)
+        .unwrap_or_else(|| "—".to_string());
+    let prefill = v
+        .prefill_latency_ms
+        .map(fmt_seconds_from_ms)
+        .unwrap_or_else(|| "—".to_string());
+    let queue = v
+        .queue_delay_ms
+        .map(fmt_seconds_from_ms)
+        .unwrap_or_else(|| "—".to_string());
+
+    format!("ttft {ttft} | tpot {tpot} | prefill {prefill} | queue {queue}")
+}
+
+/// Prompt mean (#10) — `512 tok`
+fn vllm_prompt_value(v: &VllmRawMetrics) -> String {
+    let n = v
+        .prompt_tokens_mean
+        .map(fmt_tok)
+        .unwrap_or_else(|| "—".to_string());
+    format!("{n} tok")
+}
+
+fn fmt_tok(t: f64) -> String {
+    if (t - t.round()).abs() < 1e-6 {
+        format!("{:.0}", t)
+    } else {
+        format!("{:.1}", t)
+    }
+}
+
+/// #6 TPS + #7/#8 cache hit rate — `59 tok/s | cache 72.8%`
+fn vllm_throughput_value(v: &VllmRawMetrics) -> String {
+    let tps = v
+        .generation_tokens_per_sec
+        .map(|t| format!("{:.0} tok/s", t))
+        .unwrap_or_else(|| "— tok/s".to_string());
+    let cache = cache_use_fragment(v);
+    format!("{tps} | {cache}")
+}
+
+/// Prefix cache use % from #7/#8 (Δhits/Δqueries).
+fn cache_use_fragment(v: &VllmRawMetrics) -> String {
+    match v.prefix_cache_hit_rate {
+        Some(0.0) => "cache 0%".to_string(),
+        Some(r) => format!("cache {:.1}%", r * 100.0),
+        None => "cache —".to_string(),
+    }
+}
+
+fn fmt_seconds_from_ms(ms: f64) -> String {
+    if ms >= 1000.0 {
+        format!("{:.1}s", ms / 1000.0)
+    } else {
+        format!("{:.0}ms", ms)
+    }
 }
 
 #[cfg(test)]
-#[test]
-fn metric_line_shorter_label_pads_before_colon() {
-    let s = format!("  {:<w$} : {}", "VRAM % used", "1 / 2 MiB", w = LABEL_W);
-    assert!(s.starts_with("  VRAM % used") && s.contains(" : ") && s.ends_with("1 / 2 MiB"));
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fmt_seconds_from_ms_prefers_seconds_when_large() {
+        assert_eq!(fmt_seconds_from_ms(1200.0), "1.2s");
+        assert_eq!(fmt_seconds_from_ms(50.0), "50ms");
+    }
+
+    #[test]
+    fn cache_use_fragment_formats_hit_rate_only() {
+        assert_eq!(cache_use_fragment(&VllmRawMetrics::default()), "cache —");
+        assert_eq!(
+            cache_use_fragment(&VllmRawMetrics {
+                prefix_cache_hit_rate: Some(0.0),
+                ..Default::default()
+            }),
+            "cache 0%"
+        );
+        assert_eq!(
+            cache_use_fragment(&VllmRawMetrics {
+                prefix_cache_hit_rate: Some(0.728),
+                ..Default::default()
+            }),
+            "cache 72.8%"
+        );
+    }
+
+    #[test]
+    fn gpu_gauges_line_formats_mem_gb() {
+        let g = GpuRawMetrics {
+            gpu_util_pct: Some(28.0),
+            power_watts: Some(310.0),
+            power_limit_watts: Some(400.0),
+            vram_used_mb: Some(72 * 1024),
+            vram_total_mb: Some(80 * 1024),
+            ..Default::default()
+        };
+        let s = gpu_gauges_line(&g);
+        assert!(s.contains("UTIL 28%"));
+        assert!(s.contains("POWER 310W"));
+        assert!(s.contains("MEM 72/80GB"));
+    }
+
+    #[test]
+    fn vllm_requests_value_run_wait_max() {
+        let v = VllmRawMetrics {
+            num_requests_running: Some(2.0),
+            num_requests_waiting: Some(1.0),
+            max_num_seqs: Some(256),
+            ..Default::default()
+        };
+        assert_eq!(vllm_requests_value(&v), "run 2 | wait 1 | max 256");
+    }
+
+    #[test]
+    fn vllm_throughput_value_tok_s_and_cache() {
+        let v = VllmRawMetrics {
+            generation_tokens_per_sec: Some(59.0),
+            prefix_cache_hit_rate: Some(0.5),
+            ..Default::default()
+        };
+        assert_eq!(vllm_throughput_value(&v), "59 tok/s | cache 50.0%");
+    }
+
+    #[test]
+    fn vllm_label_row_aligns_labels_and_gap_before_metrics() {
+        let line = vllm_label_row("REQUESTS", "run 2 | wait 1 | max 256");
+        assert!(line.starts_with("REQUESTS"));
+        assert!(line.contains("  run 2"));
+        let t = vllm_label_row("THROUGHPUT", "59 tok/s | cache 72.8%");
+        assert!(t.starts_with("THROUGHPUT"));
+        assert!(t.contains("  59 tok/s"));
+    }
 }
