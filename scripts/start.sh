@@ -69,6 +69,7 @@ python -m vllm.entrypoints.openai.api_server \
   --gpu-memory-utilization 0.8 \
   --tensor-parallel-size 1 \
   --enforce-eager \
+  --enable-prefix-caching \
   2>&1 | tee \"$LOG_FILE\"'"
 
 echo

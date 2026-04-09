@@ -8,7 +8,9 @@ use nvml_wrapper::Nvml;
 use super::GpuRawMetrics;
 
 const MIB: u64 = 1024 * 1024;
-const SAMPLE_COUNT: usize = 8;
+/// Nine samples with 250 ms between reads → **2.0 s** from first to last (8 gaps), aligned with
+/// `test.sh`: `timeout 2s nvidia-smi … -lms 250`.
+const SAMPLE_COUNT: usize = 9;
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Default)]
@@ -168,7 +170,7 @@ fn sample_poll(ug: u32, um: u32, p: f64, vu: u64, vt: u64, temp: f64, sm: u32) -
 
 #[cfg(test)]
 #[test]
-fn aggregate_eight_identical_polls_equals_that_value() {
+fn aggregate_identical_polls_equals_sample_values() {
     let polls: Vec<_> = (0..SAMPLE_COUNT)
         .map(|_| sample_poll(80, 20, 300.0, 1000, 8000, 55.0, 2100))
         .collect();
