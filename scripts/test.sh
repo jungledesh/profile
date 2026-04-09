@@ -83,41 +83,43 @@ while ((SECONDS < END_TIME)); do
   ./profile diagnose -u "$VLLM_METRICS_URL" &
   PROFILE_PID=$!
 
-  # Pipe nvidia-smi → awk (RAM only). Left side runs in parallel with PROFILE_PID; awk runs after profile exits.
-  {
+  # nvidia-smi runs in parallel (process sub); wait only in this shell — not inside a pipeline subshell.
+  exec 3< <(
     timeout "${SMI_WINDOW_SEC}s" nvidia-smi --id="${GPU_ID}" \
       --query-gpu=timestamp,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw,power.limit,temperature.gpu,clocks.sm \
       --format=csv,noheader,nounits \
       -lms 250 2>/dev/null || true
-  } | {
-    wait "$PROFILE_PID"
-    echo "nvidia-smi (${SMI_WINDOW_SEC}s window, same cycle as PROFILE above):"
-    awk -F', ' '
-      BEGIN { gpu_sum=mem_sum=pwr_sum=0; count=0 }
-      {
-        gpu_sum += $2
-        mem_sum += $3
-        pwr_sum += $6
-        used=$4
-        total=$5
-        temp=$8
-        sm=$9
-        count++
+  )
+
+  wait "$PROFILE_PID"
+
+  echo "nvidia-smi (${SMI_WINDOW_SEC}s window, same cycle as PROFILE above):"
+  awk -F', ' '
+    BEGIN { gpu_sum=mem_sum=pwr_sum=0; count=0 }
+    {
+      gpu_sum += $2
+      mem_sum += $3
+      pwr_sum += $6
+      used=$4
+      total=$5
+      temp=$8
+      sm=$9
+      count++
+    }
+    END {
+      if (count == 0) {
+        print "  (no samples collected)"
+        exit
       }
-      END {
-        if (count == 0) {
-          print "  (no samples collected)"
-          exit
-        }
-        printf "  %-15s : %.1f%%\n", "GPU util", gpu_sum / count
-        printf "  %-15s : %.1f%%\n", "Mem ctrl util", mem_sum / count
-        printf "  %-15s : %d / %d MiB (%.1f%%)\n", "VRAM used", used, total, used * 100.0 / total
-        printf "  Power draw      : %.0f W\n", pwr_sum / count
-        printf "  Temp            : %d C\n", temp
-        printf "  SM clock        : %d MHz\n", sm
-      }
-    '
-  }
+      printf "  %-15s : %.1f%%\n", "GPU util", gpu_sum / count
+      printf "  %-15s : %.1f%%\n", "Mem ctrl util", mem_sum / count
+      printf "  %-15s : %d / %d MiB (%.1f%%)\n", "VRAM used", used, total, used * 100.0 / total
+      printf "  Power draw      : %.0f W\n", pwr_sum / count
+      printf "  Temp            : %d C\n", temp
+      printf "  SM clock        : %d MHz\n", sm
+    }
+  ' <&3
+  exec 3<&-
 
   sleep 6
 done
