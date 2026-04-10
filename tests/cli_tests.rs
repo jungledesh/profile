@@ -141,8 +141,12 @@ fn diagnose_exits_success() {
         "stdout should include cache % on THROUGHPUT row; got:\n{out}"
     );
     assert!(
-        out.contains("ISSUES"),
-        "stdout should include ISSUES section; got:\n{out}"
+        out.contains("Rule 1 (batch collapse)"),
+        "stdout should include rule 1 section; got:\n{out}"
+    );
+    assert!(
+        out.contains("Hence:") || out.contains("ISSUES"),
+        "stdout should show rule 1 miss (Hence) or full issue block (ISSUES); got:\n{out}"
     );
     assert!(
         out.lines().any(|l| l.starts_with('+') && l.ends_with('+')),

@@ -19,46 +19,159 @@ pub struct Issue {
 }
 
 pub fn evaluate_issues(snapshot: &RawSnapshot) -> Vec<Issue> {
-    eval_batch_collapse(snapshot).into_iter().collect()
+    match rule1_batch_collapse(snapshot) {
+        Rule1Outcome::Fired(issue) => vec![issue],
+        Rule1Outcome::NotFired(_) => vec![],
+    }
 }
 
-fn skew_secs(a: SystemTime, b: SystemTime) -> f64 {
-    match a.duration_since(b) {
-        Ok(d) => d.as_secs_f64(),
-        Err(e) => -e.duration().as_secs_f64(),
-    }
-    .abs()
+/// Rule 1 evaluation: either an [`Issue`] or a report for diagnose when it does not fire.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Rule1Outcome {
+    Fired(Issue),
+    NotFired(MissReport),
 }
 
-fn eval_batch_collapse(snapshot: &RawSnapshot) -> Option<Issue> {
-    if skew_secs(snapshot.gpu_observed_at, snapshot.vllm_observed_at) > MAX_OBSERVATION_SKEW_SECS {
-        return None;
+#[derive(Debug, Clone, PartialEq)]
+pub struct MissReport {
+    pub skew_secs: f64,
+    pub running: Option<f64>,
+    pub gpu_util: Option<f64>,
+    pub waiting: Option<f64>,
+    pub max_num_seqs: Option<u32>,
+    pub reasons: Vec<String>,
+}
+
+/// Full ISSUES/DIAGNOSIS/CAUSE/FIX when rule 1 fires; otherwise the three rule metrics + why it did not fire.
+pub fn format_rule1_diagnose(snapshot: &RawSnapshot) -> Vec<String> {
+    match rule1_batch_collapse(snapshot) {
+        Rule1Outcome::Fired(issue) => format_issue(&issue),
+        Rule1Outcome::NotFired(m) => format_rule1_miss(&m),
+    }
+}
+
+pub fn rule1_batch_collapse(snapshot: &RawSnapshot) -> Rule1Outcome {
+    let skew = skew_secs(snapshot.gpu_observed_at, snapshot.vllm_observed_at);
+    let mut reasons = Vec::new();
+
+    if skew > MAX_OBSERVATION_SKEW_SECS {
+        reasons.push(format!(
+            "observation skew {:.2}s > {:.0}s (GPU vs vLLM collection end times)",
+            skew, MAX_OBSERVATION_SKEW_SECS
+        ));
     }
 
-    let avg_running = snapshot.vllm.num_requests_running?;
-    let max_seqs = snapshot.vllm.max_num_seqs?;
-    let gpu_util = snapshot.gpu.gpu_util_pct?;
-    let waiting = snapshot.vllm.num_requests_waiting?;
+    let running = snapshot.vllm.num_requests_running;
+    let max_num_seqs = snapshot.vllm.max_num_seqs;
+    let gpu_util = snapshot.gpu.gpu_util_pct;
+    let waiting = snapshot.vllm.num_requests_waiting;
 
-    if max_seqs == 0 {
-        return None;
-    }
-    if !(avg_running.is_finite() && gpu_util.is_finite() && waiting.is_finite()) {
-        return None;
-    }
+    let running_ok = match running {
+        None => {
+            reasons.push("mean running (window) unavailable".into());
+            None
+        }
+        Some(v) if !v.is_finite() => {
+            reasons.push("mean running is not finite".into());
+            None
+        }
+        Some(v) => Some(v),
+    };
 
-    let max_f = f64::from(max_seqs);
-    let half_max = 0.5 * max_f;
+    let max_ok = match max_num_seqs {
+        None => {
+            reasons.push("max_num_seqs unavailable".into());
+            None
+        }
+        Some(0) => {
+            reasons.push("max_num_seqs is 0".into());
+            None
+        }
+        Some(n) => Some(n),
+    };
 
-    if !(avg_running > ACTIVITY_FLOOR
-        && avg_running < half_max
-        && gpu_util < GPU_UTIL_BATCH_COLLAPSE_LT
-        && waiting < WAITING_LT)
+    let gpu_ok = match gpu_util {
+        None => {
+            reasons.push("GPU util unavailable".into());
+            None
+        }
+        Some(v) if !v.is_finite() => {
+            reasons.push("GPU util is not finite".into());
+            None
+        }
+        Some(v) => Some(v),
+    };
+
+    let waiting_ok = match waiting {
+        None => {
+            reasons.push("waiting metric unavailable (required for this rule)".into());
+            None
+        }
+        Some(v) if !v.is_finite() => {
+            reasons.push("waiting is not finite".into());
+            None
+        }
+        Some(v) => Some(v),
+    };
+
+    if let (Some(rf), Some(max_seqs_v), Some(gf), Some(wf)) =
+        (running_ok, max_ok, gpu_ok, waiting_ok)
     {
-        return None;
+        let max_f = f64::from(max_seqs_v);
+        let half_max = 0.5 * max_f;
+        if rf <= ACTIVITY_FLOOR {
+            reasons.push(format!(
+                "mean running {:.1} is not > {:.0} (activity floor)",
+                rf, ACTIVITY_FLOOR
+            ));
+        }
+        if rf >= half_max {
+            reasons.push(format!(
+                "mean running {:.1} is not < max_num_seqs/2 ({:.1})",
+                rf, half_max
+            ));
+        }
+        if gf >= GPU_UTIL_BATCH_COLLAPSE_LT {
+            reasons.push(format!(
+                "GPU util {:.0}% is not < {:.0}%",
+                gf, GPU_UTIL_BATCH_COLLAPSE_LT
+            ));
+        }
+        if wf >= WAITING_LT {
+            reasons.push(format!(
+                "waiting {:.1} is not < {:.0} (queue not ~empty)",
+                wf, WAITING_LT
+            ));
+        }
     }
 
-    let raw_confidence = 0.95 - avg_running / max_f;
+    let miss_report = || MissReport {
+        skew_secs: skew,
+        running,
+        gpu_util,
+        waiting,
+        max_num_seqs,
+        reasons: reasons.clone(),
+    };
+
+    if !reasons.is_empty() {
+        return Rule1Outcome::NotFired(miss_report());
+    }
+
+    let (Some(rf), Some(max_seqs_v), Some(gf), Some(wf)) = (running_ok, max_ok, gpu_ok, waiting_ok)
+    else {
+        return Rule1Outcome::NotFired(MissReport {
+            skew_secs: skew,
+            running,
+            gpu_util,
+            waiting,
+            max_num_seqs,
+            reasons: vec!["internal: inputs incomplete with no prior reasons".into()],
+        });
+    };
+    let max_f = f64::from(max_seqs_v);
+
+    let raw_confidence = 0.95 - rf / max_f;
     let confidence = raw_confidence.clamp(0.6, 0.95);
 
     let queue = snapshot
@@ -71,20 +184,69 @@ fn eval_batch_collapse(snapshot: &RawSnapshot) -> Option<Issue> {
     let evidence = vec![
         format!(
             "avg batch {:.1} (window) | max seqs {} | GPU util {:.0}%",
-            avg_running, max_seqs, gpu_util
+            rf, max_seqs_v, gf
         ),
-        format!("waiting {:.1} | queue delay {}", waiting, queue),
+        format!("waiting {:.1} | queue delay {}", wf, queue),
     ];
 
-    Some(Issue {
+    Rule1Outcome::Fired(Issue {
         confidence,
         evidence,
     })
 }
 
+fn skew_secs(a: SystemTime, b: SystemTime) -> f64 {
+    match a.duration_since(b) {
+        Ok(d) => d.as_secs_f64(),
+        Err(e) => -e.duration().as_secs_f64(),
+    }
+    .abs()
+}
+
+fn fmt_opt_running(x: Option<f64>) -> String {
+    x.filter(|v| v.is_finite())
+        .map(|v| format!("{:.1}", v))
+        .unwrap_or_else(|| "—".to_string())
+}
+
+fn fmt_opt_gpu_pct(x: Option<f64>) -> String {
+    x.filter(|v| v.is_finite())
+        .map(|v| format!("{:.0}%", v))
+        .unwrap_or_else(|| "—".to_string())
+}
+
+fn fmt_opt_waiting(x: Option<f64>) -> String {
+    x.filter(|v| v.is_finite())
+        .map(|v| format!("{:.1}", v))
+        .unwrap_or_else(|| "—".to_string())
+}
+
+fn fmt_opt_max_seqs(x: Option<u32>) -> String {
+    x.map(|n| n.to_string()).unwrap_or_else(|| "—".to_string())
+}
+
+fn format_rule1_miss(m: &MissReport) -> Vec<String> {
+    let mut lines = vec![
+        "Rule 1 (batch collapse): not triggered".to_string(),
+        format!(
+            "  mean running (window): {}  |  max_num_seqs: {}",
+            fmt_opt_running(m.running),
+            fmt_opt_max_seqs(m.max_num_seqs)
+        ),
+        format!("  GPU util: {}", fmt_opt_gpu_pct(m.gpu_util)),
+        format!("  waiting: {}", fmt_opt_waiting(m.waiting)),
+    ];
+    if !m.reasons.is_empty() {
+        lines.push(format!("  Hence: {}", m.reasons.join("; ")));
+    } else {
+        lines.push("  Hence: rule conditions not satisfied.".to_string());
+    }
+    lines
+}
+
 const FIX_BOX_INNER_W: usize = 71;
 
-/// ISSUES + FIX block for the diagnose table (same width as the static stub).
+/// ISSUES + FIX block for the diagnose table.
 pub fn format_issue(issue: &Issue) -> Vec<String> {
     let mut lines = vec![
         "ISSUES".to_string(),
@@ -224,5 +386,31 @@ mod tests {
         v.num_requests_running = Some(f64::NAN);
         let s = snap(t, t, v, pass_gpu());
         assert!(evaluate_issues(&s).is_empty());
+    }
+
+    #[test]
+    fn format_rule1_diagnose_fired_includes_issues_block() {
+        let t = SystemTime::UNIX_EPOCH;
+        let s = snap(t, t, pass_vllm(), pass_gpu());
+        let lines = format_rule1_diagnose(&s);
+        assert!(lines.iter().any(|l| l == "ISSUES"));
+        assert!(lines.iter().any(|l| l.contains("BATCH COLLAPSE")));
+        assert!(lines.iter().any(|l| l == "DIAGNOSIS"));
+    }
+
+    #[test]
+    fn format_rule1_diagnose_miss_shows_three_metrics_and_hence() {
+        let t = SystemTime::UNIX_EPOCH;
+        let mut g = pass_gpu();
+        g.gpu_util_pct = Some(70.0);
+        let s = snap(t, t, pass_vllm(), g);
+        let lines = format_rule1_diagnose(&s);
+        let text = lines.join("\n");
+        assert!(text.contains("not triggered"));
+        assert!(text.contains("mean running (window):"));
+        assert!(text.contains("GPU util:"));
+        assert!(text.contains("waiting:"));
+        assert!(text.contains("Hence:"));
+        assert!(text.contains("GPU util 70%"));
     }
 }

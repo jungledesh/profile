@@ -1,4 +1,4 @@
-//! `diagnose` subcommand: render snapshot as a boxed table (metrics + ISSUES/FIX).
+//! `diagnose` subcommand: render snapshot as a boxed table (metrics + rule 1 diagnose block).
 //!
 //! Layout: **GPU =>** (NVML); **vLLM:** REQUESTS / LATENCY / PROMPT / THROUGHPUT rows (aligned labels).
 
@@ -11,21 +11,6 @@ const VLLM_LABEL_W: usize = 10;
 
 /// Space between label column and metric values (after `vLLM:` block labels).
 const VLLM_LABEL_METRICS_GAP: &str = "  ";
-
-/// Shown when no engine rule fires (illustrative).
-const ISSUES_FIX_STUB: &str = r"ISSUES
-01 MOVEMENT   70% GPU idle (decode)
-02 SCHEDULER  batch collapse (2/16)
-
-FIX
-+-----------------------------------------------------------------------+
-| ENABLE CONTINUOUS BATCHING                                            |
-| +45% TPS   | decode underutilized   | queue 200ms => 0ms              |
-+-----------------------------------------------------------------------+
-| INCREASE BATCH WINDOW (15ms)                                          |
-| -12% cost/token   | small prompt overhead                             |
-+-----------------------------------------------------------------------+
-";
 
 pub fn execute(vllm_metrics_input: &str, max_num_seqs: u32) -> anyhow::Result<()> {
     let result = profiler::run_diagnose(vllm_metrics_input, max_num_seqs)?;
@@ -61,13 +46,7 @@ fn build_diagnose_lines(snapshot: &RawSnapshot) -> Vec<String> {
     lines.push(vllm_label_row("THROUGHPUT", &vllm_throughput_value(v)));
 
     lines.push(String::new());
-    if let Some(issue) = engine::evaluate_issues(snapshot).first() {
-        lines.extend(engine::format_issue(issue));
-    } else {
-        for stub_line in ISSUES_FIX_STUB.lines() {
-            lines.push(stub_line.to_string());
-        }
-    }
+    lines.extend(engine::format_rule1_diagnose(snapshot));
 
     lines
 }
