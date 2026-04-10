@@ -1,13 +1,11 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
+use profile::collectors::sampling::SAMPLE_COUNT;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::thread;
 
 const MINIMAL_SCRAPE: &str = "# TYPE noop gauge\nnoop 0\n";
-
-/// vLLM collector issues `count` sequential GETs to `/metrics` (default 8).
-const VLLM_SCRAPE_COUNT: usize = 8;
 
 fn spawn_metrics_server(
     body: &'static str,
@@ -44,12 +42,12 @@ fn spawn_metrics_server(
     (url, handle)
 }
 
-/// One response body per GET; must match [`VLLM_SCRAPE_COUNT`].
+/// One response body per GET; length must match [`SAMPLE_COUNT`].
 fn spawn_metrics_server_seq(bodies: &[&'static str]) -> (String, thread::JoinHandle<()>) {
     assert_eq!(
         bodies.len(),
-        VLLM_SCRAPE_COUNT,
-        "vLLM collector performs exactly {VLLM_SCRAPE_COUNT} scrapes"
+        SAMPLE_COUNT,
+        "vLLM collector performs exactly {SAMPLE_COUNT} scrapes"
     );
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test metrics server");
     let port = listener.local_addr().expect("local_addr").port();
@@ -94,7 +92,7 @@ fn help_exits_success() {
 
 #[test]
 fn diagnose_exits_success() {
-    let (url, server) = spawn_metrics_server(MINIMAL_SCRAPE, VLLM_SCRAPE_COUNT);
+    let (url, server) = spawn_metrics_server(MINIMAL_SCRAPE, SAMPLE_COUNT);
     let output = Command::cargo_bin("profile")
         .unwrap()
         .arg("diagnose")
@@ -143,8 +141,8 @@ fn diagnose_exits_success() {
         "stdout should include cache % on THROUGHPUT row; got:\n{out}"
     );
     assert!(
-        out.contains("WASTE"),
-        "stdout should include WASTE stub; got:\n{out}"
+        out.contains("ISSUES"),
+        "stdout should include ISSUES section; got:\n{out}"
     );
     assert!(
         out.lines().any(|l| l.starts_with('+') && l.ends_with('+')),
@@ -158,7 +156,7 @@ fn diagnose_exits_success() {
 fn diagnose_shows_gen_tok_per_sec_when_counters_increase() {
     const G100: &str = "vllm_generation_tokens_total 100\n";
     const G250: &str = "vllm_generation_tokens_total 250\n";
-    let bodies = [G100, G100, G100, G100, G100, G100, G100, G250];
+    let bodies = [G100, G100, G100, G100, G100, G100, G100, G100, G250];
     let (url, server) = spawn_metrics_server_seq(&bodies);
     let output = Command::cargo_bin("profile")
         .unwrap()
@@ -187,7 +185,7 @@ fn diagnose_shows_gen_tok_per_sec_when_counters_increase() {
 fn diagnose_gen_tok_per_sec_na_when_counter_resets() {
     const G100: &str = "vllm_generation_tokens_total 100\n";
     const G500: &str = "vllm_generation_tokens_total 500\n";
-    let bodies = [G500, G500, G500, G500, G500, G500, G500, G100];
+    let bodies = [G500, G500, G500, G500, G500, G500, G500, G500, G100];
     let (url, server) = spawn_metrics_server_seq(&bodies);
     let output = Command::cargo_bin("profile")
         .unwrap()
@@ -247,7 +245,7 @@ fn diagnose_help_lists_usage_and_options() {
 
 #[test]
 fn verbose_prints_level_to_stderr() {
-    let (url, server) = spawn_metrics_server(MINIMAL_SCRAPE, VLLM_SCRAPE_COUNT);
+    let (url, server) = spawn_metrics_server(MINIMAL_SCRAPE, SAMPLE_COUNT);
     Command::cargo_bin("profile")
         .unwrap()
         .args(["-vv", "diagnose", "--url"])

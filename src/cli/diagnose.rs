@@ -1,8 +1,9 @@
-//! `diagnose` subcommand: render snapshot as a boxed table (metrics + stub WASTE/FIX).
+//! `diagnose` subcommand: render snapshot as a boxed table (metrics + ISSUES/FIX).
 //!
 //! Layout: **GPU =>** (NVML); **vLLM:** REQUESTS / LATENCY / PROMPT / THROUGHPUT rows (aligned labels).
 
 use crate::collectors::{GpuRawMetrics, RawSnapshot, VllmRawMetrics};
+use crate::engine;
 use crate::profiler;
 
 /// Width for REQUESTS / LATENCY / PROMPT / THROUGHPUT label column (matches **THROUGHPUT**).
@@ -11,8 +12,8 @@ const VLLM_LABEL_W: usize = 10;
 /// Space between label column and metric values (after `vLLM:` block labels).
 const VLLM_LABEL_METRICS_GAP: &str = "  ";
 
-/// Placeholder until the rule engine fills WASTE/FIX dynamically.
-const WASTE_FIX_STUB: &str = r"WASTE
+/// Shown when no engine rule fires (illustrative).
+const ISSUES_FIX_STUB: &str = r"ISSUES
 01 MOVEMENT   70% GPU idle (decode)
 02 SCHEDULER  batch collapse (2/16)
 
@@ -60,8 +61,12 @@ fn build_diagnose_lines(snapshot: &RawSnapshot) -> Vec<String> {
     lines.push(vllm_label_row("THROUGHPUT", &vllm_throughput_value(v)));
 
     lines.push(String::new());
-    for stub_line in WASTE_FIX_STUB.lines() {
-        lines.push(stub_line.to_string());
+    if let Some(issue) = engine::evaluate_issues(snapshot).first() {
+        lines.extend(engine::format_issue(issue));
+    } else {
+        for stub_line in ISSUES_FIX_STUB.lines() {
+            lines.push(stub_line.to_string());
+        }
     }
 
     lines

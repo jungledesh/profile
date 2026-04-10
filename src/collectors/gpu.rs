@@ -1,17 +1,14 @@
 use std::thread;
-use std::time::Duration;
+use std::time::SystemTime;
 
 use anyhow::Result;
 use nvml_wrapper::enum_wrappers::device::{Clock, ClockId, TemperatureSensor};
 use nvml_wrapper::Nvml;
 
+use super::sampling::{SAMPLE_COUNT, SAMPLE_INTERVAL};
 use super::GpuRawMetrics;
 
 const MIB: u64 = 1024 * 1024;
-/// Nine samples with 250 ms between reads → **2.0 s** from first to last (8 gaps), aligned with
-/// `test.sh`: `timeout 2s nvidia-smi … -lms 250`.
-const SAMPLE_COUNT: usize = 9;
-const SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Default)]
 struct GpuPoll {
@@ -88,12 +85,13 @@ fn aggregate_polls(polls: &[GpuPoll]) -> AggregatedPolls {
     }
 }
 
-pub fn collect_gpu_metrics() -> Result<GpuRawMetrics> {
+/// Returns `(metrics, observed_at)` after the last NVML poll in the sampling window.
+pub fn collect_gpu_metrics() -> Result<(GpuRawMetrics, SystemTime)> {
     let Ok(nvml) = Nvml::init() else {
-        return Ok(GpuRawMetrics::default());
+        return Ok((GpuRawMetrics::default(), SystemTime::now()));
     };
     let Ok(device) = nvml.device_by_index(0) else {
-        return Ok(GpuRawMetrics::default());
+        return Ok((GpuRawMetrics::default(), SystemTime::now()));
     };
 
     let gpu_name = device.name().ok();
@@ -140,19 +138,22 @@ pub fn collect_gpu_metrics() -> Result<GpuRawMetrics> {
 
     let agg = aggregate_polls(&polls);
 
-    Ok(GpuRawMetrics {
-        gpu_name,
-        gpu_index,
-        gpu_uuid,
-        gpu_util_pct: agg.gpu_util_pct,
-        mem_util_pct: agg.mem_util_pct,
-        power_watts: agg.power_watts,
-        power_limit_watts,
-        vram_used_mb: agg.vram_used_mb,
-        vram_total_mb: agg.vram_total_mb,
-        temperature_c: agg.temperature_c,
-        sm_clock_mhz: agg.sm_clock_mhz,
-    })
+    Ok((
+        GpuRawMetrics {
+            gpu_name,
+            gpu_index,
+            gpu_uuid,
+            gpu_util_pct: agg.gpu_util_pct,
+            mem_util_pct: agg.mem_util_pct,
+            power_watts: agg.power_watts,
+            power_limit_watts,
+            vram_used_mb: agg.vram_used_mb,
+            vram_total_mb: agg.vram_total_mb,
+            temperature_c: agg.temperature_c,
+            sm_clock_mhz: agg.sm_clock_mhz,
+        },
+        SystemTime::now(),
+    ))
 }
 
 #[cfg(test)]
