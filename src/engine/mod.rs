@@ -34,15 +34,13 @@ pub enum Rule1Outcome {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MissReport {
-    pub skew_secs: f64,
     pub running: Option<f64>,
     pub gpu_util: Option<f64>,
-    pub waiting: Option<f64>,
     pub max_num_seqs: Option<u32>,
     pub reasons: Vec<String>,
 }
 
-/// Full ISSUES/DIAGNOSIS/CAUSE/FIX when rule 1 fires; otherwise the three rule metrics + why it did not fire.
+/// Full ISSUES/DIAGNOSIS/CAUSE/FIX when rule 1 fires; otherwise a title line plus bullet notes.
 pub fn format_rule1_diagnose(snapshot: &RawSnapshot) -> Vec<String> {
     match rule1_batch_collapse(snapshot) {
         Rule1Outcome::Fired(issue) => format_issue(&issue),
@@ -146,10 +144,8 @@ pub fn rule1_batch_collapse(snapshot: &RawSnapshot) -> Rule1Outcome {
     }
 
     let miss_report = || MissReport {
-        skew_secs: skew,
         running,
         gpu_util,
-        waiting,
         max_num_seqs,
         reasons: reasons.clone(),
     };
@@ -161,10 +157,8 @@ pub fn rule1_batch_collapse(snapshot: &RawSnapshot) -> Rule1Outcome {
     let (Some(rf), Some(max_seqs_v), Some(gf), Some(wf)) = (running_ok, max_ok, gpu_ok, waiting_ok)
     else {
         return Rule1Outcome::NotFired(MissReport {
-            skew_secs: skew,
             running,
             gpu_util,
-            waiting,
             max_num_seqs,
             reasons: vec!["internal: inputs incomplete with no prior reasons".into()],
         });
@@ -203,45 +197,62 @@ fn skew_secs(a: SystemTime, b: SystemTime) -> f64 {
     .abs()
 }
 
-fn fmt_opt_running(x: Option<f64>) -> String {
-    x.filter(|v| v.is_finite())
-        .map(|v| format!("{:.1}", v))
-        .unwrap_or_else(|| "—".to_string())
-}
-
-fn fmt_opt_gpu_pct(x: Option<f64>) -> String {
-    x.filter(|v| v.is_finite())
-        .map(|v| format!("{:.0}%", v))
-        .unwrap_or_else(|| "—".to_string())
-}
-
-fn fmt_opt_waiting(x: Option<f64>) -> String {
-    x.filter(|v| v.is_finite())
-        .map(|v| format!("{:.1}", v))
-        .unwrap_or_else(|| "—".to_string())
-}
-
-fn fmt_opt_max_seqs(x: Option<u32>) -> String {
-    x.map(|n| n.to_string()).unwrap_or_else(|| "—".to_string())
-}
-
 fn format_rule1_miss(m: &MissReport) -> Vec<String> {
-    let mut lines = vec![
-        "Rule 1 (batch collapse): not triggered".to_string(),
-        format!(
-            "  mean running (window): {}  |  max_num_seqs: {}",
-            fmt_opt_running(m.running),
-            fmt_opt_max_seqs(m.max_num_seqs)
-        ),
-        format!("  GPU util: {}", fmt_opt_gpu_pct(m.gpu_util)),
-        format!("  waiting: {}", fmt_opt_waiting(m.waiting)),
-    ];
-    if !m.reasons.is_empty() {
-        lines.push(format!("  Hence: {}", m.reasons.join("; ")));
-    } else {
-        lines.push("  Hence: rule conditions not satisfied.".to_string());
-    }
+    let mut lines = vec!["Rule 1 (batch collapse): not triggered".to_string()];
+    lines.extend(miss_bullet_lines(m));
     lines
+}
+
+/// Threshold for “large” `max_num_seqs` in miss-path bullets.
+const INSIGHT_LARGE_MAX_SEQS: u32 = 64;
+/// In-flight mean below this fraction of `max_num_seqs` → “Batch capacity … vs …” phrasing.
+const INSIGHT_SPARSE_LOAD_FRAC: f64 = 0.15;
+
+fn miss_bullet_lines(m: &MissReport) -> Vec<String> {
+    let mut bullets: Vec<String> = Vec::new();
+
+    if let (Some(max), Some(rv)) = (m.max_num_seqs, m.running.filter(|x| x.is_finite())) {
+        if max >= INSIGHT_LARGE_MAX_SEQS && rv < f64::from(max) * INSIGHT_SPARSE_LOAD_FRAC {
+            bullets.push(format!(
+                "Batch capacity {} vs ≈{:.1} in-flight (window mean)",
+                max, rv
+            ));
+        } else {
+            bullets.push(format!("max_num_seqs {}, ≈{:.1} in-flight", max, rv));
+        }
+    } else if let Some(max) = m.max_num_seqs {
+        bullets.push(format!("max_num_seqs {}", max));
+    } else if let Some(rv) = m.running.filter(|x| x.is_finite()) {
+        bullets.push(format!("≈{:.1} in-flight (window mean)", rv));
+    }
+
+    if let Some(g) = m.gpu_util.filter(|x| x.is_finite()) {
+        let band = if g < 40.0 {
+            "low"
+        } else if g < 75.0 {
+            "moderate"
+        } else {
+            "high"
+        };
+        bullets.push(format!("GPU ~{:.0}% ({})", g, band));
+    }
+
+    let gpu_util_blocks_rule = m.reasons.iter().any(|s| s.contains("GPU util"));
+    let gpu_busy_enough = m
+        .gpu_util
+        .filter(|x| x.is_finite())
+        .is_some_and(|g| g >= GPU_UTIL_BATCH_COLLAPSE_LT);
+
+    if gpu_util_blocks_rule || gpu_busy_enough {
+        bullets.push("Batching is unlikely the dominant bottleneck for this snapshot.".to_string());
+    }
+
+    if bullets.is_empty() {
+        bullets
+            .push("See GPU and vLLM rows above; not enough context for these notes.".to_string());
+    }
+
+    bullets.into_iter().map(|s| format!("  - {s}")).collect()
 }
 
 const FIX_BOX_INNER_W: usize = 71;
@@ -255,9 +266,8 @@ pub fn format_issue(issue: &Issue) -> Vec<String> {
     lines.extend(issue.evidence.clone());
     lines.push(String::new());
     lines.push("DIAGNOSIS".to_string());
-    lines.push(
-        "Decode-heavy load is under-batching vs capacity; GPU stays relatively idle.".to_string(),
-    );
+    lines.push("  - Decode-heavy load is under-batching vs capacity.".to_string());
+    lines.push("  - GPU stays relatively idle.".to_string());
     lines.push(String::new());
     lines.push("CAUSE".to_string());
     lines.push("Continuous batching off or batch window too small for decode overlap.".to_string());
@@ -266,11 +276,7 @@ pub fn format_issue(issue: &Issue) -> Vec<String> {
     let border = format!("+{}+", "-".repeat(FIX_BOX_INNER_W));
     lines.push(border.clone());
     lines.push(padded_box_line(
-        "Enable continuous batching + ~15ms batch window",
-        FIX_BOX_INNER_W,
-    ));
-    lines.push(padded_box_line(
-        "Typical: +40-60% tokens/s (A100/H100-class, workload-dependent)",
+        "Enable continuous batching or increase batch window",
         FIX_BOX_INNER_W,
     ));
     lines.push(border);
@@ -399,7 +405,7 @@ mod tests {
     }
 
     #[test]
-    fn format_rule1_diagnose_miss_shows_three_metrics_and_hence() {
+    fn format_rule1_diagnose_miss_shows_bullets_only() {
         let t = SystemTime::UNIX_EPOCH;
         let mut g = pass_gpu();
         g.gpu_util_pct = Some(70.0);
@@ -407,10 +413,15 @@ mod tests {
         let lines = format_rule1_diagnose(&s);
         let text = lines.join("\n");
         assert!(text.contains("not triggered"));
-        assert!(text.contains("mean running (window):"));
-        assert!(text.contains("GPU util:"));
-        assert!(text.contains("waiting:"));
-        assert!(text.contains("Hence:"));
-        assert!(text.contains("GPU util 70%"));
+        assert!(!text.contains("Summary:"));
+        assert!(lines.iter().filter(|l| l.starts_with("  - ")).count() >= 3);
+        assert!(text.contains("  - Batch capacity 256"));
+        assert!(text.contains("  - GPU ~70%"));
+        assert!(text.contains("  - Batching is unlikely the dominant bottleneck"));
+        assert_eq!(lines.len(), 4);
+        assert!(!text.contains("Hence:"));
+        assert!(!text.contains("mean running"));
+        assert!(!text.contains("TOP ISSUES"));
+        assert!(!text.contains("TUNING NOTES"));
     }
 }
