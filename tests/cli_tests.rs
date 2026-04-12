@@ -153,6 +153,10 @@ fn diagnose_exits_success() {
         "stdout should include rule 1 fired or not-triggered title; got:\n{out}"
     );
     assert!(
+        out.contains("KV Cache Pressure"),
+        "stdout should include rule 2 (KV cache pressure) section; got:\n{out}"
+    );
+    assert!(
         out.lines().any(|l| l.starts_with('+') && l.ends_with('+')),
         "stdout should be ASCII-boxed; got:\n{out}"
     );

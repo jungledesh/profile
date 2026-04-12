@@ -1,4 +1,4 @@
-//! `diagnose` subcommand: render snapshot as a boxed table (metrics + rule 1 diagnose block).
+//! `diagnose` subcommand: render snapshot as a boxed table (metrics + rule diagnose blocks).
 //!
 //! Layout: **GPU =>** (NVML); **vLLM:** REQUESTS / LATENCY / PROMPT / THROUGHPUT rows (aligned labels).
 
@@ -46,7 +46,7 @@ fn build_diagnose_lines(snapshot: &RawSnapshot) -> Vec<String> {
     lines.push(vllm_label_row("THROUGHPUT", &vllm_throughput_value(v)));
 
     lines.push(String::new());
-    lines.extend(engine::format_rule1_diagnose(snapshot));
+    lines.extend(engine::format_diagnose_rules(snapshot));
 
     lines
 }
