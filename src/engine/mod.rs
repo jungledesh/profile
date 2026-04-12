@@ -7,11 +7,11 @@ use crate::collectors::RawSnapshot;
 /// Correlation gate: GPU vs vLLM observation times must be close.
 const MAX_OBSERVATION_SKEW_SECS: f64 = 1.0;
 /// Rule 1: fire only when NVML GPU util is strictly below this (percent).
-const UNDER_BATCHING_GPU_UTIL_LT: f64 = 70.0;
+const UNDER_BATCHING_GPU_UTIL_LT: f64 = 62.0;
 /// Minimum mean `num_requests_running` (window) so we do not fire on an idle server.
-const UNDER_BATCHING_RUNNING_GT: f64 = 0.5;
-/// Mean running must stay strictly below this fraction of `max_num_seqs` to fire.
-const UNDER_BATCHING_OCCUPANCY_FRAC: f64 = 0.15;
+const UNDER_BATCHING_RUNNING_GT: f64 = 0.75;
+/// Mean running must stay strictly below this fraction of `max_num_seqs` to fire (8% — primary cap).
+const UNDER_BATCHING_OCCUPANCY_FRAC: f64 = 0.08;
 /// Fire only when mean waiting is strictly below this (no backlog).
 const UNDER_BATCHING_WAITING_LT: f64 = 2.0;
 
@@ -158,22 +158,22 @@ fn format_under_batching_fired(d: &UnderBatchingDetail) -> Vec<String> {
     vec![
         "ISSUE: Under-batching Detected".to_string(),
         format!(
-            "Cause: Very low scheduler occupancy — {:.1} running requests vs max_num_seqs = {} ({:.1}% utilization)",
+            "Cause: Very low scheduler occupancy — {:.1} running requests vs max_num_seqs = {} ({:.1}%)",
             d.running, d.max_num_seqs, pct
         ),
         format!(
-            "       GPU utilization only {:.1}% with significant headroom remaining",
+            "       GPU utilization only {:.1}% with large unused capacity",
             d.gpu_util
         ),
         String::new(),
         "Recommendation:".to_string(),
-        "  • Increase request concurrency (more clients or higher QPS)".to_string(),
+        "  • Increase client concurrency or request rate to better utilize the GPU".to_string(),
         "  • Consider raising max_num_seqs if it is currently limited".to_string(),
-        "  • Verify continuous batching is enabled".to_string(),
+        "  • Verify continuous batching is properly enabled".to_string(),
         String::new(),
-        "Expected Impact: Often material throughput gains (commonly 2–6x in decode-heavy workloads)"
+        "Expected Impact: Can significantly improve throughput when scheduler occupancy is the bottleneck"
             .to_string(),
-        "Confidence: High".to_string(),
+        "Confidence: Medium-High".to_string(),
     ]
 }
 
@@ -209,7 +209,7 @@ mod tests {
 
     fn gpu_low() -> GpuRawMetrics {
         GpuRawMetrics {
-            gpu_util_pct: Some(62.0),
+            gpu_util_pct: Some(58.0),
             ..Default::default()
         }
     }
@@ -217,7 +217,7 @@ mod tests {
     #[test]
     fn under_batching_fires_when_gates_pass() {
         let t = SystemTime::UNIX_EPOCH;
-        // 3.1 < 0.15 * 256 = 38.4, gpu 62 < 70, wait 0 < 2, running > 0.5
+        // 3.1 < 0.08 * 256 = 20.48, gpu 58 < 62, wait 0 < 2, running > 0.75
         let s = snap(t, t, vllm_base(), gpu_low());
         let issues = evaluate_issues(&s);
         assert_eq!(issues.len(), 1);
@@ -226,7 +226,7 @@ mod tests {
             Rule1Outcome::Fired(d) => {
                 assert!((d.running - 3.1).abs() < 1e-9);
                 assert_eq!(d.max_num_seqs, 256);
-                assert!((d.gpu_util - 62.0).abs() < 1e-9);
+                assert!((d.gpu_util - 58.0).abs() < 1e-9);
             }
             Rule1Outcome::NotFired(_) => panic!("expected fired"),
         }
@@ -262,7 +262,16 @@ mod tests {
     fn running_at_floor_suppresses() {
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
-        v.num_requests_running = Some(0.5);
+        v.num_requests_running = Some(0.75);
+        let s = snap(t, t, v, gpu_low());
+        assert!(evaluate_issues(&s).is_empty());
+    }
+
+    #[test]
+    fn running_below_activity_floor_suppresses() {
+        let t = SystemTime::UNIX_EPOCH;
+        let mut v = vllm_base();
+        v.num_requests_running = Some(0.6);
         let s = snap(t, t, v, gpu_low());
         assert!(evaluate_issues(&s).is_empty());
     }
@@ -271,16 +280,26 @@ mod tests {
     fn high_occupancy_suppresses() {
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
-        v.num_requests_running = Some(40.0); // >= 15% of 256
+        v.num_requests_running = Some(40.0); // >= 8% of 256
         let s = snap(t, t, v, gpu_low());
         assert!(evaluate_issues(&s).is_empty());
     }
 
     #[test]
-    fn gpu_seventy_suppresses() {
+    fn occupancy_at_eight_percent_cap_suppresses() {
+        let t = SystemTime::UNIX_EPOCH;
+        let mut v = vllm_base();
+        // 8% * 256 = 20.48 — must be strictly below to fire
+        v.num_requests_running = Some(21.0);
+        let s = snap(t, t, v, gpu_low());
+        assert!(evaluate_issues(&s).is_empty());
+    }
+
+    #[test]
+    fn gpu_sixty_two_suppresses() {
         let t = SystemTime::UNIX_EPOCH;
         let mut g = gpu_low();
-        g.gpu_util_pct = Some(70.0);
+        g.gpu_util_pct = Some(62.0);
         let s = snap(t, t, vllm_base(), g);
         assert!(evaluate_issues(&s).is_empty());
     }
@@ -313,9 +332,11 @@ mod tests {
         assert!(text.contains("Very low scheduler occupancy"));
         assert!(text.contains("3.1 running requests"));
         assert!(text.contains("max_num_seqs = 256"));
-        assert!(text.contains("GPU utilization only 62.0%"));
+        assert!(text.contains("GPU utilization only 58.0% with large unused capacity"));
         assert!(text.contains("Recommendation:"));
-        assert!(text.contains("Confidence: High"));
+        assert!(text.contains("continuous batching is properly enabled"));
+        assert!(text.contains("scheduler occupancy is the bottleneck"));
+        assert!(text.contains("Confidence: Medium-High"));
     }
 
     #[test]
