@@ -1,6 +1,6 @@
 //! `diagnose` subcommand: render snapshot as a boxed table (metrics + rule diagnose blocks).
 //!
-//! Layout: **GPU =>** (NVML); **vLLM:** REQUESTS / LATENCY / PROMPT / THROUGHPUT rows (aligned labels).
+//! Layout: **GPU =>** (NVML) and **vLLM** section share the same label-column width as REQUESTS / LATENCY / PROMPT / THROUGHPUT.
 
 use crate::collectors::{GpuRawMetrics, RawSnapshot, VllmRawMetrics};
 use crate::engine;
@@ -41,9 +41,15 @@ fn build_diagnose_lines(snapshot: &RawSnapshot, verbose_rules: bool) -> Vec<Stri
         gpu_label
     )];
 
-    lines.push(format!("GPU => {}", gpu_gauges_line(g)));
+    lines.push(format!(
+        "{:<width$}{}{}",
+        "GPU =>",
+        VLLM_LABEL_METRICS_GAP,
+        gpu_gauges_line(g),
+        width = VLLM_LABEL_W
+    ));
     lines.push(String::new());
-    lines.push("vLLM:".to_string());
+    lines.push(vllm_label_row("vLLM:", ""));
     lines.push(vllm_label_row("REQUESTS", &vllm_requests_value(v)));
     lines.push(vllm_label_row("LATENCY", &vllm_latency_value(v)));
     lines.push(vllm_label_row("PROMPT", &vllm_prompt_value(v)));

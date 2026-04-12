@@ -1,5 +1,6 @@
 //! Rule evaluation on [`crate::collectors::RawSnapshot`] (no network in this module).
-//! Rules: under-batching (NVML + vLLM), KV cache pressure (vLLM gauge + optional NVML VRAM).
+//! Rules: under-batching (NVML + vLLM), KV cache pressure (vLLM + optional NVML VRAM),
+//! low prefix-cache reuse (vLLM Δ window).
 
 use std::time::SystemTime;
 
@@ -20,6 +21,13 @@ const UNDER_BATCHING_WAITING_LT: f64 = 2.0;
 const KV_CACHE_PRESSURE_MIN_PERC: f64 = 85.0;
 /// Rule 2: device VRAM % at or above this corroborates KV pressure when NVML data exists.
 const KV_PRESSURE_VRAM_CORROBORATE_MIN_PERC: f64 = 78.0;
+
+/// Rule 3: fire when prefix hit rate (fraction 0–1) is strictly below this (35%).
+const PREFIX_HIT_RATE_LT: f64 = 0.35;
+/// Rule 3: mean prompt tokens at or above this so low hit rate is plausibly actionable.
+const PREFIX_RULE_PROMPT_TOKENS_GTE: f64 = 20.0;
+/// Rule 3: same activity floor as Rule 1 — skip when the server is effectively idle.
+const PREFIX_RULE_RUNNING_GT: f64 = 0.75;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Issue {
@@ -43,6 +51,14 @@ pub struct KvCachePressureDetail {
     pub vram_usage_perc_corroborated: Option<f64>,
 }
 
+/// Values that triggered rule 3 (low prefix cache reuse in the scrape window).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LowPrefixReuseDetail {
+    /// Prefix hit rate in \[0, 1\] from Δhits/Δqueries over the collector window.
+    pub hit_rate: f64,
+    pub prompt_tokens_mean: f64,
+}
+
 pub fn evaluate_issues(snapshot: &RawSnapshot) -> Vec<Issue> {
     let mut issues = Vec::new();
     if let Rule1Outcome::Fired(d) = rule1_under_batching(snapshot) {
@@ -50,6 +66,9 @@ pub fn evaluate_issues(snapshot: &RawSnapshot) -> Vec<Issue> {
     }
     if let Rule2Outcome::Fired(d) = rule2_kv_cache_pressure(snapshot) {
         issues.push(issue_from_kv_cache_pressure(&d));
+    }
+    if let Rule3Outcome::Fired(d) = rule3_low_prefix_reuse(snapshot) {
+        issues.push(issue_from_low_prefix_reuse(&d));
     }
     issues
 }
@@ -60,6 +79,17 @@ fn issue_from_under_batching(d: &UnderBatchingDetail) -> Issue {
         evidence: vec![format!(
             "Under-batching: {:.1} running / max_num_seqs {} | GPU {:.1}%",
             d.running, d.max_num_seqs, d.gpu_util
+        )],
+    }
+}
+
+fn issue_from_low_prefix_reuse(d: &LowPrefixReuseDetail) -> Issue {
+    Issue {
+        confidence: 0.85,
+        evidence: vec![format!(
+            "Low prefix cache hit rate: {:.1}% | mean prompt {:.1} tok",
+            d.hit_rate * 100.0,
+            d.prompt_tokens_mean
         )],
     }
 }
@@ -111,6 +141,13 @@ pub struct Rule2MissReport {
     pub kv_cache_usage_perc: Option<f64>,
 }
 
+/// Rule 3: low prefix-cache hit rate in the `/metrics` window.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Rule3Outcome {
+    Fired(LowPrefixReuseDetail),
+    NotFired,
+}
+
 const NO_ISSUES_LINE: &str = "No issues detected in this snapshot.";
 
 /// Diagnose lines for rules. Emits `ISSUE:` blocks when rules fire (blank line between two issues).
@@ -119,7 +156,10 @@ const NO_ISSUES_LINE: &str = "No issues detected in this snapshot.";
 pub fn format_diagnose_rules(snapshot: &RawSnapshot, verbose_rules: bool) -> Vec<String> {
     let r1 = rule1_under_batching(snapshot);
     let r2 = rule2_kv_cache_pressure(snapshot);
-    let any_issue = matches!(r1, Rule1Outcome::Fired(_)) || matches!(r2, Rule2Outcome::Fired(_));
+    let r3 = rule3_low_prefix_reuse(snapshot);
+    let any_issue = matches!(r1, Rule1Outcome::Fired(_))
+        || matches!(r2, Rule2Outcome::Fired(_))
+        || matches!(r3, Rule3Outcome::Fired(_));
 
     let mut out = Vec::new();
     let mut append = |block: Vec<String>| {
@@ -143,6 +183,12 @@ pub fn format_diagnose_rules(snapshot: &RawSnapshot, verbose_rules: bool) -> Vec
             append(vec!["KV cache pressure: not indicated".to_string()])
         }
         Rule2Outcome::NotFired(_) => {}
+    }
+
+    match &r3 {
+        Rule3Outcome::Fired(d) => append(format_low_prefix_hit_rate_fired(d)),
+        Rule3Outcome::NotFired if verbose_rules => append(format_rule3_verbose_miss(snapshot)),
+        Rule3Outcome::NotFired => {}
     }
 
     if !any_issue {
@@ -234,6 +280,38 @@ pub fn rule2_kv_cache_pressure(snapshot: &RawSnapshot) -> Rule2Outcome {
     })
 }
 
+pub fn rule3_low_prefix_reuse(snapshot: &RawSnapshot) -> Rule3Outcome {
+    let v = &snapshot.vllm;
+    let rate = v.prefix_cache_hit_rate.filter(|x| x.is_finite());
+    let running = v.num_requests_running.filter(|x| x.is_finite());
+    let prompt_mean = v.prompt_tokens_mean.filter(|x| x.is_finite());
+
+    let Some(hit_rate) = rate else {
+        return Rule3Outcome::NotFired;
+    };
+    let Some(rv) = running else {
+        return Rule3Outcome::NotFired;
+    };
+    let Some(pm) = prompt_mean else {
+        return Rule3Outcome::NotFired;
+    };
+
+    if rv <= PREFIX_RULE_RUNNING_GT {
+        return Rule3Outcome::NotFired;
+    }
+    if pm < PREFIX_RULE_PROMPT_TOKENS_GTE {
+        return Rule3Outcome::NotFired;
+    }
+    if hit_rate >= PREFIX_HIT_RATE_LT {
+        return Rule3Outcome::NotFired;
+    }
+
+    Rule3Outcome::Fired(LowPrefixReuseDetail {
+        hit_rate,
+        prompt_tokens_mean: pm,
+    })
+}
+
 fn vram_usage_perc(gpu: &GpuRawMetrics) -> Option<f64> {
     match (gpu.vram_used_mb, gpu.vram_total_mb) {
         (Some(used), Some(total)) if total > 0 => {
@@ -242,6 +320,39 @@ fn vram_usage_perc(gpu: &GpuRawMetrics) -> Option<f64> {
         }
         _ => None,
     }
+}
+
+/// Verbose-only lines when Rule 3 does not fire. Full “Rule:” block only when hit rate ≥ threshold
+/// (healthy on that axis); otherwise one line so we do not imply “effective” when rate is low but gated.
+fn format_rule3_verbose_miss(snapshot: &RawSnapshot) -> Vec<String> {
+    let v = &snapshot.vllm;
+    let Some(hr) = v.prefix_cache_hit_rate.filter(|x| x.is_finite()) else {
+        return vec!["Prefix cache hit rate: not indicated".to_string()];
+    };
+    let pct = hr * 100.0;
+    if hr >= PREFIX_HIT_RATE_LT {
+        vec![
+            "Rule: Low Prefix Cache Hit Rate — Not triggered".to_string(),
+            format!("  - Prefix cache hit rate {pct:.1}% — working effectively"),
+        ]
+    } else {
+        vec!["Prefix cache hit rate: not indicated".to_string()]
+    }
+}
+
+fn format_low_prefix_hit_rate_fired(d: &LowPrefixReuseDetail) -> Vec<String> {
+    let pct = d.hit_rate * 100.0;
+    vec![
+        "ISSUE: Low Prefix Cache Hit Rate".to_string(),
+        format!("Cause: Low prefix cache hit rate ({pct:.1}%) — limited reuse detected"),
+        String::new(),
+        "Recommendation:".to_string(),
+        "  • Enable --enable-prefix-caching if disabled".to_string(),
+        "  • Review prompt structure for better reuse opportunities".to_string(),
+        String::new(),
+        "Expected Impact: Can significantly reduce prefill time".to_string(),
+        "Confidence: Medium-High".to_string(),
+    ]
 }
 
 fn format_kv_cache_pressure_fired(d: &KvCachePressureDetail) -> Vec<String> {
@@ -260,7 +371,7 @@ fn format_kv_cache_pressure_fired(d: &KvCachePressureDetail) -> Vec<String> {
     lines.push("  • Enable prefix caching".to_string());
     lines.push("  • Consider fp8 KV cache".to_string());
     lines.push(String::new());
-    lines.push("Expected Impact: 20–45% better throughput possible".to_string());
+    lines.push("Expected Impact: Often 20–45% more throughput".to_string());
     let conf = if d.vram_usage_perc_corroborated.is_some() {
         "Confidence: High"
     } else {
@@ -301,16 +412,16 @@ fn format_under_batching_fired(d: &UnderBatchingDetail) -> Vec<String> {
     vec![
         "ISSUE: Under-batching Detected".to_string(),
         format!(
-            "Cause: Very low scheduler occupancy — {run_s} running vs {} max ({pct:.1}%)",
+            "Cause: Very low scheduler occupancy — {run_s} running requests vs max_num_seqs = {} ({pct:.1}%)",
             d.max_num_seqs,
         ),
-        format!("       GPU only {gpu_s}% with large headroom"),
+        format!("       GPU utilization only {gpu_s}% with large unused capacity"),
         String::new(),
         "Recommendation:".to_string(),
         "  • Increase concurrency or request rate".to_string(),
         "  • Consider raising max_num_seqs".to_string(),
         String::new(),
-        "Expected Impact: Can significantly improve throughput".to_string(),
+        "Expected Impact: Better throughput likely".to_string(),
         "Confidence: Medium-High".to_string(),
     ]
 }
@@ -476,12 +587,12 @@ mod tests {
         let text = lines.join("\n");
         assert!(text.contains("ISSUE: Under-batching Detected"));
         assert!(text.contains("Very low scheduler occupancy"));
-        assert!(text.contains("running vs 256 max"));
-        assert!(text.contains("GPU only 58% with large headroom"));
+        assert!(text.contains("3.1 running requests vs max_num_seqs = 256"));
+        assert!(text.contains("GPU utilization only 58% with large unused capacity"));
         assert!(text.contains("Recommendation:"));
         assert!(text.contains("Increase concurrency or request rate"));
         assert!(text.contains("Consider raising max_num_seqs"));
-        assert!(text.contains("Expected Impact: Can significantly improve throughput"));
+        assert!(text.contains("Expected Impact: Better throughput likely"));
         assert!(text.contains("Confidence: Medium-High"));
     }
 
@@ -494,6 +605,7 @@ mod tests {
         let text = format_diagnose_rules(&s, true).join("\n");
         assert!(text.contains("Under-batching: not indicated"));
         assert!(text.contains("KV cache pressure: not indicated"));
+        assert!(text.contains("Prefix cache hit rate: not indicated"));
         assert!(text.contains("No issues detected in this snapshot."));
     }
 
@@ -549,6 +661,7 @@ mod tests {
         let text = format_diagnose_rules(&s, true).join("\n");
         assert!(text.contains("Under-batching: not indicated"));
         assert!(text.contains("KV cache pressure: not indicated"));
+        assert!(text.contains("Prefix cache hit rate: not indicated"));
         assert!(text.ends_with("No issues detected in this snapshot."));
     }
 
@@ -572,7 +685,7 @@ mod tests {
         let s_kv_only = snap(t, t, vllm_high_kv(), gb);
         let text = format_diagnose_rules(&s_kv_only, false).join("\n");
         assert!(text.contains("Device VRAM also elevated at 78.0%"));
-        assert!(text.contains("20–45% better throughput possible"));
+        assert!(text.contains("Often 20–45% more throughput"));
         assert!(text.contains("Confidence: High"));
     }
 
@@ -599,7 +712,79 @@ mod tests {
         let s = snap(t, t, vllm_base(), gpu_busy());
         let text = format_diagnose_rules(&s, true).join("\n");
         assert!(text.contains("KV cache pressure: not indicated"));
+        assert!(text.contains("Prefix cache hit rate: not indicated"));
         assert!(text.contains("No issues detected in this snapshot."));
+    }
+
+    #[test]
+    fn rule3_fires_when_hit_below_35_and_gates_pass() {
+        let t = SystemTime::UNIX_EPOCH;
+        let mut v = vllm_base();
+        v.prefix_cache_hit_rate = Some(0.34);
+        v.prompt_tokens_mean = Some(25.0);
+        v.num_requests_running = Some(1.0);
+        let s = snap(t, t, v, gpu_busy());
+        match rule3_low_prefix_reuse(&s) {
+            Rule3Outcome::Fired(d) => {
+                assert!((d.hit_rate - 0.34).abs() < 1e-9);
+                assert!((d.prompt_tokens_mean - 25.0).abs() < 1e-9);
+            }
+            Rule3Outcome::NotFired => panic!("expected fired"),
+        }
+        let issues = evaluate_issues(&s);
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].evidence[0].contains("Low prefix cache hit rate"));
+    }
+
+    #[test]
+    fn rule3_suppressed_at_or_above_35() {
+        let t = SystemTime::UNIX_EPOCH;
+        let mut v = vllm_base();
+        v.prefix_cache_hit_rate = Some(0.35);
+        v.prompt_tokens_mean = Some(25.0);
+        v.num_requests_running = Some(1.0);
+        let s = snap(t, t, v, gpu_busy());
+        assert!(matches!(rule3_low_prefix_reuse(&s), Rule3Outcome::NotFired));
+    }
+
+    #[test]
+    fn format_low_prefix_hit_rate_fired_matches_template() {
+        let d = LowPrefixReuseDetail {
+            hit_rate: 0.24,
+            prompt_tokens_mean: 128.0,
+        };
+        let lines = format_low_prefix_hit_rate_fired(&d);
+        let text = lines.join("\n");
+        assert!(text.contains("ISSUE: Low Prefix Cache Hit Rate"));
+        assert!(text.contains("Cause: Low prefix cache hit rate (24.0%) — limited reuse detected"));
+        assert!(text.contains("Enable --enable-prefix-caching if disabled"));
+        assert!(text.contains("Review prompt structure for better reuse opportunities"));
+        assert!(text.contains("Expected Impact: Can significantly reduce prefill time"));
+        assert!(text.contains("Confidence: Medium-High"));
+    }
+
+    #[test]
+    fn format_diagnose_rule3_verbose_working_effectively_when_rate_healthy() {
+        let t = SystemTime::UNIX_EPOCH;
+        let mut v = vllm_base();
+        v.prefix_cache_hit_rate = Some(0.50);
+        let s = snap(t, t, v, gpu_busy());
+        let text = format_diagnose_rules(&s, true).join("\n");
+        assert!(text.contains("Rule: Low Prefix Cache Hit Rate — Not triggered"));
+        assert!(text.contains("  - Prefix cache hit rate 50.0% — working effectively"));
+    }
+
+    #[test]
+    fn format_diagnose_rule3_verbose_not_indicated_when_rate_low_but_idle() {
+        let t = SystemTime::UNIX_EPOCH;
+        let mut v = vllm_base();
+        v.prefix_cache_hit_rate = Some(0.20);
+        v.num_requests_running = Some(0.5);
+        v.prompt_tokens_mean = Some(100.0);
+        let s = snap(t, t, v, gpu_busy());
+        let text = format_diagnose_rules(&s, true).join("\n");
+        assert!(text.contains("Prefix cache hit rate: not indicated"));
+        assert!(!text.contains("working effectively"));
     }
 
     #[test]
