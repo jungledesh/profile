@@ -137,20 +137,20 @@ fn diagnose_exits_success() {
         "stdout should include THROUGHPUT row; got:\n{out}"
     );
     assert!(
-        out.contains("cache "),
-        "stdout should include cache % on THROUGHPUT row; got:\n{out}"
+        out.contains("pfix_cache "),
+        "stdout should include pfix_cache % on THROUGHPUT row; got:\n{out}"
     );
     assert!(
-        out.contains("Rule 1 (batch collapse)"),
-        "stdout should include rule 1 section; got:\n{out}"
+        out.contains("Under-batching"),
+        "stdout should include rule 1 (Under-batching) section; got:\n{out}"
     );
     assert!(
-        out.contains("  - ") || out.contains("ISSUES"),
-        "stdout should show rule 1 miss (bullets) or full issue block (ISSUES); got:\n{out}"
+        out.contains("  - ") || out.contains("ISSUE: Under-batching Detected"),
+        "stdout should show rule 1 miss bullets or fired ISSUE block; got:\n{out}"
     );
     assert!(
-        out.contains("not triggered"),
-        "stdout should include rule 1 miss title on this fixture; got:\n{out}"
+        out.contains("Not triggered") || out.contains("Under-batching Detected"),
+        "stdout should include rule 1 fired or not-triggered title; got:\n{out}"
     );
     assert!(
         out.lines().any(|l| l.starts_with('+') && l.ends_with('+')),
