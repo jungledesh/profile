@@ -109,8 +109,8 @@ fn diagnose_exits_success() {
 
     let out = String::from_utf8_lossy(&output.stdout).into_owned();
     assert!(
-        out.contains("PROFILE v") && out.contains('['),
-        "stdout should show PROFILE header with model/GPU brackets; got:\n{out}"
+        out.contains("PROFILE v") && out.contains('[') && out.contains(" UTC]"),
+        "stdout should show PROFILE header with model/GPU and bracketed UTC timestamp; got:\n{out}"
     );
     assert!(
         out.contains("GPU =>") && out.contains("UTIL"),
