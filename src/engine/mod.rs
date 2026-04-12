@@ -111,16 +111,15 @@ pub struct Rule2MissReport {
     pub kv_cache_usage_perc: Option<f64>,
 }
 
-/// Diagnose lines for rules. With `verbose_rules`, emits one calm line per rule when it does not fire.
-/// Without verbose, emits nothing if no rule fires; otherwise only `ISSUE:` blocks (blank line between two issues).
+const NO_ISSUES_LINE: &str = "No issues detected in this snapshot.";
+
+/// Diagnose lines for rules. Emits `ISSUE:` blocks when rules fire (blank line between two issues).
+/// With `verbose_rules`, also emits one calm line per rule that did not fire.
+/// When nothing fires, ends with [`NO_ISSUES_LINE`].
 pub fn format_diagnose_rules(snapshot: &RawSnapshot, verbose_rules: bool) -> Vec<String> {
     let r1 = rule1_under_batching(snapshot);
     let r2 = rule2_kv_cache_pressure(snapshot);
     let any_issue = matches!(r1, Rule1Outcome::Fired(_)) || matches!(r2, Rule2Outcome::Fired(_));
-
-    if !verbose_rules && !any_issue {
-        return Vec::new();
-    }
 
     let mut out = Vec::new();
     let mut append = |block: Vec<String>| {
@@ -144,6 +143,13 @@ pub fn format_diagnose_rules(snapshot: &RawSnapshot, verbose_rules: bool) -> Vec
             append(vec!["KV cache pressure: not indicated".to_string()])
         }
         Rule2Outcome::NotFired(_) => {}
+    }
+
+    if !any_issue {
+        if !out.is_empty() {
+            out.push(String::new());
+        }
+        out.push(NO_ISSUES_LINE.to_string());
     }
 
     out
@@ -488,6 +494,7 @@ mod tests {
         let text = format_diagnose_rules(&s, true).join("\n");
         assert!(text.contains("Under-batching: not indicated"));
         assert!(text.contains("KV cache pressure: not indicated"));
+        assert!(text.contains("No issues detected in this snapshot."));
     }
 
     fn vllm_high_kv() -> VllmRawMetrics {
@@ -542,6 +549,7 @@ mod tests {
         let text = format_diagnose_rules(&s, true).join("\n");
         assert!(text.contains("Under-batching: not indicated"));
         assert!(text.contains("KV cache pressure: not indicated"));
+        assert!(text.ends_with("No issues detected in this snapshot."));
     }
 
     #[test]
@@ -587,9 +595,24 @@ mod tests {
     #[test]
     fn kv_cache_miss_unavailable_without_gauge_verbose() {
         let t = SystemTime::UNIX_EPOCH;
-        let s = snap(t, t, vllm_base(), gpu_low());
+        // gpu_busy: Rule 1 must not fire; no KV gauge: Rule 2 miss — then verbose + no-issues line.
+        let s = snap(t, t, vllm_base(), gpu_busy());
         let text = format_diagnose_rules(&s, true).join("\n");
         assert!(text.contains("KV cache pressure: not indicated"));
+        assert!(text.contains("No issues detected in this snapshot."));
+    }
+
+    #[test]
+    fn format_diagnose_rules_no_fires_default_is_only_no_issues_line() {
+        let t = SystemTime::UNIX_EPOCH;
+        let mut g = gpu_low();
+        g.gpu_util_pct = Some(75.0);
+        let s = snap(t, t, vllm_base(), g);
+        let lines = format_diagnose_rules(&s, false);
+        assert_eq!(
+            lines,
+            vec!["No issues detected in this snapshot.".to_string()]
+        );
     }
 
     #[test]
@@ -624,6 +647,10 @@ mod tests {
         assert!(
             between.iter().any(|l| l.is_empty()),
             "expected blank line between rule blocks: {between:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("No issues detected")),
+            "should not append no-issues line when at least one rule fired"
         );
     }
 }
