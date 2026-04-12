@@ -8,11 +8,11 @@ use crate::collectors::{GpuRawMetrics, RawSnapshot};
 /// Correlation gate: GPU vs vLLM observation times must be close.
 const MAX_OBSERVATION_SKEW_SECS: f64 = 1.0;
 /// Rule 1: fire only when NVML GPU util is strictly below this (percent).
-const UNDER_BATCHING_GPU_UTIL_LT: f64 = 62.0;
+const UNDER_BATCHING_GPU_UTIL_LT: f64 = 60.0;
 /// Minimum mean `num_requests_running` (window) so we do not fire on an idle server.
 const UNDER_BATCHING_RUNNING_GT: f64 = 0.75;
-/// Mean running must stay strictly below this fraction of `max_num_seqs` to fire (8% — primary cap).
-const UNDER_BATCHING_OCCUPANCY_FRAC: f64 = 0.08;
+/// Mean running must stay strictly below this fraction of `max_num_seqs` to fire (5% — primary cap).
+const UNDER_BATCHING_OCCUPANCY_FRAC: f64 = 0.05;
 /// Fire only when mean waiting is strictly below this (no backlog).
 const UNDER_BATCHING_WAITING_LT: f64 = 2.0;
 
@@ -378,7 +378,7 @@ mod tests {
     #[test]
     fn under_batching_fires_when_gates_pass() {
         let t = SystemTime::UNIX_EPOCH;
-        // 3.1 < 0.08 * 256 = 20.48, gpu 58 < 62, wait 0 < 2, running > 0.75
+        // 3.1 < 0.05 * 256 = 12.8, gpu 58 < 60, wait 0 < 2, running > 0.75
         let s = snap(t, t, vllm_base(), gpu_low());
         let issues = evaluate_issues(&s);
         assert_eq!(issues.len(), 1);
@@ -441,26 +441,26 @@ mod tests {
     fn high_occupancy_suppresses() {
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
-        v.num_requests_running = Some(40.0); // >= 8% of 256
+        v.num_requests_running = Some(40.0); // well above 5% of 256
         let s = snap(t, t, v, gpu_low());
         assert!(evaluate_issues(&s).is_empty());
     }
 
     #[test]
-    fn occupancy_at_eight_percent_cap_suppresses() {
+    fn occupancy_at_five_percent_cap_suppresses() {
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
-        // 8% * 256 = 20.48 — must be strictly below to fire
-        v.num_requests_running = Some(21.0);
+        // 5% * 256 = 12.8 — must be strictly below to fire
+        v.num_requests_running = Some(13.0);
         let s = snap(t, t, v, gpu_low());
         assert!(evaluate_issues(&s).is_empty());
     }
 
     #[test]
-    fn gpu_sixty_two_suppresses() {
+    fn gpu_sixty_percent_suppresses() {
         let t = SystemTime::UNIX_EPOCH;
         let mut g = gpu_low();
-        g.gpu_util_pct = Some(62.0);
+        g.gpu_util_pct = Some(60.0);
         let s = snap(t, t, vllm_base(), g);
         assert!(evaluate_issues(&s).is_empty());
     }
