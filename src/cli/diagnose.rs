@@ -1,4 +1,4 @@
-//! `diagnose` subcommand: render snapshot as a boxed table (metrics + rule 1 diagnose block).
+//! `diagnose` subcommand: render snapshot as a boxed table (metrics + rule diagnose blocks).
 //!
 //! Layout: **GPU =>** (NVML); **vLLM:** REQUESTS / LATENCY / PROMPT / THROUGHPUT rows (aligned labels).
 
@@ -10,20 +10,24 @@ use crate::profiler;
 const VLLM_LABEL_W: usize = 10;
 
 /// Space between label column and metric values (after `vLLM:` block labels).
-const VLLM_LABEL_METRICS_GAP: &str = "  ";
+const VLLM_LABEL_METRICS_GAP: &str = " ";
 
-pub fn execute(vllm_metrics_input: &str, max_num_seqs: u32) -> anyhow::Result<()> {
+pub fn execute(
+    vllm_metrics_input: &str,
+    max_num_seqs: u32,
+    verbose_rules: bool,
+) -> anyhow::Result<()> {
     let result = profiler::run_diagnose(vllm_metrics_input, max_num_seqs)?;
-    print_diagnose_table(&result.snapshot);
+    print_diagnose_table(&result.snapshot, verbose_rules);
     Ok(())
 }
 
-fn print_diagnose_table(snapshot: &RawSnapshot) {
-    let lines = build_diagnose_lines(snapshot);
+fn print_diagnose_table(snapshot: &RawSnapshot, verbose_rules: bool) {
+    let lines = build_diagnose_lines(snapshot, verbose_rules);
     print_boxed(&lines);
 }
 
-fn build_diagnose_lines(snapshot: &RawSnapshot) -> Vec<String> {
+fn build_diagnose_lines(snapshot: &RawSnapshot, verbose_rules: bool) -> Vec<String> {
     let v = &snapshot.vllm;
     let g = &snapshot.gpu;
 
@@ -45,8 +49,11 @@ fn build_diagnose_lines(snapshot: &RawSnapshot) -> Vec<String> {
     lines.push(vllm_label_row("PROMPT", &vllm_prompt_value(v)));
     lines.push(vllm_label_row("THROUGHPUT", &vllm_throughput_value(v)));
 
-    lines.push(String::new());
-    lines.extend(engine::format_rule1_diagnose(snapshot));
+    let rule_lines = engine::format_diagnose_rules(snapshot, verbose_rules);
+    if !rule_lines.is_empty() {
+        lines.push(String::new());
+        lines.extend(rule_lines);
+    }
 
     lines
 }
@@ -85,14 +92,10 @@ fn gpu_gauges_line(g: &GpuRawMetrics) -> String {
         .map(|u| format!("UTIL {:.1}%", u))
         .unwrap_or_else(|| "UTIL —".to_string());
 
-    let power = match (g.power_watts, g.power_limit_watts) {
-        (Some(draw), Some(limit)) if limit > 0.0 => {
-            let pct = (draw / limit) * 100.0;
-            format!("POWER {:.0}W ({:.0}%)", draw, pct)
-        }
-        (Some(draw), _) => format!("POWER {:.0}W", draw),
-        _ => "POWER —".to_string(),
-    };
+    let power = g
+        .power_watts
+        .map(|draw| format!("POWER {:.0}W", draw))
+        .unwrap_or_else(|| "POWER —".to_string());
 
     let mem = match (g.vram_used_mb, g.vram_total_mb) {
         (Some(used), Some(total)) if total > 0 => {
@@ -294,9 +297,9 @@ mod tests {
     fn vllm_label_row_aligns_labels_and_gap_before_metrics() {
         let line = vllm_label_row("REQUESTS", "run 2 | wait 1 | max 256");
         assert!(line.starts_with("REQUESTS"));
-        assert!(line.contains("  run 2"));
+        assert!(line.contains(" run 2"));
         let t = vllm_label_row("THROUGHPUT", "59 tok/s | pfix_cache 72.8%");
         assert!(t.starts_with("THROUGHPUT"));
-        assert!(t.contains("  59 tok/s"));
+        assert!(t.contains(" 59 tok/s"));
     }
 }

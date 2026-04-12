@@ -141,16 +141,12 @@ fn diagnose_exits_success() {
         "stdout should include pfix_cache % on THROUGHPUT row; got:\n{out}"
     );
     assert!(
-        out.contains("Under-batching"),
-        "stdout should include rule 1 (Under-batching) section; got:\n{out}"
+        out.contains("No issues detected in this snapshot."),
+        "default diagnose should report no issues when nothing fires; got:\n{out}"
     );
     assert!(
-        out.contains("  - ") || out.contains("ISSUE: Under-batching Detected"),
-        "stdout should show rule 1 miss bullets or fired ISSUE block; got:\n{out}"
-    );
-    assert!(
-        out.contains("Not triggered") || out.contains("Under-batching Detected"),
-        "stdout should include rule 1 fired or not-triggered title; got:\n{out}"
+        !out.contains("ISSUE:") && !out.contains("not indicated"),
+        "default diagnose should omit ISSUE and verbose-only lines; got:\n{out}"
     );
     assert!(
         out.lines().any(|l| l.starts_with('+') && l.ends_with('+')),
@@ -218,6 +214,31 @@ fn diagnose_gen_tok_per_sec_na_when_counter_resets() {
 }
 
 #[test]
+fn diagnose_verbose_shows_not_indicated_lines() {
+    let (url, server) = spawn_metrics_server(MINIMAL_SCRAPE, SAMPLE_COUNT);
+    let output = Command::cargo_bin("profile")
+        .unwrap()
+        .args(["-v", "diagnose", "--url"])
+        .arg(&url)
+        .output()
+        .expect("run profile -v diagnose");
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let out = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        out.contains("Under-batching: not indicated")
+            && out.contains("KV cache pressure: not indicated")
+            && out.contains("No issues detected in this snapshot."),
+        "expected verbose rule status lines and no-issues summary; got:\n{out}"
+    );
+    server.join().expect("metrics server thread");
+}
+
+#[test]
 fn diagnose_help_lists_usage_and_options() {
     let output = Command::cargo_bin("profile")
         .unwrap()
@@ -234,6 +255,7 @@ fn diagnose_help_lists_usage_and_options() {
     let out = String::from_utf8_lossy(&output.stdout).into_owned();
     for needle in [
         "Collects metrics. Detects inefficiencies. Suggests fixes.",
+        "Pass -v",
         "Usage: profile diagnose [OPTIONS]",
         "-u, --url",
         "vLLM metrics endpoint",
