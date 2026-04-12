@@ -69,10 +69,17 @@ python -m vllm.entrypoints.openai.api_server \
   --gpu-memory-utilization 0.8 \
   --tensor-parallel-size 1 \
   --enforce-eager \
+  --enable-prefix-caching \
   2>&1 | tee \"$LOG_FILE\"'"
 
 echo
 echo "vLLM running in tmux session '$TMUX_SESSION'"
 echo "Attach with: tmux attach -t $TMUX_SESSION"
+echo "Edit tests: vim $APP_DIR/test.sh"
 
-tail -f /dev/null
+# Interactive shell when stdin is a TTY (e.g. docker run -it); otherwise keep container alive.
+if [[ -t 0 ]]; then
+  exec bash -l
+else
+  tail -f /dev/null
+fi

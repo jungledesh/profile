@@ -1,14 +1,12 @@
 use std::sync::OnceLock;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use prometheus_parse::{Scrape, Value};
 
+use super::sampling::{SAMPLE_COUNT, SAMPLE_INTERVAL};
 use super::types::{PrefixCacheScrapeSample, VllmRawMetrics};
-
-const SAMPLE_COUNT: usize = 8;
-const SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 const REQ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// vLLM exposes metrics with a `vllm:` prefix. The `prometheus-parse` crate only accepts
@@ -309,7 +307,10 @@ fn max_num_seqs_from_gauge(scrape: &Scrape) -> Option<u32> {
 /// Fetch raw metrics from vLLM `/metrics` endpoint.
 ///
 /// `input` may be a server base URL (e.g. `http://localhost:8000`) or the full metrics URL.
-pub fn collect_vllm_metrics(input: &str) -> Result<VllmRawMetrics> {
+///
+/// Returns `(metrics, observed_at)` where `observed_at` is wall time immediately after the last
+/// successful scrape in the window (for correlating with GPU-side collection).
+pub fn collect_vllm_metrics(input: &str) -> Result<(VllmRawMetrics, SystemTime)> {
     let url = metrics_url(input);
     let mut running_samples = Vec::with_capacity(SAMPLE_COUNT);
     let mut waiting_samples = Vec::with_capacity(SAMPLE_COUNT);
@@ -356,7 +357,7 @@ pub fn collect_vllm_metrics(input: &str) -> Result<VllmRawMetrics> {
 
     apply_histogram_window(&first_scrape, &last_scrape, &mut m);
 
-    Ok(m)
+    Ok((m, SystemTime::now()))
 }
 
 fn parse_vllm_metrics(scrape: &Scrape) -> Result<VllmRawMetrics> {
@@ -479,9 +480,9 @@ vllm_num_requests_running 4
 vllm_num_requests_waiting 0
 vllm_max_num_seqs 256
 "#;
-        let bodies = [a, a, a, a, a, a, a, b];
-        let mut running = Vec::with_capacity(8);
-        let mut waiting = Vec::with_capacity(8);
+        let bodies = [a, a, a, a, a, a, a, a, b];
+        let mut running = Vec::with_capacity(9);
+        let mut waiting = Vec::with_capacity(9);
         let mut max_last = None;
         for (i, body) in bodies.iter().enumerate() {
             let scrape = scrape_from_body(body).unwrap();
@@ -491,8 +492,8 @@ vllm_max_num_seqs 256
                 max_last = max_num_seqs_from_gauge(&scrape);
             }
         }
-        assert!((mean_option(&running).unwrap() - 2.25).abs() < 1e-9);
-        assert!((mean_option(&waiting).unwrap() - 0.875).abs() < 1e-9);
+        assert!((mean_option(&running).unwrap() - 20.0 / 9.0).abs() < 1e-9);
+        assert!((mean_option(&waiting).unwrap() - 8.0 / 9.0).abs() < 1e-9);
         assert_eq!(max_last, Some(256));
     }
 

@@ -27,7 +27,7 @@ pub struct VllmRawMetrics {
     pub num_requests_waiting: Option<f64>,
     pub kv_cache_usage_perc: Option<f64>,
 
-    // Histograms: prefer Δsum/Δcount from **first** → **last** scrape (8th sample, ~2s apart);
+    // Histograms: prefer Δsum/Δcount from **first** → **last** scrape (9th sample, ~2s apart);
     // else cumulative mean from the last scrape.
     pub ttft_ms: Option<f64>,
     pub tpot_ms: Option<f64>,
@@ -42,7 +42,7 @@ pub struct VllmRawMetrics {
     pub generation_tokens_per_sec: Option<f64>,
     /// Prefix cache hit rate: `(Δhits)/(Δqueries)` over first→last scrape (internal + external).
     pub prefix_cache_hit_rate: Option<f64>,
-    /// Cumulative prefix counters per scrape (same order as collector: 8 × ~250ms).
+    /// Cumulative prefix counters per scrape (same order as collector: 9 × ~250ms).
     pub prefix_cache_scrape_samples: Vec<PrefixCacheScrapeSample>,
 
     // Not always available
@@ -86,6 +86,11 @@ pub struct GpuRawMetrics {
 
 #[derive(Debug, Clone)]
 pub struct RawSnapshot {
+    /// When the GPU collector finished its sampling window (last NVML poll).
+    pub gpu_observed_at: SystemTime,
+    /// When the vLLM collector finished its last `/metrics` scrape in the window.
+    pub vllm_observed_at: SystemTime,
+    /// When the snapshot was assembled after both collectors joined.
     pub timestamp: SystemTime,
     pub vllm: VllmRawMetrics,
     pub gpu: GpuRawMetrics,

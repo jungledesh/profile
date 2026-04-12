@@ -1,15 +1,14 @@
 use std::thread;
-use std::time::Duration;
+use std::time::SystemTime;
 
 use anyhow::Result;
 use nvml_wrapper::enum_wrappers::device::{Clock, ClockId, TemperatureSensor};
 use nvml_wrapper::Nvml;
 
+use super::sampling::{SAMPLE_COUNT, SAMPLE_INTERVAL};
 use super::GpuRawMetrics;
 
 const MIB: u64 = 1024 * 1024;
-const SAMPLE_COUNT: usize = 8;
-const SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Default)]
 struct GpuPoll {
@@ -86,12 +85,13 @@ fn aggregate_polls(polls: &[GpuPoll]) -> AggregatedPolls {
     }
 }
 
-pub fn collect_gpu_metrics() -> Result<GpuRawMetrics> {
+/// Returns `(metrics, observed_at)` after the last NVML poll in the sampling window.
+pub fn collect_gpu_metrics() -> Result<(GpuRawMetrics, SystemTime)> {
     let Ok(nvml) = Nvml::init() else {
-        return Ok(GpuRawMetrics::default());
+        return Ok((GpuRawMetrics::default(), SystemTime::now()));
     };
     let Ok(device) = nvml.device_by_index(0) else {
-        return Ok(GpuRawMetrics::default());
+        return Ok((GpuRawMetrics::default(), SystemTime::now()));
     };
 
     let gpu_name = device.name().ok();
@@ -138,19 +138,22 @@ pub fn collect_gpu_metrics() -> Result<GpuRawMetrics> {
 
     let agg = aggregate_polls(&polls);
 
-    Ok(GpuRawMetrics {
-        gpu_name,
-        gpu_index,
-        gpu_uuid,
-        gpu_util_pct: agg.gpu_util_pct,
-        mem_util_pct: agg.mem_util_pct,
-        power_watts: agg.power_watts,
-        power_limit_watts,
-        vram_used_mb: agg.vram_used_mb,
-        vram_total_mb: agg.vram_total_mb,
-        temperature_c: agg.temperature_c,
-        sm_clock_mhz: agg.sm_clock_mhz,
-    })
+    Ok((
+        GpuRawMetrics {
+            gpu_name,
+            gpu_index,
+            gpu_uuid,
+            gpu_util_pct: agg.gpu_util_pct,
+            mem_util_pct: agg.mem_util_pct,
+            power_watts: agg.power_watts,
+            power_limit_watts,
+            vram_used_mb: agg.vram_used_mb,
+            vram_total_mb: agg.vram_total_mb,
+            temperature_c: agg.temperature_c,
+            sm_clock_mhz: agg.sm_clock_mhz,
+        },
+        SystemTime::now(),
+    ))
 }
 
 #[cfg(test)]
@@ -168,7 +171,7 @@ fn sample_poll(ug: u32, um: u32, p: f64, vu: u64, vt: u64, temp: f64, sm: u32) -
 
 #[cfg(test)]
 #[test]
-fn aggregate_eight_identical_polls_equals_that_value() {
+fn aggregate_identical_polls_equals_sample_values() {
     let polls: Vec<_> = (0..SAMPLE_COUNT)
         .map(|_| sample_poll(80, 20, 300.0, 1000, 8000, 55.0, 2100))
         .collect();

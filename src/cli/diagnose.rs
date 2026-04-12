@@ -1,8 +1,9 @@
-//! `diagnose` subcommand: render snapshot as a boxed table (metrics + stub WASTE/FIX).
+//! `diagnose` subcommand: render snapshot as a boxed table (metrics + rule 1 diagnose block).
 //!
 //! Layout: **GPU =>** (NVML); **vLLM:** REQUESTS / LATENCY / PROMPT / THROUGHPUT rows (aligned labels).
 
 use crate::collectors::{GpuRawMetrics, RawSnapshot, VllmRawMetrics};
+use crate::engine;
 use crate::profiler;
 
 /// Width for REQUESTS / LATENCY / PROMPT / THROUGHPUT label column (matches **THROUGHPUT**).
@@ -10,21 +11,6 @@ const VLLM_LABEL_W: usize = 10;
 
 /// Space between label column and metric values (after `vLLM:` block labels).
 const VLLM_LABEL_METRICS_GAP: &str = "  ";
-
-/// Placeholder until the rule engine fills WASTE/FIX dynamically.
-const WASTE_FIX_STUB: &str = r"WASTE
-01 MOVEMENT   70% GPU idle (decode)
-02 SCHEDULER  batch collapse (2/16)
-
-FIX
-+-----------------------------------------------------------------------+
-| ENABLE CONTINUOUS BATCHING                                            |
-| +45% TPS   | decode underutilized   | queue 200ms => 0ms              |
-+-----------------------------------------------------------------------+
-| INCREASE BATCH WINDOW (15ms)                                          |
-| -12% cost/token   | small prompt overhead                             |
-+-----------------------------------------------------------------------+
-";
 
 pub fn execute(vllm_metrics_input: &str, max_num_seqs: u32) -> anyhow::Result<()> {
     let result = profiler::run_diagnose(vllm_metrics_input, max_num_seqs)?;
@@ -60,9 +46,7 @@ fn build_diagnose_lines(snapshot: &RawSnapshot) -> Vec<String> {
     lines.push(vllm_label_row("THROUGHPUT", &vllm_throughput_value(v)));
 
     lines.push(String::new());
-    for stub_line in WASTE_FIX_STUB.lines() {
-        lines.push(stub_line.to_string());
-    }
+    lines.extend(engine::format_rule1_diagnose(snapshot));
 
     lines
 }
@@ -98,7 +82,7 @@ fn print_boxed(lines: &[String]) {
 fn gpu_gauges_line(g: &GpuRawMetrics) -> String {
     let util = g
         .gpu_util_pct
-        .map(|u| format!("UTIL {:.0}%", u))
+        .map(|u| format!("UTIL {:.1}%", u))
         .unwrap_or_else(|| "UTIL —".to_string());
 
     let power = match (g.power_watts, g.power_limit_watts) {
@@ -172,13 +156,17 @@ fn vllm_latency_value(v: &VllmRawMetrics) -> String {
     format!("ttft {ttft} | tpot {tpot} | prefill {prefill} | queue {queue}")
 }
 
-/// Prompt mean (#10) — `512 tok`
+/// Prompt mean + KV cache fill (`vllm_kv_cache_usage_perc` gauge, 0–100).
 fn vllm_prompt_value(v: &VllmRawMetrics) -> String {
     let n = v
         .prompt_tokens_mean
         .map(fmt_tok)
         .unwrap_or_else(|| "—".to_string());
-    format!("{n} tok")
+    let kv = match v.kv_cache_usage_perc.filter(|x| x.is_finite()) {
+        Some(p) => format!("kv_cache {:.1}%", p),
+        None => "kv_cache —".to_string(),
+    };
+    format!("{n} tok | {kv}")
 }
 
 fn fmt_tok(t: f64) -> String {
@@ -189,7 +177,9 @@ fn fmt_tok(t: f64) -> String {
     }
 }
 
-/// #6 TPS + #7/#8 cache hit rate — `59 tok/s | cache 72.8%`
+/// Output tok/s from **Δ** `vllm_generation_tokens_total` (or iteration-token fallback) over the
+/// scrape window, divided by wall time — not the cumulative counter value itself.
+/// Prefix hit rate: `pfix_cache` (Δhits/Δqueries in window).
 fn vllm_throughput_value(v: &VllmRawMetrics) -> String {
     let tps = v
         .generation_tokens_per_sec
@@ -202,9 +192,9 @@ fn vllm_throughput_value(v: &VllmRawMetrics) -> String {
 /// Prefix cache use % from #7/#8 (Δhits/Δqueries).
 fn cache_use_fragment(v: &VllmRawMetrics) -> String {
     match v.prefix_cache_hit_rate {
-        Some(0.0) => "cache 0%".to_string(),
-        Some(r) => format!("cache {:.1}%", r * 100.0),
-        None => "cache —".to_string(),
+        Some(0.0) => "pfix_cache 0%".to_string(),
+        Some(r) => format!("pfix_cache {:.1}%", r * 100.0),
+        None => "pfix_cache —".to_string(),
     }
 }
 
@@ -228,20 +218,23 @@ mod tests {
 
     #[test]
     fn cache_use_fragment_formats_hit_rate_only() {
-        assert_eq!(cache_use_fragment(&VllmRawMetrics::default()), "cache —");
+        assert_eq!(
+            cache_use_fragment(&VllmRawMetrics::default()),
+            "pfix_cache —"
+        );
         assert_eq!(
             cache_use_fragment(&VllmRawMetrics {
                 prefix_cache_hit_rate: Some(0.0),
                 ..Default::default()
             }),
-            "cache 0%"
+            "pfix_cache 0%"
         );
         assert_eq!(
             cache_use_fragment(&VllmRawMetrics {
                 prefix_cache_hit_rate: Some(0.728),
                 ..Default::default()
             }),
-            "cache 72.8%"
+            "pfix_cache 72.8%"
         );
     }
 
@@ -256,7 +249,7 @@ mod tests {
             ..Default::default()
         };
         let s = gpu_gauges_line(&g);
-        assert!(s.contains("UTIL 28%"));
+        assert!(s.contains("UTIL 28.0%"));
         assert!(s.contains("POWER 310W"));
         assert!(s.contains("MEM 72/80GB"));
     }
@@ -279,7 +272,22 @@ mod tests {
             prefix_cache_hit_rate: Some(0.5),
             ..Default::default()
         };
-        assert_eq!(vllm_throughput_value(&v), "59 tok/s | cache 50.0%");
+        assert_eq!(vllm_throughput_value(&v), "59 tok/s | pfix_cache 50.0%");
+    }
+
+    #[test]
+    fn vllm_prompt_value_includes_kv_cache() {
+        let v = VllmRawMetrics {
+            prompt_tokens_mean: Some(18.0),
+            kv_cache_usage_perc: Some(45.25),
+            ..Default::default()
+        };
+        assert_eq!(vllm_prompt_value(&v), "18 tok | kv_cache 45.2%");
+        let no_kv = VllmRawMetrics {
+            prompt_tokens_mean: Some(512.0),
+            ..Default::default()
+        };
+        assert_eq!(vllm_prompt_value(&no_kv), "512 tok | kv_cache —");
     }
 
     #[test]
@@ -287,7 +295,7 @@ mod tests {
         let line = vllm_label_row("REQUESTS", "run 2 | wait 1 | max 256");
         assert!(line.starts_with("REQUESTS"));
         assert!(line.contains("  run 2"));
-        let t = vllm_label_row("THROUGHPUT", "59 tok/s | cache 72.8%");
+        let t = vllm_label_row("THROUGHPUT", "59 tok/s | pfix_cache 72.8%");
         assert!(t.starts_with("THROUGHPUT"));
         assert!(t.contains("  59 tok/s"));
     }

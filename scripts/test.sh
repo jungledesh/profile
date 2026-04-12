@@ -1,74 +1,99 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Optional: override --max-num-seqs (default 256 matches vLLM when omitted)
-INFER_DELAY="${PROFILE_TEST_INFER_DELAY:-0.2}"
-SMI_WINDOW_SEC="${PROFILE_TEST_SMI_WINDOW_SEC:-2}"
-ITERATIONS="${PROFILE_TEST_ITERATIONS:-5}"
-GPU_ID="${PROFILE_TEST_GPU_ID:-0}"
+# ================================================
+# H100 SXM (and similar): continuous inference + comparison run
+#
+# - Continuous load: mixed prompt sizes, concurrent waves, steady pacing
+# - Default 300s (5 min) for PROFILE vs nvidia-smi comparison
+# - Each cycle: ./profile diagnose and nvidia-smi in parallel; pipe only (no temp files)
+#
+# All knobs are constants below — no environment variables required.
+# ================================================
 
-echo "=== GPU In-Flight Validation Test ==="
-echo "===================================="
+# --- tune here only ---
+INFER_DURATION_SEC=300
+REQUEST_RATE=5
+CONCURRENCY=4
+GPU_ID=0
+# Keep in sync with Profile NVML: 9 samples × 250 ms ≈ 2 s (src/collectors/gpu.rs).
+SMI_WINDOW_SEC=2
+VLLM_OPENAI_BASE="http://localhost:8000"
+VLLM_METRICS_URL="${VLLM_OPENAI_BASE}/metrics"
+# --- end tune ---
 
-cleanup() {
-  [[ -n "${RESP_FILE:-}" && -f "$RESP_FILE" ]] && rm -f "$RESP_FILE"
-  [[ -n "${SMI_FILE:-}" && -f "$SMI_FILE" ]] && rm -f "$SMI_FILE"
-  [[ -n "${PROMPT_FILE:-}" && -f "$PROMPT_FILE" ]] && rm -f "$PROMPT_FILE"
+if ((INFER_DURATION_SEC < 300)); then
+  echo "WARNING: INFER_DURATION_SEC is ${INFER_DURATION_SEC}; use at least 300 for stable H100 comparison (edit scripts/test.sh)." >&2
+fi
+
+echo "=== Continuous Real-World Inference Test (H100 / SXM-class) ==="
+echo "Duration     : ${INFER_DURATION_SEC} seconds (default 5 min for comparison)"
+echo "Rate (approx): ${REQUEST_RATE} req/s"
+echo "Concurrency  : ${CONCURRENCY} (per wave)"
+echo "vLLM         : ${VLLM_OPENAI_BASE}"
+echo "Sampling     : profile diagnose || nvidia-smi in parallel (no temp files)"
+echo "==============================================================="
+
+PROMPT_SHORT="Explain quantum computing in one paragraph."
+PROMPT_MEDIUM="Explain quantum computing concepts in detail for software engineers. Cover qubits, superposition, entanglement, gates, limitations, applications, and provide analogies."
+PROMPT_LONG="$PROMPT_MEDIUM
+Additional context block for longer prefill. $(printf 'Extra long context line %03d.\n' {1..15})"
+
+send_requests() {
+  local end_time=$((SECONDS + INFER_DURATION_SEC))
+  while ((SECONDS < end_time)); do
+    for ((i = 1; i <= CONCURRENCY; i++)); do
+      case $((RANDOM % 3)) in
+        0) PROMPT="$PROMPT_SHORT" ;;
+        1) PROMPT="$PROMPT_MEDIUM" ;;
+        2) PROMPT="$PROMPT_LONG" ;;
+      esac
+      jq -n \
+        --arg prompt "$PROMPT" \
+        '{
+          model: "llama3",
+          messages: [{role:"user",content:$prompt}],
+          max_tokens: 256,
+          temperature: 0
+        }' | curl -sS -o /dev/null -H "Content-Type: application/json" -d @- \
+        "${VLLM_OPENAI_BASE}/v1/chat/completions" || true &
+      sleep 0.05
+    done
+    wait
+    local sleep_sec
+    sleep_sec="$(awk -v r="$REQUEST_RATE" 'BEGIN {
+      if (r <= 0) { print 0.2; exit }
+      x = 1 / r - 0.05
+      if (x < 0.01) x = 0.01
+      print x
+    }')"
+    sleep "$sleep_sec"
+  done
 }
-trap cleanup EXIT
 
-PROMPT_FILE="$(mktemp)"
+echo "Starting continuous load for ${INFER_DURATION_SEC} seconds..."
+send_requests &
+SENDER_PID=$!
 
-cat > "$PROMPT_FILE" << 'PROMPT'
-Explain quantum computing concepts in detail for software engineers.
-Cover qubits, superposition, entanglement, gates, limitations,
-applications, and provide analogies.
-PROMPT
-
-for i in {1..10}; do
-  echo "Additional context block for longer prefill." >> "$PROMPT_FILE"
-done
-
-for ((i=1;i<=ITERATIONS;i++)); do
+END_TIME=$((SECONDS + INFER_DURATION_SEC))
+while ((SECONDS < END_TIME)); do
   echo ""
-  echo "=== Iteration $i ==="
+  echo "=== Profile + nvidia-smi @ $(date '+%H:%M:%S') (parallel) ==="
 
-  RESP_FILE="$(mktemp)"
-  SMI_FILE="$(mktemp)"
-
-  curl -sS -o "$RESP_FILE" http://localhost:8000/v1/chat/completions \
-    -H "Content-Type: application/json" \
-    -d "$(jq -n \
-      --arg prompt "$(cat "$PROMPT_FILE")" \
-      '{
-        model: "llama3",
-        messages: [{role:"user",content:$prompt}],
-        max_tokens: 256,
-        temperature: 0
-      }')" &
-  CURL_PID=$!
-
-  sleep "$INFER_DELAY"
-
-  MAX_SEQ_ARGS=()
-  if [[ -n "${PROFILE_MAX_NUM_SEQS:-}" ]]; then
-    MAX_SEQ_ARGS=(--max-num-seqs "$PROFILE_MAX_NUM_SEQS")
-  fi
-
-  ./profile diagnose "${MAX_SEQ_ARGS[@]}" &
+  ./profile diagnose -u "$VLLM_METRICS_URL" &
   PROFILE_PID=$!
 
-  timeout "${SMI_WINDOW_SEC}s" nvidia-smi --id="${GPU_ID}" \
-    --query-gpu=timestamp,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw,power.limit,temperature.gpu,clocks.sm \
-    --format=csv,noheader,nounits \
-    -lms 250 > "$SMI_FILE" 2>/dev/null || true
+  # nvidia-smi runs in parallel (process sub); wait only in this shell — not inside a pipeline subshell.
+  exec 3< <(
+    timeout "${SMI_WINDOW_SEC}s" nvidia-smi --id="${GPU_ID}" \
+      --query-gpu=timestamp,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw,power.limit,temperature.gpu,clocks.sm \
+      --format=csv,noheader,nounits \
+      -lms 250 2>/dev/null || true
+  )
 
   wait "$PROFILE_PID"
-  wait "$CURL_PID"
 
-  echo ""
-  echo "nvidia-smi (2s window avg):"
-
+  echo "nvidia-smi (${SMI_WINDOW_SEC}s window, same cycle as PROFILE above):"
   awk -F', ' '
     BEGIN { gpu_sum=mem_sum=pwr_sum=0; count=0 }
     {
@@ -86,17 +111,20 @@ for ((i=1;i<=ITERATIONS;i++)); do
         print "  (no samples collected)"
         exit
       }
-      printf "  %-15s : %.1f\n", "GPU util %", gpu_sum / count
-      printf "  %-15s : %.1f\n", "Mem ctrl util %", mem_sum / count
-      printf "  %-15s : %d / %d MiB (%.1f)\n", "VRAM % used", used, total, used * 100.0 / total
+      printf "  %-15s : %.1f%%\n", "GPU util", gpu_sum / count
+      printf "  %-15s : %.1f%%\n", "Mem ctrl util", mem_sum / count
+      printf "  %-15s : %d / %d MiB (%.1f%%)\n", "VRAM used", used, total, used * 100.0 / total
       printf "  Power draw      : %.0f W\n", pwr_sum / count
       printf "  Temp            : %d C\n", temp
       printf "  SM clock        : %d MHz\n", sm
     }
-  ' "$SMI_FILE"
+  ' <&3
+  exec 3<&-
 
-  rm -f "$RESP_FILE" "$SMI_FILE"
+  sleep 6
 done
 
+wait "$SENDER_PID"
+
 echo ""
-echo "Done."
+echo "Test finished. Continuous load + comparison cycles completed."
