@@ -23,3 +23,9 @@ We focus on less words, more signal: a tool that tells the truth, and gives acti
 
 - [Roadmap](docs/roadmap.md)
 - [GPU setup](docs/gpu-setup.md)
+
+---
+
+## Technical design
+
+Diagnose derives some vLLM numbers from a **short multi-scrape window** (several successive `/metrics` polls, on the order of a couple of seconds)—for example **prefix cache hit rate** as Δhits/Δqueries between the first and last sample in that window. Those values describe **what happened while Profile was observing**, not lifetime or steady-state server behavior. Runtime output stays user-facing; this note is the place for that caveat.

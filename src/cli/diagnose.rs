@@ -1,10 +1,13 @@
 //! `diagnose` subcommand: render snapshot as a boxed table (metrics + rule diagnose blocks).
 //!
-//! Layout: **GPU =>** (NVML); **vLLM:** REQUESTS / LATENCY / PROMPT / THROUGHPUT rows (aligned labels).
+//! Layout: **GPU =>** (NVML) and **vLLM** section share the same label-column width as REQUESTS / LATENCY / PROMPT / THROUGHPUT.
+
+use std::time::SystemTime;
 
 use crate::collectors::{GpuRawMetrics, RawSnapshot, VllmRawMetrics};
 use crate::engine;
 use crate::profiler;
+use chrono::{DateTime, Utc};
 
 /// Width for REQUESTS / LATENCY / PROMPT / THROUGHPUT label column (matches **THROUGHPUT**).
 const VLLM_LABEL_W: usize = 10;
@@ -33,17 +36,23 @@ fn build_diagnose_lines(snapshot: &RawSnapshot, verbose_rules: bool) -> Vec<Stri
 
     let model = v.model_name.as_deref().unwrap_or("(unknown model)");
     let gpu_label = g.gpu_name.as_deref().unwrap_or("(no GPU)");
-
-    let mut lines = vec![format!(
-        "PROFILE v{} [{}] [{}]",
+    let ts = format_profile_timestamp(snapshot.timestamp);
+    let mut lines = vec![profile_header_line(
         env!("CARGO_PKG_VERSION"),
         model,
-        gpu_label
+        gpu_label,
+        &ts,
     )];
 
-    lines.push(format!("GPU => {}", gpu_gauges_line(g)));
+    lines.push(format!(
+        "{:<width$}{}{}",
+        "GPU =>",
+        VLLM_LABEL_METRICS_GAP,
+        gpu_gauges_line(g),
+        width = VLLM_LABEL_W
+    ));
     lines.push(String::new());
-    lines.push("vLLM:".to_string());
+    lines.push(vllm_label_row("vLLM:", ""));
     lines.push(vllm_label_row("REQUESTS", &vllm_requests_value(v)));
     lines.push(vllm_label_row("LATENCY", &vllm_latency_value(v)));
     lines.push(vllm_label_row("PROMPT", &vllm_prompt_value(v)));
@@ -56,6 +65,23 @@ fn build_diagnose_lines(snapshot: &RawSnapshot, verbose_rules: bool) -> Vec<Stri
     }
 
     lines
+}
+
+/// [`RawSnapshot::timestamp`] as `YYYY-MM-DD HH:MM:SS UTC` for the PROFILE header.
+fn format_profile_timestamp(st: SystemTime) -> String {
+    let utc: DateTime<Utc> = st.into();
+    utc.format("%Y-%m-%d %H:%M:%S UTC").to_string()
+}
+
+/// `PROFILE v{semver} [model] [gpu] [UTC]` with **one ASCII space** between every segment.
+fn profile_header_line(version: &str, model: &str, gpu: &str, ts: &str) -> String {
+    [
+        format!("PROFILE v{version}"),
+        format!("[{model}]"),
+        format!("[{gpu}]"),
+        format!("[{ts}]"),
+    ]
+    .join(" ")
 }
 
 fn vllm_label_row(label: &str, value: &str) -> String {
@@ -85,7 +111,7 @@ fn print_boxed(lines: &[String]) {
     println!("{}", border);
 }
 
-/// GPU row: UTIL | POWER | MEM (NVML).
+/// GPU row: UTIL | POWER | vRAM (NVML).
 fn gpu_gauges_line(g: &GpuRawMetrics) -> String {
     let util = g
         .gpu_util_pct
@@ -101,9 +127,9 @@ fn gpu_gauges_line(g: &GpuRawMetrics) -> String {
         (Some(used), Some(total)) if total > 0 => {
             let u_gb = used as f64 / 1024.0;
             let t_gb = total as f64 / 1024.0;
-            format!("MEM {:.0}/{:.0}GB", u_gb, t_gb)
+            format!("vRAM {:.0}/{:.0}GB", u_gb, t_gb)
         }
-        _ => "MEM —".to_string(),
+        _ => "vRAM —".to_string(),
     };
 
     format!("{util} | {power} | {mem}")
@@ -212,6 +238,34 @@ fn fmt_seconds_from_ms(ms: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn format_profile_timestamp_unix_epoch_utc() {
+        assert_eq!(
+            format_profile_timestamp(UNIX_EPOCH),
+            "1970-01-01 00:00:00 UTC"
+        );
+    }
+
+    #[test]
+    fn format_profile_timestamp_known_instant() {
+        let t = UNIX_EPOCH + Duration::from_secs(1_776_030_794);
+        assert_eq!(format_profile_timestamp(t), "2026-04-12 21:53:14 UTC");
+    }
+
+    #[test]
+    fn profile_header_line_single_space_between_segments() {
+        assert_eq!(
+            profile_header_line(
+                "0.1.0",
+                "llama3",
+                "NVIDIA H100 80GB HBM3",
+                "2026-04-12 21:53:14 UTC",
+            ),
+            "PROFILE v0.1.0 [llama3] [NVIDIA H100 80GB HBM3] [2026-04-12 21:53:14 UTC]"
+        );
+    }
 
     #[test]
     fn fmt_seconds_from_ms_prefers_seconds_when_large() {
@@ -254,7 +308,7 @@ mod tests {
         let s = gpu_gauges_line(&g);
         assert!(s.contains("UTIL 28.0%"));
         assert!(s.contains("POWER 310W"));
-        assert!(s.contains("MEM 72/80GB"));
+        assert!(s.contains("vRAM 72/80GB"));
     }
 
     #[test]

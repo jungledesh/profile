@@ -109,8 +109,8 @@ fn diagnose_exits_success() {
 
     let out = String::from_utf8_lossy(&output.stdout).into_owned();
     assert!(
-        out.contains("PROFILE v") && out.contains('['),
-        "stdout should show PROFILE header with model/GPU brackets; got:\n{out}"
+        out.contains("PROFILE v") && out.contains('[') && out.contains(" UTC]"),
+        "stdout should show PROFILE header with model/GPU and bracketed UTC timestamp; got:\n{out}"
     );
     assert!(
         out.contains("GPU =>") && out.contains("UTIL"),
@@ -232,6 +232,7 @@ fn diagnose_verbose_shows_not_indicated_lines() {
     assert!(
         out.contains("Under-batching: not indicated")
             && out.contains("KV cache pressure: not indicated")
+            && out.contains("Prefix cache hit rate: not indicated")
             && out.contains("No issues detected in this snapshot."),
         "expected verbose rule status lines and no-issues summary; got:\n{out}"
     );

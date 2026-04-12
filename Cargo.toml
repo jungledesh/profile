@@ -10,6 +10,7 @@ name = "profile"
 path = "src/main.rs"
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4.5", features = ["derive"] }
 anyhow = "1.0"
 nvml-wrapper = "0.12"
