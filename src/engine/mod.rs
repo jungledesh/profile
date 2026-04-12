@@ -111,20 +111,42 @@ pub struct Rule2MissReport {
     pub kv_cache_usage_perc: Option<f64>,
 }
 
-/// Rule 1 lines for the diagnose table (fired or not).
-pub fn format_rule1_diagnose(snapshot: &RawSnapshot) -> Vec<String> {
-    match rule1_under_batching(snapshot) {
-        Rule1Outcome::Fired(d) => format_under_batching_fired(&d),
-        Rule1Outcome::NotFired(m) => format_rule1_miss(&m),
-    }
-}
+/// Diagnose lines for rules. With `verbose_rules`, emits one calm line per rule when it does not fire.
+/// Without verbose, emits nothing if no rule fires; otherwise only `ISSUE:` blocks (blank line between two issues).
+pub fn format_diagnose_rules(snapshot: &RawSnapshot, verbose_rules: bool) -> Vec<String> {
+    let r1 = rule1_under_batching(snapshot);
+    let r2 = rule2_kv_cache_pressure(snapshot);
+    let any_issue = matches!(r1, Rule1Outcome::Fired(_)) || matches!(r2, Rule2Outcome::Fired(_));
 
-/// Rule 1 then Rule 2 diagnose blocks (blank line between when both present).
-pub fn format_diagnose_rules(snapshot: &RawSnapshot) -> Vec<String> {
-    let mut lines = format_rule1_diagnose(snapshot);
-    lines.push(String::new());
-    lines.extend(format_rule2_diagnose(snapshot));
-    lines
+    if !verbose_rules && !any_issue {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let mut append = |block: Vec<String>| {
+        if !out.is_empty() && !block.is_empty() {
+            out.push(String::new());
+        }
+        out.extend(block);
+    };
+
+    match &r1 {
+        Rule1Outcome::Fired(d) => append(format_under_batching_fired(d)),
+        Rule1Outcome::NotFired(_) if verbose_rules => {
+            append(vec!["Under-batching: not indicated".to_string()])
+        }
+        Rule1Outcome::NotFired(_) => {}
+    }
+
+    match &r2 {
+        Rule2Outcome::Fired(d) => append(format_kv_cache_pressure_fired(d)),
+        Rule2Outcome::NotFired(_) if verbose_rules => {
+            append(vec!["KV cache pressure: not indicated".to_string()])
+        }
+        Rule2Outcome::NotFired(_) => {}
+    }
+
+    out
 }
 
 pub fn rule1_under_batching(snapshot: &RawSnapshot) -> Rule1Outcome {
@@ -216,59 +238,23 @@ fn vram_usage_perc(gpu: &GpuRawMetrics) -> Option<f64> {
     }
 }
 
-pub fn format_rule2_diagnose(snapshot: &RawSnapshot) -> Vec<String> {
-    match rule2_kv_cache_pressure(snapshot) {
-        Rule2Outcome::Fired(d) => format_kv_cache_pressure_fired(&d),
-        Rule2Outcome::NotFired(m) => format_rule2_miss(&m),
-    }
-}
-
-fn format_rule2_miss(m: &Rule2MissReport) -> Vec<String> {
-    let mut lines = vec!["Rule: KV Cache Pressure — Not triggered".to_string()];
-    if m.skew_exceeded {
-        lines.push(
-            "  - GPU/vLLM observation skew > 1.0s — correlated snapshot required".to_string(),
-        );
-        if let Some(p) = m.kv_cache_usage_perc {
-            lines.push(format!(
-                "  - KV cache usage {p:.1}% — not evaluated (observation skew)"
-            ));
-        } else {
-            lines.push("  - KV cache metric unavailable".to_string());
-        }
-    } else if m.kv_cache_usage_perc.is_none() {
-        lines.push("  - KV cache metric unavailable".to_string());
-    } else if let Some(p) = m.kv_cache_usage_perc {
-        lines.push(format!(
-            "  - KV cache usage {p:.1}% — within safe operating range"
-        ));
-    }
-    lines
-}
-
 fn format_kv_cache_pressure_fired(d: &KvCachePressureDetail) -> Vec<String> {
     let mut lines = vec![
         "ISSUE: KV Cache Pressure Detected".to_string(),
         format!(
-            "Cause: High KV cache usage at {:.1}% — approaching capacity with increased eviction risk",
+            "Cause: High KV cache usage at {:.1}% — risk of evictions",
             d.kv_cache_usage_perc
         ),
     ];
     if let Some(vp) = d.vram_usage_perc_corroborated {
-        lines.push(format!(
-            "       Device VRAM at {vp:.1}% (corroborates memory pressure)."
-        ));
+        lines.push(format!("       Device VRAM also elevated at {vp:.1}%"));
     }
     lines.push(String::new());
     lines.push("Recommendation:".to_string());
-    lines.push("  • Enable prefix caching (--enable-prefix-caching) if disabled".to_string());
-    lines.push("  • Consider fp8 KV cache (kv-cache-dtype=fp8)".to_string());
-    lines.push("  • Reduce max_model_len or gpu-memory-utilization if suitable".to_string());
+    lines.push("  • Enable prefix caching".to_string());
+    lines.push("  • Consider fp8 KV cache".to_string());
     lines.push(String::new());
-    lines.push(
-        "Expected Impact: Can be material for throughput and tail latency when KV capacity is the bottleneck"
-            .to_string(),
-    );
+    lines.push("Expected Impact: 20–45% better throughput possible".to_string());
     let conf = if d.vram_usage_perc_corroborated.is_some() {
         "Confidence: High"
     } else {
@@ -286,54 +272,39 @@ fn skew_secs(a: SystemTime, b: SystemTime) -> f64 {
     .abs()
 }
 
-fn format_rule1_miss(m: &MissReport) -> Vec<String> {
-    let mut lines = vec!["Rule: Under-batching — Not triggered".to_string()];
-    lines.extend(miss_bullet_lines(m));
-    lines
+fn fmt_running_display(x: f64) -> String {
+    if (x - x.round()).abs() < 1e-6 {
+        format!("{:.0}", x)
+    } else {
+        format!("{:.1}", x)
+    }
 }
 
-fn miss_bullet_lines(m: &MissReport) -> Vec<String> {
-    let run = m
-        .running
-        .filter(|x| x.is_finite())
-        .map(|r| format!("{r:.1}"))
-        .unwrap_or_else(|| "—".to_string());
-    let maxs = m
-        .max_num_seqs
-        .map(|n| n.to_string())
-        .unwrap_or_else(|| "—".to_string());
-    let gpu = m
-        .gpu_util
-        .filter(|x| x.is_finite())
-        .map(|g| format!("{g:.1}"))
-        .unwrap_or_else(|| "—".to_string());
-
-    vec![
-        format!("  - Running {run} / {maxs} max_num_seqs (moderate occupancy)"),
-        format!("  - GPU utilization {gpu}% — batching is not the primary bottleneck"),
-    ]
+fn fmt_gpu_util_display(x: f64) -> String {
+    if (x - x.round()).abs() < 1e-6 {
+        format!("{:.0}", x)
+    } else {
+        format!("{:.1}", x)
+    }
 }
 
 fn format_under_batching_fired(d: &UnderBatchingDetail) -> Vec<String> {
     let pct = (d.running / f64::from(d.max_num_seqs)) * 100.0;
+    let run_s = fmt_running_display(d.running);
+    let gpu_s = fmt_gpu_util_display(d.gpu_util);
     vec![
         "ISSUE: Under-batching Detected".to_string(),
         format!(
-            "Cause: Very low scheduler occupancy — {:.1} running requests vs max_num_seqs = {} ({:.1}%)",
-            d.running, d.max_num_seqs, pct
+            "Cause: Very low scheduler occupancy — {run_s} running vs {} max ({pct:.1}%)",
+            d.max_num_seqs,
         ),
-        format!(
-            "       GPU utilization only {:.1}% with large unused capacity",
-            d.gpu_util
-        ),
+        format!("       GPU only {gpu_s}% with large headroom"),
         String::new(),
         "Recommendation:".to_string(),
-        "  • Increase client concurrency or request rate to better utilize the GPU".to_string(),
-        "  • Consider raising max_num_seqs if it is currently limited".to_string(),
-        "  • Verify continuous batching is properly enabled".to_string(),
+        "  • Increase concurrency or request rate".to_string(),
+        "  • Consider raising max_num_seqs".to_string(),
         String::new(),
-        "Expected Impact: Can significantly improve throughput when scheduler occupancy is the bottleneck"
-            .to_string(),
+        "Expected Impact: Can significantly improve throughput".to_string(),
         "Confidence: Medium-High".to_string(),
     ]
 }
@@ -371,6 +342,14 @@ mod tests {
     fn gpu_low() -> GpuRawMetrics {
         GpuRawMetrics {
             gpu_util_pct: Some(58.0),
+            ..Default::default()
+        }
+    }
+
+    /// High enough GPU util that Rule 1 does not fire (KV-only diagnose tests).
+    fn gpu_busy() -> GpuRawMetrics {
+        GpuRawMetrics {
+            gpu_util_pct: Some(75.0),
             ..Default::default()
         }
     }
@@ -484,34 +463,31 @@ mod tests {
     }
 
     #[test]
-    fn format_rule1_diagnose_fired_matches_template() {
+    fn format_under_batching_fired_matches_template() {
         let t = SystemTime::UNIX_EPOCH;
         let s = snap(t, t, vllm_base(), gpu_low());
-        let lines = format_rule1_diagnose(&s);
+        let lines = format_diagnose_rules(&s, false);
         let text = lines.join("\n");
         assert!(text.contains("ISSUE: Under-batching Detected"));
         assert!(text.contains("Very low scheduler occupancy"));
-        assert!(text.contains("3.1 running requests"));
-        assert!(text.contains("max_num_seqs = 256"));
-        assert!(text.contains("GPU utilization only 58.0% with large unused capacity"));
+        assert!(text.contains("running vs 256 max"));
+        assert!(text.contains("GPU only 58% with large headroom"));
         assert!(text.contains("Recommendation:"));
-        assert!(text.contains("continuous batching is properly enabled"));
-        assert!(text.contains("scheduler occupancy is the bottleneck"));
+        assert!(text.contains("Increase concurrency or request rate"));
+        assert!(text.contains("Consider raising max_num_seqs"));
+        assert!(text.contains("Expected Impact: Can significantly improve throughput"));
         assert!(text.contains("Confidence: Medium-High"));
     }
 
     #[test]
-    fn format_rule1_diagnose_miss_two_bullets() {
+    fn format_diagnose_verbose_shows_not_indicated_when_no_issue() {
         let t = SystemTime::UNIX_EPOCH;
         let mut g = gpu_low();
         g.gpu_util_pct = Some(75.0);
         let s = snap(t, t, vllm_base(), g);
-        let lines = format_rule1_diagnose(&s);
-        let text = lines.join("\n");
-        assert!(text.contains("Rule: Under-batching — Not triggered"));
-        assert_eq!(lines.iter().filter(|l| l.starts_with("  - ")).count(), 2);
-        assert!(text.contains("Running 3.1 / 256 max_num_seqs"));
-        assert!(text.contains("GPU utilization 75.0%"));
+        let text = format_diagnose_rules(&s, true).join("\n");
+        assert!(text.contains("Under-batching: not indicated"));
+        assert!(text.contains("KV cache pressure: not indicated"));
     }
 
     fn vllm_high_kv() -> VllmRawMetrics {
@@ -552,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn kv_cache_pressure_skew_suppresses_with_followup_bullet() {
+    fn kv_cache_pressure_skew_suppresses() {
         let t0 = SystemTime::UNIX_EPOCH;
         let t1 = t0 + Duration::from_secs(2);
         let s = snap(t0, t1, vllm_high_kv(), gpu_low());
@@ -563,9 +539,9 @@ mod tests {
             }
             Rule2Outcome::Fired(_) => panic!("expected skew miss"),
         }
-        let text = format_rule2_diagnose(&s).join("\n");
-        assert!(text.contains("observation skew"));
-        assert!(text.contains("correlated snapshot required"));
+        let text = format_diagnose_rules(&s, true).join("\n");
+        assert!(text.contains("Under-batching: not indicated"));
+        assert!(text.contains("KV cache pressure: not indicated"));
     }
 
     #[test]
@@ -582,35 +558,38 @@ mod tests {
             }
             Rule2Outcome::NotFired(_) => panic!("expected fired"),
         }
-        let lines = format_rule2_diagnose(&s);
-        let text = lines.join("\n");
-        assert!(text.contains("corroborates memory pressure"));
+        let mut gb = gpu_busy();
+        gb.vram_used_mb = Some(78 * 1024);
+        gb.vram_total_mb = Some(100 * 1024);
+        let s_kv_only = snap(t, t, vllm_high_kv(), gb);
+        let text = format_diagnose_rules(&s_kv_only, false).join("\n");
+        assert!(text.contains("Device VRAM also elevated at 78.0%"));
+        assert!(text.contains("20–45% better throughput possible"));
         assert!(text.contains("Confidence: High"));
     }
 
     #[test]
     fn kv_cache_pressure_low_vram_not_corroborated() {
         let t = SystemTime::UNIX_EPOCH;
-        let mut g = gpu_low();
-        g.vram_used_mb = Some(50 * 1024);
-        g.vram_total_mb = Some(100 * 1024);
-        let s = snap(t, t, vllm_high_kv(), g);
+        let mut gb = gpu_busy();
+        gb.vram_used_mb = Some(50 * 1024);
+        gb.vram_total_mb = Some(100 * 1024);
+        let s = snap(t, t, vllm_high_kv(), gb);
         match rule2_kv_cache_pressure(&s) {
             Rule2Outcome::Fired(d) => assert!(d.vram_usage_perc_corroborated.is_none()),
             Rule2Outcome::NotFired(_) => panic!("expected fired"),
         }
-        let text = format_rule2_diagnose(&s).join("\n");
+        let text = format_diagnose_rules(&s, false).join("\n");
         assert!(text.contains("Confidence: Medium-High"));
-        assert!(!text.contains("Device VRAM"));
+        assert!(!text.contains("Device VRAM also elevated"));
     }
 
     #[test]
-    fn kv_cache_miss_unavailable_without_gauge() {
+    fn kv_cache_miss_unavailable_without_gauge_verbose() {
         let t = SystemTime::UNIX_EPOCH;
         let s = snap(t, t, vllm_base(), gpu_low());
-        let text = format_rule2_diagnose(&s).join("\n");
-        assert!(text.contains("Rule: KV Cache Pressure — Not triggered"));
-        assert!(text.contains("KV cache metric unavailable"));
+        let text = format_diagnose_rules(&s, true).join("\n");
+        assert!(text.contains("KV cache pressure: not indicated"));
     }
 
     #[test]
@@ -628,14 +607,14 @@ mod tests {
     fn format_diagnose_rules_inserts_blank_between_rule_blocks() {
         let t = SystemTime::UNIX_EPOCH;
         let s = snap(t, t, vllm_high_kv(), gpu_low());
-        let lines = format_diagnose_rules(&s);
+        let lines = format_diagnose_rules(&s, false);
         let idx_under = lines
             .iter()
-            .position(|l| l.contains("Under-batching"))
+            .position(|l| l.contains("ISSUE: Under-batching Detected"))
             .expect("rule1");
         let idx_kv = lines
             .iter()
-            .position(|l| l.contains("KV Cache"))
+            .position(|l| l.contains("ISSUE: KV Cache Pressure Detected"))
             .expect("rule2");
         assert!(
             idx_kv > idx_under,

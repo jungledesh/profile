@@ -13,7 +13,7 @@ pub const DEFAULT_METRICS_URL: &str = "http://localhost:8000/metrics";
 const ABOUT: &str = "Detects inefficiencies. Suggests fixes.";
 
 /// Shown for `profile diagnose --help` only (root help omits options via template).
-const DIAGNOSE_ABOUT: &str = "Collects metrics. Detects inefficiencies. Suggests fixes.";
+const DIAGNOSE_ABOUT: &str = "Collects metrics. Detects inefficiencies. Suggests fixes.\nPass -v to show per-rule status when no issue is detected.";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -86,7 +86,7 @@ pub enum Commands {
 
 pub fn run(cli: Cli) -> anyhow::Result<()> {
     match &cli.command {
-        Commands::Diagnose => diagnose::execute(&cli.url, cli.max_num_seqs)?,
+        Commands::Diagnose => diagnose::execute(&cli.url, cli.max_num_seqs, cli.verbose > 0)?,
         Commands::Help => {
             Cli::command().print_long_help()?;
             println!();
