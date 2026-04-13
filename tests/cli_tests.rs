@@ -264,6 +264,9 @@ fn diagnose_help_lists_usage_and_options() {
         "-m, --max-num-seqs",
         "Engine max_num_seqs if absent on /metrics",
         "[default: 256]",
+        "--duration",
+        "Observation duration",
+        "[default: 2s]",
         "-h, --help",
         "Display this message",
     ] {

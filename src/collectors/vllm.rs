@@ -5,7 +5,7 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Context, Result};
 use prometheus_parse::{Scrape, Value};
 
-use super::sampling::{SAMPLE_COUNT, SAMPLE_INTERVAL};
+use super::sampling::{sample_count_for, SAMPLE_INTERVAL};
 use super::types::{PrefixCacheScrapeSample, VllmRawMetrics};
 const REQ_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -311,15 +311,23 @@ fn max_num_seqs_from_gauge(scrape: &Scrape) -> Option<u32> {
 /// Returns `(metrics, observed_at)` where `observed_at` is wall time immediately after the last
 /// successful scrape in the window (for correlating with GPU-side collection).
 pub fn collect_vllm_metrics(input: &str) -> Result<(VllmRawMetrics, SystemTime)> {
+    collect_vllm_metrics_for(input, Duration::from_secs(2))
+}
+
+pub fn collect_vllm_metrics_for(
+    input: &str,
+    window: Duration,
+) -> Result<(VllmRawMetrics, SystemTime)> {
     let url = metrics_url(input);
-    let mut running_samples = Vec::with_capacity(SAMPLE_COUNT);
-    let mut waiting_samples = Vec::with_capacity(SAMPLE_COUNT);
-    let mut prefix_samples = Vec::with_capacity(SAMPLE_COUNT);
+    let sample_count = sample_count_for(window);
+    let mut running_samples = Vec::with_capacity(sample_count);
+    let mut waiting_samples = Vec::with_capacity(sample_count);
+    let mut prefix_samples = Vec::with_capacity(sample_count);
     let mut window_start: Option<Instant> = None;
     let mut first_scrape: Option<Scrape> = None;
     let mut last_scrape: Option<Scrape> = None;
 
-    for i in 0..SAMPLE_COUNT {
+    for i in 0..sample_count {
         let body = fetch_metrics_body(&url)?;
         let scrape = scrape_from_body(&body)?;
         prefix_samples.push(prefix_scrape_sample(&scrape));
@@ -335,7 +343,7 @@ pub fn collect_vllm_metrics(input: &str) -> Result<(VllmRawMetrics, SystemTime)>
             last_scrape = Some(scrape);
         }
 
-        if i + 1 < SAMPLE_COUNT {
+        if i + 1 < sample_count {
             thread::sleep(SAMPLE_INTERVAL);
         }
     }
