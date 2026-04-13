@@ -7,7 +7,9 @@ pub mod sampling;
 pub mod types;
 pub mod vllm;
 
-pub use types::{GpuRawMetrics, PrefixCacheScrapeSample, RawSnapshot, VllmRawMetrics};
+pub use types::{
+    window_is_evaluable, GpuRawMetrics, PrefixCacheScrapeSample, RawSnapshot, VllmRawMetrics,
+};
 
 use std::thread;
 use std::time::Duration;

@@ -1,6 +1,6 @@
 //! Profiler: orchestrate collectors for `diagnose`.
 
-use crate::collectors;
+use crate::collectors::{self, window_is_evaluable};
 use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Clone)]
@@ -81,7 +81,29 @@ fn aggregate_windows(
         };
     }
 
-    let last = windows.last().expect("non-empty");
+    let pairs: Vec<(&collectors::RawSnapshot, Duration)> = windows
+        .iter()
+        .enumerate()
+        .filter_map(|(i, w)| {
+            if !window_is_evaluable(w) {
+                return None;
+            }
+            let d = window_durations.get(i).copied()?;
+            Some((w, d))
+        })
+        .collect();
+
+    if pairs.is_empty() {
+        return collectors::RawSnapshot {
+            gpu_observed_at: started_at,
+            vllm_observed_at: started_at,
+            timestamp: started_at,
+            vllm: collectors::VllmRawMetrics::default(),
+            gpu: collectors::GpuRawMetrics::default(),
+        };
+    }
+
+    let last = pairs.last().expect("non-empty evaluable").0;
     let mut agg_v = collectors::VllmRawMetrics {
         model_name: last.vllm.model_name.clone(),
         max_num_seqs: last.vllm.max_num_seqs,
@@ -95,39 +117,30 @@ fn aggregate_windows(
         ..Default::default()
     };
 
-    agg_v.num_requests_running =
-        weighted_metric(windows, window_durations, |w| w.vllm.num_requests_running);
-    agg_v.num_requests_waiting =
-        weighted_metric(windows, window_durations, |w| w.vllm.num_requests_waiting);
-    agg_v.kv_cache_usage_perc =
-        weighted_metric(windows, window_durations, |w| w.vllm.kv_cache_usage_perc);
-    agg_v.ttft_ms = weighted_metric(windows, window_durations, |w| w.vllm.ttft_ms);
-    agg_v.tpot_ms = weighted_metric(windows, window_durations, |w| w.vllm.tpot_ms);
-    agg_v.prefill_latency_ms =
-        weighted_metric(windows, window_durations, |w| w.vllm.prefill_latency_ms);
-    agg_v.queue_delay_ms = weighted_metric(windows, window_durations, |w| w.vllm.queue_delay_ms);
-    agg_v.prompt_tokens_mean =
-        weighted_metric(windows, window_durations, |w| w.vllm.prompt_tokens_mean);
-    agg_v.generation_tokens_per_sec = weighted_metric(windows, window_durations, |w| {
-        w.vllm.generation_tokens_per_sec
-    });
-    agg_v.prefix_cache_hit_rate = prefix_hit_rate_from_windows(windows);
+    agg_v.num_requests_running = weighted_metric_pairs(&pairs, |w| w.vllm.num_requests_running);
+    agg_v.num_requests_waiting = weighted_metric_pairs(&pairs, |w| w.vllm.num_requests_waiting);
+    agg_v.kv_cache_usage_perc = weighted_metric_pairs(&pairs, |w| w.vllm.kv_cache_usage_perc);
+    agg_v.ttft_ms = weighted_metric_pairs(&pairs, |w| w.vllm.ttft_ms);
+    agg_v.tpot_ms = weighted_metric_pairs(&pairs, |w| w.vllm.tpot_ms);
+    agg_v.prefill_latency_ms = weighted_metric_pairs(&pairs, |w| w.vllm.prefill_latency_ms);
+    agg_v.queue_delay_ms = weighted_metric_pairs(&pairs, |w| w.vllm.queue_delay_ms);
+    agg_v.prompt_tokens_mean = weighted_metric_pairs(&pairs, |w| w.vllm.prompt_tokens_mean);
+    agg_v.generation_tokens_per_sec =
+        weighted_metric_pairs(&pairs, |w| w.vllm.generation_tokens_per_sec);
+    let eval_refs: Vec<&collectors::RawSnapshot> = pairs.iter().map(|(w, _)| *w).collect();
+    agg_v.prefix_cache_hit_rate = prefix_hit_rate_from_windows(&eval_refs);
     agg_v.generation_tokens_total = last.vllm.generation_tokens_total;
     agg_v.prefix_cache_scrape_samples = last.vllm.prefix_cache_scrape_samples.clone();
 
-    agg_g.gpu_util_pct = weighted_metric(windows, window_durations, |w| w.gpu.gpu_util_pct);
-    agg_g.mem_util_pct = weighted_metric(windows, window_durations, |w| w.gpu.mem_util_pct);
-    agg_g.power_watts = weighted_metric(windows, window_durations, |w| w.gpu.power_watts);
-    agg_g.temperature_c = weighted_metric(windows, window_durations, |w| w.gpu.temperature_c);
-    agg_g.sm_clock_mhz = weighted_metric(windows, window_durations, |w| {
-        w.gpu.sm_clock_mhz.map(|x| x as f64)
-    })
-    .map(|x| x.round() as u32);
-    agg_g.vram_used_mb = weighted_metric(windows, window_durations, |w| {
-        w.gpu.vram_used_mb.map(|x| x as f64)
-    })
-    .map(|x| x.round() as u64);
-    agg_g.vram_total_mb = windows.iter().filter_map(|w| w.gpu.vram_total_mb).max();
+    agg_g.gpu_util_pct = weighted_metric_pairs(&pairs, |w| w.gpu.gpu_util_pct);
+    agg_g.mem_util_pct = weighted_metric_pairs(&pairs, |w| w.gpu.mem_util_pct);
+    agg_g.power_watts = weighted_metric_pairs(&pairs, |w| w.gpu.power_watts);
+    agg_g.temperature_c = weighted_metric_pairs(&pairs, |w| w.gpu.temperature_c);
+    agg_g.sm_clock_mhz = weighted_metric_pairs(&pairs, |w| w.gpu.sm_clock_mhz.map(|x| x as f64))
+        .map(|x| x.round() as u32);
+    agg_g.vram_used_mb = weighted_metric_pairs(&pairs, |w| w.gpu.vram_used_mb.map(|x| x as f64))
+        .map(|x| x.round() as u64);
+    agg_g.vram_total_mb = pairs.iter().filter_map(|(w, _)| w.gpu.vram_total_mb).max();
 
     collectors::RawSnapshot {
         gpu_observed_at: last.gpu_observed_at,
@@ -138,9 +151,8 @@ fn aggregate_windows(
     }
 }
 
-fn weighted_metric<F>(
-    windows: &[collectors::RawSnapshot],
-    window_durations: &[Duration],
+fn weighted_metric_pairs<F>(
+    pairs: &[(&collectors::RawSnapshot, Duration)],
     metric: F,
 ) -> Option<f64>
 where
@@ -148,18 +160,14 @@ where
 {
     let mut weighted_sum = 0.0;
     let mut total_weight_secs = 0.0;
-    for (idx, w) in windows.iter().enumerate() {
+    for (w, dur) in pairs {
         let Some(value) = metric(w) else {
             continue;
         };
         if !value.is_finite() {
             continue;
         }
-        let weight_secs = window_durations
-            .get(idx)
-            .copied()
-            .unwrap_or_else(|| Duration::from_secs(0))
-            .as_secs_f64();
+        let weight_secs = dur.as_secs_f64();
         if weight_secs <= f64::EPSILON {
             continue;
         }
@@ -169,7 +177,7 @@ where
     (total_weight_secs > 0.0).then_some(weighted_sum / total_weight_secs)
 }
 
-fn prefix_hit_rate_from_windows(windows: &[collectors::RawSnapshot]) -> Option<f64> {
+fn prefix_hit_rate_from_windows(windows: &[&collectors::RawSnapshot]) -> Option<f64> {
     let mut total_hits = 0.0;
     let mut total_queries = 0.0;
     let mut any = false;
@@ -270,11 +278,20 @@ mod tests {
 
     #[test]
     fn prefix_hit_rate_recomputed_from_summed_deltas() {
-        let windows = vec![
-            mk_snap(None, None, Some((10.0, 20.0)), Some((50.0, 100.0))), // 10/50
-            mk_snap(None, None, Some((5.0, 15.0)), Some((10.0, 20.0))),   // 10/10
-        ];
-        let r = prefix_hit_rate_from_windows(&windows).expect("ratio");
+        let w1 = mk_snap(
+            Some(1.0),
+            Some(100.0),
+            Some((10.0, 20.0)),
+            Some((50.0, 100.0)),
+        );
+        let w2 = mk_snap(
+            Some(1.0),
+            Some(100.0),
+            Some((5.0, 15.0)),
+            Some((10.0, 20.0)),
+        );
+        let refs = vec![&w1, &w2];
+        let r = prefix_hit_rate_from_windows(&refs).expect("ratio");
         // (10 + 10) / (50 + 10) = 0.3333
         assert!((r - (20.0 / 60.0)).abs() < 1e-9);
     }

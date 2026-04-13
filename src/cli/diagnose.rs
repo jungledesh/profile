@@ -107,9 +107,7 @@ fn profile_header_line(
     duration: Duration,
 ) -> String {
     let suffix = if duration > Duration::from_secs(2) {
-        // Long-duration header keeps compact timestamp without trailing timezone token.
-        let compact_ts = ts.trim_end_matches(" UTC");
-        format!("({} from {compact_ts})", duration_short(duration))
+        format!("({} from {ts})", duration_short(duration))
     } else {
         format!("[{ts}]")
     };
@@ -316,7 +314,7 @@ mod tests {
     }
 
     #[test]
-    fn profile_header_line_duration_view_uses_compact_timestamp() {
+    fn profile_header_line_duration_view_includes_utc_timestamp() {
         assert_eq!(
             profile_header_line(
                 "0.1.0",
@@ -325,7 +323,7 @@ mod tests {
                 "2026-04-13 10:42:31 UTC",
                 Duration::from_secs(5 * 60),
             ),
-            "PROFILE v0.1.0 [llama3] [NVIDIA H100 80GB HBM3] (5m from 2026-04-13 10:42:31)"
+            "PROFILE v0.1.0 [llama3] [NVIDIA H100 80GB HBM3] (5m from 2026-04-13 10:42:31 UTC)"
         );
     }
 
