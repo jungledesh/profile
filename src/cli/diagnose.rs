@@ -124,7 +124,7 @@ fn profile_header_line(
 
 fn duration_short(duration: Duration) -> String {
     let secs = duration.as_secs();
-    if secs % 60 == 0 {
+    if secs.is_multiple_of(60) {
         format!("{}m", secs / 60)
     } else {
         format!("{secs}s")
