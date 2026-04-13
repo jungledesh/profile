@@ -1,130 +1,63 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ================================================
-# H100 SXM (and similar): continuous inference + comparison run
-#
-# - Continuous load: mixed prompt sizes, concurrent waves, steady pacing
-# - Default 300s (5 min) for PROFILE vs nvidia-smi comparison
-# - Each cycle: ./profile diagnose and nvidia-smi in parallel; pipe only (no temp files)
-#
-# All knobs are constants below — no environment variables required.
-# ================================================
+echo "=== v0.1 Duration-Aware Profiler Test (Realistic Load) ==="
+echo "Testing default + boundary cases with varied traffic"
+echo "================================================================="
 
-# --- tune here only ---
-INFER_DURATION_SEC=300
-REQUEST_RATE=5
-CONCURRENCY=4
-GPU_ID=0
-# Keep in sync with Profile NVML: 9 samples × 250 ms ≈ 2 s (src/collectors/gpu.rs).
-SMI_WINDOW_SEC=2
-VLLM_OPENAI_BASE="http://localhost:8000"
-VLLM_METRICS_URL="${VLLM_OPENAI_BASE}/metrics"
-# --- end tune ---
+VLLM_URL="http://localhost:8000"
+TEST_DURATION_SEC=420
+LOAD_PID=""
 
-if ((INFER_DURATION_SEC < 300)); then
-  echo "WARNING: INFER_DURATION_SEC is ${INFER_DURATION_SEC}; use at least 300 for stable H100 comparison (edit scripts/test.sh)." >&2
-fi
+cleanup() {
+  if [[ -n "${LOAD_PID}" ]]; then
+    kill "${LOAD_PID}" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
 
-echo "=== Continuous Real-World Inference Test (H100 / SXM-class) ==="
-echo "Duration     : ${INFER_DURATION_SEC} seconds (default 5 min for comparison)"
-echo "Rate (approx): ${REQUEST_RATE} req/s"
-echo "Concurrency  : ${CONCURRENCY} (per wave)"
-echo "vLLM         : ${VLLM_OPENAI_BASE}"
-echo "Sampling     : profile diagnose || nvidia-smi in parallel (no temp files)"
-echo "==============================================================="
-
-PROMPT_SHORT="Explain quantum computing in one paragraph."
-PROMPT_MEDIUM="Explain quantum computing concepts in detail for software engineers. Cover qubits, superposition, entanglement, gates, limitations, applications, and provide analogies."
-PROMPT_LONG="$PROMPT_MEDIUM
-Additional context block for longer prefill. $(printf 'Extra long context line %03d.\n' {1..15})"
-
-send_requests() {
-  local end_time=$((SECONDS + INFER_DURATION_SEC))
-  while ((SECONDS < end_time)); do
-    for ((i = 1; i <= CONCURRENCY; i++)); do
-      case $((RANDOM % 3)) in
-        0) PROMPT="$PROMPT_SHORT" ;;
-        1) PROMPT="$PROMPT_MEDIUM" ;;
-        2) PROMPT="$PROMPT_LONG" ;;
+send_mixed_load() {
+  local end=$((SECONDS + TEST_DURATION_SEC))
+  while ((SECONDS < end)); do
+    local conc=$((6 + RANDOM % 11))
+    for ((i = 1; i <= conc; i++)); do
+      case $((RANDOM % 4)) in
+        0 | 1) PROMPT="Explain quantum computing in one paragraph." ;;
+        2) PROMPT="Explain quantum computing concepts in detail for software engineers..." ;;
+        3) PROMPT="Long context test with repeated blocks. $(printf 'Block %03d. ' {1..25})" ;;
       esac
-      jq -n \
-        --arg prompt "$PROMPT" \
-        '{
-          model: "llama3",
-          messages: [{role:"user",content:$prompt}],
-          max_tokens: 256,
-          temperature: 0
-        }' | curl -sS -o /dev/null -H "Content-Type: application/json" -d @- \
-        "${VLLM_OPENAI_BASE}/v1/chat/completions" || true &
-      sleep 0.05
+
+      jq -n --arg p "$PROMPT" '{
+        model: "llama3",
+        messages: [{role:"user", content: $p}],
+        max_tokens: 256,
+        temperature: 0
+      }' | curl -s -o /dev/null -H "Content-Type: application/json" -d @- \
+        "${VLLM_URL}/v1/chat/completions" || true &
     done
     wait
-    local sleep_sec
-    sleep_sec="$(awk -v r="$REQUEST_RATE" 'BEGIN {
-      if (r <= 0) { print 0.2; exit }
-      x = 1 / r - 0.05
-      if (x < 0.01) x = 0.01
-      print x
-    }')"
-    sleep "$sleep_sec"
+    sleep "$(awk -v r=10 'BEGIN {x = 1/r - 0.05 + (rand()-0.5)*0.08; if (x < 0.02) x=0.02; print x}')"
   done
 }
 
-echo "Starting continuous load for ${INFER_DURATION_SEC} seconds..."
-send_requests &
-SENDER_PID=$!
+send_mixed_load &
+LOAD_PID=$!
 
-END_TIME=$((SECONDS + INFER_DURATION_SEC))
-while ((SECONDS < END_TIME)); do
+echo "Starting mixed load for ${TEST_DURATION_SEC}s..."
+
+for dur in "2s" "30s" "32s" "1m" "5m"; do
   echo ""
-  echo "=== Profile + nvidia-smi @ $(date '+%H:%M:%S') (parallel) ==="
-
-  ./profile diagnose -u "$VLLM_METRICS_URL" &
-  PROFILE_PID=$!
-
-  # nvidia-smi runs in parallel (process sub); wait only in this shell — not inside a pipeline subshell.
-  exec 3< <(
-    timeout "${SMI_WINDOW_SEC}s" nvidia-smi --id="${GPU_ID}" \
-      --query-gpu=timestamp,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw,power.limit,temperature.gpu,clocks.sm \
-      --format=csv,noheader,nounits \
-      -lms 250 2>/dev/null || true
-  )
-
-  wait "$PROFILE_PID"
-
-  echo "nvidia-smi (${SMI_WINDOW_SEC}s window, same cycle as PROFILE above):"
-  awk -F', ' '
-    BEGIN { gpu_sum=mem_sum=pwr_sum=0; count=0 }
-    {
-      gpu_sum += $2
-      mem_sum += $3
-      pwr_sum += $6
-      used=$4
-      total=$5
-      temp=$8
-      sm=$9
-      count++
-    }
-    END {
-      if (count == 0) {
-        print "  (no samples collected)"
-        exit
-      }
-      printf "  %-15s : %.1f%%\n", "GPU util", gpu_sum / count
-      printf "  %-15s : %.1f%%\n", "Mem ctrl util", mem_sum / count
-      printf "  %-15s : %d / %d MiB (%.1f%%)\n", "VRAM used", used, total, used * 100.0 / total
-      printf "  Power draw      : %.0f W\n", pwr_sum / count
-      printf "  Temp            : %d C\n", temp
-      printf "  SM clock        : %d MHz\n", sm
-    }
-  ' <&3
-  exec 3<&-
-
-  sleep 6
+  echo "=== Testing --duration ${dur} ==="
+  ./profile diagnose --url "${VLLM_URL}/metrics" --duration "${dur}"
+  sleep 10
 done
 
-wait "$SENDER_PID"
+echo ""
+echo "=== Testing --duration 5m with -v ==="
+./profile -v diagnose --url "${VLLM_URL}/metrics" --duration 5m
+
+wait "${LOAD_PID}" 2>/dev/null || true
 
 echo ""
-echo "Test finished. Continuous load + comparison cycles completed."
+echo "=== Duration test completed ==="
+echo "Check output for correct windowing, % fired, aggregation, and boundary behavior."
