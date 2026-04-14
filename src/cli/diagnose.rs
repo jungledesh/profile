@@ -2,6 +2,7 @@
 //!
 //! Layout: **GPU =>** (NVML) and **vLLM** section share the same label-column width as REQUESTS / LATENCY / PROMPT / THROUGHPUT.
 
+use std::time::Duration;
 use std::time::SystemTime;
 
 use crate::collectors::{GpuRawMetrics, RawSnapshot, VllmRawMetrics};
@@ -19,29 +20,49 @@ pub fn execute(
     vllm_metrics_input: &str,
     max_num_seqs: u32,
     verbose_rules: bool,
+    duration: Duration,
 ) -> anyhow::Result<()> {
-    let result = profiler::run_diagnose(vllm_metrics_input, max_num_seqs)?;
-    print_diagnose_table(&result.snapshot, verbose_rules);
+    let result = profiler::run_diagnose(vllm_metrics_input, max_num_seqs, duration)?;
+    print_diagnose_table(
+        &result.snapshot,
+        &result.windows,
+        verbose_rules,
+        result.duration,
+        result.started_at,
+    );
     Ok(())
 }
 
-fn print_diagnose_table(snapshot: &RawSnapshot, verbose_rules: bool) {
-    let lines = build_diagnose_lines(snapshot, verbose_rules);
+fn print_diagnose_table(
+    snapshot: &RawSnapshot,
+    windows: &[RawSnapshot],
+    verbose_rules: bool,
+    duration: Duration,
+    started_at: SystemTime,
+) {
+    let lines = build_diagnose_lines(snapshot, windows, verbose_rules, duration, started_at);
     print_boxed(&lines);
 }
 
-fn build_diagnose_lines(snapshot: &RawSnapshot, verbose_rules: bool) -> Vec<String> {
+fn build_diagnose_lines(
+    snapshot: &RawSnapshot,
+    windows: &[RawSnapshot],
+    verbose_rules: bool,
+    duration: Duration,
+    started_at: SystemTime,
+) -> Vec<String> {
     let v = &snapshot.vllm;
     let g = &snapshot.gpu;
 
     let model = v.model_name.as_deref().unwrap_or("(unknown model)");
     let gpu_label = g.gpu_name.as_deref().unwrap_or("(no GPU)");
-    let ts = format_profile_timestamp(snapshot.timestamp);
+    let ts = format_profile_timestamp(started_at);
     let mut lines = vec![profile_header_line(
         env!("CARGO_PKG_VERSION"),
         model,
         gpu_label,
         &ts,
+        duration,
     )];
 
     lines.push(format!(
@@ -58,7 +79,11 @@ fn build_diagnose_lines(snapshot: &RawSnapshot, verbose_rules: bool) -> Vec<Stri
     lines.push(vllm_label_row("PROMPT", &vllm_prompt_value(v)));
     lines.push(vllm_label_row("THROUGHPUT", &vllm_throughput_value(v)));
 
-    let rule_lines = engine::format_diagnose_rules(snapshot, verbose_rules);
+    let rule_lines = if windows.len() <= 1 {
+        engine::format_diagnose_rules(snapshot, verbose_rules)
+    } else {
+        engine::format_diagnose_rules_for_windows(windows, snapshot, verbose_rules)
+    };
     if !rule_lines.is_empty() {
         lines.push(String::new());
         lines.extend(rule_lines);
@@ -74,14 +99,34 @@ fn format_profile_timestamp(st: SystemTime) -> String {
 }
 
 /// `PROFILE v{semver} [model] [gpu] [UTC]` with **one ASCII space** between every segment.
-fn profile_header_line(version: &str, model: &str, gpu: &str, ts: &str) -> String {
+fn profile_header_line(
+    version: &str,
+    model: &str,
+    gpu: &str,
+    ts: &str,
+    duration: Duration,
+) -> String {
+    let suffix = if duration > Duration::from_secs(2) {
+        format!("({} from {ts})", duration_short(duration))
+    } else {
+        format!("[{ts}]")
+    };
     [
         format!("PROFILE v{version}"),
         format!("[{model}]"),
         format!("[{gpu}]"),
-        format!("[{ts}]"),
+        suffix,
     ]
     .join(" ")
+}
+
+fn duration_short(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    if secs.is_multiple_of(60) {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
 }
 
 fn vllm_label_row(label: &str, value: &str) -> String {
@@ -262,8 +307,23 @@ mod tests {
                 "llama3",
                 "NVIDIA H100 80GB HBM3",
                 "2026-04-12 21:53:14 UTC",
+                Duration::from_secs(2),
             ),
             "PROFILE v0.1.0 [llama3] [NVIDIA H100 80GB HBM3] [2026-04-12 21:53:14 UTC]"
+        );
+    }
+
+    #[test]
+    fn profile_header_line_duration_view_includes_utc_timestamp() {
+        assert_eq!(
+            profile_header_line(
+                "0.1.0",
+                "llama3",
+                "NVIDIA H100 80GB HBM3",
+                "2026-04-13 10:42:31 UTC",
+                Duration::from_secs(5 * 60),
+            ),
+            "PROFILE v0.1.0 [llama3] [NVIDIA H100 80GB HBM3] (5m from 2026-04-13 10:42:31 UTC)"
         );
     }
 

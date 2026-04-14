@@ -101,3 +101,25 @@ impl RawSnapshot {
         !self.vllm.has_scrape_data() && self.gpu.gpu_util_pct.is_none()
     }
 }
+
+/// Mean `num_requests_running` above this (exclusive) counts as evaluable traffic.
+pub const EVALUABLE_RUNNING_GT: f64 = 0.75;
+/// Generation throughput above this (exclusive, tok/s) counts as evaluable when running is low or missing.
+pub const EVALUABLE_TOK_PER_SEC_GT: f64 = 20.0;
+
+/// A window is evaluable if there is meaningful activity: enough concurrent requests or enough throughput.
+pub fn window_is_evaluable(s: &RawSnapshot) -> bool {
+    let run_ok = s
+        .vllm
+        .num_requests_running
+        .filter(|x| x.is_finite())
+        .map(|r| r > EVALUABLE_RUNNING_GT)
+        .unwrap_or(false);
+    let tok_ok = s
+        .vllm
+        .generation_tokens_per_sec
+        .filter(|x| x.is_finite())
+        .map(|t| t > EVALUABLE_TOK_PER_SEC_GT)
+        .unwrap_or(false);
+    run_ok || tok_ok
+}

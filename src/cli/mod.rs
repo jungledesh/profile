@@ -3,12 +3,14 @@
 mod diagnose;
 
 use clap::{CommandFactory, Parser, Subcommand};
+use std::time::Duration;
 
 /// Matches vLLM engine default when `--max-num-seqs` is omitted.
 pub const DEFAULT_MAX_NUM_SEQS: u32 = 256;
 
 /// Default `-u` / `--url` value (full `/metrics` URL; base URLs are also accepted).
 pub const DEFAULT_METRICS_URL: &str = "http://localhost:8000/metrics";
+pub const DEFAULT_DURATION: &str = "2s";
 
 const ABOUT: &str = "Detects inefficiencies. Suggests fixes.";
 
@@ -78,7 +80,15 @@ pub enum Commands {
         help_template = "\n\n{about}\n\n{usage-heading} {usage}\n\n{all-args}\n",
         display_order = 0
     )]
-    Diagnose,
+    Diagnose {
+        #[arg(
+            long = "duration",
+            default_value = DEFAULT_DURATION,
+            value_parser = parse_duration_arg,
+            help = "Observation duration (e.g. 30s, 1m, 5m, 30m)"
+        )]
+        duration: Duration,
+    },
 
     #[command(about = "Display this message", display_order = 1)]
     Help,
@@ -86,7 +96,9 @@ pub enum Commands {
 
 pub fn run(cli: Cli) -> anyhow::Result<()> {
     match &cli.command {
-        Commands::Diagnose => diagnose::execute(&cli.url, cli.max_num_seqs, cli.verbose > 0)?,
+        Commands::Diagnose { duration } => {
+            diagnose::execute(&cli.url, cli.max_num_seqs, cli.verbose > 0, *duration)?
+        }
         Commands::Help => {
             Cli::command().print_long_help()?;
             println!();
@@ -98,4 +110,23 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn parse_duration_arg(input: &str) -> Result<Duration, String> {
+    let s = input.trim();
+    if s.len() < 2 {
+        return Err("duration must be like 30s, 1m, 5m".to_string());
+    }
+    let (num, unit) = s.split_at(s.len() - 1);
+    let value: u64 = num
+        .parse()
+        .map_err(|_| format!("invalid duration value: {input}"))?;
+    if value == 0 {
+        return Err("duration must be greater than zero".to_string());
+    }
+    match unit {
+        "s" => Ok(Duration::from_secs(value)),
+        "m" => Ok(Duration::from_secs(value.saturating_mul(60))),
+        _ => Err(format!("invalid duration unit in {input}; use s or m")),
+    }
 }

@@ -7,6 +7,13 @@ use std::thread;
 
 const MINIMAL_SCRAPE: &str = "# TYPE noop gauge\nnoop 0\n";
 
+/// `vllm_num_requests_running` above the evaluable threshold (see `window_is_evaluable`).
+const MINIMAL_EVALUABLE_SCRAPE: &str = r#"# TYPE vllm_num_requests_running gauge
+vllm_num_requests_running 20
+# TYPE noop gauge
+noop 0
+"#;
+
 fn spawn_metrics_server(
     body: &'static str,
     response_count: usize,
@@ -92,7 +99,7 @@ fn help_exits_success() {
 
 #[test]
 fn diagnose_exits_success() {
-    let (url, server) = spawn_metrics_server(MINIMAL_SCRAPE, SAMPLE_COUNT);
+    let (url, server) = spawn_metrics_server(MINIMAL_EVALUABLE_SCRAPE, SAMPLE_COUNT);
     let output = Command::cargo_bin("profile")
         .unwrap()
         .arg("diagnose")
@@ -215,7 +222,7 @@ fn diagnose_gen_tok_per_sec_na_when_counter_resets() {
 
 #[test]
 fn diagnose_verbose_shows_not_indicated_lines() {
-    let (url, server) = spawn_metrics_server(MINIMAL_SCRAPE, SAMPLE_COUNT);
+    let (url, server) = spawn_metrics_server(MINIMAL_EVALUABLE_SCRAPE, SAMPLE_COUNT);
     let output = Command::cargo_bin("profile")
         .unwrap()
         .args(["-v", "diagnose", "--url"])
@@ -264,6 +271,9 @@ fn diagnose_help_lists_usage_and_options() {
         "-m, --max-num-seqs",
         "Engine max_num_seqs if absent on /metrics",
         "[default: 256]",
+        "--duration",
+        "Observation duration",
+        "[default: 2s]",
         "-h, --help",
         "Display this message",
     ] {

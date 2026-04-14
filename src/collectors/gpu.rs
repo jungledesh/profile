@@ -1,11 +1,13 @@
 use std::thread;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
 use nvml_wrapper::enum_wrappers::device::{Clock, ClockId, TemperatureSensor};
 use nvml_wrapper::Nvml;
 
-use super::sampling::{SAMPLE_COUNT, SAMPLE_INTERVAL};
+#[cfg(test)]
+use super::sampling::SAMPLE_COUNT;
+use super::sampling::{sample_count_for, SAMPLE_INTERVAL};
 use super::GpuRawMetrics;
 
 const MIB: u64 = 1024 * 1024;
@@ -87,6 +89,11 @@ fn aggregate_polls(polls: &[GpuPoll]) -> AggregatedPolls {
 
 /// Returns `(metrics, observed_at)` after the last NVML poll in the sampling window.
 pub fn collect_gpu_metrics() -> Result<(GpuRawMetrics, SystemTime)> {
+    collect_gpu_metrics_for(Duration::from_secs(2))
+}
+
+/// Returns `(metrics, observed_at)` after the last NVML poll for the requested window.
+pub fn collect_gpu_metrics_for(window: Duration) -> Result<(GpuRawMetrics, SystemTime)> {
     let Ok(nvml) = Nvml::init() else {
         return Ok((GpuRawMetrics::default(), SystemTime::now()));
     };
@@ -102,9 +109,10 @@ pub fn collect_gpu_metrics() -> Result<(GpuRawMetrics, SystemTime)> {
         .ok()
         .map(|mw| mw as f64 / 1000.0);
 
-    let mut polls = Vec::with_capacity(SAMPLE_COUNT);
+    let sample_count = sample_count_for(window);
+    let mut polls = Vec::with_capacity(sample_count);
 
-    for i in 0..SAMPLE_COUNT {
+    for i in 0..sample_count {
         let mut tick = GpuPoll::default();
 
         if let Ok(u) = device.utilization_rates() {
@@ -131,7 +139,7 @@ pub fn collect_gpu_metrics() -> Result<(GpuRawMetrics, SystemTime)> {
 
         polls.push(tick);
 
-        if i + 1 < SAMPLE_COUNT {
+        if i + 1 < sample_count {
             thread::sleep(SAMPLE_INTERVAL);
         }
     }

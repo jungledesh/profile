@@ -4,7 +4,7 @@
 
 use std::time::SystemTime;
 
-use crate::collectors::{GpuRawMetrics, RawSnapshot};
+use crate::collectors::{window_is_evaluable, GpuRawMetrics, RawSnapshot};
 
 /// Correlation gate: GPU vs vLLM observation times must be close.
 const MAX_OBSERVATION_SKEW_SECS: f64 = 1.0;
@@ -149,11 +149,20 @@ pub enum Rule3Outcome {
 }
 
 const NO_ISSUES_LINE: &str = "No issues detected in this snapshot.";
+const NOTE_NO_EVALUABLE: &str = "Note: No evaluable traffic detected during the window.";
 
 /// Diagnose lines for rules. Emits `ISSUE:` blocks when rules fire (blank line between two issues).
 /// With `verbose_rules`, also emits one calm line per rule that did not fire.
 /// When nothing fires, ends with [`NO_ISSUES_LINE`].
 pub fn format_diagnose_rules(snapshot: &RawSnapshot, verbose_rules: bool) -> Vec<String> {
+    if !window_is_evaluable(snapshot) {
+        let mut out = vec![NO_ISSUES_LINE.to_string(), NOTE_NO_EVALUABLE.to_string()];
+        if verbose_rules {
+            out.push("Note: 1 window had insufficient traffic for analysis.".to_string());
+        }
+        return out;
+    }
+
     let r1 = rule1_under_batching(snapshot);
     let r2 = rule2_kv_cache_pressure(snapshot);
     let r3 = rule3_low_prefix_reuse(snapshot);
@@ -199,6 +208,269 @@ pub fn format_diagnose_rules(snapshot: &RawSnapshot, verbose_rules: bool) -> Vec
     }
 
     out
+}
+
+/// Diagnose lines aggregated over multiple logical windows.
+pub fn format_diagnose_rules_for_windows(
+    windows: &[RawSnapshot],
+    summary: &RawSnapshot,
+    verbose_rules: bool,
+) -> Vec<String> {
+    if windows.is_empty() {
+        return vec![NO_ISSUES_LINE.to_string()];
+    }
+
+    let total = windows.len();
+    let skipped = windows.iter().filter(|w| !window_is_evaluable(w)).count();
+    let evaluable: Vec<&RawSnapshot> = windows.iter().filter(|w| window_is_evaluable(w)).collect();
+    let n_eval = evaluable.len();
+
+    if n_eval == 0 {
+        let mut out = vec![NO_ISSUES_LINE.to_string(), NOTE_NO_EVALUABLE.to_string()];
+        if verbose_rules {
+            out.push(format!(
+                "Note: {skipped} of {total} windows had insufficient traffic for analysis."
+            ));
+        }
+        return out;
+    }
+
+    let mut r1_fired = 0usize;
+    let mut r2_fired = 0usize;
+    let mut r3_fired = 0usize;
+
+    let mut r1_details = Vec::new();
+    let mut r2_details = Vec::new();
+    let mut r3_details = Vec::new();
+
+    for w in &evaluable {
+        match rule1_under_batching(w) {
+            Rule1Outcome::Fired(d) => {
+                r1_fired += 1;
+                r1_details.push(d);
+            }
+            Rule1Outcome::NotFired(_) => {}
+        }
+        match rule2_kv_cache_pressure(w) {
+            Rule2Outcome::Fired(d) => {
+                r2_fired += 1;
+                r2_details.push(d);
+            }
+            Rule2Outcome::NotFired(_) => {}
+        }
+        match rule3_low_prefix_reuse(w) {
+            Rule3Outcome::Fired(d) => {
+                r3_fired += 1;
+                r3_details.push(d);
+            }
+            Rule3Outcome::NotFired => {}
+        }
+    }
+
+    if r1_fired + r2_fired + r3_fired == 0 {
+        let mut out = Vec::new();
+        if verbose_rules {
+            out.push("Under-batching: not indicated".to_string());
+            out.push(String::new());
+            out.push("KV cache pressure: not indicated".to_string());
+            out.push(String::new());
+            out.extend(format_rule3_verbose_miss(summary));
+            out.push(String::new());
+        }
+        out.push(NO_ISSUES_LINE.to_string());
+        if verbose_rules && skipped > 0 {
+            out.push(format!(
+                "Note: {skipped} of {total} windows had insufficient traffic for analysis."
+            ));
+        }
+        trim_trailing_blank_lines(&mut out);
+        return out;
+    }
+
+    let mut out = vec!["ISSUES:".to_string(), String::new()];
+
+    if r1_fired > 0 {
+        out.extend(format_under_batching_window_issue(
+            &aggregate_r1_detail(&r1_details, summary),
+            pct(r1_fired, n_eval),
+        ));
+        out.push(String::new());
+    } else if verbose_rules {
+        out.push("Under-batching: not indicated".to_string());
+        out.push(String::new());
+    }
+
+    if r2_fired > 0 {
+        out.extend(format_kv_cache_window_issue(
+            &aggregate_r2_detail(&r2_details, summary),
+            pct(r2_fired, n_eval),
+        ));
+        out.push(String::new());
+    } else if verbose_rules {
+        out.push("KV cache pressure: not indicated".to_string());
+        out.push(String::new());
+    }
+
+    if r3_fired > 0 {
+        out.extend(format_low_prefix_window_issue(
+            &aggregate_r3_detail(&r3_details, summary),
+            pct(r3_fired, n_eval),
+        ));
+        out.push(String::new());
+    } else if verbose_rules {
+        out.extend(format_rule3_verbose_miss(summary));
+        out.push(String::new());
+    }
+
+    let mut not_fired = Vec::new();
+    if r1_fired == 0 {
+        not_fired.push("Under-batching");
+    }
+    if r2_fired == 0 {
+        not_fired.push("KV Cache Pressure");
+    }
+    if r3_fired == 0 {
+        not_fired.push("Low Prefix Cache");
+    }
+    if !not_fired.is_empty() {
+        out.push(format!("No issues for {}", join_rule_names(&not_fired)));
+    }
+    if verbose_rules && skipped > 0 {
+        out.push(String::new());
+        out.push(format!(
+            "Note: {skipped} of {total} windows had insufficient traffic for analysis."
+        ));
+    }
+    trim_trailing_blank_lines(&mut out);
+    out
+}
+
+fn trim_trailing_blank_lines(lines: &mut Vec<String>) {
+    while lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+}
+
+fn join_rule_names(items: &[&str]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.to_string(),
+        [a, b] => format!("{a} and {b}"),
+        _ => {
+            let head = &items[..items.len() - 1];
+            let last = items[items.len() - 1];
+            format!("{}, and {}", head.join(", "), last)
+        }
+    }
+}
+
+fn format_under_batching_window_issue(d: &UnderBatchingDetail, seen_pct: u32) -> Vec<String> {
+    vec![
+        "Under-batching".to_string(),
+        format!("Seen in {seen_pct}% of windows"),
+        format!(
+            "Cause: Very low occupancy — avg {:.1} / {}, avg GPU util {:.1}%",
+            d.running, d.max_num_seqs, d.gpu_util,
+        ),
+        String::new(),
+        "For better efficiency:".to_string(),
+        "  • Increase client concurrency or request rate".to_string(),
+        "  • Raise max_num_seqs if VRAM allows".to_string(),
+    ]
+}
+
+fn format_kv_cache_window_issue(d: &KvCachePressureDetail, seen_pct: u32) -> Vec<String> {
+    vec![
+        "KV Cache Pressure".to_string(),
+        format!("Seen in {seen_pct}% of windows"),
+        format!(
+            "Cause: KV usage {:.1}% — eviction risk",
+            d.kv_cache_usage_perc
+        ),
+        String::new(),
+        "For better efficiency:".to_string(),
+        "  • Enable prefix caching".to_string(),
+        "  • Consider fp8 KV cache (kv-cache-dtype=fp8)".to_string(),
+    ]
+}
+
+fn format_low_prefix_window_issue(d: &LowPrefixReuseDetail, seen_pct: u32) -> Vec<String> {
+    vec![
+        "Low Prefix Cache".to_string(),
+        format!("Seen in {seen_pct}% of windows"),
+        format!(
+            "Cause: Hit rate only {:.1}% — poor reuse",
+            d.hit_rate * 100.0
+        ),
+        String::new(),
+        "For better efficiency:".to_string(),
+        "  • Enable prefix caching".to_string(),
+        "  • Reuse identical prompt prefixes".to_string(),
+    ]
+}
+
+fn pct(fired: usize, total: usize) -> u32 {
+    if total == 0 {
+        return 0;
+    }
+    ((fired as f64 / total as f64) * 100.0).round() as u32
+}
+
+fn aggregate_r1_detail(
+    details: &[UnderBatchingDetail],
+    summary: &RawSnapshot,
+) -> UnderBatchingDetail {
+    if details.is_empty() {
+        return UnderBatchingDetail {
+            running: summary.vllm.num_requests_running.unwrap_or(0.0),
+            max_num_seqs: summary.vllm.max_num_seqs.unwrap_or(256),
+            gpu_util: summary.gpu.gpu_util_pct.unwrap_or(0.0),
+        };
+    }
+    let running = details.iter().map(|d| d.running).sum::<f64>() / details.len() as f64;
+    let gpu = details.iter().map(|d| d.gpu_util).sum::<f64>() / details.len() as f64;
+    UnderBatchingDetail {
+        running,
+        max_num_seqs: details[0].max_num_seqs,
+        gpu_util: gpu,
+    }
+}
+
+fn aggregate_r2_detail(
+    details: &[KvCachePressureDetail],
+    summary: &RawSnapshot,
+) -> KvCachePressureDetail {
+    if details.is_empty() {
+        return KvCachePressureDetail {
+            kv_cache_usage_perc: summary.vllm.kv_cache_usage_perc.unwrap_or(0.0),
+            vram_usage_perc_corroborated: None,
+        };
+    }
+    let kv = details.iter().map(|d| d.kv_cache_usage_perc).sum::<f64>() / details.len() as f64;
+    let corroborated = details.iter().find_map(|d| d.vram_usage_perc_corroborated);
+    KvCachePressureDetail {
+        kv_cache_usage_perc: kv,
+        vram_usage_perc_corroborated: corroborated,
+    }
+}
+
+fn aggregate_r3_detail(
+    details: &[LowPrefixReuseDetail],
+    summary: &RawSnapshot,
+) -> LowPrefixReuseDetail {
+    if details.is_empty() {
+        return LowPrefixReuseDetail {
+            hit_rate: summary.vllm.prefix_cache_hit_rate.unwrap_or(0.0),
+            prompt_tokens_mean: summary.vllm.prompt_tokens_mean.unwrap_or(0.0),
+        };
+    }
+    let hit_rate = details.iter().map(|d| d.hit_rate).sum::<f64>() / details.len() as f64;
+    let prompt_tokens_mean =
+        details.iter().map(|d| d.prompt_tokens_mean).sum::<f64>() / details.len() as f64;
+    LowPrefixReuseDetail {
+        hit_rate,
+        prompt_tokens_mean,
+    }
 }
 
 pub fn rule1_under_batching(snapshot: &RawSnapshot) -> Rule1Outcome {
@@ -771,12 +1043,12 @@ mod tests {
     }
 
     #[test]
-    fn format_diagnose_rule3_verbose_not_indicated_when_rate_low_but_idle() {
+    fn format_diagnose_rule3_verbose_not_indicated_when_rate_low_but_prompt_below_floor() {
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
+        // Evaluable traffic, but rule 3 does not fire (prompt mean below PREFIX_RULE_PROMPT_TOKENS_GTE).
         v.prefix_cache_hit_rate = Some(0.20);
-        v.num_requests_running = Some(0.5);
-        v.prompt_tokens_mean = Some(100.0);
+        v.prompt_tokens_mean = Some(10.0);
         let s = snap(t, t, v, gpu_busy());
         let text = format_diagnose_rules(&s, true).join("\n");
         assert!(text.contains("Prefix cache hit rate: not indicated"));
@@ -833,5 +1105,104 @@ mod tests {
             !lines.iter().any(|l| l.contains("No issues detected")),
             "should not append no-issues line when at least one rule fired"
         );
+    }
+
+    #[test]
+    fn format_diagnose_rules_for_windows_matches_requested_style_when_some_rules_fire() {
+        let t = SystemTime::UNIX_EPOCH;
+        let mut windows = Vec::new();
+        for i in 0..10 {
+            let mut v = vllm_base();
+            v.max_num_seqs = Some(256);
+            v.num_requests_waiting = Some(1.0);
+            v.kv_cache_usage_perc = Some(71.2);
+            v.prefix_cache_hit_rate = Some(0.524);
+            v.prompt_tokens_mean = Some(128.0);
+            v.generation_tokens_per_sec = Some(1580.0);
+            let mut g = gpu_busy();
+            g.power_watts = Some(312.0);
+            g.vram_used_mb = Some(62 * 1024);
+            g.vram_total_mb = Some(80 * 1024);
+            if i < 4 {
+                v.num_requests_running = Some(3.2);
+                g.gpu_util_pct = Some(50.0);
+            } else {
+                v.num_requests_running = Some(20.0);
+                g.gpu_util_pct = Some(74.0);
+            }
+            windows.push(snap(t, t, v, g));
+        }
+        let summary = windows.last().expect("summary source").clone();
+        let lines = format_diagnose_rules_for_windows(&windows, &summary, false);
+        let text = lines.join("\n");
+        assert!(text.contains("ISSUES:"));
+        assert!(text.contains("Under-batching"));
+        assert!(text.contains("Seen in 40% of windows"));
+        assert!(text.contains("Cause: Very low occupancy — avg 3.2 / 256, avg GPU util 50.0%"));
+        assert!(text.contains("For better efficiency:"));
+        assert!(text.contains("No issues for KV Cache Pressure and Low Prefix Cache"));
+    }
+
+    #[test]
+    fn format_diagnose_rules_for_windows_no_fires_is_single_no_issues_line() {
+        let t = SystemTime::UNIX_EPOCH;
+        let mut v = vllm_base();
+        v.num_requests_running = Some(20.0);
+        v.num_requests_waiting = Some(3.0);
+        v.kv_cache_usage_perc = Some(71.2);
+        v.prefix_cache_hit_rate = Some(0.524);
+        v.prompt_tokens_mean = Some(128.0);
+        v.generation_tokens_per_sec = Some(100.0);
+        let mut g = gpu_busy();
+        g.gpu_util_pct = Some(74.0);
+        let windows = vec![snap(t, t, v, g)];
+        let summary = windows[0].clone();
+        let lines = format_diagnose_rules_for_windows(&windows, &summary, false);
+        assert_eq!(
+            lines,
+            vec!["No issues detected in this snapshot.".to_string()]
+        );
+    }
+
+    #[test]
+    fn format_diagnose_rules_non_evaluable_snapshot_shows_note() {
+        let t = SystemTime::UNIX_EPOCH;
+        let mut v = vllm_base();
+        v.num_requests_running = Some(0.0);
+        v.generation_tokens_per_sec = Some(0.0);
+        let s = snap(t, t, v, gpu_busy());
+        let lines = format_diagnose_rules(&s, false);
+        assert_eq!(
+            lines,
+            vec![
+                "No issues detected in this snapshot.".to_string(),
+                "Note: No evaluable traffic detected during the window.".to_string(),
+            ]
+        );
+        let vlines = format_diagnose_rules(&s, true);
+        assert!(vlines
+            .iter()
+            .any(|l| l.contains("1 window had insufficient traffic")));
+    }
+
+    #[test]
+    fn format_diagnose_rules_for_windows_all_non_evaluable() {
+        let t = SystemTime::UNIX_EPOCH;
+        let mut v = vllm_base();
+        v.num_requests_running = Some(0.2);
+        v.generation_tokens_per_sec = Some(5.0);
+        let w1 = snap(t, t, v.clone(), gpu_busy());
+        let w2 = snap(t, t, v, gpu_busy());
+        let windows = vec![w1, w2];
+        let lines = format_diagnose_rules_for_windows(&windows, &windows[0], false);
+        assert_eq!(
+            lines,
+            vec![
+                "No issues detected in this snapshot.".to_string(),
+                "Note: No evaluable traffic detected during the window.".to_string(),
+            ]
+        );
+        let vlines = format_diagnose_rules_for_windows(&windows, &windows[0], true);
+        assert!(vlines.iter().any(|l| l.contains("2 of 2 windows")));
     }
 }
