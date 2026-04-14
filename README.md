@@ -1,31 +1,85 @@
-# Profile
+# profile — vLLM Inference Profiler
 
-Cut GPU waste. Find issues and fix them in a minute.
+**Less words. More insight.**  
+Find and fix inference bottlenecks in minutes. 
 
----
+## What it does
 
-**Bottlenecks <> Profile <> Tuning**
+`profile` turns raw vLLM + GPU metrics into **clear diagnosis and actionable fixes**.
 
-Follow **Pain → Metric → Diagnosis → Cause → Evidence → Fix**: simply, surface waste, rank issues, and return diagnosis, cause, evidence, confidence, and a recommended plan (impact + basis)—or a clean **do nothing** when there’s nothing major to fix.
+- Samples GPU + vLLM signals every **250ms**
+- Supports instant snapshots and longer analysis (`--duration 30s | 1m | 5m | ...`)
+- Detects real production bottlenecks:
+  - **Under-batching** — GPU has headroom, but scheduler occupancy is too low
+  - **KV Cache Pressure** — KV usage near capacity → eviction risk
+  - **Low Prefix Cache reuse** — prompts don’t share context → wasted performance
 
----
+It tells you **what’s wrong, why it’s happening, and what to fix first**, so you can reduce cost per token.
 
-![X ms, Y joules, Z dollars](assets/inference-metrics.jpeg)
+## Why use this
 
+vLLM `/metrics` shows numbers.  
+`profile` answers:
 
-**per request.**
+- Why is my GPU at 50%?
+- Why is throughput lower than expected?
+- Where am I wasting tokens / memory?
 
-We focus on less words, more signal: a tool that tells the truth, and gives actions you can use to save money.
+## Installation
 
----
+**Linux binary (recommended for quick start)**  
+Download from the [latest release](https://github.com/jungledesh/profile/releases).
 
-## Docs
+```bash
+chmod +x profile
+./profile diagnose --url http://localhost:8000/metrics --duration 5m
+```
 
-- [Roadmap](docs/roadmap.md)
-- [GPU setup](docs/gpu-setup.md)
+### Cargo
 
----
+```
+cargo install --git https://github.com/jungledesh/profile
+```
 
-## Technical design
+### Pip package
 
-Diagnose derives some vLLM numbers from a **short multi-scrape window** (several successive `/metrics` polls, on the order of a couple of seconds)—for example **prefix cache hit rate** as Δhits/Δqueries between the first and last sample in that window. Those values describe **what happened while Profile was observing**, not lifetime or steady-state server behavior. Runtime output stays user-facing; this note is the place for that caveat.
+coming soon 
+
+### Quick Start
+
+```
+# Instant snapshot (2s)
+./profile diagnose --url http://localhost:8000/metrics
+
+# Recommended: 5-minute analysis
+./profile diagnose --url http://localhost:8000/metrics --duration 5m
+
+# Verbose mode
+./profile -v diagnose --url http://localhost:8000/metrics --duration 5m
+```
+
+## Example Output
+
+```bash
+KV Cache Pressure
+Seen in 80% of windows
+
+Cause:
+- KV usage 93.5% — near capacity
+- High concurrency with long sequences
+
+Recommendation:
+  • Reduce active sequence count (lower concurrency)
+  • Shorten prompts/outputs where possible
+  • Use fp8 KV cache (--kv-cache-dtype=fp8)
+```
+
+## Development Notes
+
+Built as a focused solo project to make vLLM inference diagnostics  
+**predictable, truthful, and actionable**.
+
+This is **v0.1.0** — currently optimized for single-GPU setups.
+
+Feedback and real-world usage are highly valuable.  
+A deeper technical write-up is coming soon.
