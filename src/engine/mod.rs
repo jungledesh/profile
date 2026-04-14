@@ -12,8 +12,8 @@ const MAX_OBSERVATION_SKEW_SECS: f64 = 1.0;
 const UNDER_BATCHING_GPU_UTIL_LT: f64 = 62.0;
 /// Minimum mean `num_requests_running` (window) so we do not fire on an idle server.
 const UNDER_BATCHING_RUNNING_GT: f64 = 0.75;
-/// Mean running must stay strictly below this fraction of `max_num_seqs` to fire (6% — primary cap).
-const UNDER_BATCHING_OCCUPANCY_FRAC: f64 = 0.06;
+/// Mean running must stay strictly below this fraction of `max_num_seqs` to fire (4% — primary cap).
+const UNDER_BATCHING_OCCUPANCY_FRAC: f64 = 0.04;
 /// Fire only when mean waiting is strictly below this (no backlog).
 const UNDER_BATCHING_WAITING_LT: f64 = 2.0;
 
@@ -187,7 +187,7 @@ pub fn format_diagnose_rules(snapshot: &RawSnapshot, verbose_rules: bool) -> Vec
     }
 
     match &r2 {
-        Rule2Outcome::Fired(d) => append(format_kv_cache_pressure_fired(d)),
+        Rule2Outcome::Fired(d) => append(format_kv_cache_pressure_fired(d, snapshot)),
         Rule2Outcome::NotFired(_) if verbose_rules => {
             append(vec!["KV cache pressure: not indicated".to_string()])
         }
@@ -304,6 +304,7 @@ pub fn format_diagnose_rules_for_windows(
         out.extend(format_kv_cache_window_issue(
             &aggregate_r2_detail(&r2_details, summary),
             pct(r2_fired, n_eval),
+            summary,
         ));
         out.push(String::new());
     } else if verbose_rules {
@@ -365,12 +366,13 @@ fn join_rule_names(items: &[&str]) -> String {
 }
 
 fn format_under_batching_window_issue(d: &UnderBatchingDetail, seen_pct: u32) -> Vec<String> {
+    let occupancy_pct = (d.running / f64::from(d.max_num_seqs)) * 100.0;
     vec![
         "Under-batching".to_string(),
         format!("Seen in {seen_pct}% of windows"),
         format!(
-            "Cause: Very low occupancy — avg {:.1} / {}, avg GPU util {:.1}%",
-            d.running, d.max_num_seqs, d.gpu_util,
+            "Cause: Very low occupancy — avg {:.1} / {} ({occupancy_pct:.1}%), GPU util only {:.1}% with headroom",
+            d.running, d.max_num_seqs, d.gpu_util
         ),
         String::new(),
         "For better efficiency:".to_string(),
@@ -379,33 +381,51 @@ fn format_under_batching_window_issue(d: &UnderBatchingDetail, seen_pct: u32) ->
     ]
 }
 
-fn format_kv_cache_window_issue(d: &KvCachePressureDetail, seen_pct: u32) -> Vec<String> {
-    vec![
+fn format_kv_cache_window_issue(
+    d: &KvCachePressureDetail,
+    seen_pct: u32,
+    summary: &RawSnapshot,
+) -> Vec<String> {
+    let mut out = vec![
         "KV Cache Pressure".to_string(),
         format!("Seen in {seen_pct}% of windows"),
-        format!(
-            "Cause: KV usage {:.1}% — eviction risk",
-            d.kv_cache_usage_perc
-        ),
+        "Cause:".to_string(),
+        format!("  - KV usage {:.1}% — near capacity", d.kv_cache_usage_perc),
+    ];
+    if let Some(r) = summary.vllm.num_requests_running.filter(|x| x.is_finite()) {
+        out.push(format!("  - High concurrency (~{:.0} running requests)", r));
+    }
+    if let Some(p) = summary.vllm.prompt_tokens_mean.filter(|x| x.is_finite()) {
+        out.push(format!("  - Long sequences (~{:.0} token prompts)", p));
+    }
+    out.extend([
         String::new(),
-        "For better efficiency:".to_string(),
-        "  • Enable prefix caching".to_string(),
+        "Recommendation:".to_string(),
+        "  • Reduce active sequence count (lower concurrency or request rate)".to_string(),
+        "  • Shorten prompts/outputs where possible".to_string(),
+        "  • Increase KV capacity if needed:".to_string(),
+        "      - Raise --gpu-memory-utilization (if VRAM headroom exists)".to_string(),
         "  • Consider fp8 KV cache (kv-cache-dtype=fp8)".to_string(),
-    ]
+        "  • Lower max_model_len only if safe for your workload".to_string(),
+    ]);
+    out
 }
 
 fn format_low_prefix_window_issue(d: &LowPrefixReuseDetail, seen_pct: u32) -> Vec<String> {
     vec![
         "Low Prefix Cache".to_string(),
         format!("Seen in {seen_pct}% of windows"),
-        format!(
-            "Cause: Hit rate only {:.1}% — poor reuse",
-            d.hit_rate * 100.0
-        ),
+        "Cause:".to_string(),
+        format!("  - Prefix hit rate {:.1}%", d.hit_rate * 100.0),
+        "  - Prompts have no shared leading context".to_string(),
         String::new(),
-        "For better efficiency:".to_string(),
-        "  • Enable prefix caching".to_string(),
-        "  • Reuse identical prompt prefixes".to_string(),
+        "Recommendation:".to_string(),
+        "  • Workload shows no prefix reuse — cache is currently ineffective".to_string(),
+        "  • If reuse is expected:".to_string(),
+        "      - Move shared instructions/system prompts to the very start".to_string(),
+        "      - Standardize prompt templates across requests".to_string(),
+        "      - Avoid unique tokens (IDs, timestamps) at the beginning".to_string(),
+        "  • Otherwise: no action needed".to_string(),
     ]
 }
 
@@ -616,35 +636,58 @@ fn format_low_prefix_hit_rate_fired(d: &LowPrefixReuseDetail) -> Vec<String> {
     let hit = d.hit_rate * 100.0;
     vec![
         "ISSUE: Low Prefix Cache".to_string(),
-        format!("Cause: Hit rate only {hit:.1}% — poor reuse"),
+        "Cause:".to_string(),
+        format!("  - Prefix hit rate {hit:.1}%"),
+        "  - Prompts have no shared leading context".to_string(),
         String::new(),
         "Recommendation:".to_string(),
-        "  • Enable prefix caching".to_string(),
-        "  • Reuse identical prompt prefixes".to_string(),
+        "  • Workload shows no prefix reuse — cache is currently ineffective".to_string(),
+        "  • If reuse is expected:".to_string(),
+        "      - Move shared instructions/system prompts to the very start".to_string(),
+        "      - Standardize prompt templates across requests".to_string(),
+        "      - Avoid unique tokens (IDs, timestamps) at the beginning".to_string(),
+        "  • Otherwise: no action needed".to_string(),
         String::new(),
         "Expected: Reduced prefill time".to_string(),
         "Confidence: Medium-High".to_string(),
     ]
 }
 
-fn format_kv_cache_pressure_fired(d: &KvCachePressureDetail) -> Vec<String> {
+fn format_kv_cache_pressure_fired(
+    d: &KvCachePressureDetail,
+    snapshot: &RawSnapshot,
+) -> Vec<String> {
     let kv = d.kv_cache_usage_perc;
     let conf = if d.vram_usage_perc_corroborated.is_some() {
         "Confidence: High"
     } else {
         "Confidence: Medium-High"
     };
-    vec![
+    let mut out = vec![
         "ISSUE: KV Cache Pressure".to_string(),
-        format!("Cause: KV usage {kv:.1}% — eviction risk"),
+        "Cause:".to_string(),
+        format!("  - KV usage {kv:.1}% — near capacity"),
+    ];
+    if let Some(r) = snapshot.vllm.num_requests_running.filter(|x| x.is_finite()) {
+        out.push(format!("  - High concurrency (~{:.0} running requests)", r));
+    }
+    if let Some(p) = snapshot.vllm.prompt_tokens_mean.filter(|x| x.is_finite()) {
+        out.push(format!("  - Long sequences (~{:.0} token prompts)", p));
+    }
+    out.extend([
         String::new(),
         "Recommendation:".to_string(),
-        "  • Enable prefix caching".to_string(),
+        "  • Reduce active sequence count (lower concurrency or request rate)".to_string(),
+        "  • Shorten prompts/outputs where possible".to_string(),
+        "  • Increase KV capacity if needed:".to_string(),
+        "      - Raise --gpu-memory-utilization (if VRAM headroom exists)".to_string(),
         "  • Consider fp8 KV cache (kv-cache-dtype=fp8)".to_string(),
+        "  • Lower max_model_len only if safe for your workload".to_string(),
         String::new(),
         "Expected: 20–45% better throughput".to_string(),
         conf.to_string(),
-    ]
+    ]);
+    out
 }
 
 fn skew_secs(a: SystemTime, b: SystemTime) -> f64 {
@@ -678,10 +721,9 @@ fn format_under_batching_fired(d: &UnderBatchingDetail) -> Vec<String> {
     vec![
         "ISSUE: Under-batching".to_string(),
         format!(
-            "Cause: Very low occupancy — {run_s} / {} ({pct:.1}%)",
+            "Cause: Very low occupancy — {run_s} / {} ({pct:.1}%), GPU util only {gpu_s}% with headroom",
             d.max_num_seqs,
         ),
-        format!("       GPU utilization {gpu_s}% with headroom"),
         String::new(),
         "Recommendation:".to_string(),
         "  • Increase client concurrency or request rate".to_string(),
@@ -740,7 +782,7 @@ mod tests {
     #[test]
     fn under_batching_fires_when_gates_pass() {
         let t = SystemTime::UNIX_EPOCH;
-        // 3.1 < 0.06 * 256 = 15.36, gpu 58 < 62, wait 0 < 2, running > 0.75
+        // 3.1 < 0.04 * 256 = 10.24, gpu 58 < 62, wait 0 < 2, running > 0.75
         let s = snap(t, t, vllm_base(), gpu_low());
         let issues = evaluate_issues(&s);
         assert_eq!(issues.len(), 1);
@@ -803,7 +845,7 @@ mod tests {
     fn high_occupancy_suppresses() {
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
-        v.num_requests_running = Some(40.0); // well above 6% of 256
+        v.num_requests_running = Some(40.0); // well above 4% of 256
         let s = snap(t, t, v, gpu_low());
         assert!(evaluate_issues(&s).is_empty());
     }
@@ -812,7 +854,7 @@ mod tests {
     fn occupancy_at_six_percent_cap_suppresses() {
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
-        // 6% * 256 = 15.36 — must be strictly below cap to fire
+        // 4% * 256 = 10.24 — must be strictly below cap to fire
         v.num_requests_running = Some(16.0);
         let s = snap(t, t, v, gpu_low());
         assert!(evaluate_issues(&s).is_empty());
@@ -854,7 +896,7 @@ mod tests {
         assert!(text.contains("ISSUE: Under-batching"));
         assert!(text.contains("Very low occupancy"));
         assert!(text.contains("3.1 / 256"));
-        assert!(text.contains("       GPU utilization 58% with headroom"));
+        assert!(text.contains("GPU util only 58% with headroom"));
         assert!(text.contains("Recommendation:"));
         assert!(text.contains("  • Increase client concurrency or request rate"));
         assert!(text.contains("  • Raise max_num_seqs if VRAM allows"));
@@ -950,8 +992,13 @@ mod tests {
         gb.vram_total_mb = Some(100 * 1024);
         let s_kv_only = snap(t, t, vllm_high_kv(), gb);
         let text = format_diagnose_rules(&s_kv_only, false).join("\n");
-        assert!(text.contains("Cause: KV usage 86.0% — eviction risk"));
+        assert!(text.contains("Cause:"));
+        assert!(text.contains("  - KV usage 86.0% — near capacity"));
+        assert!(text.contains("  - High concurrency (~3 running requests)"));
         assert!(text.contains("Expected: 20–45% better throughput"));
+        assert!(
+            text.contains("  • Reduce active sequence count (lower concurrency or request rate)")
+        );
         assert!(text.contains("  • Consider fp8 KV cache (kv-cache-dtype=fp8)"));
         assert!(text.contains("Confidence: High"));
     }
@@ -969,7 +1016,7 @@ mod tests {
         }
         let text = format_diagnose_rules(&s, false).join("\n");
         assert!(text.contains("Confidence: Medium-High"));
-        assert!(text.contains("Cause: KV usage 86.0% — eviction risk"));
+        assert!(text.contains("  - KV usage 86.0% — near capacity"));
     }
 
     #[test]
@@ -1023,10 +1070,14 @@ mod tests {
         let lines = format_low_prefix_hit_rate_fired(&d);
         let text = lines.join("\n");
         assert!(text.contains("ISSUE: Low Prefix Cache"));
-        assert!(text.contains("Cause: Hit rate only 24.0% — poor reuse"));
+        assert!(text.contains("Cause:"));
+        assert!(text.contains("  - Prefix hit rate 24.0%"));
+        assert!(text.contains("  - Prompts have no shared leading context"));
         assert!(text.contains("Recommendation:"));
-        assert!(text.contains("  • Enable prefix caching"));
-        assert!(text.contains("  • Reuse identical prompt prefixes"));
+        assert!(
+            text.contains("  • Workload shows no prefix reuse — cache is currently ineffective")
+        );
+        assert!(text.contains("  • Otherwise: no action needed"));
         assert!(text.contains("Expected: Reduced prefill time"));
         assert!(text.contains("Confidence: Medium-High"));
     }
@@ -1138,7 +1189,9 @@ mod tests {
         assert!(text.contains("ISSUES:"));
         assert!(text.contains("Under-batching"));
         assert!(text.contains("Seen in 40% of windows"));
-        assert!(text.contains("Cause: Very low occupancy — avg 3.2 / 256, avg GPU util 50.0%"));
+        assert!(text.contains(
+            "Cause: Very low occupancy — avg 3.2 / 256 (1.2%), GPU util only 50.0% with headroom"
+        ));
         assert!(text.contains("For better efficiency:"));
         assert!(text.contains("No issues for KV Cache Pressure and Low Prefix Cache"));
     }

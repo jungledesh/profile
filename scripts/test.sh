@@ -1,63 +1,65 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "=== v0.1 Duration-Aware Profiler Test (Realistic Load) ==="
-echo "Testing default + boundary cases with varied traffic"
-echo "================================================================="
+VLLM_URL="${VLLM_URL:-http://localhost:8000}"
+MODEL="${MODEL:-llama3}"
+PROFILE_BIN="${PROFILE_BIN:-./profile}"
+TEST_SEC="${TEST_SEC:-75}"
 
-VLLM_URL="http://localhost:8000"
-TEST_DURATION_SEC=420
-LOAD_PID=""
+post_chat() {
+  local prompt="$1"
+  local max_tokens="$2"
 
-cleanup() {
-  if [[ -n "${LOAD_PID}" ]]; then
-    kill "${LOAD_PID}" 2>/dev/null || true
-  fi
+  jq -n \
+    --arg model "$MODEL" \
+    --arg prompt "$prompt" \
+    --argjson max_tokens "$max_tokens" \
+    '{
+      model: $model,
+      messages: [{role:"user", content:$prompt}],
+      max_tokens: $max_tokens,
+      temperature: 0,
+      stream: false
+    }' \
+  | curl -sS -o /dev/null \
+      -H "Content-Type: application/json" \
+      -d @- \
+      "${VLLM_URL}/v1/chat/completions" || true
 }
-trap cleanup EXIT
 
-send_mixed_load() {
-  local end=$((SECONDS + TEST_DURATION_SEC))
-  while ((SECONDS < end)); do
-    local conc=$((6 + RANDOM % 11))
-    for ((i = 1; i <= conc; i++)); do
-      case $((RANDOM % 4)) in
-        0 | 1) PROMPT="Explain quantum computing in one paragraph." ;;
-        2) PROMPT="Explain quantum computing concepts in detail for software engineers..." ;;
-        3) PROMPT="Long context test with repeated blocks. $(printf 'Block %03d. ' {1..25})" ;;
-      esac
+send_under_batching_load() {
+  local end=$((SECONDS + TEST_SEC))
 
-      jq -n --arg p "$PROMPT" '{
-        model: "llama3",
-        messages: [{role:"user", content: $p}],
-        max_tokens: 256,
-        temperature: 0
-      }' | curl -s -o /dev/null -H "Content-Type: application/json" -d @- \
-        "${VLLM_URL}/v1/chat/completions" || true &
-    done
+  while (( SECONDS < end )); do
+    # Keep a few overlapping requests alive (but far below capacity)
+    post_chat "Explain RAM in 3 short bullet points for a beginner." 80 &
+    post_chat "Explain CPU vs GPU in 4 short bullet points." 80 &
+    post_chat "What is a database index? Answer in 5 short bullets." 80 &
+    post_chat "What is caching? Give a short practical explanation." 80 &
+
+    sleep 0.35
     wait
-    sleep "$(awk -v r=10 'BEGIN {x = 1/r - 0.05 + (rand()-0.5)*0.08; if (x < 0.02) x=0.02; print x}')"
+
+    # Small gap → keeps queue low + GPU underutilized
+    sleep 0.45
   done
 }
 
-send_mixed_load &
+echo "=== Rule 1: Under-batching ==="
+echo "Starting controlled low-occupancy load for ${TEST_SEC}s..."
+
+send_under_batching_load &
 LOAD_PID=$!
 
-echo "Starting mixed load for ${TEST_DURATION_SEC}s..."
-
-for dur in "2s" "30s" "32s" "1m" "5m"; do
-  echo ""
-  echo "=== Testing --duration ${dur} ==="
-  ./profile diagnose --url "${VLLM_URL}/metrics" --duration "${dur}"
-  sleep 10
-done
-
-echo ""
-echo "=== Testing --duration 5m with -v ==="
-./profile -v diagnose --url "${VLLM_URL}/metrics" --duration 5m
+sleep 10
+"${PROFILE_BIN}" diagnose --url "${VLLM_URL}/metrics" --duration 30s
 
 wait "${LOAD_PID}" 2>/dev/null || true
 
 echo ""
-echo "=== Duration test completed ==="
-echo "Check output for correct windowing, % fired, aggregation, and boundary behavior."
+echo "Expected:"
+echo "- running > 0.75"
+echo "- occupancy << max_num_seqs (very low %)"
+echo "- GPU util < 62%"
+echo "- waiting < 2"
+echo "- Rule 1 fires"
