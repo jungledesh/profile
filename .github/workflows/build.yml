@@ -16,20 +16,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@eef61447b9ff4aafe5dcd4e0bbf5d482be7e7871
+        uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1518e098f326d16ec030ab76751fbf2fa02ed1d4
+        uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@82a92a6e8fbeee089604da2575dc567ae9ddeaab
+        uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
 
       - name: cargo audit
-        uses: actions-rust-lang/audit@5c78f6a5e63bfb3b2e64e0b1b8c6f8d9e1a2b3c4
+        uses: actions-rust-lang/audit@v1
 
       - name: OSV-Scanner (fail on HIGH/CRITICAL)
         run: |
@@ -90,10 +90,10 @@ jobs:
         run: echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u ${{ github.repository_owner }} --password-stdin
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d70bba72b1f3fd22344832f00baa16ece30505ee
+        uses: docker/setup-buildx-action@v3
 
       - name: Build and push image
-        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25
+        uses: docker/build-push-action@v6
         with:
           context: .
           push: ${{ steps.docker_meta.outputs.push == 'true' }}
