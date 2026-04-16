@@ -1,4 +1,4 @@
-# profile — vLLM Inference Profiler
+# profile — vLLM Inference Diagnoser
 
 **Less words. More insight.**  
 Find and fix inference bottlenecks in minutes. 

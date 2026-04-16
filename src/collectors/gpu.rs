@@ -87,11 +87,6 @@ fn aggregate_polls(polls: &[GpuPoll]) -> AggregatedPolls {
     }
 }
 
-/// Returns `(metrics, observed_at)` after the last NVML poll in the sampling window.
-pub fn collect_gpu_metrics() -> Result<(GpuRawMetrics, SystemTime)> {
-    collect_gpu_metrics_for(Duration::from_secs(2))
-}
-
 /// Returns `(metrics, observed_at)` after the last NVML poll for the requested window.
 pub fn collect_gpu_metrics_for(window: Duration) -> Result<(GpuRawMetrics, SystemTime)> {
     let Ok(nvml) = Nvml::init() else {

@@ -37,7 +37,7 @@ jobs:
             -o /usr/local/bin/osv-scanner
           chmod +x /usr/local/bin/osv-scanner
           sudo apt-get update -qq && sudo apt-get install -y jq
-          osv-scanner --lockfile Cargo.lock --format json > osv-results.json || true
+          osv-scanner --lockfile Cargo.lock --format json > osv-results.json
           HIGH_CRIT_COUNT=$(jq '[.results[]?.vulnerabilities[]?.severity[]? | select(.type == "CVSS_V3" and (.score | tonumber >= 7.0))] | length' osv-results.json)
           if [ "$HIGH_CRIT_COUNT" -gt 0 ]; then
             echo "ERROR: Found $HIGH_CRIT_COUNT HIGH or CRITICAL vulnerabilities!"
