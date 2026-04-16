@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Perry <jungledesh@gmail.com>"]
 description = "Rust-based CLI tool for profiling vLLM GPU and other metrics."
+repository = "https://github.com/jungledesh/profile"
 
 [[bin]]
 name = "profile"
@@ -20,3 +21,11 @@ prometheus-parse = "0.2"
 [dev-dependencies]
 assert_cmd = "2.0"
 predicates = "3"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
+codegen-units = 1 
+strip = true
+
