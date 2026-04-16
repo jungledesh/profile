@@ -5,12 +5,9 @@ mod diagnose;
 use clap::{CommandFactory, Parser, Subcommand};
 use std::time::Duration;
 
-/// Matches vLLM engine default when `--max-num-seqs` is omitted.
-pub const DEFAULT_MAX_NUM_SEQS: u32 = 256;
-
-/// Default `-u` / `--url` value (full `/metrics` URL; base URLs are also accepted).
-pub const DEFAULT_METRICS_URL: &str = "http://localhost:8000/metrics";
-pub const DEFAULT_DURATION: &str = "2s";
+const DEFAULT_MAX_NUM_SEQS: u32 = 256;
+const DEFAULT_METRICS_URL: &str = "http://localhost:8000/metrics";
+const DEFAULT_DURATION: &str = "2s";
 
 const ABOUT: &str = "Detects inefficiencies. Suggests fixes.";
 
