@@ -3,7 +3,8 @@ name = "profile"
 version = "0.1.0"
 edition = "2021"
 authors = ["Perry <jungledesh@gmail.com>"]
-description = "Rust-based CLI tool for profiling vLLM GPU and other metrics."
+description = "Live bottleneck diagnosis for vLLM inference (rule-based, scrape-only)"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/jungledesh/profile"
 
 [[bin]]

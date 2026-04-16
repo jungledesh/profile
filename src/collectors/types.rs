@@ -5,7 +5,6 @@ use std::time::SystemTime;
 pub struct PrefixCacheScrapeSample {
     pub hits: Option<f64>,
     pub queries: Option<f64>,
-    pub misses: Option<f64>,
 }
 
 /// vLLM Prometheus scrape.
@@ -49,23 +48,6 @@ pub struct VllmRawMetrics {
     pub max_num_seqs: Option<u32>,
 }
 
-impl VllmRawMetrics {
-    pub fn has_scrape_data(&self) -> bool {
-        self.model_name.is_some()
-            || self.num_requests_running.is_some()
-            || self.num_requests_waiting.is_some()
-            || self.kv_cache_usage_perc.is_some()
-            || self.ttft_ms.is_some()
-            || self.tpot_ms.is_some()
-            || self.prefill_latency_ms.is_some()
-            || self.queue_delay_ms.is_some()
-            || self.prompt_tokens_mean.is_some()
-            || self.generation_tokens_total.is_some()
-            || self.generation_tokens_per_sec.is_some()
-            || self.prefix_cache_hit_rate.is_some()
-    }
-}
-
 /// NVML / DCGM / nvidia-smi scrape
 #[derive(Debug, Clone, Default)]
 pub struct GpuRawMetrics {
@@ -94,12 +76,6 @@ pub struct RawSnapshot {
     pub timestamp: SystemTime,
     pub vllm: VllmRawMetrics,
     pub gpu: GpuRawMetrics,
-}
-
-impl RawSnapshot {
-    pub fn is_empty(&self) -> bool {
-        !self.vllm.has_scrape_data() && self.gpu.gpu_util_pct.is_none()
-    }
 }
 
 /// Mean `num_requests_running` above this (exclusive) counts as evaluable traffic.

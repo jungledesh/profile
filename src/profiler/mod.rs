@@ -103,7 +103,16 @@ fn aggregate_windows(
         };
     }
 
-    let last = pairs.last().expect("non-empty evaluable").0;
+    let Some((last, _)) = pairs.last() else {
+        return collectors::RawSnapshot {
+            gpu_observed_at: started_at,
+            vllm_observed_at: started_at,
+            timestamp: started_at,
+            vllm: collectors::VllmRawMetrics::default(),
+            gpu: collectors::GpuRawMetrics::default(),
+        };
+    };
+    let last = *last;
     let mut agg_v = collectors::VllmRawMetrics {
         model_name: last.vllm.model_name.clone(),
         max_num_seqs: last.vllm.max_num_seqs,
@@ -224,12 +233,10 @@ mod tests {
                 PrefixCacheScrapeSample {
                     hits: Some(h0),
                     queries: Some(q0),
-                    misses: None,
                 },
                 PrefixCacheScrapeSample {
                     hits: Some(h1),
                     queries: Some(q1),
-                    misses: None,
                 },
             ],
             _ => vec![],

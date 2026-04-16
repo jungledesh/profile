@@ -698,15 +698,7 @@ fn skew_secs(a: SystemTime, b: SystemTime) -> f64 {
     .abs()
 }
 
-fn fmt_running_display(x: f64) -> String {
-    if (x - x.round()).abs() < 1e-6 {
-        format!("{:.0}", x)
-    } else {
-        format!("{:.1}", x)
-    }
-}
-
-fn fmt_gpu_util_display(x: f64) -> String {
+fn fmt_f64_display(x: f64) -> String {
     if (x - x.round()).abs() < 1e-6 {
         format!("{:.0}", x)
     } else {
@@ -716,8 +708,8 @@ fn fmt_gpu_util_display(x: f64) -> String {
 
 fn format_under_batching_fired(d: &UnderBatchingDetail) -> Vec<String> {
     let pct = (d.running / f64::from(d.max_num_seqs)) * 100.0;
-    let run_s = fmt_running_display(d.running);
-    let gpu_s = fmt_gpu_util_display(d.gpu_util);
+    let run_s = fmt_f64_display(d.running);
+    let gpu_s = fmt_f64_display(d.gpu_util);
     vec![
         "ISSUE: Under-batching".to_string(),
         format!(
