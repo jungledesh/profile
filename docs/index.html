@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>The Inference Problem — profile</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      font-size: 16px;
+      line-height: 1.7;
+      color: #111;
+      background: #fdfdfd;
+    }
+
+    header {
+      border-bottom: 1px solid #e8e8e8;
+      padding: 16px 0;
+    }
+
+    header .wrap {
+      max-width: 740px;
+      margin: 0 auto;
+      padding: 0 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    header .site-title {
+      font-size: 18px;
+      font-weight: 700;
+      color: #111;
+      text-decoration: none;
+    }
+
+    header nav a {
+      font-size: 14px;
+      color: #555;
+      text-decoration: none;
+      margin-left: 20px;
+    }
+
+    .page {
+      max-width: 740px;
+      margin: 52px auto;
+      padding: 0 24px;
+    }
+
+    .post-title {
+      font-size: 30px;
+      font-weight: 700;
+      line-height: 1.2;
+      letter-spacing: -0.4px;
+      margin-bottom: 6px;
+    }
+
+    .post-meta {
+      font-size: 13px;
+      color: #888;
+      margin-bottom: 32px;
+    }
+
+    .tldr {
+      background: #f4f4f4;
+      border-left: 3px solid #111;
+      padding: 16px 20px;
+      margin-bottom: 40px;
+      border-radius: 0 4px 4px 0;
+    }
+
+    .tldr p.label {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 1.2px;
+      text-transform: uppercase;
+      color: #888;
+      margin-bottom: 10px;
+    }
+
+    .tldr ul {
+      list-style: none;
+      padding: 0;
+    }
+
+    .tldr ul li {
+      font-size: 15px;
+      color: #222;
+      padding: 3px 0 3px 18px;
+      position: relative;
+    }
+
+    .tldr ul li::before {
+      content: "→";
+      position: absolute;
+      left: 0;
+      color: #888;
+      font-size: 12px;
+      top: 6px;
+    }
+
+    h2 {
+      font-size: 21px;
+      font-weight: 700;
+      margin: 44px 0 14px;
+      letter-spacing: -0.3px;
+    }
+
+    p {
+      margin-bottom: 16px;
+      color: #2b2b2b;
+      font-size: 16px;
+    }
+
+    .diagram {
+      margin: 28px auto;
+      text-align: center;
+    }
+
+    .diagram figcaption {
+      font-size: 12px;
+      color: #999;
+      margin-top: 10px;
+    }
+
+    .stats-row {
+      display: flex;
+      gap: 28px;
+      margin: 28px 0;
+      flex-wrap: wrap;
+    }
+
+    .stat-block {
+      flex: 1;
+      min-width: 130px;
+      border-top: 2px solid #111;
+      padding-top: 10px;
+    }
+
+    .stat {
+      font-size: 26px;
+      font-weight: 700;
+      color: #111;
+      display: block;
+      margin-bottom: 2px;
+    }
+
+    .stat-label {
+      font-size: 13px;
+      color: #777;
+      display: block;
+      line-height: 1.4;
+    }
+
+    strong { font-weight: 600; color: #111; }
+    a { color: #1a6ee6; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    blockquote {
+      border-left: 3px solid #ddd;
+      padding: 4px 0 4px 18px;
+      margin: 24px 0;
+      color: #444;
+      font-style: italic;
+    }
+
+    hr {
+      border: none;
+      border-top: 1px solid #e8e8e8;
+      margin: 40px 0;
+    }
+
+    .sources {
+      margin-top: 40px;
+    }
+
+    .sources p {
+      font-size: 13px;
+      color: #888;
+      margin-bottom: 4px;
+    }
+
+    .sources a { color: #888; }
+
+    footer {
+      border-top: 1px solid #e8e8e8;
+      margin-top: 64px;
+      padding: 24px 0;
+    }
+
+    footer .wrap {
+      max-width: 740px;
+      margin: 0 auto;
+      padding: 0 24px;
+      font-size: 13px;
+      color: #aaa;
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <a class="site-title" href="#">profile</a>
+    <nav>
+      <a href="#">Posts</a>
+      <a href="https://github.com/jungledesh/profile">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="page">
+  <article>
+
+    <h1 class="post-title">The Inference Problem</h1>
+    <p class="post-meta">Apr 19, 2026</p>
+
+    <div class="tldr">
+      <p class="label">TL;DR</p>
+      <ul>
+        <li>Inference is 80–90% of your AI system's lifetime cost — not training.</li>
+        <li>Production servers bleed compute across batching gaps, KV cache pressure, prefill overhead, low throughput, and high latency. Most teams can't see any of it.</li>
+        <li>The problems are fixable. That's the gap.</li>
+      </ul>
+    </div>
+
+    <h2>The Inference Problem</h2>
+
+    <p>You send a prompt. A GPU somewhere processes it and sends back a response, one token at a time. That loop is inference.</p>
+
+    <figure class="diagram">
+      <svg width="320" height="420" viewBox="0 0 320 420" xmlns="http://www.w3.org/2000/svg"
+           style="font-family: 'Segoe UI', sans-serif; background: #fafafa; border: 1px solid #e8e8e8; border-radius: 8px; padding: 8px;">
+
+        <!-- Title -->
+        <text x="160" y="34" text-anchor="middle" font-size="17" font-weight="700" fill="#111">AI Inference Cycle</text>
+
+        <!-- Arrow: title to step 1 -->
+        <line x1="160" y1="42" x2="160" y2="58" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
+
+        <!-- Step 1: Input: Prompt -->
+        <text x="80" y="74" font-size="14" fill="#222">Input: Prompt</text>
+
+        <!-- Arrow -->
+        <line x1="160" y1="80" x2="160" y2="96" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
+
+        <!-- Step 2: Tokenization + Embeddings -->
+        <text x="55" y="112" font-size="14" fill="#222">Tokenization + Embeddings</text>
+
+        <!-- Arrow -->
+        <line x1="160" y1="118" x2="160" y2="134" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
+
+        <!-- Step 3: Memory Load -->
+        <text x="62" y="150" font-size="14" fill="#222">Memory Load: Weights +</text>
+        <text x="62" y="168" font-size="14" fill="#222">KV Cache (Prefill phase)</text>
+
+        <!-- Arrow -->
+        <line x1="160" y1="176" x2="160" y2="208" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
+
+        <!-- Step 4: Forward Pass -->
+        <text x="52" y="224" font-size="14" fill="#222">Forward Pass: Transformer</text>
+        <text x="52" y="242" font-size="14" fill="#222">Layers</text>
+
+        <!-- Arrow -->
+        <line x1="160" y1="250" x2="160" y2="266" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
+
+        <!-- Step 5: LM Head -->
+        <text x="62" y="282" font-size="14" fill="#222">LM Head + Sampling</text>
+        <text x="62" y="300" font-size="14" fill="#222">(pick next token)</text>
+
+        <!-- Arrow -->
+        <line x1="160" y1="308" x2="160" y2="324" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
+
+        <!-- Step 6: Decode & Loop -->
+        <text x="52" y="340" font-size="14" fill="#222">Decode &amp; Loop: Append</text>
+        <text x="52" y="358" font-size="14" fill="#222">token → back to Memory</text>
+
+        <!-- Repeat until EOS -->
+        <text x="160" y="392" text-anchor="middle" font-size="13" fill="#888" font-style="italic">Repeat until EOS</text>
+
+        <!-- Curved back arrow: Decode → Memory Load -->
+        <path d="M 285 348 C 310 348, 310 157, 285 157" stroke="#999" stroke-width="1.4" fill="none" stroke-dasharray="4,3" marker-end="url(#arr2)"/>
+
+        <!-- Curved back arrow: LM Head → Forward Pass -->
+        <path d="M 50 291 C 22 291, 22 233, 50 233" stroke="#999" stroke-width="1.4" fill="none" stroke-dasharray="4,3" marker-end="url(#arr2)"/>
+
+        <defs>
+          <marker id="arr" markerWidth="8" markerHeight="8" refX="4" refY="3" orient="auto">
+            <path d="M0,0 L0,6 L7,3 z" fill="#555"/>
+          </marker>
+          <marker id="arr2" markerWidth="8" markerHeight="8" refX="4" refY="3" orient="auto">
+            <path d="M0,0 L0,6 L7,3 z" fill="#999"/>
+          </marker>
+        </defs>
+      </svg>
+      <figcaption>The AI inference cycle. <a href="https://www.linkedin.com/posts/jungledesh_models-have-been-trained-huge-investments-activity-7437963429077819392-6rxt">Full post.</a></figcaption>
+    </figure>
+
+    <p>It is also where most of the money goes.</p>
+
+    <div class="stats-row">
+      <div class="stat-block">
+        <span class="stat">80–90%</span>
+        <span class="stat-label">of a production AI system's lifetime cost is inference, not training <a href="https://arxiv.org/html/2510.26136v1">[1]</a></span>
+      </div>
+      <div class="stat-block">
+        <span class="stat">15x</span>
+        <span class="stat-label">GPT-4 inference cost vs training cost. $2.3B in inference by end of 2024 vs ~$150M to train. <a href="https://primitiva.substack.com/p/all-you-need-to-know-about-inference">[Barclays via Primitiva]</a></span>
+      </div>
+    </div>
+
+    <p>Training gets the headlines. Inference pays the bills.</p>
+
+    <p>And most teams are bad at it. Here is where the waste happens:</p>
+
+    <p><strong>Throughput.</strong> A misconfigured vLLM server can run well below its hardware ceiling. When batching, memory, and scheduling are off, GPU utilization collapses. The hardware is not the problem. The configuration is.</p>
+
+    <p><strong>Latency.</strong> Real-time applications need time-to-first-token under 100ms. Most production setups don't get there without deliberate tuning.</p>
+
+    <p><strong>KV cache pressure.</strong> Every token generated needs to remember everything before it. When that memory fills up, the system evicts. Throughput drops. Latency spikes. At 90% usage, you're already in trouble.</p>
+
+    <p><strong>Batching.</strong> When batch size is 2 out of a possible 16, you're using 12% of the machine. The rest idles. You pay full price.</p>
+
+    <p><strong>Prefill overhead.</strong> Before the first output token, the model processes your entire prompt. In workloads with 500+ token prompts, prefill alone dominates response time.</p>
+
+    <p><strong>Observability.</strong> Most teams look at raw Prometheus metrics and guess. There is no standard path from "throughput is low" to "here is exactly why, here is the fix."</p>
+
+    <p>These are not edge cases. This is the normal state of a production inference server that has not been tuned.</p>
+
+    <hr>
+
+    <h2>Why This Matters Now</h2>
+
+    <p>The standard story about early tech: Amazon lost money for years. Uber still does. Growth first, economics later.</p>
+
+    <p>AI inference does not fit that story.</p>
+
+    <p>Amazon chose to lose money — a deliberate bet on demand. What is happening in AI inference is different. <strong>Companies are burning money on hardware they already paid for, because it is sitting misconfigured.</strong> That is not a growth strategy. It is waste.</p>
+
+    <div class="stats-row">
+      <div class="stat-block">
+        <span class="stat">$106B</span>
+        <span class="stat-label">AI inference market in 2025</span>
+      </div>
+      <div class="stat-block">
+        <span class="stat">$255B</span>
+        <span class="stat-label">projected by 2030 <a href="https://www.tensormesh.ai/blog-posts/ai-inference-costs-2025-energy-crisis">[2]</a></span>
+      </div>
+      <div class="stat-block">
+        <span class="stat">280x</span>
+        <span class="stat-label">cost drop since 2022 — $20 to $0.07 per million tokens</span>
+      </div>
+    </div>
+
+    <p>Larry Ellison said it plainly at Oracle's earnings call:</p>
+
+    <blockquote>
+      "The AI inferencing market will be much, much larger than the AI training market. People are running out of usable inference computing capacity." <a href="https://www.benzinga.com/markets/earnings/25/09/47587481/larry-ellison-targets-multi-trillion-dollar-ai-inference-market-for-oracle-ai-will-change-everything">[3]</a>
+    </blockquote>
+
+    <p>The shortage is not GPUs. It is efficient use of the GPUs already deployed.</p>
+
+    <p>Closing that gap is an engineering problem. It requires knowing what is actually happening inside your inference server. That visibility mostly does not exist today.</p>
+
+    <hr>
+
+    <div class="sources">
+      <p><strong>Sources</strong></p>
+      <p>1. <a href="https://arxiv.org/html/2510.26136v1">Beyond Benchmarks: The Economics of AI Inference, arXiv</a></p>
+      <p>2. <a href="https://www.tensormesh.ai/blog-posts/ai-inference-costs-2025-energy-crisis">AI Inference Costs in 2025, TensorMesh</a></p>
+      <p>3. <a href="https://www.benzinga.com/markets/earnings/25/09/47587481/larry-ellison-targets-multi-trillion-dollar-ai-inference-market-for-oracle-ai-will-change-everything">Larry Ellison Targets Multi-Trillion-Dollar AI Inference Market, Benzinga</a></p>
+    </div>
+
+  </article>
+</div>
+
+<footer>
+  <div class="wrap">profile — vLLM inference diagnostics. Less words. More insights.</div>
+</footer>
+
+</body>
+</html>

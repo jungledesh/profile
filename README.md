@@ -1,6 +1,6 @@
 # profile — vLLM Inference Profiler
 
-**Less words. More insight.**  
+**Less words. More insights.**  
 Find and fix inference bottlenecks in minutes. 
 
 ## What it does
