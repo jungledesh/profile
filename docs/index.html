@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>The Inference Problem — profile</title>
+  <title>The Inference Problem | profile</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -215,14 +215,13 @@
   <article>
 
     <h1 class="post-title">The Inference Problem</h1>
-    <p class="post-meta">Apr 19, 2026</p>
 
     <div class="tldr">
       <p class="label">TL;DR</p>
       <ul>
-        <li>Inference is 80–90% of your AI system's lifetime cost — not training.</li>
-        <li>Production servers bleed compute across batching gaps, KV cache pressure, prefill overhead, low throughput, and high latency. Most teams can't see any of it.</li>
-        <li>The problems are fixable. That's the gap.</li>
+        <li>Inference is 80 to 90% of your AI system's lifetime cost, not training.</li>
+        <li>Production servers bleed compute across batching gaps, KV cache pressure, prefill overhead, low throughput, and high latency.</li>
+        <li>The problems are fixable. Most teams can't see them.</li>
       </ul>
     </div>
 
@@ -313,9 +312,11 @@
 
     <p>Training gets the headlines. Inference pays the bills.</p>
 
-    <p>And most teams are bad at it. Here is where the waste happens:</p>
+    <p>An H100 rents for roughly $3/hr. When your GPU is underutilized, you get fewer tokens than the hardware can deliver. Same bill, lower output. <strong>That is over $1,000/month in cloud compute per GPU, wasted.</strong></p>
 
-    <p><strong>Throughput.</strong> A misconfigured vLLM server can run well below its hardware ceiling. When batching, memory, and scheduling are off, GPU utilization collapses. The hardware is not the problem. The configuration is.</p>
+    <p>Most teams are bad at it. The waste is in:</p>
+
+    <p><strong>Throughput.</strong> A misconfigured vLLM server runs well below its hardware ceiling. When batching, memory, and scheduling are off, GPU utilization collapses. The hardware is not the problem. The configuration is.</p>
 
     <p><strong>Latency.</strong> Real-time applications need time-to-first-token under 100ms. Most production setups don't get there without deliberate tuning.</p>
 
@@ -337,34 +338,23 @@
 
     <p>AI inference does not fit that story.</p>
 
-    <p>Amazon chose to lose money — a deliberate bet on demand. What is happening in AI inference is different. <strong>Companies are burning money on hardware they already paid for, because it is sitting misconfigured.</strong> That is not a growth strategy. It is waste.</p>
+    <p>Amazon chose to lose money, a deliberate bet on demand. <strong>Companies running AI inference are burning money on hardware they already paid for, because it is sitting misconfigured.</strong> That is not a growth strategy. It is waste that shows up on your cloud compute bill this month.</p>
 
-    <div class="stats-row">
-      <div class="stat-block">
-        <span class="stat">$106B</span>
-        <span class="stat-label">AI inference market in 2025</span>
-      </div>
-      <div class="stat-block">
-        <span class="stat">$255B</span>
-        <span class="stat-label">projected by 2030 <a href="https://www.tensormesh.ai/blog-posts/ai-inference-costs-2025-energy-crisis">[2]</a></span>
-      </div>
-      <div class="stat-block">
-        <span class="stat">280x</span>
-        <span class="stat-label">cost drop since 2022 — $20 to $0.07 per million tokens</span>
-      </div>
-    </div>
+    <p>Enterprises running production AI spend $50,000 to $500,000 per month on inference infrastructure. <a href="https://www.tensormesh.ai/blog-posts/ai-inference-costs-2025-energy-crisis">[2]</a> Inference costs have dropped 280x since 2022, from $20 to $0.07 per million tokens. That gap between what hardware can do and what most teams extract from it is your cost problem today.</p>
 
-    <p>Larry Ellison said it plainly at Oracle's earnings call:</p>
+    <p>Larry Ellison, Oracle earnings call:</p>
 
     <blockquote>
       "The AI inferencing market will be much, much larger than the AI training market. People are running out of usable inference computing capacity." <a href="https://www.benzinga.com/markets/earnings/25/09/47587481/larry-ellison-targets-multi-trillion-dollar-ai-inference-market-for-oracle-ai-will-change-everything">[3]</a>
     </blockquote>
 
-    <p>The shortage is not GPUs. It is efficient use of the GPUs already deployed.</p>
-
-    <p>Closing that gap is an engineering problem. It requires knowing what is actually happening inside your inference server. That visibility mostly does not exist today.</p>
+    <p>The shortage is not GPUs. It is efficient use of the GPUs already running in production, including yours.</p>
 
     <hr>
+
+    <p style="font-size: 15px; color: #111; font-weight: 500; margin-bottom: 32px;">We ran workloads. H100, RTX 4090. Qwen 2.5 under production load. Not theory. Measurement. The findings arrive in the next section. They will change what you check first.</p>
+
+    <p style="font-size:13px; color:#999; margin-bottom: 32px;"><em>Engineering work underway. Results published as they arrive.</em></p>
 
     <div class="sources">
       <p><strong>Sources</strong></p>
@@ -377,7 +367,10 @@
 </div>
 
 <footer>
-  <div class="wrap">profile — vLLM inference diagnostics. Less words. More insights.</div>
+  <div class="wrap">
+    <p style="font-size: 12px; color: #aaa; margin-bottom: 8px;">Updated: Apr 19, 2026.</p>
+    <p>profile, vLLM inference diagnoser</p>
+  </div>
 </footer>
 
 </body>
