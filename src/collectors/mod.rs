@@ -14,17 +14,6 @@ pub use types::{
 use std::thread;
 use std::time::Duration;
 
-pub fn collect_snapshot(
-    vllm_metrics_input: &str,
-    max_num_seqs_from_cli: u32,
-) -> anyhow::Result<RawSnapshot> {
-    collect_snapshot_for_window(
-        vllm_metrics_input,
-        max_num_seqs_from_cli,
-        Duration::from_secs(2),
-    )
-}
-
 pub fn collect_snapshot_for_window(
     vllm_metrics_input: &str,
     max_num_seqs_from_cli: u32,

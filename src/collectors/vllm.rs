@@ -22,7 +22,7 @@ fn http_client() -> &'static reqwest::blocking::Client {
         reqwest::blocking::Client::builder()
             .timeout(REQ_TIMEOUT)
             .build()
-            .expect("reqwest ClientBuilder with rustls")
+            .unwrap_or_else(|e| panic!("build reqwest client: {e}"))
     })
 }
 
@@ -152,21 +152,9 @@ fn prefix_counter_totals(scrape: &Scrape) -> (Option<f64>, Option<f64>) {
     (hits, queries)
 }
 
-fn prefix_misses_token_estimate(hits: Option<f64>, queries: Option<f64>) -> Option<f64> {
-    match (hits, queries) {
-        (Some(h), Some(q)) if q >= h => Some(q - h),
-        _ => None,
-    }
-}
-
 fn prefix_scrape_sample(scrape: &Scrape) -> PrefixCacheScrapeSample {
     let (hits, queries) = prefix_counter_totals(scrape);
-    let misses = prefix_misses_token_estimate(hits, queries);
-    PrefixCacheScrapeSample {
-        hits,
-        queries,
-        misses,
-    }
+    PrefixCacheScrapeSample { hits, queries }
 }
 
 /// `(hits_last - hits_first) / (queries_last - queries_first)` over the first→last scrape window.
@@ -200,11 +188,6 @@ fn prefix_window_hit_rate(first: &Scrape, last: &Scrape) -> Option<f64> {
     rate.is_finite().then_some(rate)
 }
 
-fn prefix_rate_from_scrapes(first: &Scrape, last: &Scrape) -> Option<f64> {
-    prefix_window_hit_rate(first, last)
-}
-
-/// Same logic as the first→last `/metrics` window in [`collect_vllm_metrics`].
 fn compute_counter_rates(
     first: &Scrape,
     last: &Scrape,
@@ -215,7 +198,7 @@ fn compute_counter_rates(
         total_generation_tokens(last),
         window_secs,
     );
-    let prefix = prefix_rate_from_scrapes(first, last);
+    let prefix = prefix_window_hit_rate(first, last);
     (gen_per_sec, prefix)
 }
 
@@ -302,16 +285,6 @@ fn max_num_seqs_from_gauge(scrape: &Scrape) -> Option<u32> {
             None
         }
     })
-}
-
-/// Fetch raw metrics from vLLM `/metrics` endpoint.
-///
-/// `input` may be a server base URL (e.g. `http://localhost:8000`) or the full metrics URL.
-///
-/// Returns `(metrics, observed_at)` where `observed_at` is wall time immediately after the last
-/// successful scrape in the window (for correlating with GPU-side collection).
-pub fn collect_vllm_metrics(input: &str) -> Result<(VllmRawMetrics, SystemTime)> {
-    collect_vllm_metrics_for(input, Duration::from_secs(2))
 }
 
 pub fn collect_vllm_metrics_for(

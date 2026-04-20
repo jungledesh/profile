@@ -1,4 +1,6 @@
-//! CLI for profiling vLLM GPU and system metrics. Layout: cli, profiler, collectors, engine.
+//! Live bottleneck diagnosis for vLLM inference. Layout: cli, profiler, collectors, engine.
+
+#![warn(dead_code)]
 
 pub mod cli;
 pub mod collectors;
