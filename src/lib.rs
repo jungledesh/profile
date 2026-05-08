@@ -4,7 +4,9 @@
 
 pub mod cli;
 pub mod collectors;
+pub mod context;
 pub mod engine;
+pub mod output;
 pub mod profiler;
 
 pub use cli::{run, Cli};
