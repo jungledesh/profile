@@ -3,32 +3,25 @@ use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
 
-use crate::collectors::{GpuRawMetrics, RawSnapshot, VllmRawMetrics};
+use crate::collectors::{GpuRawMetrics, VllmRawMetrics};
+use crate::context::AnalysisInput;
 use crate::engine;
+use crate::profiler::DiagnoseResult;
 
 const VLLM_LABEL_W: usize = 10;
 const VLLM_LABEL_METRICS_GAP: &str = " ";
 
-pub fn print_diagnose_table(
-    snapshot: &RawSnapshot,
-    windows: &[RawSnapshot],
-    verbose_rules: bool,
-    duration: Duration,
-    started_at: SystemTime,
-) {
-    let lines = build_diagnose_lines(snapshot, windows, verbose_rules, duration, started_at);
+pub fn print_diagnose_table(result: &DiagnoseResult, verbose_rules: bool) {
+    let lines = build_diagnose_lines(result, verbose_rules);
     print_boxed(&lines);
 }
 
-fn build_diagnose_lines(
-    snapshot: &RawSnapshot,
-    windows: &[RawSnapshot],
-    verbose_rules: bool,
-    duration: Duration,
-    started_at: SystemTime,
-) -> Vec<String> {
+fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<String> {
+    let snapshot = &result.snapshot;
     let v = &snapshot.vllm;
     let g = &snapshot.gpu;
+    let duration = result.duration;
+    let started_at = result.started_at;
 
     let model = v.model_name.as_deref().unwrap_or("(unknown model)");
     let gpu_label = g.gpu_name.as_deref().unwrap_or("(no GPU)");
@@ -55,10 +48,14 @@ fn build_diagnose_lines(
     lines.push(vllm_label_row("PROMPT", &vllm_prompt_value(v)));
     lines.push(vllm_label_row("THROUGHPUT", &vllm_throughput_value(v)));
 
-    let rule_lines = if windows.len() <= 1 {
-        engine::format_diagnose_rules(snapshot, verbose_rules)
+    // Build AnalysisInput from the aggregate snapshot for single-window rule evaluation.
+    let aggregate_win = crate::context::RuntimeWindow::from_snapshot(result.snapshot.clone());
+    let summary_input = AnalysisInput::new(&result.static_ctx, &aggregate_win);
+
+    let rule_lines = if result.windows.len() <= 1 {
+        engine::format_diagnose_rules(summary_input, verbose_rules)
     } else {
-        engine::format_diagnose_rules_for_windows(windows, snapshot, verbose_rules)
+        engine::format_diagnose_rules_for_windows(&result.windows, summary_input, verbose_rules)
     };
     if !rule_lines.is_empty() {
         lines.push(String::new());

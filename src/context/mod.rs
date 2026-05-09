@@ -1,2 +1,2 @@
 pub mod types;
-pub use types::{AnalysisInput, RuntimeWindow, StaticContext};
+pub use types::{AnalysisInput, GPUModel, ModelArch, RuntimeWindow, StaticContext};
