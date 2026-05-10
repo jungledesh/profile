@@ -317,12 +317,24 @@ fn vllm_cache_cfg_value(v: &VllmRawMetrics) -> String {
     let prefix = v
         .cache_config
         .enable_prefix_caching
-        .map(|b| if b { "prefix_cache on" } else { "prefix_cache off" })
+        .map(|b| {
+            if b {
+                "prefix_cache on"
+            } else {
+                "prefix_cache off"
+            }
+        })
         .unwrap_or("prefix_cache —");
     let chunked = v
         .cache_config
         .enable_chunked_prefill
-        .map(|b| if b { "chunked_prefill on" } else { "chunked_prefill off" })
+        .map(|b| {
+            if b {
+                "chunked_prefill on"
+            } else {
+                "chunked_prefill off"
+            }
+        })
         .unwrap_or("chunked_prefill —");
     format!("{block} | dtype {dtype} | {prefix} | {chunked}")
 }
@@ -361,11 +373,23 @@ fn config_kv_value(cfg: &VllmConfig) -> String {
         .unwrap_or_else(|| "block —".to_string());
     let prefix = cfg
         .enable_prefix_caching
-        .map(|b| if b { "prefix_cache on" } else { "prefix_cache off" })
+        .map(|b| {
+            if b {
+                "prefix_cache on"
+            } else {
+                "prefix_cache off"
+            }
+        })
         .unwrap_or("prefix_cache —");
     let chunked = cfg
         .enable_chunked_prefill
-        .map(|b| if b { "chunked_prefill on" } else { "chunked_prefill off" })
+        .map(|b| {
+            if b {
+                "chunked_prefill on"
+            } else {
+                "chunked_prefill off"
+            }
+        })
         .unwrap_or("chunked_prefill —");
     format!("dtype {kv_dtype} | {block} | {prefix} | {chunked}")
 }
