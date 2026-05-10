@@ -1,6 +1,7 @@
 use std::time::SystemTime;
 
-use crate::collectors::{window_is_evaluable, RawSnapshot};
+use crate::collectors::window_is_evaluable;
+use crate::context::{AnalysisInput, RuntimeWindow};
 
 mod r1_under_batching;
 mod r2_kv_cache_pressure;
@@ -36,7 +37,8 @@ pub struct Issue {
     pub evidence: Vec<String>,
 }
 
-pub fn evaluate_issues(snapshot: &RawSnapshot) -> Vec<Issue> {
+pub fn evaluate_issues(input: AnalysisInput<'_>) -> Vec<Issue> {
+    let snapshot = &input.window.snapshot;
     let mut issues = Vec::new();
     if let Rule1Outcome::Fired(d) = rule1_under_batching(snapshot) {
         issues.push(issue_from_under_batching(&d));
@@ -50,7 +52,8 @@ pub fn evaluate_issues(snapshot: &RawSnapshot) -> Vec<Issue> {
     issues
 }
 
-pub fn format_diagnose_rules(snapshot: &RawSnapshot, verbose_rules: bool) -> Vec<String> {
+pub fn format_diagnose_rules(input: AnalysisInput<'_>, verbose_rules: bool) -> Vec<String> {
+    let snapshot = &input.window.snapshot;
     if !window_is_evaluable(snapshot) {
         let mut out = vec![NO_ISSUES_LINE.to_string(), NOTE_NO_EVALUABLE.to_string()];
         if verbose_rules {
@@ -107,8 +110,8 @@ pub fn format_diagnose_rules(snapshot: &RawSnapshot, verbose_rules: bool) -> Vec
 }
 
 pub fn format_diagnose_rules_for_windows(
-    windows: &[RawSnapshot],
-    summary: &RawSnapshot,
+    windows: &[RuntimeWindow],
+    summary: AnalysisInput<'_>,
     verbose_rules: bool,
 ) -> Vec<String> {
     if windows.is_empty() {
@@ -116,8 +119,14 @@ pub fn format_diagnose_rules_for_windows(
     }
 
     let total = windows.len();
-    let skipped = windows.iter().filter(|w| !window_is_evaluable(w)).count();
-    let evaluable: Vec<&RawSnapshot> = windows.iter().filter(|w| window_is_evaluable(w)).collect();
+    let skipped = windows
+        .iter()
+        .filter(|w| !window_is_evaluable(&w.snapshot))
+        .count();
+    let evaluable: Vec<&RuntimeWindow> = windows
+        .iter()
+        .filter(|w| window_is_evaluable(&w.snapshot))
+        .collect();
     let n_eval = evaluable.len();
 
     if n_eval == 0 {
@@ -139,21 +148,21 @@ pub fn format_diagnose_rules_for_windows(
     let mut r3_details = Vec::new();
 
     for w in &evaluable {
-        match rule1_under_batching(w) {
+        match rule1_under_batching(&w.snapshot) {
             Rule1Outcome::Fired(d) => {
                 r1_fired += 1;
                 r1_details.push(d);
             }
             Rule1Outcome::NotFired(_) => {}
         }
-        match rule2_kv_cache_pressure(w) {
+        match rule2_kv_cache_pressure(&w.snapshot) {
             Rule2Outcome::Fired(d) => {
                 r2_fired += 1;
                 r2_details.push(d);
             }
             Rule2Outcome::NotFired(_) => {}
         }
-        match rule3_low_prefix_reuse(w) {
+        match rule3_low_prefix_reuse(&w.snapshot) {
             Rule3Outcome::Fired(d) => {
                 r3_fired += 1;
                 r3_details.push(d);
@@ -162,6 +171,8 @@ pub fn format_diagnose_rules_for_windows(
         }
     }
 
+    let summary_snap = &summary.window.snapshot;
+
     if r1_fired + r2_fired + r3_fired == 0 {
         let mut out = Vec::new();
         if verbose_rules {
@@ -169,7 +180,7 @@ pub fn format_diagnose_rules_for_windows(
             out.push(String::new());
             out.push("KV cache pressure: not indicated".to_string());
             out.push(String::new());
-            out.extend(format_rule3_verbose_miss(summary));
+            out.extend(format_rule3_verbose_miss(summary_snap));
             out.push(String::new());
         }
         out.push(NO_ISSUES_LINE.to_string());
@@ -186,7 +197,7 @@ pub fn format_diagnose_rules_for_windows(
 
     if r1_fired > 0 {
         out.extend(format_under_batching_window_issue(
-            &aggregate_r1_detail(&r1_details, summary),
+            &aggregate_r1_detail(&r1_details, summary_snap),
             pct(r1_fired, n_eval),
         ));
         out.push(String::new());
@@ -197,9 +208,9 @@ pub fn format_diagnose_rules_for_windows(
 
     if r2_fired > 0 {
         out.extend(format_kv_cache_window_issue(
-            &aggregate_r2_detail(&r2_details, summary),
+            &aggregate_r2_detail(&r2_details, summary_snap),
             pct(r2_fired, n_eval),
-            summary,
+            summary_snap,
         ));
         out.push(String::new());
     } else if verbose_rules {
@@ -209,12 +220,12 @@ pub fn format_diagnose_rules_for_windows(
 
     if r3_fired > 0 {
         out.extend(format_low_prefix_window_issue(
-            &aggregate_r3_detail(&r3_details, summary),
+            &aggregate_r3_detail(&r3_details, summary_snap),
             pct(r3_fired, n_eval),
         ));
         out.push(String::new());
     } else if verbose_rules {
-        out.extend(format_rule3_verbose_miss(summary));
+        out.extend(format_rule3_verbose_miss(summary_snap));
         out.push(String::new());
     }
 
@@ -279,6 +290,7 @@ fn join_rule_names(items: &[&str]) -> String {
 mod tests {
     use super::*;
     use crate::collectors::{GpuRawMetrics, RawSnapshot, VllmRawMetrics};
+    use crate::context::{AnalysisInput, RuntimeWindow, StaticContext};
     use std::time::{Duration, SystemTime};
 
     fn snap(
@@ -294,6 +306,18 @@ mod tests {
             vllm,
             gpu,
         }
+    }
+
+    fn mk_ctx() -> StaticContext {
+        StaticContext::default()
+    }
+
+    fn mk_win(s: RawSnapshot) -> RuntimeWindow {
+        RuntimeWindow::from_snapshot(s)
+    }
+
+    fn ai<'a>(ctx: &'a StaticContext, win: &'a RuntimeWindow) -> AnalysisInput<'a> {
+        AnalysisInput { ctx, window: win }
     }
 
     fn vllm_base() -> VllmRawMetrics {
@@ -323,10 +347,12 @@ mod tests {
     fn under_batching_fires_when_gates_pass() {
         let t = SystemTime::UNIX_EPOCH;
         let s = snap(t, t, vllm_base(), gpu_low());
-        let issues = evaluate_issues(&s);
+        let ctx = mk_ctx();
+        let win = mk_win(s);
+        let issues = evaluate_issues(ai(&ctx, &win));
         assert_eq!(issues.len(), 1);
         assert!((issues[0].confidence - 0.85).abs() < 1e-9);
-        match rule1_under_batching(&s) {
+        match rule1_under_batching(&win.snapshot) {
             Rule1Outcome::Fired(d) => {
                 assert!((d.running - 3.1).abs() < 1e-9);
                 assert_eq!(d.max_num_seqs, 256);
@@ -341,7 +367,9 @@ mod tests {
         let t0 = SystemTime::UNIX_EPOCH;
         let t1 = t0 + Duration::from_secs(2);
         let s = snap(t0, t1, vllm_base(), gpu_low());
-        assert!(evaluate_issues(&s).is_empty());
+        let ctx = mk_ctx();
+        let win = mk_win(s);
+        assert!(evaluate_issues(ai(&ctx, &win)).is_empty());
     }
 
     #[test]
@@ -350,7 +378,9 @@ mod tests {
         let mut v = vllm_base();
         v.num_requests_waiting = None;
         let s = snap(t, t, v, gpu_low());
-        assert!(evaluate_issues(&s).is_empty());
+        let ctx = mk_ctx();
+        let win = mk_win(s);
+        assert!(evaluate_issues(ai(&ctx, &win)).is_empty());
     }
 
     #[test]
@@ -359,7 +389,9 @@ mod tests {
         let mut v = vllm_base();
         v.num_requests_waiting = Some(2.0);
         let s = snap(t, t, v, gpu_low());
-        assert!(evaluate_issues(&s).is_empty());
+        let ctx = mk_ctx();
+        let win = mk_win(s);
+        assert!(evaluate_issues(ai(&ctx, &win)).is_empty());
     }
 
     #[test]
@@ -368,7 +400,9 @@ mod tests {
         let mut v = vllm_base();
         v.num_requests_running = Some(0.75);
         let s = snap(t, t, v, gpu_low());
-        assert!(evaluate_issues(&s).is_empty());
+        let ctx = mk_ctx();
+        let win = mk_win(s);
+        assert!(evaluate_issues(ai(&ctx, &win)).is_empty());
     }
 
     #[test]
@@ -377,7 +411,9 @@ mod tests {
         let mut v = vllm_base();
         v.num_requests_running = Some(0.6);
         let s = snap(t, t, v, gpu_low());
-        assert!(evaluate_issues(&s).is_empty());
+        let ctx = mk_ctx();
+        let win = mk_win(s);
+        assert!(evaluate_issues(ai(&ctx, &win)).is_empty());
     }
 
     #[test]
@@ -386,7 +422,9 @@ mod tests {
         let mut v = vllm_base();
         v.num_requests_running = Some(40.0);
         let s = snap(t, t, v, gpu_low());
-        assert!(evaluate_issues(&s).is_empty());
+        let ctx = mk_ctx();
+        let win = mk_win(s);
+        assert!(evaluate_issues(ai(&ctx, &win)).is_empty());
     }
 
     #[test]
@@ -395,7 +433,9 @@ mod tests {
         let mut v = vllm_base();
         v.num_requests_running = Some(16.0);
         let s = snap(t, t, v, gpu_low());
-        assert!(evaluate_issues(&s).is_empty());
+        let ctx = mk_ctx();
+        let win = mk_win(s);
+        assert!(evaluate_issues(ai(&ctx, &win)).is_empty());
     }
 
     #[test]
@@ -404,7 +444,9 @@ mod tests {
         let mut g = gpu_low();
         g.gpu_util_pct = Some(62.0);
         let s = snap(t, t, vllm_base(), g);
-        assert!(evaluate_issues(&s).is_empty());
+        let ctx = mk_ctx();
+        let win = mk_win(s);
+        assert!(evaluate_issues(ai(&ctx, &win)).is_empty());
     }
 
     #[test]
@@ -413,7 +455,9 @@ mod tests {
         let mut v = vllm_base();
         v.max_num_seqs = Some(0);
         let s = snap(t, t, v, gpu_low());
-        assert!(evaluate_issues(&s).is_empty());
+        let ctx = mk_ctx();
+        let win = mk_win(s);
+        assert!(evaluate_issues(ai(&ctx, &win)).is_empty());
     }
 
     #[test]
@@ -422,14 +466,18 @@ mod tests {
         let mut v = vllm_base();
         v.num_requests_running = Some(f64::NAN);
         let s = snap(t, t, v, gpu_low());
-        assert!(evaluate_issues(&s).is_empty());
+        let ctx = mk_ctx();
+        let win = mk_win(s);
+        assert!(evaluate_issues(ai(&ctx, &win)).is_empty());
     }
 
     #[test]
     fn format_under_batching_fired_matches_template() {
         let t = SystemTime::UNIX_EPOCH;
         let s = snap(t, t, vllm_base(), gpu_low());
-        let lines = format_diagnose_rules(&s, false);
+        let ctx = mk_ctx();
+        let win = mk_win(s);
+        let lines = format_diagnose_rules(ai(&ctx, &win), false);
         let text = lines.join("\n");
         assert!(text.contains("ISSUE: Under-batching"));
         assert!(text.contains("Very low occupancy"));
@@ -448,7 +496,9 @@ mod tests {
         let mut g = gpu_low();
         g.gpu_util_pct = Some(75.0);
         let s = snap(t, t, vllm_base(), g);
-        let text = format_diagnose_rules(&s, true).join("\n");
+        let ctx = mk_ctx();
+        let win = mk_win(s);
+        let text = format_diagnose_rules(ai(&ctx, &win), true).join("\n");
         assert!(text.contains("Under-batching: not indicated"));
         assert!(text.contains("KV cache pressure: not indicated"));
         assert!(text.contains("Prefix cache hit rate: not indicated"));
@@ -504,7 +554,9 @@ mod tests {
             }
             Rule2Outcome::Fired(_) => panic!("expected skew miss"),
         }
-        let text = format_diagnose_rules(&s, true).join("\n");
+        let ctx = mk_ctx();
+        let win = mk_win(s);
+        let text = format_diagnose_rules(ai(&ctx, &win), true).join("\n");
         assert!(text.contains("Under-batching: not indicated"));
         assert!(text.contains("KV cache pressure: not indicated"));
         assert!(text.contains("Prefix cache hit rate: not indicated"));
@@ -529,7 +581,9 @@ mod tests {
         gb.vram_used_mb = Some(78 * 1024);
         gb.vram_total_mb = Some(100 * 1024);
         let s_kv_only = snap(t, t, vllm_high_kv(), gb);
-        let text = format_diagnose_rules(&s_kv_only, false).join("\n");
+        let ctx2 = mk_ctx();
+        let win_kv_only = mk_win(s_kv_only);
+        let text = format_diagnose_rules(ai(&ctx2, &win_kv_only), false).join("\n");
         assert!(text.contains("Cause:"));
         assert!(text.contains("  - KV usage 86.0% — near capacity"));
         assert!(text.contains("  - High concurrency (~3 running requests)"));
@@ -552,7 +606,9 @@ mod tests {
             Rule2Outcome::Fired(d) => assert!(d.vram_usage_perc_corroborated.is_none()),
             Rule2Outcome::NotFired(_) => panic!("expected fired"),
         }
-        let text = format_diagnose_rules(&s, false).join("\n");
+        let ctx = mk_ctx();
+        let win = mk_win(s);
+        let text = format_diagnose_rules(ai(&ctx, &win), false).join("\n");
         assert!(text.contains("Confidence: Medium-High"));
         assert!(text.contains("  - KV usage 86.0% — near capacity"));
     }
@@ -561,7 +617,9 @@ mod tests {
     fn kv_cache_miss_unavailable_without_gauge_verbose() {
         let t = SystemTime::UNIX_EPOCH;
         let s = snap(t, t, vllm_base(), gpu_busy());
-        let text = format_diagnose_rules(&s, true).join("\n");
+        let ctx = mk_ctx();
+        let win = mk_win(s);
+        let text = format_diagnose_rules(ai(&ctx, &win), true).join("\n");
         assert!(text.contains("KV cache pressure: not indicated"));
         assert!(text.contains("Prefix cache hit rate: not indicated"));
         assert!(text.contains("No issues detected in this snapshot."));
@@ -575,14 +633,16 @@ mod tests {
         v.prompt_tokens_mean = Some(25.0);
         v.num_requests_running = Some(1.0);
         let s = snap(t, t, v, gpu_busy());
-        match rule3_low_prefix_reuse(&s) {
+        let ctx = mk_ctx();
+        let win = mk_win(s);
+        match rule3_low_prefix_reuse(&win.snapshot) {
             Rule3Outcome::Fired(d) => {
                 assert!((d.hit_rate - 0.34).abs() < 1e-9);
                 assert!((d.prompt_tokens_mean - 25.0).abs() < 1e-9);
             }
             Rule3Outcome::NotFired => panic!("expected fired"),
         }
-        let issues = evaluate_issues(&s);
+        let issues = evaluate_issues(ai(&ctx, &win));
         assert_eq!(issues.len(), 1);
         assert!(issues[0].evidence[0].contains("Low prefix cache hit rate"));
     }
@@ -625,7 +685,9 @@ mod tests {
         let mut v = vllm_base();
         v.prefix_cache_hit_rate = Some(0.50);
         let s = snap(t, t, v, gpu_busy());
-        let text = format_diagnose_rules(&s, true).join("\n");
+        let ctx = mk_ctx();
+        let win = mk_win(s);
+        let text = format_diagnose_rules(ai(&ctx, &win), true).join("\n");
         assert!(text.contains("Rule: Low Prefix Cache — Not triggered"));
         assert!(text.contains("  - Prefix cache hit rate 50.0% — working effectively"));
     }
@@ -637,7 +699,9 @@ mod tests {
         v.prefix_cache_hit_rate = Some(0.20);
         v.prompt_tokens_mean = Some(10.0);
         let s = snap(t, t, v, gpu_busy());
-        let text = format_diagnose_rules(&s, true).join("\n");
+        let ctx = mk_ctx();
+        let win = mk_win(s);
+        let text = format_diagnose_rules(ai(&ctx, &win), true).join("\n");
         assert!(text.contains("Prefix cache hit rate: not indicated"));
         assert!(!text.contains("working effectively"));
     }
@@ -648,7 +712,9 @@ mod tests {
         let mut g = gpu_low();
         g.gpu_util_pct = Some(75.0);
         let s = snap(t, t, vllm_base(), g);
-        let lines = format_diagnose_rules(&s, false);
+        let ctx = mk_ctx();
+        let win = mk_win(s);
+        let lines = format_diagnose_rules(ai(&ctx, &win), false);
         assert_eq!(
             lines,
             vec!["No issues detected in this snapshot.".to_string()]
@@ -660,7 +726,9 @@ mod tests {
         let t = SystemTime::UNIX_EPOCH;
         let v = vllm_high_kv();
         let s = snap(t, t, v, gpu_low());
-        let issues = evaluate_issues(&s);
+        let ctx = mk_ctx();
+        let win = mk_win(s);
+        let issues = evaluate_issues(ai(&ctx, &win));
         assert_eq!(issues.len(), 2);
         assert!(issues[0].evidence[0].contains("Under-batching"));
         assert!(issues[1].evidence[0].contains("KV cache pressure"));
@@ -670,7 +738,9 @@ mod tests {
     fn format_diagnose_rules_inserts_blank_between_rule_blocks() {
         let t = SystemTime::UNIX_EPOCH;
         let s = snap(t, t, vllm_high_kv(), gpu_low());
-        let lines = format_diagnose_rules(&s, false);
+        let ctx = mk_ctx();
+        let win = mk_win(s);
+        let lines = format_diagnose_rules(ai(&ctx, &win), false);
         let idx_under = lines
             .iter()
             .position(|l| l.contains("ISSUE: Under-batching"))
@@ -697,6 +767,7 @@ mod tests {
     #[test]
     fn format_diagnose_rules_for_windows_matches_requested_style_when_some_rules_fire() {
         let t = SystemTime::UNIX_EPOCH;
+        let ctx = mk_ctx();
         let mut windows = Vec::new();
         for i in 0..10 {
             let mut v = vllm_base();
@@ -717,10 +788,10 @@ mod tests {
                 v.num_requests_running = Some(20.0);
                 g.gpu_util_pct = Some(74.0);
             }
-            windows.push(snap(t, t, v, g));
+            windows.push(mk_win(snap(t, t, v, g)));
         }
-        let summary = windows.last().expect("summary source").clone();
-        let lines = format_diagnose_rules_for_windows(&windows, &summary, false);
+        let summary = ai(&ctx, windows.last().expect("summary source"));
+        let lines = format_diagnose_rules_for_windows(&windows, summary, false);
         let text = lines.join("\n");
         assert!(text.contains("ISSUES:"));
         assert!(text.contains("Under-batching"));
@@ -735,6 +806,7 @@ mod tests {
     #[test]
     fn format_diagnose_rules_for_windows_no_fires_is_single_no_issues_line() {
         let t = SystemTime::UNIX_EPOCH;
+        let ctx = mk_ctx();
         let mut v = vllm_base();
         v.num_requests_running = Some(20.0);
         v.num_requests_waiting = Some(3.0);
@@ -744,9 +816,9 @@ mod tests {
         v.generation_tokens_per_sec = Some(100.0);
         let mut g = gpu_busy();
         g.gpu_util_pct = Some(74.0);
-        let windows = vec![snap(t, t, v, g)];
-        let summary = windows[0].clone();
-        let lines = format_diagnose_rules_for_windows(&windows, &summary, false);
+        let windows = vec![mk_win(snap(t, t, v, g))];
+        let summary = ai(&ctx, windows.last().unwrap());
+        let lines = format_diagnose_rules_for_windows(&windows, summary, false);
         assert_eq!(
             lines,
             vec!["No issues detected in this snapshot.".to_string()]
@@ -760,7 +832,9 @@ mod tests {
         v.num_requests_running = Some(0.0);
         v.generation_tokens_per_sec = Some(0.0);
         let s = snap(t, t, v, gpu_busy());
-        let lines = format_diagnose_rules(&s, false);
+        let ctx = mk_ctx();
+        let win = mk_win(s);
+        let lines = format_diagnose_rules(ai(&ctx, &win), false);
         assert_eq!(
             lines,
             vec![
@@ -768,7 +842,7 @@ mod tests {
                 "Note: No evaluable traffic detected during the window.".to_string(),
             ]
         );
-        let vlines = format_diagnose_rules(&s, true);
+        let vlines = format_diagnose_rules(ai(&ctx, &win), true);
         assert!(vlines
             .iter()
             .any(|l| l.contains("1 window had insufficient traffic")));
@@ -777,13 +851,15 @@ mod tests {
     #[test]
     fn format_diagnose_rules_for_windows_all_non_evaluable() {
         let t = SystemTime::UNIX_EPOCH;
+        let ctx = mk_ctx();
         let mut v = vllm_base();
         v.num_requests_running = Some(0.2);
         v.generation_tokens_per_sec = Some(5.0);
-        let w1 = snap(t, t, v.clone(), gpu_busy());
-        let w2 = snap(t, t, v, gpu_busy());
+        let w1 = mk_win(snap(t, t, v.clone(), gpu_busy()));
+        let w2 = mk_win(snap(t, t, v, gpu_busy()));
         let windows = vec![w1, w2];
-        let lines = format_diagnose_rules_for_windows(&windows, &windows[0], false);
+        let summary = ai(&ctx, &windows[0]);
+        let lines = format_diagnose_rules_for_windows(&windows, summary, false);
         assert_eq!(
             lines,
             vec![
@@ -791,7 +867,8 @@ mod tests {
                 "Note: No evaluable traffic detected during the window.".to_string(),
             ]
         );
-        let vlines = format_diagnose_rules_for_windows(&windows, &windows[0], true);
+        let summary2 = ai(&ctx, &windows[0]);
+        let vlines = format_diagnose_rules_for_windows(&windows, summary2, true);
         assert!(vlines.iter().any(|l| l.contains("2 of 2 windows")));
     }
 }

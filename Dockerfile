@@ -19,6 +19,7 @@ RUN export DEBIAN_FRONTEND=noninteractive \
     wget \
     jq \
     gawk \
+    tmux \
     ca-certificates \
     && /usr/sbin/useradd -m -u 1000 -s /bin/bash appuser \
     && rm -rf /var/lib/apt/lists/*

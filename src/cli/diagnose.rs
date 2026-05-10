@@ -9,12 +9,6 @@ pub fn execute(
     duration: Duration,
 ) -> anyhow::Result<()> {
     let result = profiler::run_diagnose(vllm_metrics_input, max_num_seqs, duration)?;
-    output::stdout::print_diagnose_table(
-        &result.snapshot,
-        &result.windows,
-        verbose_rules,
-        result.duration,
-        result.started_at,
-    );
+    output::stdout::print_diagnose_table(&result, verbose_rules);
     Ok(())
 }
