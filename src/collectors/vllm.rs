@@ -1,4 +1,3 @@
-use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -6,7 +5,7 @@ use anyhow::{Context, Result};
 use prometheus_parse::{Scrape, Value};
 
 use super::sampling::{sample_count_for, SAMPLE_INTERVAL};
-use super::types::{PrefixCacheScrapeSample, VllmRawMetrics};
+use super::types::{CacheConfigLabels, PrefixCacheScrapeSample, VllmRawMetrics};
 const REQ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// vLLM exposes metrics with a `vllm:` prefix. The `prometheus-parse` crate only accepts
@@ -14,16 +13,6 @@ const REQ_TIMEOUT: Duration = Duration::from_secs(10);
 /// normalize them to underscores before parsing.
 fn normalize_vllm_prometheus_text(body: &str) -> String {
     body.replace("vllm:", "vllm_")
-}
-
-fn http_client() -> &'static reqwest::blocking::Client {
-    static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::blocking::Client::builder()
-            .timeout(REQ_TIMEOUT)
-            .build()
-            .unwrap_or_else(|e| panic!("build reqwest client: {e}"))
-    })
 }
 
 /// Resolves the GET URL for Prometheus text. Accepts a server base URL or a URL that already ends with `/metrics`.
@@ -36,8 +25,7 @@ fn metrics_url(input: &str) -> String {
     }
 }
 
-fn fetch_metrics_body(url: &str) -> Result<String> {
-    let client = http_client();
+fn fetch_metrics_body(client: &reqwest::blocking::Client, url: &str) -> Result<String> {
     client
         .get(url)
         .send()
@@ -65,18 +53,6 @@ fn first_gauge(scrape: &Scrape, name: &str) -> Option<f64> {
         })
 }
 
-fn mean_option(values: &[Option<f64>]) -> Option<f64> {
-    let mut sum = 0.0;
-    let mut n = 0u32;
-    for v in values {
-        if let Some(x) = *v {
-            sum += x;
-            n += 1;
-        }
-    }
-    (n > 0).then_some(sum / f64::from(n))
-}
-
 fn sum_metric_samples(scrape: &Scrape, name: &str) -> Option<f64> {
     let mut total = 0.0;
     let mut any = false;
@@ -95,6 +71,16 @@ fn sum_metric_samples(scrape: &Scrape, name: &str) -> Option<f64> {
 fn total_generation_tokens(scrape: &Scrape) -> Option<f64> {
     sum_metric_samples(scrape, "vllm_generation_tokens_total")
         .or_else(|| sum_metric_samples(scrape, "vllm_iteration_tokens_total_sum"))
+}
+
+fn total_preemptions(scrape: &Scrape) -> Option<f64> {
+    sum_metric_samples(scrape, "vllm_num_preemptions_total")
+        .or_else(|| sum_metric_samples(scrape, "vllm_num_preemptions"))
+}
+
+fn total_request_success(scrape: &Scrape) -> Option<f64> {
+    sum_metric_samples(scrape, "vllm_request_success_total")
+        .or_else(|| sum_metric_samples(scrape, "vllm_request_success"))
 }
 
 /// `(last - first) / window_secs` when monotonic; `None` on reset, missing endpoints, or **zero window** (no divide-by-zero).
@@ -203,19 +189,7 @@ fn compute_counter_rates(
 }
 
 /// Cumulative mean from a single scrape (`sum`/`count` across labeled series). **`count == 0` → `None`** (no divide-by-zero).
-fn histogram_mean_ms_from_scrape(scrape: &Scrape, base: &str) -> Option<f64> {
-    let sum = sum_metric_samples(scrape, &format!("{base}_sum"));
-    let count = sum_metric_samples(scrape, &format!("{base}_count"));
-    match (sum, count) {
-        (Some(s), Some(c)) if c > 0.0 => {
-            let ms = (s / c) * 1000.0;
-            ms.is_finite().then_some(ms)
-        }
-        _ => None,
-    }
-}
-
-fn histogram_mean_tokens_from_scrape(scrape: &Scrape, base: &str) -> Option<f64> {
+fn histogram_mean_from_scrape(scrape: &Scrape, base: &str) -> Option<f64> {
     let sum = sum_metric_samples(scrape, &format!("{base}_sum"));
     let count = sum_metric_samples(scrape, &format!("{base}_count"));
     match (sum, count) {
@@ -225,6 +199,10 @@ fn histogram_mean_tokens_from_scrape(scrape: &Scrape, base: &str) -> Option<f64>
         }
         _ => None,
     }
+}
+
+fn histogram_mean_ms_from_scrape(scrape: &Scrape, base: &str) -> Option<f64> {
+    histogram_mean_from_scrape(scrape, base).map(|m| m * 1000.0)
 }
 
 /// Aggregated `(Δsum)/(Δcount)` across all series for `base` (histogram `_sum` / `_count`).
@@ -269,7 +247,7 @@ fn apply_histogram_window(first: &Scrape, last: &Scrape, m: &mut VllmRawMetrics)
     m.queue_delay_ms = histogram_window_mean_ms(first, last, "vllm_request_queue_time_seconds")
         .or_else(|| histogram_mean_ms_from_scrape(last, "vllm_request_queue_time_seconds"));
     m.prompt_tokens_mean = histogram_window_mean(first, last, "vllm_request_prompt_tokens")
-        .or_else(|| histogram_mean_tokens_from_scrape(last, "vllm_request_prompt_tokens"));
+        .or_else(|| histogram_mean_from_scrape(last, "vllm_request_prompt_tokens"));
 }
 
 fn max_num_seqs_from_gauge(scrape: &Scrape) -> Option<u32> {
@@ -291,25 +269,25 @@ pub fn collect_vllm_metrics_for(
     input: &str,
     window: Duration,
 ) -> Result<(VllmRawMetrics, SystemTime)> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(REQ_TIMEOUT)
+        .build()
+        .context("failed to build HTTP client")?;
     let url = metrics_url(input);
     let sample_count = sample_count_for(window);
-    let mut running_samples = Vec::with_capacity(sample_count);
-    let mut waiting_samples = Vec::with_capacity(sample_count);
     let mut prefix_samples = Vec::with_capacity(sample_count);
     let mut window_start: Option<Instant> = None;
     let mut first_scrape: Option<Scrape> = None;
     let mut last_scrape: Option<Scrape> = None;
 
     for i in 0..sample_count {
-        let body = fetch_metrics_body(&url)?;
+        let body = fetch_metrics_body(&client, &url)?;
         let scrape = scrape_from_body(&body)?;
         prefix_samples.push(prefix_scrape_sample(&scrape));
 
         if i == 0 {
             window_start = Some(Instant::now());
         }
-        running_samples.push(first_gauge(&scrape, "vllm_num_requests_running"));
-        waiting_samples.push(first_gauge(&scrape, "vllm_num_requests_waiting"));
         if i == 0 {
             first_scrape = Some(scrape);
         } else {
@@ -328,17 +306,47 @@ pub fn collect_vllm_metrics_for(
     let first_scrape = first_scrape.context("vLLM gauge window missing first scrape")?;
     let last_scrape = last_scrape.context("vLLM gauge window missing last scrape")?;
     let mut m = parse_vllm_metrics(&last_scrape)?;
-    m.num_requests_running = mean_option(&running_samples);
-    m.num_requests_waiting = mean_option(&waiting_samples);
 
     let (gen_per_sec, prefix_hit) = compute_counter_rates(&first_scrape, &last_scrape, window_secs);
     m.generation_tokens_per_sec = gen_per_sec;
     m.prefix_cache_hit_rate = prefix_hit;
     m.prefix_cache_scrape_samples = prefix_samples;
+    m.request_success_per_sec = counter_delta_per_sec(
+        total_request_success(&first_scrape),
+        total_request_success(&last_scrape),
+        window_secs,
+    );
+    m.num_preemptions_per_sec = counter_delta_per_sec(
+        total_preemptions(&first_scrape),
+        total_preemptions(&last_scrape),
+        window_secs,
+    );
 
     apply_histogram_window(&first_scrape, &last_scrape, &mut m);
 
     Ok((m, SystemTime::now()))
+}
+
+fn parse_cache_config_labels(scrape: &Scrape) -> CacheConfigLabels {
+    let Some(s) = scrape
+        .samples
+        .iter()
+        .find(|s| s.metric == "vllm_cache_config_info")
+    else {
+        return CacheConfigLabels::default();
+    };
+    CacheConfigLabels {
+        block_size: s.labels.get("block_size").and_then(|v| v.parse().ok()),
+        cache_dtype: s.labels.get("cache_dtype").map(|v| v.to_string()),
+        enable_prefix_caching: s
+            .labels
+            .get("enable_prefix_caching")
+            .and_then(super::config::parse_bool),
+        enable_chunked_prefill: s
+            .labels
+            .get("enable_chunked_prefill")
+            .and_then(super::config::parse_bool),
+    }
 }
 
 fn parse_vllm_metrics(scrape: &Scrape) -> Result<VllmRawMetrics> {
@@ -363,12 +371,17 @@ fn parse_vllm_metrics(scrape: &Scrape) -> Result<VllmRawMetrics> {
     let prefill_latency_ms =
         histogram_mean_ms_from_scrape(scrape, "vllm_request_prefill_time_seconds");
     let queue_delay_ms = histogram_mean_ms_from_scrape(scrape, "vllm_request_queue_time_seconds");
-    let prompt_tokens_mean =
-        histogram_mean_tokens_from_scrape(scrape, "vllm_request_prompt_tokens");
+    let prompt_tokens_mean = histogram_mean_from_scrape(scrape, "vllm_request_prompt_tokens");
 
     let generation_tokens_total = total_generation_tokens(scrape);
 
     let max_num_seqs = max_num_seqs_from_gauge(scrape);
+    let num_requests_swapped = first_gauge(scrape, "vllm_num_requests_swapped");
+    let num_preemptions_total = total_preemptions(scrape);
+    let cpu_cache_usage_perc = first_gauge(scrape, "vllm_cpu_cache_usage_perc").map(|v| v * 100.0);
+    let request_success_total = total_request_success(scrape);
+
+    let cache_config = parse_cache_config_labels(scrape);
 
     Ok(VllmRawMetrics {
         model_name,
@@ -385,6 +398,13 @@ fn parse_vllm_metrics(scrape: &Scrape) -> Result<VllmRawMetrics> {
         prefix_cache_hit_rate: None,
         prefix_cache_scrape_samples: vec![],
         max_num_seqs,
+        num_requests_swapped,
+        num_preemptions_total,
+        num_preemptions_per_sec: None,
+        cpu_cache_usage_perc,
+        request_success_total,
+        request_success_per_sec: None,
+        cache_config,
     })
 }
 
@@ -392,35 +412,6 @@ fn parse_vllm_metrics(scrape: &Scrape) -> Result<VllmRawMetrics> {
 mod tests {
     use super::*;
     use crate::collectors::types::VllmRawMetrics;
-
-    /// Legacy Δhits/Δqueries window helper (tests only; production uses cumulative prefix rate).
-    fn prefix_hit_rate_window(
-        first_hits: Option<f64>,
-        first_queries: Option<f64>,
-        last_hits: Option<f64>,
-        last_queries: Option<f64>,
-    ) -> Option<f64> {
-        let (fq, lq) = match (first_queries, last_queries) {
-            (Some(f), Some(l)) => (f, l),
-            (None, Some(l)) => (l, l),
-            (Some(f), None) => (f, f),
-            (None, None) => return None,
-        };
-        let fh = first_hits.unwrap_or(0.0);
-        let lh = last_hits.unwrap_or(0.0);
-        let dq = lq - fq;
-        let dh = lh - fh;
-        if dq < 0.0 {
-            return None;
-        }
-        if dq == 0.0 {
-            return Some(0.0);
-        }
-        if dh < 0.0 {
-            return None;
-        }
-        Some(dh / dq)
-    }
 
     #[test]
     fn colon_prefixed_vllm_metrics_parse_after_normalize() {
@@ -443,14 +434,7 @@ vllm:generation_tokens_total{model_name="llama3"} 99
     }
 
     #[test]
-    fn mean_option_skips_none_and_averages_rest() {
-        assert_eq!(mean_option(&[None, Some(2.0), None, Some(4.0)]), Some(3.0));
-        assert_eq!(mean_option(&[None, None]), None);
-        assert_eq!(mean_option(&[]), None);
-    }
-
-    #[test]
-    fn gauge_window_mean_and_max_num_seqs_last_scrape() {
+    fn state_gauges_use_last_scrape_in_window() {
         let a = r#"
 vllm_num_requests_running 2
 vllm_num_requests_waiting 1
@@ -461,21 +445,15 @@ vllm_num_requests_running 4
 vllm_num_requests_waiting 0
 vllm_max_num_seqs 256
 "#;
-        let bodies = [a, a, a, a, a, a, a, a, b];
-        let mut running = Vec::with_capacity(9);
-        let mut waiting = Vec::with_capacity(9);
-        let mut max_last = None;
-        for (i, body) in bodies.iter().enumerate() {
-            let scrape = scrape_from_body(body).unwrap();
-            running.push(first_gauge(&scrape, "vllm_num_requests_running"));
-            waiting.push(first_gauge(&scrape, "vllm_num_requests_waiting"));
-            if i + 1 == bodies.len() {
-                max_last = max_num_seqs_from_gauge(&scrape);
-            }
-        }
-        assert!((mean_option(&running).unwrap() - 20.0 / 9.0).abs() < 1e-9);
-        assert!((mean_option(&waiting).unwrap() - 8.0 / 9.0).abs() < 1e-9);
-        assert_eq!(max_last, Some(256));
+        let last = scrape_from_body(b).unwrap();
+        let m = parse_vllm_metrics(&last).unwrap();
+        assert!((m.num_requests_running.unwrap() - 4.0).abs() < 1e-9);
+        assert!((m.num_requests_waiting.unwrap()).abs() < 1e-9);
+        assert_eq!(m.max_num_seqs, Some(256));
+        let early = scrape_from_body(a).unwrap();
+        let m_early = parse_vllm_metrics(&early).unwrap();
+        assert!((m_early.num_requests_running.unwrap() - 2.0).abs() < 1e-9);
+        assert!((m_early.num_requests_waiting.unwrap() - 1.0).abs() < 1e-9);
     }
 
     #[test]
@@ -514,42 +492,6 @@ vllm_max_num_seqs 256
     fn counter_delta_per_sec_missing_endpoint() {
         assert_eq!(counter_delta_per_sec(None, Some(10.0), 1.0), None);
         assert_eq!(counter_delta_per_sec(Some(1.0), None, 1.0), None);
-    }
-
-    #[test]
-    fn prefix_hit_rate_window_delta() {
-        assert_eq!(
-            prefix_hit_rate_window(Some(1.0), Some(10.0), Some(3.0), Some(20.0)),
-            Some(0.2)
-        );
-        assert_eq!(
-            prefix_hit_rate_window(Some(1.0), Some(10.0), Some(3.0), Some(10.0)),
-            Some(0.0)
-        );
-        assert_eq!(
-            prefix_hit_rate_window(Some(5.0), Some(10.0), Some(3.0), Some(20.0)),
-            None
-        );
-    }
-
-    #[test]
-    fn prefix_hit_rate_window_queries_on_one_scrape_yield_zero_rate() {
-        assert_eq!(
-            prefix_hit_rate_window(Some(0.0), None, Some(10.0), Some(100.0)),
-            Some(0.0)
-        );
-        assert_eq!(
-            prefix_hit_rate_window(Some(1.0), Some(50.0), Some(2.0), None),
-            Some(0.0)
-        );
-    }
-
-    #[test]
-    fn prefix_hit_rate_window_all_hits() {
-        assert_eq!(
-            prefix_hit_rate_window(Some(0.0), Some(0.0), Some(10.0), Some(10.0)),
-            Some(1.0)
-        );
     }
 
     #[test]
@@ -873,6 +815,28 @@ vllm_external_prefix_cache_queries 14
     }
 
     #[test]
+    fn request_success_and_preemptions_delta_per_sec() {
+        let a = "vllm_request_success_total 100\nvllm_num_preemptions_total 4\n";
+        let b = "vllm_request_success_total 150\nvllm_num_preemptions_total 9\n";
+        let fa = scrape_from_body(a).unwrap();
+        let fb = scrape_from_body(b).unwrap();
+        let w = 2.0_f64;
+        let qps = counter_delta_per_sec(total_request_success(&fa), total_request_success(&fb), w);
+        let pps = counter_delta_per_sec(total_preemptions(&fa), total_preemptions(&fb), w);
+        assert!((qps.unwrap() - 25.0).abs() < 1e-9);
+        assert!((pps.unwrap() - 2.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_single_scrape_leaves_counter_rates_none() {
+        let body = "vllm_request_success_total 10\nvllm_num_preemptions_total 3\n";
+        let m = parse_vllm_metrics(&scrape_from_body(body).unwrap()).unwrap();
+        assert!(m.request_success_per_sec.is_none() && m.num_preemptions_per_sec.is_none());
+        assert_eq!(m.request_success_total, Some(10.0));
+        assert_eq!(m.num_preemptions_total, Some(3.0));
+    }
+
+    #[test]
     fn metrics_url_appends_when_base() {
         assert_eq!(
             metrics_url("http://localhost:8000"),
@@ -890,5 +854,43 @@ vllm_external_prefix_cache_queries 14
             metrics_url("http://localhost:8000/metrics"),
             "http://localhost:8000/metrics"
         );
+    }
+
+    #[test]
+    fn cache_config_info_labels_parsed() {
+        let body = r#"
+# HELP vllm:cache_config_info Information of the cache configuration.
+# TYPE vllm:cache_config_info gauge
+vllm:cache_config_info{block_size="16",cache_dtype="auto",cpu_offload_gb="0",enable_prefix_caching="True",enable_chunked_prefill="False",num_cpu_blocks="2048",num_gpu_blocks="4096",sliding_window="None"} 1.0
+"#;
+        let scrape = scrape_from_body(body).unwrap();
+        let cc = parse_cache_config_labels(&scrape);
+        assert_eq!(cc.block_size, Some(16));
+        assert_eq!(cc.cache_dtype.as_deref(), Some("auto"));
+        assert_eq!(cc.enable_prefix_caching, Some(true));
+        assert_eq!(cc.enable_chunked_prefill, Some(false));
+    }
+
+    #[test]
+    fn cache_config_info_absent_yields_default() {
+        let body = "vllm_num_requests_running 1\n";
+        let scrape = scrape_from_body(body).unwrap();
+        let cc = parse_cache_config_labels(&scrape);
+        assert!(cc.block_size.is_none());
+        assert!(cc.cache_dtype.is_none());
+        assert!(cc.enable_prefix_caching.is_none());
+        assert!(cc.enable_chunked_prefill.is_none());
+    }
+
+    #[test]
+    fn cache_config_info_fp8_dtype() {
+        let body = r#"
+vllm:cache_config_info{block_size="32",cache_dtype="fp8",enable_prefix_caching="False"} 1.0
+"#;
+        let scrape = scrape_from_body(body).unwrap();
+        let cc = parse_cache_config_labels(&scrape);
+        assert_eq!(cc.block_size, Some(32));
+        assert_eq!(cc.cache_dtype.as_deref(), Some("fp8"));
+        assert_eq!(cc.enable_prefix_caching, Some(false));
     }
 }

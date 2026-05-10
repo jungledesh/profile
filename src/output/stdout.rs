@@ -3,32 +3,26 @@ use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
 
-use crate::collectors::{GpuRawMetrics, RawSnapshot, VllmRawMetrics};
+use crate::collectors::{GpuRawMetrics, VllmConfig, VllmRawMetrics};
+use crate::context::AnalysisInput;
 use crate::engine;
+use crate::profiler::DiagnoseResult;
 
 const VLLM_LABEL_W: usize = 10;
 const VLLM_LABEL_METRICS_GAP: &str = " ";
 
-pub fn print_diagnose_table(
-    snapshot: &RawSnapshot,
-    windows: &[RawSnapshot],
-    verbose_rules: bool,
-    duration: Duration,
-    started_at: SystemTime,
-) {
-    let lines = build_diagnose_lines(snapshot, windows, verbose_rules, duration, started_at);
+pub fn print_diagnose_table(result: &DiagnoseResult, verbose_rules: bool) {
+    let lines = build_diagnose_lines(result, verbose_rules);
     print_boxed(&lines);
 }
 
-fn build_diagnose_lines(
-    snapshot: &RawSnapshot,
-    windows: &[RawSnapshot],
-    verbose_rules: bool,
-    duration: Duration,
-    started_at: SystemTime,
-) -> Vec<String> {
+fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<String> {
+    let snapshot = &result.snapshot;
     let v = &snapshot.vllm;
     let g = &snapshot.gpu;
+    let cfg = &result.static_ctx.config;
+    let duration = result.duration;
+    let started_at = result.started_at;
 
     let model = v.model_name.as_deref().unwrap_or("(unknown model)");
     let gpu_label = g.gpu_name.as_deref().unwrap_or("(no GPU)");
@@ -48,17 +42,36 @@ fn build_diagnose_lines(
         gpu_gauges_line(g),
         width = VLLM_LABEL_W
     ));
+    lines.push(format!(
+        "{:<width$}{}{}",
+        "",
+        VLLM_LABEL_METRICS_GAP,
+        gpu_detail_line(g),
+        width = VLLM_LABEL_W
+    ));
     lines.push(String::new());
     lines.push(vllm_label_row("vLLM:", ""));
     lines.push(vllm_label_row("REQUESTS", &vllm_requests_value(v)));
     lines.push(vllm_label_row("LATENCY", &vllm_latency_value(v)));
     lines.push(vllm_label_row("PROMPT", &vllm_prompt_value(v)));
     lines.push(vllm_label_row("THROUGHPUT", &vllm_throughput_value(v)));
+    lines.push(vllm_label_row("MEMORY", &vllm_memory_value(v)));
+    lines.push(vllm_label_row("TRAFFIC", &vllm_traffic_value(v)));
+    lines.push(vllm_label_row("CACHE CFG", &vllm_cache_cfg_value(v)));
+    lines.push(String::new());
+    lines.push(vllm_label_row("Config:", ""));
+    lines.push(vllm_label_row("PARALLEL", &config_parallel_value(cfg)));
+    lines.push(vllm_label_row("MODEL", &config_model_value(cfg)));
+    lines.push(vllm_label_row("KV", &config_kv_value(cfg)));
 
-    let rule_lines = if windows.len() <= 1 {
-        engine::format_diagnose_rules(snapshot, verbose_rules)
+    // Build AnalysisInput from the aggregate snapshot for single-window rule evaluation.
+    let aggregate_win = crate::context::RuntimeWindow::from_snapshot(result.snapshot.clone());
+    let summary_input = AnalysisInput::new(&result.static_ctx, &aggregate_win);
+
+    let rule_lines = if result.windows.len() <= 1 {
+        engine::format_diagnose_rules(summary_input, verbose_rules)
     } else {
-        engine::format_diagnose_rules_for_windows(windows, snapshot, verbose_rules)
+        engine::format_diagnose_rules_for_windows(&result.windows, summary_input, verbose_rules)
     };
     if !rule_lines.is_empty() {
         lines.push(String::new());
@@ -235,6 +248,150 @@ fn cache_use_fragment(v: &VllmRawMetrics) -> String {
         Some(r) => format!("pfix_cache {:.1}%", r * 100.0),
         None => "pfix_cache —".to_string(),
     }
+}
+
+fn gpu_detail_line(g: &GpuRawMetrics) -> String {
+    let mem_util = g
+        .mem_util_pct
+        .map(|u| format!("mem_util {:.1}%", u))
+        .unwrap_or_else(|| "mem_util —".to_string());
+    let temp = g
+        .temperature_c
+        .map(|t| format!("temp {:.0}°C", t))
+        .unwrap_or_else(|| "temp —".to_string());
+    let sm = g
+        .sm_clock_mhz
+        .map(|c| format!("sm {}MHz", c))
+        .unwrap_or_else(|| "sm —".to_string());
+    let limit = g
+        .power_limit_watts
+        .map(|l| format!("limit {:.0}W", l))
+        .unwrap_or_else(|| "limit —".to_string());
+    format!("{mem_util} | {temp} | {sm} | {limit}")
+}
+
+fn vllm_memory_value(v: &VllmRawMetrics) -> String {
+    let swapped = v
+        .num_requests_swapped
+        .map(fmt_gauge)
+        .map(|s| format!("swapped {s}"))
+        .unwrap_or_else(|| "swapped —".to_string());
+    let cpu_cache = match v.cpu_cache_usage_perc.filter(|x| x.is_finite()) {
+        Some(p) => format!("cpu_cache {:.1}%", p),
+        None => "cpu_cache —".to_string(),
+    };
+    format!("{swapped} | {cpu_cache}")
+}
+
+fn vllm_traffic_value(v: &VllmRawMetrics) -> String {
+    let qps = v
+        .request_success_per_sec
+        .map(|q| format!("qps {:.1}", q))
+        .unwrap_or_else(|| "qps —".to_string());
+    let req_total = v
+        .request_success_total
+        .map(|t| format!("req_total {:.0}", t))
+        .unwrap_or_else(|| "req_total —".to_string());
+    let gen_total = v
+        .generation_tokens_total
+        .map(|t| format!("gen_total {:.0}", t))
+        .unwrap_or_else(|| "gen_total —".to_string());
+    let preempt_rate = v
+        .num_preemptions_per_sec
+        .map(|p| format!("preempt/s {:.2}", p))
+        .unwrap_or_else(|| "preempt/s —".to_string());
+    let preempt_total = v
+        .num_preemptions_total
+        .map(|t| format!("preempt_total {:.0}", t))
+        .unwrap_or_else(|| "preempt_total —".to_string());
+    format!("{qps} | {req_total} | {gen_total} | {preempt_rate} | {preempt_total}")
+}
+
+fn vllm_cache_cfg_value(v: &VllmRawMetrics) -> String {
+    let block = v
+        .cache_config
+        .block_size
+        .map(|b| format!("block {b}"))
+        .unwrap_or_else(|| "block —".to_string());
+    let dtype = v.cache_config.cache_dtype.as_deref().unwrap_or("—");
+    let prefix = v
+        .cache_config
+        .enable_prefix_caching
+        .map(|b| {
+            if b {
+                "prefix_cache on"
+            } else {
+                "prefix_cache off"
+            }
+        })
+        .unwrap_or("prefix_cache —");
+    let chunked = v
+        .cache_config
+        .enable_chunked_prefill
+        .map(|b| {
+            if b {
+                "chunked_prefill on"
+            } else {
+                "chunked_prefill off"
+            }
+        })
+        .unwrap_or("chunked_prefill —");
+    format!("{block} | dtype {dtype} | {prefix} | {chunked}")
+}
+
+fn config_parallel_value(cfg: &VllmConfig) -> String {
+    let tp = cfg
+        .tensor_parallel_size
+        .map(|v| format!("tp {v}"))
+        .unwrap_or_else(|| "tp —".to_string());
+    let pp = cfg
+        .pipeline_parallel_size
+        .map(|v| format!("pp {v}"))
+        .unwrap_or_else(|| "pp —".to_string());
+    format!("{tp} | {pp}")
+}
+
+fn config_model_value(cfg: &VllmConfig) -> String {
+    let max_len = cfg
+        .max_model_len
+        .map(|v| format!("max_len {v}"))
+        .unwrap_or_else(|| "max_len —".to_string());
+    let dtype = cfg.dtype.as_deref().unwrap_or("—");
+    let quant = cfg.quantization.as_deref().unwrap_or("—");
+    let gpu_mem = cfg
+        .gpu_memory_utilization
+        .map(|v| format!("gpu_mem_util {:.2}", v))
+        .unwrap_or_else(|| "gpu_mem_util —".to_string());
+    format!("{max_len} | dtype {dtype} | quant {quant} | {gpu_mem}")
+}
+
+fn config_kv_value(cfg: &VllmConfig) -> String {
+    let kv_dtype = cfg.kv_cache_dtype.as_deref().unwrap_or("—");
+    let block = cfg
+        .block_size
+        .map(|b| format!("block {b}"))
+        .unwrap_or_else(|| "block —".to_string());
+    let prefix = cfg
+        .enable_prefix_caching
+        .map(|b| {
+            if b {
+                "prefix_cache on"
+            } else {
+                "prefix_cache off"
+            }
+        })
+        .unwrap_or("prefix_cache —");
+    let chunked = cfg
+        .enable_chunked_prefill
+        .map(|b| {
+            if b {
+                "chunked_prefill on"
+            } else {
+                "chunked_prefill off"
+            }
+        })
+        .unwrap_or("chunked_prefill —");
+    format!("dtype {kv_dtype} | {block} | {prefix} | {chunked}")
 }
 
 fn fmt_seconds_from_ms(ms: f64) -> String {

@@ -2,13 +2,18 @@
 //!
 //! **Parallel:** NVML and `/metrics` run **concurrently** (`std::thread`). Cadence: `sampling`.
 
+pub mod config;
 pub mod gpu;
 pub mod sampling;
+pub mod traffic;
 pub mod types;
 pub mod vllm;
 
+pub use config::{build_config, VllmConfig};
+pub use traffic::{traffic_from_snapshot, TrafficSource, TrafficState};
 pub use types::{
-    window_is_evaluable, GpuRawMetrics, PrefixCacheScrapeSample, RawSnapshot, VllmRawMetrics,
+    window_is_evaluable, CacheConfigLabels, GpuRawMetrics, PrefixCacheScrapeSample, RawSnapshot,
+    VllmRawMetrics,
 };
 
 use std::thread;
