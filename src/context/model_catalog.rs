@@ -512,8 +512,8 @@ mod tests {
 
     #[test]
     fn llama4_scout() {
-        let e = lookup_model("meta-llama/Llama-4-Scout-17B-16E-Instruct")
-            .expect("should match scout");
+        let e =
+            lookup_model("meta-llama/Llama-4-Scout-17B-16E-Instruct").expect("should match scout");
         assert_eq!(e.family, "llama4");
         assert!(e.is_moe);
     }

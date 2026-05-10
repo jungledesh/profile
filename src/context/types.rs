@@ -38,9 +38,7 @@ pub struct StaticContext {
 impl StaticContext {
     pub fn from_snapshot(snapshot: &RawSnapshot, config: VllmConfig) -> Self {
         let model_name = snapshot.vllm.model_name.clone();
-        let catalog_entry = model_name
-            .as_deref()
-            .and_then(model_catalog::lookup_model);
+        let catalog_entry = model_name.as_deref().and_then(model_catalog::lookup_model);
         let model = match catalog_entry {
             Some(e) => ModelArch {
                 name: model_name,
