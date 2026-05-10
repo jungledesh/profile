@@ -2,20 +2,29 @@ use std::time::SystemTime;
 
 use crate::collectors::{traffic_from_snapshot, RawSnapshot, TrafficState, VllmConfig};
 
+use super::{gpu_catalog, model_catalog};
+
 #[derive(Debug, Clone, Default)]
 pub struct ModelArch {
     pub name: Option<String>,
-    /// Total parameter count. None until Step 3 fills it from a model catalog.
+    pub family: Option<String>,
+    /// Total parameter count (billions × 1e9 as u64). Dense and MoE total.
     pub param_count: Option<u64>,
+    /// Active parameter count for MoE models. None for dense.
+    pub active_param_count: Option<u64>,
+    pub num_layers: Option<u32>,
+    pub hidden_dim: Option<u32>,
+    pub is_moe: bool,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct GPUModel {
     pub name: Option<String>,
+    pub arch: Option<String>,
     pub vram_gb: Option<f64>,
-    /// Peak FP32 TFLOPS. None until Step 3 fills it from a GPU catalog.
+    /// Non-tensor-core FP32 TFLOPS. Conservative roofline input.
     pub peak_flops_f32_tflops: Option<f64>,
-    /// Peak memory bandwidth GB/s. None until Step 3.
+    /// Peak memory bandwidth GB/s.
     pub peak_bw_gbps: Option<f64>,
 }
 
@@ -28,19 +37,43 @@ pub struct StaticContext {
 
 impl StaticContext {
     pub fn from_snapshot(snapshot: &RawSnapshot, config: VllmConfig) -> Self {
-        StaticContext {
-            model: ModelArch {
-                name: snapshot.vllm.model_name.clone(),
-                param_count: None,
+        let model_name = snapshot.vllm.model_name.clone();
+        let catalog_entry = model_name.as_deref().and_then(model_catalog::lookup_model);
+        let model = match catalog_entry {
+            Some(e) => ModelArch {
+                name: model_name,
+                family: Some(e.family.to_string()),
+                param_count: Some(e.param_count),
+                active_param_count: e.active_param_count,
+                num_layers: Some(e.num_layers),
+                hidden_dim: Some(e.hidden_dim),
+                is_moe: e.is_moe,
             },
-            gpu: GPUModel {
-                name: snapshot.gpu.gpu_name.clone(),
-                vram_gb: snapshot.gpu.vram_total_mb.map(|m| m as f64 / 1024.0),
+            None => ModelArch {
+                name: model_name,
+                ..Default::default()
+            },
+        };
+        let gpu_name = snapshot.gpu.gpu_name.clone();
+        let vram_gb = snapshot.gpu.vram_total_mb.map(|m| m as f64 / 1024.0);
+        let gpu_entry = gpu_name.as_deref().and_then(gpu_catalog::lookup_gpu);
+        let gpu = match gpu_entry {
+            Some(e) => GPUModel {
+                name: gpu_name,
+                arch: Some(e.arch.to_string()),
+                vram_gb,
+                peak_flops_f32_tflops: Some(e.peak_flops_f32_tflops),
+                peak_bw_gbps: Some(e.peak_bw_gbps),
+            },
+            None => GPUModel {
+                name: gpu_name,
+                arch: None,
+                vram_gb,
                 peak_flops_f32_tflops: None,
                 peak_bw_gbps: None,
             },
-            config,
-        }
+        };
+        StaticContext { model, gpu, config }
     }
 }
 
