@@ -11,6 +11,8 @@ const API_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(Debug, Clone, Default)]
 pub struct VllmConfig {
     pub model_name: Option<String>,
+    /// HF repo id or weight path from `/v1/models` `root` when present.
+    pub model_root: Option<String>,
     pub max_num_seqs: Option<u32>,
     pub tensor_parallel_size: Option<u32>,
     pub pipeline_parallel_size: Option<u32>,
@@ -35,6 +37,7 @@ pub(crate) fn config_from_snapshot(snapshot: &RawSnapshot, cli_max_num_seqs: u32
             .model_name
             .clone()
             .or_else(|| env_str("VLLM_MODEL")),
+        model_root: None,
         max_num_seqs: snapshot
             .vllm
             .max_num_seqs
@@ -80,6 +83,7 @@ pub fn build_config(
     let base = base_url_from_metrics(metrics_url);
     let api = fetch_config_from_api(&base);
     cfg.model_name = api.model_name.or(cfg.model_name);
+    cfg.model_root = api.model_root.or(cfg.model_root);
     cfg.max_model_len = api.max_model_len.or(cfg.max_model_len);
     cfg
 }
@@ -119,12 +123,18 @@ fn fetch_config_from_api(base_url: &str) -> VllmConfig {
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+    let model_root = entry
+        .and_then(|e| e.get("root"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     let max_model_len = entry
         .and_then(|e| e.get("max_model_len"))
         .and_then(|v| v.as_u64())
         .and_then(|n| u32::try_from(n).ok());
     VllmConfig {
         model_name,
+        model_root,
         max_model_len,
         ..VllmConfig::default()
     }

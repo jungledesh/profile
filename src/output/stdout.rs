@@ -156,7 +156,7 @@ fn duration_short(duration: Duration) -> String {
 
 fn baseline_lines(baseline: Option<engine::PhysicsBaseline>) -> Vec<String> {
     let Some(b) = baseline else {
-        return vec!["BASELINE   model not in catalog — roofline unavailable".to_string()];
+        return vec!["BASELINE   unavailable — model not recognized".to_string()];
     };
 
     // Line 1: efficiency + throughput ceilings
