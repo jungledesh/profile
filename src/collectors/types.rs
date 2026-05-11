@@ -45,7 +45,8 @@ pub struct HistogramWindowMass {
 pub struct VllmRawMetrics {
     pub model_name: Option<String>,
 
-    /// Queue-depth style gauges: **last** `/metrics` scrape in the collection window (not averaged).
+    /// Queue-depth style gauges: **last** `/metrics` scrape in the collection window.
+    /// Multi-window diagnose: **time-weighted mean** across evaluable windows (same as `gpu_util_pct`).
     pub num_requests_running: Option<f64>,
     pub num_requests_waiting: Option<f64>,
     /// Last scrape in the window.

@@ -208,16 +208,22 @@ fn gpu_gauges_line(g: &GpuRawMetrics) -> String {
 }
 
 fn vllm_requests_value(v: &VllmRawMetrics) -> String {
-    let run = v
-        .num_requests_running
-        .map(fmt_gauge)
-        .map(|s| format!("run {s}"))
-        .unwrap_or_else(|| "run —".to_string());
-    let wait = v
-        .num_requests_waiting
-        .map(fmt_gauge)
-        .map(|s| format!("wait {s}"))
-        .unwrap_or_else(|| "wait —".to_string());
+    let run = match v.num_requests_running.filter(|x| x.is_finite()) {
+        Some(avg) => {
+            let rounded = avg.round();
+            if let Some(max_n) = v.max_num_seqs.filter(|&m| m > 0) {
+                let pct = (avg / f64::from(max_n)) * 100.0;
+                format!("run {:.0} ({:.1}%)", rounded, pct)
+            } else {
+                format!("run {:.0}", rounded)
+            }
+        }
+        None => "run —".to_string(),
+    };
+    let wait = match v.num_requests_waiting.filter(|x| x.is_finite()) {
+        Some(w) => format!("wait {:.0}", w.round()),
+        None => "wait —".to_string(),
+    };
     let max_seq = v
         .max_num_seqs
         .map(|n| format!("max {n}"))
@@ -622,7 +628,18 @@ mod tests {
             max_num_seqs: Some(256),
             ..Default::default()
         };
-        assert_eq!(vllm_requests_value(&v), "run 2 | wait 1 | max 256");
+        assert_eq!(vllm_requests_value(&v), "run 2 (0.8%) | wait 1 | max 256");
+    }
+
+    #[test]
+    fn vllm_requests_value_omits_pct_when_max_unknown() {
+        let v = VllmRawMetrics {
+            num_requests_running: Some(4.0),
+            num_requests_waiting: Some(0.0),
+            max_num_seqs: None,
+            ..Default::default()
+        };
+        assert_eq!(vllm_requests_value(&v), "run 4 | wait 0 | max —");
     }
 
     #[test]
@@ -682,7 +699,7 @@ mod tests {
 
     #[test]
     fn vllm_label_row_aligns_labels_and_gap_before_metrics() {
-        let line = vllm_label_row("REQUESTS", "run 2 | wait 1 | max 256");
+        let line = vllm_label_row("REQUESTS", "run 2 (0.8%) | wait 1 | max 256");
         assert!(line.starts_with("REQUESTS"));
         assert!(line.contains(" run 2"));
         let t = vllm_label_row("THROUGHPUT", "59 tok/s | pfix_cache 72.8%");

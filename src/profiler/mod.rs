@@ -176,9 +176,10 @@ fn aggregate_windows(
         ..Default::default()
     };
 
+    // Running / waiting: duration-weighted mean over evaluable windows (same weight story as gpu_util_pct).
+    agg_v.num_requests_running = weighted_metric_pairs(&pairs, |w| w.vllm.num_requests_running);
+    agg_v.num_requests_waiting = weighted_metric_pairs(&pairs, |w| w.vllm.num_requests_waiting);
     // State gauges: last evaluable window only (ground truth at end of diagnosis).
-    agg_v.num_requests_running = last.vllm.num_requests_running;
-    agg_v.num_requests_waiting = last.vllm.num_requests_waiting;
     agg_v.kv_cache_usage_perc = last.vllm.kv_cache_usage_perc;
     agg_v.kv_cache_peak_perc = aggregate_kv_cache_peak_perc(&pairs, last);
     agg_v.num_requests_swapped = last.vllm.num_requests_swapped;
@@ -441,7 +442,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_windows_time_weights_rates_and_latencies_state_from_last_window() {
+    fn aggregate_windows_time_weights_rates_latencies_running_waiting_and_state_from_last() {
         let g1 = GpuRawMetrics {
             gpu_util_pct: Some(10.0),
             vram_used_mb: Some(1000),
@@ -478,7 +479,9 @@ mod tests {
         ];
         let durations = vec![Duration::from_secs(2), Duration::from_secs(10)];
         let agg = aggregate_windows(&windows, &durations, SystemTime::UNIX_EPOCH);
-        assert!((agg.vllm.num_requests_running.unwrap() - 10.0).abs() < 1e-9);
+        // (2×2s + 10×10s) / 12s — not last window's 10.
+        let expected_run = (2.0 * 2.0 + 10.0 * 10.0) / 12.0;
+        assert!((agg.vllm.num_requests_running.unwrap() - expected_run).abs() < 1e-9);
         assert!((agg.vllm.generation_tokens_per_sec.unwrap() - 433.3333333).abs() < 1e-4);
         // (10+10)/(80+10) = 20/90 — sum of Δhits / sum of Δqueries, not last window only.
         assert!((agg.vllm.prefix_cache_hit_rate.unwrap() - 20.0 / 90.0).abs() < 1e-9);
