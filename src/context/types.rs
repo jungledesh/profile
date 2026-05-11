@@ -15,6 +15,7 @@ pub struct ModelArch {
     pub num_layers: Option<u32>,
     pub hidden_dim: Option<u32>,
     pub is_moe: bool,
+    pub default_weight_dtype: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -48,6 +49,7 @@ impl StaticContext {
                 num_layers: Some(e.num_layers),
                 hidden_dim: Some(e.hidden_dim),
                 is_moe: e.is_moe,
+                default_weight_dtype: Some(e.default_weight_dtype.to_string()),
             },
             None => ModelArch {
                 name: model_name,

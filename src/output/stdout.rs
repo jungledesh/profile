@@ -57,6 +57,13 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
         duration,
     )];
 
+    // Build AnalysisInput from the aggregate snapshot for baseline + single-window rule evaluation.
+    let aggregate_win = crate::context::RuntimeWindow::from_snapshot(result.snapshot.clone());
+    let summary_input = AnalysisInput::new(&result.static_ctx, &aggregate_win);
+    let report = engine::build_report(summary_input);
+    lines.extend(baseline_lines(report.baseline));
+    lines.push(String::new());
+
     if !result.any_evaluable {
         lines.push(vllm_label_row("Target:", &result.metrics_input));
         lines.push(String::new());
@@ -95,10 +102,6 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
     lines.push(vllm_label_row("PARALLEL", &config_parallel_value(cfg)));
     lines.push(vllm_label_row("MODEL", &config_model_value(cfg)));
     lines.push(vllm_label_row("KV", &config_kv_value(cfg)));
-
-    // Build AnalysisInput from the aggregate snapshot for single-window rule evaluation.
-    let aggregate_win = crate::context::RuntimeWindow::from_snapshot(result.snapshot.clone());
-    let summary_input = AnalysisInput::new(&result.static_ctx, &aggregate_win);
 
     let rule_lines = if result.windows.len() <= 1 {
         engine::format_diagnose_rules(summary_input, verbose_rules)
@@ -149,6 +152,31 @@ fn duration_short(duration: Duration) -> String {
     } else {
         format!("{secs}s")
     }
+}
+
+fn baseline_lines(baseline: Option<engine::PhysicsBaseline>) -> Vec<String> {
+    let Some(b) = baseline else {
+        return vec!["BASELINE   model not in catalog — roofline unavailable".to_string()];
+    };
+
+    let mut segments = Vec::new();
+    if let Some(raw_eff) = b.efficiency_pct {
+        if raw_eff > 100.0 {
+            segments.push(">100% of decode ceiling (check weight dtype)".to_string());
+        } else {
+            segments.push(format!("{raw_eff:.1}% of decode ceiling"));
+        }
+    }
+    segments.push(format!("decode ~{:.0} tok/s (est)", b.decode.expected));
+    if let Some(prefill) = b.prefill {
+        segments.push(format!("prefill ~{:.0} tok/s (est)", prefill.expected));
+    }
+
+    let mut out = vec![format!("BASELINE   {}", segments.join(" | "))];
+    if b.weight_dtype_source == engine::WeightDtypeSource::Fallback {
+        out.push("           weight dtype assumed bf16 — set DTYPE env var to confirm".to_string());
+    }
+    out
 }
 
 fn vllm_label_row(label: &str, value: &str) -> String {
