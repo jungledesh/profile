@@ -35,6 +35,7 @@ This is a deliberate design choice: time-weighting across evaluable windows acts
 - **Catalog-resolved fields:** Derived once from the raw `model_name` / `gpu_name` strings at `StaticContext` construction. Never re-queried mid-run. `None` when the name doesn't match any catalog entry — consumers must handle gracefully. GPU `peak_flops_f32_tflops` is non-tensor-core FP32 (conservative roofline input); B200 and GB10 values are estimates.
 - **State vs utilization:** State = what the system looks like at the **end of the last active window**. Utilization = how busy the GPU was **over time** (averages).
 - **All windows non-evaluable:** The aggregated snapshot is the **chronologically last raw window** in full (nothing to weight).
+- **`sm_clock_mhz` min tracking deferred:** A sagged clock during evaluable windows indicates thermal or power throttling. Tracking the minimum would expose this, but idle gaps between polls make a low min ambiguous without a base/boost clock reference to compare against. Deferred until the GPU catalog carries per-GPU base and boost clock data. For now, temperature peak serves as the throttle signal.
 
 ---
 
