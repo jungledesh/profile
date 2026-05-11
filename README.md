@@ -16,6 +16,10 @@ Find and fix inference bottlenecks in minutes.
 
 It tells you **what’s wrong, why it’s happening, and what to fix first**, so you can reduce cost per token.
 
+### Reports 3 kind of numbers
+
+1. **Under-load behavior only** This means profile reports the character of your server under real load, not a session-wide average diluted by quiet time
+
 ## Why use this
 
 vLLM `/metrics` shows numbers.  
@@ -79,7 +83,7 @@ Recommendation:
 Built as a focused solo project to make vLLM inference diagnostics  
 **predictable, truthful, and actionable**.
 
-This is **v0.1.0** — currently optimized for single-GPU setups.
+This is **v2.0.0** — currently optimized for single-GPU setups.
 
 Feedback and real-world usage are highly valuable.  
 A deeper technical write-up is coming soon.

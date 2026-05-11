@@ -18,6 +18,14 @@ pub struct PrefixCacheScrapeSample {
     pub queries: Option<f64>,
 }
 
+/// Δ(sum) and Δ(count) for a Prometheus histogram between **first → last** scrape in a window.
+/// Sum units match the histogram (seconds for latency histograms, token-sum for `request_prompt_tokens`).
+#[derive(Debug, Clone, Copy)]
+pub struct HistogramWindowMass {
+    pub sum_delta: f64,
+    pub count_delta: f64,
+}
+
 /// vLLM Prometheus scrape.
 ///
 /// How fields are combined across scrapes and diagnose windows: **`docs/collection-policy.md`**.
@@ -27,19 +35,24 @@ pub struct PrefixCacheScrapeSample {
 /// applicable (e.g. 0% prefix hits in-window), not “missing data.”
 ///
 /// - **Histogram means** (TTFT, TPOT, prefill, queue, prompt mean): `None` if no observations or
-///   **Δcount ≤ 0** in the window.
+///   **Δcount ≤ 0** in the window (unless last-scrape cumulative fallback applies).
+/// - **Multi-window diagnose:** combined mean = **ΣΔsum / ΣΔcount** over evaluable windows using
+///   [`HistogramWindowMass`]; falls back to duration-weighted blend of window means if no mass (`docs/collection-policy.md`).
 /// - **`generation_tokens_per_sec`:** `None` if missing counters, negative Δ, or zero time window.
 /// - **`request_success_per_sec` / `num_preemptions_per_sec`:** Δ counter / window duration (first→last scrape), same rules as generation tokens.
-/// - **`prefix_cache_hit_rate`:** `None` if **`Δqueries ≤ 0`** or invalid deltas; `Some(0.0)` means 0% hits in-window.
+/// - **`prefix_cache_hit_rate`:** Per window: `(Δhits)/(Δqueries)` over first→last scrape. Multi-window diagnose: **`(Σ Δhits)/(Σ Δqueries)`** over evaluable windows (`docs/collection-policy.md`). `None` if no valid query mass.
 #[derive(Debug, Clone, Default)]
 pub struct VllmRawMetrics {
     pub model_name: Option<String>,
 
-    /// Queue-depth style gauges: **last** `/metrics` scrape in the collection window (not averaged).
+    /// Queue-depth style gauges: **last** `/metrics` scrape in the collection window.
+    /// Multi-window diagnose: **time-weighted mean** across evaluable windows (same as `gpu_util_pct`).
     pub num_requests_running: Option<f64>,
     pub num_requests_waiting: Option<f64>,
     /// Last scrape in the window.
     pub kv_cache_usage_perc: Option<f64>,
+    /// Max KV cache usage % seen across scrapes in this window (0–100). Multi-window: max over evaluable windows.
+    pub kv_cache_peak_perc: Option<f64>,
 
     // Histograms: prefer Δsum/Δcount from **first** → **last** scrape (9th sample, ~2s apart);
     // else cumulative mean from the last scrape.
@@ -50,12 +63,19 @@ pub struct VllmRawMetrics {
     /// `request_prompt_tokens` histogram: mean tokens (Δ window or last-scrape fallback).
     pub prompt_tokens_mean: Option<f64>,
 
+    /// Per-window histogram observation mass (first→last scrape). Used for multi-window **ΣΔsum / ΣΔcount** aggregation.
+    pub ttft_window_mass: Option<HistogramWindowMass>,
+    pub tpot_window_mass: Option<HistogramWindowMass>,
+    pub prefill_window_mass: Option<HistogramWindowMass>,
+    pub queue_window_mass: Option<HistogramWindowMass>,
+    pub prompt_tokens_window_mass: Option<HistogramWindowMass>,
+
     /// Cumulative generation tokens (last scrape per window), summed over label sets.
     /// Multi-window diagnose: from the **chronologically last** collected window (`docs/collection-policy.md`).
     pub generation_tokens_total: Option<f64>,
     /// Δ generation tokens / s over the first→last scrape window (output throughput).
     pub generation_tokens_per_sec: Option<f64>,
-    /// Prefix cache hit rate: `(Δhits)/(Δqueries)` over first→last scrape (internal + external).
+    /// Prefix cache hit rate. Single window: `(Δhits)/(Δqueries)` first→last scrape. Multi-window aggregate: sum of valid window deltas — see `docs/collection-policy.md`.
     pub prefix_cache_hit_rate: Option<f64>,
     /// Cumulative prefix counters per scrape (same order as collector: 9 × ~250ms).
     pub prefix_cache_scrape_samples: Vec<PrefixCacheScrapeSample>,
@@ -97,8 +117,12 @@ pub struct GpuRawMetrics {
     pub power_watts: Option<f64>,
     pub power_limit_watts: Option<f64>,
     pub vram_used_mb: Option<u64>,
+    /// Max VRAM used (MiB) across NVML polls in this window. Multi-window: max over evaluable windows.
+    pub vram_peak_mb: Option<u64>,
     pub vram_total_mb: Option<u64>,
     pub temperature_c: Option<f64>,
+    /// Max GPU temperature (°C) across NVML polls in this window. Multi-window: max over evaluable windows (with landing fold-in); stdout parenthetical uses threshold in `output/stdout.rs`.
+    pub temperature_peak_c: Option<f64>,
     pub sm_clock_mhz: Option<u32>,
 }
 

@@ -194,9 +194,16 @@ fn diagnose_shows_gen_tok_per_sec_when_counters_increase() {
 
 #[test]
 fn diagnose_gen_tok_per_sec_na_when_counter_resets() {
-    const G100: &str = "vllm_generation_tokens_total 100\n";
-    const G500: &str = "vllm_generation_tokens_total 500\n";
-    let bodies = [G500, G500, G500, G500, G500, G500, G500, G500, G100];
+    // Keep window evaluable via running count; counter reset still yields NA tok/s (invalid Δ).
+    const B500: &str = concat!(
+        "vllm_num_requests_running 20\n",
+        "vllm_generation_tokens_total 500\n"
+    );
+    const B100: &str = concat!(
+        "vllm_num_requests_running 20\n",
+        "vllm_generation_tokens_total 100\n"
+    );
+    let bodies = [B500, B500, B500, B500, B500, B500, B500, B500, B100];
     let (url, server) = spawn_metrics_server_seq(&bodies);
     let output = Command::cargo_bin("profile")
         .unwrap()
