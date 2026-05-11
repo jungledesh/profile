@@ -1,6 +1,13 @@
 # Ground-truth capture policy (v2)
 
-Normative rules for how Profile combines vLLM `/metrics` scrapes and NVML polls. **Evaluable window:** `window_is_evaluable` is true (enough concurrent load or tok/s). Diagnostic aggregates prioritize **what happened under load** while still exposing **true cumulative counters** from the latest collection.
+Normative rules for how Profile combines vLLM `/metrics` scrapes and NVML polls.
+
+**What Profile measures — and what it doesn't.**
+Profile reports on the character of the server under load, not the aggregate experience of every request in a session. Latency, throughput, GPU utilization, and cache hit rates are computed over **evaluable windows only** — periods where `num_requests_running > 0.75` OR `tok/s > 20`. Idle periods are excluded entirely from these aggregates.
+
+This is a deliberate design choice: time-weighting across evaluable windows acts as a low-pass filter against volumetric noise. A 1-second burst of 10,000 tiny fast requests gets 1 second of vote; 59 seconds of steady-state 100ms latency keeps its dominance. Profile measures the stability of the provider, not the distribution of the workload that hit it.
+
+**Evaluable window gate:** `window_is_evaluable` is true when there is enough concurrent load or tok/s. Diagnostic aggregates prioritize **what happened under load** while still exposing **true cumulative counters** from the latest collection.
 
 ---
 
@@ -28,6 +35,23 @@ Normative rules for how Profile combines vLLM `/metrics` scrapes and NVML polls.
 - **Catalog-resolved fields:** Derived once from the raw `model_name` / `gpu_name` strings at `StaticContext` construction. Never re-queried mid-run. `None` when the name doesn't match any catalog entry — consumers must handle gracefully. GPU `peak_flops_f32_tflops` is non-tensor-core FP32 (conservative roofline input); B200 and GB10 values are estimates.
 - **State vs utilization:** State = what the system looks like at the **end of the last active window**. Utilization = how busy the GPU was **over time** (averages).
 - **All windows non-evaluable:** The aggregated snapshot is the **chronologically last raw window** in full (nothing to weight).
+
+---
+
+## What the numbers mean
+
+Profile reports three kinds of numbers. Only the first is documented here; the others are pending final policy decisions.
+
+**Under-load behavior** — evaluable windows only. Idle periods excluded.
+
+| Metric | Examples |
+|--------|---------|
+| Latency | `ttft_ms`, `tpot_ms`, `prefill_latency_ms`, `queue_delay_ms` |
+| Throughput | `generation_tokens_per_sec`, `request_success_per_sec` |
+| GPU utilization | `gpu_util_pct`, `mem_util_pct`, `power_watts` |
+| Cache hit rates | `prefix_cache_hit_rate` |
+
+A number in this category answers: *"While the server was actively handling requests, how did it behave?"* It does not represent session-wide averages and will differ from APM tools that include idle time.
 
 ---
 

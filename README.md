@@ -16,6 +16,10 @@ Find and fix inference bottlenecks in minutes.
 
 It tells you **what’s wrong, why it’s happening, and what to fix first**, so you can reduce cost per token.
 
+### Reports 3 kind of numbers
+
+1. **Under-load behavior only** This means profile reports the character of your server under real load, not a session-wide average diluted by quiet time
+
 ## Why use this
 
 vLLM `/metrics` shows numbers.  

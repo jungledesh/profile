@@ -29,7 +29,29 @@ use r3_low_prefix_reuse::{
 pub(super) const MAX_OBSERVATION_SKEW_SECS: f64 = 1.0;
 
 const NO_ISSUES_LINE: &str = "No issues detected in this snapshot.";
-const NOTE_NO_EVALUABLE: &str = "Note: No evaluable traffic detected during the window.";
+
+/// User-facing lines when no window met `window_is_evaluable` (shared by stdout and rule formatters).
+pub fn no_evaluable_diagnose_lines(verbose: bool, windows: &[RuntimeWindow]) -> Vec<String> {
+    let mut out = vec![
+        "No qualifying load was detected during this run. Profile only diagnoses behavior under active traffic.".to_string(),
+        "Run diagnose again while the server is handling requests (raise concurrency or wait for steady load).".to_string(),
+    ];
+    if verbose {
+        let total = windows.len();
+        if total == 0 {
+            out.push("Note: No collection windows were recorded.".to_string());
+        } else {
+            let skipped = windows
+                .iter()
+                .filter(|w| !window_is_evaluable(&w.snapshot))
+                .count();
+            out.push(format!(
+                "Note: {skipped} of {total} collected windows had insufficient traffic (running ≤ 0.75 and tok/s ≤ 20)."
+            ));
+        }
+    }
+    out
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Issue {
@@ -55,11 +77,7 @@ pub fn evaluate_issues(input: AnalysisInput<'_>) -> Vec<Issue> {
 pub fn format_diagnose_rules(input: AnalysisInput<'_>, verbose_rules: bool) -> Vec<String> {
     let snapshot = &input.window.snapshot;
     if !window_is_evaluable(snapshot) {
-        let mut out = vec![NO_ISSUES_LINE.to_string(), NOTE_NO_EVALUABLE.to_string()];
-        if verbose_rules {
-            out.push("Note: 1 window had insufficient traffic for analysis.".to_string());
-        }
-        return out;
+        return no_evaluable_diagnose_lines(verbose_rules, std::slice::from_ref(input.window));
     }
 
     let r1 = rule1_under_batching(snapshot);
@@ -115,7 +133,7 @@ pub fn format_diagnose_rules_for_windows(
     verbose_rules: bool,
 ) -> Vec<String> {
     if windows.is_empty() {
-        return vec![NO_ISSUES_LINE.to_string()];
+        return no_evaluable_diagnose_lines(verbose_rules, &[]);
     }
 
     let total = windows.len();
@@ -130,13 +148,7 @@ pub fn format_diagnose_rules_for_windows(
     let n_eval = evaluable.len();
 
     if n_eval == 0 {
-        let mut out = vec![NO_ISSUES_LINE.to_string(), NOTE_NO_EVALUABLE.to_string()];
-        if verbose_rules {
-            out.push(format!(
-                "Note: {skipped} of {total} windows had insufficient traffic for analysis."
-            ));
-        }
-        return out;
+        return no_evaluable_diagnose_lines(verbose_rules, windows);
     }
 
     let mut r1_fired = 0usize;
@@ -837,15 +849,12 @@ mod tests {
         let lines = format_diagnose_rules(ai(&ctx, &win), false);
         assert_eq!(
             lines,
-            vec![
-                "No issues detected in this snapshot.".to_string(),
-                "Note: No evaluable traffic detected during the window.".to_string(),
-            ]
+            no_evaluable_diagnose_lines(false, std::slice::from_ref(&win))
         );
         let vlines = format_diagnose_rules(ai(&ctx, &win), true);
         assert!(vlines
             .iter()
-            .any(|l| l.contains("1 window had insufficient traffic")));
+            .any(|l| l.contains("1 of 1 collected windows")));
     }
 
     #[test]
@@ -860,15 +869,11 @@ mod tests {
         let windows = vec![w1, w2];
         let summary = ai(&ctx, &windows[0]);
         let lines = format_diagnose_rules_for_windows(&windows, summary, false);
-        assert_eq!(
-            lines,
-            vec![
-                "No issues detected in this snapshot.".to_string(),
-                "Note: No evaluable traffic detected during the window.".to_string(),
-            ]
-        );
+        assert_eq!(lines, no_evaluable_diagnose_lines(false, &windows));
         let summary2 = ai(&ctx, &windows[0]);
         let vlines = format_diagnose_rules_for_windows(&windows, summary2, true);
-        assert!(vlines.iter().any(|l| l.contains("2 of 2 windows")));
+        assert!(vlines
+            .iter()
+            .any(|l| l.contains("2 of 2 collected windows")));
     }
 }

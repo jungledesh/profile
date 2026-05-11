@@ -29,8 +29,10 @@ struct AggregatedPolls {
     mem_util_pct: Option<f64>,
     power_watts: Option<f64>,
     vram_used_mb: Option<u64>,
+    vram_peak_mb: Option<u64>,
     vram_total_mb: Option<u64>,
     temperature_c: Option<f64>,
+    temperature_peak_c: Option<f64>,
     sm_clock_mhz: Option<u32>,
 }
 
@@ -42,8 +44,10 @@ fn aggregate_polls(polls: &[GpuPoll]) -> AggregatedPolls {
     let mut n_power = 0u32;
 
     let mut vram_used_mb = None;
+    let mut vram_peak_mb: Option<u64> = None;
     let mut vram_total_mb = None;
     let mut temperature_c = None;
+    let mut temperature_peak_c: Option<f64> = None;
     let mut sm_clock_mhz = None;
 
     for p in polls {
@@ -60,12 +64,20 @@ fn aggregate_polls(polls: &[GpuPoll]) -> AggregatedPolls {
 
         if let Some(u) = p.vram_used_mb {
             vram_used_mb = Some(u);
+            vram_peak_mb = Some(match vram_peak_mb {
+                Some(p) => p.max(u),
+                None => u,
+            });
         }
         if let Some(t) = p.vram_total_mb {
             vram_total_mb = Some(t);
         }
-        if let Some(t) = p.temperature_c {
+        if let Some(t) = p.temperature_c.filter(|x| x.is_finite()) {
             temperature_c = Some(t);
+            temperature_peak_c = Some(match temperature_peak_c {
+                Some(pk) => pk.max(t),
+                None => t,
+            });
         }
         if let Some(c) = p.sm_clock_mhz {
             sm_clock_mhz = Some(c);
@@ -81,8 +93,10 @@ fn aggregate_polls(polls: &[GpuPoll]) -> AggregatedPolls {
         mem_util_pct,
         power_watts,
         vram_used_mb,
+        vram_peak_mb,
         vram_total_mb,
         temperature_c,
+        temperature_peak_c,
         sm_clock_mhz,
     }
 }
@@ -151,8 +165,10 @@ pub fn collect_gpu_metrics_for(window: Duration) -> Result<(GpuRawMetrics, Syste
             power_watts: agg.power_watts,
             power_limit_watts,
             vram_used_mb: agg.vram_used_mb,
+            vram_peak_mb: agg.vram_peak_mb,
             vram_total_mb: agg.vram_total_mb,
             temperature_c: agg.temperature_c,
+            temperature_peak_c: agg.temperature_peak_c,
             sm_clock_mhz: agg.sm_clock_mhz,
         },
         SystemTime::now(),
@@ -183,8 +199,10 @@ fn aggregate_identical_polls_equals_sample_values() {
     assert_eq!(a.mem_util_pct, Some(20.0));
     assert_eq!(a.power_watts, Some(300.0));
     assert_eq!(a.vram_used_mb, Some(1000));
+    assert_eq!(a.vram_peak_mb, Some(1000));
     assert_eq!(a.vram_total_mb, Some(8000));
     assert_eq!(a.temperature_c, Some(55.0));
+    assert_eq!(a.temperature_peak_c, Some(55.0));
     assert_eq!(a.sm_clock_mhz, Some(2100));
 }
 
@@ -200,9 +218,35 @@ fn aggregate_means_util_and_power_averages_last_for_rest() {
     assert_eq!(a.mem_util_pct, Some(25.0));
     assert_eq!(a.power_watts, Some(150.0));
     assert_eq!(a.vram_used_mb, Some(200));
+    assert_eq!(a.vram_peak_mb, Some(200));
     assert_eq!(a.vram_total_mb, Some(8000));
     assert_eq!(a.temperature_c, Some(50.0));
+    assert_eq!(a.temperature_peak_c, Some(50.0));
     assert_eq!(a.sm_clock_mhz, Some(2000));
+}
+
+#[cfg(test)]
+#[test]
+fn aggregate_vram_peak_is_max_across_polls_not_last_only() {
+    let polls = vec![
+        sample_poll(80, 20, 300.0, 50 * 1024, 8000, 55.0, 2100),
+        sample_poll(80, 20, 300.0, 10 * 1024, 8000, 55.0, 2100),
+    ];
+    let a = aggregate_polls(&polls);
+    assert_eq!(a.vram_used_mb, Some(10 * 1024));
+    assert_eq!(a.vram_peak_mb, Some(50 * 1024));
+}
+
+#[cfg(test)]
+#[test]
+fn aggregate_temperature_peak_is_max_across_polls_not_last_only() {
+    let polls = vec![
+        sample_poll(80, 20, 300.0, 1000, 8000, 72.0, 2100),
+        sample_poll(80, 20, 300.0, 1000, 8000, 65.0, 2100),
+    ];
+    let a = aggregate_polls(&polls);
+    assert_eq!(a.temperature_c, Some(65.0));
+    assert_eq!(a.temperature_peak_c, Some(72.0));
 }
 
 #[cfg(test)]
@@ -231,8 +275,10 @@ fn aggregate_empty_is_all_none() {
             mem_util_pct: None,
             power_watts: None,
             vram_used_mb: None,
+            vram_peak_mb: None,
             vram_total_mb: None,
             temperature_c: None,
+            temperature_peak_c: None,
             sm_clock_mhz: None,
         }
     );

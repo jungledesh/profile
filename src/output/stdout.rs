@@ -11,6 +11,28 @@ use crate::profiler::DiagnoseResult;
 const VLLM_LABEL_W: usize = 10;
 const VLLM_LABEL_METRICS_GAP: &str = " ";
 
+/// KV cache peak parenthetical only if spike reached at least this (rule r2 neighborhood).
+const KV_CACHE_PEAK_SHOW_THRESHOLD_PCT: f64 = 85.0;
+/// Peak VRAM / total must reach this fraction to show a spike parenthetical.
+const VRAM_PEAK_SHOW_THRESHOLD_FRAC: f64 = 0.90;
+/// Global GPU temp parenthetical until per-arch throttle thresholds exist (Hopper ~83°C).
+const GPU_TEMP_PEAK_SHOW_THRESHOLD_C: f64 = 80.0;
+
+#[inline]
+fn show_kv_cache_peak_parenthetical(last_pct: f64, peak_pct: f64) -> bool {
+    peak_pct > last_pct && peak_pct >= KV_CACHE_PEAK_SHOW_THRESHOLD_PCT
+}
+
+#[inline]
+fn show_vram_peak_parenthetical(used_mb: u64, peak_mb: u64, total_mb: u64) -> bool {
+    peak_mb > used_mb && (peak_mb as f64 / total_mb as f64) >= VRAM_PEAK_SHOW_THRESHOLD_FRAC
+}
+
+#[inline]
+fn show_gpu_temp_peak_parenthetical(current_c: f64, peak_c: f64) -> bool {
+    peak_c > current_c && peak_c >= GPU_TEMP_PEAK_SHOW_THRESHOLD_C
+}
+
 pub fn print_diagnose_table(result: &DiagnoseResult, verbose_rules: bool) {
     let lines = build_diagnose_lines(result, verbose_rules);
     print_boxed(&lines);
@@ -34,6 +56,16 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
         &ts,
         duration,
     )];
+
+    if !result.any_evaluable {
+        lines.push(vllm_label_row("Target:", &result.metrics_input));
+        lines.push(String::new());
+        lines.extend(engine::no_evaluable_diagnose_lines(
+            verbose_rules,
+            &result.windows,
+        ));
+        return lines;
+    }
 
     lines.push(format!(
         "{:<width$}{}{}",
@@ -77,6 +109,9 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
         lines.push(String::new());
         lines.extend(rule_lines);
     }
+
+    lines.push(String::new());
+    lines.push("† LATENCY, THROUGHPUT, GPU UTIL, CACHE: under active load only".to_string());
 
     lines
 }
@@ -157,7 +192,14 @@ fn gpu_gauges_line(g: &GpuRawMetrics) -> String {
         (Some(used), Some(total)) if total > 0 => {
             let u_gb = used as f64 / 1024.0;
             let t_gb = total as f64 / 1024.0;
-            format!("vRAM {:.0}/{:.0}GB", u_gb, t_gb)
+            let mut s = format!("vRAM {:.0}/{:.0}GB", u_gb, t_gb);
+            if let Some(pk) = g.vram_peak_mb {
+                if show_vram_peak_parenthetical(used, pk, total) {
+                    let pk_gb = pk as f64 / 1024.0;
+                    s.push_str(&format!(" (peak {:.0}GB)", pk_gb));
+                }
+            }
+            s
         }
         _ => "vRAM —".to_string(),
     };
@@ -219,7 +261,15 @@ fn vllm_prompt_value(v: &VllmRawMetrics) -> String {
         .map(fmt_tok)
         .unwrap_or_else(|| "—".to_string());
     let kv = match v.kv_cache_usage_perc.filter(|x| x.is_finite()) {
-        Some(p) => format!("kv_cache {:.1}%", p),
+        Some(p) => {
+            let mut s = format!("kv_cache {:.1}%", p);
+            if let Some(pk) = v.kv_cache_peak_perc.filter(|x| x.is_finite()) {
+                if show_kv_cache_peak_parenthetical(p, pk) {
+                    s.push_str(&format!(" (peak {:.1}%)", pk));
+                }
+            }
+            s
+        }
         None => "kv_cache —".to_string(),
     };
     format!("{n} tok | {kv}")
@@ -255,10 +305,18 @@ fn gpu_detail_line(g: &GpuRawMetrics) -> String {
         .mem_util_pct
         .map(|u| format!("mem_util {:.1}%", u))
         .unwrap_or_else(|| "mem_util —".to_string());
-    let temp = g
-        .temperature_c
-        .map(|t| format!("temp {:.0}°C", t))
-        .unwrap_or_else(|| "temp —".to_string());
+    let temp = match g.temperature_c.filter(|t| t.is_finite()) {
+        Some(cur) => {
+            let mut s = format!("temp {:.0}°C", cur);
+            if let Some(pk) = g.temperature_peak_c.filter(|t| t.is_finite()) {
+                if show_gpu_temp_peak_parenthetical(cur, pk) {
+                    s.push_str(&format!(" (peak {:.0}°C)", pk));
+                }
+            }
+            s
+        }
+        None => "temp —".to_string(),
+    };
     let sm = g
         .sm_clock_mhz
         .map(|c| format!("sm {}MHz", c))
@@ -405,6 +463,9 @@ fn fmt_seconds_from_ms(ms: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collectors::{GpuRawMetrics, RawSnapshot, VllmRawMetrics};
+    use crate::context::{RuntimeWindow, StaticContext};
+    use crate::profiler::DiagnoseResult;
     use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
@@ -491,6 +552,66 @@ mod tests {
         assert!(s.contains("UTIL 28.0%"));
         assert!(s.contains("POWER 310W"));
         assert!(s.contains("vRAM 72/80GB"));
+        let g_peak = GpuRawMetrics {
+            gpu_util_pct: Some(28.0),
+            power_watts: Some(310.0),
+            vram_used_mb: Some(60 * 1024),
+            vram_peak_mb: Some(78 * 1024),
+            vram_total_mb: Some(80 * 1024),
+            ..Default::default()
+        };
+        let s_peak = gpu_gauges_line(&g_peak);
+        assert!(s_peak.contains("vRAM 60/80GB (peak 78GB)"));
+        let g_peak_below_frac = GpuRawMetrics {
+            gpu_util_pct: Some(28.0),
+            power_watts: Some(310.0),
+            vram_used_mb: Some(60 * 1024),
+            vram_peak_mb: Some(70 * 1024),
+            vram_total_mb: Some(80 * 1024),
+            ..Default::default()
+        };
+        assert!(!gpu_gauges_line(&g_peak_below_frac).contains("peak"));
+        let g_no_recovery = GpuRawMetrics {
+            gpu_util_pct: Some(28.0),
+            power_watts: Some(310.0),
+            vram_used_mb: Some(78 * 1024),
+            vram_peak_mb: Some(78 * 1024),
+            vram_total_mb: Some(80 * 1024),
+            ..Default::default()
+        };
+        assert!(!gpu_gauges_line(&g_no_recovery).contains("peak"));
+    }
+
+    #[test]
+    fn gpu_detail_line_shows_temp_peak_when_spike_hot_enough() {
+        let g = GpuRawMetrics {
+            mem_util_pct: Some(88.3),
+            temperature_c: Some(72.0),
+            temperature_peak_c: Some(86.0),
+            sm_clock_mhz: Some(1980),
+            power_limit_watts: Some(700.0),
+            ..Default::default()
+        };
+        let line = gpu_detail_line(&g);
+        assert!(line.contains("temp 72°C (peak 86°C)"));
+    }
+
+    #[test]
+    fn gpu_detail_line_hides_temp_peak_below_threshold_or_not_above_current() {
+        let below_80 = GpuRawMetrics {
+            mem_util_pct: Some(50.0),
+            temperature_c: Some(60.0),
+            temperature_peak_c: Some(70.0),
+            ..Default::default()
+        };
+        assert!(!gpu_detail_line(&below_80).contains("peak"));
+        let not_recovered = GpuRawMetrics {
+            mem_util_pct: Some(50.0),
+            temperature_c: Some(86.0),
+            temperature_peak_c: Some(86.0),
+            ..Default::default()
+        };
+        assert!(!gpu_detail_line(&not_recovered).contains("peak"));
     }
 
     #[test]
@@ -522,6 +643,36 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(vllm_prompt_value(&v), "18 tok | kv_cache 45.2%");
+        let v_peak = VllmRawMetrics {
+            prompt_tokens_mean: Some(18.0),
+            kv_cache_usage_perc: Some(40.0),
+            kv_cache_peak_perc: Some(92.0),
+            ..Default::default()
+        };
+        assert_eq!(
+            vllm_prompt_value(&v_peak),
+            "18 tok | kv_cache 40.0% (peak 92.0%)"
+        );
+        let peak_below_threshold = VllmRawMetrics {
+            prompt_tokens_mean: Some(18.0),
+            kv_cache_usage_perc: Some(40.0),
+            kv_cache_peak_perc: Some(84.0),
+            ..Default::default()
+        };
+        assert_eq!(
+            vllm_prompt_value(&peak_below_threshold),
+            "18 tok | kv_cache 40.0%"
+        );
+        let peak_not_above_last = VllmRawMetrics {
+            prompt_tokens_mean: Some(18.0),
+            kv_cache_usage_perc: Some(92.0),
+            kv_cache_peak_perc: Some(92.0),
+            ..Default::default()
+        };
+        assert_eq!(
+            vllm_prompt_value(&peak_not_above_last),
+            "18 tok | kv_cache 92.0%"
+        );
         let no_kv = VllmRawMetrics {
             prompt_tokens_mean: Some(512.0),
             ..Default::default()
@@ -537,5 +688,39 @@ mod tests {
         let t = vllm_label_row("THROUGHPUT", "59 tok/s | pfix_cache 72.8%");
         assert!(t.starts_with("THROUGHPUT"));
         assert!(t.contains(" 59 tok/s"));
+    }
+
+    #[test]
+    fn diagnose_lines_when_no_evaluable_skip_metric_table_and_dagger() {
+        let idle_snap = RawSnapshot {
+            gpu_observed_at: UNIX_EPOCH,
+            vllm_observed_at: UNIX_EPOCH,
+            timestamp: UNIX_EPOCH,
+            vllm: VllmRawMetrics {
+                num_requests_running: Some(0.0),
+                generation_tokens_per_sec: Some(0.0),
+                model_name: Some("test-model".into()),
+                ..Default::default()
+            },
+            gpu: GpuRawMetrics {
+                gpu_name: Some("Test GPU".into()),
+                ..Default::default()
+            },
+        };
+        let result = DiagnoseResult {
+            snapshot: idle_snap.clone(),
+            windows: vec![RuntimeWindow::from_snapshot(idle_snap)],
+            static_ctx: StaticContext::default(),
+            duration: Duration::from_secs(2),
+            started_at: UNIX_EPOCH,
+            any_evaluable: false,
+            metrics_input: "http://127.0.0.1:8000/metrics".into(),
+        };
+        let lines = build_diagnose_lines(&result, false);
+        let text = lines.join("\n");
+        assert!(text.contains("Target:") && text.contains("127.0.0.1"));
+        assert!(text.contains("No qualifying load"));
+        assert!(!text.contains("GPU =>"));
+        assert!(!text.contains("† LATENCY"));
     }
 }
