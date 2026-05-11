@@ -83,7 +83,7 @@ Recommendation:
 Built as a focused solo project to make vLLM inference diagnostics  
 **predictable, truthful, and actionable**.
 
-This is **v0.1.0** — currently optimized for single-GPU setups.
+This is **v2.0.0** — currently optimized for single-GPU setups.
 
 Feedback and real-world usage are highly valuable.  
 A deeper technical write-up is coming soon.

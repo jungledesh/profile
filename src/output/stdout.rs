@@ -490,29 +490,31 @@ mod tests {
 
     #[test]
     fn profile_header_line_single_space_between_segments() {
+        let v = env!("CARGO_PKG_VERSION");
         assert_eq!(
             profile_header_line(
-                "0.1.0",
+                v,
                 "llama3",
                 "NVIDIA H100 80GB HBM3",
                 "2026-04-12 21:53:14 UTC",
                 Duration::from_secs(2),
             ),
-            "PROFILE v0.1.0 [llama3] [NVIDIA H100 80GB HBM3] [2026-04-12 21:53:14 UTC]"
+            format!("PROFILE v{v} [llama3] [NVIDIA H100 80GB HBM3] [2026-04-12 21:53:14 UTC]")
         );
     }
 
     #[test]
     fn profile_header_line_duration_view_includes_utc_timestamp() {
+        let v = env!("CARGO_PKG_VERSION");
         assert_eq!(
             profile_header_line(
-                "0.1.0",
+                v,
                 "llama3",
                 "NVIDIA H100 80GB HBM3",
                 "2026-04-13 10:42:31 UTC",
                 Duration::from_secs(5 * 60),
             ),
-            "PROFILE v0.1.0 [llama3] [NVIDIA H100 80GB HBM3] (5m from 2026-04-13 10:42:31 UTC)"
+            format!("PROFILE v{v} [llama3] [NVIDIA H100 80GB HBM3] (5m from 2026-04-13 10:42:31 UTC)")
         );
     }
 
