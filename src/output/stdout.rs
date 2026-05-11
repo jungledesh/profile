@@ -61,7 +61,10 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
     let aggregate_win = crate::context::RuntimeWindow::from_snapshot(result.snapshot.clone());
     let summary_input = AnalysisInput::new(&result.static_ctx, &aggregate_win);
     let report = engine::build_report(summary_input);
-    lines.extend(baseline_lines(report.baseline));
+    lines.extend(baseline_lines(
+        report.baseline,
+        aggregate_win.snapshot.vllm.prefix_cache_hit_rate,
+    ));
     lines.push(String::new());
 
     if !result.any_evaluable {
@@ -154,7 +157,28 @@ fn duration_short(duration: Duration) -> String {
     }
 }
 
-fn baseline_lines(baseline: Option<engine::PhysicsBaseline>) -> Vec<String> {
+fn over_ceiling_hint(
+    raw_eff: f64,
+    decode_expected: f64,
+    cache_hit_rate: Option<f64>,
+) -> &'static str {
+    let actual_tps = (raw_eff / 100.0) * decode_expected;
+    if let Some(r) = cache_hit_rate.filter(|x| x.is_finite() && *x >= 0.0 && *x < 1.0) {
+        let effective_ceiling = decode_expected / (1.0 - r);
+        if actual_tps > effective_ceiling {
+            "(verify weight dtype)"
+        } else {
+            "(prefix cache inflating throughput)"
+        }
+    } else {
+        "(verify weight dtype)"
+    }
+}
+
+fn baseline_lines(
+    baseline: Option<engine::PhysicsBaseline>,
+    prefix_cache_hit_rate: Option<f64>,
+) -> Vec<String> {
     let Some(b) = baseline else {
         return vec!["BASELINE   unavailable — model not recognized".to_string()];
     };
@@ -163,14 +187,19 @@ fn baseline_lines(baseline: Option<engine::PhysicsBaseline>) -> Vec<String> {
     let mut seg1 = Vec::new();
     if let Some(raw_eff) = b.efficiency_pct {
         if raw_eff > 100.0 {
-            seg1.push(">100% of decode ceiling (check weight dtype)".to_string());
+            let hint = over_ceiling_hint(raw_eff, b.decode.expected, prefix_cache_hit_rate);
+            seg1.push(format!(">100% of decode ceiling {hint}"));
         } else {
             seg1.push(format!("{raw_eff:.1}% of decode ceiling"));
         }
     }
-    seg1.push(format!("decode ~{:.0} tok/s (est)", b.decode.expected));
+    if b.decode.expected >= 0.5 {
+        seg1.push(format!("decode ~{:.0} tok/s (est)", b.decode.expected));
+    }
     if let Some(prefill) = b.prefill {
-        seg1.push(format!("prefill ~{:.0} tok/s (est)", prefill.expected));
+        if prefill.expected >= 0.5 {
+            seg1.push(format!("prefill ~{:.0} tok/s (est)", prefill.expected));
+        }
     }
 
     // Line 2: memory budget + latency floors
@@ -185,7 +214,9 @@ fn baseline_lines(baseline: Option<engine::PhysicsBaseline>) -> Vec<String> {
     }
     seg2.push(format!("tpot_floor ~{:.0}ms", b.tpot_floor_ms));
     if let Some(pf) = b.prefill_latency_floor_ms {
-        seg2.push(format!("prefill_floor ~{:.0}ms", pf));
+        if pf >= 0.5 {
+            seg2.push(format!("prefill_floor ~{:.0}ms", pf));
+        }
     }
 
     let mut out = vec![
@@ -571,6 +602,48 @@ mod tests {
     fn fmt_seconds_from_ms_prefers_seconds_when_large() {
         assert_eq!(fmt_seconds_from_ms(1200.0), "1.2s");
         assert_eq!(fmt_seconds_from_ms(50.0), "50ms");
+    }
+
+    #[test]
+    fn over_ceiling_hint_prefix_cache_when_under_effective_ceiling() {
+        // decode 100, raw 150% → actual 150 tok/s; hit 0.4 → effective 166.67
+        assert_eq!(
+            over_ceiling_hint(150.0, 100.0, Some(0.4)),
+            "(prefix cache inflating throughput)"
+        );
+    }
+
+    #[test]
+    fn over_ceiling_hint_dtype_when_above_effective_ceiling() {
+        // decode 100, raw 200% → actual 200 tok/s; hit 0.4 → effective 166.67
+        assert_eq!(
+            over_ceiling_hint(200.0, 100.0, Some(0.4)),
+            "(verify weight dtype)"
+        );
+    }
+
+    #[test]
+    fn over_ceiling_hint_dtype_when_hit_rate_missing() {
+        assert_eq!(
+            over_ceiling_hint(150.0, 100.0, None),
+            "(verify weight dtype)"
+        );
+    }
+
+    #[test]
+    fn over_ceiling_hint_dtype_when_hit_rate_out_of_band() {
+        assert_eq!(
+            over_ceiling_hint(150.0, 100.0, Some(f64::NAN)),
+            "(verify weight dtype)"
+        );
+        assert_eq!(
+            over_ceiling_hint(150.0, 100.0, Some(-0.1)),
+            "(verify weight dtype)"
+        );
+        assert_eq!(
+            over_ceiling_hint(150.0, 100.0, Some(1.0)),
+            "(verify weight dtype)"
+        );
     }
 
     #[test]

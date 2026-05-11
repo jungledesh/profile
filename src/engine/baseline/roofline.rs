@@ -106,14 +106,15 @@ fn make_estimate(expected: f64) -> Option<CeilingEstimate> {
 }
 
 fn resolve_seq_len(max_model_len: Option<u32>, prompt_tokens_mean: Option<f64>) -> Option<u32> {
-    if let Some(v) = max_model_len.filter(|v| *v > 0) {
-        return Some(v);
-    }
-    prompt_tokens_mean
+    if let Some(v) = prompt_tokens_mean
         .filter(|v| v.is_finite())
         .map(|v| v.round())
         .filter(|v| *v > 0.0 && *v <= u32::MAX as f64)
         .map(|v| v as u32)
+    {
+        return Some(v);
+    }
+    max_model_len.filter(|v| *v > 0)
 }
 
 fn resolve_bytes_per_param(
@@ -355,6 +356,82 @@ mod tests {
             None => panic!("expected baseline"),
         };
         assert_eq!(b.weight_dtype_source, WeightDtypeSource::Fallback);
+    }
+
+    #[test]
+    fn resolve_seq_len_prefers_prompt_tokens_mean_when_both_present() {
+        let cfg = VllmConfig {
+            dtype: Some("bf16".to_string()),
+            max_model_len: Some(8192),
+            ..Default::default()
+        };
+        let snap_prompt = VllmRawMetrics {
+            prompt_tokens_mean: Some(512.0),
+            generation_tokens_per_sec: Some(10.0),
+            ..Default::default()
+        };
+        let snap_no_prompt = VllmRawMetrics {
+            prompt_tokens_mean: None,
+            generation_tokens_per_sec: Some(10.0),
+            ..Default::default()
+        };
+        let (ctx, win_short) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(67.0),
+            Some(3350.0),
+            cfg.clone(),
+            snap_prompt,
+        );
+        let (_, win_long) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(67.0),
+            Some(3350.0),
+            cfg,
+            snap_no_prompt,
+        );
+        let input_short = AnalysisInput::new(&ctx, &win_short);
+        let input_long = AnalysisInput::new(&ctx, &win_long);
+        let b_short = compute(&input_short).expect("baseline");
+        let b_long = compute(&input_long).expect("baseline");
+        let ps = b_short.prefill.expect("prefill");
+        let pl = b_long.prefill.expect("prefill");
+        assert!(
+            ps.expected > pl.expected,
+            "shorter seq_len from prompt mean should raise prefill ceiling"
+        );
+    }
+
+    #[test]
+    fn resolve_seq_len_falls_back_to_max_model_len_when_prompt_missing() {
+        let cfg = VllmConfig {
+            dtype: Some("bf16".to_string()),
+            max_model_len: Some(1024),
+            ..Default::default()
+        };
+        let snap = VllmRawMetrics {
+            prompt_tokens_mean: None,
+            generation_tokens_per_sec: Some(10.0),
+            ..Default::default()
+        };
+        let (ctx, win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(67.0),
+            Some(3350.0),
+            cfg,
+            snap,
+        );
+        let input = AnalysisInput::new(&ctx, &win);
+        let b = compute(&input);
+        assert!(b.is_some());
+        let expected = math::prefill_ceiling_tps(67.0, 8_000_000_000, 1024);
+        let got = b.and_then(|x| x.prefill).expect("prefill").expected;
+        assert!((got - expected).abs() < 1e-6);
     }
 
     #[test]
