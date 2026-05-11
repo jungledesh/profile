@@ -24,6 +24,14 @@ pub struct PhysicsBaseline {
     pub efficiency_pct: Option<f64>,
     pub headroom_pct: Option<f64>,
     pub weight_dtype_source: WeightDtypeSource,
+    /// Model weight memory footprint in GB (params × bytes_per_param).
+    pub weight_gb: f64,
+    /// VRAM remaining after weights, if total VRAM is known. Negative means weights alone exceed VRAM.
+    pub kv_headroom_gb: Option<f64>,
+    /// Theoretical minimum time-per-output-token at decode ceiling (ms).
+    pub tpot_floor_ms: f64,
+    /// Theoretical minimum prefill latency at prefill ceiling (ms). None when seq_len unknown.
+    pub prefill_latency_floor_ms: Option<f64>,
 }
 
 pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
@@ -63,12 +71,21 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
 
     let headroom_pct = efficiency_pct.map(|raw| 100.0 - raw.min(100.0));
 
+    let weight_gb = math::weight_gb(model_params, bytes_per_param);
+    let kv_headroom_gb = ctx.gpu.vram_gb.map(|vram| vram - weight_gb);
+    let tpot_floor_ms = math::latency_floor_ms(decode.expected);
+    let prefill_latency_floor_ms = prefill.map(|p| math::latency_floor_ms(p.expected));
+
     Some(PhysicsBaseline {
         decode,
         prefill,
         efficiency_pct,
         headroom_pct,
         weight_dtype_source,
+        weight_gb,
+        kv_headroom_gb,
+        tpot_floor_ms,
+        prefill_latency_floor_ms,
     })
 }
 

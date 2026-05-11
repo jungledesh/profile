@@ -10,6 +10,16 @@ pub fn efficiency_pct(actual_tps: f64, decode_ceiling: f64) -> f64 {
     (actual_tps / decode_ceiling) * 100.0
 }
 
+pub fn weight_gb(param_count: u64, bytes_per_param: u8) -> f64 {
+    (param_count as f64 * bytes_per_param as f64) / 1e9
+}
+
+/// Theoretical minimum latency (ms) for one token at the given ceiling.
+/// decode ceiling → tpot floor; prefill ceiling → prefill latency floor.
+pub fn latency_floor_ms(ceiling_tps: f64) -> f64 {
+    1000.0 / ceiling_tps
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -49,6 +59,24 @@ mod tests {
     fn decode_zero_param_count_returns_infinity() {
         let tps = decode_ceiling_tps(3350.0, 0, 2);
         assert!(tps.is_infinite());
+    }
+
+    #[test]
+    fn weight_gb_happy_path() {
+        // 8B params × 2 bytes = 16GB
+        assert!((weight_gb(8_000_000_000, 2) - 16.0).abs() < 1e-6);
+        // 70B params × 2 bytes = 140GB
+        assert!((weight_gb(70_000_000_000, 2) - 140.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn latency_floor_ms_happy_path() {
+        // decode ceiling ~209.375 tok/s → tpot floor ~4.776ms
+        let floor = latency_floor_ms(209.375);
+        assert!((floor - 4.776).abs() < 0.001);
+        // decode ceiling ~23.93 tok/s → tpot floor ~41.8ms
+        let floor2 = latency_floor_ms(23.928_571_428_571_43);
+        assert!((floor2 - 41.8).abs() < 0.1);
     }
 
     #[test]

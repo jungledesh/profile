@@ -159,20 +159,39 @@ fn baseline_lines(baseline: Option<engine::PhysicsBaseline>) -> Vec<String> {
         return vec!["BASELINE   model not in catalog — roofline unavailable".to_string()];
     };
 
-    let mut segments = Vec::new();
+    // Line 1: efficiency + throughput ceilings
+    let mut seg1 = Vec::new();
     if let Some(raw_eff) = b.efficiency_pct {
         if raw_eff > 100.0 {
-            segments.push(">100% of decode ceiling (check weight dtype)".to_string());
+            seg1.push(">100% of decode ceiling (check weight dtype)".to_string());
         } else {
-            segments.push(format!("{raw_eff:.1}% of decode ceiling"));
+            seg1.push(format!("{raw_eff:.1}% of decode ceiling"));
         }
     }
-    segments.push(format!("decode ~{:.0} tok/s (est)", b.decode.expected));
+    seg1.push(format!("decode ~{:.0} tok/s (est)", b.decode.expected));
     if let Some(prefill) = b.prefill {
-        segments.push(format!("prefill ~{:.0} tok/s (est)", prefill.expected));
+        seg1.push(format!("prefill ~{:.0} tok/s (est)", prefill.expected));
     }
 
-    let mut out = vec![format!("BASELINE   {}", segments.join(" | "))];
+    // Line 2: memory budget + latency floors
+    let mut seg2 = Vec::new();
+    seg2.push(format!("weight {:.0}GB", b.weight_gb));
+    if let Some(headroom) = b.kv_headroom_gb {
+        if headroom < 0.0 {
+            seg2.push(format!("kv_headroom {:.0}GB (needs TP)", headroom));
+        } else {
+            seg2.push(format!("kv_headroom {:.0}GB", headroom));
+        }
+    }
+    seg2.push(format!("tpot_floor ~{:.0}ms", b.tpot_floor_ms));
+    if let Some(pf) = b.prefill_latency_floor_ms {
+        seg2.push(format!("prefill_floor ~{:.0}ms", pf));
+    }
+
+    let mut out = vec![
+        format!("BASELINE   {}", seg1.join(" | ")),
+        format!("           {}", seg2.join(" | ")),
+    ];
     if b.weight_dtype_source == engine::WeightDtypeSource::Fallback {
         out.push("           weight dtype assumed bf16 — set DTYPE env var to confirm".to_string());
     }
