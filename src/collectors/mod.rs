@@ -12,8 +12,8 @@ pub mod vllm;
 pub use config::{build_config, VllmConfig};
 pub use traffic::{traffic_from_snapshot, TrafficSource, TrafficState};
 pub use types::{
-    window_is_evaluable, CacheConfigLabels, GpuRawMetrics, PrefixCacheScrapeSample, RawSnapshot,
-    VllmRawMetrics,
+    window_is_evaluable, CacheConfigLabels, GpuRawMetrics, HistogramWindowMass,
+    PrefixCacheScrapeSample, RawSnapshot, VllmRawMetrics,
 };
 
 use std::thread;

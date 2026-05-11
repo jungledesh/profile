@@ -5,7 +5,9 @@ use anyhow::{Context, Result};
 use prometheus_parse::{Scrape, Value};
 
 use super::sampling::{sample_count_for, SAMPLE_INTERVAL};
-use super::types::{CacheConfigLabels, PrefixCacheScrapeSample, VllmRawMetrics};
+use super::types::{
+    CacheConfigLabels, HistogramWindowMass, PrefixCacheScrapeSample, VllmRawMetrics,
+};
 const REQ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// vLLM exposes metrics with a `vllm:` prefix. The `prometheus-parse` crate only accepts
@@ -40,6 +42,13 @@ fn scrape_from_body(body: &str) -> Result<Scrape> {
     let normalized = normalize_vllm_prometheus_text(body);
     Scrape::parse(normalized.lines().map(|s| Ok(s.to_string())))
         .context("failed to parse Prometheus text format")
+}
+
+/// KV cache fill ratio 0–100, same as last scrape in `parse_vllm_metrics`.
+fn kv_cache_usage_perc_from_scrape(scrape: &Scrape) -> Option<f64> {
+    first_gauge(scrape, "vllm_kv_cache_usage_perc")
+        .or_else(|| first_gauge(scrape, "vllm_gpu_cache_usage_perc"))
+        .map(|v| v * 100.0)
 }
 
 fn first_gauge(scrape: &Scrape, name: &str) -> Option<f64> {
@@ -207,7 +216,7 @@ fn histogram_mean_ms_from_scrape(scrape: &Scrape, base: &str) -> Option<f64> {
 
 /// Aggregated `(Δsum)/(Δcount)` across all series for `base` (histogram `_sum` / `_count`).
 /// Units match the histogram (seconds vs tokens). `None` if **`Δcount <= 0`** (no new observations), reset, or non-finite.
-fn histogram_window_mean(first: &Scrape, last: &Scrape, base: &str) -> Option<f64> {
+fn histogram_window_mass(first: &Scrape, last: &Scrape, base: &str) -> Option<HistogramWindowMass> {
     let sum_key = format!("{base}_sum");
     let count_key = format!("{base}_count");
     let s0 = sum_metric_samples(first, &sum_key)?;
@@ -216,11 +225,24 @@ fn histogram_window_mean(first: &Scrape, last: &Scrape, base: &str) -> Option<f6
     let c1 = sum_metric_samples(last, &count_key)?;
     let ds = s1 - s0;
     let dc = c1 - c0;
-    if dc <= 0.0 || ds < 0.0 {
+    if dc <= 0.0 || ds < 0.0 || !(ds.is_finite() && dc.is_finite()) {
         return None;
     }
-    let m = ds / dc;
-    m.is_finite().then_some(m)
+    Some(HistogramWindowMass {
+        sum_delta: ds,
+        count_delta: dc,
+    })
+}
+
+fn histogram_window_mean(first: &Scrape, last: &Scrape, base: &str) -> Option<f64> {
+    let m = histogram_window_mass(first, last, base)?;
+    let x = m.sum_delta / m.count_delta;
+    x.is_finite().then_some(x)
+}
+
+fn tpot_window_mass(first: &Scrape, last: &Scrape) -> Option<HistogramWindowMass> {
+    histogram_window_mass(first, last, "vllm_request_time_per_output_token_seconds")
+        .or_else(|| histogram_window_mass(first, last, "vllm_time_per_output_token_seconds"))
 }
 
 fn histogram_window_mean_ms(first: &Scrape, last: &Scrape, base: &str) -> Option<f64> {
@@ -228,12 +250,20 @@ fn histogram_window_mean_ms(first: &Scrape, last: &Scrape, base: &str) -> Option
 }
 
 fn tpot_window_ms(first: &Scrape, last: &Scrape) -> Option<f64> {
-    histogram_window_mean_ms(first, last, "vllm_request_time_per_output_token_seconds")
-        .or_else(|| histogram_window_mean_ms(first, last, "vllm_time_per_output_token_seconds"))
+    tpot_window_mass(first, last).and_then(|m| {
+        let sec = m.sum_delta / m.count_delta;
+        sec.is_finite().then_some(sec * 1000.0)
+    })
 }
 
 /// `first` = scrape from sample 1, `last` = scrape from sample [`SAMPLE_COUNT`] (~2s later).
 fn apply_histogram_window(first: &Scrape, last: &Scrape, m: &mut VllmRawMetrics) {
+    m.ttft_window_mass = histogram_window_mass(first, last, "vllm_time_to_first_token_seconds");
+    m.tpot_window_mass = tpot_window_mass(first, last);
+    m.prefill_window_mass = histogram_window_mass(first, last, "vllm_request_prefill_time_seconds");
+    m.queue_window_mass = histogram_window_mass(first, last, "vllm_request_queue_time_seconds");
+    m.prompt_tokens_window_mass = histogram_window_mass(first, last, "vllm_request_prompt_tokens");
+
     // Prefer Δsum/Δcount over that window; if no new observations, use last-scrape mean.
     m.ttft_ms = histogram_window_mean_ms(first, last, "vllm_time_to_first_token_seconds")
         .or_else(|| histogram_mean_ms_from_scrape(last, "vllm_time_to_first_token_seconds"));
@@ -279,10 +309,14 @@ pub fn collect_vllm_metrics_for(
     let mut window_start: Option<Instant> = None;
     let mut first_scrape: Option<Scrape> = None;
     let mut last_scrape: Option<Scrape> = None;
+    let mut kv_cache_peak_perc: Option<f64> = None;
 
     for i in 0..sample_count {
         let body = fetch_metrics_body(&client, &url)?;
         let scrape = scrape_from_body(&body)?;
+        if let Some(k) = kv_cache_usage_perc_from_scrape(&scrape).filter(|x| x.is_finite()) {
+            kv_cache_peak_perc = Some(kv_cache_peak_perc.map_or(k, |p| p.max(k)));
+        }
         prefix_samples.push(prefix_scrape_sample(&scrape));
 
         if i == 0 {
@@ -306,6 +340,7 @@ pub fn collect_vllm_metrics_for(
     let first_scrape = first_scrape.context("vLLM gauge window missing first scrape")?;
     let last_scrape = last_scrape.context("vLLM gauge window missing last scrape")?;
     let mut m = parse_vllm_metrics(&last_scrape)?;
+    m.kv_cache_peak_perc = kv_cache_peak_perc;
 
     let (gen_per_sec, prefix_hit) = compute_counter_rates(&first_scrape, &last_scrape, window_secs);
     m.generation_tokens_per_sec = gen_per_sec;
@@ -358,9 +393,7 @@ fn parse_vllm_metrics(scrape: &Scrape) -> Result<VllmRawMetrics> {
 
     let num_requests_running = first_gauge(scrape, "vllm_num_requests_running");
     let num_requests_waiting = first_gauge(scrape, "vllm_num_requests_waiting");
-    let kv_cache_usage_perc = first_gauge(scrape, "vllm_kv_cache_usage_perc")
-        .or_else(|| first_gauge(scrape, "vllm_gpu_cache_usage_perc"))
-        .map(|v| v * 100.0);
+    let kv_cache_usage_perc = kv_cache_usage_perc_from_scrape(scrape);
 
     let ttft_ms = histogram_mean_ms_from_scrape(scrape, "vllm_time_to_first_token_seconds");
     let tpot_ms =
@@ -388,11 +421,17 @@ fn parse_vllm_metrics(scrape: &Scrape) -> Result<VllmRawMetrics> {
         num_requests_running,
         num_requests_waiting,
         kv_cache_usage_perc,
+        kv_cache_peak_perc: None,
         ttft_ms,
         tpot_ms,
         prefill_latency_ms,
         queue_delay_ms,
         prompt_tokens_mean,
+        ttft_window_mass: None,
+        tpot_window_mass: None,
+        prefill_window_mass: None,
+        queue_window_mass: None,
+        prompt_tokens_window_mass: None,
         generation_tokens_total,
         generation_tokens_per_sec: None,
         prefix_cache_hit_rate: None,
