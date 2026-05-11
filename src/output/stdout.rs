@@ -647,6 +647,36 @@ mod tests {
     }
 
     #[test]
+    fn baseline_lines_over_ceiling_wires_hint_into_first_line() {
+        // 150% efficiency at decode 100 tok/s → actual 150; hit 0.4 → effective 166.67 → prefix-cache hint.
+        let b = engine::PhysicsBaseline {
+            decode: engine::CeilingEstimate {
+                lower: 85.0,
+                expected: 100.0,
+                upper: 105.0,
+            },
+            prefill: None,
+            efficiency_pct: Some(150.0),
+            headroom_pct: Some(0.0),
+            weight_dtype_source: engine::WeightDtypeSource::EnvVar,
+            weight_gb: 16.0,
+            kv_headroom_gb: Some(8.0),
+            tpot_floor_ms: 10.0,
+            prefill_latency_floor_ms: None,
+        };
+        let lines = baseline_lines(Some(b), Some(0.4));
+        assert_eq!(
+            lines[0],
+            "BASELINE   >100% of decode ceiling (prefix cache inflating throughput) | decode ~100 tok/s (est)"
+        );
+        assert_eq!(
+            lines[1],
+            "           weight 16GB | kv_headroom 8GB | tpot_floor ~10ms"
+        );
+        assert_eq!(lines.len(), 2);
+    }
+
+    #[test]
     fn cache_use_fragment_formats_hit_rate_only() {
         assert_eq!(
             cache_use_fragment(&VllmRawMetrics::default()),
