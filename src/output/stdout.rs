@@ -514,7 +514,9 @@ mod tests {
                 "2026-04-13 10:42:31 UTC",
                 Duration::from_secs(5 * 60),
             ),
-            format!("PROFILE v{v} [llama3] [NVIDIA H100 80GB HBM3] (5m from 2026-04-13 10:42:31 UTC)")
+            format!(
+                "PROFILE v{v} [llama3] [NVIDIA H100 80GB HBM3] (5m from 2026-04-13 10:42:31 UTC)"
+            )
         );
     }
 
