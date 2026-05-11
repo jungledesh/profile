@@ -32,6 +32,8 @@ pub struct PhysicsBaseline {
     pub tpot_floor_ms: f64,
     /// Theoretical minimum prefill latency at prefill ceiling (ms). None when seq_len unknown.
     pub prefill_latency_floor_ms: Option<f64>,
+    /// Concurrent batch size at which decode crosses from BW-bound to compute-bound (roofline ridge).
+    pub ridge_batch_size: f64,
 }
 
 pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
@@ -47,6 +49,8 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
         ctx.config.kv_cache_dtype.as_deref(),
         catalog_default_dtype,
     );
+
+    let ridge_batch_size = math::ridge_batch_size(peak_flops, peak_bw, bytes_per_param);
 
     let decode_expected = math::decode_ceiling_tps(peak_bw, model_params, bytes_per_param);
     let decode = make_estimate(decode_expected)?;
@@ -86,6 +90,7 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
         kv_headroom_gb,
         tpot_floor_ms,
         prefill_latency_floor_ms,
+        ridge_batch_size,
     })
 }
 

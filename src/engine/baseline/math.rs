@@ -20,6 +20,12 @@ pub fn latency_floor_ms(ceiling_tps: f64) -> f64 {
     1000.0 / ceiling_tps
 }
 
+/// Batch size at which decode transitions from memory-BW-bound to compute-bound.
+/// Below this: throughput limited by peak_bw. At or above: limited by peak_flops.
+pub fn ridge_batch_size(peak_flops_f32_tflops: f64, peak_bw_gbps: f64, bytes_per_param: u8) -> f64 {
+    (peak_flops_f32_tflops * 1e12 * bytes_per_param as f64) / (peak_bw_gbps * 1e9)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,6 +83,27 @@ mod tests {
         // decode ceiling ~23.93 tok/s → tpot floor ~41.8ms
         let floor2 = latency_floor_ms(23.928_571_428_571_43);
         assert!((floor2 - 41.8).abs() < 0.1);
+    }
+
+    #[test]
+    fn ridge_batch_size_h100_sxm_bf16() {
+        // (67e12 × 2) / 3350e9 ≈ 40.0
+        let r = ridge_batch_size(67.0, 3350.0, 2);
+        assert!((r - 40.0).abs() < 0.05);
+    }
+
+    #[test]
+    fn ridge_batch_size_a100_80gb_bf16() {
+        // (19.5e12 × 2) / 2039e9 ≈ 19.1
+        let r = ridge_batch_size(19.5, 2039.0, 2);
+        assert!((r - 19.127).abs() < 0.05);
+    }
+
+    #[test]
+    fn ridge_batch_size_l40s_fp8() {
+        // (91.6e12 × 1) / 864e9 ≈ 106.0
+        let r = ridge_batch_size(91.6, 864.0, 1);
+        assert!((r - 106.0185).abs() < 0.1);
     }
 
     #[test]
