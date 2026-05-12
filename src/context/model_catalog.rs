@@ -16,6 +16,7 @@ pub struct CatalogEntry {
     pub num_layers: u32,
     pub hidden_dim: u32,
     pub is_moe: bool,
+    pub default_weight_dtype: &'static str,
 }
 
 struct ModelEntry {
@@ -38,6 +39,7 @@ static CATALOG: &[ModelEntry] = &[
             num_layers: 48,
             hidden_dim: 5120,
             is_moe: true,
+            default_weight_dtype: "bf16",
         },
     },
     // Scout: 17B active / 109B total MoE
@@ -50,6 +52,7 @@ static CATALOG: &[ModelEntry] = &[
             num_layers: 48,
             hidden_dim: 5120,
             is_moe: true,
+            default_weight_dtype: "bf16",
         },
     },
     // ── Nemotron (before generic llama entries — names contain "llama" + size) ─
@@ -62,6 +65,7 @@ static CATALOG: &[ModelEntry] = &[
             num_layers: 80,
             hidden_dim: 8192,
             is_moe: false,
+            default_weight_dtype: "bf16",
         },
     },
     ModelEntry {
@@ -73,6 +77,7 @@ static CATALOG: &[ModelEntry] = &[
             num_layers: 32,
             hidden_dim: 4096,
             is_moe: false,
+            default_weight_dtype: "bf16",
         },
     },
     // ── Llama 3.x ────────────────────────────────────────────────────────────
@@ -87,6 +92,7 @@ static CATALOG: &[ModelEntry] = &[
             num_layers: 126,
             hidden_dim: 16384,
             is_moe: false,
+            default_weight_dtype: "bf16",
         },
     },
     ModelEntry {
@@ -98,6 +104,7 @@ static CATALOG: &[ModelEntry] = &[
             num_layers: 80,
             hidden_dim: 8192,
             is_moe: false,
+            default_weight_dtype: "bf16",
         },
     },
     ModelEntry {
@@ -109,6 +116,7 @@ static CATALOG: &[ModelEntry] = &[
             num_layers: 32,
             hidden_dim: 4096,
             is_moe: false,
+            default_weight_dtype: "bf16",
         },
     },
     // ── Qwen 3 MoE ───────────────────────────────────────────────────────────
@@ -121,6 +129,7 @@ static CATALOG: &[ModelEntry] = &[
             num_layers: 94,
             hidden_dim: 7168,
             is_moe: true,
+            default_weight_dtype: "bf16",
         },
     },
     ModelEntry {
@@ -132,6 +141,7 @@ static CATALOG: &[ModelEntry] = &[
             num_layers: 48,
             hidden_dim: 2048,
             is_moe: true,
+            default_weight_dtype: "bf16",
         },
     },
     // ── Qwen 3 dense ─────────────────────────────────────────────────────────
@@ -144,6 +154,7 @@ static CATALOG: &[ModelEntry] = &[
             num_layers: 80,
             hidden_dim: 8192,
             is_moe: false,
+            default_weight_dtype: "bf16",
         },
     },
     ModelEntry {
@@ -155,6 +166,7 @@ static CATALOG: &[ModelEntry] = &[
             num_layers: 64,
             hidden_dim: 5120,
             is_moe: false,
+            default_weight_dtype: "bf16",
         },
     },
     ModelEntry {
@@ -166,6 +178,7 @@ static CATALOG: &[ModelEntry] = &[
             num_layers: 40,
             hidden_dim: 5120,
             is_moe: false,
+            default_weight_dtype: "bf16",
         },
     },
     ModelEntry {
@@ -177,6 +190,7 @@ static CATALOG: &[ModelEntry] = &[
             num_layers: 28,
             hidden_dim: 3584,
             is_moe: false,
+            default_weight_dtype: "bf16",
         },
     },
     // ── Qwen 2.5 dense ───────────────────────────────────────────────────────
@@ -189,6 +203,7 @@ static CATALOG: &[ModelEntry] = &[
             num_layers: 80,
             hidden_dim: 8192,
             is_moe: false,
+            default_weight_dtype: "bf16",
         },
     },
     ModelEntry {
@@ -200,6 +215,7 @@ static CATALOG: &[ModelEntry] = &[
             num_layers: 64,
             hidden_dim: 5120,
             is_moe: false,
+            default_weight_dtype: "bf16",
         },
     },
     ModelEntry {
@@ -211,6 +227,7 @@ static CATALOG: &[ModelEntry] = &[
             num_layers: 48,
             hidden_dim: 5120,
             is_moe: false,
+            default_weight_dtype: "bf16",
         },
     },
     ModelEntry {
@@ -222,6 +239,7 @@ static CATALOG: &[ModelEntry] = &[
             num_layers: 28,
             hidden_dim: 3584,
             is_moe: false,
+            default_weight_dtype: "bf16",
         },
     },
     // ── DeepSeek V3 / R1 ─────────────────────────────────────────────────────
@@ -235,6 +253,7 @@ static CATALOG: &[ModelEntry] = &[
             num_layers: 61,
             hidden_dim: 7168,
             is_moe: true,
+            default_weight_dtype: "bf16",
         },
     },
     // R1 without size token defaults to 671B
@@ -247,6 +266,7 @@ static CATALOG: &[ModelEntry] = &[
             num_layers: 61,
             hidden_dim: 7168,
             is_moe: true,
+            default_weight_dtype: "bf16",
         },
     },
     // V3 without size token defaults to 671B
@@ -259,6 +279,7 @@ static CATALOG: &[ModelEntry] = &[
             num_layers: 61,
             hidden_dim: 7168,
             is_moe: true,
+            default_weight_dtype: "bf16",
         },
     },
     ModelEntry {
@@ -270,6 +291,7 @@ static CATALOG: &[ModelEntry] = &[
             num_layers: 80,
             hidden_dim: 8192,
             is_moe: false,
+            default_weight_dtype: "bf16",
         },
     },
     ModelEntry {
@@ -281,6 +303,7 @@ static CATALOG: &[ModelEntry] = &[
             num_layers: 30,
             hidden_dim: 4096,
             is_moe: false,
+            default_weight_dtype: "bf16",
         },
     },
     // ── Mistral Large 3 ──────────────────────────────────────────────────────
@@ -294,6 +317,7 @@ static CATALOG: &[ModelEntry] = &[
             num_layers: 88,
             hidden_dim: 8192,
             is_moe: true,
+            default_weight_dtype: "bf16",
         },
     },
     // 123B dense
@@ -306,6 +330,7 @@ static CATALOG: &[ModelEntry] = &[
             num_layers: 88,
             hidden_dim: 8192,
             is_moe: false,
+            default_weight_dtype: "bf16",
         },
     },
     // Mistral Large without explicit size — 123B default
@@ -318,6 +343,7 @@ static CATALOG: &[ModelEntry] = &[
             num_layers: 88,
             hidden_dim: 8192,
             is_moe: false,
+            default_weight_dtype: "bf16",
         },
     },
     // ── Mixtral MoE ──────────────────────────────────────────────────────────
@@ -331,6 +357,7 @@ static CATALOG: &[ModelEntry] = &[
             num_layers: 56,
             hidden_dim: 6144,
             is_moe: true,
+            default_weight_dtype: "bf16",
         },
     },
     // 8x7B — 47B total, ~13B active
@@ -343,6 +370,7 @@ static CATALOG: &[ModelEntry] = &[
             num_layers: 32,
             hidden_dim: 4096,
             is_moe: true,
+            default_weight_dtype: "bf16",
         },
     },
     // ── Mistral 7B dense ─────────────────────────────────────────────────────
@@ -355,6 +383,7 @@ static CATALOG: &[ModelEntry] = &[
             num_layers: 32,
             hidden_dim: 4096,
             is_moe: false,
+            default_weight_dtype: "bf16",
         },
     },
     // ── Gemma 2 / 3 ──────────────────────────────────────────────────────────
@@ -367,6 +396,7 @@ static CATALOG: &[ModelEntry] = &[
             num_layers: 46,
             hidden_dim: 4608,
             is_moe: false,
+            default_weight_dtype: "bf16",
         },
     },
     ModelEntry {
@@ -378,6 +408,7 @@ static CATALOG: &[ModelEntry] = &[
             num_layers: 42,
             hidden_dim: 3584,
             is_moe: false,
+            default_weight_dtype: "bf16",
         },
     },
     // ── Kimi K2.5 ────────────────────────────────────────────────────────────
@@ -391,6 +422,7 @@ static CATALOG: &[ModelEntry] = &[
             num_layers: 96,
             hidden_dim: 7168,
             is_moe: true,
+            default_weight_dtype: "bf16",
         },
     },
     // ── GLM-5 / 5.1 MoE ──────────────────────────────────────────────────────
@@ -404,6 +436,7 @@ static CATALOG: &[ModelEntry] = &[
             num_layers: 80,
             hidden_dim: 8192,
             is_moe: true,
+            default_weight_dtype: "bf16",
         },
     },
     // 32B dense variant
@@ -416,6 +449,7 @@ static CATALOG: &[ModelEntry] = &[
             num_layers: 64,
             hidden_dim: 5120,
             is_moe: false,
+            default_weight_dtype: "bf16",
         },
     },
     // ── Phi-4 ────────────────────────────────────────────────────────────────
@@ -428,6 +462,7 @@ static CATALOG: &[ModelEntry] = &[
             num_layers: 40,
             hidden_dim: 5120,
             is_moe: false,
+            default_weight_dtype: "bf16",
         },
     },
     ModelEntry {
@@ -439,6 +474,7 @@ static CATALOG: &[ModelEntry] = &[
             num_layers: 40,
             hidden_dim: 5120,
             is_moe: false,
+            default_weight_dtype: "bf16",
         },
     },
     // Phi-4 without explicit size — 14B default
@@ -451,6 +487,7 @@ static CATALOG: &[ModelEntry] = &[
             num_layers: 40,
             hidden_dim: 5120,
             is_moe: false,
+            default_weight_dtype: "bf16",
         },
     },
 ];

@@ -15,6 +15,7 @@ pub struct ModelArch {
     pub num_layers: Option<u32>,
     pub hidden_dim: Option<u32>,
     pub is_moe: bool,
+    pub default_weight_dtype: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -35,10 +36,42 @@ pub struct StaticContext {
     pub config: VllmConfig,
 }
 
+/// Last non-empty `/`-delimited segment; `None` if `s` is empty or whitespace only.
+fn catalog_path_basename(s: &str) -> Option<&str> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    t.rsplit('/').find(|seg| !seg.is_empty())
+}
+
+fn catalog_model_lookup(s: &str) -> Option<&'static model_catalog::CatalogEntry> {
+    model_catalog::lookup_model(s.trim())
+}
+
+fn lookup_model_catalog(
+    config: &VllmConfig,
+    snapshot_model_name: Option<&str>,
+) -> Option<&'static model_catalog::CatalogEntry> {
+    let root = config.model_root.as_deref();
+    let scrape = snapshot_model_name;
+    root.and_then(catalog_model_lookup)
+        .or_else(|| scrape.and_then(catalog_model_lookup))
+        .or_else(|| {
+            root.and_then(catalog_path_basename)
+                .and_then(catalog_model_lookup)
+        })
+        .or_else(|| {
+            scrape
+                .and_then(catalog_path_basename)
+                .and_then(catalog_model_lookup)
+        })
+}
+
 impl StaticContext {
     pub fn from_snapshot(snapshot: &RawSnapshot, config: VllmConfig) -> Self {
         let model_name = snapshot.vllm.model_name.clone();
-        let catalog_entry = model_name.as_deref().and_then(model_catalog::lookup_model);
+        let catalog_entry = lookup_model_catalog(&config, model_name.as_deref());
         let model = match catalog_entry {
             Some(e) => ModelArch {
                 name: model_name,
@@ -48,6 +81,7 @@ impl StaticContext {
                 num_layers: Some(e.num_layers),
                 hidden_dim: Some(e.hidden_dim),
                 is_moe: e.is_moe,
+                default_weight_dtype: Some(e.default_weight_dtype.to_string()),
             },
             None => ModelArch {
                 name: model_name,
@@ -105,5 +139,37 @@ pub struct AnalysisInput<'a> {
 impl<'a> AnalysisInput<'a> {
     pub fn new(ctx: &'a StaticContext, window: &'a RuntimeWindow) -> Self {
         AnalysisInput { ctx, window }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::catalog_path_basename;
+
+    #[test]
+    fn catalog_path_basename_hf_repo() {
+        assert_eq!(
+            catalog_path_basename("meta-llama/Meta-Llama-3-8B-Instruct"),
+            Some("Meta-Llama-3-8B-Instruct")
+        );
+    }
+
+    #[test]
+    fn catalog_path_basename_local_path() {
+        assert_eq!(
+            catalog_path_basename("/workspace/models/Meta-Llama-3-8B-Instruct"),
+            Some("Meta-Llama-3-8B-Instruct")
+        );
+    }
+
+    #[test]
+    fn catalog_path_basename_plain_name() {
+        assert_eq!(catalog_path_basename("llama3"), Some("llama3"));
+    }
+
+    #[test]
+    fn catalog_path_basename_empty() {
+        assert_eq!(catalog_path_basename(""), None);
+        assert_eq!(catalog_path_basename("   "), None);
     }
 }
