@@ -8,7 +8,7 @@ const API_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// vLLM deployment configuration.
 /// All fields `Option<T>` — graceful degradation when sources are unavailable.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct VllmConfig {
     pub model_name: Option<String>,
     /// HF repo id or weight path from `/v1/models` `root` when present.
