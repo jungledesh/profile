@@ -1,6 +1,6 @@
 use crate::collectors::RawSnapshot;
 
-use super::{skew_secs, Issue, MAX_OBSERVATION_SKEW_SECS};
+use super::{skew_secs, Recommendation, MAX_OBSERVATION_SKEW_SECS};
 
 const UNDER_BATCHING_GPU_UTIL_LT: f64 = 62.0;
 const UNDER_BATCHING_RUNNING_GT: f64 = 0.75;
@@ -76,14 +76,18 @@ pub fn rule1_under_batching(snapshot: &RawSnapshot) -> Rule1Outcome {
     }
 }
 
-pub(super) fn issue_from_under_batching(d: &UnderBatchingDetail) -> Issue {
-    Issue {
-        confidence: 0.85,
-        evidence: vec![format!(
-            "Under-batching: {:.1} running / max_num_seqs {} | GPU utilization {:.1}%",
-            d.running, d.max_num_seqs, d.gpu_util
-        )],
-    }
+pub fn r1_recommendation(snapshot: &RawSnapshot) -> Option<Recommendation> {
+    let Rule1Outcome::Fired(d) = rule1_under_batching(snapshot) else {
+        return None;
+    };
+    Some(Recommendation {
+        rule_name: "under_batching",
+        impact: 4,
+        confidence: if d.gpu_util < 30.0 { 0.9 } else { 0.75 },
+        action: "Increase client concurrency or raise max_num_seqs".to_string(),
+        expected_impact: "Higher GPU utilization and throughput".to_string(),
+        display_lines: format_under_batching_fired(&d),
+    })
 }
 
 pub(super) fn format_under_batching_fired(d: &UnderBatchingDetail) -> Vec<String> {
@@ -93,7 +97,7 @@ pub(super) fn format_under_batching_fired(d: &UnderBatchingDetail) -> Vec<String
     vec![
         "ISSUE: Under-batching".to_string(),
         format!(
-            "Cause: Very low occupancy — {run_s} / {} ({pct:.1}%), GPU util only {gpu_s}% with headroom",
+            "Cause: Very low occupancy — {run_s} / {} ({pct:.1}%), avg GPU util {gpu_s}% with headroom",
             d.max_num_seqs,
         ),
         String::new(),
@@ -115,7 +119,7 @@ pub(super) fn format_under_batching_window_issue(
         "Under-batching".to_string(),
         format!("Seen in {seen_pct}% of windows"),
         format!(
-            "Cause: Very low occupancy — avg {:.1} / {} ({occupancy_pct:.1}%), GPU util only {:.1}% with headroom",
+            "Cause: Very low occupancy — avg {:.1} / {} ({occupancy_pct:.1}%), avg GPU util {:.1}% with headroom",
             d.running, d.max_num_seqs, d.gpu_util
         ),
         String::new(),
