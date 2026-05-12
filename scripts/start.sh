@@ -17,8 +17,6 @@ MODELS_DIR="${MODELS_DIR:-/workspace/models}"
 MODEL_PATH="${MODEL_PATH:-$MODELS_DIR/llama3-8b}"
 TMUX_SESSION="${TMUX_SESSION:-vllm}"
 LOG_FILE="${APP_DIR}/vllm.log"
-GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.55}"
-MAX_NUM_SEQS="${MAX_NUM_SEQS:-256}"
 
 echo "Starting container..."
 
@@ -68,9 +66,9 @@ python -m vllm.entrypoints.openai.api_server \
   --host 0.0.0.0 \
   --port 8000 \
   --dtype auto \
-  --gpu-memory-utilization "${GPU_MEM_UTIL}" \
-  --max-num-seqs "${MAX_NUM_SEQS}" \
+  --gpu-memory-utilization 0.55 \
   --tensor-parallel-size 1 \
+  --enforce-eager \
   --enable-prefix-caching \
   2>&1 | tee \"$LOG_FILE\"'"
 
