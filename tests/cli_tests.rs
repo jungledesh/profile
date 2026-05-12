@@ -103,6 +103,8 @@ fn diagnose_exits_success() {
     let output = Command::cargo_bin("profile")
         .unwrap()
         .arg("diagnose")
+        .arg("--duration")
+        .arg("2s")
         .arg("--url")
         .arg(&url)
         .output()
@@ -172,6 +174,8 @@ fn diagnose_shows_gen_tok_per_sec_when_counters_increase() {
     let output = Command::cargo_bin("profile")
         .unwrap()
         .arg("diagnose")
+        .arg("--duration")
+        .arg("2s")
         .arg("--url")
         .arg(&url)
         .output()
@@ -208,6 +212,8 @@ fn diagnose_gen_tok_per_sec_na_when_counter_resets() {
     let output = Command::cargo_bin("profile")
         .unwrap()
         .arg("diagnose")
+        .arg("--duration")
+        .arg("2s")
         .arg("--url")
         .arg(&url)
         .output()
@@ -232,7 +238,7 @@ fn diagnose_verbose_shows_not_indicated_lines() {
     let (url, server) = spawn_metrics_server(MINIMAL_EVALUABLE_SCRAPE, SAMPLE_COUNT);
     let output = Command::cargo_bin("profile")
         .unwrap()
-        .args(["-v", "diagnose", "--url"])
+        .args(["-v", "diagnose", "--duration", "2s", "--url"])
         .arg(&url)
         .output()
         .expect("run profile -v diagnose");
@@ -280,8 +286,8 @@ fn diagnose_help_lists_usage_and_options() {
         "Engine max_num_seqs if absent on /metrics",
         "[default: 256]",
         "--duration",
-        "Observation duration",
-        "[default: 2s]",
+        "Observation window per iteration",
+        "[default: 30s]",
         "-h, --help",
         "Display this message",
     ] {
@@ -297,7 +303,7 @@ fn verbose_prints_level_to_stderr() {
     let (url, server) = spawn_metrics_server(MINIMAL_SCRAPE, SAMPLE_COUNT);
     Command::cargo_bin("profile")
         .unwrap()
-        .args(["-vv", "diagnose", "--url"])
+        .args(["-vv", "diagnose", "--duration", "2s", "--url"])
         .arg(&url)
         .assert()
         .success()

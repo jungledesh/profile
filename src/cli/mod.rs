@@ -8,7 +8,7 @@ use std::time::Duration;
 
 const DEFAULT_MAX_NUM_SEQS: u32 = 256;
 const DEFAULT_METRICS_URL: &str = "http://localhost:8000/metrics";
-const DEFAULT_DURATION: &str = "2s";
+const DEFAULT_DURATION: &str = "30s";
 
 const ABOUT: &str = "Detects inefficiencies. Suggests fixes.";
 
@@ -83,7 +83,7 @@ pub enum Commands {
             long = "duration",
             default_value = DEFAULT_DURATION,
             value_parser = parse_duration_arg,
-            help = "Observation duration (e.g. 30s, 1m, 5m, 30m)"
+            help = "Observation window per iteration (default: 30s)"
         )]
         duration: Duration,
     },
