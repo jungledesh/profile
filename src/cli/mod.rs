@@ -1,6 +1,7 @@
 //! CLI: parse commands, print results.
 
 mod diagnose;
+mod goal;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use std::time::Duration;
