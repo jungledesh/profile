@@ -1,6 +1,6 @@
 use crate::collectors::RawSnapshot;
 
-use super::Issue;
+use super::Recommendation;
 
 const PREFIX_HIT_RATE_LT: f64 = 0.35;
 const PREFIX_RULE_PROMPT_TOKENS_GTE: f64 = 20.0;
@@ -50,15 +50,18 @@ pub fn rule3_low_prefix_reuse(snapshot: &RawSnapshot) -> Rule3Outcome {
     })
 }
 
-pub(super) fn issue_from_low_prefix_reuse(d: &LowPrefixReuseDetail) -> Issue {
-    Issue {
-        confidence: 0.85,
-        evidence: vec![format!(
-            "Low prefix cache hit rate: {:.1}% | mean prompt {:.1} tok",
-            d.hit_rate * 100.0,
-            d.prompt_tokens_mean
-        )],
-    }
+pub fn r3_recommendation(snapshot: &RawSnapshot) -> Option<Recommendation> {
+    let Rule3Outcome::Fired(d) = rule3_low_prefix_reuse(snapshot) else {
+        return None;
+    };
+    Some(Recommendation {
+        rule_name: "low_prefix_reuse",
+        impact: 2,
+        confidence: 0.6,
+        action: "Move shared context to prompt prefix; standardize prompt templates".to_string(),
+        expected_impact: "Higher prefix cache hit rate and lower TTFT".to_string(),
+        display_lines: format_low_prefix_hit_rate_fired(&d),
+    })
 }
 
 pub(super) fn format_low_prefix_hit_rate_fired(d: &LowPrefixReuseDetail) -> Vec<String> {

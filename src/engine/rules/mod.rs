@@ -6,27 +6,57 @@ use crate::context::{AnalysisInput, RuntimeWindow};
 mod r1_under_batching;
 mod r2_kv_cache_pressure;
 mod r3_low_prefix_reuse;
+mod r4_parallelism;
 
-pub use r1_under_batching::{rule1_under_batching, MissReport, Rule1Outcome, UnderBatchingDetail};
+pub use r1_under_batching::{
+    r1_recommendation, rule1_under_batching, MissReport, Rule1Outcome, UnderBatchingDetail,
+};
 pub use r2_kv_cache_pressure::{
-    rule2_kv_cache_pressure, KvCachePressureDetail, Rule2MissReport, Rule2Outcome,
+    r2_recommendation, rule2_kv_cache_pressure, KvCachePressureDetail, Rule2MissReport,
+    Rule2Outcome,
 };
-pub use r3_low_prefix_reuse::{rule3_low_prefix_reuse, LowPrefixReuseDetail, Rule3Outcome};
+pub use r3_low_prefix_reuse::{
+    r3_recommendation, rule3_low_prefix_reuse, LowPrefixReuseDetail, Rule3Outcome,
+};
+pub use r4_parallelism::r4_recommendation;
 
-use r1_under_batching::{
-    aggregate_r1_detail, format_under_batching_fired, format_under_batching_window_issue,
-    issue_from_under_batching,
-};
-use r2_kv_cache_pressure::{
-    aggregate_r2_detail, format_kv_cache_pressure_fired, format_kv_cache_window_issue,
-    issue_from_kv_cache_pressure,
-};
+use r1_under_batching::{aggregate_r1_detail, format_under_batching_window_issue};
+use r2_kv_cache_pressure::{aggregate_r2_detail, format_kv_cache_window_issue};
+#[cfg(test)]
+use r3_low_prefix_reuse::format_low_prefix_hit_rate_fired;
 use r3_low_prefix_reuse::{
-    aggregate_r3_detail, format_low_prefix_hit_rate_fired, format_low_prefix_window_issue,
-    format_rule3_verbose_miss, issue_from_low_prefix_reuse,
+    aggregate_r3_detail, format_low_prefix_window_issue, format_rule3_verbose_miss,
 };
 
 pub(super) const MAX_OBSERVATION_SKEW_SECS: f64 = 1.0;
+
+// TODO(r5): sampling cliff — sampling temperature is not in collected metrics; wire rule when available.
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Recommendation {
+    pub rule_name: &'static str,
+    /// 1–5; 5 = highest impact
+    pub impact: u8,
+    /// 0.0–1.0
+    pub confidence: f64,
+    /// Prescriptive: what to change
+    pub action: String,
+    pub expected_impact: String,
+    /// Pre-formatted cause + recommendation lines for stdout
+    pub display_lines: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IssueGroup {
+    pub primary: Recommendation,
+    pub secondary: Vec<Recommendation>,
+}
+
+impl IssueGroup {
+    pub fn score(&self) -> f64 {
+        self.primary.impact as f64 * self.primary.confidence
+    }
+}
 
 const NO_ISSUES_LINE: &str = "No issues detected in this snapshot.";
 
@@ -53,39 +83,17 @@ pub fn no_evaluable_diagnose_lines(verbose: bool, windows: &[RuntimeWindow]) -> 
     out
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct Issue {
-    pub confidence: f64,
-    pub evidence: Vec<String>,
-}
-
-pub fn evaluate_issues(input: AnalysisInput<'_>) -> Vec<Issue> {
-    let snapshot = &input.window.snapshot;
-    let mut issues = Vec::new();
-    if let Rule1Outcome::Fired(d) = rule1_under_batching(snapshot) {
-        issues.push(issue_from_under_batching(&d));
-    }
-    if let Rule2Outcome::Fired(d) = rule2_kv_cache_pressure(snapshot) {
-        issues.push(issue_from_kv_cache_pressure(&d));
-    }
-    if let Rule3Outcome::Fired(d) = rule3_low_prefix_reuse(snapshot) {
-        issues.push(issue_from_low_prefix_reuse(&d));
-    }
-    issues
-}
-
 pub fn format_diagnose_rules(input: AnalysisInput<'_>, verbose_rules: bool) -> Vec<String> {
     let snapshot = &input.window.snapshot;
     if !window_is_evaluable(snapshot) {
         return no_evaluable_diagnose_lines(verbose_rules, std::slice::from_ref(input.window));
     }
 
-    let r1 = rule1_under_batching(snapshot);
-    let r2 = rule2_kv_cache_pressure(snapshot);
-    let r3 = rule3_low_prefix_reuse(snapshot);
-    let any_issue = matches!(r1, Rule1Outcome::Fired(_))
-        || matches!(r2, Rule2Outcome::Fired(_))
-        || matches!(r3, Rule3Outcome::Fired(_));
+    let report = super::build_report(input);
+    let any_issue = !report.groups.is_empty();
+
+    let fired_names: std::collections::HashSet<&'static str> =
+        report.groups.iter().map(|g| g.primary.rule_name).collect();
 
     let mut out = Vec::new();
     let mut append = |block: Vec<String>| {
@@ -95,26 +103,23 @@ pub fn format_diagnose_rules(input: AnalysisInput<'_>, verbose_rules: bool) -> V
         out.extend(block);
     };
 
-    match &r1 {
-        Rule1Outcome::Fired(d) => append(format_under_batching_fired(d)),
-        Rule1Outcome::NotFired(_) if verbose_rules => {
-            append(vec!["Under-batching: not indicated".to_string()])
-        }
-        Rule1Outcome::NotFired(_) => {}
+    for g in &report.groups {
+        append(g.primary.display_lines.clone());
     }
 
-    match &r2 {
-        Rule2Outcome::Fired(d) => append(format_kv_cache_pressure_fired(d, snapshot)),
-        Rule2Outcome::NotFired(_) if verbose_rules => {
-            append(vec!["KV cache pressure: not indicated".to_string()])
+    if verbose_rules {
+        if !fired_names.contains("under_batching") {
+            append(vec!["Under-batching: not indicated".to_string()]);
         }
-        Rule2Outcome::NotFired(_) => {}
-    }
-
-    match &r3 {
-        Rule3Outcome::Fired(d) => append(format_low_prefix_hit_rate_fired(d)),
-        Rule3Outcome::NotFired if verbose_rules => append(format_rule3_verbose_miss(snapshot)),
-        Rule3Outcome::NotFired => {}
+        if !fired_names.contains("kv_cache_pressure") {
+            append(vec!["KV cache pressure: not indicated".to_string()]);
+        }
+        if !fired_names.contains("low_prefix_reuse") {
+            append(format_rule3_verbose_miss(snapshot));
+        }
+        if !fired_names.contains("parallelism_mismatch") {
+            append(vec!["Parallelism mismatch: not indicated".to_string()]);
+        }
     }
 
     if !any_issue {
@@ -359,11 +364,11 @@ mod tests {
     fn under_batching_fires_when_gates_pass() {
         let t = SystemTime::UNIX_EPOCH;
         let s = snap(t, t, vllm_base(), gpu_low());
-        let ctx = mk_ctx();
         let win = mk_win(s);
-        let issues = evaluate_issues(ai(&ctx, &win));
-        assert_eq!(issues.len(), 1);
-        assert!((issues[0].confidence - 0.85).abs() < 1e-9);
+        let r = r1_recommendation(&win.snapshot).expect("r1 fired");
+        assert_eq!(r.rule_name, "under_batching");
+        assert_eq!(r.impact, 4);
+        assert!((r.confidence - 0.75).abs() < 1e-9);
         match rule1_under_batching(&win.snapshot) {
             Rule1Outcome::Fired(d) => {
                 assert!((d.running - 3.1).abs() < 1e-9);
@@ -375,13 +380,23 @@ mod tests {
     }
 
     #[test]
+    fn r1_recommendation_higher_confidence_when_gpu_util_below_30() {
+        let t = SystemTime::UNIX_EPOCH;
+        let mut g = gpu_low();
+        g.gpu_util_pct = Some(28.0);
+        let s = snap(t, t, vllm_base(), g);
+        let r = r1_recommendation(&s).expect("fired");
+        assert_eq!(r.rule_name, "under_batching");
+        assert!((r.confidence - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
     fn skew_over_one_second_suppresses() {
         let t0 = SystemTime::UNIX_EPOCH;
         let t1 = t0 + Duration::from_secs(2);
         let s = snap(t0, t1, vllm_base(), gpu_low());
-        let ctx = mk_ctx();
         let win = mk_win(s);
-        assert!(evaluate_issues(ai(&ctx, &win)).is_empty());
+        assert!(r1_recommendation(&win.snapshot).is_none());
     }
 
     #[test]
@@ -390,9 +405,8 @@ mod tests {
         let mut v = vllm_base();
         v.num_requests_waiting = None;
         let s = snap(t, t, v, gpu_low());
-        let ctx = mk_ctx();
         let win = mk_win(s);
-        assert!(evaluate_issues(ai(&ctx, &win)).is_empty());
+        assert!(r1_recommendation(&win.snapshot).is_none());
     }
 
     #[test]
@@ -401,9 +415,8 @@ mod tests {
         let mut v = vllm_base();
         v.num_requests_waiting = Some(2.0);
         let s = snap(t, t, v, gpu_low());
-        let ctx = mk_ctx();
         let win = mk_win(s);
-        assert!(evaluate_issues(ai(&ctx, &win)).is_empty());
+        assert!(r1_recommendation(&win.snapshot).is_none());
     }
 
     #[test]
@@ -412,9 +425,8 @@ mod tests {
         let mut v = vllm_base();
         v.num_requests_running = Some(0.75);
         let s = snap(t, t, v, gpu_low());
-        let ctx = mk_ctx();
         let win = mk_win(s);
-        assert!(evaluate_issues(ai(&ctx, &win)).is_empty());
+        assert!(r1_recommendation(&win.snapshot).is_none());
     }
 
     #[test]
@@ -423,9 +435,8 @@ mod tests {
         let mut v = vllm_base();
         v.num_requests_running = Some(0.6);
         let s = snap(t, t, v, gpu_low());
-        let ctx = mk_ctx();
         let win = mk_win(s);
-        assert!(evaluate_issues(ai(&ctx, &win)).is_empty());
+        assert!(r1_recommendation(&win.snapshot).is_none());
     }
 
     #[test]
@@ -434,9 +445,8 @@ mod tests {
         let mut v = vllm_base();
         v.num_requests_running = Some(40.0);
         let s = snap(t, t, v, gpu_low());
-        let ctx = mk_ctx();
         let win = mk_win(s);
-        assert!(evaluate_issues(ai(&ctx, &win)).is_empty());
+        assert!(r1_recommendation(&win.snapshot).is_none());
     }
 
     #[test]
@@ -445,9 +455,8 @@ mod tests {
         let mut v = vllm_base();
         v.num_requests_running = Some(16.0);
         let s = snap(t, t, v, gpu_low());
-        let ctx = mk_ctx();
         let win = mk_win(s);
-        assert!(evaluate_issues(ai(&ctx, &win)).is_empty());
+        assert!(r1_recommendation(&win.snapshot).is_none());
     }
 
     #[test]
@@ -456,9 +465,8 @@ mod tests {
         let mut g = gpu_low();
         g.gpu_util_pct = Some(62.0);
         let s = snap(t, t, vllm_base(), g);
-        let ctx = mk_ctx();
         let win = mk_win(s);
-        assert!(evaluate_issues(ai(&ctx, &win)).is_empty());
+        assert!(r1_recommendation(&win.snapshot).is_none());
     }
 
     #[test]
@@ -467,9 +475,8 @@ mod tests {
         let mut v = vllm_base();
         v.max_num_seqs = Some(0);
         let s = snap(t, t, v, gpu_low());
-        let ctx = mk_ctx();
         let win = mk_win(s);
-        assert!(evaluate_issues(ai(&ctx, &win)).is_empty());
+        assert!(r1_recommendation(&win.snapshot).is_none());
     }
 
     #[test]
@@ -478,9 +485,8 @@ mod tests {
         let mut v = vllm_base();
         v.num_requests_running = Some(f64::NAN);
         let s = snap(t, t, v, gpu_low());
-        let ctx = mk_ctx();
         let win = mk_win(s);
-        assert!(evaluate_issues(ai(&ctx, &win)).is_empty());
+        assert!(r1_recommendation(&win.snapshot).is_none());
     }
 
     #[test]
@@ -494,7 +500,7 @@ mod tests {
         assert!(text.contains("ISSUE: Under-batching"));
         assert!(text.contains("Very low occupancy"));
         assert!(text.contains("3.1 / 256"));
-        assert!(text.contains("GPU util only 58% with headroom"));
+        assert!(text.contains("avg GPU util 58% with headroom"));
         assert!(text.contains("Recommendation:"));
         assert!(text.contains("  • Increase client concurrency or request rate"));
         assert!(text.contains("  • Raise max_num_seqs if VRAM allows"));
@@ -514,6 +520,7 @@ mod tests {
         assert!(text.contains("Under-batching: not indicated"));
         assert!(text.contains("KV cache pressure: not indicated"));
         assert!(text.contains("Prefix cache hit rate: not indicated"));
+        assert!(text.contains("Parallelism mismatch: not indicated"));
         assert!(text.contains("No issues detected in this snapshot."));
     }
 
@@ -522,6 +529,30 @@ mod tests {
             kv_cache_usage_perc: Some(86.0),
             ..vllm_base()
         }
+    }
+
+    #[test]
+    fn r2_recommendation_confidence_matches_vram_corroboration() {
+        let t = SystemTime::UNIX_EPOCH;
+        let mut g = gpu_low();
+        g.vram_used_mb = Some(78 * 1024);
+        g.vram_total_mb = Some(100 * 1024);
+        let s = snap(t, t, vllm_high_kv(), g);
+        let r = r2_recommendation(&s).expect("fired");
+        assert_eq!(r.rule_name, "kv_cache_pressure");
+        assert_eq!(r.impact, 5);
+        assert!((r.confidence - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn r2_recommendation_lower_confidence_without_vram_corroboration() {
+        let t = SystemTime::UNIX_EPOCH;
+        let mut gb = gpu_busy();
+        gb.vram_used_mb = Some(50 * 1024);
+        gb.vram_total_mb = Some(100 * 1024);
+        let s = snap(t, t, vllm_high_kv(), gb);
+        let r = r2_recommendation(&s).expect("fired");
+        assert!((r.confidence - 0.7).abs() < 1e-9);
     }
 
     #[test]
@@ -572,7 +603,8 @@ mod tests {
         assert!(text.contains("Under-batching: not indicated"));
         assert!(text.contains("KV cache pressure: not indicated"));
         assert!(text.contains("Prefix cache hit rate: not indicated"));
-        assert!(text.ends_with("No issues detected in this snapshot."));
+        assert!(text.contains("Parallelism mismatch: not indicated"));
+        assert!(text.contains("No issues detected in this snapshot."));
     }
 
     #[test]
@@ -634,6 +666,7 @@ mod tests {
         let text = format_diagnose_rules(ai(&ctx, &win), true).join("\n");
         assert!(text.contains("KV cache pressure: not indicated"));
         assert!(text.contains("Prefix cache hit rate: not indicated"));
+        assert!(text.contains("Parallelism mismatch: not indicated"));
         assert!(text.contains("No issues detected in this snapshot."));
     }
 
@@ -645,7 +678,6 @@ mod tests {
         v.prompt_tokens_mean = Some(25.0);
         v.num_requests_running = Some(1.0);
         let s = snap(t, t, v, gpu_busy());
-        let ctx = mk_ctx();
         let win = mk_win(s);
         match rule3_low_prefix_reuse(&win.snapshot) {
             Rule3Outcome::Fired(d) => {
@@ -654,9 +686,10 @@ mod tests {
             }
             Rule3Outcome::NotFired => panic!("expected fired"),
         }
-        let issues = evaluate_issues(ai(&ctx, &win));
-        assert_eq!(issues.len(), 1);
-        assert!(issues[0].evidence[0].contains("Low prefix cache hit rate"));
+        let r = r3_recommendation(&win.snapshot).expect("r3 fired");
+        assert_eq!(r.rule_name, "low_prefix_reuse");
+        assert_eq!(r.impact, 2);
+        assert!((r.confidence - 0.6).abs() < 1e-9);
     }
 
     #[test]
@@ -734,19 +767,6 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_issues_under_batching_then_kv_order() {
-        let t = SystemTime::UNIX_EPOCH;
-        let v = vllm_high_kv();
-        let s = snap(t, t, v, gpu_low());
-        let ctx = mk_ctx();
-        let win = mk_win(s);
-        let issues = evaluate_issues(ai(&ctx, &win));
-        assert_eq!(issues.len(), 2);
-        assert!(issues[0].evidence[0].contains("Under-batching"));
-        assert!(issues[1].evidence[0].contains("KV cache pressure"));
-    }
-
-    #[test]
     fn format_diagnose_rules_inserts_blank_between_rule_blocks() {
         let t = SystemTime::UNIX_EPOCH;
         let s = snap(t, t, vllm_high_kv(), gpu_low());
@@ -762,10 +782,10 @@ mod tests {
             .position(|l| l.contains("ISSUE: KV Cache Pressure"))
             .expect("rule2");
         assert!(
-            idx_kv > idx_under,
-            "under-batching should appear before KV rule"
+            idx_kv < idx_under,
+            "KV cache pressure should rank before under-batching by score"
         );
-        let between = &lines[idx_under..idx_kv];
+        let between = &lines[idx_kv..idx_under];
         assert!(
             between.iter().any(|l| l.is_empty()),
             "expected blank line between rule blocks: {between:?}"
@@ -809,7 +829,7 @@ mod tests {
         assert!(text.contains("Under-batching"));
         assert!(text.contains("Seen in 40% of windows"));
         assert!(text.contains(
-            "Cause: Very low occupancy — avg 3.2 / 256 (1.2%), GPU util only 50.0% with headroom"
+            "Cause: Very low occupancy — avg 3.2 / 256 (1.2%), avg GPU util 50.0% with headroom"
         ));
         assert!(text.contains("For better efficiency:"));
         assert!(text.contains("No issues for KV Cache Pressure and Low Prefix Cache"));

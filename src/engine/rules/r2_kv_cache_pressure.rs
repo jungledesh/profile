@@ -1,6 +1,6 @@
 use crate::collectors::{GpuRawMetrics, RawSnapshot};
 
-use super::{skew_secs, Issue, MAX_OBSERVATION_SKEW_SECS};
+use super::{skew_secs, Recommendation, MAX_OBSERVATION_SKEW_SECS};
 
 const KV_CACHE_PRESSURE_MIN_PERC: f64 = 85.0;
 const KV_PRESSURE_VRAM_CORROBORATE_MIN_PERC: f64 = 78.0;
@@ -53,23 +53,23 @@ pub fn rule2_kv_cache_pressure(snapshot: &RawSnapshot) -> Rule2Outcome {
     })
 }
 
-pub(super) fn issue_from_kv_cache_pressure(d: &KvCachePressureDetail) -> Issue {
+pub fn r2_recommendation(snapshot: &RawSnapshot) -> Option<Recommendation> {
+    let Rule2Outcome::Fired(d) = rule2_kv_cache_pressure(snapshot) else {
+        return None;
+    };
     let confidence = if d.vram_usage_perc_corroborated.is_some() {
         0.9
     } else {
-        0.82
+        0.7
     };
-    let vram_note = d
-        .vram_usage_perc_corroborated
-        .map(|p| format!(" | device VRAM {:.1}%", p))
-        .unwrap_or_default();
-    Issue {
+    Some(Recommendation {
+        rule_name: "kv_cache_pressure",
+        impact: 5,
         confidence,
-        evidence: vec![format!(
-            "KV cache pressure: {:.1}% KV usage{}",
-            d.kv_cache_usage_perc, vram_note
-        )],
-    }
+        action: "Reduce max_num_seqs or add tensor parallelism".to_string(),
+        expected_impact: "Reduced KV evictions and lower latency variance".to_string(),
+        display_lines: format_kv_cache_pressure_fired(&d, snapshot),
+    })
 }
 
 pub(super) fn format_kv_cache_pressure_fired(
