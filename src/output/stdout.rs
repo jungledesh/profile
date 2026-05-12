@@ -209,7 +209,7 @@ fn baseline_lines(
         seg1.push(format!("decode ~{:.0} tok/s (est)", b.decode.expected));
     }
     if let Some(prefill) = b.prefill {
-        if prefill.expected >= 0.5 {
+        if prefill.expected >= 10.0 {
             seg1.push(format!("prefill ~{:.0} tok/s (est)", prefill.expected));
         }
     }
@@ -229,7 +229,9 @@ fn baseline_lines(
         let compute_bound = num_requests_running
             .filter(|x| x.is_finite())
             .is_some_and(|n| n >= b.ridge_batch_size);
-        if pf >= 0.5 && !compute_bound {
+        let prefill_ceiling_meaningful = b.prefill.is_some_and(|p| p.expected >= 10.0);
+        let over_ceiling = b.efficiency_pct.is_some_and(|e| e > 100.0);
+        if pf >= 0.5 && !compute_bound && prefill_ceiling_meaningful && !over_ceiling {
             seg2.push(format!("prefill_floor ~{:.0}ms", pf));
         }
     }
@@ -695,20 +697,24 @@ mod tests {
                 expected: 100.0,
                 upper: 105.0,
             },
-            prefill: None,
+            prefill: Some(engine::CeilingEstimate {
+                lower: 90.0,
+                expected: 50.0,
+                upper: 55.0,
+            }),
             efficiency_pct: Some(150.0),
             headroom_pct: Some(0.0),
             weight_dtype_source: engine::WeightDtypeSource::EnvVar,
             weight_gb: 16.0,
             kv_headroom_gb: Some(8.0),
             tpot_floor_ms: 10.0,
-            prefill_latency_floor_ms: None,
+            prefill_latency_floor_ms: Some(20.0),
             ridge_batch_size: 40.0,
         };
         let lines = baseline_lines(Some(b), Some(0.4), None);
         assert_eq!(
             lines[0],
-            "BASELINE   >100% of decode ceiling (prefix cache inflating throughput) | decode ~100 tok/s (est)"
+            "BASELINE   >100% of decode ceiling (prefix cache inflating throughput) | decode ~100 tok/s (est) | prefill ~50 tok/s (est)"
         );
         assert_eq!(
             lines[1],
@@ -725,7 +731,11 @@ mod tests {
                 expected: 100.0,
                 upper: 105.0,
             },
-            prefill: None,
+            prefill: Some(engine::CeilingEstimate {
+                lower: 90.0,
+                expected: 100.0,
+                upper: 110.0,
+            }),
             efficiency_pct: Some(50.0),
             headroom_pct: Some(50.0),
             weight_dtype_source: engine::WeightDtypeSource::EnvVar,
@@ -746,6 +756,76 @@ mod tests {
             below[1].contains("prefill_floor ~42ms"),
             "expected prefill_floor below ridge: {}",
             below[1]
+        );
+    }
+
+    #[test]
+    fn baseline_lines_prefill_ceiling_and_floor_suppressed_when_prefill_below_10_tok_s() {
+        let b = engine::PhysicsBaseline {
+            decode: engine::CeilingEstimate {
+                lower: 85.0,
+                expected: 100.0,
+                upper: 105.0,
+            },
+            prefill: Some(engine::CeilingEstimate {
+                lower: 4.0,
+                expected: 5.0,
+                upper: 6.0,
+            }),
+            efficiency_pct: Some(50.0),
+            headroom_pct: Some(50.0),
+            weight_dtype_source: engine::WeightDtypeSource::EnvVar,
+            weight_gb: 16.0,
+            kv_headroom_gb: Some(8.0),
+            tpot_floor_ms: 10.0,
+            prefill_latency_floor_ms: Some(200.0),
+            ridge_batch_size: 40.0,
+        };
+        let lines = baseline_lines(Some(b), None, Some(5.0));
+        assert!(
+            !lines[0].contains("prefill ~"),
+            "line1 should omit low prefill ceiling: {}",
+            lines[0]
+        );
+        assert!(
+            !lines[1].contains("prefill_floor"),
+            "line2 should omit prefill_floor when ceiling suppressed: {}",
+            lines[1]
+        );
+    }
+
+    #[test]
+    fn baseline_lines_prefill_ceiling_and_floor_shown_when_meaningful_and_below_ridge() {
+        let b = engine::PhysicsBaseline {
+            decode: engine::CeilingEstimate {
+                lower: 85.0,
+                expected: 100.0,
+                upper: 105.0,
+            },
+            prefill: Some(engine::CeilingEstimate {
+                lower: 90.0,
+                expected: 50.0,
+                upper: 55.0,
+            }),
+            efficiency_pct: Some(50.0),
+            headroom_pct: Some(50.0),
+            weight_dtype_source: engine::WeightDtypeSource::EnvVar,
+            weight_gb: 16.0,
+            kv_headroom_gb: Some(8.0),
+            tpot_floor_ms: 10.0,
+            prefill_latency_floor_ms: Some(20.0),
+            ridge_batch_size: 40.0,
+        };
+        let lines = baseline_lines(Some(b), None, Some(10.0));
+        assert!(
+            lines[0].contains("prefill ~50 tok/s (est)"),
+            "line1 should include prefill ceiling: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("prefill_floor ~20ms"),
+            "line2 should include prefill_floor below ridge: {}",
+            lines[1]
         );
     }
 
