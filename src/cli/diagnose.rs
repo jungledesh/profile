@@ -28,10 +28,14 @@ pub fn execute(
 
     match goal::check_feasibility(&chosen, report.baseline.as_ref()) {
         goal::FeasibilityResult::Reachable => {
-            println!(
-                "\nGoal: {}. Optimization loop coming in Step 6.",
-                chosen.objective.label()
-            );
+            profiler::loop_runner::run(
+                vllm_metrics_input,
+                max_num_seqs,
+                duration,
+                result,
+                report,
+                chosen,
+            )?;
         }
         goal::FeasibilityResult::AtCeiling { headroom_pct } => {
             println!(
