@@ -57,6 +57,17 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
         duration,
     )];
 
+    // Build AnalysisInput from the aggregate snapshot for baseline + single-window rule evaluation.
+    let aggregate_win = crate::context::RuntimeWindow::from_snapshot(result.snapshot.clone());
+    let summary_input = AnalysisInput::new(&result.static_ctx, &aggregate_win);
+    let report = engine::build_report(summary_input);
+    lines.extend(baseline_lines(
+        report.baseline,
+        aggregate_win.snapshot.vllm.prefix_cache_hit_rate,
+        aggregate_win.snapshot.vllm.num_requests_running,
+    ));
+    lines.push(String::new());
+
     if !result.any_evaluable {
         lines.push(vllm_label_row("Target:", &result.metrics_input));
         lines.push(String::new());
@@ -95,10 +106,6 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
     lines.push(vllm_label_row("PARALLEL", &config_parallel_value(cfg)));
     lines.push(vllm_label_row("MODEL", &config_model_value(cfg)));
     lines.push(vllm_label_row("KV", &config_kv_value(cfg)));
-
-    // Build AnalysisInput from the aggregate snapshot for single-window rule evaluation.
-    let aggregate_win = crate::context::RuntimeWindow::from_snapshot(result.snapshot.clone());
-    let summary_input = AnalysisInput::new(&result.static_ctx, &aggregate_win);
 
     let rule_lines = if result.windows.len() <= 1 {
         engine::format_diagnose_rules(summary_input, verbose_rules)
@@ -149,6 +156,94 @@ fn duration_short(duration: Duration) -> String {
     } else {
         format!("{secs}s")
     }
+}
+
+fn over_ceiling_hint(
+    raw_eff: f64,
+    decode_expected: f64,
+    ridge_batch_size: f64,
+    num_requests_running: Option<f64>,
+    cache_hit_rate: Option<f64>,
+) -> &'static str {
+    let actual_tps = (raw_eff / 100.0) * decode_expected;
+    if let Some(r) = cache_hit_rate.filter(|x| x.is_finite() && *x >= 0.0 && *x < 1.0) {
+        let effective_ceiling = decode_expected / (1.0 - r);
+        if actual_tps <= effective_ceiling {
+            return "(prefix cache inflating throughput)";
+        }
+    }
+    if let Some(n) = num_requests_running.filter(|x| x.is_finite()) {
+        if n >= ridge_batch_size {
+            return "(large batch — compute-bound)";
+        }
+    }
+    "(verify weight dtype)"
+}
+
+fn baseline_lines(
+    baseline: Option<engine::PhysicsBaseline>,
+    prefix_cache_hit_rate: Option<f64>,
+    num_requests_running: Option<f64>,
+) -> Vec<String> {
+    let Some(b) = baseline else {
+        return vec!["BASELINE   unavailable — model not recognized".to_string()];
+    };
+
+    // Line 1: efficiency + throughput ceilings
+    let mut seg1 = Vec::new();
+    if let Some(raw_eff) = b.efficiency_pct {
+        if raw_eff > 100.0 {
+            let hint = over_ceiling_hint(
+                raw_eff,
+                b.decode.expected,
+                b.ridge_batch_size,
+                num_requests_running,
+                prefix_cache_hit_rate,
+            );
+            seg1.push(format!(">100% of decode ceiling {hint}"));
+        } else {
+            seg1.push(format!("{raw_eff:.1}% of decode ceiling"));
+        }
+    }
+    if b.decode.expected >= 0.5 {
+        seg1.push(format!("decode ~{:.0} tok/s (est)", b.decode.expected));
+    }
+    if let Some(prefill) = b.prefill {
+        if prefill.expected >= 10.0 {
+            seg1.push(format!("prefill ~{:.0} tok/s (est)", prefill.expected));
+        }
+    }
+
+    // Line 2: memory budget + latency floors
+    let mut seg2 = Vec::new();
+    seg2.push(format!("weight {:.0}GB", b.weight_gb));
+    if let Some(headroom) = b.kv_headroom_gb {
+        if headroom < 0.0 {
+            seg2.push(format!("kv_headroom {:.0}GB (needs TP)", headroom));
+        } else {
+            seg2.push(format!("kv_headroom {:.0}GB", headroom));
+        }
+    }
+    seg2.push(format!("tpot_floor ~{:.0}ms", b.tpot_floor_ms));
+    if let Some(pf) = b.prefill_latency_floor_ms {
+        let compute_bound = num_requests_running
+            .filter(|x| x.is_finite())
+            .is_some_and(|n| n >= b.ridge_batch_size);
+        let prefill_ceiling_meaningful = b.prefill.is_some_and(|p| p.expected >= 10.0);
+        let over_ceiling = b.efficiency_pct.is_some_and(|e| e > 100.0);
+        if pf >= 0.5 && !compute_bound && prefill_ceiling_meaningful && !over_ceiling {
+            seg2.push(format!("prefill_floor ~{:.0}ms", pf));
+        }
+    }
+
+    let mut out = vec![
+        format!("BASELINE   {}", seg1.join(" | ")),
+        format!("           {}", seg2.join(" | ")),
+    ];
+    if b.weight_dtype_source == engine::WeightDtypeSource::Fallback {
+        out.push("           weight dtype assumed bf16 — set DTYPE env var to confirm".to_string());
+    }
+    out
 }
 
 fn vllm_label_row(label: &str, value: &str) -> String {
@@ -524,6 +619,214 @@ mod tests {
     fn fmt_seconds_from_ms_prefers_seconds_when_large() {
         assert_eq!(fmt_seconds_from_ms(1200.0), "1.2s");
         assert_eq!(fmt_seconds_from_ms(50.0), "50ms");
+    }
+
+    #[test]
+    fn over_ceiling_hint_prefix_cache_when_under_effective_ceiling() {
+        // decode 100, raw 150% → actual 150 tok/s; hit 0.4 → effective 166.67
+        assert_eq!(
+            over_ceiling_hint(150.0, 100.0, 40.0, None, Some(0.4)),
+            "(prefix cache inflating throughput)"
+        );
+    }
+
+    #[test]
+    fn over_ceiling_hint_dtype_when_above_effective_ceiling() {
+        // decode 100, raw 200% → actual 200 tok/s; hit 0.4 → effective 166.67; running below ridge → dtype
+        assert_eq!(
+            over_ceiling_hint(200.0, 100.0, 40.0, Some(10.0), Some(0.4)),
+            "(verify weight dtype)"
+        );
+    }
+
+    #[test]
+    fn over_ceiling_hint_dtype_when_hit_rate_missing() {
+        assert_eq!(
+            over_ceiling_hint(150.0, 100.0, 40.0, Some(10.0), None),
+            "(verify weight dtype)"
+        );
+    }
+
+    #[test]
+    fn over_ceiling_hint_dtype_when_hit_rate_out_of_band() {
+        assert_eq!(
+            over_ceiling_hint(150.0, 100.0, 40.0, Some(10.0), Some(f64::NAN)),
+            "(verify weight dtype)"
+        );
+        assert_eq!(
+            over_ceiling_hint(150.0, 100.0, 40.0, Some(10.0), Some(-0.1)),
+            "(verify weight dtype)"
+        );
+        assert_eq!(
+            over_ceiling_hint(150.0, 100.0, 40.0, Some(10.0), Some(1.0)),
+            "(verify weight dtype)"
+        );
+    }
+
+    #[test]
+    fn over_ceiling_hint_large_batch_compute_bound_when_no_cache_explanation() {
+        assert_eq!(
+            over_ceiling_hint(150.0, 100.0, 40.0, Some(50.0), None),
+            "(large batch — compute-bound)"
+        );
+    }
+
+    #[test]
+    fn over_ceiling_hint_cache_wins_before_large_batch() {
+        // actual 150 ≤ effective 166.67 — prefix cache; running is high but irrelevant
+        assert_eq!(
+            over_ceiling_hint(150.0, 100.0, 40.0, Some(100.0), Some(0.4)),
+            "(prefix cache inflating throughput)"
+        );
+    }
+
+    #[test]
+    fn over_ceiling_hint_dtype_when_running_none() {
+        assert_eq!(
+            over_ceiling_hint(150.0, 100.0, 40.0, None, None),
+            "(verify weight dtype)"
+        );
+    }
+
+    #[test]
+    fn baseline_lines_over_ceiling_wires_hint_into_first_line() {
+        // 150% efficiency at decode 100 tok/s → actual 150; hit 0.4 → effective 166.67 → prefix-cache hint.
+        let b = engine::PhysicsBaseline {
+            decode: engine::CeilingEstimate {
+                lower: 85.0,
+                expected: 100.0,
+                upper: 105.0,
+            },
+            prefill: Some(engine::CeilingEstimate {
+                lower: 90.0,
+                expected: 50.0,
+                upper: 55.0,
+            }),
+            efficiency_pct: Some(150.0),
+            headroom_pct: Some(0.0),
+            weight_dtype_source: engine::WeightDtypeSource::EnvVar,
+            weight_gb: 16.0,
+            kv_headroom_gb: Some(8.0),
+            tpot_floor_ms: 10.0,
+            prefill_latency_floor_ms: Some(20.0),
+            ridge_batch_size: 40.0,
+        };
+        let lines = baseline_lines(Some(b), Some(0.4), None);
+        assert_eq!(
+            lines[0],
+            "BASELINE   >100% of decode ceiling (prefix cache inflating throughput) | decode ~100 tok/s (est) | prefill ~50 tok/s (est)"
+        );
+        assert_eq!(
+            lines[1],
+            "           weight 16GB | kv_headroom 8GB | tpot_floor ~10ms"
+        );
+        assert_eq!(lines.len(), 2);
+    }
+
+    #[test]
+    fn baseline_lines_prefill_floor_hidden_when_at_or_above_ridge_running() {
+        let base = || engine::PhysicsBaseline {
+            decode: engine::CeilingEstimate {
+                lower: 85.0,
+                expected: 100.0,
+                upper: 105.0,
+            },
+            prefill: Some(engine::CeilingEstimate {
+                lower: 90.0,
+                expected: 100.0,
+                upper: 110.0,
+            }),
+            efficiency_pct: Some(50.0),
+            headroom_pct: Some(50.0),
+            weight_dtype_source: engine::WeightDtypeSource::EnvVar,
+            weight_gb: 16.0,
+            kv_headroom_gb: Some(8.0),
+            tpot_floor_ms: 10.0,
+            prefill_latency_floor_ms: Some(42.0),
+            ridge_batch_size: 40.0,
+        };
+        let above = baseline_lines(Some(base()), None, Some(40.0));
+        assert!(
+            !above[1].contains("prefill_floor"),
+            "expected no prefill_floor at ridge: {}",
+            above[1]
+        );
+        let below = baseline_lines(Some(base()), None, Some(39.0));
+        assert!(
+            below[1].contains("prefill_floor ~42ms"),
+            "expected prefill_floor below ridge: {}",
+            below[1]
+        );
+    }
+
+    #[test]
+    fn baseline_lines_prefill_ceiling_and_floor_suppressed_when_prefill_below_10_tok_s() {
+        let b = engine::PhysicsBaseline {
+            decode: engine::CeilingEstimate {
+                lower: 85.0,
+                expected: 100.0,
+                upper: 105.0,
+            },
+            prefill: Some(engine::CeilingEstimate {
+                lower: 4.0,
+                expected: 5.0,
+                upper: 6.0,
+            }),
+            efficiency_pct: Some(50.0),
+            headroom_pct: Some(50.0),
+            weight_dtype_source: engine::WeightDtypeSource::EnvVar,
+            weight_gb: 16.0,
+            kv_headroom_gb: Some(8.0),
+            tpot_floor_ms: 10.0,
+            prefill_latency_floor_ms: Some(200.0),
+            ridge_batch_size: 40.0,
+        };
+        let lines = baseline_lines(Some(b), None, Some(5.0));
+        assert!(
+            !lines[0].contains("prefill ~"),
+            "line1 should omit low prefill ceiling: {}",
+            lines[0]
+        );
+        assert!(
+            !lines[1].contains("prefill_floor"),
+            "line2 should omit prefill_floor when ceiling suppressed: {}",
+            lines[1]
+        );
+    }
+
+    #[test]
+    fn baseline_lines_prefill_ceiling_and_floor_shown_when_meaningful_and_below_ridge() {
+        let b = engine::PhysicsBaseline {
+            decode: engine::CeilingEstimate {
+                lower: 85.0,
+                expected: 100.0,
+                upper: 105.0,
+            },
+            prefill: Some(engine::CeilingEstimate {
+                lower: 90.0,
+                expected: 50.0,
+                upper: 55.0,
+            }),
+            efficiency_pct: Some(50.0),
+            headroom_pct: Some(50.0),
+            weight_dtype_source: engine::WeightDtypeSource::EnvVar,
+            weight_gb: 16.0,
+            kv_headroom_gb: Some(8.0),
+            tpot_floor_ms: 10.0,
+            prefill_latency_floor_ms: Some(20.0),
+            ridge_batch_size: 40.0,
+        };
+        let lines = baseline_lines(Some(b), None, Some(10.0));
+        assert!(
+            lines[0].contains("prefill ~50 tok/s (est)"),
+            "line1 should include prefill ceiling: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("prefill_floor ~20ms"),
+            "line2 should include prefill_floor below ridge: {}",
+            lines[1]
+        );
     }
 
     #[test]
