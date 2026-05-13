@@ -498,9 +498,9 @@ mod tests {
         let lines = format_diagnose_rules(ai(&ctx, &win), false);
         let text = lines.join("\n");
         assert!(text.contains("ISSUE: Under-batching"));
-        assert!(text.contains("Very low occupancy"));
-        assert!(text.contains("3.1 / 256"));
-        assert!(text.contains("avg GPU util 58% with headroom"));
+        assert!(text.contains("avg GPU util 58% (threshold: 62%)"));
+        assert!(text.contains("occupancy 1.2% (threshold: 4%)"));
+        assert!(text.contains("3.1 / 256 max_seqs"));
         assert!(text.contains("Recommendation:"));
         assert!(text.contains("  • Increase client concurrency or request rate"));
         assert!(text.contains("  • Raise max_num_seqs if VRAM allows"));
@@ -629,7 +629,7 @@ mod tests {
         let win_kv_only = mk_win(s_kv_only);
         let text = format_diagnose_rules(ai(&ctx2, &win_kv_only), false).join("\n");
         assert!(text.contains("Cause:"));
-        assert!(text.contains("  - KV usage 86.0% — near capacity"));
+        assert!(text.contains("  - KV usage 86.0% (threshold: 85%)"));
         assert!(text.contains("  - High concurrency (~3 running requests)"));
         assert!(text.contains("Expected: 20–45% better throughput"));
         assert!(
@@ -654,7 +654,7 @@ mod tests {
         let win = mk_win(s);
         let text = format_diagnose_rules(ai(&ctx, &win), false).join("\n");
         assert!(text.contains("Confidence: Medium-High"));
-        assert!(text.contains("  - KV usage 86.0% — near capacity"));
+        assert!(text.contains("  - KV usage 86.0% (threshold: 85%)"));
     }
 
     #[test]
@@ -713,7 +713,7 @@ mod tests {
         let text = lines.join("\n");
         assert!(text.contains("ISSUE: Low Prefix Cache"));
         assert!(text.contains("Cause:"));
-        assert!(text.contains("  - Prefix hit rate 24.0%"));
+        assert!(text.contains("  - Prefix hit rate 24.0% (threshold: 35%)"));
         assert!(text.contains("  - Prompts have no shared leading context"));
         assert!(text.contains("Recommendation:"));
         assert!(
@@ -829,7 +829,7 @@ mod tests {
         assert!(text.contains("Under-batching"));
         assert!(text.contains("Seen in 40% of windows"));
         assert!(text.contains(
-            "Cause: Very low occupancy — avg 3.2 / 256 (1.2%), avg GPU util 50.0% with headroom"
+            "Cause: avg GPU util 50.0% (threshold: 62%) and occupancy 1.2% (threshold: 4%) — avg 3.2 / 256 max_seqs"
         ));
         assert!(text.contains("For better efficiency:"));
         assert!(text.contains("No issues for KV Cache Pressure and Low Prefix Cache"));

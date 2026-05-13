@@ -69,7 +69,10 @@ pub(super) fn format_low_prefix_hit_rate_fired(d: &LowPrefixReuseDetail) -> Vec<
     vec![
         "ISSUE: Low Prefix Cache".to_string(),
         "Cause:".to_string(),
-        format!("  - Prefix hit rate {hit:.1}%"),
+        format!(
+            "  - Prefix hit rate {hit:.1}% (threshold: {:.0}%)",
+            PREFIX_HIT_RATE_LT * 100.0
+        ),
         "  - Prompts have no shared leading context".to_string(),
         String::new(),
         "Recommendation:".to_string(),
@@ -93,7 +96,11 @@ pub(super) fn format_low_prefix_window_issue(
         "Low Prefix Cache".to_string(),
         format!("Seen in {seen_pct}% of windows"),
         "Cause:".to_string(),
-        format!("  - Prefix hit rate {:.1}%", d.hit_rate * 100.0),
+        format!(
+            "  - Prefix hit rate {:.1}% (threshold: {:.0}%)",
+            d.hit_rate * 100.0,
+            PREFIX_HIT_RATE_LT * 100.0
+        ),
         "  - Prompts have no shared leading context".to_string(),
         String::new(),
         "Recommendation:".to_string(),

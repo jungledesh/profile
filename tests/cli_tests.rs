@@ -138,7 +138,7 @@ fn diagnose_exits_success() {
         "stdout should include LATENCY row; got:\n{out}"
     );
     assert!(
-        out.contains("PROMPT") && out.contains(" tok"),
+        out.contains("PROMPT") && out.contains("kv_cache"),
         "stdout should include PROMPT row; got:\n{out}"
     );
     assert!(

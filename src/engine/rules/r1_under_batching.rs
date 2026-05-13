@@ -94,10 +94,13 @@ pub(super) fn format_under_batching_fired(d: &UnderBatchingDetail) -> Vec<String
     let pct = (d.running / f64::from(d.max_num_seqs)) * 100.0;
     let run_s = fmt_f64_display(d.running);
     let gpu_s = fmt_f64_display(d.gpu_util);
+    let occ_thresh_pct = UNDER_BATCHING_OCCUPANCY_FRAC * 100.0;
     vec![
         "ISSUE: Under-batching".to_string(),
         format!(
-            "Cause: Very low occupancy — {run_s} / {} ({pct:.1}%), avg GPU util {gpu_s}% with headroom",
+            "Cause: avg GPU util {gpu_s}% (threshold: {:.0}%) and occupancy {pct:.1}% (threshold: {:.0}%) — {run_s} / {} max_seqs",
+            UNDER_BATCHING_GPU_UTIL_LT,
+            occ_thresh_pct,
             d.max_num_seqs,
         ),
         String::new(),
@@ -115,12 +118,17 @@ pub(super) fn format_under_batching_window_issue(
     seen_pct: u32,
 ) -> Vec<String> {
     let occupancy_pct = (d.running / f64::from(d.max_num_seqs)) * 100.0;
+    let occ_thresh_pct = UNDER_BATCHING_OCCUPANCY_FRAC * 100.0;
     vec![
         "Under-batching".to_string(),
         format!("Seen in {seen_pct}% of windows"),
         format!(
-            "Cause: Very low occupancy — avg {:.1} / {} ({occupancy_pct:.1}%), avg GPU util {:.1}% with headroom",
-            d.running, d.max_num_seqs, d.gpu_util
+            "Cause: avg GPU util {:.1}% (threshold: {:.0}%) and occupancy {occupancy_pct:.1}% (threshold: {:.0}%) — avg {:.1} / {} max_seqs",
+            d.gpu_util,
+            UNDER_BATCHING_GPU_UTIL_LT,
+            occ_thresh_pct,
+            d.running,
+            d.max_num_seqs,
         ),
         String::new(),
         "For better efficiency:".to_string(),
