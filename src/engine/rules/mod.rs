@@ -210,7 +210,7 @@ pub fn format_diagnose_rules_for_windows(
         return out;
     }
 
-    let mut out = vec!["ISSUES:".to_string(), String::new()];
+    let mut out = Vec::new();
 
     if r1_fired > 0 {
         out.extend(format_under_batching_window_issue(
@@ -825,7 +825,6 @@ mod tests {
         let summary = ai(&ctx, windows.last().expect("summary source"));
         let lines = format_diagnose_rules_for_windows(&windows, summary, false);
         let text = lines.join("\n");
-        assert!(text.contains("ISSUES:"));
         assert!(text.contains("Under-batching"));
         assert!(text.contains("Seen in 40% of windows"));
         assert!(text.contains(

@@ -61,6 +61,7 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
     let summary_input = AnalysisInput::new(&result.static_ctx, &aggregate_win);
     let report = engine::build_report(summary_input);
     if verbose_rules {
+        lines.push(String::new());
         lines.extend(baseline_lines(
             report.baseline,
             aggregate_win.snapshot.vllm.prefix_cache_hit_rate,
@@ -94,8 +95,8 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
             gpu_detail_line(g),
             width = VLLM_LABEL_W
         ));
-        lines.push(String::new());
     }
+    lines.push(String::new());
     lines.push(vllm_label_row("vLLM:", ""));
     lines.push(vllm_label_row("REQUESTS", &vllm_requests_value(v)));
     lines.push(vllm_label_row(
@@ -126,11 +127,10 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
     };
     if !rule_lines.is_empty() {
         lines.push(String::new());
+        lines.push("ISSUES:".to_string());
+        lines.push(String::new());
         lines.extend(rule_lines);
     }
-
-    lines.push(String::new());
-    lines.push("† LATENCY, THROUGHPUT, GPU UTIL, CACHE: under active load only".to_string());
 
     lines
 }
@@ -198,7 +198,7 @@ fn baseline_lines(
     num_requests_running: Option<f64>,
 ) -> Vec<String> {
     let Some(b) = baseline else {
-        return vec!["BASELINE   unavailable — model not recognized".to_string()];
+        return vec!["HW LIMITS  unavailable — model not recognized".to_string()];
     };
 
     // Line 1: efficiency + throughput ceilings
@@ -249,7 +249,7 @@ fn baseline_lines(
     }
 
     let mut out = vec![
-        format!("BASELINE   {}", seg1.join(" | ")),
+        format!("HW LIMITS  {}", seg1.join(" | ")),
         format!("           {}", seg2.join(" | ")),
     ];
     if b.weight_dtype_source == engine::WeightDtypeSource::Fallback {
@@ -735,7 +735,7 @@ mod tests {
         let lines = baseline_lines(Some(b), Some(0.4), None);
         assert_eq!(
             lines[0],
-            "BASELINE   >100% of decode ceiling (prefix cache inflating throughput) | decode ~100 tok/s (est) | prefill ~50 tok/s (est)"
+            "HW LIMITS  >100% of decode ceiling (prefix cache inflating throughput) | decode ~100 tok/s (est) | prefill ~50 tok/s (est)"
         );
         assert_eq!(
             lines[1],
@@ -1062,7 +1062,7 @@ mod tests {
     }
 
     #[test]
-    fn diagnose_lines_when_no_evaluable_skip_metric_table_and_dagger() {
+    fn diagnose_lines_when_no_evaluable_skip_metric_table() {
         let idle_snap = RawSnapshot {
             gpu_observed_at: UNIX_EPOCH,
             vllm_observed_at: UNIX_EPOCH,
@@ -1092,6 +1092,5 @@ mod tests {
         assert!(text.contains("Target:") && text.contains("127.0.0.1"));
         assert!(text.contains("No qualifying load"));
         assert!(!text.contains("GPU =>"));
-        assert!(!text.contains("† LATENCY"));
     }
 }
