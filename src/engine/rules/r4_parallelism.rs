@@ -16,6 +16,7 @@ pub fn r4_recommendation(
         return None;
     }
     let overflow = h.abs();
+    let tp = tensor_parallel_size.unwrap_or(1);
     Some(Recommendation {
         rule_name: "parallelism_mismatch",
         impact: 5,
@@ -28,8 +29,8 @@ pub fn r4_recommendation(
         display_lines: vec![
             "Parallelism Mismatch".to_string(),
             format!(
-                "Cause: Model weights exceed single-GPU VRAM by {:.0}GB",
-                overflow
+                "Cause: KV headroom {:.1}GB (threshold: ≥0GB); TP {tp} (threshold: ≥2); weights overflow ~{:.0}GB past single-GPU fit",
+                h, overflow
             ),
             String::new(),
             "Recommendation:".to_string(),
@@ -55,6 +56,10 @@ mod tests {
         assert_eq!(r.impact, 5);
         assert!((r.confidence - 0.95).abs() < 1e-9);
         assert!(r.action.contains("tensor-parallel-size"));
+        let cause = r.display_lines[1].as_str();
+        assert!(cause.contains("KV headroom"));
+        assert!(cause.contains("threshold: ≥0GB"));
+        assert!(cause.contains("TP 1 (threshold: ≥2)"));
     }
 
     #[test]

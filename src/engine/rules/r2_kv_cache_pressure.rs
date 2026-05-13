@@ -85,7 +85,10 @@ pub(super) fn format_kv_cache_pressure_fired(
     let mut out = vec![
         "ISSUE: KV Cache Pressure".to_string(),
         "Cause:".to_string(),
-        format!("  - KV usage {kv:.1}% — near capacity"),
+        format!(
+            "  - KV usage {kv:.1}% (threshold: {:.0}%)",
+            KV_CACHE_PRESSURE_MIN_PERC
+        ),
     ];
     if let Some(r) = snapshot.vllm.num_requests_running.filter(|x| x.is_finite()) {
         out.push(format!("  - High concurrency (~{:.0} running requests)", r));
@@ -118,7 +121,10 @@ pub(super) fn format_kv_cache_window_issue(
         "KV Cache Pressure".to_string(),
         format!("Seen in {seen_pct}% of windows"),
         "Cause:".to_string(),
-        format!("  - KV usage {:.1}% — near capacity", d.kv_cache_usage_perc),
+        format!(
+            "  - KV usage {:.1}% (threshold: {:.0}%)",
+            d.kv_cache_usage_perc, KV_CACHE_PRESSURE_MIN_PERC
+        ),
     ];
     if let Some(r) = summary.vllm.num_requests_running.filter(|x| x.is_finite()) {
         out.push(format!("  - High concurrency (~{:.0} running requests)", r));

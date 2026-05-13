@@ -1,10 +1,11 @@
 use std::time::Duration;
 
 use super::{delta, drift, poll, run_diagnose, state::LoopState, DiagnoseResult};
-use crate::cli::goal::{check_feasibility, FeasibilityResult, Goal};
 use crate::context::{AnalysisInput, RuntimeWindow};
 use crate::engine;
 use crate::output;
+
+const CEILING_HEADROOM_THRESHOLD_PCT: f64 = 10.0;
 
 pub fn run(
     url: &str,
@@ -12,7 +13,6 @@ pub fn run(
     duration: Duration,
     initial_result: DiagnoseResult,
     initial_report: engine::Report,
-    goal: Goal,
 ) -> anyhow::Result<()> {
     let mut state = LoopState::new(initial_result, initial_report);
     let mut iteration: u32 = 1;
@@ -21,7 +21,19 @@ pub fn run(
     loop {
         let (rule_name, display_lines) = match state.current_primary_recommendation() {
             None => {
-                println!("\nNo issues detected. Server looks healthy.");
+                let baseline = state.last().report.baseline.as_ref();
+                let efficiency = baseline.and_then(|b| b.efficiency_pct);
+                let headroom = baseline.and_then(|b| b.headroom_pct);
+
+                let msg = if efficiency.is_some_and(|e| e > 100.0) {
+                    "No issues detected. Server is healthy under current load."
+                } else if headroom.is_some_and(|h| h < CEILING_HEADROOM_THRESHOLD_PCT) {
+                    "No issues detected. Server is at hardware capacity."
+                } else {
+                    "No issues detected. Server is healthy under current load."
+                };
+
+                println!("\n{msg}");
                 break;
             }
             Some(rec) => (rec.rule_name, rec.display_lines.clone()),
@@ -65,17 +77,6 @@ pub fn run(
         print_delta(&d);
 
         output::stdout::print_diagnose_table(&new_result, false);
-
-        match check_feasibility(&goal, new_report.baseline.as_ref()) {
-            FeasibilityResult::AtCeiling { headroom_pct } => {
-                println!(
-                    "\nAt hardware ceiling ({:.1}% headroom). No further improvement possible.",
-                    headroom_pct
-                );
-                break;
-            }
-            FeasibilityResult::Reachable => {}
-        }
 
         match d.direction {
             delta::Direction::Worse => {

@@ -31,11 +31,12 @@ RUN mkdir -p "${APP_DIR}" "${MODELS_DIR}" /workspace && \
 WORKDIR ${APP_DIR}
 
 COPY --chown=appuser:appuser scripts/start.sh ./start.sh
+COPY --chown=appuser:appuser scripts/load.sh ./load.sh
 COPY --chown=appuser:appuser scripts/test.sh ./test.sh
 COPY --chown=appuser:appuser scripts/test2.sh ./test2.sh
 COPY --chown=appuser:appuser target/release/profile ./profile
 
-RUN chmod 0755 ./start.sh ./test.sh ./test2.sh ./profile
+RUN chmod 0755 ./start.sh ./load.sh ./test.sh ./test2.sh ./profile
 
 USER appuser
 
