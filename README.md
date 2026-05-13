@@ -17,9 +17,13 @@ Find and fix inference bottlenecks in minutes.
 
 It tells you **what’s wrong, why it’s happening, and what to fix first**, so you can reduce cost per token.
 
-### Reports 3 kind of numbers
+### Reports 3 kinds of numbers
 
-1. **Under-load behavior only** This means profile reports the character of your server under real load, not a session-wide average diluted by quiet time
+1. **Under-load behavior only** — profile filters out idle windows and reports only what happens under real traffic. A session-wide average diluted by quiet time hides the problem; profile shows you the character of your server when it's actually working.
+
+2. **Aggregated, not instantaneous** — a single 250ms sample is noise. Profile collects across your full observation window and aggregates correctly: rates as duration-weighted means, latency histograms as true deltas, gauges as last stable value. What you see is representative, not lucky.
+
+3. **Hardware-referenced** — every number is shown against what your specific GPU and model are theoretically capable of. Not a generic benchmark. Not a guess. Your actual decode ceiling, your actual weight footprint, your actual headroom.
 
 ## Why use this
 

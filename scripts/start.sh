@@ -66,7 +66,7 @@ python -m vllm.entrypoints.openai.api_server \
   --host 0.0.0.0 \
   --port 8000 \
   --dtype auto \
-  --gpu-memory-utilization 0.8 \
+  --gpu-memory-utilization 0.55 \
   --tensor-parallel-size 1 \
   --enforce-eager \
   --enable-prefix-caching \

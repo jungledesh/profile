@@ -42,7 +42,6 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
     let snapshot = &result.snapshot;
     let v = &snapshot.vllm;
     let g = &snapshot.gpu;
-    let cfg = &result.static_ctx.config;
     let duration = result.duration;
     let started_at = result.started_at;
 
@@ -61,12 +60,15 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
     let aggregate_win = crate::context::RuntimeWindow::from_snapshot(result.snapshot.clone());
     let summary_input = AnalysisInput::new(&result.static_ctx, &aggregate_win);
     let report = engine::build_report(summary_input);
-    lines.extend(baseline_lines(
-        report.baseline,
-        aggregate_win.snapshot.vllm.prefix_cache_hit_rate,
-        aggregate_win.snapshot.vllm.num_requests_running,
-    ));
-    lines.push(String::new());
+    if verbose_rules {
+        lines.push(String::new());
+        lines.extend(baseline_lines(
+            report.baseline,
+            aggregate_win.snapshot.vllm.prefix_cache_hit_rate,
+            aggregate_win.snapshot.vllm.num_requests_running,
+        ));
+        lines.push(String::new());
+    }
 
     if !result.any_evaluable {
         lines.push(vllm_label_row("Target:", &result.metrics_input));
@@ -85,27 +87,38 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
         gpu_gauges_line(g),
         width = VLLM_LABEL_W
     ));
-    lines.push(format!(
-        "{:<width$}{}{}",
-        "",
-        VLLM_LABEL_METRICS_GAP,
-        gpu_detail_line(g),
-        width = VLLM_LABEL_W
-    ));
+    if verbose_rules {
+        lines.push(format!(
+            "{:<width$}{}{}",
+            "",
+            VLLM_LABEL_METRICS_GAP,
+            gpu_detail_line(g),
+            width = VLLM_LABEL_W
+        ));
+    }
     lines.push(String::new());
     lines.push(vllm_label_row("vLLM:", ""));
     lines.push(vllm_label_row("REQUESTS", &vllm_requests_value(v)));
-    lines.push(vllm_label_row("LATENCY", &vllm_latency_value(v)));
-    lines.push(vllm_label_row("PROMPT", &vllm_prompt_value(v)));
+    lines.push(vllm_label_row(
+        "LATENCY",
+        &vllm_latency_value(v, verbose_rules),
+    ));
+    lines.push(vllm_label_row(
+        "PROMPT",
+        &vllm_prompt_value(v, verbose_rules),
+    ));
     lines.push(vllm_label_row("THROUGHPUT", &vllm_throughput_value(v)));
-    lines.push(vllm_label_row("MEMORY", &vllm_memory_value(v)));
-    lines.push(vllm_label_row("TRAFFIC", &vllm_traffic_value(v)));
-    lines.push(vllm_label_row("CACHE CFG", &vllm_cache_cfg_value(v)));
-    lines.push(String::new());
-    lines.push(vllm_label_row("Config:", ""));
-    lines.push(vllm_label_row("PARALLEL", &config_parallel_value(cfg)));
-    lines.push(vllm_label_row("MODEL", &config_model_value(cfg)));
-    lines.push(vllm_label_row("KV", &config_kv_value(cfg)));
+    if verbose_rules {
+        lines.push(vllm_label_row("MEMORY", &vllm_memory_value(v)));
+        lines.push(vllm_label_row("TRAFFIC", &vllm_traffic_value(v)));
+        lines.push(vllm_label_row("CACHE CFG", &vllm_cache_cfg_value(v)));
+        lines.push(String::new());
+        lines.push(vllm_label_row("Config:", ""));
+        let cfg = &result.static_ctx.config;
+        lines.push(vllm_label_row("PARALLEL", &config_parallel_value(cfg)));
+        lines.push(vllm_label_row("MODEL", &config_model_value(cfg)));
+        lines.push(vllm_label_row("KV", &config_kv_value(cfg)));
+    }
 
     let rule_lines = if result.windows.len() <= 1 {
         engine::format_diagnose_rules(summary_input, verbose_rules)
@@ -114,11 +127,10 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
     };
     if !rule_lines.is_empty() {
         lines.push(String::new());
+        lines.push("ISSUES:".to_string());
+        lines.push(String::new());
         lines.extend(rule_lines);
     }
-
-    lines.push(String::new());
-    lines.push("† LATENCY, THROUGHPUT, GPU UTIL, CACHE: under active load only".to_string());
 
     lines
 }
@@ -186,7 +198,7 @@ fn baseline_lines(
     num_requests_running: Option<f64>,
 ) -> Vec<String> {
     let Some(b) = baseline else {
-        return vec!["BASELINE   unavailable — model not recognized".to_string()];
+        return vec!["HW LIMITS  unavailable — model not recognized".to_string()];
     };
 
     // Line 1: efficiency + throughput ceilings
@@ -237,7 +249,7 @@ fn baseline_lines(
     }
 
     let mut out = vec![
-        format!("BASELINE   {}", seg1.join(" | ")),
+        format!("HW LIMITS  {}", seg1.join(" | ")),
         format!("           {}", seg2.join(" | ")),
     ];
     if b.weight_dtype_source == engine::WeightDtypeSource::Fallback {
@@ -335,7 +347,7 @@ fn fmt_gauge(x: f64) -> String {
     }
 }
 
-fn vllm_latency_value(v: &VllmRawMetrics) -> String {
+fn vllm_latency_value(v: &VllmRawMetrics, verbose: bool) -> String {
     let ttft = v
         .ttft_ms
         .map(fmt_seconds_from_ms)
@@ -344,6 +356,9 @@ fn vllm_latency_value(v: &VllmRawMetrics) -> String {
         .tpot_ms
         .map(fmt_seconds_from_ms)
         .unwrap_or_else(|| "—".to_string());
+    if !verbose {
+        return format!("ttft {ttft} | tpot {tpot}");
+    }
     let prefill = v
         .prefill_latency_ms
         .map(fmt_seconds_from_ms)
@@ -352,16 +367,11 @@ fn vllm_latency_value(v: &VllmRawMetrics) -> String {
         .queue_delay_ms
         .map(fmt_seconds_from_ms)
         .unwrap_or_else(|| "—".to_string());
-
     format!("ttft {ttft} | tpot {tpot} | prefill {prefill} | queue {queue}")
 }
 
-fn vllm_prompt_value(v: &VllmRawMetrics) -> String {
-    let n = v
-        .prompt_tokens_mean
-        .map(fmt_tok)
-        .unwrap_or_else(|| "—".to_string());
-    let kv = match v.kv_cache_usage_perc.filter(|x| x.is_finite()) {
+fn vllm_prompt_kv_fragment(v: &VllmRawMetrics) -> String {
+    match v.kv_cache_usage_perc.filter(|x| x.is_finite()) {
         Some(p) => {
             let mut s = format!("kv_cache {:.1}%", p);
             if let Some(pk) = v.kv_cache_peak_perc.filter(|x| x.is_finite()) {
@@ -372,7 +382,18 @@ fn vllm_prompt_value(v: &VllmRawMetrics) -> String {
             s
         }
         None => "kv_cache —".to_string(),
-    };
+    }
+}
+
+fn vllm_prompt_value(v: &VllmRawMetrics, verbose: bool) -> String {
+    let kv = vllm_prompt_kv_fragment(v);
+    if !verbose {
+        return kv;
+    }
+    let n = v
+        .prompt_tokens_mean
+        .map(fmt_tok)
+        .unwrap_or_else(|| "—".to_string());
     format!("{n} tok | {kv}")
 }
 
@@ -714,7 +735,7 @@ mod tests {
         let lines = baseline_lines(Some(b), Some(0.4), None);
         assert_eq!(
             lines[0],
-            "BASELINE   >100% of decode ceiling (prefix cache inflating throughput) | decode ~100 tok/s (est) | prefill ~50 tok/s (est)"
+            "HW LIMITS  >100% of decode ceiling (prefix cache inflating throughput) | decode ~100 tok/s (est) | prefill ~50 tok/s (est)"
         );
         assert_eq!(
             lines[1],
@@ -960,13 +981,23 @@ mod tests {
     }
 
     #[test]
-    fn vllm_prompt_value_includes_kv_cache() {
+    fn vllm_prompt_value_default_is_kv_only() {
         let v = VllmRawMetrics {
             prompt_tokens_mean: Some(18.0),
             kv_cache_usage_perc: Some(45.25),
             ..Default::default()
         };
-        assert_eq!(vllm_prompt_value(&v), "18 tok | kv_cache 45.2%");
+        assert_eq!(vllm_prompt_value(&v, false), "kv_cache 45.2%");
+    }
+
+    #[test]
+    fn vllm_prompt_value_verbose_includes_prompt_tok_and_kv() {
+        let v = VllmRawMetrics {
+            prompt_tokens_mean: Some(18.0),
+            kv_cache_usage_perc: Some(45.25),
+            ..Default::default()
+        };
+        assert_eq!(vllm_prompt_value(&v, true), "18 tok | kv_cache 45.2%");
         let v_peak = VllmRawMetrics {
             prompt_tokens_mean: Some(18.0),
             kv_cache_usage_perc: Some(40.0),
@@ -974,7 +1005,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            vllm_prompt_value(&v_peak),
+            vllm_prompt_value(&v_peak, true),
             "18 tok | kv_cache 40.0% (peak 92.0%)"
         );
         let peak_below_threshold = VllmRawMetrics {
@@ -984,7 +1015,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            vllm_prompt_value(&peak_below_threshold),
+            vllm_prompt_value(&peak_below_threshold, true),
             "18 tok | kv_cache 40.0%"
         );
         let peak_not_above_last = VllmRawMetrics {
@@ -994,14 +1025,30 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            vllm_prompt_value(&peak_not_above_last),
+            vllm_prompt_value(&peak_not_above_last, true),
             "18 tok | kv_cache 92.0%"
         );
         let no_kv = VllmRawMetrics {
             prompt_tokens_mean: Some(512.0),
             ..Default::default()
         };
-        assert_eq!(vllm_prompt_value(&no_kv), "512 tok | kv_cache —");
+        assert_eq!(vllm_prompt_value(&no_kv, true), "512 tok | kv_cache —");
+    }
+
+    #[test]
+    fn vllm_latency_value_default_ttft_tpot_only() {
+        let v = VllmRawMetrics {
+            ttft_ms: Some(120.0),
+            tpot_ms: Some(50.0),
+            prefill_latency_ms: Some(200.0),
+            queue_delay_ms: Some(10.0),
+            ..Default::default()
+        };
+        assert_eq!(vllm_latency_value(&v, false), "ttft 120ms | tpot 50ms");
+        assert_eq!(
+            vllm_latency_value(&v, true),
+            "ttft 120ms | tpot 50ms | prefill 200ms | queue 10ms"
+        );
     }
 
     #[test]
@@ -1015,7 +1062,7 @@ mod tests {
     }
 
     #[test]
-    fn diagnose_lines_when_no_evaluable_skip_metric_table_and_dagger() {
+    fn diagnose_lines_when_no_evaluable_skip_metric_table() {
         let idle_snap = RawSnapshot {
             gpu_observed_at: UNIX_EPOCH,
             vllm_observed_at: UNIX_EPOCH,
@@ -1045,6 +1092,5 @@ mod tests {
         assert!(text.contains("Target:") && text.contains("127.0.0.1"));
         assert!(text.contains("No qualifying load"));
         assert!(!text.contains("GPU =>"));
-        assert!(!text.contains("† LATENCY"));
     }
 }
