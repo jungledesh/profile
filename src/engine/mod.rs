@@ -10,6 +10,8 @@ pub use rules::*;
 pub struct Report {
     pub baseline: Option<PhysicsBaseline>,
     pub groups: Vec<IssueGroup>,
+    /// True when r4 removed a `kv_cache_pressure` recommendation from this report.
+    pub r2_suppressed_by_r4: bool,
 }
 
 pub fn build_report(input: AnalysisInput<'_>) -> Report {
@@ -28,6 +30,13 @@ pub fn build_report(input: AnalysisInput<'_>) -> Report {
     .flatten()
     .collect();
 
+    let r2_present_before = recs.iter().any(|r| r.rule_name == "kv_cache_pressure");
+    let r4_fired = recs.iter().any(|r| r.rule_name == "parallelism_mismatch");
+    let r2_suppressed_by_r4 = r4_fired && r2_present_before;
+    if r4_fired {
+        recs.retain(|r| r.rule_name != "kv_cache_pressure");
+    }
+
     recs.sort_by(|a, b| {
         let sa = a.impact as f64 * a.confidence;
         let sb = b.impact as f64 * b.confidence;
@@ -42,7 +51,11 @@ pub fn build_report(input: AnalysisInput<'_>) -> Report {
         })
         .collect();
 
-    Report { baseline, groups }
+    Report {
+        baseline,
+        groups,
+        r2_suppressed_by_r4,
+    }
 }
 
 #[cfg(test)]
@@ -95,5 +108,55 @@ mod build_report_tests {
             );
         }
         assert_eq!(report.groups[0].primary.rule_name, "kv_cache_pressure");
+        assert!(!report.r2_suppressed_by_r4);
+    }
+
+    #[test]
+    fn build_report_suppresses_r2_when_r4_fires() {
+        use crate::collectors::VllmConfig;
+
+        let t = SystemTime::UNIX_EPOCH;
+        let v = VllmRawMetrics {
+            model_name: Some("meta-llama/Llama-3.1-70B-Instruct".to_string()),
+            num_requests_running: Some(3.0),
+            num_requests_waiting: Some(0.0),
+            max_num_seqs: Some(256),
+            kv_cache_usage_perc: Some(86.0),
+            generation_tokens_per_sec: Some(50.0),
+            request_success_per_sec: Some(10.0),
+            ..Default::default()
+        };
+        let g = GpuRawMetrics {
+            gpu_name: Some("NVIDIA H100 80GB HBM3".to_string()),
+            vram_total_mb: Some(80 * 1024),
+            gpu_util_pct: Some(58.0),
+            ..Default::default()
+        };
+        let s = RawSnapshot {
+            gpu_observed_at: t,
+            vllm_observed_at: t,
+            timestamp: t,
+            vllm: v,
+            gpu: g,
+        };
+        let cfg = VllmConfig {
+            dtype: Some("bf16".to_string()),
+            max_model_len: Some(2048),
+            ..Default::default()
+        };
+        let ctx = StaticContext::from_snapshot(&s, cfg);
+        let win = RuntimeWindow::from_snapshot(s);
+        let input = AnalysisInput::new(&ctx, &win);
+        let report = build_report(input);
+
+        assert!(report.r2_suppressed_by_r4);
+        assert!(report
+            .groups
+            .iter()
+            .any(|g| g.primary.rule_name == "parallelism_mismatch"));
+        assert!(!report
+            .groups
+            .iter()
+            .any(|g| g.primary.rule_name == "kv_cache_pressure"));
     }
 }

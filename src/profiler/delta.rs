@@ -117,6 +117,7 @@ mod tests {
                 ridge_batch_size: 1.0,
             }),
             groups: Vec::new(),
+            r2_suppressed_by_r4: false,
         }
     }
 

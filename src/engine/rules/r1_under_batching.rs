@@ -6,6 +6,7 @@ const UNDER_BATCHING_GPU_UTIL_LT: f64 = 62.0;
 const UNDER_BATCHING_RUNNING_GT: f64 = 0.75;
 const UNDER_BATCHING_OCCUPANCY_FRAC: f64 = 0.04;
 const UNDER_BATCHING_WAITING_LT: f64 = 2.0;
+const UNDER_BATCHING_TPOT_HIGH_MS: f64 = 100.0;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnderBatchingDetail {
@@ -80,56 +81,76 @@ pub fn r1_recommendation(snapshot: &RawSnapshot) -> Option<Recommendation> {
     let Rule1Outcome::Fired(d) = rule1_under_batching(snapshot) else {
         return None;
     };
+    let tpot = snapshot.vllm.tpot_ms;
+    let confidence = match tpot {
+        Some(t) if t >= UNDER_BATCHING_TPOT_HIGH_MS => 0.9,
+        Some(t) if t > 0.0 => 0.5,
+        _ => 0.5,
+    };
     Some(Recommendation {
         rule_name: "under_batching",
         impact: 4,
-        confidence: if d.gpu_util < 30.0 { 0.9 } else { 0.75 },
+        confidence,
         action: "Increase client concurrency or raise max_num_seqs".to_string(),
         expected_impact: "Higher GPU utilization and throughput".to_string(),
-        display_lines: format_under_batching_fired(&d),
+        display_lines: format_under_batching_fired(&d, tpot),
     })
 }
 
-pub(super) fn format_under_batching_fired(d: &UnderBatchingDetail) -> Vec<String> {
-    let pct = (d.running / f64::from(d.max_num_seqs)) * 100.0;
-    let run_s = fmt_f64_display(d.running);
-    let gpu_s = fmt_f64_display(d.gpu_util);
-    let occ_thresh_pct = UNDER_BATCHING_OCCUPANCY_FRAC * 100.0;
+fn under_batching_cause_from_tpot(d: &UnderBatchingDetail, tpot_ms: Option<f64>) -> String {
+    let occupancy_pct = (d.running / f64::from(d.max_num_seqs)) * 100.0;
+    if tpot_ms.is_some_and(|t| t >= UNDER_BATCHING_TPOT_HIGH_MS) {
+        let t = tpot_ms.expect("checked");
+        format!(
+            "Cause: GPU util {:.0}% (threshold: {:.0}%), occupancy {:.1}% (threshold: {:.0}%), tpot {:.0}ms — GPU has headroom but tokens are slow",
+            d.gpu_util,
+            UNDER_BATCHING_GPU_UTIL_LT,
+            occupancy_pct,
+            UNDER_BATCHING_OCCUPANCY_FRAC * 100.0,
+            t
+        )
+    } else {
+        format!(
+            "Cause: GPU util {:.0}% (threshold: {:.0}%), occupancy {:.1}% (threshold: {:.0}%) — likely light traffic",
+            d.gpu_util,
+            UNDER_BATCHING_GPU_UTIL_LT,
+            occupancy_pct,
+            UNDER_BATCHING_OCCUPANCY_FRAC * 100.0,
+        )
+    }
+}
+
+pub(super) fn format_under_batching_fired(
+    d: &UnderBatchingDetail,
+    tpot_ms: Option<f64>,
+) -> Vec<String> {
+    let conf = if tpot_ms.is_some_and(|t| t >= UNDER_BATCHING_TPOT_HIGH_MS) {
+        "Confidence: High"
+    } else {
+        "Confidence: Medium"
+    };
     vec![
         "ISSUE: Under-batching".to_string(),
-        format!(
-            "Cause: avg GPU util {gpu_s}% (threshold: {:.0}%) and occupancy {pct:.1}% (threshold: {:.0}%) — {run_s} / {} max_seqs",
-            UNDER_BATCHING_GPU_UTIL_LT,
-            occ_thresh_pct,
-            d.max_num_seqs,
-        ),
+        under_batching_cause_from_tpot(d, tpot_ms),
         String::new(),
         "Recommendation:".to_string(),
         "  • Increase client concurrency or request rate".to_string(),
         "  • Raise max_num_seqs if VRAM allows".to_string(),
         String::new(),
         "Expected: Better throughput".to_string(),
-        "Confidence: Medium-High".to_string(),
+        conf.to_string(),
     ]
 }
 
 pub(super) fn format_under_batching_window_issue(
     d: &UnderBatchingDetail,
     seen_pct: u32,
+    tpot_ms: Option<f64>,
 ) -> Vec<String> {
-    let occupancy_pct = (d.running / f64::from(d.max_num_seqs)) * 100.0;
-    let occ_thresh_pct = UNDER_BATCHING_OCCUPANCY_FRAC * 100.0;
     vec![
         "Under-batching".to_string(),
         format!("Seen in {seen_pct}% of windows"),
-        format!(
-            "Cause: avg GPU util {:.1}% (threshold: {:.0}%) and occupancy {occupancy_pct:.1}% (threshold: {:.0}%) — avg {:.1} / {} max_seqs",
-            d.gpu_util,
-            UNDER_BATCHING_GPU_UTIL_LT,
-            occ_thresh_pct,
-            d.running,
-            d.max_num_seqs,
-        ),
+        under_batching_cause_from_tpot(d, tpot_ms),
         String::new(),
         "For better efficiency:".to_string(),
         "  • Increase client concurrency or request rate".to_string(),
@@ -154,13 +175,5 @@ pub(super) fn aggregate_r1_detail(
         running,
         max_num_seqs: details[0].max_num_seqs,
         gpu_util: gpu,
-    }
-}
-
-fn fmt_f64_display(x: f64) -> String {
-    if (x - x.round()).abs() < 1e-6 {
-        format!("{:.0}", x)
-    } else {
-        format!("{:.1}", x)
     }
 }

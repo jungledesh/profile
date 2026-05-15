@@ -1,9 +1,9 @@
 use super::Recommendation;
 
-/// r4: weights do not fit a single GPU (`kv_headroom_gb < 0`) and TP is not configured.
+/// r4: weights exceed GPU VRAM budget (`kv_headroom_gb < 0`).
 pub fn r4_recommendation(
     kv_headroom_gb: Option<f64>,
-    tensor_parallel_size: Option<u32>,
+    _tensor_parallel_size: Option<u32>,
 ) -> Option<Recommendation> {
     let h = kv_headroom_gb?;
     if !h.is_finite() {
@@ -12,30 +12,26 @@ pub fn r4_recommendation(
     if h >= 0.0 {
         return None;
     }
-    if tensor_parallel_size.unwrap_or(1) > 1 {
-        return None;
-    }
     let overflow = h.abs();
-    let tp = tensor_parallel_size.unwrap_or(1);
     Some(Recommendation {
         rule_name: "parallelism_mismatch",
         impact: 5,
         confidence: 0.95,
         action: format!(
-            "Model weights exceed single-GPU VRAM by {:.0}GB — set --tensor-parallel-size ≥ 2",
+            "Model weights exceed GPU VRAM by {:.0}GB — increase --tensor-parallel-size",
             overflow
         ),
         expected_impact: "Model fits in memory; eliminates OOM risk".to_string(),
         display_lines: vec![
             "Parallelism Mismatch".to_string(),
             format!(
-                "Cause: KV headroom {:.1}GB (threshold: ≥0GB); TP {tp} (threshold: ≥2); weights overflow ~{:.0}GB past single-GPU fit",
+                "Cause: KV headroom {:.1}GB (threshold: ≥0GB); model weights exceed GPU VRAM by ~{:.0}GB",
                 h, overflow
             ),
             String::new(),
             "Recommendation:".to_string(),
             format!(
-                "  • Set --tensor-parallel-size ≥ 2 (weights overflow by {:.0}GB)",
+                "  • Increase --tensor-parallel-size (weights overflow by ~{:.0}GB)",
                 overflow
             ),
             String::new(),
@@ -50,7 +46,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn r4_fires_when_negative_headroom_and_tp_none() {
+    fn r4_fires_when_negative_headroom() {
         let r = r4_recommendation(Some(-12.5), None).expect("fired");
         assert_eq!(r.rule_name, "parallelism_mismatch");
         assert_eq!(r.impact, 5);
@@ -59,18 +55,19 @@ mod tests {
         let cause = r.display_lines[1].as_str();
         assert!(cause.contains("KV headroom"));
         assert!(cause.contains("threshold: ≥0GB"));
-        assert!(cause.contains("TP 1 (threshold: ≥2)"));
+        assert!(!cause.contains("TP "));
+    }
+
+    #[test]
+    fn r4_fires_when_negative_headroom_even_with_tp_configured() {
+        let r = r4_recommendation(Some(-8.0), Some(2)).expect("fired");
+        assert_eq!(r.rule_name, "parallelism_mismatch");
     }
 
     #[test]
     fn r4_suppressed_when_headroom_non_negative() {
         assert!(r4_recommendation(Some(4.0), None).is_none());
         assert!(r4_recommendation(Some(0.0), None).is_none());
-    }
-
-    #[test]
-    fn r4_suppressed_when_tp_configured() {
-        assert!(r4_recommendation(Some(-8.0), Some(2)).is_none());
     }
 
     #[test]

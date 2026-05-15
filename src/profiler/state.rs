@@ -101,6 +101,7 @@ mod tests {
         Report {
             baseline: None,
             groups: Vec::new(),
+            r2_suppressed_by_r4: false,
         }
     }
 
@@ -142,6 +143,7 @@ mod tests {
         let rep = Report {
             baseline: None,
             groups: vec![group("under_batching")],
+            r2_suppressed_by_r4: false,
         };
         let mut s = LoopState::new(r, rep);
         s.record_recommendation("under_batching");
@@ -156,6 +158,7 @@ mod tests {
         let rep = Report {
             baseline: None,
             groups: vec![group("a")],
+            r2_suppressed_by_r4: false,
         };
         let mut s = LoopState::new(r, rep);
         s.record_recommendation("under_batching");
