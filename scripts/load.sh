@@ -35,15 +35,16 @@ print(''.join(f'[{i:03d}] ' + chunk for i in range(1, 40)))
 LONG_CTX="$(long_context)"
 
 load_r1() {
-  # 3-4 concurrent requests, short output, gap between batches → GPU underutilised
+  # 2 concurrent requests, long output, gap between batches.
+  # Goal: keep GPU util < 62%, running > 0.75, waiting < 2, TPOT >= 100ms.
   while true; do
-    post "Explain RAM in 3 bullet points." 80 &
-    post "What is a CPU vs GPU? 3 bullets." 80 &
-    post "What is a database index? 3 bullets." 80 &
-    post "What is caching? Short answer." 80 &
-    sleep 0.4
+    post "Write a detailed 500-word essay on GPU architecture and
+          how tensor cores accelerate matrix multiplication." 600 &
+    post "Write a detailed 500-word essay on LLM inference
+          optimization techniques including batching and KV cache." 600 &
+    sleep 2.0
     wait
-    sleep 0.4
+    sleep 0.5
   done
 }
 
