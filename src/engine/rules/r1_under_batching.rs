@@ -162,6 +162,9 @@ pub(super) fn format_under_batching_window_issue(
     let mut lines = format_under_batching_fired(d);
     // Insert "Seen in N% of windows" after the header line.
     lines.insert(1, format!("  Seen in {seen_pct}% of windows"));
+    // Drop the GPU util line — it's already in the header and reflects a different
+    // window population than the fired-window average shown here.
+    lines.retain(|l| !l.trim_start().starts_with("GPU util"));
     lines
 }
 

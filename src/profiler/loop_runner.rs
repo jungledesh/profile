@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use super::{delta, drift, poll, run_diagnose, state::LoopState, DiagnoseResult};
+use crate::collectors::window_is_evaluable;
 use crate::context::{AnalysisInput, RuntimeWindow};
 use crate::engine;
 use crate::output;
@@ -18,7 +19,9 @@ pub fn run(
     let stdin_rx = poll::spawn_stdin_watcher();
 
     loop {
-        let rule_name = match state.current_primary_recommendation() {
+        let rule_name = match primary_window_rule(&state.last().result)
+            .or_else(|| state.current_primary_recommendation().map(|r| r.rule_name))
+        {
             None => {
                 let baseline = state.last().report.baseline.as_ref();
                 let efficiency = baseline.and_then(|b| b.efficiency_pct);
@@ -35,7 +38,7 @@ pub fn run(
                 println!("\n{msg}");
                 break;
             }
-            Some(rec) => rec.rule_name,
+            Some(rule_name) => rule_name,
         };
 
         if state.is_oscillating() {
@@ -87,6 +90,36 @@ pub fn run(
     }
 
     Ok(())
+}
+
+/// Returns the rule name that fired in >50% of evaluable windows, if any.
+/// This drives the loop exit decision — consistent with what the box shows.
+fn primary_window_rule(result: &DiagnoseResult) -> Option<&'static str> {
+    let ctx = &result.static_ctx;
+    let evaluable: Vec<_> = result
+        .windows
+        .iter()
+        .filter(|w| window_is_evaluable(&w.snapshot))
+        .collect();
+    let n = evaluable.len();
+    if n == 0 {
+        return None;
+    }
+    let r1_count = evaluable
+        .iter()
+        .filter(|w| {
+            let input = AnalysisInput::new(ctx, w);
+            let baseline = engine::baseline::compute(&input);
+            matches!(
+                engine::rule1_under_batching(&w.snapshot, baseline.as_ref()),
+                engine::Rule1Outcome::Fired(_)
+            )
+        })
+        .count();
+    if r1_count * 2 > n {
+        return Some("under_batching");
+    }
+    None
 }
 
 fn print_delta(d: &delta::Delta) {
