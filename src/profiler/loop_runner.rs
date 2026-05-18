@@ -15,11 +15,10 @@ pub fn run(
     initial_report: engine::Report,
 ) -> anyhow::Result<()> {
     let mut state = LoopState::new(initial_result, initial_report);
-    let mut iteration: u32 = 1;
     let stdin_rx = poll::spawn_stdin_watcher();
 
     loop {
-        let (rule_name, display_lines) = match state.current_primary_recommendation() {
+        let rule_name = match state.current_primary_recommendation() {
             None => {
                 let baseline = state.last().report.baseline.as_ref();
                 let efficiency = baseline.and_then(|b| b.efficiency_pct);
@@ -36,7 +35,7 @@ pub fn run(
                 println!("\n{msg}");
                 break;
             }
-            Some(rec) => (rec.rule_name, rec.display_lines.clone()),
+            Some(rec) => rec.rule_name,
         };
 
         if state.is_oscillating() {
@@ -47,10 +46,6 @@ pub fn run(
             break;
         }
 
-        println!("\n━━━ Iteration {iteration} ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        for line in &display_lines {
-            println!("{line}");
-        }
         state.record_recommendation(rule_name);
 
         let _outcome = poll::wait_for_restart_or_skip(url, &stdin_rx);
@@ -89,7 +84,6 @@ pub fn run(
         }
 
         state.push(new_result, new_report, Some(rule_name));
-        iteration += 1;
     }
 
     Ok(())

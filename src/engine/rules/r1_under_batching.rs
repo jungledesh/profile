@@ -159,30 +159,10 @@ pub(super) fn format_under_batching_window_issue(
     d: &UnderBatchingDetail,
     seen_pct: u32,
 ) -> Vec<String> {
-    vec![
-        "[!] Under-batching — Memory-Bandwidth Bottleneck".to_string(),
-        format!("  Seen in {seen_pct}% of windows"),
-        String::new(),
-        format!(
-            "  GPU util   {:.1}%  (threshold: < {:.0}%)",
-            d.gpu_util, UNDER_BATCHING_GPU_UTIL_LT
-        ),
-        format!(
-            "  TPOT       {:.1}ms     (floor: {:.1}ms, ratio: {:.1}x, threshold: ≥ {:.1}x)",
-            d.tpot_ms, d.tpot_floor_ms, d.tpot_ratio, UNDER_BATCHING_TPOT_RATIO
-        ),
-        format!(
-            "  Requests   {:.0} running, {:.0} waiting",
-            d.running, d.waiting
-        ),
-        String::new(),
-        "  Fix:".to_string(),
-        format!(
-            "    • Raise --max-num-seqs (current: {}) if upstream traffic is queuing elsewhere",
-            d.max_num_seqs
-        ),
-        "    • Increase client concurrency to feed the GPU larger batches".to_string(),
-    ]
+    let mut lines = format_under_batching_fired(d);
+    // Insert "Seen in N% of windows" after the header line.
+    lines.insert(1, format!("  Seen in {seen_pct}% of windows"));
+    lines
 }
 
 pub(super) fn aggregate_r1_detail(
