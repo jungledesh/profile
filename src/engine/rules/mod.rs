@@ -233,7 +233,6 @@ pub fn format_diagnose_rules_for_windows(
         out.extend(format_under_batching_window_issue(
             &aggregate_r1_detail(&r1_details, summary_snap),
             pct(r1_fired, n_eval),
-            summary_snap.vllm.tpot_ms,
         ));
         out.push(String::new());
     } else if verbose_rules {
@@ -433,31 +432,23 @@ mod tests {
     #[test]
     fn under_batching_fires_when_gates_pass() {
         let t = SystemTime::UNIX_EPOCH;
-        let s = snap(t, t, vllm_base(), gpu_low());
+        let mut v = vllm_base();
+        v.tpot_ms = Some(120.0);
+        let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
         let r = r1_recommendation(&win.snapshot).expect("r1 fired");
         assert_eq!(r.rule_name, "under_batching");
         assert_eq!(r.impact, 4);
-        assert!((r.confidence - 0.5).abs() < 1e-9);
+        assert!((r.confidence - 0.9).abs() < 1e-9);
         match rule1_under_batching(&win.snapshot) {
             Rule1Outcome::Fired(d) => {
                 assert!((d.running - 3.1).abs() < 1e-9);
                 assert_eq!(d.max_num_seqs, 256);
                 assert!((d.gpu_util - 58.0).abs() < 1e-9);
+                assert!((d.tpot_ms - 120.0).abs() < 1e-9);
             }
             Rule1Outcome::NotFired(_) => panic!("expected fired"),
         }
-    }
-
-    #[test]
-    fn r1_recommendation_higher_confidence_when_tpot_high() {
-        let t = SystemTime::UNIX_EPOCH;
-        let mut v = vllm_base();
-        v.tpot_ms = Some(120.0);
-        let s = snap(t, t, v, gpu_low());
-        let r = r1_recommendation(&s).expect("fired");
-        assert_eq!(r.rule_name, "under_batching");
-        assert!((r.confidence - 0.9).abs() < 1e-9);
     }
 
     #[test]
@@ -510,26 +501,6 @@ mod tests {
     }
 
     #[test]
-    fn high_occupancy_suppresses() {
-        let t = SystemTime::UNIX_EPOCH;
-        let mut v = vllm_base();
-        v.num_requests_running = Some(40.0);
-        let s = snap(t, t, v, gpu_low());
-        let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot).is_none());
-    }
-
-    #[test]
-    fn occupancy_at_six_percent_cap_suppresses() {
-        let t = SystemTime::UNIX_EPOCH;
-        let mut v = vllm_base();
-        v.num_requests_running = Some(16.0);
-        let s = snap(t, t, v, gpu_low());
-        let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot).is_none());
-    }
-
-    #[test]
     fn gpu_sixty_two_percent_suppresses() {
         let t = SystemTime::UNIX_EPOCH;
         let mut g = gpu_low();
@@ -562,18 +533,20 @@ mod tests {
     #[test]
     fn format_under_batching_fired_matches_template() {
         let t = SystemTime::UNIX_EPOCH;
-        let s = snap(t, t, vllm_base(), gpu_low());
+        let mut v = vllm_base();
+        v.tpot_ms = Some(120.0);
+        let s = snap(t, t, v, gpu_low());
         let ctx = mk_ctx();
         let win = mk_win(s);
         let lines = format_diagnose_rules(ai(&ctx, &win), false);
         let text = lines.join("\n");
-        assert!(text.contains("ISSUE: Under-batching"));
-        assert!(text.contains("likely light traffic"));
-        assert!(text.contains("Recommendation:"));
-        assert!(text.contains("  • Increase client concurrency or request rate"));
-        assert!(text.contains("  • Raise max_num_seqs if VRAM allows"));
-        assert!(text.contains("Expected: Better throughput"));
-        assert!(text.contains("Confidence: Medium"));
+        assert!(text.contains("[!] Under-batching — Memory-Bandwidth Bottleneck"));
+        assert!(text.contains("GPU util   58.0%  (threshold: < 62%)"));
+        assert!(text.contains("TPOT       120ms     (threshold: ≥ 100ms)"));
+        assert!(text.contains("memory-bandwidth-bound execution"));
+        assert!(text.contains("Raise --max-num-seqs (current: 256)"));
+        assert!(text.contains("Expected: Lower TPOT, higher throughput at scale."));
+        assert!(text.contains("Confidence: High"));
     }
 
     #[test]
@@ -859,23 +832,25 @@ mod tests {
     #[test]
     fn format_diagnose_rules_inserts_blank_between_rule_blocks() {
         let t = SystemTime::UNIX_EPOCH;
-        let s = snap(t, t, vllm_high_kv(), gpu_low());
+        let mut v = vllm_high_kv();
+        v.tpot_ms = Some(120.0);
+        let s = snap(t, t, v, gpu_low());
         let ctx = mk_ctx();
         let win = mk_win(s);
         let lines = format_diagnose_rules(ai(&ctx, &win), false);
         let idx_under = lines
             .iter()
-            .position(|l| l.contains("ISSUE: Under-batching"))
+            .position(|l| l.contains("[!] Under-batching"))
             .expect("rule1");
         let idx_kv = lines
             .iter()
             .position(|l| l.contains("ISSUE: KV Cache Pressure"))
             .expect("rule2");
         assert!(
-            idx_kv < idx_under,
-            "KV cache pressure should rank before under-batching by score"
+            idx_under < idx_kv,
+            "under-batching should rank before KV cache pressure by score"
         );
-        let between = &lines[idx_kv..idx_under];
+        let between = &lines[idx_under..idx_kv];
         assert!(
             between.iter().any(|l| l.is_empty()),
             "expected blank line between rule blocks: {between:?}"
@@ -905,6 +880,7 @@ mod tests {
             g.vram_total_mb = Some(80 * 1024);
             if i < 4 {
                 v.num_requests_running = Some(3.2);
+                v.tpot_ms = Some(120.0);
                 g.gpu_util_pct = Some(50.0);
             } else {
                 v.num_requests_running = Some(20.0);
@@ -915,10 +891,10 @@ mod tests {
         let summary = ai(&ctx, windows.last().expect("summary source"));
         let lines = format_diagnose_rules_for_windows(&windows, summary, false);
         let text = lines.join("\n");
-        assert!(text.contains("Under-batching"));
+        assert!(text.contains("Under-batching — Memory-Bandwidth Bottleneck"));
         assert!(text.contains("Seen in 40% of windows"));
-        assert!(text.contains("likely light traffic"));
-        assert!(text.contains("For better efficiency:"));
+        assert!(text.contains("TPOT       120ms"));
+        assert!(text.contains("Raise --max-num-seqs"));
         assert!(text.contains("No issues for KV Cache Pressure and Low Prefix Cache"));
     }
 

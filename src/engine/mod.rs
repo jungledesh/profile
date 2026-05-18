@@ -73,6 +73,7 @@ mod build_report_tests {
             num_requests_waiting: Some(0.0),
             max_num_seqs: Some(256),
             kv_cache_usage_perc: Some(86.0),
+            tpot_ms: Some(120.0),
             ..Default::default()
         };
         let g = GpuRawMetrics {
@@ -107,7 +108,7 @@ mod build_report_tests {
                 w[1].primary.rule_name
             );
         }
-        assert_eq!(report.groups[0].primary.rule_name, "kv_cache_pressure");
+        assert_eq!(report.groups[0].primary.rule_name, "under_batching");
         assert!(!report.r2_suppressed_by_r4);
     }
 

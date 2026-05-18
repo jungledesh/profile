@@ -4,15 +4,16 @@ use super::{skew_secs, Recommendation, MAX_OBSERVATION_SKEW_SECS};
 
 const UNDER_BATCHING_GPU_UTIL_LT: f64 = 62.0;
 const UNDER_BATCHING_RUNNING_GT: f64 = 0.75;
-const UNDER_BATCHING_OCCUPANCY_FRAC: f64 = 0.04;
 const UNDER_BATCHING_WAITING_LT: f64 = 2.0;
 const UNDER_BATCHING_TPOT_HIGH_MS: f64 = 100.0;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnderBatchingDetail {
     pub running: f64,
+    pub waiting: f64,
     pub max_num_seqs: u32,
     pub gpu_util: f64,
+    pub tpot_ms: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -34,6 +35,7 @@ pub fn rule1_under_batching(snapshot: &RawSnapshot) -> Rule1Outcome {
     let max_num_seqs = snapshot.vllm.max_num_seqs;
     let gpu_util = snapshot.gpu.gpu_util_pct;
     let waiting = snapshot.vllm.num_requests_waiting;
+    let tpot = snapshot.vllm.tpot_ms;
 
     let miss = || MissReport {
         running,
@@ -57,20 +59,21 @@ pub fn rule1_under_batching(snapshot: &RawSnapshot) -> Rule1Outcome {
     let Some(wv) = waiting.filter(|v| v.is_finite()) else {
         return Rule1Outcome::NotFired(miss());
     };
-
-    let max_f = f64::from(max_n);
-    let occupancy_cap = UNDER_BATCHING_OCCUPANCY_FRAC * max_f;
+    let Some(tpot_ms) = tpot.filter(|v| v.is_finite() && *v >= UNDER_BATCHING_TPOT_HIGH_MS) else {
+        return Rule1Outcome::NotFired(miss());
+    };
 
     let fires = rv > UNDER_BATCHING_RUNNING_GT
-        && rv < occupancy_cap
         && gpu < UNDER_BATCHING_GPU_UTIL_LT
         && wv < UNDER_BATCHING_WAITING_LT;
 
     if fires {
         Rule1Outcome::Fired(UnderBatchingDetail {
             running: rv,
+            waiting: wv,
             max_num_seqs: max_n,
             gpu_util: gpu,
+            tpot_ms,
         })
     } else {
         Rule1Outcome::NotFired(miss())
@@ -81,80 +84,77 @@ pub fn r1_recommendation(snapshot: &RawSnapshot) -> Option<Recommendation> {
     let Rule1Outcome::Fired(d) = rule1_under_batching(snapshot) else {
         return None;
     };
-    let tpot = snapshot.vllm.tpot_ms;
-    let confidence = match tpot {
-        Some(t) if t >= UNDER_BATCHING_TPOT_HIGH_MS => 0.9,
-        Some(t) if t > 0.0 => 0.5,
-        _ => 0.5,
-    };
     Some(Recommendation {
         rule_name: "under_batching",
         impact: 4,
-        confidence,
-        action: "Increase client concurrency or raise max_num_seqs".to_string(),
-        expected_impact: "Higher GPU utilization and throughput".to_string(),
-        display_lines: format_under_batching_fired(&d, tpot),
+        confidence: 0.9,
+        action: "Raise max_num_seqs or increase client concurrency".to_string(),
+        expected_impact: "Lower TPOT, higher throughput at scale".to_string(),
+        display_lines: format_under_batching_fired(&d),
     })
 }
 
-fn under_batching_cause_from_tpot(d: &UnderBatchingDetail, tpot_ms: Option<f64>) -> String {
-    let occupancy_pct = (d.running / f64::from(d.max_num_seqs)) * 100.0;
-    if tpot_ms.is_some_and(|t| t >= UNDER_BATCHING_TPOT_HIGH_MS) {
-        let t = tpot_ms.expect("checked");
-        format!(
-            "Cause: GPU util {:.0}% (threshold: {:.0}%), occupancy {:.1}% (threshold: {:.0}%), tpot {:.0}ms — GPU has headroom but tokens are slow",
-            d.gpu_util,
-            UNDER_BATCHING_GPU_UTIL_LT,
-            occupancy_pct,
-            UNDER_BATCHING_OCCUPANCY_FRAC * 100.0,
-            t
-        )
-    } else {
-        format!(
-            "Cause: GPU util {:.0}% (threshold: {:.0}%), occupancy {:.1}% (threshold: {:.0}%) — likely light traffic",
-            d.gpu_util,
-            UNDER_BATCHING_GPU_UTIL_LT,
-            occupancy_pct,
-            UNDER_BATCHING_OCCUPANCY_FRAC * 100.0,
-        )
-    }
-}
-
-pub(super) fn format_under_batching_fired(
-    d: &UnderBatchingDetail,
-    tpot_ms: Option<f64>,
-) -> Vec<String> {
-    let conf = if tpot_ms.is_some_and(|t| t >= UNDER_BATCHING_TPOT_HIGH_MS) {
-        "Confidence: High"
-    } else {
-        "Confidence: Medium"
-    };
+pub(super) fn format_under_batching_fired(d: &UnderBatchingDetail) -> Vec<String> {
     vec![
-        "ISSUE: Under-batching".to_string(),
-        under_batching_cause_from_tpot(d, tpot_ms),
+        "[!] Under-batching — Memory-Bandwidth Bottleneck".to_string(),
         String::new(),
-        "Recommendation:".to_string(),
-        "  • Increase client concurrency or request rate".to_string(),
-        "  • Raise max_num_seqs if VRAM allows".to_string(),
+        format!(
+            "  GPU util   {:.1}%  (threshold: < {:.0}%)",
+            d.gpu_util, UNDER_BATCHING_GPU_UTIL_LT
+        ),
+        format!(
+            "  TPOT       {:.0}ms     (threshold: ≥ {:.0}ms)",
+            d.tpot_ms, UNDER_BATCHING_TPOT_HIGH_MS
+        ),
+        format!(
+            "  Requests   {:.0} running, {:.0} waiting",
+            d.running, d.waiting
+        ),
         String::new(),
-        "Expected: Better throughput".to_string(),
-        conf.to_string(),
+        "  Small batch size is forcing memory-bandwidth-bound execution —".to_string(),
+        "  GPU loads weights faster than it computes, stalling token output.".to_string(),
+        String::new(),
+        "  Fix:".to_string(),
+        format!(
+            "    • Raise --max-num-seqs (current: {}) if upstream traffic is queuing elsewhere",
+            d.max_num_seqs
+        ),
+        "    • Increase client concurrency to feed the GPU larger batches".to_string(),
+        "    • If this is peak traffic: switch to a quantized model (fp8/AWQ)".to_string(),
+        "      to shrink weight footprint and lower TPOT at low concurrency".to_string(),
+        String::new(),
+        "  Expected: Lower TPOT, higher throughput at scale.".to_string(),
+        "  Confidence: High".to_string(),
     ]
 }
 
 pub(super) fn format_under_batching_window_issue(
     d: &UnderBatchingDetail,
     seen_pct: u32,
-    tpot_ms: Option<f64>,
 ) -> Vec<String> {
     vec![
-        "Under-batching".to_string(),
-        format!("Seen in {seen_pct}% of windows"),
-        under_batching_cause_from_tpot(d, tpot_ms),
+        "[!] Under-batching — Memory-Bandwidth Bottleneck".to_string(),
+        format!("  Seen in {seen_pct}% of windows"),
         String::new(),
-        "For better efficiency:".to_string(),
-        "  • Increase client concurrency or request rate".to_string(),
-        "  • Raise max_num_seqs if VRAM allows".to_string(),
+        format!(
+            "  GPU util   {:.1}%  (threshold: < {:.0}%)",
+            d.gpu_util, UNDER_BATCHING_GPU_UTIL_LT
+        ),
+        format!(
+            "  TPOT       {:.0}ms     (threshold: ≥ {:.0}ms)",
+            d.tpot_ms, UNDER_BATCHING_TPOT_HIGH_MS
+        ),
+        format!(
+            "  Requests   {:.0} running, {:.0} waiting",
+            d.running, d.waiting
+        ),
+        String::new(),
+        "  Fix:".to_string(),
+        format!(
+            "    • Raise --max-num-seqs (current: {}) if upstream traffic is queuing elsewhere",
+            d.max_num_seqs
+        ),
+        "    • Increase client concurrency to feed the GPU larger batches".to_string(),
     ]
 }
 
@@ -165,15 +165,100 @@ pub(super) fn aggregate_r1_detail(
     if details.is_empty() {
         return UnderBatchingDetail {
             running: summary.vllm.num_requests_running.unwrap_or(0.0),
+            waiting: summary.vllm.num_requests_waiting.unwrap_or(0.0),
             max_num_seqs: summary.vllm.max_num_seqs.unwrap_or(256),
             gpu_util: summary.gpu.gpu_util_pct.unwrap_or(0.0),
+            tpot_ms: summary.vllm.tpot_ms.unwrap_or(UNDER_BATCHING_TPOT_HIGH_MS),
         };
     }
-    let running = details.iter().map(|d| d.running).sum::<f64>() / details.len() as f64;
-    let gpu = details.iter().map(|d| d.gpu_util).sum::<f64>() / details.len() as f64;
+    let n = details.len() as f64;
+    let running = details.iter().map(|d| d.running).sum::<f64>() / n;
+    let waiting = details.iter().map(|d| d.waiting).sum::<f64>() / n;
+    let gpu = details.iter().map(|d| d.gpu_util).sum::<f64>() / n;
+    let tpot = details.iter().map(|d| d.tpot_ms).sum::<f64>() / n;
     UnderBatchingDetail {
         running,
+        waiting,
         max_num_seqs: details[0].max_num_seqs,
         gpu_util: gpu,
+        tpot_ms: tpot,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::collectors::{GpuRawMetrics, VllmRawMetrics};
+    use std::time::{Duration, SystemTime};
+
+    fn snap(
+        gpu_at: SystemTime,
+        vllm_at: SystemTime,
+        running: f64,
+        waiting: f64,
+        gpu_util: f64,
+        tpot_ms: Option<f64>,
+    ) -> RawSnapshot {
+        RawSnapshot {
+            gpu_observed_at: gpu_at,
+            vllm_observed_at: vllm_at,
+            timestamp: gpu_at,
+            vllm: VllmRawMetrics {
+                num_requests_running: Some(running),
+                num_requests_waiting: Some(waiting),
+                max_num_seqs: Some(256),
+                tpot_ms,
+                ..Default::default()
+            },
+            gpu: GpuRawMetrics {
+                gpu_util_pct: Some(gpu_util),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn fires_when_gates_and_tpot_high() {
+        let t = SystemTime::UNIX_EPOCH;
+        let s = snap(t, t, 2.0, 0.0, 36.0, Some(120.0));
+        let r = r1_recommendation(&s).expect("fired");
+        assert_eq!(r.rule_name, "under_batching");
+        assert!((r.confidence - 0.9).abs() < 1e-9);
+        match rule1_under_batching(&s) {
+            Rule1Outcome::Fired(d) => {
+                assert!((d.running - 2.0).abs() < 1e-9);
+                assert!((d.tpot_ms - 120.0).abs() < 1e-9);
+            }
+            Rule1Outcome::NotFired(_) => panic!("expected fired"),
+        }
+    }
+
+    #[test]
+    fn mute_when_tpot_low() {
+        let t = SystemTime::UNIX_EPOCH;
+        let s = snap(t, t, 2.0, 0.0, 36.0, Some(50.0));
+        assert!(r1_recommendation(&s).is_none());
+    }
+
+    #[test]
+    fn mute_when_tpot_missing() {
+        let t = SystemTime::UNIX_EPOCH;
+        let s = snap(t, t, 2.0, 0.0, 36.0, None);
+        assert!(r1_recommendation(&s).is_none());
+    }
+
+    #[test]
+    fn mute_when_waiting_at_two() {
+        let t = SystemTime::UNIX_EPOCH;
+        let s = snap(t, t, 2.0, 2.0, 36.0, Some(120.0));
+        assert!(r1_recommendation(&s).is_none());
+    }
+
+    #[test]
+    fn mute_when_skew_over_one_second() {
+        let t0 = SystemTime::UNIX_EPOCH;
+        let t1 = t0 + Duration::from_secs(2);
+        let s = snap(t0, t1, 2.0, 0.0, 36.0, Some(120.0));
+        assert!(r1_recommendation(&s).is_none());
     }
 }
