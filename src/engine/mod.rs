@@ -21,7 +21,7 @@ pub fn build_report(input: AnalysisInput<'_>) -> Report {
     let tp = input.ctx.config.tensor_parallel_size;
 
     let mut recs: Vec<Recommendation> = [
-        rules::r1_recommendation(snapshot),
+        rules::r1_recommendation(snapshot, baseline.as_ref()),
         rules::r2_recommendation(snapshot),
         rules::r3_recommendation(snapshot),
         rules::r4_recommendation(kv_headroom, tp),
@@ -67,16 +67,20 @@ mod build_report_tests {
 
     #[test]
     fn build_report_groups_sorted_by_impact_times_confidence() {
+        use crate::collectors::VllmConfig;
+
         let t = SystemTime::UNIX_EPOCH;
         let v = VllmRawMetrics {
+            model_name: Some("meta-llama/Llama-3.1-8B-Instruct".to_string()),
             num_requests_running: Some(3.1),
             num_requests_waiting: Some(0.0),
             max_num_seqs: Some(256),
             kv_cache_usage_perc: Some(86.0),
-            tpot_ms: Some(120.0),
+            tpot_ms: Some(35.0),
             ..Default::default()
         };
         let g = GpuRawMetrics {
+            gpu_name: Some("NVIDIA H100 80GB HBM3".to_string()),
             gpu_util_pct: Some(58.0),
             ..Default::default()
         };
@@ -87,7 +91,12 @@ mod build_report_tests {
             vllm: v,
             gpu: g,
         };
-        let ctx = StaticContext::default();
+        let cfg = VllmConfig {
+            dtype: Some("bf16".to_string()),
+            max_model_len: Some(2048),
+            ..Default::default()
+        };
+        let ctx = StaticContext::from_snapshot(&s, cfg);
         let win = RuntimeWindow::from_snapshot(s);
         let input = AnalysisInput::new(&ctx, &win);
         let report = build_report(input);

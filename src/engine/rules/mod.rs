@@ -2,6 +2,7 @@ use std::time::SystemTime;
 
 use crate::collectors::window_is_evaluable;
 use crate::context::{AnalysisInput, RuntimeWindow};
+use crate::engine::baseline;
 
 mod r1_under_batching;
 mod r2_kv_cache_pressure;
@@ -181,8 +182,10 @@ pub fn format_diagnose_rules_for_windows(
     let mut r2_details = Vec::new();
     let mut r3_details = Vec::new();
 
+    let summary_baseline = baseline::compute(&summary);
     for w in &evaluable {
-        match rule1_under_batching(&w.snapshot) {
+        let win_baseline = baseline::compute(&AnalysisInput::new(summary.ctx, w));
+        match rule1_under_batching(&w.snapshot, win_baseline.as_ref()) {
             Rule1Outcome::Fired(d) => {
                 r1_fired += 1;
                 r1_details.push(d);
@@ -231,7 +234,7 @@ pub fn format_diagnose_rules_for_windows(
 
     if r1_fired > 0 {
         out.extend(format_under_batching_window_issue(
-            &aggregate_r1_detail(&r1_details, summary_snap),
+            &aggregate_r1_detail(&r1_details, summary_snap, summary_baseline.as_ref()),
             pct(r1_fired, n_eval),
         ));
         out.push(String::new());
@@ -343,7 +346,58 @@ mod tests {
     use super::*;
     use crate::collectors::{GpuRawMetrics, RawSnapshot, VllmConfig, VllmRawMetrics};
     use crate::context::{AnalysisInput, RuntimeWindow, StaticContext};
+    use crate::engine::baseline::{CeilingEstimate, PhysicsBaseline, WeightDtypeSource};
     use std::time::{Duration, SystemTime};
+
+    fn mock_baseline(tpot_floor_ms: f64) -> PhysicsBaseline {
+        PhysicsBaseline {
+            decode: CeilingEstimate {
+                lower: 1.0,
+                expected: 1.0,
+                upper: 1.0,
+            },
+            prefill: None,
+            efficiency_pct: None,
+            headroom_pct: None,
+            weight_dtype_source: WeightDtypeSource::Fallback,
+            weight_gb: 1.0,
+            kv_headroom_gb: None,
+            tpot_floor_ms,
+            prefill_latency_floor_ms: None,
+            ridge_batch_size: 1.0,
+        }
+    }
+
+    fn r1_catalog_ctx_win(tpot_ms: f64) -> (StaticContext, RuntimeWindow) {
+        let t = SystemTime::UNIX_EPOCH;
+        let snap = RawSnapshot {
+            gpu_observed_at: t,
+            vllm_observed_at: t,
+            timestamp: t,
+            vllm: VllmRawMetrics {
+                model_name: Some("meta-llama/Llama-3.1-8B-Instruct".to_string()),
+                num_requests_running: Some(3.1),
+                num_requests_waiting: Some(0.0),
+                max_num_seqs: Some(256),
+                tpot_ms: Some(tpot_ms),
+                request_success_per_sec: Some(10.0),
+                ..Default::default()
+            },
+            gpu: GpuRawMetrics {
+                gpu_name: Some("NVIDIA H100 80GB HBM3".to_string()),
+                gpu_util_pct: Some(58.0),
+                ..Default::default()
+            },
+        };
+        let cfg = VllmConfig {
+            dtype: Some("bf16".to_string()),
+            max_model_len: Some(2048),
+            ..Default::default()
+        };
+        let ctx = StaticContext::from_snapshot(&snap, cfg);
+        let win = RuntimeWindow::from_snapshot(snap);
+        (ctx, win)
+    }
 
     fn snap(
         gpu_at: SystemTime,
@@ -431,21 +485,23 @@ mod tests {
 
     #[test]
     fn under_batching_fires_when_gates_pass() {
+        let base = mock_baseline(10.0);
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
-        v.tpot_ms = Some(120.0);
+        v.tpot_ms = Some(35.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        let r = r1_recommendation(&win.snapshot).expect("r1 fired");
+        let r = r1_recommendation(&win.snapshot, Some(&base)).expect("r1 fired");
         assert_eq!(r.rule_name, "under_batching");
         assert_eq!(r.impact, 4);
         assert!((r.confidence - 0.9).abs() < 1e-9);
-        match rule1_under_batching(&win.snapshot) {
+        match rule1_under_batching(&win.snapshot, Some(&base)) {
             Rule1Outcome::Fired(d) => {
                 assert!((d.running - 3.1).abs() < 1e-9);
                 assert_eq!(d.max_num_seqs, 256);
                 assert!((d.gpu_util - 58.0).abs() < 1e-9);
-                assert!((d.tpot_ms - 120.0).abs() < 1e-9);
+                assert!((d.tpot_ms - 35.0).abs() < 1e-9);
+                assert!((d.tpot_ratio - 3.5).abs() < 1e-9);
             }
             Rule1Outcome::NotFired(_) => panic!("expected fired"),
         }
@@ -453,96 +509,111 @@ mod tests {
 
     #[test]
     fn skew_over_one_second_suppresses() {
+        let base = mock_baseline(10.0);
         let t0 = SystemTime::UNIX_EPOCH;
         let t1 = t0 + Duration::from_secs(2);
-        let s = snap(t0, t1, vllm_base(), gpu_low());
+        let mut v = vllm_base();
+        v.tpot_ms = Some(35.0);
+        let s = snap(t0, t1, v, gpu_low());
         let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot).is_none());
+        assert!(r1_recommendation(&win.snapshot, Some(&base)).is_none());
     }
 
     #[test]
     fn waiting_none_suppresses() {
+        let base = mock_baseline(10.0);
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
         v.num_requests_waiting = None;
+        v.tpot_ms = Some(35.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot).is_none());
+        assert!(r1_recommendation(&win.snapshot, Some(&base)).is_none());
     }
 
     #[test]
     fn waiting_at_two_suppresses() {
+        let base = mock_baseline(10.0);
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
         v.num_requests_waiting = Some(2.0);
+        v.tpot_ms = Some(35.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot).is_none());
+        assert!(r1_recommendation(&win.snapshot, Some(&base)).is_none());
     }
 
     #[test]
     fn running_at_floor_suppresses() {
+        let base = mock_baseline(10.0);
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
         v.num_requests_running = Some(0.75);
+        v.tpot_ms = Some(35.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot).is_none());
+        assert!(r1_recommendation(&win.snapshot, Some(&base)).is_none());
     }
 
     #[test]
     fn running_below_activity_floor_suppresses() {
+        let base = mock_baseline(10.0);
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
         v.num_requests_running = Some(0.6);
+        v.tpot_ms = Some(35.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot).is_none());
+        assert!(r1_recommendation(&win.snapshot, Some(&base)).is_none());
     }
 
     #[test]
     fn gpu_sixty_two_percent_suppresses() {
+        let base = mock_baseline(10.0);
         let t = SystemTime::UNIX_EPOCH;
         let mut g = gpu_low();
         g.gpu_util_pct = Some(62.0);
-        let s = snap(t, t, vllm_base(), g);
+        let mut v = vllm_base();
+        v.tpot_ms = Some(35.0);
+        let s = snap(t, t, v, g);
         let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot).is_none());
+        assert!(r1_recommendation(&win.snapshot, Some(&base)).is_none());
     }
 
     #[test]
     fn max_seqs_zero_suppresses() {
+        let base = mock_baseline(10.0);
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
         v.max_num_seqs = Some(0);
+        v.tpot_ms = Some(35.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot).is_none());
+        assert!(r1_recommendation(&win.snapshot, Some(&base)).is_none());
     }
 
     #[test]
     fn nan_running_suppresses() {
+        let base = mock_baseline(10.0);
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
         v.num_requests_running = Some(f64::NAN);
+        v.tpot_ms = Some(35.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot).is_none());
+        assert!(r1_recommendation(&win.snapshot, Some(&base)).is_none());
     }
 
     #[test]
     fn format_under_batching_fired_matches_template() {
-        let t = SystemTime::UNIX_EPOCH;
-        let mut v = vllm_base();
-        v.tpot_ms = Some(120.0);
-        let s = snap(t, t, v, gpu_low());
-        let ctx = mk_ctx();
-        let win = mk_win(s);
+        let (ctx, win) = r1_catalog_ctx_win(35.0);
         let lines = format_diagnose_rules(ai(&ctx, &win), false);
         let text = lines.join("\n");
         assert!(text.contains("[!] Under-batching — Memory-Bandwidth Bottleneck"));
         assert!(text.contains("GPU util   58.0%  (threshold: < 62%)"));
-        assert!(text.contains("TPOT       120ms     (threshold: ≥ 100ms)"));
+        assert!(text.contains("TPOT       35ms"));
+        assert!(text.contains("ratio:"));
+        assert!(text.contains("threshold: ≥ 3.0x"));
         assert!(text.contains("memory-bandwidth-bound execution"));
         assert!(text.contains("Raise --max-num-seqs (current: 256)"));
         assert!(text.contains("Expected: Lower TPOT, higher throughput at scale."));
@@ -831,12 +902,23 @@ mod tests {
 
     #[test]
     fn format_diagnose_rules_inserts_blank_between_rule_blocks() {
-        let t = SystemTime::UNIX_EPOCH;
-        let mut v = vllm_high_kv();
-        v.tpot_ms = Some(120.0);
-        let s = snap(t, t, v, gpu_low());
-        let ctx = mk_ctx();
-        let win = mk_win(s);
+        let (ctx, win) = {
+            let mut v = vllm_high_kv();
+            v.tpot_ms = Some(35.0);
+            v.model_name = Some("meta-llama/Llama-3.1-8B-Instruct".to_string());
+            let mut g = gpu_low();
+            g.gpu_name = Some("NVIDIA H100 80GB HBM3".to_string());
+            let t = SystemTime::UNIX_EPOCH;
+            let snap = snap(t, t, v, g);
+            let cfg = VllmConfig {
+                dtype: Some("bf16".to_string()),
+                max_model_len: Some(2048),
+                ..Default::default()
+            };
+            let ctx = StaticContext::from_snapshot(&snap, cfg);
+            let win = mk_win(snap);
+            (ctx, win)
+        };
         let lines = format_diagnose_rules(ai(&ctx, &win), false);
         let idx_under = lines
             .iter()
@@ -864,7 +946,11 @@ mod tests {
     #[test]
     fn format_diagnose_rules_for_windows_matches_requested_style_when_some_rules_fire() {
         let t = SystemTime::UNIX_EPOCH;
-        let ctx = mk_ctx();
+        let cfg = VllmConfig {
+            dtype: Some("bf16".to_string()),
+            max_model_len: Some(2048),
+            ..Default::default()
+        };
         let mut windows = Vec::new();
         for i in 0..10 {
             let mut v = vllm_base();
@@ -878,9 +964,11 @@ mod tests {
             g.power_watts = Some(312.0);
             g.vram_used_mb = Some(62 * 1024);
             g.vram_total_mb = Some(80 * 1024);
+            v.model_name = Some("meta-llama/Llama-3.1-8B-Instruct".to_string());
+            g.gpu_name = Some("NVIDIA H100 80GB HBM3".to_string());
             if i < 4 {
                 v.num_requests_running = Some(3.2);
-                v.tpot_ms = Some(120.0);
+                v.tpot_ms = Some(35.0);
                 g.gpu_util_pct = Some(50.0);
             } else {
                 v.num_requests_running = Some(20.0);
@@ -888,12 +976,13 @@ mod tests {
             }
             windows.push(mk_win(snap(t, t, v, g)));
         }
+        let ctx = StaticContext::from_snapshot(&windows[0].snapshot, cfg);
         let summary = ai(&ctx, windows.last().expect("summary source"));
         let lines = format_diagnose_rules_for_windows(&windows, summary, false);
         let text = lines.join("\n");
         assert!(text.contains("Under-batching — Memory-Bandwidth Bottleneck"));
         assert!(text.contains("Seen in 40% of windows"));
-        assert!(text.contains("TPOT       120ms"));
+        assert!(text.contains("TPOT       35ms"));
         assert!(text.contains("Raise --max-num-seqs"));
         assert!(text.contains("No issues for KV Cache Pressure and Low Prefix Cache"));
     }
