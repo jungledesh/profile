@@ -6,7 +6,7 @@ use super::{skew_secs, Recommendation, MAX_OBSERVATION_SKEW_SECS};
 const UNDER_BATCHING_GPU_UTIL_LT: f64 = 62.0;
 const UNDER_BATCHING_RUNNING_GT: f64 = 0.75;
 const UNDER_BATCHING_WAITING_LT: f64 = 2.0;
-const UNDER_BATCHING_TPOT_RATIO: f64 = 3.0;
+const UNDER_BATCHING_TPOT_RATIO: f64 = 2.5;
 const UNDER_BATCHING_TPOT_FLOOR_MIN_MS: f64 = 1.0;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -130,7 +130,7 @@ pub(super) fn format_under_batching_fired(d: &UnderBatchingDetail) -> Vec<String
             d.gpu_util, UNDER_BATCHING_GPU_UTIL_LT
         ),
         format!(
-            "  TPOT       {:.0}ms     (floor: {:.0}ms, ratio: {:.1}x, threshold: ≥ {:.1}x)",
+            "  TPOT       {:.1}ms     (floor: {:.1}ms, ratio: {:.1}x, threshold: ≥ {:.1}x)",
             d.tpot_ms, d.tpot_floor_ms, d.tpot_ratio, UNDER_BATCHING_TPOT_RATIO
         ),
         format!(
@@ -168,7 +168,7 @@ pub(super) fn format_under_batching_window_issue(
             d.gpu_util, UNDER_BATCHING_GPU_UTIL_LT
         ),
         format!(
-            "  TPOT       {:.0}ms     (floor: {:.0}ms, ratio: {:.1}x, threshold: ≥ {:.1}x)",
+            "  TPOT       {:.1}ms     (floor: {:.1}ms, ratio: {:.1}x, threshold: ≥ {:.1}x)",
             d.tpot_ms, d.tpot_floor_ms, d.tpot_ratio, UNDER_BATCHING_TPOT_RATIO
         ),
         format!(

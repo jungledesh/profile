@@ -611,9 +611,9 @@ mod tests {
         let text = lines.join("\n");
         assert!(text.contains("[!] Under-batching — Memory-Bandwidth Bottleneck"));
         assert!(text.contains("GPU util   58.0%  (threshold: < 62%)"));
-        assert!(text.contains("TPOT       35ms"));
+        assert!(text.contains("TPOT       35.0ms"));
         assert!(text.contains("ratio:"));
-        assert!(text.contains("threshold: ≥ 3.0x"));
+        assert!(text.contains("threshold: ≥ 2.5x"));
         assert!(text.contains("memory-bandwidth-bound execution"));
         assert!(text.contains("Raise --max-num-seqs (current: 256)"));
         assert!(text.contains("Expected: Lower TPOT, higher throughput at scale."));
@@ -982,7 +982,7 @@ mod tests {
         let text = lines.join("\n");
         assert!(text.contains("Under-batching — Memory-Bandwidth Bottleneck"));
         assert!(text.contains("Seen in 40% of windows"));
-        assert!(text.contains("TPOT       35ms"));
+        assert!(text.contains("TPOT       35.0ms"));
         assert!(text.contains("Raise --max-num-seqs"));
         assert!(text.contains("No issues for KV Cache Pressure and Low Prefix Cache"));
     }

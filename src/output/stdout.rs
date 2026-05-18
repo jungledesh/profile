@@ -236,7 +236,7 @@ fn baseline_lines(
             seg2.push(format!("kv_headroom {:.0}GB", headroom));
         }
     }
-    seg2.push(format!("tpot_floor ~{:.0}ms", b.tpot_floor_ms));
+    seg2.push(format!("tpot_floor ~{:.1}ms", b.tpot_floor_ms));
     if let Some(pf) = b.prefill_latency_floor_ms {
         let compute_bound = num_requests_running
             .filter(|x| x.is_finite())
@@ -739,7 +739,7 @@ mod tests {
         );
         assert_eq!(
             lines[1],
-            "           weight 16GB | kv_headroom 8GB | tpot_floor ~10ms"
+            "           weight 16GB | kv_headroom 8GB | tpot_floor ~10.0ms"
         );
         assert_eq!(lines.len(), 2);
     }
