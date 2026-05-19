@@ -385,37 +385,6 @@ mod tests {
         }
     }
 
-    fn r1_catalog_ctx_win(tpot_ms: f64) -> (StaticContext, RuntimeWindow) {
-        let t = SystemTime::UNIX_EPOCH;
-        let snap = RawSnapshot {
-            gpu_observed_at: t,
-            vllm_observed_at: t,
-            timestamp: t,
-            vllm: VllmRawMetrics {
-                model_name: Some("meta-llama/Llama-3.1-8B-Instruct".to_string()),
-                num_requests_running: Some(3.1),
-                num_requests_waiting: Some(0.0),
-                max_num_seqs: Some(256),
-                tpot_ms: Some(tpot_ms),
-                request_success_per_sec: Some(10.0),
-                ..Default::default()
-            },
-            gpu: GpuRawMetrics {
-                gpu_name: Some("NVIDIA H100 80GB HBM3".to_string()),
-                gpu_util_pct: Some(58.0),
-                ..Default::default()
-            },
-        };
-        let cfg = VllmConfig {
-            dtype: Some("bf16".to_string()),
-            max_model_len: Some(2048),
-            ..Default::default()
-        };
-        let ctx = StaticContext::from_snapshot(&snap, cfg);
-        let win = RuntimeWindow::from_snapshot(snap);
-        (ctx, win)
-    }
-
     fn snap(
         gpu_at: SystemTime,
         vllm_at: SystemTime,
@@ -516,24 +485,10 @@ mod tests {
             Rule1Outcome::Fired(d) => {
                 assert!((d.running - 3.1).abs() < 1e-9);
                 assert_eq!(d.max_num_seqs, 256);
-                assert!((d.gpu_util - 58.0).abs() < 1e-9);
-                assert!((d.tpot_ms - 35.0).abs() < 1e-9);
-                assert!((d.tpot_ratio - 3.5).abs() < 1e-9);
+                assert!(d.occupancy_pct < 10.0);
             }
             Rule1Outcome::NotFired(_) => panic!("expected fired"),
         }
-    }
-
-    #[test]
-    fn skew_over_one_second_suppresses() {
-        let base = mock_baseline(10.0);
-        let t0 = SystemTime::UNIX_EPOCH;
-        let t1 = t0 + Duration::from_secs(2);
-        let mut v = vllm_base();
-        v.tpot_ms = Some(35.0);
-        let s = snap(t0, t1, v, gpu_low());
-        let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot, Some(&base)).is_none());
     }
 
     #[test]
@@ -561,38 +516,12 @@ mod tests {
     }
 
     #[test]
-    fn running_at_floor_suppresses() {
+    fn running_at_occupancy_threshold_suppresses() {
         let base = mock_baseline(10.0);
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
-        v.num_requests_running = Some(0.75);
-        v.tpot_ms = Some(35.0);
+        v.num_requests_running = Some(26.0);
         let s = snap(t, t, v, gpu_low());
-        let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot, Some(&base)).is_none());
-    }
-
-    #[test]
-    fn running_below_activity_floor_suppresses() {
-        let base = mock_baseline(10.0);
-        let t = SystemTime::UNIX_EPOCH;
-        let mut v = vllm_base();
-        v.num_requests_running = Some(0.6);
-        v.tpot_ms = Some(35.0);
-        let s = snap(t, t, v, gpu_low());
-        let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot, Some(&base)).is_none());
-    }
-
-    #[test]
-    fn gpu_sixty_two_percent_suppresses() {
-        let base = mock_baseline(10.0);
-        let t = SystemTime::UNIX_EPOCH;
-        let mut g = gpu_low();
-        g.gpu_util_pct = Some(62.0);
-        let mut v = vllm_base();
-        v.tpot_ms = Some(35.0);
-        let s = snap(t, t, v, g);
         let win = mk_win(s);
         assert!(r1_recommendation(&win.snapshot, Some(&base)).is_none());
     }
@@ -623,17 +552,20 @@ mod tests {
 
     #[test]
     fn format_under_batching_fired_matches_template() {
-        let (ctx, win) = r1_catalog_ctx_win(35.0);
+        let t = SystemTime::UNIX_EPOCH;
+        let mut v = vllm_base();
+        v.num_requests_running = Some(5.0);
+        let s = snap(t, t, v, gpu_low());
+        let ctx = mk_ctx();
+        let win = mk_win(s);
         let lines = format_diagnose_rules(ai(&ctx, &win), false);
         let text = lines.join("\n");
-        assert!(text.contains("[!] Under-batching — Memory-Bandwidth Bottleneck"));
-        assert!(text.contains("GPU util   58.0%  (threshold: < 62%)"));
-        assert!(text.contains("TPOT       35.0ms"));
-        assert!(text.contains("ratio:"));
-        assert!(text.contains("threshold: ≥ 2.5x"));
-        assert!(text.contains("memory-bandwidth-bound execution"));
-        assert!(text.contains("Raise --max-num-seqs (current: 256)"));
-        assert!(text.contains("Expected: Lower TPOT, higher throughput at scale."));
+        assert!(text.contains("[!] Under-batching — Low Occupancy"));
+        assert!(text.contains("Occupancy"));
+        assert!(text.contains("threshold: < 10%"));
+        assert!(text.contains("unused capacity"));
+        assert!(text.contains("unused slots"));
+        assert!(text.contains("Expected: Higher throughput, stable TPOT."));
         assert!(text.contains("Confidence: High"));
     }
 
@@ -661,7 +593,9 @@ mod tests {
         let t = SystemTime::UNIX_EPOCH;
         let mut g = gpu_low();
         g.gpu_util_pct = Some(75.0);
-        let s = snap(t, t, vllm_base(), g);
+        let mut v = vllm_base();
+        v.num_requests_running = Some(30.0);
+        let s = snap(t, t, v, g);
         let ctx = mk_ctx();
         let win = mk_win(s);
         let text = format_diagnose_rules(ai(&ctx, &win), true).join("\n");
@@ -740,7 +674,9 @@ mod tests {
     fn kv_cache_pressure_skew_suppresses() {
         let t0 = SystemTime::UNIX_EPOCH;
         let t1 = t0 + Duration::from_secs(2);
-        let s = snap(t0, t1, vllm_high_kv(), gpu_low());
+        let mut v = vllm_high_kv();
+        v.num_requests_running = Some(30.0);
+        let s = snap(t0, t1, v, gpu_low());
         match rule2_kv_cache_pressure(&s) {
             Rule2Outcome::NotFired(m) => {
                 assert!(m.skew_exceeded);
@@ -811,7 +747,9 @@ mod tests {
     #[test]
     fn kv_cache_miss_unavailable_without_gauge_verbose() {
         let t = SystemTime::UNIX_EPOCH;
-        let s = snap(t, t, vllm_base(), gpu_busy());
+        let mut v = vllm_base();
+        v.num_requests_running = Some(30.0);
+        let s = snap(t, t, v, gpu_busy());
         let ctx = mk_ctx();
         let win = mk_win(s);
         let text = format_diagnose_rules(ai(&ctx, &win), true).join("\n");
@@ -907,7 +845,9 @@ mod tests {
         let t = SystemTime::UNIX_EPOCH;
         let mut g = gpu_low();
         g.gpu_util_pct = Some(75.0);
-        let s = snap(t, t, vllm_base(), g);
+        let mut v = vllm_base();
+        v.num_requests_running = Some(30.0);
+        let s = snap(t, t, v, g);
         let ctx = mk_ctx();
         let win = mk_win(s);
         let lines = format_diagnose_rules(ai(&ctx, &win), false);
@@ -939,7 +879,7 @@ mod tests {
         let lines = format_diagnose_rules(ai(&ctx, &win), false);
         let idx_under = lines
             .iter()
-            .position(|l| l.contains("[!] Under-batching"))
+            .position(|l| l.contains("[!] Under-batching — Low Occupancy"))
             .expect("rule1");
         let idx_kv = lines
             .iter()
@@ -1008,7 +948,7 @@ mod tests {
                 v.tpot_ms = Some(35.0);
                 g.gpu_util_pct = Some(50.0);
             } else {
-                v.num_requests_running = Some(20.0);
+                v.num_requests_running = Some(30.0);
                 g.gpu_util_pct = Some(74.0);
             }
             windows.push(mk_win(snap(t, t, v, g)));
@@ -1017,10 +957,10 @@ mod tests {
         let summary = ai(&ctx, windows.last().expect("summary source"));
         let lines = format_diagnose_rules_for_windows(&windows, summary, false);
         let text = lines.join("\n");
-        assert!(text.contains("Under-batching — Memory-Bandwidth Bottleneck"));
+        assert!(text.contains("Under-batching — Low Occupancy"));
         assert!(text.contains("Seen in 60% of windows"));
-        assert!(text.contains("TPOT       35.0ms"));
-        assert!(text.contains("Raise --max-num-seqs"));
+        assert!(text.contains("Occupancy"));
+        assert!(text.contains("raise --max-num-seqs"));
         assert!(text.contains("No issues for KV Cache Pressure and Low Prefix Cache"));
     }
 
