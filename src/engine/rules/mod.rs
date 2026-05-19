@@ -569,7 +569,7 @@ mod tests {
         assert!(text.contains("threshold: < 10%"));
         assert!(text.contains("unused capacity"));
         assert!(text.contains("unused slots"));
-        assert!(text.contains("Expected: Higher throughput, stable TPOT."));
+        assert!(text.contains("Expected: Higher throughput, lower TPOT at scale."));
         assert!(text.contains("Confidence: High"));
     }
 
@@ -721,11 +721,9 @@ mod tests {
         let text = format_diagnose_rules(ai(&ctx2, &win_kv_only), false).join("\n");
         assert!(text.contains("Cause:"));
         assert!(text.contains("  - KV cache 86.0% (threshold: 85%)"));
-        assert!(text.contains("Expected: 20–45% better throughput"));
-        assert!(
-            text.contains("  • Reduce active sequence count (lower concurrency or request rate)")
-        );
-        assert!(text.contains("  • Consider fp8 KV cache (kv-cache-dtype=fp8)"));
+        assert!(text.contains("Expected: Lower TTFT, stable TPOT once evictions stop."));
+        assert!(text.contains("Reduce max_num_seqs to limit peak concurrent KV block consumption"));
+        assert!(text.contains("Consider fp8 KV cache (--kv-cache-dtype fp8)"));
         assert!(text.contains("Confidence: Medium-High"));
     }
 

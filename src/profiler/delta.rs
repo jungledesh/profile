@@ -14,8 +14,14 @@ pub enum Direction {
 pub struct Delta {
     /// Relative % change in `generation_tokens_per_sec`.
     pub throughput_delta_pct: Option<f64>,
+    pub throughput_before: Option<f64>,
+    pub throughput_after: Option<f64>,
     /// Absolute percentage-point change in `efficiency_pct`.
     pub efficiency_delta_pp: Option<f64>,
+    pub ttft_before_ms: Option<f64>,
+    pub ttft_after_ms: Option<f64>,
+    pub tpot_before_ms: Option<f64>,
+    pub tpot_after_ms: Option<f64>,
     pub direction: Direction,
     pub config_drifted: bool,
 }
@@ -29,10 +35,16 @@ pub fn compute(
     curr_report: &Report,
     config_drifted: bool,
 ) -> Delta {
-    let prev_tps = prev_result.snapshot.vllm.generation_tokens_per_sec;
-    let curr_tps = curr_result.snapshot.vllm.generation_tokens_per_sec;
+    let throughput_before = prev_result.snapshot.vllm.generation_tokens_per_sec;
+    let throughput_after = curr_result.snapshot.vllm.generation_tokens_per_sec;
 
-    let throughput_delta_pct = match (prev_tps, curr_tps) {
+    let ttft_before_ms = prev_result.snapshot.vllm.ttft_ms;
+    let ttft_after_ms = curr_result.snapshot.vllm.ttft_ms;
+
+    let tpot_before_ms = prev_result.snapshot.vllm.tpot_ms;
+    let tpot_after_ms = curr_result.snapshot.vllm.tpot_ms;
+
+    let throughput_delta_pct = match (throughput_before, throughput_after) {
         (Some(p), Some(c)) if p > 0.0 && p.is_finite() && c.is_finite() => {
             Some((c - p) / p * 100.0)
         }
@@ -56,7 +68,13 @@ pub fn compute(
 
     Delta {
         throughput_delta_pct,
+        throughput_before,
+        throughput_after,
         efficiency_delta_pp,
+        ttft_before_ms,
+        ttft_after_ms,
+        tpot_before_ms,
+        tpot_after_ms,
         direction,
         config_drifted,
     }
@@ -132,6 +150,8 @@ mod tests {
         );
         assert_eq!(d.direction, Direction::Better);
         assert!((d.throughput_delta_pct.unwrap() - 10.0).abs() < 1e-9);
+        assert_eq!(d.throughput_before, Some(100.0));
+        assert_eq!(d.throughput_after, Some(110.0));
     }
 
     #[test]

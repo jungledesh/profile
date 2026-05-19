@@ -136,7 +136,7 @@ pub(super) fn format_kv_cache_pressure_fired(
     }
     out.extend([
         String::new(),
-        "  Expected: Lower eviction rate, stable TPOT under load.".to_string(),
+        "  Expected: Lower TTFT, stable TPOT once evictions stop.".to_string(),
         format!("  {conf_label}"),
     ]);
     out
