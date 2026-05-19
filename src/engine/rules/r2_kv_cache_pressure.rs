@@ -112,18 +112,29 @@ pub(super) fn format_kv_cache_pressure_fired(
             d.kv_cache_usage_perc, KV_CACHE_PRESSURE_MIN_PERC
         ));
     }
+    out.push(String::new());
+    out.push("  Fix:".to_string());
+    if d.preemptions_active {
+        // Evictions are live — immediate action needed
+        out.extend([
+            "    • Reduce concurrency now — active evictions are degrading latency".to_string(),
+            "    • Lower --max-num-seqs to shed in-flight sequences".to_string(),
+            "    • Consider fp8 KV cache (--kv-cache-dtype fp8) to halve KV memory footprint".to_string(),
+            "    • Lower max_model_len if workload allows shorter context".to_string(),
+        ]);
+    } else {
+        // Approaching capacity — strategic fixes
+        out.extend([
+            "    • Raise --gpu-memory-utilization if VRAM headroom exists (check vRAM in header)".to_string(),
+            "    • Reduce max_num_seqs to limit peak concurrent KV block consumption".to_string(),
+            "    • Consider fp8 KV cache (--kv-cache-dtype fp8) to halve KV memory footprint".to_string(),
+            "    • Lower max_model_len only if safe for your workload".to_string(),
+        ]);
+    }
     out.extend([
         String::new(),
-        "Recommendation:".to_string(),
-        "  • Reduce active sequence count (lower concurrency or request rate)".to_string(),
-        "  • Shorten prompts/outputs where possible".to_string(),
-        "  • Increase KV capacity if needed:".to_string(),
-        "      - Raise --gpu-memory-utilization (if VRAM headroom exists)".to_string(),
-        "  • Consider fp8 KV cache (kv-cache-dtype=fp8)".to_string(),
-        "  • Lower max_model_len only if safe for your workload".to_string(),
-        String::new(),
-        "Expected: 20–45% better throughput".to_string(),
-        conf_label.to_string(),
+        "  Expected: Lower eviction rate, stable TPOT under load.".to_string(),
+        format!("  {conf_label}"),
     ]);
     out
 }
