@@ -92,8 +92,8 @@ pub fn run(
     Ok(())
 }
 
-/// Returns the rule name that fired in >50% of evaluable windows, if any.
-/// This drives the loop exit decision — consistent with what the box shows.
+/// Returns the rule name that met window-significance thresholds, if any.
+/// Aligned with `engine::rule_is_significant` used by the diagnose UI formatter.
 fn primary_window_rule(result: &DiagnoseResult) -> Option<&'static str> {
     let ctx = &result.static_ctx;
     let evaluable: Vec<_> = result
@@ -116,7 +116,7 @@ fn primary_window_rule(result: &DiagnoseResult) -> Option<&'static str> {
             )
         })
         .count();
-    if r1_count * 2 > n {
+    if engine::rule_is_significant(r1_count, n) {
         return Some("under_batching");
     }
     None

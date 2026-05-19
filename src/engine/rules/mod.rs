@@ -30,8 +30,21 @@ use r3_low_prefix_reuse::{
 };
 
 pub(super) const MAX_OBSERVATION_SKEW_SECS: f64 = 1.0;
+/// Enforces >= 6s temporal substance (3 windows × 2s).
+pub(super) const ENGINE_MIN_PERSISTENT_WINDOWS: usize = 3;
+/// Enforces >= 25% density floor across evaluable windows.
+pub(super) const ENGINE_MIN_WINDOW_PCT: f64 = 0.25;
 
 // TODO(r5): sampling cliff — sampling temperature is not in collected metrics; wire rule when available.
+
+/// True when a rule fired in enough evaluable windows to be statistically stable.
+pub fn rule_is_significant(fired: usize, total_evaluable: usize) -> bool {
+    if total_evaluable == 0 {
+        return false;
+    }
+    let pct = fired as f64 / total_evaluable as f64;
+    fired >= ENGINE_MIN_PERSISTENT_WINDOWS && pct >= ENGINE_MIN_WINDOW_PCT
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Recommendation {
@@ -232,7 +245,11 @@ pub fn format_diagnose_rules_for_windows(
 
     let mut out = Vec::new();
 
-    if r1_fired > 0 {
+    let r1_significant = rule_is_significant(r1_fired, n_eval);
+    let r2_significant = rule_is_significant(r2_fired, n_eval);
+    let r3_significant = rule_is_significant(r3_fired, n_eval);
+
+    if r1_significant {
         out.extend(format_under_batching_window_issue(
             &aggregate_r1_detail(&r1_details, summary_snap, summary_baseline.as_ref()),
             pct(r1_fired, n_eval),
@@ -243,7 +260,7 @@ pub fn format_diagnose_rules_for_windows(
         out.push(String::new());
     }
 
-    if r2_fired > 0 {
+    if r2_significant {
         out.extend(format_kv_cache_window_issue(
             &aggregate_r2_detail(&r2_details, summary_snap),
             pct(r2_fired, n_eval),
@@ -255,7 +272,7 @@ pub fn format_diagnose_rules_for_windows(
         out.push(String::new());
     }
 
-    if r3_fired > 0 {
+    if r3_significant {
         out.extend(format_low_prefix_window_issue(
             &aggregate_r3_detail(&r3_details, summary_snap),
             pct(r3_fired, n_eval),
@@ -268,13 +285,13 @@ pub fn format_diagnose_rules_for_windows(
     }
 
     let mut not_fired = Vec::new();
-    if r1_fired == 0 {
+    if !r1_significant {
         not_fired.push("Under-batching");
     }
-    if r2_fired == 0 {
+    if !r2_significant {
         not_fired.push("KV Cache Pressure");
     }
-    if r3_fired == 0 {
+    if !r3_significant {
         not_fired.push("Low Prefix Cache");
     }
     if !not_fired.is_empty() {
@@ -944,6 +961,26 @@ mod tests {
     }
 
     #[test]
+    fn rule_is_significant_six_of_ten_windows_passes() {
+        assert!(rule_is_significant(6, 10));
+    }
+
+    #[test]
+    fn rule_is_significant_three_of_fifteen_fails_density_gate() {
+        assert!(!rule_is_significant(3, 15));
+    }
+
+    #[test]
+    fn rule_is_significant_four_of_fifteen_passes() {
+        assert!(rule_is_significant(4, 15));
+    }
+
+    #[test]
+    fn rule_is_significant_zero_evaluable_windows_is_false() {
+        assert!(!rule_is_significant(3, 0));
+    }
+
+    #[test]
     fn format_diagnose_rules_for_windows_matches_requested_style_when_some_rules_fire() {
         let t = SystemTime::UNIX_EPOCH;
         let cfg = VllmConfig {
@@ -966,7 +1003,7 @@ mod tests {
             g.vram_total_mb = Some(80 * 1024);
             v.model_name = Some("meta-llama/Llama-3.1-8B-Instruct".to_string());
             g.gpu_name = Some("NVIDIA H100 80GB HBM3".to_string());
-            if i < 4 {
+            if i < 6 {
                 v.num_requests_running = Some(3.2);
                 v.tpot_ms = Some(35.0);
                 g.gpu_util_pct = Some(50.0);
@@ -981,7 +1018,7 @@ mod tests {
         let lines = format_diagnose_rules_for_windows(&windows, summary, false);
         let text = lines.join("\n");
         assert!(text.contains("Under-batching — Memory-Bandwidth Bottleneck"));
-        assert!(text.contains("Seen in 40% of windows"));
+        assert!(text.contains("Seen in 60% of windows"));
         assert!(text.contains("TPOT       35.0ms"));
         assert!(text.contains("Raise --max-num-seqs"));
         assert!(text.contains("No issues for KV Cache Pressure and Low Prefix Cache"));
