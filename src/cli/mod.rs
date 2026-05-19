@@ -82,7 +82,17 @@ pub enum Commands {
             long = "duration",
             default_value = DEFAULT_DURATION,
             value_parser = parse_duration_arg,
-            help = "Observation window per iteration (default: 30s)"
+            help = "Observation window (default: 30s). s=seconds, m=minutes (not ms/mins). Examples: 30s, 2m, 5m, 10m, 30m",
+            long_help = "How long to collect metrics before analyzing each iteration (default: 30s).\n\n\
+                Units:\n  \
+                  s  seconds\n  \
+                  m  minutes — not ms (milliseconds), not \"mins\", not bare m\n\n\
+                Examples:\n  \
+                  30s   half-minute snapshot\n  \
+                  2m    short run\n  \
+                  5m    typical load test\n  \
+                  10m   sustained observation\n  \
+                  30m   long soak"
         )]
         duration: Duration,
     },
@@ -112,18 +122,45 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
 fn parse_duration_arg(input: &str) -> Result<Duration, String> {
     let s = input.trim();
     if s.len() < 2 {
-        return Err("duration must be like 30s, 1m, 5m".to_string());
+        return Err(
+            "duration needs a number and unit: s (seconds) or m (minutes). Examples: 30s, 2m, 5m, 10m, 30m"
+                .to_string(),
+        );
     }
     let (num, unit) = s.split_at(s.len() - 1);
     let value: u64 = num
         .parse()
-        .map_err(|_| format!("invalid duration value: {input}"))?;
+        .map_err(|_| format!("invalid duration value in \"{input}\" (examples: 30s, 5m, 10m)"))?;
     if value == 0 {
         return Err("duration must be greater than zero".to_string());
     }
     match unit {
         "s" => Ok(Duration::from_secs(value)),
         "m" => Ok(Duration::from_secs(value.saturating_mul(60))),
-        _ => Err(format!("invalid duration unit in {input}; use s or m")),
+        _ => Err(format!(
+            "invalid unit in \"{input}\": use s (seconds) or m (minutes), not ms/mins — e.g. 5m, 10m, 30m"
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_duration_seconds_and_minutes() {
+        assert_eq!(parse_duration_arg("30s").unwrap(), Duration::from_secs(30));
+        assert_eq!(parse_duration_arg("2m").unwrap(), Duration::from_secs(120));
+        assert_eq!(parse_duration_arg("10m").unwrap(), Duration::from_secs(600));
+        assert_eq!(
+            parse_duration_arg("30m").unwrap(),
+            Duration::from_secs(1800)
+        );
+    }
+
+    #[test]
+    fn parse_duration_rejects_ms_and_bare_number() {
+        assert!(parse_duration_arg("5ms").is_err());
+        assert!(parse_duration_arg("5").is_err());
     }
 }
