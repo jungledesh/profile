@@ -81,31 +81,36 @@ pub fn r2_recommendation(snapshot: &RawSnapshot) -> Option<Recommendation> {
     })
 }
 
+pub(super) fn kv_pressure_confidence(d: &KvCachePressureDetail) -> f64 {
+    if d.preemptions_active {
+        KV_PRESSURE_CRITICAL_CONFIDENCE
+    } else {
+        KV_PRESSURE_WARNING_CONFIDENCE
+    }
+}
+
 pub(super) fn format_kv_cache_pressure_fired(
     d: &KvCachePressureDetail,
     snapshot: &RawSnapshot,
     confidence: f64,
 ) -> Vec<String> {
-    let kv = d.kv_cache_usage_perc;
+    let kv_p = snapshot.vllm.kv_cache_usage_perc.filter(|v| v.is_finite());
     let conf_label = if (confidence - KV_PRESSURE_CRITICAL_CONFIDENCE).abs() < 1e-9 {
         "Confidence: High"
     } else {
         "Confidence: Medium-High"
     };
-    let mut out = vec!["ISSUE: KV Cache Pressure".to_string(), "Cause:".to_string()];
+    let mut out = vec!["[!] KV Cache Pressure".to_string(), "Cause:".to_string()];
     if d.preemptions_active {
         out.push("  - Active evictions — tokens being preempted to free KV cache".to_string());
+        if let Some(k) = kv_p {
+            out.push(format!("  - KV cache {k:.1}% — evictions active"));
+        }
     } else {
         out.push(format!(
-            "  - KV cache {kv:.1}% (threshold: {:.0}%) — approaching capacity",
-            KV_CACHE_PRESSURE_MIN_PERC
+            "  - KV cache {:.1}% (threshold: {:.0}%) — approaching capacity",
+            d.kv_cache_usage_perc, KV_CACHE_PRESSURE_MIN_PERC
         ));
-    }
-    if let Some(r) = snapshot.vllm.num_requests_running.filter(|x| x.is_finite()) {
-        out.push(format!("  - High concurrency (~{:.0} running requests)", r));
-    }
-    if let Some(p) = snapshot.vllm.prompt_tokens_mean.filter(|x| x.is_finite()) {
-        out.push(format!("  - Long sequences (~{:.0} token prompts)", p));
     }
     out.extend([
         String::new(),
@@ -126,39 +131,12 @@ pub(super) fn format_kv_cache_pressure_fired(
 pub(super) fn format_kv_cache_window_issue(
     d: &KvCachePressureDetail,
     seen_pct: u32,
-    summary: &RawSnapshot,
+    snapshot: &RawSnapshot,
+    confidence: f64,
 ) -> Vec<String> {
-    let kv = d.kv_cache_usage_perc;
-    let mut out = vec![
-        "KV Cache Pressure".to_string(),
-        format!("Seen in {seen_pct}% of windows"),
-        "Cause:".to_string(),
-    ];
-    if d.preemptions_active {
-        out.push("  - Active evictions — tokens being preempted to free KV cache".to_string());
-    } else {
-        out.push(format!(
-            "  - KV cache {kv:.1}% (threshold: {:.0}%) — approaching capacity",
-            KV_CACHE_PRESSURE_MIN_PERC
-        ));
-    }
-    if let Some(r) = summary.vllm.num_requests_running.filter(|x| x.is_finite()) {
-        out.push(format!("  - High concurrency (~{:.0} running requests)", r));
-    }
-    if let Some(p) = summary.vllm.prompt_tokens_mean.filter(|x| x.is_finite()) {
-        out.push(format!("  - Long sequences (~{:.0} token prompts)", p));
-    }
-    out.extend([
-        String::new(),
-        "Recommendation:".to_string(),
-        "  • Reduce active sequence count (lower concurrency or request rate)".to_string(),
-        "  • Shorten prompts/outputs where possible".to_string(),
-        "  • Increase KV capacity if needed:".to_string(),
-        "      - Raise --gpu-memory-utilization (if VRAM headroom exists)".to_string(),
-        "  • Consider fp8 KV cache (kv-cache-dtype=fp8)".to_string(),
-        "  • Lower max_model_len only if safe for your workload".to_string(),
-    ]);
-    out
+    let mut lines = format_kv_cache_pressure_fired(d, snapshot, confidence);
+    lines.insert(1, format!("  Seen in {seen_pct}% of windows"));
+    lines
 }
 
 pub(super) fn aggregate_r2_detail(

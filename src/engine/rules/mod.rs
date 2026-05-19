@@ -22,7 +22,9 @@ pub use r3_low_prefix_reuse::{
 pub use r4_parallelism::r4_recommendation;
 
 use r1_under_batching::{aggregate_r1_detail, format_under_batching_window_issue};
-use r2_kv_cache_pressure::{aggregate_r2_detail, format_kv_cache_window_issue};
+use r2_kv_cache_pressure::{
+    aggregate_r2_detail, format_kv_cache_window_issue, kv_pressure_confidence,
+};
 #[cfg(test)]
 use r3_low_prefix_reuse::format_low_prefix_hit_rate_fired;
 use r3_low_prefix_reuse::{
@@ -261,10 +263,12 @@ pub fn format_diagnose_rules_for_windows(
     }
 
     if r2_significant {
+        let r2_agg = aggregate_r2_detail(&r2_details, summary_snap);
         out.extend(format_kv_cache_window_issue(
-            &aggregate_r2_detail(&r2_details, summary_snap),
+            &r2_agg,
             pct(r2_fired, n_eval),
             summary_snap,
+            kv_pressure_confidence(&r2_agg),
         ));
         out.push(String::new());
     } else if verbose_rules {
@@ -576,7 +580,7 @@ mod tests {
         assert!(text.contains("Parallelism Mismatch"));
         assert!(text.contains(R2_SUPPRESSED_BY_R4_VERBOSE_LINE));
         assert!(!text.contains("KV cache pressure: not indicated"));
-        assert!(!text.contains("ISSUE: KV Cache Pressure"));
+        assert!(!text.contains("[!] KV Cache Pressure"));
     }
 
     #[test]
@@ -585,7 +589,7 @@ mod tests {
         let text = format_diagnose_rules(ai(&ctx, &win), false).join("\n");
         assert!(text.contains("Parallelism Mismatch"));
         assert!(!text.contains(R2_SUPPRESSED_BY_R4_VERBOSE_LINE));
-        assert!(!text.contains("ISSUE: KV Cache Pressure"));
+        assert!(!text.contains("[!] KV Cache Pressure"));
     }
 
     #[test]
@@ -717,7 +721,6 @@ mod tests {
         let text = format_diagnose_rules(ai(&ctx2, &win_kv_only), false).join("\n");
         assert!(text.contains("Cause:"));
         assert!(text.contains("  - KV cache 86.0% (threshold: 85%)"));
-        assert!(text.contains("  - High concurrency (~3 running requests)"));
         assert!(text.contains("Expected: 20–45% better throughput"));
         assert!(
             text.contains("  • Reduce active sequence count (lower concurrency or request rate)")
@@ -883,7 +886,7 @@ mod tests {
             .expect("rule1");
         let idx_kv = lines
             .iter()
-            .position(|l| l.contains("ISSUE: KV Cache Pressure"))
+            .position(|l| l.contains("[!] KV Cache Pressure"))
             .expect("rule2");
         assert!(
             idx_under < idx_kv,
