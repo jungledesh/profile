@@ -5,6 +5,7 @@ use super::Recommendation;
 const PREFIX_HIT_RATE_LT: f64 = 0.35;
 const PREFIX_RULE_PROMPT_TOKENS_GTE: f64 = 20.0;
 const PREFIX_RULE_RUNNING_GT: f64 = 0.75;
+const PREFIX_RULE_MIN_QPS: f64 = 5.0;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LowPrefixReuseDetail {
@@ -23,6 +24,11 @@ pub fn rule3_low_prefix_reuse(snapshot: &RawSnapshot) -> Rule3Outcome {
     let rate = v.prefix_cache_hit_rate.filter(|x| x.is_finite());
     let running = v.num_requests_running.filter(|x| x.is_finite());
     let prompt_mean = v.prompt_tokens_mean.filter(|x| x.is_finite());
+
+    let qps = v.request_success_per_sec.filter(|x| x.is_finite());
+    if qps.is_none_or(|q| q < PREFIX_RULE_MIN_QPS) {
+        return Rule3Outcome::NotFired;
+    }
 
     let Some(hit_rate) = rate else {
         return Rule3Outcome::NotFired;
@@ -54,17 +60,32 @@ pub fn r3_recommendation(snapshot: &RawSnapshot) -> Option<Recommendation> {
     let Rule3Outcome::Fired(d) = rule3_low_prefix_reuse(snapshot) else {
         return None;
     };
+    let enable_prefix = snapshot.vllm.cache_config.enable_prefix_caching;
     Some(Recommendation {
         rule_name: "low_prefix_reuse",
         impact: 2,
-        confidence: 0.6,
+        confidence: 0.9,
         action: "Move shared context to prompt prefix; standardize prompt templates".to_string(),
         expected_impact: "Higher prefix cache hit rate and lower TTFT".to_string(),
-        display_lines: format_low_prefix_hit_rate_fired(&d),
+        display_lines: format_low_prefix_hit_rate_fired(&d, enable_prefix),
     })
 }
 
-pub(super) fn format_low_prefix_hit_rate_fired(d: &LowPrefixReuseDetail) -> Vec<String> {
+fn prefix_cause_detail(enable_prefix_caching: Option<bool>) -> String {
+    match enable_prefix_caching {
+        Some(false) => {
+            "  - Prefix caching is disabled — enable with --enable-prefix-caching".to_string()
+        }
+        Some(true) | None => {
+            "  - Low prefix hit rate — restructure prompts to share common prefixes".to_string()
+        }
+    }
+}
+
+pub(super) fn format_low_prefix_hit_rate_fired(
+    d: &LowPrefixReuseDetail,
+    enable_prefix_caching: Option<bool>,
+) -> Vec<String> {
     let hit = d.hit_rate * 100.0;
     vec![
         "ISSUE: Low Prefix Cache".to_string(),
@@ -73,7 +94,7 @@ pub(super) fn format_low_prefix_hit_rate_fired(d: &LowPrefixReuseDetail) -> Vec<
             "  - Prefix hit rate {hit:.1}% (threshold: {:.0}%)",
             PREFIX_HIT_RATE_LT * 100.0
         ),
-        "  - Prompts have no shared leading context".to_string(),
+        prefix_cause_detail(enable_prefix_caching),
         String::new(),
         "Recommendation:".to_string(),
         "  • Workload shows no prefix reuse — cache is currently ineffective".to_string(),
@@ -84,13 +105,14 @@ pub(super) fn format_low_prefix_hit_rate_fired(d: &LowPrefixReuseDetail) -> Vec<
         "  • Otherwise: no action needed".to_string(),
         String::new(),
         "Expected: Reduced prefill time".to_string(),
-        "Confidence: Medium-High".to_string(),
+        "Confidence: High".to_string(),
     ]
 }
 
 pub(super) fn format_low_prefix_window_issue(
     d: &LowPrefixReuseDetail,
     seen_pct: u32,
+    enable_prefix_caching: Option<bool>,
 ) -> Vec<String> {
     vec![
         "Low Prefix Cache".to_string(),
@@ -101,7 +123,7 @@ pub(super) fn format_low_prefix_window_issue(
             d.hit_rate * 100.0,
             PREFIX_HIT_RATE_LT * 100.0
         ),
-        "  - Prompts have no shared leading context".to_string(),
+        prefix_cause_detail(enable_prefix_caching),
         String::new(),
         "Recommendation:".to_string(),
         "  • Workload shows no prefix reuse — cache is currently ineffective".to_string(),

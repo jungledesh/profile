@@ -4,11 +4,14 @@ use super::{skew_secs, Recommendation, MAX_OBSERVATION_SKEW_SECS};
 
 const KV_CACHE_PRESSURE_MIN_PERC: f64 = 85.0;
 const KV_PRESSURE_VRAM_CORROBORATE_MIN_PERC: f64 = 78.0;
+const KV_PRESSURE_CRITICAL_CONFIDENCE: f64 = 0.95;
+const KV_PRESSURE_WARNING_CONFIDENCE: f64 = 0.7;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct KvCachePressureDetail {
     pub kv_cache_usage_perc: f64,
     pub vram_usage_perc_corroborated: Option<f64>,
+    pub preemptions_active: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -36,20 +39,26 @@ pub fn rule2_kv_cache_pressure(snapshot: &RawSnapshot) -> Rule2Outcome {
         return Rule2Outcome::NotFired(miss(true, kv));
     }
 
-    let Some(kv_p) = kv else {
-        return Rule2Outcome::NotFired(miss(false, None));
-    };
+    let preemptions_active = snapshot
+        .vllm
+        .num_preemptions_per_sec
+        .is_some_and(|p| p > 0.0)
+        || snapshot.vllm.num_requests_swapped.is_some_and(|s| s > 0.0);
 
-    if kv_p < KV_CACHE_PRESSURE_MIN_PERC {
-        return Rule2Outcome::NotFired(miss(false, Some(kv_p)));
+    let kv_high = kv.is_some_and(|kv_p| kv_p >= KV_CACHE_PRESSURE_MIN_PERC);
+
+    if !kv_high && !preemptions_active {
+        return Rule2Outcome::NotFired(miss(false, kv));
     }
 
+    let kv_p = kv.unwrap_or(0.0);
     let vram = vram_usage_perc(&snapshot.gpu);
     let corroborated = vram.filter(|&p| p >= KV_PRESSURE_VRAM_CORROBORATE_MIN_PERC);
 
     Rule2Outcome::Fired(KvCachePressureDetail {
         kv_cache_usage_perc: kv_p,
         vram_usage_perc_corroborated: corroborated,
+        preemptions_active,
     })
 }
 
@@ -57,10 +66,10 @@ pub fn r2_recommendation(snapshot: &RawSnapshot) -> Option<Recommendation> {
     let Rule2Outcome::Fired(d) = rule2_kv_cache_pressure(snapshot) else {
         return None;
     };
-    let confidence = if d.vram_usage_perc_corroborated.is_some() {
-        0.9
+    let confidence = if d.preemptions_active {
+        KV_PRESSURE_CRITICAL_CONFIDENCE
     } else {
-        0.7
+        KV_PRESSURE_WARNING_CONFIDENCE
     };
     Some(Recommendation {
         rule_name: "kv_cache_pressure",
@@ -68,28 +77,30 @@ pub fn r2_recommendation(snapshot: &RawSnapshot) -> Option<Recommendation> {
         confidence,
         action: "Reduce max_num_seqs or add tensor parallelism".to_string(),
         expected_impact: "Reduced KV evictions and lower latency variance".to_string(),
-        display_lines: format_kv_cache_pressure_fired(&d, snapshot),
+        display_lines: format_kv_cache_pressure_fired(&d, snapshot, confidence),
     })
 }
 
 pub(super) fn format_kv_cache_pressure_fired(
     d: &KvCachePressureDetail,
     snapshot: &RawSnapshot,
+    confidence: f64,
 ) -> Vec<String> {
     let kv = d.kv_cache_usage_perc;
-    let conf = if d.vram_usage_perc_corroborated.is_some() {
+    let conf_label = if (confidence - KV_PRESSURE_CRITICAL_CONFIDENCE).abs() < 1e-9 {
         "Confidence: High"
     } else {
         "Confidence: Medium-High"
     };
-    let mut out = vec![
-        "ISSUE: KV Cache Pressure".to_string(),
-        "Cause:".to_string(),
-        format!(
-            "  - KV usage {kv:.1}% (threshold: {:.0}%)",
+    let mut out = vec!["ISSUE: KV Cache Pressure".to_string(), "Cause:".to_string()];
+    if d.preemptions_active {
+        out.push("  - Active evictions — tokens being preempted to free KV cache".to_string());
+    } else {
+        out.push(format!(
+            "  - KV cache {kv:.1}% (threshold: {:.0}%) — approaching capacity",
             KV_CACHE_PRESSURE_MIN_PERC
-        ),
-    ];
+        ));
+    }
     if let Some(r) = snapshot.vllm.num_requests_running.filter(|x| x.is_finite()) {
         out.push(format!("  - High concurrency (~{:.0} running requests)", r));
     }
@@ -107,7 +118,7 @@ pub(super) fn format_kv_cache_pressure_fired(
         "  • Lower max_model_len only if safe for your workload".to_string(),
         String::new(),
         "Expected: 20–45% better throughput".to_string(),
-        conf.to_string(),
+        conf_label.to_string(),
     ]);
     out
 }
@@ -117,15 +128,20 @@ pub(super) fn format_kv_cache_window_issue(
     seen_pct: u32,
     summary: &RawSnapshot,
 ) -> Vec<String> {
+    let kv = d.kv_cache_usage_perc;
     let mut out = vec![
         "KV Cache Pressure".to_string(),
         format!("Seen in {seen_pct}% of windows"),
         "Cause:".to_string(),
-        format!(
-            "  - KV usage {:.1}% (threshold: {:.0}%)",
-            d.kv_cache_usage_perc, KV_CACHE_PRESSURE_MIN_PERC
-        ),
     ];
+    if d.preemptions_active {
+        out.push("  - Active evictions — tokens being preempted to free KV cache".to_string());
+    } else {
+        out.push(format!(
+            "  - KV cache {kv:.1}% (threshold: {:.0}%) — approaching capacity",
+            KV_CACHE_PRESSURE_MIN_PERC
+        ));
+    }
     if let Some(r) = summary.vllm.num_requests_running.filter(|x| x.is_finite()) {
         out.push(format!("  - High concurrency (~{:.0} running requests)", r));
     }
@@ -150,16 +166,24 @@ pub(super) fn aggregate_r2_detail(
     summary: &RawSnapshot,
 ) -> KvCachePressureDetail {
     if details.is_empty() {
+        let preemptions_active = summary
+            .vllm
+            .num_preemptions_per_sec
+            .is_some_and(|p| p > 0.0)
+            || summary.vllm.num_requests_swapped.is_some_and(|s| s > 0.0);
         return KvCachePressureDetail {
             kv_cache_usage_perc: summary.vllm.kv_cache_usage_perc.unwrap_or(0.0),
             vram_usage_perc_corroborated: None,
+            preemptions_active,
         };
     }
     let kv = details.iter().map(|d| d.kv_cache_usage_perc).sum::<f64>() / details.len() as f64;
     let corroborated = details.iter().find_map(|d| d.vram_usage_perc_corroborated);
+    let preemptions_active = details.iter().any(|d| d.preemptions_active);
     KvCachePressureDetail {
         kv_cache_usage_perc: kv,
         vram_usage_perc_corroborated: corroborated,
+        preemptions_active,
     }
 }
 
