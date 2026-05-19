@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Usage:
-#   MODE=r1 ./load.sh          # under-batching: low concurrency, short prompts
-#   MODE=r2 ./load.sh          # KV cache pressure: high concurrency, long context
+#   MODE=r1  ./load.sh         # under-batching: 2 concurrent, continuous, no gaps
+#   MODE=seq ./load.sh         # under-batching (extreme): 1 sequential request at a time
+#   MODE=r2  ./load.sh         # KV cache pressure: high concurrency, long context
 #
 # Runs forever. Kill with Ctrl-C.
 
@@ -35,16 +36,26 @@ print(''.join(f'[{i:03d}] ' + chunk for i in range(1, 40)))
 LONG_CTX="$(long_context)"
 
 load_r1() {
-  # 2 concurrent requests, long output, gap between batches.
-  # Goal: keep GPU util < 62%, running > 0.75, waiting < 2, TPOT >= 100ms.
+  # Continuous low-concurrency load — no sleep gaps.
+  # CONCURRENCY env var controls batch size (default 2).
+  # Keep small to starve the GPU each decode step without burst/idle cycles.
+  local concurrency="${CONCURRENCY:-2}"
+  local prompt="Write a detailed 500-word essay on GPU architecture and how tensor cores accelerate matrix multiplication."
   while true; do
-    post "Write a detailed 500-word essay on GPU architecture and
-          how tensor cores accelerate matrix multiplication." 600 &
-    post "Write a detailed 500-word essay on LLM inference
-          optimization techniques including batching and KV cache." 600 &
-    sleep 2.0
+    for i in $(seq 1 "$concurrency"); do
+      post "$prompt" 600 &
+    done
     wait
-    sleep 0.5
+  done
+}
+
+load_seq() {
+  # 1 sequential request at a time — maximum under-batching.
+  # Each decode step processes exactly 1 token, exposing raw weight-load cost.
+  # Equivalent to CONCURRENCY=1 MODE=r1 but blocking (no &).
+  local prompt="Write a detailed 500-word essay on GPU architecture and how tensor cores accelerate matrix multiplication."
+  while true; do
+    post "$prompt" 600
   done
 }
 
@@ -67,7 +78,8 @@ echo "Ctrl-C to stop."
 echo ""
 
 case "$MODE" in
-  r1) load_r1 ;;
-  r2) load_r2 ;;
-  *)  echo "Unknown MODE=${MODE}. Use r1 or r2." >&2; exit 1 ;;
+  r1)  load_r1 ;;
+  seq) load_seq ;;
+  r2)  load_r2 ;;
+  *)   echo "Unknown MODE=${MODE}. Use r1, seq, or r2." >&2; exit 1 ;;
 esac
