@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use super::{delta, drift, poll, run_diagnose, state::LoopState, DiagnoseResult};
+use crate::collectors::window_is_evaluable;
 use crate::context::{AnalysisInput, RuntimeWindow};
 use crate::engine;
 use crate::output;
@@ -15,11 +16,12 @@ pub fn run(
     initial_report: engine::Report,
 ) -> anyhow::Result<()> {
     let mut state = LoopState::new(initial_result, initial_report);
-    let mut iteration: u32 = 1;
     let stdin_rx = poll::spawn_stdin_watcher();
 
     loop {
-        let (rule_name, display_lines) = match state.current_primary_recommendation() {
+        let rule_name = match primary_window_rule(&state.last().result)
+            .or_else(|| state.current_primary_recommendation().map(|r| r.rule_name))
+        {
             None => {
                 let baseline = state.last().report.baseline.as_ref();
                 let efficiency = baseline.and_then(|b| b.efficiency_pct);
@@ -36,7 +38,7 @@ pub fn run(
                 println!("\n{msg}");
                 break;
             }
-            Some(rec) => (rec.rule_name, rec.display_lines.clone()),
+            Some(rule_name) => rule_name,
         };
 
         if state.is_oscillating() {
@@ -47,10 +49,6 @@ pub fn run(
             break;
         }
 
-        println!("\n━━━ Iteration {iteration} ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        for line in &display_lines {
-            println!("{line}");
-        }
         state.record_recommendation(rule_name);
 
         let _outcome = poll::wait_for_restart_or_skip(url, &stdin_rx);
@@ -89,10 +87,39 @@ pub fn run(
         }
 
         state.push(new_result, new_report, Some(rule_name));
-        iteration += 1;
     }
 
     Ok(())
+}
+
+/// Returns the rule name that met window-significance thresholds, if any.
+/// Aligned with `engine::rule_is_significant` used by the diagnose UI formatter.
+fn primary_window_rule(result: &DiagnoseResult) -> Option<&'static str> {
+    let ctx = &result.static_ctx;
+    let evaluable: Vec<_> = result
+        .windows
+        .iter()
+        .filter(|w| window_is_evaluable(&w.snapshot))
+        .collect();
+    let n = evaluable.len();
+    if n == 0 {
+        return None;
+    }
+    let r1_count = evaluable
+        .iter()
+        .filter(|w| {
+            let input = AnalysisInput::new(ctx, w);
+            let baseline = engine::baseline::compute(&input);
+            matches!(
+                engine::rule1_under_batching(&w.snapshot, baseline.as_ref()),
+                engine::Rule1Outcome::Fired(_)
+            )
+        })
+        .count();
+    if engine::rule_is_significant(r1_count, n) {
+        return Some("under_batching");
+    }
+    None
 }
 
 fn print_delta(d: &delta::Delta) {

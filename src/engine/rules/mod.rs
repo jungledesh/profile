@@ -2,6 +2,7 @@ use std::time::SystemTime;
 
 use crate::collectors::window_is_evaluable;
 use crate::context::{AnalysisInput, RuntimeWindow};
+use crate::engine::baseline;
 
 mod r1_under_batching;
 mod r2_kv_cache_pressure;
@@ -29,8 +30,21 @@ use r3_low_prefix_reuse::{
 };
 
 pub(super) const MAX_OBSERVATION_SKEW_SECS: f64 = 1.0;
+/// Enforces >= 6s temporal substance (3 windows × 2s).
+pub(super) const ENGINE_MIN_PERSISTENT_WINDOWS: usize = 3;
+/// Enforces >= 25% density floor across evaluable windows.
+pub(super) const ENGINE_MIN_WINDOW_PCT: f64 = 0.25;
 
 // TODO(r5): sampling cliff — sampling temperature is not in collected metrics; wire rule when available.
+
+/// True when a rule fired in enough evaluable windows to be statistically stable.
+pub fn rule_is_significant(fired: usize, total_evaluable: usize) -> bool {
+    if total_evaluable == 0 {
+        return false;
+    }
+    let pct = fired as f64 / total_evaluable as f64;
+    fired >= ENGINE_MIN_PERSISTENT_WINDOWS && pct >= ENGINE_MIN_WINDOW_PCT
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Recommendation {
@@ -59,6 +73,19 @@ impl IssueGroup {
 }
 
 const NO_ISSUES_LINE: &str = "No issues detected in this snapshot.";
+const R2_SUPPRESSED_BY_R4_VERBOSE_LINE: &str = "  ↳ KV pressure suppressed — symptom of the above";
+
+fn rule_display_block(
+    g: &IssueGroup,
+    verbose_rules: bool,
+    r2_suppressed_by_r4: bool,
+) -> Vec<String> {
+    let mut block = g.primary.display_lines.clone();
+    if verbose_rules && r2_suppressed_by_r4 && g.primary.rule_name == "parallelism_mismatch" {
+        block.push(R2_SUPPRESSED_BY_R4_VERBOSE_LINE.to_string());
+    }
+    block
+}
 
 /// User-facing lines when no window met `window_is_evaluable` (shared by stdout and rule formatters).
 pub fn no_evaluable_diagnose_lines(verbose: bool, windows: &[RuntimeWindow]) -> Vec<String> {
@@ -104,14 +131,18 @@ pub fn format_diagnose_rules(input: AnalysisInput<'_>, verbose_rules: bool) -> V
     };
 
     for g in &report.groups {
-        append(g.primary.display_lines.clone());
+        append(rule_display_block(
+            g,
+            verbose_rules,
+            report.r2_suppressed_by_r4,
+        ));
     }
 
     if verbose_rules {
         if !fired_names.contains("under_batching") {
             append(vec!["Under-batching: not indicated".to_string()]);
         }
-        if !fired_names.contains("kv_cache_pressure") {
+        if !fired_names.contains("kv_cache_pressure") && !report.r2_suppressed_by_r4 {
             append(vec!["KV cache pressure: not indicated".to_string()]);
         }
         if !fired_names.contains("low_prefix_reuse") {
@@ -164,8 +195,10 @@ pub fn format_diagnose_rules_for_windows(
     let mut r2_details = Vec::new();
     let mut r3_details = Vec::new();
 
+    let summary_baseline = baseline::compute(&summary);
     for w in &evaluable {
-        match rule1_under_batching(&w.snapshot) {
+        let win_baseline = baseline::compute(&AnalysisInput::new(summary.ctx, w));
+        match rule1_under_batching(&w.snapshot, win_baseline.as_ref()) {
             Rule1Outcome::Fired(d) => {
                 r1_fired += 1;
                 r1_details.push(d);
@@ -212,9 +245,13 @@ pub fn format_diagnose_rules_for_windows(
 
     let mut out = Vec::new();
 
-    if r1_fired > 0 {
+    let r1_significant = rule_is_significant(r1_fired, n_eval);
+    let r2_significant = rule_is_significant(r2_fired, n_eval);
+    let r3_significant = rule_is_significant(r3_fired, n_eval);
+
+    if r1_significant {
         out.extend(format_under_batching_window_issue(
-            &aggregate_r1_detail(&r1_details, summary_snap),
+            &aggregate_r1_detail(&r1_details, summary_snap, summary_baseline.as_ref()),
             pct(r1_fired, n_eval),
         ));
         out.push(String::new());
@@ -223,7 +260,7 @@ pub fn format_diagnose_rules_for_windows(
         out.push(String::new());
     }
 
-    if r2_fired > 0 {
+    if r2_significant {
         out.extend(format_kv_cache_window_issue(
             &aggregate_r2_detail(&r2_details, summary_snap),
             pct(r2_fired, n_eval),
@@ -235,10 +272,11 @@ pub fn format_diagnose_rules_for_windows(
         out.push(String::new());
     }
 
-    if r3_fired > 0 {
+    if r3_significant {
         out.extend(format_low_prefix_window_issue(
             &aggregate_r3_detail(&r3_details, summary_snap),
             pct(r3_fired, n_eval),
+            summary_snap.vllm.cache_config.enable_prefix_caching,
         ));
         out.push(String::new());
     } else if verbose_rules {
@@ -247,13 +285,13 @@ pub fn format_diagnose_rules_for_windows(
     }
 
     let mut not_fired = Vec::new();
-    if r1_fired == 0 {
+    if !r1_significant {
         not_fired.push("Under-batching");
     }
-    if r2_fired == 0 {
+    if !r2_significant {
         not_fired.push("KV Cache Pressure");
     }
-    if r3_fired == 0 {
+    if !r3_significant {
         not_fired.push("Low Prefix Cache");
     }
     if !not_fired.is_empty() {
@@ -265,6 +303,23 @@ pub fn format_diagnose_rules_for_windows(
             "Note: {skipped} of {total} windows had insufficient traffic for analysis."
         ));
     }
+
+    let summary_report = super::build_report(summary);
+    for g in summary_report
+        .groups
+        .iter()
+        .filter(|g| g.primary.rule_name == "parallelism_mismatch")
+    {
+        if !out.is_empty() {
+            out.push(String::new());
+        }
+        out.extend(rule_display_block(
+            g,
+            verbose_rules,
+            summary_report.r2_suppressed_by_r4,
+        ));
+    }
+
     trim_trailing_blank_lines(&mut out);
     out
 }
@@ -306,9 +361,29 @@ fn join_rule_names(items: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::collectors::{GpuRawMetrics, RawSnapshot, VllmRawMetrics};
+    use crate::collectors::{GpuRawMetrics, RawSnapshot, VllmConfig, VllmRawMetrics};
     use crate::context::{AnalysisInput, RuntimeWindow, StaticContext};
+    use crate::engine::baseline::{CeilingEstimate, PhysicsBaseline, WeightDtypeSource};
     use std::time::{Duration, SystemTime};
+
+    fn mock_baseline(tpot_floor_ms: f64) -> PhysicsBaseline {
+        PhysicsBaseline {
+            decode: CeilingEstimate {
+                lower: 1.0,
+                expected: 1.0,
+                upper: 1.0,
+            },
+            prefill: None,
+            efficiency_pct: None,
+            headroom_pct: None,
+            weight_dtype_source: WeightDtypeSource::Fallback,
+            weight_gb: 1.0,
+            kv_headroom_gb: None,
+            tpot_floor_ms,
+            prefill_latency_floor_ms: None,
+            ridge_batch_size: 1.0,
+        }
+    }
 
     fn snap(
         gpu_at: SystemTime,
@@ -337,11 +412,45 @@ mod tests {
         AnalysisInput { ctx, window: win }
     }
 
+    fn input_r4_suppresses_r2() -> (StaticContext, RuntimeWindow) {
+        let t = SystemTime::UNIX_EPOCH;
+        let snap = RawSnapshot {
+            gpu_observed_at: t,
+            vllm_observed_at: t,
+            timestamp: t,
+            vllm: VllmRawMetrics {
+                model_name: Some("meta-llama/Llama-3.1-70B-Instruct".to_string()),
+                num_requests_running: Some(3.0),
+                num_requests_waiting: Some(0.0),
+                max_num_seqs: Some(256),
+                kv_cache_usage_perc: Some(86.0),
+                generation_tokens_per_sec: Some(50.0),
+                request_success_per_sec: Some(10.0),
+                ..Default::default()
+            },
+            gpu: GpuRawMetrics {
+                gpu_name: Some("NVIDIA H100 80GB HBM3".to_string()),
+                vram_total_mb: Some(80 * 1024),
+                gpu_util_pct: Some(58.0),
+                ..Default::default()
+            },
+        };
+        let cfg = VllmConfig {
+            dtype: Some("bf16".to_string()),
+            max_model_len: Some(2048),
+            ..Default::default()
+        };
+        let ctx = StaticContext::from_snapshot(&snap, cfg);
+        let win = RuntimeWindow::from_snapshot(snap);
+        (ctx, win)
+    }
+
     fn vllm_base() -> VllmRawMetrics {
         VllmRawMetrics {
             num_requests_running: Some(3.1),
             num_requests_waiting: Some(0.0),
             max_num_seqs: Some(256),
+            request_success_per_sec: Some(10.0),
             ..Default::default()
         }
     }
@@ -362,150 +471,121 @@ mod tests {
 
     #[test]
     fn under_batching_fires_when_gates_pass() {
+        let base = mock_baseline(10.0);
         let t = SystemTime::UNIX_EPOCH;
-        let s = snap(t, t, vllm_base(), gpu_low());
+        let mut v = vllm_base();
+        v.tpot_ms = Some(35.0);
+        let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        let r = r1_recommendation(&win.snapshot).expect("r1 fired");
+        let r = r1_recommendation(&win.snapshot, Some(&base)).expect("r1 fired");
         assert_eq!(r.rule_name, "under_batching");
         assert_eq!(r.impact, 4);
-        assert!((r.confidence - 0.75).abs() < 1e-9);
-        match rule1_under_batching(&win.snapshot) {
+        assert!((r.confidence - 0.9).abs() < 1e-9);
+        match rule1_under_batching(&win.snapshot, Some(&base)) {
             Rule1Outcome::Fired(d) => {
                 assert!((d.running - 3.1).abs() < 1e-9);
                 assert_eq!(d.max_num_seqs, 256);
-                assert!((d.gpu_util - 58.0).abs() < 1e-9);
+                assert!(d.occupancy_pct < 10.0);
             }
             Rule1Outcome::NotFired(_) => panic!("expected fired"),
         }
     }
 
     #[test]
-    fn r1_recommendation_higher_confidence_when_gpu_util_below_30() {
-        let t = SystemTime::UNIX_EPOCH;
-        let mut g = gpu_low();
-        g.gpu_util_pct = Some(28.0);
-        let s = snap(t, t, vllm_base(), g);
-        let r = r1_recommendation(&s).expect("fired");
-        assert_eq!(r.rule_name, "under_batching");
-        assert!((r.confidence - 0.9).abs() < 1e-9);
-    }
-
-    #[test]
-    fn skew_over_one_second_suppresses() {
-        let t0 = SystemTime::UNIX_EPOCH;
-        let t1 = t0 + Duration::from_secs(2);
-        let s = snap(t0, t1, vllm_base(), gpu_low());
-        let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot).is_none());
-    }
-
-    #[test]
     fn waiting_none_suppresses() {
+        let base = mock_baseline(10.0);
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
         v.num_requests_waiting = None;
+        v.tpot_ms = Some(35.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot).is_none());
+        assert!(r1_recommendation(&win.snapshot, Some(&base)).is_none());
     }
 
     #[test]
     fn waiting_at_two_suppresses() {
+        let base = mock_baseline(10.0);
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
         v.num_requests_waiting = Some(2.0);
+        v.tpot_ms = Some(35.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot).is_none());
+        assert!(r1_recommendation(&win.snapshot, Some(&base)).is_none());
     }
 
     #[test]
-    fn running_at_floor_suppresses() {
+    fn running_at_occupancy_threshold_suppresses() {
+        let base = mock_baseline(10.0);
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
-        v.num_requests_running = Some(0.75);
+        v.num_requests_running = Some(26.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot).is_none());
-    }
-
-    #[test]
-    fn running_below_activity_floor_suppresses() {
-        let t = SystemTime::UNIX_EPOCH;
-        let mut v = vllm_base();
-        v.num_requests_running = Some(0.6);
-        let s = snap(t, t, v, gpu_low());
-        let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot).is_none());
-    }
-
-    #[test]
-    fn high_occupancy_suppresses() {
-        let t = SystemTime::UNIX_EPOCH;
-        let mut v = vllm_base();
-        v.num_requests_running = Some(40.0);
-        let s = snap(t, t, v, gpu_low());
-        let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot).is_none());
-    }
-
-    #[test]
-    fn occupancy_at_six_percent_cap_suppresses() {
-        let t = SystemTime::UNIX_EPOCH;
-        let mut v = vllm_base();
-        v.num_requests_running = Some(16.0);
-        let s = snap(t, t, v, gpu_low());
-        let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot).is_none());
-    }
-
-    #[test]
-    fn gpu_sixty_two_percent_suppresses() {
-        let t = SystemTime::UNIX_EPOCH;
-        let mut g = gpu_low();
-        g.gpu_util_pct = Some(62.0);
-        let s = snap(t, t, vllm_base(), g);
-        let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot).is_none());
+        assert!(r1_recommendation(&win.snapshot, Some(&base)).is_none());
     }
 
     #[test]
     fn max_seqs_zero_suppresses() {
+        let base = mock_baseline(10.0);
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
         v.max_num_seqs = Some(0);
+        v.tpot_ms = Some(35.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot).is_none());
+        assert!(r1_recommendation(&win.snapshot, Some(&base)).is_none());
     }
 
     #[test]
     fn nan_running_suppresses() {
+        let base = mock_baseline(10.0);
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
         v.num_requests_running = Some(f64::NAN);
+        v.tpot_ms = Some(35.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot).is_none());
+        assert!(r1_recommendation(&win.snapshot, Some(&base)).is_none());
     }
 
     #[test]
     fn format_under_batching_fired_matches_template() {
         let t = SystemTime::UNIX_EPOCH;
-        let s = snap(t, t, vllm_base(), gpu_low());
+        let mut v = vllm_base();
+        v.num_requests_running = Some(5.0);
+        let s = snap(t, t, v, gpu_low());
         let ctx = mk_ctx();
         let win = mk_win(s);
         let lines = format_diagnose_rules(ai(&ctx, &win), false);
         let text = lines.join("\n");
-        assert!(text.contains("ISSUE: Under-batching"));
-        assert!(text.contains("avg GPU util 58% (threshold: 62%)"));
-        assert!(text.contains("occupancy 1.2% (threshold: 4%)"));
-        assert!(text.contains("3.1 / 256 max_seqs"));
-        assert!(text.contains("Recommendation:"));
-        assert!(text.contains("  • Increase client concurrency or request rate"));
-        assert!(text.contains("  • Raise max_num_seqs if VRAM allows"));
-        assert!(text.contains("Expected: Better throughput"));
-        assert!(text.contains("Confidence: Medium-High"));
+        assert!(text.contains("[!] Under-batching — Low Occupancy"));
+        assert!(text.contains("Occupancy"));
+        assert!(text.contains("threshold: < 10%"));
+        assert!(text.contains("unused capacity"));
+        assert!(text.contains("unused slots"));
+        assert!(text.contains("Expected: Higher throughput, stable TPOT."));
+        assert!(text.contains("Confidence: High"));
+    }
+
+    #[test]
+    fn format_diagnose_verbose_shows_r2_suppression_note_on_r4() {
+        let (ctx, win) = input_r4_suppresses_r2();
+        let text = format_diagnose_rules(ai(&ctx, &win), true).join("\n");
+        assert!(text.contains("Parallelism Mismatch"));
+        assert!(text.contains(R2_SUPPRESSED_BY_R4_VERBOSE_LINE));
+        assert!(!text.contains("KV cache pressure: not indicated"));
+        assert!(!text.contains("ISSUE: KV Cache Pressure"));
+    }
+
+    #[test]
+    fn format_diagnose_non_verbose_omits_r2_suppression_note() {
+        let (ctx, win) = input_r4_suppresses_r2();
+        let text = format_diagnose_rules(ai(&ctx, &win), false).join("\n");
+        assert!(text.contains("Parallelism Mismatch"));
+        assert!(!text.contains(R2_SUPPRESSED_BY_R4_VERBOSE_LINE));
+        assert!(!text.contains("ISSUE: KV Cache Pressure"));
     }
 
     #[test]
@@ -513,7 +593,9 @@ mod tests {
         let t = SystemTime::UNIX_EPOCH;
         let mut g = gpu_low();
         g.gpu_util_pct = Some(75.0);
-        let s = snap(t, t, vllm_base(), g);
+        let mut v = vllm_base();
+        v.num_requests_running = Some(30.0);
+        let s = snap(t, t, v, g);
         let ctx = mk_ctx();
         let win = mk_win(s);
         let text = format_diagnose_rules(ai(&ctx, &win), true).join("\n");
@@ -532,7 +614,20 @@ mod tests {
     }
 
     #[test]
-    fn r2_recommendation_confidence_matches_vram_corroboration() {
+    fn r2_recommendation_critical_confidence_when_preemptions_active() {
+        let t = SystemTime::UNIX_EPOCH;
+        let mut v = vllm_high_kv();
+        v.kv_cache_usage_perc = Some(50.0);
+        v.num_preemptions_per_sec = Some(0.5);
+        let s = snap(t, t, v, gpu_low());
+        let r = r2_recommendation(&s).expect("fired");
+        assert_eq!(r.rule_name, "kv_cache_pressure");
+        assert_eq!(r.impact, 5);
+        assert!((r.confidence - 0.95).abs() < 1e-9);
+    }
+
+    #[test]
+    fn r2_recommendation_warning_confidence_when_kv_high_only() {
         let t = SystemTime::UNIX_EPOCH;
         let mut g = gpu_low();
         g.vram_used_mb = Some(78 * 1024);
@@ -541,17 +636,6 @@ mod tests {
         let r = r2_recommendation(&s).expect("fired");
         assert_eq!(r.rule_name, "kv_cache_pressure");
         assert_eq!(r.impact, 5);
-        assert!((r.confidence - 0.9).abs() < 1e-9);
-    }
-
-    #[test]
-    fn r2_recommendation_lower_confidence_without_vram_corroboration() {
-        let t = SystemTime::UNIX_EPOCH;
-        let mut gb = gpu_busy();
-        gb.vram_used_mb = Some(50 * 1024);
-        gb.vram_total_mb = Some(100 * 1024);
-        let s = snap(t, t, vllm_high_kv(), gb);
-        let r = r2_recommendation(&s).expect("fired");
         assert!((r.confidence - 0.7).abs() < 1e-9);
     }
 
@@ -565,6 +649,7 @@ mod tests {
             Rule2Outcome::Fired(d) => {
                 assert!((d.kv_cache_usage_perc - 85.0).abs() < 1e-9);
                 assert!(d.vram_usage_perc_corroborated.is_none());
+                assert!(!d.preemptions_active);
             }
             Rule2Outcome::NotFired(_) => panic!("expected fired at 85%"),
         }
@@ -589,7 +674,9 @@ mod tests {
     fn kv_cache_pressure_skew_suppresses() {
         let t0 = SystemTime::UNIX_EPOCH;
         let t1 = t0 + Duration::from_secs(2);
-        let s = snap(t0, t1, vllm_high_kv(), gpu_low());
+        let mut v = vllm_high_kv();
+        v.num_requests_running = Some(30.0);
+        let s = snap(t0, t1, v, gpu_low());
         match rule2_kv_cache_pressure(&s) {
             Rule2Outcome::NotFired(m) => {
                 assert!(m.skew_exceeded);
@@ -629,14 +716,14 @@ mod tests {
         let win_kv_only = mk_win(s_kv_only);
         let text = format_diagnose_rules(ai(&ctx2, &win_kv_only), false).join("\n");
         assert!(text.contains("Cause:"));
-        assert!(text.contains("  - KV usage 86.0% (threshold: 85%)"));
+        assert!(text.contains("  - KV cache 86.0% (threshold: 85%)"));
         assert!(text.contains("  - High concurrency (~3 running requests)"));
         assert!(text.contains("Expected: 20–45% better throughput"));
         assert!(
             text.contains("  • Reduce active sequence count (lower concurrency or request rate)")
         );
         assert!(text.contains("  • Consider fp8 KV cache (kv-cache-dtype=fp8)"));
-        assert!(text.contains("Confidence: High"));
+        assert!(text.contains("Confidence: Medium-High"));
     }
 
     #[test]
@@ -654,13 +741,15 @@ mod tests {
         let win = mk_win(s);
         let text = format_diagnose_rules(ai(&ctx, &win), false).join("\n");
         assert!(text.contains("Confidence: Medium-High"));
-        assert!(text.contains("  - KV usage 86.0% (threshold: 85%)"));
+        assert!(text.contains("  - KV cache 86.0% (threshold: 85%)"));
     }
 
     #[test]
     fn kv_cache_miss_unavailable_without_gauge_verbose() {
         let t = SystemTime::UNIX_EPOCH;
-        let s = snap(t, t, vllm_base(), gpu_busy());
+        let mut v = vllm_base();
+        v.num_requests_running = Some(30.0);
+        let s = snap(t, t, v, gpu_busy());
         let ctx = mk_ctx();
         let win = mk_win(s);
         let text = format_diagnose_rules(ai(&ctx, &win), true).join("\n");
@@ -689,7 +778,7 @@ mod tests {
         let r = r3_recommendation(&win.snapshot).expect("r3 fired");
         assert_eq!(r.rule_name, "low_prefix_reuse");
         assert_eq!(r.impact, 2);
-        assert!((r.confidence - 0.6).abs() < 1e-9);
+        assert!((r.confidence - 0.9).abs() < 1e-9);
     }
 
     #[test]
@@ -709,19 +798,19 @@ mod tests {
             hit_rate: 0.24,
             prompt_tokens_mean: 128.0,
         };
-        let lines = format_low_prefix_hit_rate_fired(&d);
+        let lines = format_low_prefix_hit_rate_fired(&d, Some(true));
         let text = lines.join("\n");
         assert!(text.contains("ISSUE: Low Prefix Cache"));
         assert!(text.contains("Cause:"));
         assert!(text.contains("  - Prefix hit rate 24.0% (threshold: 35%)"));
-        assert!(text.contains("  - Prompts have no shared leading context"));
+        assert!(text.contains("restructure prompts to share common prefixes"));
         assert!(text.contains("Recommendation:"));
         assert!(
             text.contains("  • Workload shows no prefix reuse — cache is currently ineffective")
         );
         assert!(text.contains("  • Otherwise: no action needed"));
         assert!(text.contains("Expected: Reduced prefill time"));
-        assert!(text.contains("Confidence: Medium-High"));
+        assert!(text.contains("Confidence: High"));
     }
 
     #[test]
@@ -756,7 +845,9 @@ mod tests {
         let t = SystemTime::UNIX_EPOCH;
         let mut g = gpu_low();
         g.gpu_util_pct = Some(75.0);
-        let s = snap(t, t, vllm_base(), g);
+        let mut v = vllm_base();
+        v.num_requests_running = Some(30.0);
+        let s = snap(t, t, v, g);
         let ctx = mk_ctx();
         let win = mk_win(s);
         let lines = format_diagnose_rules(ai(&ctx, &win), false);
@@ -768,24 +859,37 @@ mod tests {
 
     #[test]
     fn format_diagnose_rules_inserts_blank_between_rule_blocks() {
-        let t = SystemTime::UNIX_EPOCH;
-        let s = snap(t, t, vllm_high_kv(), gpu_low());
-        let ctx = mk_ctx();
-        let win = mk_win(s);
+        let (ctx, win) = {
+            let mut v = vllm_high_kv();
+            v.tpot_ms = Some(35.0);
+            v.model_name = Some("meta-llama/Llama-3.1-8B-Instruct".to_string());
+            let mut g = gpu_low();
+            g.gpu_name = Some("NVIDIA H100 80GB HBM3".to_string());
+            let t = SystemTime::UNIX_EPOCH;
+            let snap = snap(t, t, v, g);
+            let cfg = VllmConfig {
+                dtype: Some("bf16".to_string()),
+                max_model_len: Some(2048),
+                ..Default::default()
+            };
+            let ctx = StaticContext::from_snapshot(&snap, cfg);
+            let win = mk_win(snap);
+            (ctx, win)
+        };
         let lines = format_diagnose_rules(ai(&ctx, &win), false);
         let idx_under = lines
             .iter()
-            .position(|l| l.contains("ISSUE: Under-batching"))
+            .position(|l| l.contains("[!] Under-batching — Low Occupancy"))
             .expect("rule1");
         let idx_kv = lines
             .iter()
             .position(|l| l.contains("ISSUE: KV Cache Pressure"))
             .expect("rule2");
         assert!(
-            idx_kv < idx_under,
-            "KV cache pressure should rank before under-batching by score"
+            idx_under < idx_kv,
+            "under-batching should rank before KV cache pressure by score"
         );
-        let between = &lines[idx_kv..idx_under];
+        let between = &lines[idx_under..idx_kv];
         assert!(
             between.iter().any(|l| l.is_empty()),
             "expected blank line between rule blocks: {between:?}"
@@ -797,9 +901,33 @@ mod tests {
     }
 
     #[test]
+    fn rule_is_significant_six_of_ten_windows_passes() {
+        assert!(rule_is_significant(6, 10));
+    }
+
+    #[test]
+    fn rule_is_significant_three_of_fifteen_fails_density_gate() {
+        assert!(!rule_is_significant(3, 15));
+    }
+
+    #[test]
+    fn rule_is_significant_four_of_fifteen_passes() {
+        assert!(rule_is_significant(4, 15));
+    }
+
+    #[test]
+    fn rule_is_significant_zero_evaluable_windows_is_false() {
+        assert!(!rule_is_significant(3, 0));
+    }
+
+    #[test]
     fn format_diagnose_rules_for_windows_matches_requested_style_when_some_rules_fire() {
         let t = SystemTime::UNIX_EPOCH;
-        let ctx = mk_ctx();
+        let cfg = VllmConfig {
+            dtype: Some("bf16".to_string()),
+            max_model_len: Some(2048),
+            ..Default::default()
+        };
         let mut windows = Vec::new();
         for i in 0..10 {
             let mut v = vllm_base();
@@ -813,24 +941,26 @@ mod tests {
             g.power_watts = Some(312.0);
             g.vram_used_mb = Some(62 * 1024);
             g.vram_total_mb = Some(80 * 1024);
-            if i < 4 {
+            v.model_name = Some("meta-llama/Llama-3.1-8B-Instruct".to_string());
+            g.gpu_name = Some("NVIDIA H100 80GB HBM3".to_string());
+            if i < 6 {
                 v.num_requests_running = Some(3.2);
+                v.tpot_ms = Some(35.0);
                 g.gpu_util_pct = Some(50.0);
             } else {
-                v.num_requests_running = Some(20.0);
+                v.num_requests_running = Some(30.0);
                 g.gpu_util_pct = Some(74.0);
             }
             windows.push(mk_win(snap(t, t, v, g)));
         }
+        let ctx = StaticContext::from_snapshot(&windows[0].snapshot, cfg);
         let summary = ai(&ctx, windows.last().expect("summary source"));
         let lines = format_diagnose_rules_for_windows(&windows, summary, false);
         let text = lines.join("\n");
-        assert!(text.contains("Under-batching"));
-        assert!(text.contains("Seen in 40% of windows"));
-        assert!(text.contains(
-            "Cause: avg GPU util 50.0% (threshold: 62%) and occupancy 1.2% (threshold: 4%) — avg 3.2 / 256 max_seqs"
-        ));
-        assert!(text.contains("For better efficiency:"));
+        assert!(text.contains("Under-batching — Low Occupancy"));
+        assert!(text.contains("Seen in 60% of windows"));
+        assert!(text.contains("Occupancy"));
+        assert!(text.contains("raise --max-num-seqs"));
         assert!(text.contains("No issues for KV Cache Pressure and Low Prefix Cache"));
     }
 

@@ -1,23 +1,22 @@
 use crate::collectors::RawSnapshot;
+use crate::engine::PhysicsBaseline;
 
-use super::{skew_secs, Recommendation, MAX_OBSERVATION_SKEW_SECS};
+use super::Recommendation;
 
-const UNDER_BATCHING_GPU_UTIL_LT: f64 = 62.0;
-const UNDER_BATCHING_RUNNING_GT: f64 = 0.75;
-const UNDER_BATCHING_OCCUPANCY_FRAC: f64 = 0.04;
+const UNDER_BATCHING_OCCUPANCY_PCT: f64 = 0.10;
 const UNDER_BATCHING_WAITING_LT: f64 = 2.0;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnderBatchingDetail {
     pub running: f64,
+    pub waiting: f64,
     pub max_num_seqs: u32,
-    pub gpu_util: f64,
+    pub occupancy_pct: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MissReport {
     pub running: Option<f64>,
-    pub gpu_util: Option<f64>,
     pub max_num_seqs: Option<u32>,
 }
 
@@ -27,89 +26,86 @@ pub enum Rule1Outcome {
     NotFired(MissReport),
 }
 
-pub fn rule1_under_batching(snapshot: &RawSnapshot) -> Rule1Outcome {
-    let skew = skew_secs(snapshot.gpu_observed_at, snapshot.vllm_observed_at);
+pub fn rule1_under_batching(
+    snapshot: &RawSnapshot,
+    _baseline: Option<&PhysicsBaseline>,
+) -> Rule1Outcome {
     let running = snapshot.vllm.num_requests_running;
     let max_num_seqs = snapshot.vllm.max_num_seqs;
-    let gpu_util = snapshot.gpu.gpu_util_pct;
     let waiting = snapshot.vllm.num_requests_waiting;
 
     let miss = || MissReport {
         running,
-        gpu_util,
         max_num_seqs,
     };
 
-    if skew > MAX_OBSERVATION_SKEW_SECS {
-        return Rule1Outcome::NotFired(miss());
-    }
-
-    let Some(rv) = running.filter(|v| v.is_finite()) else {
+    let Some(rv) = running.filter(|v| v.is_finite() && *v > 0.0) else {
         return Rule1Outcome::NotFired(miss());
     };
     let Some(max_n) = max_num_seqs.filter(|&n| n > 0) else {
-        return Rule1Outcome::NotFired(miss());
-    };
-    let Some(gpu) = gpu_util.filter(|v| v.is_finite()) else {
         return Rule1Outcome::NotFired(miss());
     };
     let Some(wv) = waiting.filter(|v| v.is_finite()) else {
         return Rule1Outcome::NotFired(miss());
     };
 
-    let max_f = f64::from(max_n);
-    let occupancy_cap = UNDER_BATCHING_OCCUPANCY_FRAC * max_f;
+    let occupancy = rv / f64::from(max_n);
 
-    let fires = rv > UNDER_BATCHING_RUNNING_GT
-        && rv < occupancy_cap
-        && gpu < UNDER_BATCHING_GPU_UTIL_LT
-        && wv < UNDER_BATCHING_WAITING_LT;
-
-    if fires {
+    if occupancy < UNDER_BATCHING_OCCUPANCY_PCT && wv < UNDER_BATCHING_WAITING_LT {
         Rule1Outcome::Fired(UnderBatchingDetail {
             running: rv,
+            waiting: wv,
             max_num_seqs: max_n,
-            gpu_util: gpu,
+            occupancy_pct: occupancy * 100.0,
         })
     } else {
         Rule1Outcome::NotFired(miss())
     }
 }
 
-pub fn r1_recommendation(snapshot: &RawSnapshot) -> Option<Recommendation> {
-    let Rule1Outcome::Fired(d) = rule1_under_batching(snapshot) else {
+pub fn r1_recommendation(
+    snapshot: &RawSnapshot,
+    baseline: Option<&PhysicsBaseline>,
+) -> Option<Recommendation> {
+    let Rule1Outcome::Fired(d) = rule1_under_batching(snapshot, baseline) else {
         return None;
     };
     Some(Recommendation {
         rule_name: "under_batching",
         impact: 4,
-        confidence: if d.gpu_util < 30.0 { 0.9 } else { 0.75 },
-        action: "Increase client concurrency or raise max_num_seqs".to_string(),
-        expected_impact: "Higher GPU utilization and throughput".to_string(),
+        confidence: 0.9,
+        action: "Increase client concurrency".to_string(),
+        expected_impact: "Higher throughput, stable TPOT".to_string(),
         display_lines: format_under_batching_fired(&d),
     })
 }
 
 pub(super) fn format_under_batching_fired(d: &UnderBatchingDetail) -> Vec<String> {
-    let pct = (d.running / f64::from(d.max_num_seqs)) * 100.0;
-    let run_s = fmt_f64_display(d.running);
-    let gpu_s = fmt_f64_display(d.gpu_util);
-    let occ_thresh_pct = UNDER_BATCHING_OCCUPANCY_FRAC * 100.0;
+    let threshold = UNDER_BATCHING_OCCUPANCY_PCT * 100.0;
+    let unused = f64::from(d.max_num_seqs) - d.running;
     vec![
-        "ISSUE: Under-batching".to_string(),
+        "[!] Under-batching — Low Occupancy".to_string(),
+        String::new(),
         format!(
-            "Cause: avg GPU util {gpu_s}% (threshold: {:.0}%) and occupancy {pct:.1}% (threshold: {:.0}%) — {run_s} / {} max_seqs",
-            UNDER_BATCHING_GPU_UTIL_LT,
-            occ_thresh_pct,
-            d.max_num_seqs,
+            "  Occupancy  {:.1}%  (threshold: < {threshold:.0}%)",
+            d.occupancy_pct
+        ),
+        format!(
+            "  Requests   {:.0} running, {:.0} waiting  (max: {})",
+            d.running, d.waiting, d.max_num_seqs
         ),
         String::new(),
-        "Recommendation:".to_string(),
-        "  • Increase client concurrency or request rate".to_string(),
-        "  • Raise max_num_seqs if VRAM allows".to_string(),
+        "  Engine has unused capacity with no backlog — batch is too small.".to_string(),
         String::new(),
-        "Expected: Better throughput".to_string(),
-        "Confidence: Medium-High".to_string(),
+        "  Fix:".to_string(),
+        format!("    • Increase client concurrency — engine has {unused:.0} unused slots"),
+        format!(
+            "    • If upstream is already at max traffic: raise --max-num-seqs (current: {})",
+            d.max_num_seqs
+        ),
+        String::new(),
+        "  Expected: Higher throughput, stable TPOT.".to_string(),
+        "  Confidence: High".to_string(),
     ]
 }
 
@@ -117,50 +113,139 @@ pub(super) fn format_under_batching_window_issue(
     d: &UnderBatchingDetail,
     seen_pct: u32,
 ) -> Vec<String> {
-    let occupancy_pct = (d.running / f64::from(d.max_num_seqs)) * 100.0;
-    let occ_thresh_pct = UNDER_BATCHING_OCCUPANCY_FRAC * 100.0;
-    vec![
-        "Under-batching".to_string(),
-        format!("Seen in {seen_pct}% of windows"),
-        format!(
-            "Cause: avg GPU util {:.1}% (threshold: {:.0}%) and occupancy {occupancy_pct:.1}% (threshold: {:.0}%) — avg {:.1} / {} max_seqs",
-            d.gpu_util,
-            UNDER_BATCHING_GPU_UTIL_LT,
-            occ_thresh_pct,
-            d.running,
-            d.max_num_seqs,
-        ),
-        String::new(),
-        "For better efficiency:".to_string(),
-        "  • Increase client concurrency or request rate".to_string(),
-        "  • Raise max_num_seqs if VRAM allows".to_string(),
-    ]
+    let mut lines = format_under_batching_fired(d);
+    lines.insert(1, format!("  Seen in {seen_pct}% of windows"));
+    lines
 }
 
 pub(super) fn aggregate_r1_detail(
     details: &[UnderBatchingDetail],
     summary: &RawSnapshot,
+    _baseline: Option<&PhysicsBaseline>,
 ) -> UnderBatchingDetail {
     if details.is_empty() {
+        let running = summary.vllm.num_requests_running.unwrap_or(0.0);
+        let max_n = summary.vllm.max_num_seqs.unwrap_or(256);
+        let waiting = summary.vllm.num_requests_waiting.unwrap_or(0.0);
+        let occupancy_pct = if max_n > 0 {
+            running / f64::from(max_n) * 100.0
+        } else {
+            0.0
+        };
         return UnderBatchingDetail {
-            running: summary.vllm.num_requests_running.unwrap_or(0.0),
-            max_num_seqs: summary.vllm.max_num_seqs.unwrap_or(256),
-            gpu_util: summary.gpu.gpu_util_pct.unwrap_or(0.0),
+            running,
+            waiting,
+            max_num_seqs: max_n,
+            occupancy_pct,
         };
     }
-    let running = details.iter().map(|d| d.running).sum::<f64>() / details.len() as f64;
-    let gpu = details.iter().map(|d| d.gpu_util).sum::<f64>() / details.len() as f64;
+    let n = details.len() as f64;
+    let running = details.iter().map(|d| d.running).sum::<f64>() / n;
+    let waiting = details.iter().map(|d| d.waiting).sum::<f64>() / n;
+    let occupancy_pct = details.iter().map(|d| d.occupancy_pct).sum::<f64>() / n;
     UnderBatchingDetail {
         running,
+        waiting,
         max_num_seqs: details[0].max_num_seqs,
-        gpu_util: gpu,
+        occupancy_pct,
     }
 }
 
-fn fmt_f64_display(x: f64) -> String {
-    if (x - x.round()).abs() < 1e-6 {
-        format!("{:.0}", x)
-    } else {
-        format!("{:.1}", x)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::collectors::VllmRawMetrics;
+
+    fn snap(running: Option<f64>, max_num_seqs: Option<u32>, waiting: Option<f64>) -> RawSnapshot {
+        use std::time::SystemTime;
+        let t = SystemTime::UNIX_EPOCH;
+        RawSnapshot {
+            gpu_observed_at: t,
+            vllm_observed_at: t,
+            timestamp: t,
+            vllm: VllmRawMetrics {
+                num_requests_running: running,
+                num_requests_waiting: waiting,
+                max_num_seqs,
+                ..Default::default()
+            },
+            gpu: Default::default(),
+        }
+    }
+
+    #[test]
+    fn fires_when_occupancy_low() {
+        let s = snap(Some(5.0), Some(256), Some(0.0));
+        match rule1_under_batching(&s, None) {
+            Rule1Outcome::Fired(d) => {
+                assert!((d.occupancy_pct - (5.0 / 256.0 * 100.0)).abs() < 0.1);
+            }
+            Rule1Outcome::NotFired(_) => panic!("expected fired"),
+        }
+    }
+
+    #[test]
+    fn fires_at_occupancy_boundary() {
+        let s = snap(Some(25.0), Some(256), Some(0.0));
+        match rule1_under_batching(&s, None) {
+            Rule1Outcome::Fired(d) => {
+                assert!(d.occupancy_pct < 10.0);
+            }
+            Rule1Outcome::NotFired(_) => panic!("expected fired at 9.8% occupancy"),
+        }
+    }
+
+    #[test]
+    fn mutes_at_occupancy_threshold() {
+        let s = snap(Some(26.0), Some(256), Some(0.0));
+        assert!(matches!(
+            rule1_under_batching(&s, None),
+            Rule1Outcome::NotFired(_)
+        ));
+    }
+
+    #[test]
+    fn mutes_when_no_traffic() {
+        let s = snap(Some(0.0), Some(256), Some(0.0));
+        assert!(matches!(
+            rule1_under_batching(&s, None),
+            Rule1Outcome::NotFired(_)
+        ));
+    }
+
+    #[test]
+    fn mutes_when_backpressure_at_two() {
+        let s = snap(Some(5.0), Some(256), Some(2.0));
+        assert!(matches!(
+            rule1_under_batching(&s, None),
+            Rule1Outcome::NotFired(_)
+        ));
+    }
+
+    #[test]
+    fn fires_when_waiting_one_below_backpressure_gate() {
+        let s = snap(Some(5.0), Some(256), Some(1.0));
+        assert!(matches!(
+            rule1_under_batching(&s, None),
+            Rule1Outcome::Fired(_)
+        ));
+    }
+
+    #[test]
+    fn mutes_when_max_num_seqs_missing() {
+        let s = snap(Some(5.0), None, Some(0.0));
+        assert!(matches!(
+            rule1_under_batching(&s, None),
+            Rule1Outcome::NotFired(_)
+        ));
+    }
+
+    #[test]
+    fn mutes_when_running_missing() {
+        let s = snap(None, Some(256), Some(0.0));
+        assert!(matches!(
+            rule1_under_batching(&s, None),
+            Rule1Outcome::NotFired(_)
+        ));
     }
 }
