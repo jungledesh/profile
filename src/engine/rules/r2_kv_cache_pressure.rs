@@ -119,15 +119,18 @@ pub(super) fn format_kv_cache_pressure_fired(
         out.extend([
             "    • Reduce concurrency now — active evictions are degrading latency".to_string(),
             "    • Lower --max-num-seqs to shed in-flight sequences".to_string(),
-            "    • Consider fp8 KV cache (--kv-cache-dtype fp8) to halve KV memory footprint".to_string(),
+            "    • Consider fp8 KV cache (--kv-cache-dtype fp8) to halve KV memory footprint"
+                .to_string(),
             "    • Lower max_model_len if workload allows shorter context".to_string(),
         ]);
     } else {
         // Approaching capacity — strategic fixes
         out.extend([
-            "    • Raise --gpu-memory-utilization if VRAM headroom exists (check vRAM in header)".to_string(),
+            "    • Raise --gpu-memory-utilization if VRAM headroom exists (check vRAM in header)"
+                .to_string(),
             "    • Reduce max_num_seqs to limit peak concurrent KV block consumption".to_string(),
-            "    • Consider fp8 KV cache (--kv-cache-dtype fp8) to halve KV memory footprint".to_string(),
+            "    • Consider fp8 KV cache (--kv-cache-dtype fp8) to halve KV memory footprint"
+                .to_string(),
             "    • Lower max_model_len only if safe for your workload".to_string(),
         ]);
     }
