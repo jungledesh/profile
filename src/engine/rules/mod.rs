@@ -24,6 +24,7 @@ pub use r4_parallelism::r4_recommendation;
 use r1_under_batching::{aggregate_r1_detail, format_under_batching_window_issue};
 use r2_kv_cache_pressure::{
     aggregate_r2_detail, format_kv_cache_window_issue, kv_pressure_confidence,
+    KV_CACHE_CRITICAL_THRESHOLD_PCT,
 };
 #[cfg(test)]
 use r3_low_prefix_reuse::format_low_prefix_hit_rate_fired;
@@ -248,7 +249,13 @@ pub fn format_diagnose_rules_for_windows(
     let mut out = Vec::new();
 
     let r1_significant = rule_is_significant(r1_fired, n_eval);
-    let r2_significant = rule_is_significant(r2_fired, n_eval);
+    let r2_any_preemptions = r2_details.iter().any(|d| d.preemptions_active);
+    let r2_critical_windows = r2_details
+        .iter()
+        .filter(|d| d.kv_cache_usage_perc >= KV_CACHE_CRITICAL_THRESHOLD_PCT)
+        .count();
+    let r2_significant =
+        r2_any_preemptions || r2_critical_windows >= 2 || rule_is_significant(r2_fired, n_eval);
     let r3_significant = rule_is_significant(r3_fired, n_eval);
 
     if r1_significant {
@@ -617,6 +624,24 @@ mod tests {
         }
     }
 
+    fn mk_evaluable_kv_window(kv_pct: f64, preemptions: bool) -> RuntimeWindow {
+        let t = SystemTime::UNIX_EPOCH;
+        let mut v = vllm_base();
+        v.kv_cache_usage_perc = Some(kv_pct);
+        v.generation_tokens_per_sec = Some(100.0);
+        v.num_requests_running = Some(30.0);
+        if preemptions {
+            v.num_preemptions_per_sec = Some(1.0);
+        }
+        mk_win(snap(t, t, v, gpu_busy()))
+    }
+
+    fn r2_issue_lines(windows: Vec<RuntimeWindow>) -> Vec<String> {
+        let ctx = mk_ctx();
+        let summary = ai(&ctx, windows.last().expect("windows"));
+        format_diagnose_rules_for_windows(&windows, summary, false)
+    }
+
     #[test]
     fn r2_recommendation_critical_confidence_when_preemptions_active() {
         let t = SystemTime::UNIX_EPOCH;
@@ -919,6 +944,51 @@ mod tests {
     #[test]
     fn rule_is_significant_zero_evaluable_windows_is_false() {
         assert!(!rule_is_significant(3, 0));
+    }
+
+    #[test]
+    fn r2_fires_on_single_preemption_window() {
+        let mut windows: Vec<_> = (0..15)
+            .map(|_| mk_evaluable_kv_window(50.0, false))
+            .collect();
+        windows[0] = mk_evaluable_kv_window(86.0, true);
+        let text = r2_issue_lines(windows).join("\n");
+        assert!(text.contains("[!] KV Cache Pressure"));
+    }
+
+    #[test]
+    fn r2_fires_on_two_critical_kv_windows_without_preemptions() {
+        let mut windows: Vec<_> = (0..10)
+            .map(|_| mk_evaluable_kv_window(50.0, false))
+            .collect();
+        windows[0] = mk_evaluable_kv_window(96.0, false);
+        windows[1] = mk_evaluable_kv_window(97.0, false);
+        let text = r2_issue_lines(windows).join("\n");
+        assert!(text.contains("[!] KV Cache Pressure"));
+    }
+
+    #[test]
+    fn r2_does_not_fire_on_single_critical_kv_window_without_preemptions() {
+        let mut windows: Vec<_> = (0..10)
+            .map(|_| mk_evaluable_kv_window(50.0, false))
+            .collect();
+        windows[0] = mk_evaluable_kv_window(96.0, false);
+        let text = r2_issue_lines(windows).join("\n");
+        assert!(!text.contains("[!] KV Cache Pressure"));
+        assert!(text.contains("KV Cache Pressure"));
+        assert!(!text.contains("Seen in"));
+    }
+
+    #[test]
+    fn r2_fires_on_sustained_warning_level_kv() {
+        let mut windows: Vec<_> = (0..15)
+            .map(|_| mk_evaluable_kv_window(50.0, false))
+            .collect();
+        for w in windows.iter_mut().take(4) {
+            *w = mk_evaluable_kv_window(86.0, false);
+        }
+        let text = r2_issue_lines(windows).join("\n");
+        assert!(text.contains("[!] KV Cache Pressure"));
     }
 
     #[test]

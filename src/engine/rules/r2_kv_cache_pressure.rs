@@ -3,8 +3,10 @@ use crate::collectors::{GpuRawMetrics, RawSnapshot};
 use super::{skew_secs, Recommendation, MAX_OBSERVATION_SKEW_SECS};
 
 const KV_CACHE_PRESSURE_MIN_PERC: f64 = 85.0;
+pub(super) const KV_CACHE_CRITICAL_THRESHOLD_PCT: f64 = 95.0;
 const KV_PRESSURE_VRAM_CORROBORATE_MIN_PERC: f64 = 78.0;
 const KV_PRESSURE_CRITICAL_CONFIDENCE: f64 = 0.95;
+const KV_PRESSURE_THREAT_CONFIDENCE: f64 = 0.85;
 const KV_PRESSURE_WARNING_CONFIDENCE: f64 = 0.7;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -84,6 +86,8 @@ pub fn r2_recommendation(snapshot: &RawSnapshot) -> Option<Recommendation> {
 pub(super) fn kv_pressure_confidence(d: &KvCachePressureDetail) -> f64 {
     if d.preemptions_active {
         KV_PRESSURE_CRITICAL_CONFIDENCE
+    } else if d.kv_cache_usage_perc >= KV_CACHE_CRITICAL_THRESHOLD_PCT {
+        KV_PRESSURE_THREAT_CONFIDENCE
     } else {
         KV_PRESSURE_WARNING_CONFIDENCE
     }
@@ -186,5 +190,33 @@ fn vram_usage_perc(gpu: &GpuRawMetrics) -> Option<f64> {
             p.is_finite().then_some(p)
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn detail(kv: f64, preemptions: bool) -> KvCachePressureDetail {
+        KvCachePressureDetail {
+            kv_cache_usage_perc: kv,
+            vram_usage_perc_corroborated: None,
+            preemptions_active: preemptions,
+        }
+    }
+
+    #[test]
+    fn kv_pressure_confidence_critical_when_preemptions_active() {
+        assert!((kv_pressure_confidence(&detail(50.0, true)) - 0.95).abs() < 1e-9);
+    }
+
+    #[test]
+    fn kv_pressure_confidence_threat_when_kv_at_95_no_preemptions() {
+        assert!((kv_pressure_confidence(&detail(95.0, false)) - 0.85).abs() < 1e-9);
+    }
+
+    #[test]
+    fn kv_pressure_confidence_warning_when_kv_below_95_no_preemptions() {
+        assert!((kv_pressure_confidence(&detail(90.0, false)) - 0.7).abs() < 1e-9);
     }
 }
