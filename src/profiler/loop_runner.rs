@@ -78,7 +78,8 @@ pub fn run(
 
         match d.direction {
             delta::Direction::Worse => {
-                println!("Performance regressed. Trying next recommendation.");
+                println!("Throughput dropped. Check if workload changed before acting on this.");
+                println!("Trying next recommendation.");
             }
             delta::Direction::Plateau => {
                 println!("No significant change. Trying next recommendation.");
