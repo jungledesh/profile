@@ -207,7 +207,7 @@ fn efficiency_is_none_when_actual_tps_missing() {
 }
 
 #[test]
-fn efficiency_can_exceed_100_and_headroom_floors_to_zero() {
+fn efficiency_none_when_actual_above_decode_ceiling() {
     let cfg = VllmConfig {
         dtype: Some("bf16".to_string()),
         max_model_len: Some(2048),
@@ -227,7 +227,31 @@ fn efficiency_can_exceed_100_and_headroom_floors_to_zero() {
         Some(v) => v,
         None => panic!("baseline missing"),
     };
-    let raw = b.efficiency_pct.unwrap_or(0.0);
-    assert!(raw > 100.0);
-    assert_eq!(b.headroom_pct, Some(0.0));
+    assert!(b.efficiency_pct.is_none());
+    assert!(b.headroom_pct.is_none());
+}
+
+#[test]
+fn efficiency_some_in_zero_to_100_when_below_ceiling() {
+    let cfg = VllmConfig {
+        dtype: Some("bf16".to_string()),
+        max_model_len: Some(2048),
+        ..Default::default()
+    };
+    let (ctx, win) = build_input(
+        "meta-llama/Llama-3.1-70B-Instruct",
+        "NVIDIA H100 80GB HBM3",
+        cfg,
+        Some(2048.0),
+        Some(10.0),
+    );
+    let input = AnalysisInput::new(&ctx, &win);
+    let b = compute(&input).expect("baseline");
+    assert!(
+        10.0 <= b.decode.expected,
+        "test setup: actual must be at or below decode ceiling"
+    );
+    let eff = b.efficiency_pct.expect("efficiency");
+    assert!((0.0..=100.0).contains(&eff));
+    assert!(b.headroom_pct.is_some());
 }
