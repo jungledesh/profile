@@ -49,8 +49,10 @@ pub struct VllmRawMetrics {
     /// Multi-window diagnose: **time-weighted mean** across evaluable windows (same as `gpu_util_pct`).
     pub num_requests_running: Option<f64>,
     pub num_requests_waiting: Option<f64>,
-    /// Last scrape in the window.
+    /// KV cache usage %: last scrape in a single window; duration-weighted mean across evaluable windows in diagnose aggregate.
     pub kv_cache_usage_perc: Option<f64>,
+    /// Same as `kv_cache_usage_perc` after multi-window aggregate; carried for display clarity.
+    pub kv_cache_avg_perc: Option<f64>,
     /// Max KV cache usage % seen across scrapes in this window (0–100). Multi-window: max over evaluable windows.
     pub kv_cache_peak_perc: Option<f64>,
 

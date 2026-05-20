@@ -11,16 +11,14 @@ use crate::profiler::DiagnoseResult;
 const VLLM_LABEL_W: usize = 10;
 const VLLM_LABEL_METRICS_GAP: &str = " ";
 
-/// KV cache peak parenthetical only if spike reached at least this (rule r2 neighborhood).
-const KV_CACHE_PEAK_SHOW_THRESHOLD_PCT: f64 = 85.0;
 /// Peak VRAM / total must reach this fraction to show a spike parenthetical.
 const VRAM_PEAK_SHOW_THRESHOLD_FRAC: f64 = 0.90;
 /// Global GPU temp parenthetical until per-arch throttle thresholds exist (Hopper ~83°C).
 const GPU_TEMP_PEAK_SHOW_THRESHOLD_C: f64 = 80.0;
 
 #[inline]
-fn show_kv_cache_peak_parenthetical(last_pct: f64, peak_pct: f64) -> bool {
-    peak_pct > last_pct && peak_pct >= KV_CACHE_PEAK_SHOW_THRESHOLD_PCT
+fn show_kv_cache_peak_parenthetical(avg_pct: f64, peak_pct: f64) -> bool {
+    peak_pct > avg_pct + 10.0 || peak_pct >= 95.0
 }
 
 #[inline]
@@ -372,11 +370,11 @@ fn vllm_latency_value(v: &VllmRawMetrics, verbose: bool) -> String {
 
 fn vllm_prompt_kv_fragment(v: &VllmRawMetrics) -> String {
     match v.kv_cache_usage_perc.filter(|x| x.is_finite()) {
-        Some(p) => {
-            let mut s = format!("kv_cache {:.1}%", p);
+        Some(avg) => {
+            let mut s = format!("kv_cache {:.1}% avg", avg);
             if let Some(pk) = v.kv_cache_peak_perc.filter(|x| x.is_finite()) {
-                if show_kv_cache_peak_parenthetical(p, pk) {
-                    s.push_str(&format!(" (peak {:.1}%)", pk));
+                if show_kv_cache_peak_parenthetical(avg, pk) {
+                    s.push_str(&format!(" ({:.1}% peak)", pk));
                 }
             }
             s
@@ -987,7 +985,7 @@ mod tests {
             kv_cache_usage_perc: Some(45.25),
             ..Default::default()
         };
-        assert_eq!(vllm_prompt_value(&v, false), "kv_cache 45.2%");
+        assert_eq!(vllm_prompt_value(&v, false), "kv_cache 45.2% avg");
     }
 
     #[test]
@@ -997,7 +995,7 @@ mod tests {
             kv_cache_usage_perc: Some(45.25),
             ..Default::default()
         };
-        assert_eq!(vllm_prompt_value(&v, true), "18 tok | kv_cache 45.2%");
+        assert_eq!(vllm_prompt_value(&v, true), "18 tok | kv_cache 45.2% avg");
         let v_peak = VllmRawMetrics {
             prompt_tokens_mean: Some(18.0),
             kv_cache_usage_perc: Some(40.0),
@@ -1006,27 +1004,35 @@ mod tests {
         };
         assert_eq!(
             vllm_prompt_value(&v_peak, true),
-            "18 tok | kv_cache 40.0% (peak 92.0%)"
+            "18 tok | kv_cache 40.0% avg (92.0% peak)"
         );
-        let peak_below_threshold = VllmRawMetrics {
-            prompt_tokens_mean: Some(18.0),
-            kv_cache_usage_perc: Some(40.0),
-            kv_cache_peak_perc: Some(84.0),
+        let peak_ceiling = VllmRawMetrics {
+            kv_cache_usage_perc: Some(92.0),
+            kv_cache_peak_perc: Some(100.0),
             ..Default::default()
         };
         assert_eq!(
-            vllm_prompt_value(&peak_below_threshold, true),
-            "18 tok | kv_cache 40.0%"
+            vllm_prompt_kv_fragment(&peak_ceiling),
+            "kv_cache 92.0% avg (100.0% peak)"
         );
-        let peak_not_above_last = VllmRawMetrics {
+        let peak_no_spike = VllmRawMetrics {
+            kv_cache_usage_perc: Some(67.0),
+            kv_cache_peak_perc: Some(68.0),
+            ..Default::default()
+        };
+        assert_eq!(
+            vllm_prompt_kv_fragment(&peak_no_spike),
+            "kv_cache 67.0% avg"
+        );
+        let peak_not_above_avg = VllmRawMetrics {
             prompt_tokens_mean: Some(18.0),
             kv_cache_usage_perc: Some(92.0),
             kv_cache_peak_perc: Some(92.0),
             ..Default::default()
         };
         assert_eq!(
-            vllm_prompt_value(&peak_not_above_last, true),
-            "18 tok | kv_cache 92.0%"
+            vllm_prompt_value(&peak_not_above_avg, true),
+            "18 tok | kv_cache 92.0% avg"
         );
         let no_kv = VllmRawMetrics {
             prompt_tokens_mean: Some(512.0),

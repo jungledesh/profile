@@ -421,6 +421,7 @@ fn parse_vllm_metrics(scrape: &Scrape) -> Result<VllmRawMetrics> {
         num_requests_running,
         num_requests_waiting,
         kv_cache_usage_perc,
+        kv_cache_avg_perc: None,
         kv_cache_peak_perc: None,
         ttft_ms,
         tpot_ms,
