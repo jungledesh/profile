@@ -8,6 +8,16 @@ const KV_PRESSURE_VRAM_CORROBORATE_MIN_PERC: f64 = 78.0;
 const KV_PRESSURE_CRITICAL_CONFIDENCE: f64 = 0.95;
 const KV_PRESSURE_THREAT_CONFIDENCE: f64 = 0.85;
 const KV_PRESSURE_WARNING_CONFIDENCE: f64 = 0.7;
+const KV_ADMISSION_BACKLOG_KV_MIN_PERC: f64 = 50.0;
+const KV_ADMISSION_BACKLOG_QUEUE_RATIO_MIN: f64 = 0.3;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct KvAdmissionBacklogDetail {
+    pub kv_cache_usage_perc: f64,
+    pub admission_ratio: f64,
+    pub requests_waiting: f64,
+    pub requests_running: f64,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct KvCachePressureDetail {
@@ -26,6 +36,38 @@ pub struct Rule2MissReport {
 pub enum Rule2Outcome {
     Fired(KvCachePressureDetail),
     NotFired(Rule2MissReport),
+}
+
+pub fn rule2_kv_admission_backlog(snapshot: &RawSnapshot) -> Option<KvAdmissionBacklogDetail> {
+    let kv = snapshot
+        .vllm
+        .kv_cache_usage_perc
+        .filter(|v| v.is_finite())?;
+    if kv < KV_ADMISSION_BACKLOG_KV_MIN_PERC {
+        return None;
+    }
+    let wait = snapshot
+        .vllm
+        .num_requests_waiting
+        .filter(|v| v.is_finite())?;
+    let run = snapshot
+        .vllm
+        .num_requests_running
+        .filter(|v| v.is_finite())?;
+    let total = wait + run;
+    if total <= 0.0 {
+        return None;
+    }
+    let ratio = wait / total;
+    if ratio < KV_ADMISSION_BACKLOG_QUEUE_RATIO_MIN {
+        return None;
+    }
+    Some(KvAdmissionBacklogDetail {
+        kv_cache_usage_perc: kv,
+        admission_ratio: ratio,
+        requests_waiting: wait,
+        requests_running: run,
+    })
 }
 
 pub fn rule2_kv_cache_pressure(snapshot: &RawSnapshot) -> Rule2Outcome {
@@ -146,6 +188,50 @@ pub(super) fn format_kv_cache_pressure_fired(
     out
 }
 
+pub(super) fn format_kv_admission_backlog_issue(
+    d: &KvAdmissionBacklogDetail,
+    seen_pct: u32,
+) -> Vec<String> {
+    vec![
+        "[!] KV Cache Pressure — Admission Backlog".to_string(),
+        format!("  Seen in {seen_pct}% of windows"),
+        "Cause:".to_string(),
+        format!(
+            "  - Scheduler holding {:.0} requests in queue ({:.0}% of capacity) to protect KV memory",
+            d.requests_waiting,
+            d.admission_ratio * 100.0
+        ),
+        format!(
+            "  - KV cache {:.1}% — scheduler refusing admission to prevent overflow",
+            d.kv_cache_usage_perc
+        ),
+        String::new(),
+        "  Fix:".to_string(),
+        "    • Raise --gpu-memory-utilization if VRAM headroom exists".to_string(),
+        "    • Reduce max_num_seqs to lower peak KV block demand".to_string(),
+        "    • Consider fp8 KV cache (--kv-cache-dtype fp8) to halve KV memory footprint".to_string(),
+        String::new(),
+        "  Expected: Wait queue drains, TTFT recovers.".to_string(),
+        "  Confidence: Medium-High".to_string(),
+    ]
+}
+
+pub(super) fn aggregate_backlog_detail(
+    details: &[KvAdmissionBacklogDetail],
+) -> KvAdmissionBacklogDetail {
+    let n = details.len() as f64;
+    let kv = details.iter().map(|d| d.kv_cache_usage_perc).sum::<f64>() / n;
+    let ratio = details.iter().map(|d| d.admission_ratio).sum::<f64>() / n;
+    let wait = details.iter().map(|d| d.requests_waiting).sum::<f64>() / n;
+    let run = details.iter().map(|d| d.requests_running).sum::<f64>() / n;
+    KvAdmissionBacklogDetail {
+        kv_cache_usage_perc: kv,
+        admission_ratio: ratio,
+        requests_waiting: wait,
+        requests_running: run,
+    }
+}
+
 pub(super) fn format_kv_cache_window_issue(
     d: &KvCachePressureDetail,
     seen_pct: u32,
@@ -196,6 +282,45 @@ fn vram_usage_perc(gpu: &GpuRawMetrics) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collectors::{GpuRawMetrics, VllmRawMetrics};
+    use std::time::SystemTime;
+
+    fn snap(vllm: VllmRawMetrics) -> RawSnapshot {
+        RawSnapshot {
+            gpu_observed_at: SystemTime::UNIX_EPOCH,
+            vllm_observed_at: SystemTime::UNIX_EPOCH,
+            timestamp: SystemTime::UNIX_EPOCH,
+            vllm,
+            gpu: GpuRawMetrics::default(),
+        }
+    }
+
+    fn backlog_vllm(kv: f64, wait: f64, run: f64) -> VllmRawMetrics {
+        VllmRawMetrics {
+            kv_cache_usage_perc: Some(kv),
+            num_requests_waiting: Some(wait),
+            num_requests_running: Some(run),
+            generation_tokens_per_sec: Some(100.0),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn backlog_fires_when_kv_50_and_ratio_0_3() {
+        let d = rule2_kv_admission_backlog(&snap(backlog_vllm(50.0, 3.0, 7.0))).expect("fired");
+        assert!((d.kv_cache_usage_perc - 50.0).abs() < 1e-9);
+        assert!((d.admission_ratio - 0.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn backlog_silent_when_kv_below_50() {
+        assert!(rule2_kv_admission_backlog(&snap(backlog_vllm(49.9, 5.0, 5.0))).is_none());
+    }
+
+    #[test]
+    fn backlog_silent_when_ratio_below_0_3() {
+        assert!(rule2_kv_admission_backlog(&snap(backlog_vllm(60.0, 2.0, 8.0))).is_none());
+    }
 
     fn detail(kv: f64, preemptions: bool) -> KvCachePressureDetail {
         KvCachePressureDetail {
