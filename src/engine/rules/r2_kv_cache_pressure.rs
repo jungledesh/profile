@@ -8,7 +8,7 @@ const KV_PRESSURE_VRAM_CORROBORATE_MIN_PERC: f64 = 78.0;
 const KV_PRESSURE_CRITICAL_CONFIDENCE: f64 = 0.95;
 const KV_PRESSURE_THREAT_CONFIDENCE: f64 = 0.85;
 const KV_PRESSURE_WARNING_CONFIDENCE: f64 = 0.7;
-const KV_ADMISSION_BACKLOG_KV_MIN_PERC: f64 = 50.0;
+const KV_ADMISSION_BACKLOG_KV_MIN_PERC: f64 = 25.0;
 const KV_ADMISSION_BACKLOG_QUEUE_RATIO_MIN: f64 = 0.3;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -313,8 +313,8 @@ mod tests {
     }
 
     #[test]
-    fn backlog_silent_when_kv_below_50() {
-        assert!(rule2_kv_admission_backlog(&snap(backlog_vllm(49.9, 5.0, 5.0))).is_none());
+    fn backlog_silent_when_kv_below_25() {
+        assert!(rule2_kv_admission_backlog(&snap(backlog_vllm(24.9, 5.0, 5.0))).is_none());
     }
 
     #[test]
