@@ -169,9 +169,17 @@ pub(super) fn format_kv_cache_pressure_fired(
     };
     let mut out = vec!["[!] KV Cache Pressure".to_string(), "Cause:".to_string()];
     if d.preemptions_active {
-        out.push("  - Active evictions — tokens being preempted to free KV cache".to_string());
+        out.push(
+            "  - Active preemptions — scheduler evicting sequences to free KV blocks".to_string(),
+        );
         if let Some(k) = kv_p {
-            out.push(format!("  - KV cache {k:.1}% — evictions active"));
+            if let Some(peak) = snapshot.vllm.kv_cache_peak_perc.filter(|v| v.is_finite()) {
+                out.push(format!(
+                    "  - KV cache {k:.1}% avg ({peak:.1}% peak) — peak triggered evictions"
+                ));
+            } else {
+                out.push(format!("  - KV cache {k:.1}% — evictions active"));
+            }
         }
     } else {
         out.push(format!(
@@ -182,10 +190,9 @@ pub(super) fn format_kv_cache_pressure_fired(
     out.push(String::new());
     out.push("  Fix:".to_string());
     if d.preemptions_active {
-        // Evictions are live — immediate action needed
         out.extend([
-            "    • Reduce concurrency now — active evictions are degrading latency".to_string(),
-            "    • Lower --max-num-seqs to shed in-flight sequences".to_string(),
+            "    • Lower --max-num-seqs immediately — reduces sequences competing for KV blocks"
+                .to_string(),
             "    • Consider fp8 KV cache (--kv-cache-dtype fp8) to halve KV memory footprint"
                 .to_string(),
             "    • Lower max_model_len if workload allows shorter context".to_string(),
@@ -201,9 +208,14 @@ pub(super) fn format_kv_cache_pressure_fired(
             "    • Lower max_model_len only if safe for your workload".to_string(),
         ]);
     }
+    let expected = if d.preemptions_active {
+        "  Expected: TTFT and TPOT recover once evictions stop."
+    } else {
+        "  Expected: Lower TTFT, stable TPOT once evictions stop."
+    };
     out.extend([
         String::new(),
-        "  Expected: Lower TTFT, stable TPOT once evictions stop.".to_string(),
+        expected.to_string(),
         format!("  {conf_label}"),
     ]);
     out
