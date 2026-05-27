@@ -8,6 +8,7 @@ mod r1_under_batching;
 mod r2_kv_cache_pressure;
 mod r3_low_prefix_reuse;
 mod r4_parallelism;
+mod r5_concurrency_saturation;
 
 pub use r1_under_batching::{
     r1_recommendation, rule1_under_batching, MissReport, Rule1Outcome, UnderBatchingDetail,
@@ -20,6 +21,7 @@ pub use r3_low_prefix_reuse::{
     r3_recommendation, rule3_low_prefix_reuse, LowPrefixReuseDetail, Rule3Outcome,
 };
 pub use r4_parallelism::r4_recommendation;
+pub use r5_concurrency_saturation::{rule5_concurrency_saturation, ConcurrencySaturationDetail};
 
 use r1_under_batching::{aggregate_r1_detail, format_under_batching_window_issue};
 use r2_kv_cache_pressure::{aggregate_r2_detail, format_kv_cache_window_issue};
@@ -28,6 +30,9 @@ use r3_low_prefix_reuse::format_low_prefix_hit_rate_fired;
 use r3_low_prefix_reuse::{
     aggregate_r3_detail, format_low_prefix_window_issue, format_rule3_verbose_miss,
 };
+use r5_concurrency_saturation::{
+    aggregate_concurrency_saturation_detail, format_concurrency_saturation_issue,
+};
 
 pub(super) const MAX_OBSERVATION_SKEW_SECS: f64 = 1.0;
 /// Enforces >= 6s temporal substance (3 windows × 2s).
@@ -35,7 +40,7 @@ pub(super) const ENGINE_MIN_PERSISTENT_WINDOWS: usize = 3;
 /// Enforces >= 25% density floor across evaluable windows.
 pub(super) const ENGINE_MIN_WINDOW_PCT: f64 = 0.25;
 
-// TODO(r5): sampling cliff — sampling temperature is not in collected metrics; wire rule when available.
+// TODO(sampling_cliff): sampling temperature is not in collected metrics; wire rule when available.
 
 /// True when a rule fired in enough evaluable windows to be statistically stable.
 pub fn rule_is_significant(fired: usize, total_evaluable: usize) -> bool {
@@ -190,10 +195,12 @@ pub fn format_diagnose_rules_for_windows(
     let mut r1_fired = 0usize;
     let mut r2_fired = 0usize;
     let mut r3_fired = 0usize;
+    let mut r5_fired = 0usize;
 
     let mut r1_details = Vec::new();
     let mut r2_details = Vec::new();
     let mut r3_details = Vec::new();
+    let mut r5_details: Vec<ConcurrencySaturationDetail> = Vec::new();
 
     let summary_baseline = baseline::compute(&summary);
     for w in &evaluable {
@@ -219,11 +226,15 @@ pub fn format_diagnose_rules_for_windows(
             }
             Rule3Outcome::NotFired => {}
         }
+        if let Some(d) = rule5_concurrency_saturation(&w.snapshot) {
+            r5_fired += 1;
+            r5_details.push(d);
+        }
     }
 
     let summary_snap = &summary.window.snapshot;
 
-    if r1_fired + r2_fired + r3_fired == 0 {
+    if r1_fired + r2_fired + r3_fired + r5_fired == 0 {
         let mut out = Vec::new();
         if verbose_rules {
             out.push("Under-batching: not indicated".to_string());
@@ -248,6 +259,7 @@ pub fn format_diagnose_rules_for_windows(
     let r1_significant = rule_is_significant(r1_fired, n_eval);
     let r2_significant = rule_is_significant(r2_fired, n_eval);
     let r3_significant = rule_is_significant(r3_fired, n_eval);
+    let r5_significant = rule_is_significant(r5_fired, n_eval);
 
     if r1_significant {
         out.extend(format_under_batching_window_issue(
@@ -272,6 +284,16 @@ pub fn format_diagnose_rules_for_windows(
         out.push(String::new());
     }
 
+    if r5_significant && !r2_significant {
+        if let Some(agg) = aggregate_concurrency_saturation_detail(&r5_details) {
+            out.extend(format_concurrency_saturation_issue(
+                &agg,
+                pct(r5_fired, n_eval),
+            ));
+            out.push(String::new());
+        }
+    }
+
     if r3_significant {
         out.extend(format_low_prefix_window_issue(
             &aggregate_r3_detail(&r3_details, summary_snap),
@@ -293,6 +315,9 @@ pub fn format_diagnose_rules_for_windows(
     }
     if !r3_significant {
         not_fired.push("Low Prefix Cache");
+    }
+    if !r5_significant && !r2_significant {
+        not_fired.push("Concurrency Saturation");
     }
     if !not_fired.is_empty() {
         out.push(format!("No issues for {}", join_rule_names(&not_fired)));
@@ -613,6 +638,41 @@ mod tests {
         }
     }
 
+    fn mk_evaluable_kv_window(kv_pct: f64, preemptions: bool) -> RuntimeWindow {
+        let t = SystemTime::UNIX_EPOCH;
+        let mut v = vllm_base();
+        v.kv_cache_usage_perc = Some(kv_pct);
+        v.generation_tokens_per_sec = Some(100.0);
+        v.num_requests_running = Some(30.0);
+        if preemptions {
+            v.num_preemptions_per_sec = Some(1.0);
+        }
+        mk_win(snap(t, t, v, gpu_busy()))
+    }
+
+    fn mk_evaluable_concurrency_saturation_window(
+        kv_pct: f64,
+        run: f64,
+        wait: f64,
+        max_num_seqs: u32,
+    ) -> RuntimeWindow {
+        let t = SystemTime::UNIX_EPOCH;
+        let mut v = vllm_base();
+        v.kv_cache_usage_perc = Some(kv_pct);
+        v.num_requests_running = Some(run);
+        v.num_requests_waiting = Some(wait);
+        v.max_num_seqs = Some(max_num_seqs);
+        v.generation_tokens_per_sec = Some(100.0);
+        mk_win(snap(t, t, v, gpu_busy()))
+    }
+
+    fn r2_issue_lines(windows: Vec<RuntimeWindow>) -> Vec<String> {
+        let ctx = mk_ctx();
+        let summary = ai(&ctx, windows.last().expect("windows"));
+        format_diagnose_rules_for_windows(&windows, summary, false)
+    }
+
+
     #[test]
     fn r2_recommendation_critical_confidence_when_preemptions_active() {
         let t = SystemTime::UNIX_EPOCH;
@@ -921,6 +981,32 @@ mod tests {
     }
 
     #[test]
+    fn r5_concurrency_saturation_fires_on_sustained_saturation() {
+        let mut windows: Vec<_> = (0..15)
+            .map(|_| mk_evaluable_kv_window(50.0, false))
+            .collect();
+        for w in windows.iter_mut().take(4) {
+            *w = mk_evaluable_concurrency_saturation_window(50.0, 32.0, 15.0, 32);
+        }
+        let text = r2_issue_lines(windows).join("\n");
+        assert!(text.contains("[!] Concurrency Saturation"));
+        assert!(text.contains("max-num-seqs limit"));
+    }
+
+    #[test]
+    fn r5_concurrency_saturation_suppressed_when_standard_r2_fires() {
+        let mut windows: Vec<_> = (0..15)
+            .map(|_| mk_evaluable_kv_window(50.0, false))
+            .collect();
+        for w in windows.iter_mut().take(4) {
+            *w = mk_evaluable_concurrency_saturation_window(86.0, 32.0, 15.0, 32);
+        }
+        let text = r2_issue_lines(windows).join("\n");
+        assert!(text.contains("[!] KV Cache Pressure"));
+        assert!(!text.contains("[!] Concurrency Saturation"));
+    }
+
+    #[test]
     fn format_diagnose_rules_for_windows_matches_requested_style_when_some_rules_fire() {
         let t = SystemTime::UNIX_EPOCH;
         let cfg = VllmConfig {
@@ -961,7 +1047,9 @@ mod tests {
         assert!(text.contains("Seen in 60% of windows"));
         assert!(text.contains("Occupancy"));
         assert!(text.contains("raise --max-num-seqs"));
-        assert!(text.contains("No issues for KV Cache Pressure and Low Prefix Cache"));
+        assert!(text.contains(
+            "No issues for KV Cache Pressure, Low Prefix Cache, and Concurrency Saturation"
+        ));
     }
 
     #[test]
