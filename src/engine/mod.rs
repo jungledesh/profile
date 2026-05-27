@@ -30,6 +30,13 @@ pub fn build_report(input: AnalysisInput<'_>) -> Report {
     .flatten()
     .collect();
 
+    let kv_pressure = recs.iter().any(|r| r.rule_name == "kv_cache_pressure");
+    if !kv_pressure {
+        if let Some(r5) = rules::r5_recommendation(snapshot) {
+            recs.push(r5);
+        }
+    }
+
     let r2_present_before = recs.iter().any(|r| r.rule_name == "kv_cache_pressure");
     let r4_fired = recs.iter().any(|r| r.rule_name == "parallelism_mismatch");
     let r2_suppressed_by_r4 = r4_fired && r2_present_before;
