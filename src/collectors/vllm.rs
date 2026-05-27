@@ -372,6 +372,7 @@ fn parse_cache_config_labels(scrape: &Scrape) -> CacheConfigLabels {
     };
     CacheConfigLabels {
         block_size: s.labels.get("block_size").and_then(|v| v.parse().ok()),
+        num_gpu_blocks: s.labels.get("num_gpu_blocks").and_then(|v| v.parse().ok()),
         cache_dtype: s.labels.get("cache_dtype").map(|v| v.to_string()),
         enable_prefix_caching: s
             .labels
@@ -421,6 +422,7 @@ fn parse_vllm_metrics(scrape: &Scrape) -> Result<VllmRawMetrics> {
         num_requests_running,
         num_requests_waiting,
         kv_cache_usage_perc,
+        kv_cache_avg_perc: None,
         kv_cache_peak_perc: None,
         ttft_ms,
         tpot_ms,
@@ -905,6 +907,7 @@ vllm:cache_config_info{block_size="16",cache_dtype="auto",cpu_offload_gb="0",ena
         let scrape = scrape_from_body(body).unwrap();
         let cc = parse_cache_config_labels(&scrape);
         assert_eq!(cc.block_size, Some(16));
+        assert_eq!(cc.num_gpu_blocks, Some(4096));
         assert_eq!(cc.cache_dtype.as_deref(), Some("auto"));
         assert_eq!(cc.enable_prefix_caching, Some(true));
         assert_eq!(cc.enable_chunked_prefill, Some(false));
@@ -916,6 +919,7 @@ vllm:cache_config_info{block_size="16",cache_dtype="auto",cpu_offload_gb="0",ena
         let scrape = scrape_from_body(body).unwrap();
         let cc = parse_cache_config_labels(&scrape);
         assert!(cc.block_size.is_none());
+        assert!(cc.num_gpu_blocks.is_none());
         assert!(cc.cache_dtype.is_none());
         assert!(cc.enable_prefix_caching.is_none());
         assert!(cc.enable_chunked_prefill.is_none());

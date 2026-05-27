@@ -224,6 +224,7 @@ mod tests {
         let mut s = mk_snap(None, None);
         s.vllm.cache_config = CacheConfigLabels {
             block_size: Some(32),
+            num_gpu_blocks: None,
             cache_dtype: Some("fp8".to_string()),
             enable_prefix_caching: Some(true),
             enable_chunked_prefill: Some(false),

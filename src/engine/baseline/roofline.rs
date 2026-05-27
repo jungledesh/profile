@@ -64,14 +64,21 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
         make_estimate(expected)
     });
 
+    let ceiling = decode.expected;
     let efficiency_pct = input
         .window
         .snapshot
         .vllm
         .generation_tokens_per_sec
         .filter(|v| v.is_finite())
-        .map(|actual| math::efficiency_pct(actual, decode.expected))
-        .filter(|v| v.is_finite());
+        .and_then(|actual| {
+            if actual > 0.0 && actual <= ceiling {
+                let pct = math::efficiency_pct(actual, ceiling);
+                pct.is_finite().then_some(pct)
+            } else {
+                None
+            }
+        });
 
     let headroom_pct = efficiency_pct.map(|raw| 100.0 - raw.min(100.0));
 
@@ -284,7 +291,7 @@ mod tests {
     }
 
     #[test]
-    fn compute_efficiency_and_headroom_rules() {
+    fn efficiency_none_when_actual_above_decode_ceiling() {
         let cfg = VllmConfig {
             kv_cache_dtype: Some("bf16".to_string()),
             max_model_len: Some(2048),
@@ -304,14 +311,41 @@ mod tests {
             snap,
         );
         let input = AnalysisInput::new(&ctx, &win);
-        let out = compute(&input);
-        assert!(out.is_some());
-        let b = match out {
-            Some(v) => v,
-            None => panic!("expected baseline"),
+        let b = compute(&input).expect("baseline");
+        let ceiling = b.decode.expected;
+        assert!(
+            300.0 > ceiling,
+            "test setup: actual must exceed ceiling (ceiling={ceiling})"
+        );
+        assert!(b.efficiency_pct.is_none());
+        assert!(b.headroom_pct.is_none());
+    }
+
+    #[test]
+    fn efficiency_some_when_actual_below_decode_ceiling() {
+        let cfg = VllmConfig {
+            kv_cache_dtype: Some("bf16".to_string()),
+            max_model_len: Some(2048),
+            ..Default::default()
         };
-        assert!(b.efficiency_pct.unwrap_or(0.0) > 100.0);
-        assert_eq!(b.headroom_pct, Some(0.0));
+        let snap = VllmRawMetrics {
+            generation_tokens_per_sec: Some(50.0),
+            ..Default::default()
+        };
+        let (ctx, win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(67.0),
+            Some(3350.0),
+            cfg,
+            snap,
+        );
+        let input = AnalysisInput::new(&ctx, &win);
+        let b = compute(&input).expect("baseline");
+        let eff = b.efficiency_pct.expect("efficiency");
+        assert!((0.0..=100.0).contains(&eff));
+        assert!(b.headroom_pct.is_some());
     }
 
     #[test]

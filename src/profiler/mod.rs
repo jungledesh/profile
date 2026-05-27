@@ -185,8 +185,9 @@ fn aggregate_windows(
     // Running / waiting: duration-weighted mean over evaluable windows (same weight story as gpu_util_pct).
     agg_v.num_requests_running = weighted_metric_pairs(&pairs, |w| w.vllm.num_requests_running);
     agg_v.num_requests_waiting = weighted_metric_pairs(&pairs, |w| w.vllm.num_requests_waiting);
-    // State gauges: last evaluable window only (ground truth at end of diagnosis).
-    agg_v.kv_cache_usage_perc = last.vllm.kv_cache_usage_perc;
+    let kv_avg = aggregate_kv_cache_avg_perc(&pairs);
+    agg_v.kv_cache_usage_perc = kv_avg;
+    agg_v.kv_cache_avg_perc = kv_avg;
     agg_v.kv_cache_peak_perc = aggregate_kv_cache_peak_perc(&pairs, last);
     agg_v.num_requests_swapped = last.vllm.num_requests_swapped;
     agg_v.cpu_cache_usage_perc = last.vllm.cpu_cache_usage_perc;
@@ -234,6 +235,10 @@ fn aggregate_windows(
         vllm: agg_v,
         gpu: agg_g,
     }
+}
+
+fn aggregate_kv_cache_avg_perc(pairs: &[(&collectors::RawSnapshot, Duration)]) -> Option<f64> {
+    weighted_metric_pairs(pairs, |w| w.vllm.kv_cache_usage_perc)
 }
 
 /// `max(max per-window peaks, last evaluable window's landing KV %)` so aggregate peak ≥ displayed usage.
@@ -648,7 +653,8 @@ mod tests {
             &[Duration::from_secs(2), Duration::from_secs(2)],
             SystemTime::UNIX_EPOCH,
         );
-        assert!((agg.vllm.kv_cache_usage_perc.unwrap() - 10.0).abs() < 1e-9);
+        assert!((agg.vllm.kv_cache_usage_perc.unwrap() - 25.0).abs() < 1e-9);
+        assert!((agg.vllm.kv_cache_avg_perc.unwrap() - 25.0).abs() < 1e-9);
         assert!((agg.vllm.kv_cache_peak_perc.unwrap() - 92.0).abs() < 1e-9);
         assert_eq!(agg.gpu.vram_used_mb, Some(55 * 1024));
         assert_eq!(agg.gpu.vram_peak_mb, Some(78 * 1024));
@@ -701,7 +707,8 @@ mod tests {
             &[Duration::from_secs(2), Duration::from_secs(2)],
             SystemTime::UNIX_EPOCH,
         );
-        assert!((agg.vllm.kv_cache_usage_perc.unwrap() - 95.0).abs() < 1e-9);
+        assert!((agg.vllm.kv_cache_usage_perc.unwrap() - 67.5).abs() < 1e-9);
+        assert!((agg.vllm.kv_cache_avg_perc.unwrap() - 67.5).abs() < 1e-9);
         assert!((agg.vllm.kv_cache_peak_perc.unwrap() - 95.0).abs() < 1e-9);
         assert_eq!(agg.gpu.vram_used_mb, Some(72 * 1024));
         assert_eq!(agg.gpu.vram_peak_mb, Some(72 * 1024));
