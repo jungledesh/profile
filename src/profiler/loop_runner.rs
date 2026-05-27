@@ -78,7 +78,8 @@ pub fn run(
 
         match d.direction {
             delta::Direction::Worse => {
-                println!("Performance regressed. Trying next recommendation.");
+                println!("Throughput dropped. Check if workload changed before acting on this.");
+                println!("Trying next recommendation.");
             }
             delta::Direction::Plateau => {
                 println!("No significant change. Trying next recommendation.");
@@ -126,15 +127,53 @@ fn print_delta(d: &delta::Delta) {
     if d.config_drifted {
         println!("  Config changed — baseline reset.");
     }
-    match d.throughput_delta_pct {
-        Some(v) if v > 0.0 => println!("  Throughput  +{v:.1}% ↑"),
-        Some(v) if v < 0.0 => println!("  Throughput  {v:.1}% ↓"),
-        Some(_) => println!("  Throughput  no change"),
-        None => {}
+    if let (Some(before), Some(after)) = (d.throughput_before, d.throughput_after) {
+        if before.is_finite() && after.is_finite() {
+            let arrow = throughput_arrow(before, after);
+            println!("  Throughput  {before:.0} → {after:.0} tok/s {arrow}");
+        }
+    }
+    if let (Some(before), Some(after)) = (d.ttft_before_ms, d.ttft_after_ms) {
+        if before.is_finite() && after.is_finite() {
+            let delta = after - before;
+            if delta.abs() > 5.0 {
+                let arrow = latency_arrow(delta);
+                println!("  TTFT        {before:.0} → {after:.0}ms {arrow}");
+            }
+        }
+    }
+    if let (Some(before), Some(after)) = (d.tpot_before_ms, d.tpot_after_ms) {
+        if before.is_finite() && after.is_finite() {
+            let delta = after - before;
+            if delta.abs() > 0.5 {
+                let arrow = latency_arrow(delta);
+                println!("  TPOT        {before:.1} → {after:.1}ms {arrow}");
+            }
+        }
     }
     match d.efficiency_delta_pp {
         Some(v) if v > 0.0 => println!("  Efficiency  +{v:.1}pp ↑"),
         Some(v) if v < 0.0 => println!("  Efficiency  {v:.1}pp ↓"),
         _ => {}
+    }
+}
+
+fn throughput_arrow(before: f64, after: f64) -> &'static str {
+    if after > before {
+        "↑"
+    } else if after < before {
+        "↓"
+    } else {
+        ""
+    }
+}
+
+fn latency_arrow(delta_ms: f64) -> &'static str {
+    if delta_ms < 0.0 {
+        "↓"
+    } else if delta_ms > 0.0 {
+        "↑"
+    } else {
+        ""
     }
 }

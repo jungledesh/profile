@@ -104,7 +104,7 @@ pub(super) fn format_under_batching_fired(d: &UnderBatchingDetail) -> Vec<String
             d.max_num_seqs
         ),
         String::new(),
-        "  Expected: Higher throughput, stable TPOT.".to_string(),
+        "  Expected: Higher throughput, lower TPOT at scale.".to_string(),
         "  Confidence: High".to_string(),
     ]
 }
