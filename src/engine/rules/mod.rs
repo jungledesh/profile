@@ -650,13 +650,26 @@ mod tests {
         mk_win(snap(t, t, v, gpu_busy()))
     }
 
-    fn mk_evaluable_backlog_window(kv_pct: f64, wait: f64, run: f64) -> RuntimeWindow {
+    fn mk_evaluable_backlog_window(
+        kv_pct: f64,
+        wait: f64,
+        run: f64,
+        prompt_mean: f64,
+        num_gpu_blocks: u32,
+        block_size: u32,
+    ) -> RuntimeWindow {
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
         v.kv_cache_usage_perc = Some(kv_pct);
         v.num_requests_waiting = Some(wait);
         v.num_requests_running = Some(run);
+        v.prompt_tokens_mean = Some(prompt_mean);
         v.generation_tokens_per_sec = Some(100.0);
+        v.cache_config = crate::collectors::CacheConfigLabels {
+            num_gpu_blocks: Some(num_gpu_blocks),
+            block_size: Some(block_size),
+            ..Default::default()
+        };
         mk_win(snap(t, t, v, gpu_busy()))
     }
 
@@ -1006,14 +1019,15 @@ mod tests {
     #[test]
     fn r2_backlog_fires_when_sustained_admission_pressure() {
         let mut windows: Vec<_> = (0..15)
-            .map(|_| mk_evaluable_backlog_window(40.0, 1.0, 9.0))
+            .map(|_| mk_evaluable_backlog_window(10.0, 1.0, 9.0, 10.0, 10_000, 16))
             .collect();
         for w in windows.iter_mut().take(4) {
-            *w = mk_evaluable_backlog_window(55.0, 15.0, 15.0);
+            // KV 70% (< 85% standard r2 gate); free = 100×16×0.30 = 480; demand = 15×40 = 600
+            *w = mk_evaluable_backlog_window(70.0, 15.0, 5.0, 40.0, 100, 16);
         }
         let text = r2_issue_lines(windows).join("\n");
         assert!(text.contains("[!] KV Cache Pressure — Admission Backlog"));
-        assert!(text.contains("Scheduler holding"));
+        assert!(text.contains("Free KV capacity"));
         assert!(!text.contains("threshold: 85%"));
     }
 
@@ -1023,7 +1037,7 @@ mod tests {
             .map(|_| mk_evaluable_kv_window(50.0, false))
             .collect();
         for w in windows.iter_mut().take(4) {
-            *w = mk_evaluable_backlog_window(86.0, 15.0, 15.0);
+            *w = mk_evaluable_backlog_window(86.0, 15.0, 15.0, 20.0, 100, 16);
         }
         let text = r2_issue_lines(windows).join("\n");
         assert!(text.contains("[!] KV Cache Pressure"));

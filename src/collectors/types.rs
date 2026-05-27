@@ -5,6 +5,7 @@ use std::time::SystemTime;
 #[derive(Debug, Clone, Default)]
 pub struct CacheConfigLabels {
     pub block_size: Option<u32>,
+    pub num_gpu_blocks: Option<u32>,
     /// KV cache element dtype (e.g. "auto", "fp8", "fp16").
     pub cache_dtype: Option<String>,
     pub enable_prefix_caching: Option<bool>,

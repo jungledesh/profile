@@ -8,8 +8,7 @@ const KV_PRESSURE_VRAM_CORROBORATE_MIN_PERC: f64 = 78.0;
 const KV_PRESSURE_CRITICAL_CONFIDENCE: f64 = 0.95;
 const KV_PRESSURE_THREAT_CONFIDENCE: f64 = 0.85;
 const KV_PRESSURE_WARNING_CONFIDENCE: f64 = 0.7;
-const KV_ADMISSION_BACKLOG_KV_MIN_PERC: f64 = 25.0;
-const KV_ADMISSION_BACKLOG_QUEUE_RATIO_MIN: f64 = 0.3;
+const KV_ADMISSION_BACKLOG_QUEUE_RATIO_MIN: f64 = 0.30;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct KvAdmissionBacklogDetail {
@@ -17,6 +16,8 @@ pub struct KvAdmissionBacklogDetail {
     pub admission_ratio: f64,
     pub requests_waiting: f64,
     pub requests_running: f64,
+    pub free_kv_tokens: f64,
+    pub demand_tokens: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -43,9 +44,6 @@ pub fn rule2_kv_admission_backlog(snapshot: &RawSnapshot) -> Option<KvAdmissionB
         .vllm
         .kv_cache_usage_perc
         .filter(|v| v.is_finite())?;
-    if kv < KV_ADMISSION_BACKLOG_KV_MIN_PERC {
-        return None;
-    }
     let wait = snapshot
         .vllm
         .num_requests_waiting
@@ -54,6 +52,17 @@ pub fn rule2_kv_admission_backlog(snapshot: &RawSnapshot) -> Option<KvAdmissionB
         .vllm
         .num_requests_running
         .filter(|v| v.is_finite())?;
+    let prompt_mean = snapshot.vllm.prompt_tokens_mean.filter(|v| v.is_finite())?;
+    let num_gpu_blocks = snapshot.vllm.cache_config.num_gpu_blocks?;
+    let block_size = snapshot.vllm.cache_config.block_size?;
+    let max_seqs = snapshot.vllm.max_num_seqs?;
+
+    // If running == max_num_seqs the scheduler is stalling on the concurrency cap,
+    // not KV exhaustion. Can't rule out that cause without max_num_seqs, so require it.
+    if run >= f64::from(max_seqs) {
+        return None;
+    }
+
     let total = wait + run;
     if total <= 0.0 {
         return None;
@@ -62,11 +71,23 @@ pub fn rule2_kv_admission_backlog(snapshot: &RawSnapshot) -> Option<KvAdmissionB
     if ratio < KV_ADMISSION_BACKLOG_QUEUE_RATIO_MIN {
         return None;
     }
+
+    let free_kv_tokens = f64::from(num_gpu_blocks) * f64::from(block_size) * (1.0 - kv / 100.0);
+    let demand_tokens = wait * prompt_mean;
+    if !(free_kv_tokens.is_finite() && demand_tokens.is_finite()) {
+        return None;
+    }
+    if free_kv_tokens >= demand_tokens {
+        return None;
+    }
+
     Some(KvAdmissionBacklogDetail {
         kv_cache_usage_perc: kv,
         admission_ratio: ratio,
         requests_waiting: wait,
         requests_running: run,
+        free_kv_tokens,
+        demand_tokens,
     })
 }
 
@@ -197,13 +218,13 @@ pub(super) fn format_kv_admission_backlog_issue(
         format!("  Seen in {seen_pct}% of windows"),
         "Cause:".to_string(),
         format!(
-            "  - Scheduler holding {:.0} requests in queue ({:.0}% of capacity) to protect KV memory",
+            "  - Scheduler holding {:.0} requests in queue ({:.0}% of active requests waiting) to protect KV memory",
             d.requests_waiting,
             d.admission_ratio * 100.0
         ),
         format!(
-            "  - KV cache {:.1}% — scheduler refusing admission to prevent overflow",
-            d.kv_cache_usage_perc
+            "  - Free KV capacity: {:.0} tokens — queue demands {:.0} tokens",
+            d.free_kv_tokens, d.demand_tokens
         ),
         String::new(),
         "  Fix:".to_string(),
@@ -224,11 +245,15 @@ pub(super) fn aggregate_backlog_detail(
     let ratio = details.iter().map(|d| d.admission_ratio).sum::<f64>() / n;
     let wait = details.iter().map(|d| d.requests_waiting).sum::<f64>() / n;
     let run = details.iter().map(|d| d.requests_running).sum::<f64>() / n;
+    let free_kv_tokens = details.iter().map(|d| d.free_kv_tokens).sum::<f64>() / n;
+    let demand_tokens = details.iter().map(|d| d.demand_tokens).sum::<f64>() / n;
     KvAdmissionBacklogDetail {
         kv_cache_usage_perc: kv,
         admission_ratio: ratio,
         requests_waiting: wait,
         requests_running: run,
+        free_kv_tokens,
+        demand_tokens,
     }
 }
 
@@ -282,7 +307,7 @@ fn vram_usage_perc(gpu: &GpuRawMetrics) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::collectors::{GpuRawMetrics, VllmRawMetrics};
+    use crate::collectors::{CacheConfigLabels, GpuRawMetrics, VllmRawMetrics};
     use std::time::SystemTime;
 
     fn snap(vllm: VllmRawMetrics) -> RawSnapshot {
@@ -295,31 +320,117 @@ mod tests {
         }
     }
 
-    fn backlog_vllm(kv: f64, wait: f64, run: f64) -> VllmRawMetrics {
+    fn backlog_vllm(
+        kv: f64,
+        wait: f64,
+        run: f64,
+        prompt_mean: f64,
+        num_gpu_blocks: Option<u32>,
+        block_size: Option<u32>,
+    ) -> VllmRawMetrics {
+        // max_num_seqs set well above run so concurrency cap doesn't suppress the rule.
+        let max_num_seqs = Some((run as u32) + 100);
         VllmRawMetrics {
             kv_cache_usage_perc: Some(kv),
             num_requests_waiting: Some(wait),
             num_requests_running: Some(run),
+            prompt_tokens_mean: Some(prompt_mean),
             generation_tokens_per_sec: Some(100.0),
+            max_num_seqs,
+            cache_config: CacheConfigLabels {
+                num_gpu_blocks,
+                block_size,
+                ..Default::default()
+            },
             ..Default::default()
         }
     }
 
     #[test]
-    fn backlog_fires_when_kv_50_and_ratio_0_3() {
-        let d = rule2_kv_admission_backlog(&snap(backlog_vllm(50.0, 3.0, 7.0))).expect("fired");
-        assert!((d.kv_cache_usage_perc - 50.0).abs() < 1e-9);
-        assert!((d.admission_ratio - 0.3).abs() < 1e-9);
+    fn backlog_fires_when_free_below_demand_and_ratio_at_least_0_30() {
+        // 100 blocks × 16 tok/block × 10% free = 160 free; 10 wait × 20 tok = 200 demand
+        let d = rule2_kv_admission_backlog(&snap(backlog_vllm(
+            90.0,
+            10.0,
+            5.0,
+            20.0,
+            Some(100),
+            Some(16),
+        )))
+        .expect("fired");
+        assert!((d.free_kv_tokens - 160.0).abs() < 1e-9);
+        assert!((d.demand_tokens - 200.0).abs() < 1e-9);
+        assert!((d.admission_ratio - (10.0 / 15.0)).abs() < 1e-9);
     }
 
     #[test]
-    fn backlog_silent_when_kv_below_25() {
-        assert!(rule2_kv_admission_backlog(&snap(backlog_vllm(24.9, 5.0, 5.0))).is_none());
+    fn backlog_silent_when_free_at_least_demand() {
+        // 10% KV used → 90% free pool; demand is small
+        assert!(rule2_kv_admission_backlog(&snap(backlog_vllm(
+            10.0,
+            5.0,
+            5.0,
+            100.0,
+            Some(1000),
+            Some(16),
+        )))
+        .is_none());
     }
 
     #[test]
-    fn backlog_silent_when_ratio_below_0_3() {
-        assert!(rule2_kv_admission_backlog(&snap(backlog_vllm(60.0, 2.0, 8.0))).is_none());
+    fn backlog_silent_when_required_field_missing() {
+        assert!(rule2_kv_admission_backlog(&snap(backlog_vllm(
+            90.0,
+            10.0,
+            5.0,
+            20.0,
+            None,
+            Some(16)
+        )))
+        .is_none());
+        assert!(rule2_kv_admission_backlog(&snap(backlog_vllm(
+            90.0,
+            10.0,
+            5.0,
+            20.0,
+            Some(100),
+            None
+        )))
+        .is_none());
+        assert!(rule2_kv_admission_backlog(&snap(backlog_vllm(
+            90.0,
+            10.0,
+            5.0,
+            f64::NAN,
+            Some(100),
+            Some(16)
+        )))
+        .is_none());
+        let mut v = backlog_vllm(90.0, 10.0, 5.0, 20.0, Some(100), Some(16));
+        v.max_num_seqs = None;
+        assert!(rule2_kv_admission_backlog(&snap(v)).is_none());
+    }
+
+    #[test]
+    fn backlog_silent_when_at_concurrency_cap() {
+        // run == max_num_seqs → concurrency cap is the cause, not KV. Must stay silent
+        // even though physics gate would fire (free=160 < demand=200).
+        let mut v = backlog_vllm(90.0, 10.0, 5.0, 20.0, Some(100), Some(16));
+        v.max_num_seqs = Some(5);
+        assert!(rule2_kv_admission_backlog(&snap(v)).is_none());
+    }
+
+    #[test]
+    fn backlog_silent_when_ratio_below_0_30() {
+        assert!(rule2_kv_admission_backlog(&snap(backlog_vllm(
+            90.0,
+            2.0,
+            8.0,
+            20.0,
+            Some(100),
+            Some(16),
+        )))
+        .is_none());
     }
 
     fn detail(kv: f64, preemptions: bool) -> KvCachePressureDetail {
