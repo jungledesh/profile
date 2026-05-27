@@ -14,8 +14,8 @@ pub use r1_under_batching::{
     r1_recommendation, rule1_under_batching, MissReport, Rule1Outcome, UnderBatchingDetail,
 };
 pub use r2_kv_cache_pressure::{
-    r2_recommendation, rule2_kv_cache_pressure, KvCachePressureDetail, Rule2MissReport,
-    Rule2Outcome,
+    r2_recommendation, rule2_kv_admission_backlog, rule2_kv_cache_pressure,
+    KvAdmissionBacklogDetail, KvCachePressureDetail, Rule2MissReport, Rule2Outcome,
 };
 pub use r3_low_prefix_reuse::{
     r3_recommendation, rule3_low_prefix_reuse, LowPrefixReuseDetail, Rule3Outcome,
@@ -24,7 +24,10 @@ pub use r4_parallelism::r4_recommendation;
 pub use r5_concurrency_saturation::{rule5_concurrency_saturation, ConcurrencySaturationDetail};
 
 use r1_under_batching::{aggregate_r1_detail, format_under_batching_window_issue};
-use r2_kv_cache_pressure::{aggregate_r2_detail, format_kv_cache_window_issue};
+use r2_kv_cache_pressure::{
+    aggregate_backlog_detail, aggregate_r2_detail, format_kv_admission_backlog_issue,
+    format_kv_cache_window_issue, kv_pressure_confidence, KV_CACHE_CRITICAL_THRESHOLD_PCT,
+};
 #[cfg(test)]
 use r3_low_prefix_reuse::format_low_prefix_hit_rate_fired;
 use r3_low_prefix_reuse::{
@@ -194,11 +197,13 @@ pub fn format_diagnose_rules_for_windows(
 
     let mut r1_fired = 0usize;
     let mut r2_fired = 0usize;
+    let mut r2_backlog_fired = 0usize;
     let mut r3_fired = 0usize;
     let mut r5_fired = 0usize;
 
     let mut r1_details = Vec::new();
     let mut r2_details = Vec::new();
+    let mut r2_backlog_details: Vec<KvAdmissionBacklogDetail> = Vec::new();
     let mut r3_details = Vec::new();
     let mut r5_details: Vec<ConcurrencySaturationDetail> = Vec::new();
 
@@ -219,6 +224,10 @@ pub fn format_diagnose_rules_for_windows(
             }
             Rule2Outcome::NotFired(_) => {}
         }
+        if let Some(d) = rule2_kv_admission_backlog(&w.snapshot) {
+            r2_backlog_fired += 1;
+            r2_backlog_details.push(d);
+        }
         match rule3_low_prefix_reuse(&w.snapshot) {
             Rule3Outcome::Fired(d) => {
                 r3_fired += 1;
@@ -234,7 +243,7 @@ pub fn format_diagnose_rules_for_windows(
 
     let summary_snap = &summary.window.snapshot;
 
-    if r1_fired + r2_fired + r3_fired + r5_fired == 0 {
+    if r1_fired + r2_fired + r2_backlog_fired + r3_fired + r5_fired == 0 {
         let mut out = Vec::new();
         if verbose_rules {
             out.push("Under-batching: not indicated".to_string());
@@ -257,7 +266,14 @@ pub fn format_diagnose_rules_for_windows(
     let mut out = Vec::new();
 
     let r1_significant = rule_is_significant(r1_fired, n_eval);
-    let r2_significant = rule_is_significant(r2_fired, n_eval);
+    let r2_any_preemptions = r2_details.iter().any(|d| d.preemptions_active);
+    let r2_critical_windows = r2_details
+        .iter()
+        .filter(|d| d.kv_cache_usage_perc >= KV_CACHE_CRITICAL_THRESHOLD_PCT)
+        .count();
+    let r2_significant =
+        r2_any_preemptions || r2_critical_windows >= 2 || rule_is_significant(r2_fired, n_eval);
+    let r2_backlog_significant = rule_is_significant(r2_backlog_fired, n_eval);
     let r3_significant = rule_is_significant(r3_fired, n_eval);
     let r5_significant = rule_is_significant(r5_fired, n_eval);
 
@@ -273,10 +289,19 @@ pub fn format_diagnose_rules_for_windows(
     }
 
     if r2_significant {
+        let r2_agg = aggregate_r2_detail(&r2_details, summary_snap);
         out.extend(format_kv_cache_window_issue(
-            &aggregate_r2_detail(&r2_details, summary_snap),
+            &r2_agg,
             pct(r2_fired, n_eval),
             summary_snap,
+            kv_pressure_confidence(&r2_agg),
+        ));
+        out.push(String::new());
+    } else if r2_backlog_significant {
+        let agg = aggregate_backlog_detail(&r2_backlog_details);
+        out.extend(format_kv_admission_backlog_issue(
+            &agg,
+            pct(r2_backlog_fired, n_eval),
         ));
         out.push(String::new());
     } else if verbose_rules {
@@ -284,7 +309,7 @@ pub fn format_diagnose_rules_for_windows(
         out.push(String::new());
     }
 
-    if r5_significant && !r2_significant {
+    if r5_significant && !r2_significant && !r2_backlog_significant {
         if let Some(agg) = aggregate_concurrency_saturation_detail(&r5_details) {
             out.extend(format_concurrency_saturation_issue(
                 &agg,
@@ -310,7 +335,7 @@ pub fn format_diagnose_rules_for_windows(
     if !r1_significant {
         not_fired.push("Under-batching");
     }
-    if !r2_significant {
+    if !r2_significant && !r2_backlog_significant {
         not_fired.push("KV Cache Pressure");
     }
     if !r3_significant {
@@ -650,6 +675,29 @@ mod tests {
         mk_win(snap(t, t, v, gpu_busy()))
     }
 
+    fn mk_evaluable_backlog_window(
+        kv_pct: f64,
+        wait: f64,
+        run: f64,
+        prompt_mean: f64,
+        num_gpu_blocks: u32,
+        block_size: u32,
+    ) -> RuntimeWindow {
+        let t = SystemTime::UNIX_EPOCH;
+        let mut v = vllm_base();
+        v.kv_cache_usage_perc = Some(kv_pct);
+        v.num_requests_waiting = Some(wait);
+        v.num_requests_running = Some(run);
+        v.prompt_tokens_mean = Some(prompt_mean);
+        v.generation_tokens_per_sec = Some(100.0);
+        v.cache_config = crate::collectors::CacheConfigLabels {
+            num_gpu_blocks: Some(num_gpu_blocks),
+            block_size: Some(block_size),
+            ..Default::default()
+        };
+        mk_win(snap(t, t, v, gpu_busy()))
+    }
+
     fn mk_evaluable_concurrency_saturation_window(
         kv_pct: f64,
         run: f64,
@@ -978,6 +1026,54 @@ mod tests {
     #[test]
     fn rule_is_significant_zero_evaluable_windows_is_false() {
         assert!(!rule_is_significant(3, 0));
+    }
+
+    #[test]
+    fn r2_fires_on_single_preemption_window() {
+        let mut windows: Vec<_> = (0..15)
+            .map(|_| mk_evaluable_kv_window(50.0, false))
+            .collect();
+        windows[0] = mk_evaluable_kv_window(86.0, true);
+        let text = r2_issue_lines(windows).join("\n");
+        assert!(text.contains("[!] KV Cache Pressure") || text.contains("KV Cache Pressure"));
+    }
+
+    #[test]
+    fn r2_fires_on_two_critical_kv_windows_without_preemptions() {
+        let mut windows: Vec<_> = (0..10)
+            .map(|_| mk_evaluable_kv_window(50.0, false))
+            .collect();
+        windows[0] = mk_evaluable_kv_window(96.0, false);
+        windows[1] = mk_evaluable_kv_window(97.0, false);
+        let text = r2_issue_lines(windows).join("\n");
+        assert!(text.contains("KV Cache Pressure"));
+    }
+
+    #[test]
+    fn r2_backlog_fires_when_sustained_admission_pressure() {
+        let mut windows: Vec<_> = (0..15)
+            .map(|_| mk_evaluable_backlog_window(10.0, 1.0, 9.0, 10.0, 10_000, 16))
+            .collect();
+        for w in windows.iter_mut().take(4) {
+            // KV 70% (< 85% standard r2 gate); free = 100×16×0.30 = 480; demand = 15×40 = 600
+            *w = mk_evaluable_backlog_window(70.0, 15.0, 5.0, 40.0, 100, 16);
+        }
+        let text = r2_issue_lines(windows).join("\n");
+        assert!(text.contains("Admission Backlog"));
+        assert!(!text.contains("threshold: 85%"));
+    }
+
+    #[test]
+    fn r2_backlog_suppressed_when_standard_r2_fires() {
+        let mut windows: Vec<_> = (0..15)
+            .map(|_| mk_evaluable_kv_window(50.0, false))
+            .collect();
+        for w in windows.iter_mut().take(4) {
+            *w = mk_evaluable_backlog_window(86.0, 15.0, 15.0, 20.0, 100, 16);
+        }
+        let text = r2_issue_lines(windows).join("\n");
+        assert!(text.contains("KV Cache Pressure"));
+        assert!(!text.contains("Admission Backlog"));
     }
 
     #[test]
