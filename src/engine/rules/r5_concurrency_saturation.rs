@@ -18,7 +18,9 @@ pub fn rule5_concurrency_saturation(snapshot: &RawSnapshot) -> Option<Concurrenc
         .num_requests_running
         .filter(|v| v.is_finite() && *v > 0.0)?;
     let max_seqs = snapshot.vllm.max_num_seqs.filter(|&n| n > 0)?;
-    if run < f64::from(max_seqs) {
+    // Exact equality: scheduler cap is the bottleneck.
+    // run > max_seqs means chunked prefill is batching across steps — cap is not the constraint.
+    if (run - f64::from(max_seqs)).abs() > 0.5 {
         return None;
     }
     let wait = snapshot
@@ -158,5 +160,12 @@ mod tests {
         let mut v = sat_vllm(32.0, 15.0, Some(32));
         v.num_requests_waiting = None;
         assert!(rule5_concurrency_saturation(&snap(v)).is_none());
+    }
+
+    #[test]
+    fn silent_when_run_exceeds_max_num_seqs_chunked_prefill() {
+        // run=40 > max_num_seqs=32: chunked prefill is batching across steps.
+        // Scheduler cap is not the bottleneck — r5 must not fire.
+        assert!(rule5_concurrency_saturation(&snap(sat_vllm(40.0, 15.0, Some(32)))).is_none());
     }
 }

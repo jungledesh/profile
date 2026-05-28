@@ -4,8 +4,12 @@ use crate::engine::{Recommendation, Report};
 
 use super::DiagnoseResult;
 
-const MAX_HISTORY: usize = 100;
 const OSCILLATION_WINDOW: usize = 3;
+/// Closed-loop iterations stored in `LoopState`. Each entry is one full diagnose
+/// cycle (user applies a change, profile re-measures). In practice a single session
+/// rarely exceeds a handful of iterations; 20 is a generous upper bound that costs
+/// essentially nothing.
+const MAX_LOOP_ITERATIONS: usize = 20;
 
 pub struct IterationRecord {
     pub result: DiagnoseResult,
@@ -21,7 +25,7 @@ pub struct LoopState {
 
 impl LoopState {
     pub fn new(result: DiagnoseResult, report: Report) -> Self {
-        let mut history = VecDeque::with_capacity(MAX_HISTORY);
+        let mut history = VecDeque::with_capacity(MAX_LOOP_ITERATIONS);
         history.push_back(IterationRecord {
             result,
             report,
@@ -39,9 +43,6 @@ impl LoopState {
         report: Report,
         rec_shown: Option<&'static str>,
     ) {
-        if self.history.len() >= MAX_HISTORY {
-            self.history.pop_front();
-        }
         self.history.push_back(IterationRecord {
             result,
             report,
@@ -50,9 +51,10 @@ impl LoopState {
     }
 
     pub fn last(&self) -> &IterationRecord {
-        self.history
-            .back()
-            .expect("history always has at least one entry")
+        let Some(rec) = self.history.back() else {
+            unreachable!("history is initialized with one entry and never cleared")
+        };
+        rec
     }
 
     pub fn prev(&self) -> Option<&IterationRecord> {

@@ -105,18 +105,19 @@ Summarise the above. List 10 risks and 10 recommendations." "$max_tokens" &
 }
 
 load_r5() {
-  # More concurrent requests than max_num_seqs — fills slots, builds wait queue.
-  # Short prompts + low max_tokens keeps KV usage low so r2 doesn't fire first.
-  # Set CONCURRENCY to ~3× your vLLM --max-num-seqs value.
-  local concurrency="${CONCURRENCY:-48}"
-  local max_tokens="${MAX_TOKENS:-256}"
-  local prompt="Explain in one paragraph what a transformer model is."
-  while true; do
-    for ((i = 0; i < concurrency; i++)); do
-      post "$prompt" "$max_tokens" &
-    done
-    wait
+  # Keeps exactly CONCURRENCY requests in flight at all times.
+  # No batch gaps — as each request completes, a new one fires immediately.
+  # This saturates max_num_seqs and builds a persistent wait queue.
+  # Keep prompts short so KV stays healthy (r2 should not fire).
+  local concurrency="${CONCURRENCY:-512}"
+  local max_tokens="${MAX_TOKENS:-4096}"
+  local prompt="Explain in detail what a transformer model is, how attention works, and why it replaced RNNs for sequence modeling tasks."
+  for ((i = 0; i < concurrency; i++)); do
+    while true; do
+      post "$prompt" "$max_tokens"
+    done &
   done
+  wait
 }
 
 echo "load.sh — MODE=${MODE}  target=${VLLM_URL}"
