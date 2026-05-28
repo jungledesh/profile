@@ -22,7 +22,7 @@ pub fn build_report(input: AnalysisInput<'_>) -> Report {
 
     let mut recs: Vec<Recommendation> = [
         rules::r1_recommendation(snapshot, baseline.as_ref()),
-        rules::r2_recommendation(snapshot),
+        rules::r2_recommendation(snapshot, input.ctx.config.max_model_len),
         rules::r3_recommendation(snapshot),
         rules::r4_recommendation(kv_headroom, tp),
     ]
@@ -32,7 +32,9 @@ pub fn build_report(input: AnalysisInput<'_>) -> Report {
 
     let kv_pressure = recs.iter().any(|r| r.rule_name == "kv_cache_pressure");
     if !kv_pressure {
-        if let Some(r5) = rules::r5_recommendation(snapshot, kv_headroom) {
+        if let Some(r5) =
+            rules::r5_recommendation(snapshot, kv_headroom, input.ctx.config.max_model_len)
+        {
             recs.push(r5);
         }
     }

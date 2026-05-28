@@ -95,14 +95,11 @@ pub(super) fn format_under_batching_fired(d: &UnderBatchingDetail) -> Vec<String
             d.running, d.waiting, d.max_num_seqs
         ),
         String::new(),
-        "  Engine has unused capacity with no backlog — batch is too small.".to_string(),
+        "  Engine has unused capacity with no backlog. Batch is too small.".to_string(),
         String::new(),
         "  Fix:".to_string(),
-        format!("    • Increase client concurrency — engine has {unused:.0} unused slots"),
-        format!(
-            "    • If upstream is already at max traffic: raise --max-num-seqs (current: {})",
-            d.max_num_seqs
-        ),
+        format!("    • Increase client concurrency ({unused:.0} slots unused)"),
+        "    • Note: if your client is already at full capacity, the bottleneck is upstream of vLLM, not a server config issue.".to_string(),
         String::new(),
         "  Expected: Higher throughput, lower TPOT at scale.".to_string(),
         "  Confidence: High".to_string(),
@@ -120,25 +117,13 @@ pub(super) fn format_under_batching_window_issue(
 
 pub(super) fn aggregate_r1_detail(
     details: &[UnderBatchingDetail],
-    summary: &RawSnapshot,
+    _summary: &RawSnapshot,
     _baseline: Option<&PhysicsBaseline>,
 ) -> UnderBatchingDetail {
-    if details.is_empty() {
-        let running = summary.vllm.num_requests_running.unwrap_or(0.0);
-        let max_n = summary.vllm.max_num_seqs.unwrap_or(256);
-        let waiting = summary.vllm.num_requests_waiting.unwrap_or(0.0);
-        let occupancy_pct = if max_n > 0 {
-            running / f64::from(max_n) * 100.0
-        } else {
-            0.0
-        };
-        return UnderBatchingDetail {
-            running,
-            waiting,
-            max_num_seqs: max_n,
-            occupancy_pct,
-        };
-    }
+    debug_assert!(
+        !details.is_empty(),
+        "aggregate_r1_detail called with empty details"
+    );
     let n = details.len() as f64;
     let running = details.iter().map(|d| d.running).sum::<f64>() / n;
     let waiting = details.iter().map(|d| d.waiting).sum::<f64>() / n;
@@ -146,7 +131,7 @@ pub(super) fn aggregate_r1_detail(
     UnderBatchingDetail {
         running,
         waiting,
-        max_num_seqs: details[0].max_num_seqs,
+        max_num_seqs: details.first().map_or(0, |d| d.max_num_seqs),
         occupancy_pct,
     }
 }
