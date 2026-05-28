@@ -14,6 +14,7 @@ Find and fix inference bottlenecks in minutes.
   - **KV Cache Pressure** — KV usage near capacity → eviction risk
   - **Low Prefix Cache reuse** — prompts don’t share context → wasted performance
   - **Parallelism mismatch** — model weights exceed single-GPU VRAM but TP not set
+  - **Concurrency Saturation** — scheduler pinned at max_num_seqs cap with queue building
 
 It tells you **what’s wrong, why it’s happening, and what to fix first**, so you can reduce cost per token.
 

@@ -10,6 +10,7 @@ const DEFAULT_METRICS_URL: &str = "http://localhost:8000/metrics";
 const DEFAULT_DURATION: &str = "30s";
 
 const ABOUT: &str = "Detects inefficiencies. Suggests fixes.";
+const MAX_DURATION: Duration = Duration::from_secs(30 * 60);
 
 /// Shown for `profile diagnose --help` only (root help omits options via template).
 const DIAGNOSE_ABOUT: &str = "Collects metrics. Detects inefficiencies. Suggests fixes.\nPass -v to show per-rule status when no issue is detected.";
@@ -134,13 +135,19 @@ fn parse_duration_arg(input: &str) -> Result<Duration, String> {
     if value == 0 {
         return Err("duration must be greater than zero".to_string());
     }
-    match unit {
-        "s" => Ok(Duration::from_secs(value)),
-        "m" => Ok(Duration::from_secs(value.saturating_mul(60))),
-        _ => Err(format!(
-            "invalid unit in \"{input}\": use s (seconds) or m (minutes), not ms/mins — e.g. 5m, 10m, 30m"
-        )),
+    let duration = match unit {
+        "s" => Duration::from_secs(value),
+        "m" => Duration::from_secs(value.saturating_mul(60)),
+        _ => {
+            return Err(format!(
+                "invalid unit in \"{input}\": use s (seconds) or m (minutes), not ms/mins — e.g. 5m, 10m, 30m"
+            ));
+        }
+    };
+    if duration > MAX_DURATION {
+        return Err("maximum duration is 30m".to_string());
     }
+    Ok(duration)
 }
 
 #[cfg(test)]
@@ -162,5 +169,17 @@ mod tests {
     fn parse_duration_rejects_ms_and_bare_number() {
         assert!(parse_duration_arg("5ms").is_err());
         assert!(parse_duration_arg("5").is_err());
+    }
+
+    #[test]
+    fn parse_duration_rejects_above_30m() {
+        assert_eq!(
+            parse_duration_arg("31m").unwrap_err(),
+            "maximum duration is 30m"
+        );
+        assert_eq!(
+            parse_duration_arg("1801s").unwrap_err(),
+            "maximum duration is 30m"
+        );
     }
 }

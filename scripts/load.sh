@@ -3,15 +3,20 @@
 #   MODE=r1  ./load.sh         # under-batching: low concurrency, continuous, no gaps
 #   MODE=seq ./load.sh         # under-batching (extreme): 1 sequential request at a time
 #   MODE=r2  ./load.sh         # KV cache pressure: high concurrency, long context
+#   MODE=r5  ./load.sh         # concurrency saturation: more requests than max_num_seqs
 #
 # Tuning env vars:
-#   CONCURRENCY=N              # number of concurrent requests (default: 2 for r1/seq, 8 for r2)
-#   MAX_TOKENS=N               # max output tokens per request (default: 600 for r1/seq, 256 for r2)
+#   CONCURRENCY=N              # number of concurrent requests (default: 2 for r1/seq, 8 for r2, 3× max_num_seqs for r5)
+#   MAX_TOKENS=N               # max output tokens per request (default: 600 for r1/seq, 256 for r2/r5)
 #   CONTEXT_CHUNKS=N           # number of context chunks for r2 long prompt (default: 40)
 #
 # r2 prerequisite: lower --gpu-memory-utilization in vLLM start script to
 # constrain KV cache space (e.g. 0.50–0.65). The right value depends on your
 # GPU VRAM and model size — start low and raise until r2 fires.
+#
+# r5 prerequisite: start vLLM with a low --max-num-seqs (e.g. 16 or 32) so
+# the slot cap is easy to hit. Keep prompts short so KV stays healthy — you
+# want the scheduler cap to be the bottleneck, not memory.
 #
 # Runs forever. Kill with Ctrl-C.
 
@@ -99,6 +104,22 @@ Summarise the above. List 10 risks and 10 recommendations." "$max_tokens" &
   done
 }
 
+load_r5() {
+  # Keeps exactly CONCURRENCY requests in flight at all times.
+  # No batch gaps — as each request completes, a new one fires immediately.
+  # This saturates max_num_seqs and builds a persistent wait queue.
+  # Keep prompts short so KV stays healthy (r2 should not fire).
+  local concurrency="${CONCURRENCY:-512}"
+  local max_tokens="${MAX_TOKENS:-4096}"
+  local prompt="Explain in detail what a transformer model is, how attention works, and why it replaced RNNs for sequence modeling tasks."
+  for ((i = 0; i < concurrency; i++)); do
+    while true; do
+      post "$prompt" "$max_tokens"
+    done &
+  done
+  wait
+}
+
 echo "load.sh — MODE=${MODE}  target=${VLLM_URL}"
 echo "Ctrl-C to stop."
 echo ""
@@ -107,5 +128,6 @@ case "$MODE" in
   r1)  load_r1 ;;
   seq) load_seq ;;
   r2)  load_r2 ;;
-  *)   echo "Unknown MODE=${MODE}. Use r1, seq, or r2." >&2; exit 1 ;;
+  r5)  load_r5 ;;
+  *)   echo "Unknown MODE=${MODE}. Use r1, seq, r2, or r5." >&2; exit 1 ;;
 esac

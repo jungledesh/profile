@@ -303,6 +303,39 @@ fn diagnose_help_lists_usage_and_options() {
 }
 
 #[test]
+fn r5_concurrency_saturation_fires_in_output() {
+    // run >= max_num_seqs (32) with >30% queue ratio → r5 should fire
+    const SCRAPE: &str = r#"# TYPE vllm_num_requests_running gauge
+vllm_num_requests_running 32
+# TYPE vllm_num_requests_waiting gauge
+vllm_num_requests_waiting 15
+# TYPE vllm_max_num_seqs gauge
+vllm_max_num_seqs 32
+# TYPE vllm_generation_tokens_total counter
+vllm_generation_tokens_total 1000
+"#;
+    let bodies = [SCRAPE; SAMPLE_COUNT];
+    let (url, server) = spawn_metrics_server_seq(&bodies);
+    let output = Command::cargo_bin("profile")
+        .unwrap()
+        .args(["diagnose", "--duration", "2s", "--url"])
+        .arg(&url)
+        .output()
+        .expect("run profile diagnose");
+
+    let out = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        out.contains("Concurrency Saturation"),
+        "expected r5 Concurrency Saturation in output; got:\n{out}"
+    );
+    assert!(
+        out.contains("max_num_seqs"),
+        "output should show max_num_seqs; got:\n{out}"
+    );
+    server.join().expect("metrics server thread");
+}
+
+#[test]
 fn verbose_prints_level_to_stderr() {
     let (url, server) = spawn_metrics_server(MINIMAL_SCRAPE, SAMPLE_COUNT);
     Command::cargo_bin("profile")
