@@ -1,6 +1,6 @@
 use crate::collectors::RawSnapshot;
 
-use super::Recommendation;
+use super::{model_len_suffix, Recommendation};
 
 const CONCURRENCY_SATURATION_QUEUE_RATIO_MIN: f64 = 0.30;
 const VRAM_HEADROOM_MIN_GB: f64 = 20.0;
@@ -54,47 +54,46 @@ pub fn rule5_concurrency_saturation(
 pub(super) fn format_concurrency_saturation_issue(
     d: &ConcurrencySaturationDetail,
     seen_pct: u32,
+    max_model_len: Option<u32>,
 ) -> Vec<String> {
     let mut lines = vec![
-        "[!] Concurrency Saturation — Scheduler at max_num_seqs limit".to_string(),
+        "[!] Concurrency Saturation".to_string(),
         format!("  Seen in {seen_pct}% of windows"),
         String::new(),
         "  Cause:".to_string(),
         format!(
-            "  - Running at --max-num-seqs={} — scheduler cannot admit more sequences",
+            "  - --max-num-seqs={} hit: scheduler won't admit more sequences",
             d.max_num_seqs
         ),
         format!(
-            "  - {:.0}% of active requests waiting (threshold: ≥{:.0}%)",
+            "  - {:.0}% of requests waiting ({:.0} of {:.0} active)",
             d.queue_ratio * 100.0,
-            CONCURRENCY_SATURATION_QUEUE_RATIO_MIN * 100.0
-        ),
-        format!(
-            "  - Queue: {:.0} waiting, {:.0} running",
-            d.requests_waiting, d.requests_running
+            d.requests_waiting,
+            d.requests_waiting + d.requests_running
         ),
     ];
     if let Some(ttft_ms) = d.ttft_ms.filter(|t| t.is_finite()) {
         lines.push(format!(
-            "  - TTFT {:.1}s — requests queuing behind {:.0} others before scheduling",
+            "  - TTFT {:.1}s, {:.0} requests queued ahead",
             ttft_ms / 1000.0,
             d.requests_waiting
         ));
     }
     lines.push(String::new());
-    lines.push("  Recommendation:".to_string());
+    lines.push("  Fix:".to_string());
     match d.kv_headroom_gb {
         Some(headroom) if headroom > VRAM_HEADROOM_MIN_GB => {
             lines.push(format!(
-                "  • Raise --max-num-seqs above {} — {headroom:.0}GB VRAM headroom available",
+                "  • Raise --max-num-seqs above {} ({headroom:.0}GB VRAM available)",
                 d.max_num_seqs
             ));
         }
         _ => {
-            lines.push("  • Add a replica to scale out horizontally".to_string());
-            lines.push(
-                "  • Or lower --max-model-len to reduce KV footprint per sequence".to_string(),
-            );
+            lines.push("  • Add a replica".to_string());
+            lines.push(format!(
+                "  • Or lower --max-model-len{} to reduce KV footprint per sequence",
+                model_len_suffix(max_model_len)
+            ));
         }
     }
     lines.push(String::new());
@@ -106,6 +105,7 @@ pub(super) fn format_concurrency_saturation_issue(
 pub fn r5_recommendation(
     snapshot: &RawSnapshot,
     kv_headroom_gb: Option<f64>,
+    max_model_len: Option<u32>,
 ) -> Option<Recommendation> {
     let d = rule5_concurrency_saturation(snapshot, kv_headroom_gb)?;
     Some(Recommendation {
@@ -118,7 +118,7 @@ pub fn r5_recommendation(
             d.queue_ratio * 100.0
         ),
         expected_impact: "Queue drains, TTFT recovers.".to_string(),
-        display_lines: format_concurrency_saturation_issue(&d, 100),
+        display_lines: format_concurrency_saturation_issue(&d, 100, max_model_len),
     })
 }
 
@@ -231,34 +231,45 @@ mod tests {
 
     #[test]
     fn recommendation_raises_cap_when_headroom_available() {
-        let text =
-            format_concurrency_saturation_issue(&fired_detail(None, Some(63.0)), 100).join("\n");
-        assert!(text.contains("63GB VRAM headroom available"));
+        let text = format_concurrency_saturation_issue(&fired_detail(None, Some(63.0)), 100, None)
+            .join("\n");
+        assert!(text.contains("63GB VRAM available"));
     }
 
     #[test]
     fn recommendation_scales_out_when_vram_exhausted() {
-        let text =
-            format_concurrency_saturation_issue(&fired_detail(None, Some(5.0)), 100).join("\n");
+        let text = format_concurrency_saturation_issue(&fired_detail(None, Some(5.0)), 100, None)
+            .join("\n");
         assert!(text.contains("Add a replica"));
     }
 
     #[test]
     fn recommendation_scales_out_when_headroom_unknown() {
-        let text = format_concurrency_saturation_issue(&fired_detail(None, None), 100).join("\n");
+        let text =
+            format_concurrency_saturation_issue(&fired_detail(None, None), 100, None).join("\n");
         assert!(text.contains("Add a replica"));
+    }
+
+    #[test]
+    fn recommendation_shows_max_model_len_when_known() {
+        let text =
+            format_concurrency_saturation_issue(&fired_detail(None, Some(5.0)), 100, Some(8192))
+                .join("\n");
+        assert!(text.contains("--max-model-len (currently 8192)"));
     }
 
     #[test]
     fn cause_shows_ttft_when_available() {
         let text =
-            format_concurrency_saturation_issue(&fired_detail(Some(5000.0), None), 100).join("\n");
+            format_concurrency_saturation_issue(&fired_detail(Some(5000.0), None), 100, None)
+                .join("\n");
         assert!(text.contains("TTFT 5.0s"));
     }
 
     #[test]
     fn cause_omits_ttft_when_none() {
-        let text = format_concurrency_saturation_issue(&fired_detail(None, None), 100).join("\n");
-        assert!(!text.contains("requests queuing behind"));
+        let text =
+            format_concurrency_saturation_issue(&fired_detail(None, None), 100, None).join("\n");
+        assert!(!text.contains("requests queued ahead"));
     }
 }

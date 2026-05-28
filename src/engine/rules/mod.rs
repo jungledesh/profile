@@ -47,6 +47,15 @@ pub(super) const ENGINE_MIN_WINDOW_PCT: f64 = 0.25;
 
 // TODO(r5): sampling cliff — sampling temperature is not in collected metrics; wire rule when available.
 
+/// Returns ` (currently N)` when known, empty string when not.
+/// Used by rules that surface --max-model-len in Fix bullets.
+pub(super) fn model_len_suffix(max_model_len: Option<u32>) -> String {
+    match max_model_len {
+        Some(v) => format!(" (currently {v})"),
+        None => String::new(),
+    }
+}
+
 /// True when a rule fired in enough evaluable windows to be statistically stable.
 pub fn rule_is_significant(fired: usize, total_evaluable: usize) -> bool {
     if total_evaluable == 0 {
@@ -250,7 +259,19 @@ pub fn format_diagnose_rules_for_windows(
 
     if r1_fired + r2_fired + r2_backlog_fired + r3_fired + r5_fired == 0 {
         let mut out = Vec::new();
-        if verbose_rules {
+        let r1_max_seqs_advisory = summary_snap.vllm.max_num_seqs.is_none()
+            && summary_snap
+                .vllm
+                .num_requests_running
+                .is_some_and(|r| r > 0.0);
+        if r1_max_seqs_advisory {
+            out.push(
+                "[i] Under-batching: max_num_seqs not in metrics, occupancy cannot be measured."
+                    .to_string(),
+            );
+            out.push("    Pass -m <value> to profile to enable batching analysis.".to_string());
+            out.push(String::new());
+        } else if verbose_rules {
             out.push("Under-batching: not indicated".to_string());
             out.push(String::new());
             out.push("KV cache pressure: not indicated".to_string());
@@ -258,7 +279,9 @@ pub fn format_diagnose_rules_for_windows(
             out.extend(format_rule3_verbose_miss(summary_snap));
             out.push(String::new());
         }
-        out.push(NO_ISSUES_LINE.to_string());
+        if !r1_max_seqs_advisory {
+            out.push(NO_ISSUES_LINE.to_string());
+        }
         if verbose_rules && skipped > 0 {
             out.push(format!(
                 "Note: {skipped} of {total} windows had insufficient traffic for analysis."
@@ -288,6 +311,18 @@ pub fn format_diagnose_rules_for_windows(
             pct(r1_fired, n_eval),
         ));
         out.push(String::new());
+    } else if summary_snap.vllm.max_num_seqs.is_none()
+        && summary_snap
+            .vllm
+            .num_requests_running
+            .is_some_and(|r| r > 0.0)
+    {
+        out.push(
+            "[i] Under-batching: max_num_seqs not in metrics, occupancy cannot be measured."
+                .to_string(),
+        );
+        out.push("    Pass -m <value> to profile to enable batching analysis.".to_string());
+        out.push(String::new());
     } else if verbose_rules {
         out.push("Under-batching: not indicated".to_string());
         out.push(String::new());
@@ -300,6 +335,7 @@ pub fn format_diagnose_rules_for_windows(
             pct(r2_fired, n_eval),
             summary_snap,
             kv_pressure_confidence(&r2_agg),
+            summary.ctx.config.max_model_len,
         ));
         out.push(String::new());
     } else if r2_backlog_significant {
@@ -307,6 +343,7 @@ pub fn format_diagnose_rules_for_windows(
         out.extend(format_kv_admission_backlog_issue(
             &agg,
             pct(r2_backlog_fired, n_eval),
+            summary.ctx.config.max_model_len,
         ));
         out.push(String::new());
     } else if verbose_rules {
@@ -319,6 +356,7 @@ pub fn format_diagnose_rules_for_windows(
             out.extend(format_concurrency_saturation_issue(
                 &agg,
                 pct(r5_fired, n_eval),
+                summary.ctx.config.max_model_len,
             ));
             out.push(String::new());
         }
@@ -603,6 +641,24 @@ mod tests {
     }
 
     #[test]
+    fn max_num_seqs_none_with_traffic_shows_advisory() {
+        let t = SystemTime::UNIX_EPOCH;
+        let windows: Vec<_> = (0..15)
+            .map(|_| {
+                let mut v = vllm_base();
+                v.max_num_seqs = None;
+                v.num_requests_running = Some(20.0);
+                v.generation_tokens_per_sec = Some(100.0);
+                mk_win(snap(t, t, v, gpu_busy()))
+            })
+            .collect();
+        let ctx = mk_ctx();
+        let summary = ai(&ctx, windows.last().expect("windows"));
+        let text = format_diagnose_rules_for_windows(&windows, summary, false).join("\n");
+        assert!(text.contains("max_num_seqs not in metrics"));
+    }
+
+    #[test]
     fn format_under_batching_fired_matches_template() {
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
@@ -616,7 +672,7 @@ mod tests {
         assert!(text.contains("Occupancy"));
         assert!(text.contains("threshold: < 10%"));
         assert!(text.contains("unused capacity"));
-        assert!(text.contains("unused slots"));
+        assert!(text.contains("slots unused"));
         assert!(text.contains("Expected: Higher throughput, lower TPOT at scale."));
         assert!(text.contains("Confidence: High"));
     }
@@ -713,7 +769,7 @@ mod tests {
         v.kv_cache_usage_perc = Some(50.0);
         v.num_preemptions_per_sec = Some(0.5);
         let s = snap(t, t, v, gpu_low());
-        let r = r2_recommendation(&s).expect("fired");
+        let r = r2_recommendation(&s, None).expect("fired");
         assert_eq!(r.rule_name, "kv_cache_pressure");
         assert_eq!(r.impact, 5);
         assert!((r.confidence - 0.95).abs() < 1e-9);
@@ -726,7 +782,7 @@ mod tests {
         g.vram_used_mb = Some(78 * 1024);
         g.vram_total_mb = Some(100 * 1024);
         let s = snap(t, t, vllm_high_kv(), g);
-        let r = r2_recommendation(&s).expect("fired");
+        let r = r2_recommendation(&s, None).expect("fired");
         assert_eq!(r.rule_name, "kv_cache_pressure");
         assert_eq!(r.impact, 5);
         assert!((r.confidence - 0.7).abs() < 1e-9);
@@ -811,7 +867,7 @@ mod tests {
         assert!(text.contains("Cause:"));
         assert!(text.contains("  - KV cache 86.0% (threshold: 85%)"));
         assert!(text.contains("Expected: Lower TTFT, stable TPOT once evictions stop."));
-        assert!(text.contains("Reduce max_num_seqs to limit peak concurrent KV block consumption"));
+        assert!(text.contains("Reduce --max-num-seqs to lower KV block demand"));
         assert!(text.contains("Consider fp8 KV cache (--kv-cache-dtype fp8)"));
         assert!(text.contains("Confidence: Medium-High"));
     }
@@ -1054,7 +1110,7 @@ mod tests {
         }
         let text = r2_issue_lines(windows).join("\n");
         assert!(text.contains("[!] KV Cache Pressure — Admission Backlog"));
-        assert!(text.contains("Free KV capacity"));
+        assert!(text.contains("Free KV tokens"));
         assert!(!text.contains("threshold: 85%"));
     }
 
@@ -1123,7 +1179,7 @@ mod tests {
         assert!(text.contains("Under-batching — Low Occupancy"));
         assert!(text.contains("Seen in 60% of windows"));
         assert!(text.contains("Occupancy"));
-        assert!(text.contains("raise --max-num-seqs"));
+        assert!(text.contains("bottleneck is upstream of vLLM"));
         assert!(text.contains("No issues for KV Cache Pressure and Low Prefix Cache"));
     }
 
@@ -1198,7 +1254,7 @@ mod tests {
             text.contains("[!] Concurrency Saturation"),
             "expected r5: {text}"
         );
-        assert!(text.contains("max_num_seqs limit"));
+        assert!(text.contains("--max-num-seqs=32 hit:"));
     }
 
     #[test]

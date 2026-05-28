@@ -1,6 +1,6 @@
 use crate::collectors::{GpuRawMetrics, RawSnapshot};
 
-use super::{skew_secs, Recommendation, MAX_OBSERVATION_SKEW_SECS};
+use super::{model_len_suffix, skew_secs, Recommendation, MAX_OBSERVATION_SKEW_SECS};
 
 const KV_CACHE_PRESSURE_MIN_PERC: f64 = 85.0;
 pub(super) const KV_CACHE_CRITICAL_THRESHOLD_PCT: f64 = 95.0;
@@ -127,7 +127,10 @@ pub fn rule2_kv_cache_pressure(snapshot: &RawSnapshot) -> Rule2Outcome {
     })
 }
 
-pub fn r2_recommendation(snapshot: &RawSnapshot) -> Option<Recommendation> {
+pub fn r2_recommendation(
+    snapshot: &RawSnapshot,
+    max_model_len: Option<u32>,
+) -> Option<Recommendation> {
     let Rule2Outcome::Fired(d) = rule2_kv_cache_pressure(snapshot) else {
         return None;
     };
@@ -142,7 +145,7 @@ pub fn r2_recommendation(snapshot: &RawSnapshot) -> Option<Recommendation> {
         confidence,
         action: "Reduce max_num_seqs or add tensor parallelism".to_string(),
         expected_impact: "Reduced KV evictions and lower latency variance".to_string(),
-        display_lines: format_kv_cache_pressure_fired(&d, snapshot, confidence),
+        display_lines: format_kv_cache_pressure_fired(&d, snapshot, confidence, max_model_len),
     })
 }
 
@@ -160,6 +163,7 @@ pub(super) fn format_kv_cache_pressure_fired(
     d: &KvCachePressureDetail,
     snapshot: &RawSnapshot,
     confidence: f64,
+    max_model_len: Option<u32>,
 ) -> Vec<String> {
     let kv_p = snapshot.vllm.kv_cache_usage_perc.filter(|v| v.is_finite());
     let conf_label = if (confidence - KV_PRESSURE_CRITICAL_CONFIDENCE).abs() < 1e-9 {
@@ -167,45 +171,49 @@ pub(super) fn format_kv_cache_pressure_fired(
     } else {
         "Confidence: Medium-High"
     };
-    let mut out = vec!["[!] KV Cache Pressure".to_string(), "Cause:".to_string()];
+    let mut out = vec!["[!] KV Cache Pressure".to_string(), "  Cause:".to_string()];
     if d.preemptions_active {
         out.push(
-            "  - Active preemptions — scheduler evicting sequences to free KV blocks".to_string(),
+            "  - Active preemptions: scheduler evicting sequences to free KV blocks".to_string(),
         );
         if let Some(k) = kv_p {
             if let Some(peak) = snapshot.vllm.kv_cache_peak_perc.filter(|v| v.is_finite()) {
                 out.push(format!(
-                    "  - KV cache {k:.1}% avg ({peak:.1}% peak) — peak triggered evictions"
+                    "  - KV cache {k:.1}% avg ({peak:.1}% peak), peak triggered evictions"
                 ));
             } else {
-                out.push(format!("  - KV cache {k:.1}% — evictions active"));
+                out.push(format!("  - KV cache {k:.1}%, evictions active"));
             }
         }
     } else {
         out.push(format!(
-            "  - KV cache {:.1}% (threshold: {:.0}%) — approaching capacity",
+            "  - KV cache {:.1}% (threshold: {:.0}%), approaching capacity",
             d.kv_cache_usage_perc, KV_CACHE_PRESSURE_MIN_PERC
         ));
     }
     out.push(String::new());
     out.push("  Fix:".to_string());
+    let model_len_bullet = format!(
+        "    • Lower --max-model-len{} if your workload allows shorter context",
+        model_len_suffix(max_model_len)
+    );
     if d.preemptions_active {
         out.extend([
-            "    • Lower --max-num-seqs immediately — reduces sequences competing for KV blocks"
+            "    • Lower --max-num-seqs immediately (reduces sequences competing for KV blocks)"
                 .to_string(),
             "    • Consider fp8 KV cache (--kv-cache-dtype fp8) to halve KV memory footprint"
                 .to_string(),
-            "    • Lower max_model_len if workload allows shorter context".to_string(),
+            model_len_bullet,
         ]);
     } else {
         // Approaching capacity — strategic fixes
         out.extend([
             "    • Raise --gpu-memory-utilization if VRAM headroom exists (check vRAM in header)"
                 .to_string(),
-            "    • Reduce max_num_seqs to limit peak concurrent KV block consumption".to_string(),
+            "    • Reduce --max-num-seqs to lower KV block demand".to_string(),
             "    • Consider fp8 KV cache (--kv-cache-dtype fp8) to halve KV memory footprint"
                 .to_string(),
-            "    • Lower max_model_len only if safe for your workload".to_string(),
+            model_len_bullet,
         ]);
     }
     let expected = if d.preemptions_active {
@@ -224,25 +232,31 @@ pub(super) fn format_kv_cache_pressure_fired(
 pub(super) fn format_kv_admission_backlog_issue(
     d: &KvAdmissionBacklogDetail,
     seen_pct: u32,
+    max_model_len: Option<u32>,
 ) -> Vec<String> {
+    let model_len_bullet = format!(
+        "    • Lower --max-model-len{} if your workload allows shorter context",
+        model_len_suffix(max_model_len)
+    );
     vec![
         "[!] KV Cache Pressure — Admission Backlog".to_string(),
         format!("  Seen in {seen_pct}% of windows"),
-        "Cause:".to_string(),
+        "  Cause:".to_string(),
         format!(
             "  - Scheduler holding {:.0} requests in queue ({:.0}% of active requests waiting) to protect KV memory",
             d.requests_waiting,
             d.admission_ratio * 100.0
         ),
         format!(
-            "  - Free KV capacity: {:.0} tokens — queue demands {:.0} tokens",
+            "  - Free KV tokens: {:.0} available, {:.0} demanded",
             d.free_kv_tokens, d.demand_tokens
         ),
         String::new(),
         "  Fix:".to_string(),
         "    • Raise --gpu-memory-utilization if VRAM headroom exists".to_string(),
-        "    • Reduce max_num_seqs to lower peak KV block demand".to_string(),
+        "    • Reduce --max-num-seqs to lower peak KV block demand".to_string(),
         "    • Consider fp8 KV cache (--kv-cache-dtype fp8) to halve KV memory footprint".to_string(),
+        model_len_bullet,
         String::new(),
         "  Expected: Wait queue drains, TTFT recovers.".to_string(),
         "  Confidence: Medium-High".to_string(),
@@ -274,8 +288,9 @@ pub(super) fn format_kv_cache_window_issue(
     seen_pct: u32,
     snapshot: &RawSnapshot,
     confidence: f64,
+    max_model_len: Option<u32>,
 ) -> Vec<String> {
-    let mut lines = format_kv_cache_pressure_fired(d, snapshot, confidence);
+    let mut lines = format_kv_cache_pressure_fired(d, snapshot, confidence, max_model_len);
     lines.insert(1, format!("  Seen in {seen_pct}% of windows"));
     lines
 }
@@ -466,5 +481,30 @@ mod tests {
     #[test]
     fn kv_pressure_confidence_warning_when_kv_below_95_no_preemptions() {
         assert!((kv_pressure_confidence(&detail(90.0, false)) - 0.7).abs() < 1e-9);
+    }
+
+    #[test]
+    fn model_len_shown_when_some() {
+        let text = format_kv_cache_pressure_fired(
+            &detail(50.0, true),
+            &snap(VllmRawMetrics::default()),
+            KV_PRESSURE_CRITICAL_CONFIDENCE,
+            Some(4096),
+        )
+        .join("\n");
+        assert!(text.contains("--max-model-len (currently 4096)"));
+    }
+
+    #[test]
+    fn model_len_generic_when_none() {
+        let text = format_kv_cache_pressure_fired(
+            &detail(50.0, true),
+            &snap(VllmRawMetrics::default()),
+            KV_PRESSURE_CRITICAL_CONFIDENCE,
+            None,
+        )
+        .join("\n");
+        assert!(text.contains("--max-model-len if"));
+        assert!(!text.contains("currently"));
     }
 }
