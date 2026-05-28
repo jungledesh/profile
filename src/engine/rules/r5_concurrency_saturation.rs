@@ -3,6 +3,7 @@ use crate::collectors::RawSnapshot;
 use super::Recommendation;
 
 const CONCURRENCY_SATURATION_QUEUE_RATIO_MIN: f64 = 0.30;
+const VRAM_HEADROOM_MIN_GB: f64 = 20.0;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConcurrencySaturationDetail {
@@ -10,9 +11,14 @@ pub struct ConcurrencySaturationDetail {
     pub requests_waiting: f64,
     pub max_num_seqs: u32,
     pub queue_ratio: f64,
+    pub ttft_ms: Option<f64>,
+    pub kv_headroom_gb: Option<f64>,
 }
 
-pub fn rule5_concurrency_saturation(snapshot: &RawSnapshot) -> Option<ConcurrencySaturationDetail> {
+pub fn rule5_concurrency_saturation(
+    snapshot: &RawSnapshot,
+    kv_headroom_gb: Option<f64>,
+) -> Option<ConcurrencySaturationDetail> {
     let run = snapshot
         .vllm
         .num_requests_running
@@ -40,6 +46,8 @@ pub fn rule5_concurrency_saturation(snapshot: &RawSnapshot) -> Option<Concurrenc
         requests_waiting: wait,
         max_num_seqs: max_seqs,
         queue_ratio: ratio,
+        ttft_ms: snapshot.vllm.ttft_ms,
+        kv_headroom_gb,
     })
 }
 
@@ -47,7 +55,7 @@ pub(super) fn format_concurrency_saturation_issue(
     d: &ConcurrencySaturationDetail,
     seen_pct: u32,
 ) -> Vec<String> {
-    vec![
+    let mut lines = vec![
         "[!] Concurrency Saturation — Scheduler at max_num_seqs limit".to_string(),
         format!("  Seen in {seen_pct}% of windows"),
         String::new(),
@@ -61,19 +69,45 @@ pub(super) fn format_concurrency_saturation_issue(
             d.queue_ratio * 100.0,
             CONCURRENCY_SATURATION_QUEUE_RATIO_MIN * 100.0
         ),
-        format!("  - Queue: {:.0} waiting, {:.0} running", d.requests_waiting, d.requests_running),
-        String::new(),
-        "  Recommendation:".to_string(),
-        format!("  • Raise --max-num-seqs above {} — check VRAM headroom in header first", d.max_num_seqs),
-        "  • If VRAM is at limit: add a replica or lower max_model_len to reduce KV footprint per sequence".to_string(),
-        String::new(),
-        "  Expected: Queue drains, TTFT recovers.".to_string(),
-        "  Confidence: High".to_string(),
-    ]
+        format!(
+            "  - Queue: {:.0} waiting, {:.0} running",
+            d.requests_waiting, d.requests_running
+        ),
+    ];
+    if let Some(ttft_ms) = d.ttft_ms.filter(|t| t.is_finite()) {
+        lines.push(format!(
+            "  - TTFT {:.1}s — requests queuing behind {:.0} others before scheduling",
+            ttft_ms / 1000.0,
+            d.requests_waiting
+        ));
+    }
+    lines.push(String::new());
+    lines.push("  Recommendation:".to_string());
+    match d.kv_headroom_gb {
+        Some(headroom) if headroom > VRAM_HEADROOM_MIN_GB => {
+            lines.push(format!(
+                "  • Raise --max-num-seqs above {} — {headroom:.0}GB VRAM headroom available",
+                d.max_num_seqs
+            ));
+        }
+        _ => {
+            lines.push("  • Add a replica to scale out horizontally".to_string());
+            lines.push(
+                "  • Or lower --max-model-len to reduce KV footprint per sequence".to_string(),
+            );
+        }
+    }
+    lines.push(String::new());
+    lines.push("  Expected: Queue drains, TTFT recovers.".to_string());
+    lines.push("  Confidence: High".to_string());
+    lines
 }
 
-pub fn r5_recommendation(snapshot: &RawSnapshot) -> Option<Recommendation> {
-    let d = rule5_concurrency_saturation(snapshot)?;
+pub fn r5_recommendation(
+    snapshot: &RawSnapshot,
+    kv_headroom_gb: Option<f64>,
+) -> Option<Recommendation> {
+    let d = rule5_concurrency_saturation(snapshot, kv_headroom_gb)?;
     Some(Recommendation {
         rule_name: "concurrency_saturation",
         impact: 4,
@@ -99,11 +133,19 @@ pub(super) fn aggregate_concurrency_saturation_detail(
     let wait = details.iter().map(|d| d.requests_waiting).sum::<f64>() / n;
     let ratio = details.iter().map(|d| d.queue_ratio).sum::<f64>() / n;
     let max_seqs = details.iter().map(|d| d.max_num_seqs).max().unwrap_or(0);
+    let (ttft_sum, ttft_count) = details
+        .iter()
+        .filter_map(|d| d.ttft_ms)
+        .fold((0.0_f64, 0usize), |(s, c), v| (s + v, c + 1));
+    let ttft_ms = (ttft_count > 0).then_some(ttft_sum / ttft_count as f64);
+    let kv_headroom_gb = details.last().and_then(|d| d.kv_headroom_gb);
     Some(ConcurrencySaturationDetail {
         requests_running: run,
         requests_waiting: wait,
         max_num_seqs: max_seqs,
         queue_ratio: ratio,
+        ttft_ms,
+        kv_headroom_gb,
     })
 }
 
@@ -133,39 +175,90 @@ mod tests {
         }
     }
 
+    fn fired_detail(
+        ttft_ms: Option<f64>,
+        kv_headroom_gb: Option<f64>,
+    ) -> ConcurrencySaturationDetail {
+        ConcurrencySaturationDetail {
+            requests_running: 32.0,
+            requests_waiting: 15.0,
+            max_num_seqs: 32,
+            queue_ratio: 15.0 / 47.0,
+            ttft_ms,
+            kv_headroom_gb,
+        }
+    }
+
     #[test]
     fn fires_when_at_max_num_seqs_and_ratio_at_least_0_30() {
-        let d = rule5_concurrency_saturation(&snap(sat_vllm(32.0, 15.0, Some(32)))).expect("fired");
+        let d = rule5_concurrency_saturation(&snap(sat_vllm(32.0, 15.0, Some(32))), None)
+            .expect("fired");
         assert_eq!(d.max_num_seqs, 32);
         assert!((d.queue_ratio - (15.0 / 47.0)).abs() < 1e-9);
+        assert_eq!(d.kv_headroom_gb, None);
     }
 
     #[test]
     fn silent_when_run_below_max_num_seqs() {
-        assert!(rule5_concurrency_saturation(&snap(sat_vllm(31.0, 15.0, Some(32)))).is_none());
+        assert!(
+            rule5_concurrency_saturation(&snap(sat_vllm(31.0, 15.0, Some(32))), None).is_none()
+        );
     }
 
     #[test]
     fn silent_when_ratio_below_0_30() {
-        assert!(rule5_concurrency_saturation(&snap(sat_vllm(32.0, 2.0, Some(32)))).is_none());
+        assert!(rule5_concurrency_saturation(&snap(sat_vllm(32.0, 2.0, Some(32))), None).is_none());
     }
 
     #[test]
     fn silent_when_max_num_seqs_missing() {
-        assert!(rule5_concurrency_saturation(&snap(sat_vllm(32.0, 15.0, None))).is_none());
+        assert!(rule5_concurrency_saturation(&snap(sat_vllm(32.0, 15.0, None)), None).is_none());
     }
 
     #[test]
     fn silent_when_num_requests_waiting_missing() {
         let mut v = sat_vllm(32.0, 15.0, Some(32));
         v.num_requests_waiting = None;
-        assert!(rule5_concurrency_saturation(&snap(v)).is_none());
+        assert!(rule5_concurrency_saturation(&snap(v), None).is_none());
     }
 
     #[test]
     fn silent_when_run_exceeds_max_num_seqs_chunked_prefill() {
-        // run=40 > max_num_seqs=32: chunked prefill is batching across steps.
-        // Scheduler cap is not the bottleneck — r5 must not fire.
-        assert!(rule5_concurrency_saturation(&snap(sat_vllm(40.0, 15.0, Some(32)))).is_none());
+        assert!(
+            rule5_concurrency_saturation(&snap(sat_vllm(40.0, 15.0, Some(32))), None).is_none()
+        );
+    }
+
+    #[test]
+    fn recommendation_raises_cap_when_headroom_available() {
+        let text =
+            format_concurrency_saturation_issue(&fired_detail(None, Some(63.0)), 100).join("\n");
+        assert!(text.contains("63GB VRAM headroom available"));
+    }
+
+    #[test]
+    fn recommendation_scales_out_when_vram_exhausted() {
+        let text =
+            format_concurrency_saturation_issue(&fired_detail(None, Some(5.0)), 100).join("\n");
+        assert!(text.contains("Add a replica"));
+    }
+
+    #[test]
+    fn recommendation_scales_out_when_headroom_unknown() {
+        let text = format_concurrency_saturation_issue(&fired_detail(None, None), 100).join("\n");
+        assert!(text.contains("Add a replica"));
+    }
+
+    #[test]
+    fn cause_shows_ttft_when_available() {
+        let text =
+            format_concurrency_saturation_issue(&fired_detail(Some(5000.0), None), 100).join("\n");
+        assert!(text.contains("TTFT 5.0s"));
+    }
+
+    #[test]
+    fn cause_omits_ttft_when_none() {
+        let text = format_concurrency_saturation_issue(&fired_detail(None, None), 100).join("\n");
+        assert!(!text.contains("requests queuing behind"));
     }
 }

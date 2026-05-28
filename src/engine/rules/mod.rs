@@ -237,7 +237,10 @@ pub fn format_diagnose_rules_for_windows(
             }
             Rule3Outcome::NotFired => {}
         }
-        if let Some(d) = rule5_concurrency_saturation(&w.snapshot) {
+        if let Some(d) = rule5_concurrency_saturation(
+            &w.snapshot,
+            win_baseline.as_ref().and_then(|b| b.kv_headroom_gb),
+        ) {
             r5_fired += 1;
             r5_details.push(d);
         }

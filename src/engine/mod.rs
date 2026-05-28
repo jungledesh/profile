@@ -32,7 +32,7 @@ pub fn build_report(input: AnalysisInput<'_>) -> Report {
 
     let kv_pressure = recs.iter().any(|r| r.rule_name == "kv_cache_pressure");
     if !kv_pressure {
-        if let Some(r5) = rules::r5_recommendation(snapshot) {
+        if let Some(r5) = rules::r5_recommendation(snapshot, kv_headroom) {
             recs.push(r5);
         }
     }
