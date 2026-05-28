@@ -329,8 +329,8 @@ vllm_generation_tokens_total 1000
         "expected r5 Concurrency Saturation in output; got:\n{out}"
     );
     assert!(
-        out.contains("max_num_seqs"),
-        "output should show max_num_seqs; got:\n{out}"
+        out.contains("--max-num-seqs=32"),
+        "output should show max-num-seqs cap; got:\n{out}"
     );
     server.join().expect("metrics server thread");
 }
