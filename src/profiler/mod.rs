@@ -203,6 +203,11 @@ fn aggregate_windows(
     agg_v.prompt_tokens_mean =
         aggregate_histogram_from_mass(&pairs, |v| v.prompt_tokens_window_mass, 1.0)
             .or_else(|| weighted_metric_pairs(&pairs, |w| w.vllm.prompt_tokens_mean));
+    let total_window_secs: f64 = pairs.iter().map(|(_, d)| d.as_secs_f64()).sum();
+    if total_window_secs.is_finite() && total_window_secs > f64::EPSILON {
+        agg_v.window_duration_secs = Some(total_window_secs);
+    }
+    agg_v.prefill_window_mass = aggregate_histogram_window_mass(&pairs, |v| v.prefill_window_mass);
     agg_v.generation_tokens_per_sec =
         weighted_metric_pairs(&pairs, |w| w.vllm.generation_tokens_per_sec);
     agg_v.request_success_per_sec =
@@ -290,6 +295,39 @@ fn aggregate_temperature_peak_c(
         (Some(pw), None) => Some(pw),
         (None, Some(u)) => Some(u),
         (None, None) => None,
+    }
+}
+
+/// Sum histogram Δmass across evaluable windows (for saturation gates on aggregated snapshots).
+fn aggregate_histogram_window_mass<M>(
+    pairs: &[(&collectors::RawSnapshot, Duration)],
+    mass: M,
+) -> Option<HistogramWindowMass>
+where
+    M: Fn(&collectors::VllmRawMetrics) -> Option<HistogramWindowMass>,
+{
+    let mut sum = 0.0_f64;
+    let mut count = 0.0_f64;
+    for (w, _) in pairs {
+        let Some(m) = mass(&w.vllm) else {
+            continue;
+        };
+        if m.count_delta <= 0.0 || m.sum_delta < 0.0 {
+            continue;
+        }
+        if !(m.sum_delta.is_finite() && m.count_delta.is_finite()) {
+            continue;
+        }
+        sum += m.sum_delta;
+        count += m.count_delta;
+    }
+    if count > 0.0 && sum.is_finite() {
+        Some(HistogramWindowMass {
+            sum_delta: sum,
+            count_delta: count,
+        })
+    } else {
+        None
     }
 }
 

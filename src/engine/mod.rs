@@ -84,8 +84,9 @@ mod build_report_tests {
             num_requests_running: Some(3.1),
             num_requests_waiting: Some(0.0),
             max_num_seqs: Some(256),
-            kv_cache_usage_perc: Some(86.0),
+            kv_cache_usage_perc: Some(89.0),
             tpot_ms: Some(35.0),
+            window_duration_secs: Some(2.0),
             ..Default::default()
         };
         let g = GpuRawMetrics {
@@ -140,9 +141,10 @@ mod build_report_tests {
             num_requests_running: Some(3.0),
             num_requests_waiting: Some(0.0),
             max_num_seqs: Some(256),
-            kv_cache_usage_perc: Some(86.0),
+            kv_cache_usage_perc: Some(89.0),
             generation_tokens_per_sec: Some(50.0),
             request_success_per_sec: Some(10.0),
+            window_duration_secs: Some(2.0),
             ..Default::default()
         };
         let g = GpuRawMetrics {
