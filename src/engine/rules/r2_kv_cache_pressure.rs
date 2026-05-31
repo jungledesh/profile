@@ -2,7 +2,8 @@ use crate::collectors::{GpuRawMetrics, RawSnapshot};
 
 use super::{model_len_suffix, skew_secs, Recommendation, MAX_OBSERVATION_SKEW_SECS};
 
-const KV_CACHE_PRESSURE_MIN_PERC: f64 = 85.0;
+/// 88% matches observed vLLM production eviction onset; 85% was too conservative.
+const KV_CACHE_PRESSURE_MIN_PERC: f64 = 88.0;
 pub(super) const KV_CACHE_CRITICAL_THRESHOLD_PCT: f64 = 95.0;
 const KV_PRESSURE_VRAM_CORROBORATE_MIN_PERC: f64 = 78.0;
 const KV_PRESSURE_CRITICAL_CONFIDENCE: f64 = 0.95;

@@ -359,6 +359,10 @@ pub fn collect_vllm_metrics_for(
 
     apply_histogram_window(&first_scrape, &last_scrape, &mut m);
 
+    if window_secs.is_finite() && window_secs > f64::EPSILON {
+        m.window_duration_secs = Some(window_secs);
+    }
+
     Ok((m, SystemTime::now()))
 }
 
@@ -429,6 +433,7 @@ fn parse_vllm_metrics(scrape: &Scrape) -> Result<VllmRawMetrics> {
         prefill_latency_ms,
         queue_delay_ms,
         prompt_tokens_mean,
+        window_duration_secs: None,
         ttft_window_mass: None,
         tpot_window_mass: None,
         prefill_window_mass: None,

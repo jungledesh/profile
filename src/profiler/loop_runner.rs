@@ -111,10 +111,12 @@ fn primary_window_rule(result: &DiagnoseResult) -> Option<&'static str> {
         .filter(|w| {
             let input = AnalysisInput::new(ctx, w);
             let baseline = engine::baseline::compute(&input);
-            matches!(
-                engine::rule1_under_batching(&w.snapshot, baseline.as_ref()),
-                engine::Rule1Outcome::Fired(_)
-            )
+            baseline.as_ref().is_some_and(|b| {
+                matches!(
+                    engine::rule1_under_batching(&w.snapshot, b),
+                    engine::Rule1Outcome::Fired(_)
+                )
+            })
         })
         .count();
     if engine::rule_is_significant(r1_count, n) {
