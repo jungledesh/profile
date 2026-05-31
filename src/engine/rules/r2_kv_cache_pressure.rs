@@ -9,6 +9,7 @@ const KV_PRESSURE_CRITICAL_CONFIDENCE: f64 = 0.95;
 const KV_PRESSURE_THREAT_CONFIDENCE: f64 = 0.85;
 const KV_PRESSURE_WARNING_CONFIDENCE: f64 = 0.7;
 const KV_ADMISSION_BACKLOG_QUEUE_RATIO_MIN: f64 = 0.30;
+const KV_HEADROOM_SAFE_MIN_GB: f64 = 2.0;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct KvAdmissionBacklogDetail {
@@ -199,19 +200,17 @@ pub(super) fn format_kv_cache_pressure_fired(
     );
     if d.preemptions_active {
         out.extend([
-            "    • Lower --max-num-seqs immediately (reduces sequences competing for KV blocks)"
+            "    • Lower --max-num-seqs now to stop evictions, pick a value below current running count"
                 .to_string(),
-            "    • Consider fp8 KV cache (--kv-cache-dtype fp8) to halve KV memory footprint"
+            "    • Switch to fp8 KV cache (--kv-cache-dtype fp8) to halve KV memory footprint"
                 .to_string(),
             model_len_bullet,
         ]);
     } else {
-        // Approaching capacity — strategic fixes
         out.extend([
-            "    • Raise --gpu-memory-utilization if VRAM headroom exists (check vRAM in header)"
+            "    • Raise --gpu-memory-utilization if VRAM headroom exists (check header for available VRAM)"
                 .to_string(),
-            "    • Reduce --max-num-seqs to lower KV block demand".to_string(),
-            "    • Consider fp8 KV cache (--kv-cache-dtype fp8) to halve KV memory footprint"
+            "    • Switch to fp8 KV cache (--kv-cache-dtype fp8) to halve KV memory footprint"
                 .to_string(),
             model_len_bullet,
         ]);
@@ -233,11 +232,22 @@ pub(super) fn format_kv_admission_backlog_issue(
     d: &KvAdmissionBacklogDetail,
     seen_pct: u32,
     max_model_len: Option<u32>,
+    kv_headroom_gb: Option<f64>,
 ) -> Vec<String> {
     let model_len_bullet = format!(
         "    • Lower --max-model-len{} if your workload allows shorter context",
         model_len_suffix(max_model_len)
     );
+    let gpu_mem_bullet = match kv_headroom_gb {
+        Some(h) if h >= KV_HEADROOM_SAFE_MIN_GB => format!(
+            "    • Raise --gpu-memory-utilization ({h:.0}GB VRAM available) to expand KV pool"
+        ),
+        Some(_) => {
+            "    • GPU at VRAM capacity: cannot raise --gpu-memory-utilization. Scale out or reduce context footprint."
+                .to_string()
+        }
+        None => "    • Raise --gpu-memory-utilization if VRAM headroom exists".to_string(),
+    };
     vec![
         "[!] KV Cache Pressure — Admission Backlog".to_string(),
         format!("  Seen in {seen_pct}% of windows"),
@@ -253,9 +263,8 @@ pub(super) fn format_kv_admission_backlog_issue(
         ),
         String::new(),
         "  Fix:".to_string(),
-        "    • Raise --gpu-memory-utilization if VRAM headroom exists".to_string(),
-        "    • Reduce --max-num-seqs to lower peak KV block demand".to_string(),
-        "    • Consider fp8 KV cache (--kv-cache-dtype fp8) to halve KV memory footprint".to_string(),
+        gpu_mem_bullet,
+        "    • Switch to fp8 KV cache (--kv-cache-dtype fp8) to halve KV memory footprint".to_string(),
         model_len_bullet,
         String::new(),
         "  Expected: Wait queue drains, TTFT recovers.".to_string(),
@@ -506,5 +515,38 @@ mod tests {
         .join("\n");
         assert!(text.contains("--max-model-len if"));
         assert!(!text.contains("currently"));
+    }
+
+    fn sample_backlog_detail() -> KvAdmissionBacklogDetail {
+        KvAdmissionBacklogDetail {
+            kv_cache_usage_perc: 90.0,
+            admission_ratio: 0.4,
+            requests_waiting: 10.0,
+            requests_running: 15.0,
+            free_kv_tokens: 160.0,
+            demand_tokens: 200.0,
+        }
+    }
+
+    #[test]
+    fn backlog_shows_headroom_when_safe() {
+        let text =
+            format_kv_admission_backlog_issue(&sample_backlog_detail(), 27, None, Some(30.0))
+                .join("\n");
+        assert!(text.contains("30GB VRAM available"));
+    }
+
+    #[test]
+    fn backlog_warns_when_vram_full() {
+        let text = format_kv_admission_backlog_issue(&sample_backlog_detail(), 27, None, Some(1.0))
+            .join("\n");
+        assert!(text.contains("GPU at VRAM capacity"));
+    }
+
+    #[test]
+    fn backlog_generic_when_headroom_unknown() {
+        let text =
+            format_kv_admission_backlog_issue(&sample_backlog_detail(), 27, None, None).join("\n");
+        assert!(text.contains("if VRAM headroom exists"));
     }
 }

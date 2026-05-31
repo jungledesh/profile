@@ -344,6 +344,7 @@ pub fn format_diagnose_rules_for_windows(
             &agg,
             pct(r2_backlog_fired, n_eval),
             summary.ctx.config.max_model_len,
+            summary_baseline.as_ref().and_then(|b| b.kv_headroom_gb),
         ));
         out.push(String::new());
     } else if verbose_rules {
@@ -867,8 +868,8 @@ mod tests {
         assert!(text.contains("Cause:"));
         assert!(text.contains("  - KV cache 86.0% (threshold: 85%)"));
         assert!(text.contains("Expected: Lower TTFT, stable TPOT once evictions stop."));
-        assert!(text.contains("Reduce --max-num-seqs to lower KV block demand"));
-        assert!(text.contains("Consider fp8 KV cache (--kv-cache-dtype fp8)"));
+        assert!(text.contains("check header for available VRAM"));
+        assert!(text.contains("Switch to fp8 KV cache (--kv-cache-dtype fp8)"));
         assert!(text.contains("Confidence: Medium-High"));
     }
 
