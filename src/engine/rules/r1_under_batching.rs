@@ -113,7 +113,11 @@ pub fn r1_recommendation(
     Some(Recommendation {
         rule_name: "under_batching",
         impact: 4,
-        confidence: if baseline.efficiency_pct.is_some() { 0.9 } else { 0.7 },
+        confidence: if baseline.efficiency_pct.is_some() {
+            0.9
+        } else {
+            0.7
+        },
         action: "Increase client concurrency".to_string(),
         expected_impact: "Higher throughput, stable TPOT".to_string(),
         display_lines: format_under_batching_fired(&d, baseline.efficiency_pct),
