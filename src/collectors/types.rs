@@ -66,6 +66,9 @@ pub struct VllmRawMetrics {
     /// `request_prompt_tokens` histogram: mean tokens (Δ window or last-scrape fallback).
     pub prompt_tokens_mean: Option<f64>,
 
+    /// Wall-clock seconds from first→last `/metrics` scrape in this collection window.
+    pub window_duration_secs: Option<f64>,
+
     /// Per-window histogram observation mass (first→last scrape). Used for multi-window **ΣΔsum / ΣΔcount** aggregation.
     pub ttft_window_mass: Option<HistogramWindowMass>,
     pub tpot_window_mass: Option<HistogramWindowMass>,

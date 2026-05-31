@@ -221,12 +221,14 @@ pub fn format_diagnose_rules_for_windows(
     let summary_baseline = baseline::compute(&summary);
     for w in &evaluable {
         let win_baseline = baseline::compute(&AnalysisInput::new(summary.ctx, w));
-        match rule1_under_batching(&w.snapshot, win_baseline.as_ref()) {
-            Rule1Outcome::Fired(d) => {
-                r1_fired += 1;
-                r1_details.push(d);
+        if let Some(b) = win_baseline.as_ref() {
+            match rule1_under_batching(&w.snapshot, b) {
+                Rule1Outcome::Fired(d) => {
+                    r1_fired += 1;
+                    r1_details.push(d);
+                }
+                Rule1Outcome::NotFired(_) => {}
             }
-            Rule1Outcome::NotFired(_) => {}
         }
         match rule2_kv_cache_pressure(&w.snapshot) {
             Rule2Outcome::Fired(d) => {
@@ -309,6 +311,7 @@ pub fn format_diagnose_rules_for_windows(
         out.extend(format_under_batching_window_issue(
             &aggregate_r1_detail(&r1_details, summary_snap, summary_baseline.as_ref()),
             pct(r1_fired, n_eval),
+            summary_baseline.as_ref().and_then(|b| b.efficiency_pct),
         ));
         out.push(String::new());
     } else if summary_snap.vllm.max_num_seqs.is_none()
@@ -514,9 +517,10 @@ mod tests {
                 num_requests_running: Some(3.0),
                 num_requests_waiting: Some(0.0),
                 max_num_seqs: Some(256),
-                kv_cache_usage_perc: Some(86.0),
+                kv_cache_usage_perc: Some(89.0),
                 generation_tokens_per_sec: Some(50.0),
                 request_success_per_sec: Some(10.0),
+                window_duration_secs: Some(2.0),
                 ..Default::default()
             },
             gpu: GpuRawMetrics {
@@ -542,6 +546,7 @@ mod tests {
             num_requests_waiting: Some(0.0),
             max_num_seqs: Some(256),
             request_success_per_sec: Some(10.0),
+            window_duration_secs: Some(2.0),
             ..Default::default()
         }
     }
@@ -572,10 +577,10 @@ mod tests {
         assert_eq!(r.rule_name, "under_batching");
         assert_eq!(r.impact, 4);
         assert!((r.confidence - 0.9).abs() < 1e-9);
-        match rule1_under_batching(&win.snapshot, Some(&base)) {
+        match rule1_under_batching(&win.snapshot, &base) {
             Rule1Outcome::Fired(d) => {
                 assert!((d.running - 3.1).abs() < 1e-9);
-                assert_eq!(d.max_num_seqs, 256);
+                assert_eq!(d.max_num_seqs, Some(256));
                 assert!(d.occupancy_pct < 10.0);
             }
             Rule1Outcome::NotFired(_) => panic!("expected fired"),
@@ -664,18 +669,31 @@ mod tests {
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
         v.num_requests_running = Some(5.0);
-        let s = snap(t, t, v, gpu_low());
-        let ctx = mk_ctx();
+        v.model_name = Some("meta-llama/Llama-3.1-8B-Instruct".to_string());
+        let mut g = gpu_low();
+        g.gpu_name = Some("NVIDIA H100 80GB HBM3".to_string());
+        let s = snap(t, t, v, g);
+        let cfg = VllmConfig {
+            dtype: Some("bf16".to_string()),
+            max_model_len: Some(2048),
+            ..Default::default()
+        };
+        let ctx = StaticContext::from_snapshot(&s, cfg);
         let win = mk_win(s);
         let lines = format_diagnose_rules(ai(&ctx, &win), false);
         let text = lines.join("\n");
         assert!(text.contains("[!] Under-batching — Low Occupancy"));
         assert!(text.contains("Occupancy"));
         assert!(text.contains("threshold: < 10%"));
-        assert!(text.contains("unused capacity"));
-        assert!(text.contains("slots unused"));
+        assert!(text.contains("  Cause:"));
+        assert!(text.contains("unused capacity and no backlog"));
+        assert!(text.contains("Batch more requests or increase client concurrency"));
+        assert!(text.contains("slots idle"));
         assert!(text.contains("Expected: Higher throughput, lower TPOT at scale."));
-        assert!(text.contains("Confidence: High"));
+        assert!(
+            text.contains("Confidence: High") || text.contains("Confidence: Medium"),
+            "confidence reflects efficiency availability: {text}"
+        );
     }
 
     #[test]
@@ -717,7 +735,7 @@ mod tests {
 
     fn vllm_high_kv() -> VllmRawMetrics {
         VllmRawMetrics {
-            kv_cache_usage_perc: Some(86.0),
+            kv_cache_usage_perc: Some(89.0),
             ..vllm_base()
         }
     }
@@ -790,31 +808,31 @@ mod tests {
     }
 
     #[test]
-    fn kv_cache_pressure_fires_at_85_boundary() {
+    fn kv_cache_pressure_fires_at_88_boundary() {
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
-        v.kv_cache_usage_perc = Some(85.0);
+        v.kv_cache_usage_perc = Some(88.0);
         let s = snap(t, t, v, gpu_low());
         match rule2_kv_cache_pressure(&s) {
             Rule2Outcome::Fired(d) => {
-                assert!((d.kv_cache_usage_perc - 85.0).abs() < 1e-9);
+                assert!((d.kv_cache_usage_perc - 88.0).abs() < 1e-9);
                 assert!(d.vram_usage_perc_corroborated.is_none());
                 assert!(!d.preemptions_active);
             }
-            Rule2Outcome::NotFired(_) => panic!("expected fired at 85%"),
+            Rule2Outcome::NotFired(_) => panic!("expected fired at 88%"),
         }
     }
 
     #[test]
-    fn kv_cache_pressure_suppressed_below_85() {
+    fn kv_cache_pressure_suppressed_below_88() {
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
-        v.kv_cache_usage_perc = Some(84.9);
+        v.kv_cache_usage_perc = Some(87.9);
         let s = snap(t, t, v, gpu_low());
         match rule2_kv_cache_pressure(&s) {
             Rule2Outcome::NotFired(m) => {
                 assert!(!m.skew_exceeded);
-                assert_eq!(m.kv_cache_usage_perc, Some(84.9));
+                assert_eq!(m.kv_cache_usage_perc, Some(87.9));
             }
             Rule2Outcome::Fired(_) => panic!("expected not fired"),
         }
@@ -830,7 +848,7 @@ mod tests {
         match rule2_kv_cache_pressure(&s) {
             Rule2Outcome::NotFired(m) => {
                 assert!(m.skew_exceeded);
-                assert_eq!(m.kv_cache_usage_perc, Some(86.0));
+                assert_eq!(m.kv_cache_usage_perc, Some(89.0));
             }
             Rule2Outcome::Fired(_) => panic!("expected skew miss"),
         }
@@ -866,7 +884,7 @@ mod tests {
         let win_kv_only = mk_win(s_kv_only);
         let text = format_diagnose_rules(ai(&ctx2, &win_kv_only), false).join("\n");
         assert!(text.contains("Cause:"));
-        assert!(text.contains("  - KV cache 86.0% (threshold: 85%)"));
+        assert!(text.contains("  - KV cache 89.0% (threshold: 88%)"));
         assert!(text.contains("Expected: Lower TTFT, stable TPOT once evictions stop."));
         assert!(text.contains("check header for available VRAM"));
         assert!(text.contains("Switch to fp8 KV cache (--kv-cache-dtype fp8)"));
@@ -888,7 +906,7 @@ mod tests {
         let win = mk_win(s);
         let text = format_diagnose_rules(ai(&ctx, &win), false).join("\n");
         assert!(text.contains("Confidence: Medium-High"));
-        assert!(text.contains("  - KV cache 86.0% (threshold: 85%)"));
+        assert!(text.contains("  - KV cache 89.0% (threshold: 88%)"));
     }
 
     #[test]
@@ -1072,7 +1090,7 @@ mod tests {
         let mut windows: Vec<_> = (0..15)
             .map(|_| mk_evaluable_kv_window(50.0, false))
             .collect();
-        windows[0] = mk_evaluable_kv_window(86.0, true);
+        windows[0] = mk_evaluable_kv_window(89.0, true);
         let text = r2_issue_lines(windows).join("\n");
         assert!(text.contains("[!] KV Cache Pressure"));
     }
@@ -1106,13 +1124,13 @@ mod tests {
             .map(|_| mk_evaluable_backlog_window(10.0, 1.0, 9.0, 10.0, 10_000, 16))
             .collect();
         for w in windows.iter_mut().take(4) {
-            // KV 70% (< 85% standard r2 gate); free = 100×16×0.30 = 480; demand = 15×40 = 600
+            // KV 70% (< 88% standard r2 gate); free = 100×16×0.30 = 480; demand = 15×40 = 600
             *w = mk_evaluable_backlog_window(70.0, 15.0, 5.0, 40.0, 100, 16);
         }
         let text = r2_issue_lines(windows).join("\n");
         assert!(text.contains("[!] KV Cache Pressure — Admission Backlog"));
         assert!(text.contains("Free KV tokens"));
-        assert!(!text.contains("threshold: 85%"));
+        assert!(!text.contains("threshold: 88%"));
     }
 
     #[test]
@@ -1121,7 +1139,7 @@ mod tests {
             .map(|_| mk_evaluable_kv_window(50.0, false))
             .collect();
         for w in windows.iter_mut().take(4) {
-            *w = mk_evaluable_backlog_window(86.0, 15.0, 15.0, 20.0, 100, 16);
+            *w = mk_evaluable_backlog_window(89.0, 15.0, 15.0, 20.0, 100, 16);
         }
         let text = r2_issue_lines(windows).join("\n");
         assert!(text.contains("[!] KV Cache Pressure"));
@@ -1134,7 +1152,7 @@ mod tests {
             .map(|_| mk_evaluable_kv_window(50.0, false))
             .collect();
         for w in windows.iter_mut().take(4) {
-            *w = mk_evaluable_kv_window(86.0, false);
+            *w = mk_evaluable_kv_window(89.0, false);
         }
         let text = r2_issue_lines(windows).join("\n");
         assert!(text.contains("[!] KV Cache Pressure"));
@@ -1180,7 +1198,8 @@ mod tests {
         assert!(text.contains("Under-batching — Low Occupancy"));
         assert!(text.contains("Seen in 60% of windows"));
         assert!(text.contains("Occupancy"));
-        assert!(text.contains("bottleneck is upstream of vLLM"));
+        assert!(text.contains("  Cause:"));
+        assert!(text.contains("Batch more requests or increase client concurrency"));
         assert!(text.contains("No issues for KV Cache Pressure and Low Prefix Cache"));
     }
 
@@ -1264,7 +1283,7 @@ mod tests {
             .map(|_| mk_evaluable_concurrency_saturation_window(32.0, 15.0, 32))
             .collect();
         // one preemption window forces r2 significant
-        windows[0] = mk_evaluable_kv_window(86.0, true);
+        windows[0] = mk_evaluable_kv_window(89.0, true);
         let ctx = mk_ctx();
         let summary = ai(&ctx, windows.last().expect("windows"));
         let text = format_diagnose_rules_for_windows(&windows, summary, false).join("\n");
