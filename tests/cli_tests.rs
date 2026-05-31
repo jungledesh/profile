@@ -122,7 +122,7 @@ fn diagnose_exits_success() {
         "stdout should show PROFILE header with model/GPU and bracketed UTC timestamp; got:\n{out}"
     );
     assert!(
-        out.contains("GPU =>") && out.contains("UTIL"),
+        out.contains("GPU =>") && out.contains("EFFICIENCY"),
         "stdout should include GPU => row; got:\n{out}"
     );
     assert!(

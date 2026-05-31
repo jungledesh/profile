@@ -36,7 +36,7 @@ use r3_low_prefix_reuse::{
     aggregate_r3_detail, format_low_prefix_window_issue, format_rule3_verbose_miss,
 };
 use r5_concurrency_saturation::{
-    aggregate_concurrency_saturation_detail, format_concurrency_saturation_issue,
+    aggregate_concurrency_saturation_detail, format_concurrency_saturation_window_issue,
 };
 
 pub(super) const MAX_OBSERVATION_SKEW_SECS: f64 = 1.0;
@@ -248,10 +248,9 @@ pub fn format_diagnose_rules_for_windows(
             }
             Rule3Outcome::NotFired => {}
         }
-        if let Some(d) = rule5_concurrency_saturation(
-            &w.snapshot,
-            win_baseline.as_ref().and_then(|b| b.kv_headroom_gb),
-        ) {
+        if let Some(d) =
+            rule5_concurrency_saturation(&w.snapshot, w.snapshot.vllm.kv_cache_usage_perc)
+        {
             r5_fired += 1;
             r5_details.push(d);
         }
@@ -357,7 +356,7 @@ pub fn format_diagnose_rules_for_windows(
 
     if r5_significant && !r2_significant && !r2_backlog_significant {
         if let Some(agg) = aggregate_concurrency_saturation_detail(&r5_details) {
-            out.extend(format_concurrency_saturation_issue(
+            out.extend(format_concurrency_saturation_window_issue(
                 &agg,
                 pct(r5_fired, n_eval),
                 summary.ctx.config.max_model_len,
@@ -567,7 +566,8 @@ mod tests {
 
     #[test]
     fn under_batching_fires_when_gates_pass() {
-        let base = mock_baseline(10.0);
+        let mut base = mock_baseline(10.0);
+        base.efficiency_pct = Some(15.0);
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
         v.tpot_ms = Some(35.0);
@@ -1027,6 +1027,7 @@ mod tests {
         let (ctx, win) = {
             let mut v = vllm_high_kv();
             v.tpot_ms = Some(35.0);
+            v.generation_tokens_per_sec = Some(30.0);
             v.model_name = Some("meta-llama/Llama-3.1-8B-Instruct".to_string());
             let mut g = gpu_low();
             g.gpu_name = Some("NVIDIA H100 80GB HBM3".to_string());

@@ -81,7 +81,7 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
         "{:<width$}{}{}",
         "GPU =>",
         VLLM_LABEL_METRICS_GAP,
-        gpu_gauges_line(g),
+        gpu_gauges_line(g, report.baseline.as_ref().and_then(|b| b.efficiency_pct)),
         width = VLLM_LABEL_W
     ));
     if verbose_rules {
@@ -248,11 +248,10 @@ fn print_boxed(lines: &[String]) {
     println!("{}", border);
 }
 
-fn gpu_gauges_line(g: &GpuRawMetrics) -> String {
-    let util = g
-        .gpu_util_pct
-        .map(|u| format!("UTIL {:.1}%", u))
-        .unwrap_or_else(|| "UTIL —".to_string());
+fn gpu_gauges_line(g: &GpuRawMetrics, efficiency_pct: Option<f64>) -> String {
+    let efficiency = efficiency_pct
+        .map(|e| format!("EFFICIENCY {:.1}%", e))
+        .unwrap_or_else(|| "EFFICIENCY —".to_string());
 
     let power = g
         .power_watts
@@ -275,7 +274,7 @@ fn gpu_gauges_line(g: &GpuRawMetrics) -> String {
         _ => "vRAM —".to_string(),
     };
 
-    format!("{util} | {power} | {mem}")
+    format!("{efficiency} | {power} | {mem}")
 }
 
 fn vllm_requests_value(v: &VllmRawMetrics) -> String {
@@ -778,8 +777,8 @@ mod tests {
             vram_total_mb: Some(80 * 1024),
             ..Default::default()
         };
-        let s = gpu_gauges_line(&g);
-        assert!(s.contains("UTIL 28.0%"));
+        let s = gpu_gauges_line(&g, Some(28.0));
+        assert!(s.contains("EFFICIENCY 28.0%"));
         assert!(s.contains("POWER 310W"));
         assert!(s.contains("vRAM 72/80GB"));
         let g_peak = GpuRawMetrics {
@@ -790,7 +789,7 @@ mod tests {
             vram_total_mb: Some(80 * 1024),
             ..Default::default()
         };
-        let s_peak = gpu_gauges_line(&g_peak);
+        let s_peak = gpu_gauges_line(&g_peak, None);
         assert!(s_peak.contains("vRAM 60/80GB (peak 78GB)"));
         let g_peak_below_frac = GpuRawMetrics {
             gpu_util_pct: Some(28.0),
@@ -800,7 +799,7 @@ mod tests {
             vram_total_mb: Some(80 * 1024),
             ..Default::default()
         };
-        assert!(!gpu_gauges_line(&g_peak_below_frac).contains("peak"));
+        assert!(!gpu_gauges_line(&g_peak_below_frac, None).contains("peak"));
         let g_no_recovery = GpuRawMetrics {
             gpu_util_pct: Some(28.0),
             power_watts: Some(310.0),
@@ -809,7 +808,7 @@ mod tests {
             vram_total_mb: Some(80 * 1024),
             ..Default::default()
         };
-        assert!(!gpu_gauges_line(&g_no_recovery).contains("peak"));
+        assert!(!gpu_gauges_line(&g_no_recovery, None).contains("peak"));
     }
 
     #[test]
