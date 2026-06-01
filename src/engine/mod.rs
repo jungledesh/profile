@@ -21,7 +21,7 @@ pub fn build_report(input: AnalysisInput<'_>) -> Report {
     let tp = input.ctx.config.tensor_parallel_size;
 
     let mut recs: Vec<Recommendation> = [
-        rules::r1_recommendation(snapshot, baseline.as_ref()),
+        rules::r1_recommendation(snapshot),
         rules::r2_recommendation(snapshot, input.ctx.config.max_model_len),
         rules::r3_recommendation(snapshot),
         rules::r4_recommendation(kv_headroom, tp),
@@ -113,22 +113,6 @@ mod build_report_tests {
         let win = RuntimeWindow::from_snapshot(s);
         let input = AnalysisInput::new(&ctx, &win);
         let report = build_report(input);
-        let r1_score = report
-            .groups
-            .iter()
-            .find(|g| g.primary.rule_name == "under_batching")
-            .map(|g| g.score())
-            .expect("under_batching");
-        let r2_score = report
-            .groups
-            .iter()
-            .find(|g| g.primary.rule_name == "kv_cache_pressure")
-            .map(|g| g.score())
-            .expect("kv_cache_pressure");
-        assert!(
-            r1_score > r2_score,
-            "r1 score {r1_score} should beat r2 {r2_score} when efficiency corroborates starvation"
-        );
         assert!(
             report.groups.len() >= 2,
             "expected r1+r2 to fire; got {:?}",
@@ -146,7 +130,14 @@ mod build_report_tests {
                 w[1].primary.rule_name
             );
         }
-        assert_eq!(report.groups[0].primary.rule_name, "under_batching");
+        assert!(report
+            .groups
+            .iter()
+            .any(|g| g.primary.rule_name == "under_batching"));
+        assert!(report
+            .groups
+            .iter()
+            .any(|g| g.primary.rule_name == "kv_cache_pressure"));
         assert!(!report.r2_suppressed_by_r4);
     }
 
