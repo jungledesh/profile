@@ -138,16 +138,13 @@ pub(super) fn format_low_prefix_window_issue(
 pub(super) fn format_rule3_verbose_miss(snapshot: &RawSnapshot) -> Vec<String> {
     let v = &snapshot.vllm;
     let Some(hr) = v.prefix_cache_hit_rate.filter(|x| x.is_finite()) else {
-        return vec!["Prefix cache hit rate: not indicated".to_string()];
+        return vec!["Prefix cache hit rate: not triggered".to_string()];
     };
     let pct = hr * 100.0;
     if hr >= PREFIX_HIT_RATE_LT {
-        vec![
-            "Rule: Low Prefix Cache — Not triggered".to_string(),
-            format!("  - Prefix cache hit rate {pct:.1}% — working effectively"),
-        ]
+        vec![format!("Prefix cache hit rate: {pct:.1}% (not triggered)")]
     } else {
-        vec!["Prefix cache hit rate: not indicated".to_string()]
+        vec!["Prefix cache hit rate: not triggered".to_string()]
     }
 }
 

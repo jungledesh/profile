@@ -159,16 +159,16 @@ pub fn format_diagnose_rules(input: AnalysisInput<'_>, verbose_rules: bool) -> V
 
     if verbose_rules {
         if !fired_names.contains("under_batching") {
-            append(vec!["Under-batching: not indicated".to_string()]);
+            append(vec!["Under-batching: not triggered".to_string()]);
         }
         if !fired_names.contains("kv_cache_pressure") && !report.r2_suppressed_by_r4 {
-            append(vec!["KV cache pressure: not indicated".to_string()]);
+            append(vec!["KV cache pressure: not triggered".to_string()]);
         }
         if !fired_names.contains("low_prefix_reuse") {
             append(format_rule3_verbose_miss(snapshot));
         }
         if !fired_names.contains("parallelism_mismatch") {
-            append(vec!["Parallelism mismatch: not indicated".to_string()]);
+            append(vec!["Parallelism mismatch: not triggered".to_string()]);
         }
     }
 
@@ -273,9 +273,9 @@ pub fn format_diagnose_rules_for_windows(
             out.push("    Pass -m <value> to profile to enable batching analysis.".to_string());
             out.push(String::new());
         } else if verbose_rules {
-            out.push("Under-batching: not indicated".to_string());
+            out.push("Under-batching: not triggered".to_string());
             out.push(String::new());
-            out.push("KV cache pressure: not indicated".to_string());
+            out.push("KV cache pressure: not triggered".to_string());
             out.push(String::new());
             out.extend(format_rule3_verbose_miss(summary_snap));
             out.push(String::new());
@@ -326,7 +326,7 @@ pub fn format_diagnose_rules_for_windows(
         out.push("    Pass -m <value> to profile to enable batching analysis.".to_string());
         out.push(String::new());
     } else if verbose_rules {
-        out.push("Under-batching: not indicated".to_string());
+        out.push("Under-batching: not triggered".to_string());
         out.push(String::new());
     }
 
@@ -350,7 +350,7 @@ pub fn format_diagnose_rules_for_windows(
         ));
         out.push(String::new());
     } else if verbose_rules {
-        out.push("KV cache pressure: not indicated".to_string());
+        out.push("KV cache pressure: not triggered".to_string());
         out.push(String::new());
     }
 
@@ -702,7 +702,7 @@ mod tests {
         let text = format_diagnose_rules(ai(&ctx, &win), true).join("\n");
         assert!(text.contains("Parallelism Mismatch"));
         assert!(text.contains(R2_SUPPRESSED_BY_R4_VERBOSE_LINE));
-        assert!(!text.contains("KV cache pressure: not indicated"));
+        assert!(!text.contains("KV cache pressure: not triggered"));
         assert!(!text.contains("[!] KV Cache Pressure"));
     }
 
@@ -726,10 +726,10 @@ mod tests {
         let ctx = mk_ctx();
         let win = mk_win(s);
         let text = format_diagnose_rules(ai(&ctx, &win), true).join("\n");
-        assert!(text.contains("Under-batching: not indicated"));
-        assert!(text.contains("KV cache pressure: not indicated"));
-        assert!(text.contains("Prefix cache hit rate: not indicated"));
-        assert!(text.contains("Parallelism mismatch: not indicated"));
+        assert!(text.contains("Under-batching: not triggered"));
+        assert!(text.contains("KV cache pressure: not triggered"));
+        assert!(text.contains("Prefix cache hit rate: not triggered"));
+        assert!(text.contains("Parallelism mismatch: not triggered"));
         assert!(text.contains("No issues detected in this snapshot."));
     }
 
@@ -855,10 +855,10 @@ mod tests {
         let ctx = mk_ctx();
         let win = mk_win(s);
         let text = format_diagnose_rules(ai(&ctx, &win), true).join("\n");
-        assert!(text.contains("Under-batching: not indicated"));
-        assert!(text.contains("KV cache pressure: not indicated"));
-        assert!(text.contains("Prefix cache hit rate: not indicated"));
-        assert!(text.contains("Parallelism mismatch: not indicated"));
+        assert!(text.contains("Under-batching: not triggered"));
+        assert!(text.contains("KV cache pressure: not triggered"));
+        assert!(text.contains("Prefix cache hit rate: not triggered"));
+        assert!(text.contains("Parallelism mismatch: not triggered"));
         assert!(text.contains("No issues detected in this snapshot."));
     }
 
@@ -918,9 +918,9 @@ mod tests {
         let ctx = mk_ctx();
         let win = mk_win(s);
         let text = format_diagnose_rules(ai(&ctx, &win), true).join("\n");
-        assert!(text.contains("KV cache pressure: not indicated"));
-        assert!(text.contains("Prefix cache hit rate: not indicated"));
-        assert!(text.contains("Parallelism mismatch: not indicated"));
+        assert!(text.contains("KV cache pressure: not triggered"));
+        assert!(text.contains("Prefix cache hit rate: not triggered"));
+        assert!(text.contains("Parallelism mismatch: not triggered"));
         assert!(text.contains("No issues detected in this snapshot."));
     }
 
@@ -987,8 +987,7 @@ mod tests {
         let ctx = mk_ctx();
         let win = mk_win(s);
         let text = format_diagnose_rules(ai(&ctx, &win), true).join("\n");
-        assert!(text.contains("Rule: Low Prefix Cache — Not triggered"));
-        assert!(text.contains("  - Prefix cache hit rate 50.0% — working effectively"));
+        assert!(text.contains("Prefix cache hit rate: 50.0% (not triggered)"));
     }
 
     #[test]
@@ -1001,7 +1000,7 @@ mod tests {
         let ctx = mk_ctx();
         let win = mk_win(s);
         let text = format_diagnose_rules(ai(&ctx, &win), true).join("\n");
-        assert!(text.contains("Prefix cache hit rate: not indicated"));
+        assert!(text.contains("Prefix cache hit rate: not triggered"));
         assert!(!text.contains("working effectively"));
     }
 
