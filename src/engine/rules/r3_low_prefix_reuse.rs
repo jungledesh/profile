@@ -71,7 +71,7 @@ pub fn r3_recommendation(snapshot: &RawSnapshot) -> Option<Recommendation> {
     })
 }
 
-fn prefix_cause_detail(enable_prefix_caching: Option<bool>) -> String {
+fn prefix_cause_bullet(enable_prefix_caching: Option<bool>) -> String {
     match enable_prefix_caching {
         Some(false) => {
             "  - Prefix caching is disabled — enable with --enable-prefix-caching".to_string()
@@ -88,24 +88,22 @@ pub(super) fn format_low_prefix_hit_rate_fired(
 ) -> Vec<String> {
     let hit = d.hit_rate * 100.0;
     vec![
-        "ISSUE: Low Prefix Cache".to_string(),
-        "Cause:".to_string(),
+        "[!] Low Prefix Cache".to_string(),
+        String::new(),
+        "  Cause:".to_string(),
         format!(
             "  - Prefix hit rate {hit:.1}% (threshold: {:.0}%)",
             PREFIX_HIT_RATE_LT * 100.0
         ),
-        prefix_cause_detail(enable_prefix_caching),
+        prefix_cause_bullet(enable_prefix_caching),
         String::new(),
-        "Recommendation:".to_string(),
-        "  • Workload shows no prefix reuse — cache is currently ineffective".to_string(),
-        "  • If reuse is expected:".to_string(),
-        "      - Move shared instructions/system prompts to the very start".to_string(),
-        "      - Standardize prompt templates across requests".to_string(),
-        "      - Avoid unique tokens (IDs, timestamps) at the beginning".to_string(),
-        "  • Otherwise: no action needed".to_string(),
+        "  Fix:".to_string(),
+        "  • Move shared instructions/system prompts to the very start".to_string(),
+        "  • Standardize prompt templates across requests".to_string(),
+        "  • Avoid unique tokens (IDs, timestamps) at the beginning".to_string(),
         String::new(),
-        "Expected: Reduced prefill time".to_string(),
-        "Confidence: High".to_string(),
+        "  Expected: Reduced prefill time".to_string(),
+        "  Confidence: High".to_string(),
     ]
 }
 
@@ -114,25 +112,9 @@ pub(super) fn format_low_prefix_window_issue(
     seen_pct: u32,
     enable_prefix_caching: Option<bool>,
 ) -> Vec<String> {
-    vec![
-        "Low Prefix Cache".to_string(),
-        format!("Seen in {seen_pct}% of windows"),
-        "Cause:".to_string(),
-        format!(
-            "  - Prefix hit rate {:.1}% (threshold: {:.0}%)",
-            d.hit_rate * 100.0,
-            PREFIX_HIT_RATE_LT * 100.0
-        ),
-        prefix_cause_detail(enable_prefix_caching),
-        String::new(),
-        "Recommendation:".to_string(),
-        "  • Workload shows no prefix reuse — cache is currently ineffective".to_string(),
-        "  • If reuse is expected:".to_string(),
-        "      - Move shared instructions/system prompts to the very start".to_string(),
-        "      - Standardize prompt templates across requests".to_string(),
-        "      - Avoid unique tokens (IDs, timestamps) at the beginning".to_string(),
-        "  • Otherwise: no action needed".to_string(),
-    ]
+    let mut lines = format_low_prefix_hit_rate_fired(d, enable_prefix_caching);
+    lines.insert(1, format!("  Seen in {seen_pct}% of windows"));
+    lines
 }
 
 pub(super) fn format_rule3_verbose_miss(snapshot: &RawSnapshot) -> Vec<String> {

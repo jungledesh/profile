@@ -95,8 +95,10 @@ pub fn r1_recommendation(snapshot: &RawSnapshot) -> Option<Recommendation> {
 
 pub(super) fn format_under_batching_fired(d: &UnderBatchingDetail, confidence: f64) -> Vec<String> {
     let Some(max_n) = d.max_num_seqs else {
-        // Structurally unreachable — r1 hard-aborts without max_num_seqs.
-        return vec!["[!] Under-batching — Insufficient Concurrency".to_string()];
+        // Structurally unreachable: r1 hard-aborts without max_num_seqs.
+        unreachable!(
+            "format_under_batching_fired called without max_num_seqs — r1 hard-aborts before reaching this"
+        );
     };
     let threshold = UNDER_BATCHING_OCCUPANCY_PCT * 100.0;
     let max_str = max_n.to_string();
