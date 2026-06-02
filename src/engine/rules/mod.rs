@@ -121,9 +121,11 @@ pub fn no_evaluable_diagnose_lines(verbose: bool, windows: &[RuntimeWindow]) -> 
                 .iter()
                 .filter(|w| !window_is_evaluable(&w.snapshot))
                 .count();
-            out.push(format!(
-                "Note: {skipped} of {total} collected windows had missing telemetry (duration or vLLM metrics absent)."
-            ));
+            if skipped > 0 {
+                out.push(format!(
+                    "Note: {skipped} of {total} collected windows dropped — telemetry failure. Diagnosis may be incomplete."
+                ));
+            }
         }
     }
     out
@@ -170,9 +172,12 @@ pub fn format_diagnose_rules(input: AnalysisInput<'_>, verbose_rules: bool) -> V
         if !fired_names.contains("parallelism_mismatch") {
             append(vec!["Parallelism mismatch: not triggered".to_string()]);
         }
+        if !fired_names.contains("concurrency_saturation") {
+            append(vec!["Concurrency saturation: not triggered".to_string()]);
+        }
     }
 
-    if !any_issue {
+    if !any_issue && !verbose_rules {
         if !out.is_empty() {
             out.push(String::new());
         }
@@ -276,13 +281,17 @@ pub fn format_diagnose_rules_for_windows(
             out.push(String::new());
             out.extend(format_rule3_verbose_miss(summary_snap));
             out.push(String::new());
+            out.push("Parallelism mismatch: not triggered".to_string());
+            out.push(String::new());
+            out.push("Concurrency saturation: not triggered".to_string());
+            out.push(String::new());
         }
-        if !r1_max_seqs_advisory {
+        if !r1_max_seqs_advisory && !verbose_rules {
             out.push(NO_ISSUES_LINE.to_string());
         }
-        if verbose_rules && skipped > 0 {
+        if skipped > 0 {
             out.push(format!(
-                "Note: {skipped} of {total} windows had missing telemetry (duration or vLLM metrics absent)."
+                "Note: {skipped} of {total} windows dropped — telemetry failure. Diagnosis may be incomplete."
             ));
         }
         trim_trailing_blank_lines(&mut out);
@@ -360,6 +369,9 @@ pub fn format_diagnose_rules_for_windows(
             ));
             out.push(String::new());
         }
+    } else if verbose_rules && !r2_significant && !r2_backlog_significant {
+        out.push("Concurrency saturation: not triggered".to_string());
+        out.push(String::new());
     }
 
     if r3_significant {
@@ -384,13 +396,16 @@ pub fn format_diagnose_rules_for_windows(
     if !r3_significant {
         not_fired.push("Low Prefix Cache");
     }
-    if !not_fired.is_empty() {
+    if !r5_significant {
+        not_fired.push("Concurrency Saturation");
+    }
+    if !verbose_rules && !not_fired.is_empty() {
         out.push(format!("No issues for {}", join_rule_names(&not_fired)));
     }
-    if verbose_rules && skipped > 0 {
+    if skipped > 0 {
         out.push(String::new());
         out.push(format!(
-            "Note: {skipped} of {total} windows had missing telemetry (duration or vLLM metrics absent)."
+            "Note: {skipped} of {total} windows dropped — telemetry failure. Diagnosis may be incomplete."
         ));
     }
 
@@ -700,7 +715,8 @@ mod tests {
         assert!(text.contains("KV cache pressure: not triggered"));
         assert!(text.contains("Prefix cache hit rate: not triggered"));
         assert!(text.contains("Parallelism mismatch: not triggered"));
-        assert!(text.contains("No issues detected in this snapshot."));
+        assert!(text.contains("Concurrency saturation: not triggered"));
+        assert!(!text.contains("No issues detected in this snapshot."));
     }
 
     fn vllm_high_kv() -> VllmRawMetrics {
@@ -829,7 +845,8 @@ mod tests {
         assert!(text.contains("KV cache pressure: not triggered"));
         assert!(text.contains("Prefix cache hit rate: not triggered"));
         assert!(text.contains("Parallelism mismatch: not triggered"));
-        assert!(text.contains("No issues detected in this snapshot."));
+        assert!(text.contains("Concurrency saturation: not triggered"));
+        assert!(!text.contains("No issues detected in this snapshot."));
     }
 
     #[test]
@@ -892,7 +909,8 @@ mod tests {
         assert!(text.contains("KV cache pressure: not triggered"));
         assert!(text.contains("Prefix cache hit rate: not triggered"));
         assert!(text.contains("Parallelism mismatch: not triggered"));
-        assert!(text.contains("No issues detected in this snapshot."));
+        assert!(text.contains("Concurrency saturation: not triggered"));
+        assert!(!text.contains("No issues detected in this snapshot."));
     }
 
     #[test]
@@ -1172,7 +1190,9 @@ mod tests {
         assert!(text.contains("Occupancy"));
         assert!(text.contains("  Cause:"));
         assert!(text.contains("Batch more requests or increase client concurrency"));
-        assert!(text.contains("No issues for KV Cache Pressure and Low Prefix Cache"));
+        assert!(text.contains(
+            "No issues for KV Cache Pressure, Low Prefix Cache, and Concurrency Saturation"
+        ));
     }
 
     #[test]
