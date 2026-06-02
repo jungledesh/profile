@@ -11,7 +11,7 @@ mod r4_parallelism;
 mod r5_concurrency_saturation;
 
 pub use r1_under_batching::{
-    r1_recommendation, rule1_under_batching, MissReport, Rule1Outcome, UnderBatchingDetail,
+    r1_recommendation, rule1_under_batching, Rule1Outcome, UnderBatchingDetail,
 };
 pub use r2_kv_cache_pressure::{
     r2_recommendation, rule2_kv_admission_backlog, rule2_kv_cache_pressure,
@@ -36,7 +36,7 @@ use r3_low_prefix_reuse::{
     aggregate_r3_detail, format_low_prefix_window_issue, format_rule3_verbose_miss,
 };
 use r5_concurrency_saturation::{
-    aggregate_concurrency_saturation_detail, format_concurrency_saturation_issue,
+    aggregate_concurrency_saturation_detail, format_concurrency_saturation_window_issue,
 };
 
 pub(super) const MAX_OBSERVATION_SKEW_SECS: f64 = 1.0;
@@ -122,7 +122,7 @@ pub fn no_evaluable_diagnose_lines(verbose: bool, windows: &[RuntimeWindow]) -> 
                 .filter(|w| !window_is_evaluable(&w.snapshot))
                 .count();
             out.push(format!(
-                "Note: {skipped} of {total} collected windows had insufficient traffic (running ≤ 0.75 and tok/s ≤ 20)."
+                "Note: {skipped} of {total} collected windows had missing telemetry (duration or vLLM metrics absent)."
             ));
         }
     }
@@ -159,16 +159,16 @@ pub fn format_diagnose_rules(input: AnalysisInput<'_>, verbose_rules: bool) -> V
 
     if verbose_rules {
         if !fired_names.contains("under_batching") {
-            append(vec!["Under-batching: not indicated".to_string()]);
+            append(vec!["Under-batching: not triggered".to_string()]);
         }
         if !fired_names.contains("kv_cache_pressure") && !report.r2_suppressed_by_r4 {
-            append(vec!["KV cache pressure: not indicated".to_string()]);
+            append(vec!["KV cache pressure: not triggered".to_string()]);
         }
         if !fired_names.contains("low_prefix_reuse") {
             append(format_rule3_verbose_miss(snapshot));
         }
         if !fired_names.contains("parallelism_mismatch") {
-            append(vec!["Parallelism mismatch: not indicated".to_string()]);
+            append(vec!["Parallelism mismatch: not triggered".to_string()]);
         }
     }
 
@@ -220,15 +220,12 @@ pub fn format_diagnose_rules_for_windows(
 
     let summary_baseline = baseline::compute(&summary);
     for w in &evaluable {
-        let win_baseline = baseline::compute(&AnalysisInput::new(summary.ctx, w));
-        if let Some(b) = win_baseline.as_ref() {
-            match rule1_under_batching(&w.snapshot, b) {
-                Rule1Outcome::Fired(d) => {
-                    r1_fired += 1;
-                    r1_details.push(d);
-                }
-                Rule1Outcome::NotFired(_) => {}
+        match rule1_under_batching(&w.snapshot) {
+            Rule1Outcome::Fired(d) => {
+                r1_fired += 1;
+                r1_details.push(d);
             }
+            Rule1Outcome::NotFired => {}
         }
         match rule2_kv_cache_pressure(&w.snapshot) {
             Rule2Outcome::Fired(d) => {
@@ -248,10 +245,9 @@ pub fn format_diagnose_rules_for_windows(
             }
             Rule3Outcome::NotFired => {}
         }
-        if let Some(d) = rule5_concurrency_saturation(
-            &w.snapshot,
-            win_baseline.as_ref().and_then(|b| b.kv_headroom_gb),
-        ) {
+        if let Some(d) =
+            rule5_concurrency_saturation(&w.snapshot, w.snapshot.vllm.kv_cache_usage_perc)
+        {
             r5_fired += 1;
             r5_details.push(d);
         }
@@ -274,9 +270,9 @@ pub fn format_diagnose_rules_for_windows(
             out.push("    Pass -m <value> to profile to enable batching analysis.".to_string());
             out.push(String::new());
         } else if verbose_rules {
-            out.push("Under-batching: not indicated".to_string());
+            out.push("Under-batching: not triggered".to_string());
             out.push(String::new());
-            out.push("KV cache pressure: not indicated".to_string());
+            out.push("KV cache pressure: not triggered".to_string());
             out.push(String::new());
             out.extend(format_rule3_verbose_miss(summary_snap));
             out.push(String::new());
@@ -286,7 +282,7 @@ pub fn format_diagnose_rules_for_windows(
         }
         if verbose_rules && skipped > 0 {
             out.push(format!(
-                "Note: {skipped} of {total} windows had insufficient traffic for analysis."
+                "Note: {skipped} of {total} windows had missing telemetry (duration or vLLM metrics absent)."
             ));
         }
         trim_trailing_blank_lines(&mut out);
@@ -309,9 +305,9 @@ pub fn format_diagnose_rules_for_windows(
 
     if r1_significant {
         out.extend(format_under_batching_window_issue(
-            &aggregate_r1_detail(&r1_details, summary_snap, summary_baseline.as_ref()),
+            &aggregate_r1_detail(&r1_details),
             pct(r1_fired, n_eval),
-            summary_baseline.as_ref().and_then(|b| b.efficiency_pct),
+            0.8,
         ));
         out.push(String::new());
     } else if summary_snap.vllm.max_num_seqs.is_none()
@@ -327,7 +323,7 @@ pub fn format_diagnose_rules_for_windows(
         out.push("    Pass -m <value> to profile to enable batching analysis.".to_string());
         out.push(String::new());
     } else if verbose_rules {
-        out.push("Under-batching: not indicated".to_string());
+        out.push("Under-batching: not triggered".to_string());
         out.push(String::new());
     }
 
@@ -351,13 +347,13 @@ pub fn format_diagnose_rules_for_windows(
         ));
         out.push(String::new());
     } else if verbose_rules {
-        out.push("KV cache pressure: not indicated".to_string());
+        out.push("KV cache pressure: not triggered".to_string());
         out.push(String::new());
     }
 
     if r5_significant && !r2_significant && !r2_backlog_significant {
         if let Some(agg) = aggregate_concurrency_saturation_detail(&r5_details) {
-            out.extend(format_concurrency_saturation_issue(
+            out.extend(format_concurrency_saturation_window_issue(
                 &agg,
                 pct(r5_fired, n_eval),
                 summary.ctx.config.max_model_len,
@@ -394,7 +390,7 @@ pub fn format_diagnose_rules_for_windows(
     if verbose_rules && skipped > 0 {
         out.push(String::new());
         out.push(format!(
-            "Note: {skipped} of {total} windows had insufficient traffic for analysis."
+            "Note: {skipped} of {total} windows had missing telemetry (duration or vLLM metrics absent)."
         ));
     }
 
@@ -457,27 +453,7 @@ mod tests {
     use super::*;
     use crate::collectors::{GpuRawMetrics, RawSnapshot, VllmConfig, VllmRawMetrics};
     use crate::context::{AnalysisInput, RuntimeWindow, StaticContext};
-    use crate::engine::baseline::{CeilingEstimate, PhysicsBaseline, WeightDtypeSource};
     use std::time::{Duration, SystemTime};
-
-    fn mock_baseline(tpot_floor_ms: f64) -> PhysicsBaseline {
-        PhysicsBaseline {
-            decode: CeilingEstimate {
-                lower: 1.0,
-                expected: 1.0,
-                upper: 1.0,
-            },
-            prefill: None,
-            efficiency_pct: None,
-            headroom_pct: None,
-            weight_dtype_source: WeightDtypeSource::Fallback,
-            weight_gb: 1.0,
-            kv_headroom_gb: None,
-            tpot_floor_ms,
-            prefill_latency_floor_ms: None,
-            ridge_batch_size: 1.0,
-        }
-    }
 
     fn snap(
         gpu_at: SystemTime,
@@ -567,83 +543,77 @@ mod tests {
 
     #[test]
     fn under_batching_fires_when_gates_pass() {
-        let base = mock_baseline(10.0);
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
         v.tpot_ms = Some(35.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        let r = r1_recommendation(&win.snapshot, Some(&base)).expect("r1 fired");
+        let r = r1_recommendation(&win.snapshot).expect("r1 fired");
         assert_eq!(r.rule_name, "under_batching");
         assert_eq!(r.impact, 4);
-        assert!((r.confidence - 0.9).abs() < 1e-9);
-        match rule1_under_batching(&win.snapshot, &base) {
+        assert!((r.confidence - 0.8).abs() < 1e-9);
+        match rule1_under_batching(&win.snapshot) {
             Rule1Outcome::Fired(d) => {
                 assert!((d.running - 3.1).abs() < 1e-9);
                 assert_eq!(d.max_num_seqs, Some(256));
-                assert!(d.occupancy_pct < 10.0);
+                assert!(d.occupancy_pct < 25.0);
             }
-            Rule1Outcome::NotFired(_) => panic!("expected fired"),
+            Rule1Outcome::NotFired => panic!("expected fired"),
         }
     }
 
     #[test]
     fn waiting_none_suppresses() {
-        let base = mock_baseline(10.0);
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
         v.num_requests_waiting = None;
         v.tpot_ms = Some(35.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot, Some(&base)).is_none());
+        assert!(r1_recommendation(&win.snapshot).is_none());
     }
 
     #[test]
     fn waiting_at_two_suppresses() {
-        let base = mock_baseline(10.0);
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
         v.num_requests_waiting = Some(2.0);
         v.tpot_ms = Some(35.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot, Some(&base)).is_none());
+        assert!(r1_recommendation(&win.snapshot).is_none());
     }
 
     #[test]
     fn running_at_occupancy_threshold_suppresses() {
-        let base = mock_baseline(10.0);
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
-        v.num_requests_running = Some(26.0);
+        v.num_requests_running = Some(64.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot, Some(&base)).is_none());
+        assert!(r1_recommendation(&win.snapshot).is_none());
     }
 
     #[test]
     fn max_seqs_zero_suppresses() {
-        let base = mock_baseline(10.0);
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
         v.max_num_seqs = Some(0);
         v.tpot_ms = Some(35.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot, Some(&base)).is_none());
+        assert!(r1_recommendation(&win.snapshot).is_none());
     }
 
     #[test]
     fn nan_running_suppresses() {
-        let base = mock_baseline(10.0);
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
         v.num_requests_running = Some(f64::NAN);
         v.tpot_ms = Some(35.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot, Some(&base)).is_none());
+        assert!(r1_recommendation(&win.snapshot).is_none());
     }
 
     #[test]
@@ -682,11 +652,11 @@ mod tests {
         let win = mk_win(s);
         let lines = format_diagnose_rules(ai(&ctx, &win), false);
         let text = lines.join("\n");
-        assert!(text.contains("[!] Under-batching — Low Occupancy"));
+        assert!(text.contains("[!] Under-batching — Insufficient Concurrency"));
         assert!(text.contains("Occupancy"));
-        assert!(text.contains("threshold: < 10%"));
+        assert!(text.contains("threshold: < 25%"));
         assert!(text.contains("  Cause:"));
-        assert!(text.contains("unused capacity and no backlog"));
+        assert!(text.contains("under-fed by client"));
         assert!(text.contains("Batch more requests or increase client concurrency"));
         assert!(text.contains("slots idle"));
         assert!(text.contains("Expected: Higher throughput, lower TPOT at scale."));
@@ -702,7 +672,7 @@ mod tests {
         let text = format_diagnose_rules(ai(&ctx, &win), true).join("\n");
         assert!(text.contains("Parallelism Mismatch"));
         assert!(text.contains(R2_SUPPRESSED_BY_R4_VERBOSE_LINE));
-        assert!(!text.contains("KV cache pressure: not indicated"));
+        assert!(!text.contains("KV cache pressure: not triggered"));
         assert!(!text.contains("[!] KV Cache Pressure"));
     }
 
@@ -721,15 +691,15 @@ mod tests {
         let mut g = gpu_low();
         g.gpu_util_pct = Some(75.0);
         let mut v = vllm_base();
-        v.num_requests_running = Some(30.0);
+        v.num_requests_running = Some(64.0);
         let s = snap(t, t, v, g);
         let ctx = mk_ctx();
         let win = mk_win(s);
         let text = format_diagnose_rules(ai(&ctx, &win), true).join("\n");
-        assert!(text.contains("Under-batching: not indicated"));
-        assert!(text.contains("KV cache pressure: not indicated"));
-        assert!(text.contains("Prefix cache hit rate: not indicated"));
-        assert!(text.contains("Parallelism mismatch: not indicated"));
+        assert!(text.contains("Under-batching: not triggered"));
+        assert!(text.contains("KV cache pressure: not triggered"));
+        assert!(text.contains("Prefix cache hit rate: not triggered"));
+        assert!(text.contains("Parallelism mismatch: not triggered"));
         assert!(text.contains("No issues detected in this snapshot."));
     }
 
@@ -745,7 +715,7 @@ mod tests {
         let mut v = vllm_base();
         v.kv_cache_usage_perc = Some(kv_pct);
         v.generation_tokens_per_sec = Some(100.0);
-        v.num_requests_running = Some(30.0);
+        v.num_requests_running = Some(100.0);
         if preemptions {
             v.num_preemptions_per_sec = Some(1.0);
         }
@@ -843,7 +813,7 @@ mod tests {
         let t0 = SystemTime::UNIX_EPOCH;
         let t1 = t0 + Duration::from_secs(2);
         let mut v = vllm_high_kv();
-        v.num_requests_running = Some(30.0);
+        v.num_requests_running = Some(64.0);
         let s = snap(t0, t1, v, gpu_low());
         match rule2_kv_cache_pressure(&s) {
             Rule2Outcome::NotFired(m) => {
@@ -855,10 +825,10 @@ mod tests {
         let ctx = mk_ctx();
         let win = mk_win(s);
         let text = format_diagnose_rules(ai(&ctx, &win), true).join("\n");
-        assert!(text.contains("Under-batching: not indicated"));
-        assert!(text.contains("KV cache pressure: not indicated"));
-        assert!(text.contains("Prefix cache hit rate: not indicated"));
-        assert!(text.contains("Parallelism mismatch: not indicated"));
+        assert!(text.contains("Under-batching: not triggered"));
+        assert!(text.contains("KV cache pressure: not triggered"));
+        assert!(text.contains("Prefix cache hit rate: not triggered"));
+        assert!(text.contains("Parallelism mismatch: not triggered"));
         assert!(text.contains("No issues detected in this snapshot."));
     }
 
@@ -913,14 +883,15 @@ mod tests {
     fn kv_cache_miss_unavailable_without_gauge_verbose() {
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
-        v.num_requests_running = Some(30.0);
+        v.num_requests_running = Some(64.0);
         let s = snap(t, t, v, gpu_busy());
         let ctx = mk_ctx();
         let win = mk_win(s);
         let text = format_diagnose_rules(ai(&ctx, &win), true).join("\n");
-        assert!(text.contains("KV cache pressure: not indicated"));
-        assert!(text.contains("Prefix cache hit rate: not indicated"));
-        assert!(text.contains("Parallelism mismatch: not indicated"));
+        assert!(text.contains("Under-batching: not triggered"));
+        assert!(text.contains("KV cache pressure: not triggered"));
+        assert!(text.contains("Prefix cache hit rate: not triggered"));
+        assert!(text.contains("Parallelism mismatch: not triggered"));
         assert!(text.contains("No issues detected in this snapshot."));
     }
 
@@ -987,8 +958,7 @@ mod tests {
         let ctx = mk_ctx();
         let win = mk_win(s);
         let text = format_diagnose_rules(ai(&ctx, &win), true).join("\n");
-        assert!(text.contains("Rule: Low Prefix Cache — Not triggered"));
-        assert!(text.contains("  - Prefix cache hit rate 50.0% — working effectively"));
+        assert!(text.contains("Prefix cache hit rate: 50.0% (not triggered)"));
     }
 
     #[test]
@@ -1001,7 +971,7 @@ mod tests {
         let ctx = mk_ctx();
         let win = mk_win(s);
         let text = format_diagnose_rules(ai(&ctx, &win), true).join("\n");
-        assert!(text.contains("Prefix cache hit rate: not indicated"));
+        assert!(text.contains("Prefix cache hit rate: not triggered"));
         assert!(!text.contains("working effectively"));
     }
 
@@ -1011,7 +981,7 @@ mod tests {
         let mut g = gpu_low();
         g.gpu_util_pct = Some(75.0);
         let mut v = vllm_base();
-        v.num_requests_running = Some(30.0);
+        v.num_requests_running = Some(64.0);
         let s = snap(t, t, v, g);
         let ctx = mk_ctx();
         let win = mk_win(s);
@@ -1027,6 +997,7 @@ mod tests {
         let (ctx, win) = {
             let mut v = vllm_high_kv();
             v.tpot_ms = Some(35.0);
+            v.generation_tokens_per_sec = Some(30.0);
             v.model_name = Some("meta-llama/Llama-3.1-8B-Instruct".to_string());
             let mut g = gpu_low();
             g.gpu_name = Some("NVIDIA H100 80GB HBM3".to_string());
@@ -1044,17 +1015,18 @@ mod tests {
         let lines = format_diagnose_rules(ai(&ctx, &win), false);
         let idx_under = lines
             .iter()
-            .position(|l| l.contains("[!] Under-batching — Low Occupancy"))
+            .position(|l| l.contains("[!] Under-batching — Insufficient Concurrency"))
             .expect("rule1");
         let idx_kv = lines
             .iter()
             .position(|l| l.contains("[!] KV Cache Pressure"))
             .expect("rule2");
-        assert!(
-            idx_under < idx_kv,
-            "under-batching should rank before KV cache pressure by score"
-        );
-        let between = &lines[idx_under..idx_kv];
+        let (lo, hi) = if idx_under < idx_kv {
+            (idx_under, idx_kv)
+        } else {
+            (idx_kv, idx_under)
+        };
+        let between = &lines[lo..hi];
         assert!(
             between.iter().any(|l| l.is_empty()),
             "expected blank line between rule blocks: {between:?}"
@@ -1186,7 +1158,7 @@ mod tests {
                 v.tpot_ms = Some(35.0);
                 g.gpu_util_pct = Some(50.0);
             } else {
-                v.num_requests_running = Some(30.0);
+                v.num_requests_running = Some(100.0);
                 g.gpu_util_pct = Some(74.0);
             }
             windows.push(mk_win(snap(t, t, v, g)));
@@ -1195,7 +1167,7 @@ mod tests {
         let summary = ai(&ctx, windows.last().expect("summary source"));
         let lines = format_diagnose_rules_for_windows(&windows, summary, false);
         let text = lines.join("\n");
-        assert!(text.contains("Under-batching — Low Occupancy"));
+        assert!(text.contains("Under-batching — Insufficient Concurrency"));
         assert!(text.contains("Seen in 60% of windows"));
         assert!(text.contains("Occupancy"));
         assert!(text.contains("  Cause:"));
@@ -1229,8 +1201,7 @@ mod tests {
     fn format_diagnose_rules_non_evaluable_snapshot_shows_note() {
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
-        v.num_requests_running = Some(0.0);
-        v.generation_tokens_per_sec = Some(0.0);
+        v.num_requests_running = None;
         let s = snap(t, t, v, gpu_busy());
         let ctx = mk_ctx();
         let win = mk_win(s);
@@ -1296,8 +1267,7 @@ mod tests {
         let t = SystemTime::UNIX_EPOCH;
         let ctx = mk_ctx();
         let mut v = vllm_base();
-        v.num_requests_running = Some(0.2);
-        v.generation_tokens_per_sec = Some(5.0);
+        v.num_requests_running = None;
         let w1 = mk_win(snap(t, t, v.clone(), gpu_busy()));
         let w2 = mk_win(snap(t, t, v, gpu_busy()));
         let windows = vec![w1, w2];

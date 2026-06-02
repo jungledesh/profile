@@ -7,7 +7,7 @@ use std::thread;
 
 const MINIMAL_SCRAPE: &str = "# TYPE noop gauge\nnoop 0\n";
 
-/// `vllm_num_requests_running` above the evaluable threshold (see `window_is_evaluable`).
+/// Includes `vllm_num_requests_running` so the window passes `window_is_evaluable`.
 const MINIMAL_EVALUABLE_SCRAPE: &str = r#"# TYPE vllm_num_requests_running gauge
 vllm_num_requests_running 20
 # TYPE noop gauge
@@ -122,7 +122,7 @@ fn diagnose_exits_success() {
         "stdout should show PROFILE header with model/GPU and bracketed UTC timestamp; got:\n{out}"
     );
     assert!(
-        out.contains("GPU =>") && out.contains("UTIL"),
+        out.contains("GPU =>") && out.contains("EFFICIENCY"),
         "stdout should include GPU => row; got:\n{out}"
     );
     assert!(
@@ -167,8 +167,8 @@ fn diagnose_exits_success() {
 
 #[test]
 fn diagnose_shows_gen_tok_per_sec_when_counters_increase() {
-    const G100: &str = "vllm_generation_tokens_total 100\n";
-    const G250: &str = "vllm_generation_tokens_total 250\n";
+    const G100: &str = "vllm_num_requests_running 0\nvllm_generation_tokens_total 100\n";
+    const G250: &str = "vllm_num_requests_running 0\nvllm_generation_tokens_total 250\n";
     let bodies = [G100, G100, G100, G100, G100, G100, G100, G100, G250];
     let (url, server) = spawn_metrics_server_seq(&bodies);
     let output = Command::cargo_bin("profile")
@@ -250,10 +250,10 @@ fn diagnose_verbose_shows_not_indicated_lines() {
     );
     let out = String::from_utf8_lossy(&output.stdout).into_owned();
     assert!(
-        out.contains("Under-batching: not indicated")
-            && out.contains("KV cache pressure: not indicated")
-            && out.contains("Prefix cache hit rate: not indicated")
-            && out.contains("Parallelism mismatch: not indicated")
+        out.contains("Under-batching: not triggered")
+            && out.contains("KV cache pressure: not triggered")
+            && out.contains("Prefix cache hit rate: not triggered")
+            && out.contains("Parallelism mismatch: not triggered")
             && out.contains("No issues detected in this snapshot."),
         "expected verbose rule status lines and no-issues summary; got:\n{out}"
     );

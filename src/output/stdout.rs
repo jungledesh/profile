@@ -63,6 +63,7 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
         lines.extend(baseline_lines(
             report.baseline,
             aggregate_win.snapshot.vllm.num_requests_running,
+            aggregate_win.snapshot.vllm.cache_config.num_gpu_blocks,
         ));
         lines.push(String::new());
     }
@@ -81,7 +82,7 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
         "{:<width$}{}{}",
         "GPU =>",
         VLLM_LABEL_METRICS_GAP,
-        gpu_gauges_line(g),
+        gpu_gauges_line(g, report.baseline.as_ref().and_then(|b| b.efficiency_pct)),
         width = VLLM_LABEL_W
     ));
     if verbose_rules {
@@ -170,6 +171,7 @@ fn duration_short(duration: Duration) -> String {
 fn baseline_lines(
     baseline: Option<engine::PhysicsBaseline>,
     num_requests_running: Option<f64>,
+    num_gpu_blocks: Option<u32>,
 ) -> Vec<String> {
     let Some(b) = baseline else {
         return vec!["HW LIMITS  unavailable — model not recognized".to_string()];
@@ -194,11 +196,11 @@ fn baseline_lines(
     // Line 2: memory budget + latency floors
     let mut seg2 = Vec::new();
     seg2.push(format!("weight {:.0}GB", b.weight_gb));
-    if let Some(headroom) = b.kv_headroom_gb {
+    if let Some(blocks) = num_gpu_blocks {
+        seg2.push(format!("kv_blocks {blocks}"));
+    } else if let Some(headroom) = b.kv_headroom_gb {
         if headroom < 0.0 {
             seg2.push(format!("kv_headroom {:.0}GB (needs TP)", headroom));
-        } else {
-            seg2.push(format!("kv_headroom {:.0}GB", headroom));
         }
     }
     seg2.push(format!("tpot_floor ~{:.1}ms", b.tpot_floor_ms));
@@ -248,11 +250,10 @@ fn print_boxed(lines: &[String]) {
     println!("{}", border);
 }
 
-fn gpu_gauges_line(g: &GpuRawMetrics) -> String {
-    let util = g
-        .gpu_util_pct
-        .map(|u| format!("UTIL {:.1}%", u))
-        .unwrap_or_else(|| "UTIL —".to_string());
+fn gpu_gauges_line(g: &GpuRawMetrics, efficiency_pct: Option<f64>) -> String {
+    let efficiency = efficiency_pct
+        .map(|e| format!("EFFICIENCY {:.1}%", e))
+        .unwrap_or_else(|| "EFFICIENCY —".to_string());
 
     let power = g
         .power_watts
@@ -275,7 +276,7 @@ fn gpu_gauges_line(g: &GpuRawMetrics) -> String {
         _ => "vRAM —".to_string(),
     };
 
-    format!("{util} | {power} | {mem}")
+    format!("{efficiency} | {power} | {mem}")
 }
 
 fn vllm_requests_value(v: &VllmRawMetrics) -> String {
@@ -468,7 +469,7 @@ fn vllm_cache_cfg_value(v: &VllmRawMetrics) -> String {
                 "prefix_cache off"
             }
         })
-        .unwrap_or("prefix_cache —");
+        .unwrap_or("prefix_cache unknown");
     let chunked = v
         .cache_config
         .enable_chunked_prefill
@@ -479,7 +480,7 @@ fn vllm_cache_cfg_value(v: &VllmRawMetrics) -> String {
                 "chunked_prefill off"
             }
         })
-        .unwrap_or("chunked_prefill —");
+        .unwrap_or("chunked_prefill unknown");
     format!("{block} | dtype {dtype} | {prefix} | {chunked}")
 }
 
@@ -524,7 +525,7 @@ fn config_kv_value(cfg: &VllmConfig) -> String {
                 "prefix_cache off"
             }
         })
-        .unwrap_or("prefix_cache —");
+        .unwrap_or("prefix_cache unknown");
     let chunked = cfg
         .enable_chunked_prefill
         .map(|b| {
@@ -534,7 +535,7 @@ fn config_kv_value(cfg: &VllmConfig) -> String {
                 "chunked_prefill off"
             }
         })
-        .unwrap_or("chunked_prefill —");
+        .unwrap_or("chunked_prefill unknown");
     format!("dtype {kv_dtype} | {block} | {prefix} | {chunked}")
 }
 
@@ -628,7 +629,7 @@ mod tests {
             prefill_latency_floor_ms: Some(20.0),
             ridge_batch_size: 40.0,
         };
-        let lines = baseline_lines(Some(b), None);
+        let lines = baseline_lines(Some(b), None, None);
         assert_eq!(
             lines[0],
             "HW LIMITS  Efficiency  — | decode ~100 tok/s (est) | prefill ~50 tok/s (est)"
@@ -662,13 +663,13 @@ mod tests {
             prefill_latency_floor_ms: Some(42.0),
             ridge_batch_size: 40.0,
         };
-        let above = baseline_lines(Some(base()), Some(40.0));
+        let above = baseline_lines(Some(base()), Some(40.0), None);
         assert!(
             !above[1].contains("prefill_floor"),
             "expected no prefill_floor at ridge: {}",
             above[1]
         );
-        let below = baseline_lines(Some(base()), Some(39.0));
+        let below = baseline_lines(Some(base()), Some(39.0), None);
         assert!(
             below[1].contains("prefill_floor ~42ms"),
             "expected prefill_floor below ridge: {}",
@@ -698,7 +699,7 @@ mod tests {
             prefill_latency_floor_ms: Some(200.0),
             ridge_batch_size: 40.0,
         };
-        let lines = baseline_lines(Some(b), Some(5.0));
+        let lines = baseline_lines(Some(b), Some(5.0), None);
         assert!(
             !lines[0].contains("prefill ~"),
             "line1 should omit low prefill ceiling: {}",
@@ -733,7 +734,7 @@ mod tests {
             prefill_latency_floor_ms: Some(20.0),
             ridge_batch_size: 40.0,
         };
-        let lines = baseline_lines(Some(b), Some(10.0));
+        let lines = baseline_lines(Some(b), Some(10.0), None);
         assert!(
             lines[0].contains("prefill ~50 tok/s (est)"),
             "line1 should include prefill ceiling: {}",
@@ -778,8 +779,8 @@ mod tests {
             vram_total_mb: Some(80 * 1024),
             ..Default::default()
         };
-        let s = gpu_gauges_line(&g);
-        assert!(s.contains("UTIL 28.0%"));
+        let s = gpu_gauges_line(&g, Some(28.0));
+        assert!(s.contains("EFFICIENCY 28.0%"));
         assert!(s.contains("POWER 310W"));
         assert!(s.contains("vRAM 72/80GB"));
         let g_peak = GpuRawMetrics {
@@ -790,7 +791,7 @@ mod tests {
             vram_total_mb: Some(80 * 1024),
             ..Default::default()
         };
-        let s_peak = gpu_gauges_line(&g_peak);
+        let s_peak = gpu_gauges_line(&g_peak, None);
         assert!(s_peak.contains("vRAM 60/80GB (peak 78GB)"));
         let g_peak_below_frac = GpuRawMetrics {
             gpu_util_pct: Some(28.0),
@@ -800,7 +801,7 @@ mod tests {
             vram_total_mb: Some(80 * 1024),
             ..Default::default()
         };
-        assert!(!gpu_gauges_line(&g_peak_below_frac).contains("peak"));
+        assert!(!gpu_gauges_line(&g_peak_below_frac, None).contains("peak"));
         let g_no_recovery = GpuRawMetrics {
             gpu_util_pct: Some(28.0),
             power_watts: Some(310.0),
@@ -809,7 +810,7 @@ mod tests {
             vram_total_mb: Some(80 * 1024),
             ..Default::default()
         };
-        assert!(!gpu_gauges_line(&g_no_recovery).contains("peak"));
+        assert!(!gpu_gauges_line(&g_no_recovery, None).contains("peak"));
     }
 
     #[test]
