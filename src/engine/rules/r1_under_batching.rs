@@ -94,15 +94,16 @@ pub fn r1_recommendation(snapshot: &RawSnapshot) -> Option<Recommendation> {
 }
 
 pub(super) fn format_under_batching_fired(d: &UnderBatchingDetail, confidence: f64) -> Vec<String> {
+    let Some(max_n) = d.max_num_seqs else {
+        // Structurally unreachable — r1 hard-aborts without max_num_seqs.
+        return vec!["[!] Under-batching — Insufficient Concurrency".to_string()];
+    };
     let threshold = UNDER_BATCHING_OCCUPANCY_PCT * 100.0;
-    let idle_slots = d
-        .max_num_seqs
-        .map(|n| format!("{:.0}", f64::from(n) - d.running))
-        .unwrap_or_else(|| "?".to_string());
-    let max_str = d
-        .max_num_seqs
-        .map(|n| n.to_string())
-        .unwrap_or_else(|| "?".to_string());
+    let max_str = max_n.to_string();
+    let fix_line = format!(
+        "    • Batch more requests or increase client concurrency ({:.0} slots idle)",
+        f64::from(max_n) - d.running
+    );
     let confidence_str = if confidence >= 0.8 { "High" } else { "Medium" };
 
     vec![
@@ -122,9 +123,7 @@ pub(super) fn format_under_batching_fired(d: &UnderBatchingDetail, confidence: f
             .to_string(),
         String::new(),
         "  Fix:".to_string(),
-        format!(
-            "    • Batch more requests or increase client concurrency ({idle_slots} slots idle)"
-        ),
+        fix_line,
         String::new(),
         "  Expected: Higher throughput, lower TPOT at scale.".to_string(),
         format!("  Confidence: {confidence_str}"),
