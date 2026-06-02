@@ -109,7 +109,7 @@ fn primary_window_rule(result: &DiagnoseResult) -> Option<&'static str> {
         .iter()
         .filter(|w| {
             matches!(
-                engine::rule1_under_batching(&w.snapshot),
+                engine::rule1_under_batching(&w.snapshot, result.static_ctx.config.max_num_seqs),
                 engine::Rule1Outcome::Fired(_)
             )
         })

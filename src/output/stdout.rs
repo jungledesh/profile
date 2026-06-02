@@ -96,7 +96,10 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
     }
     lines.push(String::new());
     lines.push(vllm_label_row("vLLM:", ""));
-    lines.push(vllm_label_row("REQUESTS", &vllm_requests_value(v)));
+    lines.push(vllm_label_row(
+        "REQUESTS",
+        &vllm_requests_value(v, result.static_ctx.config.max_num_seqs),
+    ));
     lines.push(vllm_label_row(
         "LATENCY",
         &vllm_latency_value(v, verbose_rules),
@@ -307,11 +310,12 @@ fn format_efficiency_label(
     }
 }
 
-fn vllm_requests_value(v: &VllmRawMetrics) -> String {
+fn vllm_requests_value(v: &VllmRawMetrics, config_max_num_seqs: Option<u32>) -> String {
+    let max_n = v.max_num_seqs.or(config_max_num_seqs).filter(|&m| m > 0);
     let run = match v.num_requests_running.filter(|x| x.is_finite()) {
         Some(avg) => {
             let rounded = avg.round();
-            if let Some(max_n) = v.max_num_seqs.filter(|&m| m > 0) {
+            if let Some(max_n) = max_n {
                 let pct = (avg / f64::from(max_n)) * 100.0;
                 format!("run {:.0} ({:.1}%)", rounded, pct)
             } else {
@@ -324,8 +328,7 @@ fn vllm_requests_value(v: &VllmRawMetrics) -> String {
         Some(w) => format!("wait {:.0}", w.round()),
         None => "wait —".to_string(),
     };
-    let max_seq = v
-        .max_num_seqs
+    let max_seq = max_n
         .map(|n| format!("max {n}"))
         .unwrap_or_else(|| "max —".to_string());
 
@@ -910,7 +913,10 @@ mod tests {
             max_num_seqs: Some(256),
             ..Default::default()
         };
-        assert_eq!(vllm_requests_value(&v), "run 2 (0.8%) | wait 1 | max 256");
+        assert_eq!(
+            vllm_requests_value(&v, Some(256)),
+            "run 2 (0.8%) | wait 1 | max 256"
+        );
     }
 
     #[test]
@@ -921,7 +927,11 @@ mod tests {
             max_num_seqs: None,
             ..Default::default()
         };
-        assert_eq!(vllm_requests_value(&v), "run 4 | wait 0 | max —");
+        assert_eq!(vllm_requests_value(&v, None), "run 4 | wait 0 | max —");
+        assert_eq!(
+            vllm_requests_value(&v, Some(64)),
+            "run 4 (6.2%) | wait 0 | max 64"
+        );
     }
 
     #[test]

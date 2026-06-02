@@ -94,9 +94,12 @@ impl IssueGroup {
 const NO_ISSUES_LINE: &str = "No issues detected in this snapshot.";
 const R2_SUPPRESSED_BY_R4_VERBOSE_LINE: &str = "  ↳ KV pressure suppressed — symptom of the above";
 
-/// R1 core metric: `max_num_seqs` on the scrape only (not CLI/config fallback).
-fn r1_max_num_seqs_advisory(snapshot: &RawSnapshot) -> Option<Vec<String>> {
-    if snapshot.vllm.max_num_seqs.is_some() {
+/// R1 core metric: `max_num_seqs` on the scrape; config (`-m`) satisfies the metric when scrape lacks it.
+fn r1_max_num_seqs_advisory(
+    snapshot: &RawSnapshot,
+    config_max_num_seqs: Option<u32>,
+) -> Option<Vec<String>> {
+    if snapshot.vllm.max_num_seqs.is_some() || config_max_num_seqs.is_some() {
         return None;
     }
     if !snapshot
@@ -236,7 +239,7 @@ pub fn format_diagnose_rules(
     }
 
     let r1_adv = if !fired_names.contains("under_batching") {
-        r1_max_num_seqs_advisory(snapshot)
+        r1_max_num_seqs_advisory(snapshot, input.ctx.config.max_num_seqs)
     } else {
         None
     };
@@ -342,7 +345,7 @@ pub fn format_diagnose_rules_for_windows(
 
     let summary_baseline = baseline::compute(&summary);
     for w in &evaluable {
-        match rule1_under_batching(&w.snapshot) {
+        match rule1_under_batching(&w.snapshot, summary.ctx.config.max_num_seqs) {
             Rule1Outcome::Fired(d) => {
                 r1_fired += 1;
                 r1_details.push(d);
@@ -382,7 +385,7 @@ pub fn format_diagnose_rules_for_windows(
     if r1_fired + r2_fired + r2_backlog_fired + r3_fired + r5_fired == 0 {
         let mut out = Vec::new();
         let config_max = summary.ctx.config.max_num_seqs;
-        let r1_adv = r1_max_num_seqs_advisory(summary_snap);
+        let r1_adv = r1_max_num_seqs_advisory(summary_snap, config_max);
         let r2_adv = r2_kv_cache_advisory(summary_snap, metrics_url);
         let r3_adv = r3_prefix_cache_advisory(summary_snap);
         let r5_adv = r5_max_num_seqs_advisory(summary_snap, config_max);
@@ -526,7 +529,7 @@ pub fn format_diagnose_rules_for_windows(
 
     let config_max = summary.ctx.config.max_num_seqs;
     let r1_adv = if !r1_significant {
-        r1_max_num_seqs_advisory(summary_snap)
+        r1_max_num_seqs_advisory(summary_snap, config_max)
     } else {
         None
     };
@@ -747,11 +750,11 @@ mod tests {
         v.tpot_ms = Some(35.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        let r = r1_recommendation(&win.snapshot).expect("r1 fired");
+        let r = r1_recommendation(&win.snapshot, None).expect("r1 fired");
         assert_eq!(r.rule_name, "under_batching");
         assert_eq!(r.impact, 4);
         assert!((r.confidence - 0.8).abs() < 1e-9);
-        match rule1_under_batching(&win.snapshot) {
+        match rule1_under_batching(&win.snapshot, None) {
             Rule1Outcome::Fired(d) => {
                 assert!((d.running - 3.1).abs() < 1e-9);
                 assert_eq!(d.max_num_seqs, Some(256));
@@ -769,7 +772,7 @@ mod tests {
         v.tpot_ms = Some(35.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot).is_none());
+        assert!(r1_recommendation(&win.snapshot, None).is_none());
     }
 
     #[test]
@@ -780,7 +783,7 @@ mod tests {
         v.tpot_ms = Some(35.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot).is_none());
+        assert!(r1_recommendation(&win.snapshot, None).is_none());
     }
 
     #[test]
@@ -790,7 +793,7 @@ mod tests {
         v.num_requests_running = Some(64.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot).is_none());
+        assert!(r1_recommendation(&win.snapshot, None).is_none());
     }
 
     #[test]
@@ -801,7 +804,7 @@ mod tests {
         v.tpot_ms = Some(35.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot).is_none());
+        assert!(r1_recommendation(&win.snapshot, None).is_none());
     }
 
     #[test]
@@ -812,7 +815,7 @@ mod tests {
         v.tpot_ms = Some(35.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot).is_none());
+        assert!(r1_recommendation(&win.snapshot, None).is_none());
     }
 
     #[test]
@@ -837,6 +840,24 @@ mod tests {
         )
         .join("\n");
         assert!(text.contains("max_num_seqs not in metrics"));
+    }
+
+    #[test]
+    fn r1_advisory_suppressed_when_config_max_num_seqs_set() {
+        let t = SystemTime::UNIX_EPOCH;
+        let mut v = vllm_base();
+        v.max_num_seqs = None;
+        v.num_requests_running = Some(20.0);
+        let s = snap(t, t, v, gpu_busy());
+        let cfg = VllmConfig {
+            max_num_seqs: Some(64),
+            ..Default::default()
+        };
+        let ctx = StaticContext::from_snapshot(&s, cfg);
+        let win = mk_win(s);
+        let text = format_diagnose_rules(ai(&ctx, &win), false, "http://127.0.0.1:8000/metrics")
+            .join("\n");
+        assert!(!text.contains("[i] Under-batching: max_num_seqs not in metrics"));
     }
 
     #[test]

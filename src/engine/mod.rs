@@ -21,7 +21,7 @@ pub fn build_report(input: AnalysisInput<'_>) -> Report {
     let tp = input.ctx.config.tensor_parallel_size;
 
     let mut recs: Vec<Recommendation> = [
-        rules::r1_recommendation(snapshot),
+        rules::r1_recommendation(snapshot, input.ctx.config.max_num_seqs),
         rules::r2_recommendation(snapshot, input.ctx.config.max_model_len),
         rules::r3_recommendation(snapshot),
         rules::r4_recommendation(kv_headroom, tp),
