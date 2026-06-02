@@ -21,7 +21,7 @@ pub fn build_report(input: AnalysisInput<'_>) -> Report {
     let tp = input.ctx.config.tensor_parallel_size;
 
     let mut recs: Vec<Recommendation> = [
-        rules::r1_recommendation(snapshot, baseline.as_ref()),
+        rules::r1_recommendation(snapshot),
         rules::r2_recommendation(snapshot, input.ctx.config.max_model_len),
         rules::r3_recommendation(snapshot),
         rules::r4_recommendation(kv_headroom, tp),
@@ -32,9 +32,11 @@ pub fn build_report(input: AnalysisInput<'_>) -> Report {
 
     let kv_pressure = recs.iter().any(|r| r.rule_name == "kv_cache_pressure");
     if !kv_pressure {
-        if let Some(r5) =
-            rules::r5_recommendation(snapshot, kv_headroom, input.ctx.config.max_model_len)
-        {
+        if let Some(r5) = rules::r5_recommendation(
+            snapshot,
+            snapshot.vllm.kv_cache_usage_perc,
+            input.ctx.config.max_model_len,
+        ) {
             recs.push(r5);
         }
     }
@@ -86,6 +88,7 @@ mod build_report_tests {
             max_num_seqs: Some(256),
             kv_cache_usage_perc: Some(89.0),
             tpot_ms: Some(35.0),
+            generation_tokens_per_sec: Some(30.0),
             window_duration_secs: Some(2.0),
             ..Default::default()
         };
@@ -127,7 +130,14 @@ mod build_report_tests {
                 w[1].primary.rule_name
             );
         }
-        assert_eq!(report.groups[0].primary.rule_name, "under_batching");
+        assert!(report
+            .groups
+            .iter()
+            .any(|g| g.primary.rule_name == "under_batching"));
+        assert!(report
+            .groups
+            .iter()
+            .any(|g| g.primary.rule_name == "kv_cache_pressure"));
         assert!(!report.r2_suppressed_by_r4);
     }
 

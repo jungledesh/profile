@@ -144,24 +144,60 @@ pub struct RawSnapshot {
     pub gpu: GpuRawMetrics,
 }
 
-/// Mean `num_requests_running` above this (exclusive) counts as evaluable traffic.
-pub const EVALUABLE_RUNNING_GT: f64 = 0.75;
-/// Generation throughput above this (exclusive, tok/s) counts as evaluable when running is low or missing.
-pub const EVALUABLE_TOK_PER_SEC_GT: f64 = 20.0;
-
-/// A window is evaluable if there is meaningful activity: enough concurrent requests or enough throughput.
+/// A window is structurally valid if core telemetry was collected successfully.
+/// Zero traffic is a valid observation — it proves the server is idle, not that
+/// collection failed. Only skip windows where timing or metrics are absent entirely.
 pub fn window_is_evaluable(s: &RawSnapshot) -> bool {
-    let run_ok = s
+    // Duration must be present and positive — needed for all rate calculations.
+    let duration_ok = s
         .vllm
-        .num_requests_running
-        .filter(|x| x.is_finite())
-        .map(|r| r > EVALUABLE_RUNNING_GT)
-        .unwrap_or(false);
-    let tok_ok = s
-        .vllm
-        .generation_tokens_per_sec
-        .filter(|x| x.is_finite())
-        .map(|t| t > EVALUABLE_TOK_PER_SEC_GT)
-        .unwrap_or(false);
-    run_ok || tok_ok
+        .window_duration_secs
+        .filter(|w| w.is_finite() && *w > f64::EPSILON)
+        .is_some();
+
+    // vLLM metrics must have been collected — num_requests_running being Some
+    // (even if 0) means the endpoint responded successfully.
+    let vllm_ok = s.vllm.num_requests_running.is_some();
+
+    duration_ok && vllm_ok
+}
+
+#[cfg(test)]
+mod window_evaluable_tests {
+    use super::*;
+    use std::time::SystemTime;
+
+    fn snap(run: Option<f64>, duration: Option<f64>) -> RawSnapshot {
+        RawSnapshot {
+            gpu_observed_at: SystemTime::UNIX_EPOCH,
+            vllm_observed_at: SystemTime::UNIX_EPOCH,
+            timestamp: SystemTime::UNIX_EPOCH,
+            vllm: VllmRawMetrics {
+                num_requests_running: run,
+                window_duration_secs: duration,
+                ..Default::default()
+            },
+            gpu: Default::default(),
+        }
+    }
+
+    #[test]
+    fn false_when_running_missing() {
+        assert!(!window_is_evaluable(&snap(None, Some(2.0))));
+    }
+
+    #[test]
+    fn false_when_duration_missing() {
+        assert!(!window_is_evaluable(&snap(Some(0.0), None)));
+    }
+
+    #[test]
+    fn true_when_idle_with_valid_telemetry() {
+        assert!(window_is_evaluable(&snap(Some(0.0), Some(2.0))));
+    }
+
+    #[test]
+    fn false_when_duration_zero() {
+        assert!(!window_is_evaluable(&snap(Some(1.0), Some(0.0))));
+    }
 }

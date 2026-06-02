@@ -96,7 +96,6 @@ pub fn run(
 /// Returns the rule name that met window-significance thresholds, if any.
 /// Aligned with `engine::rule_is_significant` used by the diagnose UI formatter.
 fn primary_window_rule(result: &DiagnoseResult) -> Option<&'static str> {
-    let ctx = &result.static_ctx;
     let evaluable: Vec<_> = result
         .windows
         .iter()
@@ -109,14 +108,10 @@ fn primary_window_rule(result: &DiagnoseResult) -> Option<&'static str> {
     let r1_count = evaluable
         .iter()
         .filter(|w| {
-            let input = AnalysisInput::new(ctx, w);
-            let baseline = engine::baseline::compute(&input);
-            baseline.as_ref().is_some_and(|b| {
-                matches!(
-                    engine::rule1_under_batching(&w.snapshot, b),
-                    engine::Rule1Outcome::Fired(_)
-                )
-            })
+            matches!(
+                engine::rule1_under_batching(&w.snapshot),
+                engine::Rule1Outcome::Fired(_)
+            )
         })
         .count();
     if engine::rule_is_significant(r1_count, n) {
