@@ -7,7 +7,7 @@ use std::thread;
 
 const MINIMAL_SCRAPE: &str = "# TYPE noop gauge\nnoop 0\n";
 
-/// `vllm_num_requests_running` above the evaluable threshold (see `window_is_evaluable`).
+/// Includes `vllm_num_requests_running` so the window passes `window_is_evaluable`.
 const MINIMAL_EVALUABLE_SCRAPE: &str = r#"# TYPE vllm_num_requests_running gauge
 vllm_num_requests_running 20
 # TYPE noop gauge
@@ -167,8 +167,8 @@ fn diagnose_exits_success() {
 
 #[test]
 fn diagnose_shows_gen_tok_per_sec_when_counters_increase() {
-    const G100: &str = "vllm_generation_tokens_total 100\n";
-    const G250: &str = "vllm_generation_tokens_total 250\n";
+    const G100: &str = "vllm_num_requests_running 0\nvllm_generation_tokens_total 100\n";
+    const G250: &str = "vllm_num_requests_running 0\nvllm_generation_tokens_total 250\n";
     let bodies = [G100, G100, G100, G100, G100, G100, G100, G100, G250];
     let (url, server) = spawn_metrics_server_seq(&bodies);
     let output = Command::cargo_bin("profile")

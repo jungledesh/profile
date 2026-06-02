@@ -122,7 +122,7 @@ pub fn no_evaluable_diagnose_lines(verbose: bool, windows: &[RuntimeWindow]) -> 
                 .filter(|w| !window_is_evaluable(&w.snapshot))
                 .count();
             out.push(format!(
-                "Note: {skipped} of {total} collected windows had insufficient traffic (running ≤ 0.75 and tok/s ≤ 20)."
+                "Note: {skipped} of {total} collected windows had missing telemetry (duration or vLLM metrics absent)."
             ));
         }
     }
@@ -282,7 +282,7 @@ pub fn format_diagnose_rules_for_windows(
         }
         if verbose_rules && skipped > 0 {
             out.push(format!(
-                "Note: {skipped} of {total} windows had insufficient traffic for analysis."
+                "Note: {skipped} of {total} windows had missing telemetry (duration or vLLM metrics absent)."
             ));
         }
         trim_trailing_blank_lines(&mut out);
@@ -390,7 +390,7 @@ pub fn format_diagnose_rules_for_windows(
     if verbose_rules && skipped > 0 {
         out.push(String::new());
         out.push(format!(
-            "Note: {skipped} of {total} windows had insufficient traffic for analysis."
+            "Note: {skipped} of {total} windows had missing telemetry (duration or vLLM metrics absent)."
         ));
     }
 
@@ -1201,8 +1201,7 @@ mod tests {
     fn format_diagnose_rules_non_evaluable_snapshot_shows_note() {
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
-        v.num_requests_running = Some(0.0);
-        v.generation_tokens_per_sec = Some(0.0);
+        v.num_requests_running = None;
         let s = snap(t, t, v, gpu_busy());
         let ctx = mk_ctx();
         let win = mk_win(s);
@@ -1268,8 +1267,7 @@ mod tests {
         let t = SystemTime::UNIX_EPOCH;
         let ctx = mk_ctx();
         let mut v = vllm_base();
-        v.num_requests_running = Some(0.2);
-        v.generation_tokens_per_sec = Some(5.0);
+        v.num_requests_running = None;
         let w1 = mk_win(snap(t, t, v.clone(), gpu_busy()));
         let w2 = mk_win(snap(t, t, v, gpu_busy()));
         let windows = vec![w1, w2];

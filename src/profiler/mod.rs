@@ -470,6 +470,7 @@ mod tests {
                 prefix_cache_hit_rate: prefix_hit_rate,
                 prefix_cache_scrape_samples: samples,
                 generation_tokens_total,
+                window_duration_secs: Some(2.0),
                 ..Default::default()
             },
             gpu,
@@ -582,7 +583,7 @@ mod tests {
             g.clone(),
             Some(1000.0),
         );
-        let w2 = mk_snap(Some(0.5), None, None, None, None, g, Some(9999.0));
+        let w2 = mk_snap(None, None, None, None, None, g, Some(9999.0));
         let agg = aggregate_windows(
             &[w1, w2],
             &[Duration::from_secs(2), Duration::from_secs(2)],
@@ -595,15 +596,15 @@ mod tests {
     #[test]
     fn aggregate_all_non_evaluable_returns_chronological_last_snapshot() {
         let g = GpuRawMetrics::default();
-        let w1 = mk_snap(Some(0.0), None, None, None, None, g.clone(), Some(10.0));
-        let w2 = mk_snap(Some(0.0), None, None, None, None, g, Some(20.0));
+        let w1 = mk_snap(None, None, None, None, None, g.clone(), Some(10.0));
+        let w2 = mk_snap(None, None, None, None, None, g, Some(20.0));
         let agg = aggregate_windows(
             &[w1, w2],
             &[Duration::from_secs(2), Duration::from_secs(2)],
             SystemTime::UNIX_EPOCH,
         );
         assert_eq!(agg.vllm.generation_tokens_total, Some(20.0));
-        assert!((agg.vllm.num_requests_running.unwrap()).abs() < 1e-9);
+        assert!(agg.vllm.num_requests_running.is_none());
     }
 
     #[test]
@@ -651,6 +652,7 @@ mod tests {
             generation_tokens_per_sec: Some(100.0),
             kv_cache_usage_perc: Some(40.0),
             kv_cache_peak_perc: Some(92.0),
+            window_duration_secs: Some(2.0),
             ..Default::default()
         };
         let g1 = GpuRawMetrics {
@@ -664,6 +666,7 @@ mod tests {
             generation_tokens_per_sec: Some(100.0),
             kv_cache_usage_perc: Some(10.0),
             kv_cache_peak_perc: Some(15.0),
+            window_duration_secs: Some(2.0),
             ..Default::default()
         };
         let g2 = GpuRawMetrics {
@@ -705,6 +708,7 @@ mod tests {
             generation_tokens_per_sec: Some(100.0),
             kv_cache_usage_perc: Some(40.0),
             kv_cache_peak_perc: Some(40.0),
+            window_duration_secs: Some(2.0),
             ..Default::default()
         };
         let g1 = GpuRawMetrics {
@@ -718,6 +722,7 @@ mod tests {
             generation_tokens_per_sec: Some(100.0),
             kv_cache_usage_perc: Some(95.0),
             kv_cache_peak_perc: Some(50.0),
+            window_duration_secs: Some(2.0),
             ..Default::default()
         };
         let g2 = GpuRawMetrics {
@@ -757,6 +762,7 @@ mod tests {
         let v = VllmRawMetrics {
             num_requests_running: Some(2.0),
             generation_tokens_per_sec: Some(100.0),
+            window_duration_secs: Some(2.0),
             ..Default::default()
         };
         let g1 = GpuRawMetrics {
@@ -798,6 +804,7 @@ mod tests {
         let v1 = VllmRawMetrics {
             num_requests_running: Some(2.0),
             generation_tokens_per_sec: Some(100.0),
+            window_duration_secs: Some(10.0),
             ttft_ms: Some(5000.0),
             ttft_window_mass: Some(HistogramWindowMass {
                 sum_delta: 5.0,
@@ -808,6 +815,7 @@ mod tests {
         let v2 = VllmRawMetrics {
             num_requests_running: Some(2.0),
             generation_tokens_per_sec: Some(100.0),
+            window_duration_secs: Some(2.0),
             ttft_ms: Some(50.0),
             ttft_window_mass: Some(HistogramWindowMass {
                 sum_delta: 25.0,
