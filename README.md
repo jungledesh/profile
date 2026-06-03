@@ -93,3 +93,33 @@ cargo install --git https://github.com/jungledesh/profile
 
 Built to make vLLM inference diagnostics predictable, truthful, and actionable.  
 Feedback and real-world usage are welcome.
+
+---
+
+## License
+
+**Profile** is open source software licensed under the **Apache License 2.0**.  
+See the full [LICENSE](LICENSE) file for details.
+
+```
+Copyright 2025-2026 Gagandeep Singh
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+```
+
+## Commercial Use
+
+The core of Profile is and will remain fully open source.  
+We are building a sustainable business around it through hosted/managed SaaS, enterprise support, and premium capabilities coming in future versions.
+
+If you're using Profile in production or want to discuss commercial licensing, support, or custom development, reach out: **jungledesh@gmail.com**
