@@ -119,7 +119,7 @@ limitations under the License.
 
 ## Commercial Use
 
-The core of Profile is and will remain fully open source.  
-We are building a sustainable business around it through hosted/managed SaaS, enterprise support, and premium capabilities coming in future versions.
+The core of Profile is and will remain fully open source under the Apache 2.0 license.  
+We are building a sustainable business around it through hosted/managed SaaS, enterprise support and SLAs, and premium capabilities in future versions.
 
-If you're using Profile in production or want to discuss commercial licensing, support, or custom development, reach out: **jungledesh@gmail.com**
+If you're using Profile in production or want to discuss commercial licensing, support contracts, or custom development, reach out: **jungledesh@gmail.com**
