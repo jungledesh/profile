@@ -1,7 +1,6 @@
 use std::time::Duration;
 
 use super::{delta, drift, poll, run_diagnose, state::LoopState, DiagnoseResult};
-use crate::collectors::window_is_evaluable;
 use crate::context::{AnalysisInput, RuntimeWindow};
 use crate::engine;
 use crate::output;
@@ -19,26 +18,27 @@ pub fn run(
     let stdin_rx = poll::spawn_stdin_watcher();
 
     loop {
-        let rule_name = match primary_window_rule(&state.last().result)
-            .or_else(|| state.current_primary_recommendation().map(|r| r.rule_name))
-        {
-            None => {
-                let baseline = state.last().report.baseline.as_ref();
-                let efficiency = baseline.and_then(|b| b.efficiency_pct);
-                let headroom = baseline.and_then(|b| b.headroom_pct);
+        let Some(rule_name) = state
+            .last()
+            .report
+            .groups
+            .first()
+            .map(|g| g.primary.rule_name)
+        else {
+            let baseline = state.last().report.baseline.as_ref();
+            let efficiency = baseline.and_then(|b| b.efficiency_pct);
+            let headroom = baseline.and_then(|b| b.headroom_pct);
 
-                let msg = if efficiency.is_some_and(|e| e > 100.0) {
-                    "No issues detected. Server is healthy under current load."
-                } else if headroom.is_some_and(|h| h < CEILING_HEADROOM_THRESHOLD_PCT) {
-                    "No issues detected. Server is at hardware capacity."
-                } else {
-                    "No issues detected. Server is healthy under current load."
-                };
+            let msg = if efficiency.is_some_and(|e| e > 100.0) {
+                "No issues detected. Server is healthy under current load."
+            } else if headroom.is_some_and(|h| h < CEILING_HEADROOM_THRESHOLD_PCT) {
+                "No issues detected. Server is at hardware capacity."
+            } else {
+                "No issues detected. Server is healthy under current load."
+            };
 
-                println!("\n{msg}");
-                break;
-            }
-            Some(rule_name) => rule_name,
+            println!("\n{msg}");
+            break;
         };
 
         if state.is_oscillating() {
@@ -57,7 +57,7 @@ pub fn run(
         let new_result = run_diagnose(url, max_num_seqs, duration)?;
         let agg_win = RuntimeWindow::from_snapshot(new_result.snapshot.clone());
         let summary = AnalysisInput::new(&new_result.static_ctx, &agg_win);
-        let new_report = engine::build_report(summary);
+        let new_report = engine::build_report_for_diagnose(&new_result.windows, summary);
 
         let drifted =
             drift::config_changed(&state.last().result.static_ctx, &new_result.static_ctx);
@@ -91,33 +91,6 @@ pub fn run(
     }
 
     Ok(())
-}
-
-/// Returns the rule name that met window-significance thresholds, if any.
-/// Aligned with `engine::rule_is_significant` used by the diagnose UI formatter.
-fn primary_window_rule(result: &DiagnoseResult) -> Option<&'static str> {
-    let evaluable: Vec<_> = result
-        .windows
-        .iter()
-        .filter(|w| window_is_evaluable(&w.snapshot))
-        .collect();
-    let n = evaluable.len();
-    if n == 0 {
-        return None;
-    }
-    let r1_count = evaluable
-        .iter()
-        .filter(|w| {
-            matches!(
-                engine::rule1_under_batching(&w.snapshot),
-                engine::Rule1Outcome::Fired(_)
-            )
-        })
-        .count();
-    if engine::rule_is_significant(r1_count, n) {
-        return Some("under_batching");
-    }
-    None
 }
 
 fn print_delta(d: &delta::Delta) {

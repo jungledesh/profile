@@ -12,6 +12,7 @@ fn build_input(
     cfg: VllmConfig,
     prompt_tokens_mean: Option<f64>,
     generation_tokens_per_sec: Option<f64>,
+    num_requests_running: Option<f64>,
 ) -> (StaticContext, RuntimeWindow) {
     let snap = RawSnapshot {
         gpu_observed_at: SystemTime::UNIX_EPOCH,
@@ -21,6 +22,7 @@ fn build_input(
             model_name: Some(model_name.to_string()),
             prompt_tokens_mean,
             generation_tokens_per_sec,
+            num_requests_running,
             ..Default::default()
         },
         gpu: GpuRawMetrics {
@@ -47,6 +49,7 @@ fn h100_sxm_llama3_70b_decode_ceiling_is_about_23_9_tok_s() {
         cfg,
         Some(2048.0),
         Some(10.0),
+        None,
     );
     let input = AnalysisInput::new(&ctx, &win);
     let baseline = compute(&input);
@@ -81,6 +84,7 @@ fn h100_sxm_llama3_8b_decode_ceiling_is_about_209_tok_s() {
         cfg,
         Some(2048.0),
         Some(10.0),
+        None,
     );
     let input = AnalysisInput::new(&ctx, &win);
     let baseline = compute(&input);
@@ -108,6 +112,7 @@ fn a100_80gb_llama3_70b_decode_ceiling_is_about_14_6_tok_s() {
         cfg,
         Some(2048.0),
         Some(10.0),
+        None,
     );
     let input = AnalysisInput::new(&ctx, &win);
     let baseline = compute(&input);
@@ -134,6 +139,7 @@ fn compute_returns_none_when_gpu_not_in_catalog() {
         cfg,
         Some(2048.0),
         Some(10.0),
+        None,
     );
     let input = AnalysisInput::new(&ctx, &win);
     assert!(compute(&input).is_none());
@@ -152,6 +158,7 @@ fn compute_returns_none_when_model_not_in_catalog() {
         cfg,
         Some(2048.0),
         Some(10.0),
+        None,
     );
     let input = AnalysisInput::new(&ctx, &win);
     assert!(compute(&input).is_none());
@@ -170,6 +177,7 @@ fn prefill_is_none_when_seq_len_unavailable() {
         cfg,
         None,
         Some(10.0),
+        None,
     );
     let input = AnalysisInput::new(&ctx, &win);
     let baseline = compute(&input);
@@ -193,6 +201,7 @@ fn efficiency_is_none_when_actual_tps_missing() {
         "NVIDIA H100 80GB HBM3",
         cfg,
         Some(2048.0),
+        None,
         None,
     );
     let input = AnalysisInput::new(&ctx, &win);
@@ -219,6 +228,7 @@ fn efficiency_none_when_actual_above_decode_ceiling() {
         cfg,
         Some(2048.0),
         Some(1000.0),
+        Some(1.0),
     );
     let input = AnalysisInput::new(&ctx, &win);
     let baseline = compute(&input);
@@ -244,11 +254,12 @@ fn efficiency_some_in_zero_to_100_when_below_ceiling() {
         cfg,
         Some(2048.0),
         Some(10.0),
+        Some(1.0),
     );
     let input = AnalysisInput::new(&ctx, &win);
     let b = compute(&input).expect("baseline");
     assert!(
-        10.0 <= b.decode.expected,
+        10.0 <= b.decode.expected * 1.0,
         "test setup: actual must be at or below decode ceiling"
     );
     let eff = b.efficiency_pct.expect("efficiency");
