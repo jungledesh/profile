@@ -102,7 +102,7 @@ Feedback and real-world usage are welcome.
 See the full [LICENSE](LICENSE) file for details.
 
 ```
-Copyright 2025-2026 Gagandeep Singh
+Copyright 2026 Gagandeep Singh
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
