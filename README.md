@@ -1,43 +1,66 @@
 # profile — vLLM Inference Diagnoser
 
-**Less words. More insights.**  
-Find and fix inference bottlenecks in minutes. 
+Find and fix inference bottlenecks. Know what your hardware is capable of, and whether you're getting it.
+
+**v2 is work in progress.**
+
+---
 
 ## What it does
 
-`profile` turns raw vLLM + GPU metrics into **clear diagnosis and actionable fixes**.
+Samples GPU + vLLM signals every 250ms. Computes a physics baseline (roofline). Runs gap analysis. Tells you what's wrong, why, and what to fix first.
 
-- Samples GPU + vLLM signals every **250ms**
-- Supports instant snapshots and longer analysis (`--duration 30s | 1m | 5m | ...`)
-- Detects real production bottlenecks:
-  - **Under-batching** — GPU has headroom, but scheduler occupancy is too low
-  - **KV Cache Pressure** — KV usage near capacity → eviction risk
-  - **Low Prefix Cache reuse** — prompts don’t share context → wasted performance
-  - **Parallelism mismatch** — model weights exceed single-GPU VRAM but TP not set
-  - **Concurrency Saturation** — scheduler pinned at max_num_seqs cap with queue building
+- Filters idle windows, reports only under-load behavior
+- Every number is hardware-referenced: your GPU, your model, your actual ceiling
+- Aggregated across your observation window, not a single noisy sample
 
-It tells you **what’s wrong, why it’s happening, and what to fix first**, so you can reduce cost per token.
+**Detects real production bottlenecks:**
 
-### Reports 3 kinds of numbers
+- **Under-batching** — GPU has headroom, scheduler occupancy too low
+- **KV Cache Pressure** — KV usage near capacity, eviction risk
+- **Concurrency Saturation** — scheduler pinned at `max_num_seqs` cap, queue building
 
-1. **Under-load behavior only** — profile filters out idle windows and reports only what happens under real traffic. A session-wide average diluted by quiet time hides the problem; profile shows you the character of your server when it's actually working.
+---
 
-2. **Aggregated, not instantaneous** — a single 250ms sample is noise. Profile collects across your full observation window and aggregates correctly: rates as duration-weighted means, latency histograms as true deltas, gauges as last stable value. What you see is representative, not lucky.
+## Example Output
 
-3. **Hardware-referenced** — every number is shown against what your specific GPU and model are theoretically capable of. Not a generic benchmark. Not a guess. Your actual decode ceiling, your actual weight footprint, your actual headroom.
+```
++------------------------------------------------------------------------------------------+
+|PROFILE v2.0.0 [llama3] [NVIDIA H200] (2m from 2026-06-03 22:25:45 UTC)                  |
+|GPU =>     EFFICIENCY 31.7% | POWER 421W | vRAM 70/140GB                                  |
+|                                                                                          |
+|vLLM:                                                                                     |
+|REQUESTS   run 63 (98.0%) | wait 25 | max 64                                              |
+|LATENCY    ttft 656ms | tpot 11ms                                                         |
+|PROMPT     kv_cache 1.1% avg                                                              |
+|THROUGHPUT 5970 tok/s | pfix_cache 88.9%                                                  |
+|TRAFFIC    qps 46.5 | req_total 6336 | gen_total 812499 | preempt/s 0.00 | preempt_total 0|
+|                                                                                          |
+|ISSUES:                                                                                   |
+|                                                                                          |
+|[!] Concurrency Saturation                                                                |
+|  Seen in 58% of windows                                                                  |
+|                                                                                          |
+|  Cause:                                                                                  |
+|    • --max-num-seqs=64 hit: scheduler won't admit more sequences                         |
+|    • 33% of requests waiting (32 of 96 active)                                           |
+|    • TTFT 0.6s                                                                           |
+|                                                                                          |
+|  Fix:                                                                                    |
+|    • Raise --max-num-seqs above 64 (KV cache 1% used, pool has room)                     |
+|                                                                                          |
+|  Expected: Queue drains, TTFT recovers.                                                  |
+|  Confidence: High                                                                        |
+|                                                                                          |
+|No issues for Under-batching and KV cache pressure                                        |
++------------------------------------------------------------------------------------------+
+```
 
-## Why use this
-
-vLLM `/metrics` shows numbers.  
-`profile` answers:
-
-- Why is my GPU at 50%?
-- Why is throughput lower than expected?
-- Where am I wasting tokens / memory?
+---
 
 ## Installation
 
-**Linux binary (recommended for quick start)**  
+**Linux binary**
 Download from the [latest release](https://github.com/jungledesh/profile/releases).
 
 ```bash
@@ -45,51 +68,28 @@ chmod +x profile
 ./profile diagnose --url http://localhost:8000/metrics --duration 5m
 ```
 
-### Cargo
+**Cargo**
 
-```
+```bash
 cargo install --git https://github.com/jungledesh/profile
 ```
 
-### Pip package
+---
 
-coming soon 
+## Usage
 
-### Quick Start
-
-```
-# Instant snapshot (2s)
+```bash
+# Instant snapshot
 ./profile diagnose --url http://localhost:8000/metrics
 
-# Recommended: 5-minute analysis
+# Recommended: 5-minute window
 ./profile diagnose --url http://localhost:8000/metrics --duration 5m
 
 # Verbose mode
 ./profile -v diagnose --url http://localhost:8000/metrics --duration 5m
 ```
 
-## Example Output
+---
 
-```bash
-KV Cache Pressure
-Seen in 80% of windows
-
-Cause:
-- KV usage 93.5% — near capacity
-- High concurrency with long sequences
-
-Recommendation:
-  • Reduce active sequence count (lower concurrency)
-  • Shorten prompts/outputs where possible
-  • Use fp8 KV cache (--kv-cache-dtype=fp8)
-```
-
-## Development Notes
-
-Built as a focused solo project to make vLLM inference diagnostics  
-**predictable, truthful, and actionable**.
-
-This is **v2.0.0** — currently optimized for single-GPU setups.
-
-Feedback and real-world usage are highly valuable.  
-A deeper technical write-up is coming soon.
+Built to make vLLM inference diagnostics predictable, truthful, and actionable.  
+Feedback and real-world usage are welcome.
