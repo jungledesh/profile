@@ -54,6 +54,10 @@ pub fn run_diagnose(
         config.model_name, config.model_root
     );
     let static_ctx = StaticContext::from_snapshot(&snapshot, config);
+    eprintln!(
+        "[debug] param_count={:?} gpu_bw={:?}",
+        static_ctx.model.param_count, static_ctx.gpu.peak_bw_gbps,
+    );
     let windows: Vec<RuntimeWindow> = raw_windows
         .into_iter()
         .map(RuntimeWindow::from_snapshot)
