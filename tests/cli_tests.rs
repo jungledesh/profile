@@ -10,6 +10,12 @@ const MINIMAL_SCRAPE: &str = "# TYPE noop gauge\nnoop 0\n";
 /// Includes `vllm_num_requests_running` so the window passes `window_is_evaluable`.
 const MINIMAL_EVALUABLE_SCRAPE: &str = r#"# TYPE vllm_num_requests_running gauge
 vllm_num_requests_running 20
+vllm_max_num_seqs 256
+vllm_kv_cache_usage_perc 10
+vllm_prefix_cache_hits_total 50
+vllm_prefix_cache_queries_total 100
+vllm_request_success_total 10
+vllm_generation_tokens_total 1000
 # TYPE noop gauge
 noop 0
 "#;
@@ -97,15 +103,40 @@ fn help_exits_success() {
         .success();
 }
 
+const MINIMAL_PREFIX_EARLY: &str = r#"vllm_prefix_cache_hits 0
+vllm_prefix_cache_queries 100
+vllm_num_requests_running 20
+vllm_max_num_seqs 256
+vllm_kv_cache_usage_perc 50
+vllm_request_success_total 10
+vllm_generation_tokens_total 1000
+"#;
+const MINIMAL_PREFIX_LATE: &str = r#"vllm_prefix_cache_hits 50
+vllm_prefix_cache_queries 200
+vllm_num_requests_running 20
+vllm_max_num_seqs 256
+vllm_kv_cache_usage_perc 50
+vllm_request_success_total 10
+vllm_generation_tokens_total 1100
+"#;
+
 #[test]
 fn diagnose_exits_success() {
-    let (url, server) = spawn_metrics_server(MINIMAL_EVALUABLE_SCRAPE, SAMPLE_COUNT);
+    let bodies = [
+        MINIMAL_PREFIX_EARLY,
+        MINIMAL_PREFIX_EARLY,
+        MINIMAL_PREFIX_EARLY,
+        MINIMAL_PREFIX_EARLY,
+        MINIMAL_PREFIX_EARLY,
+        MINIMAL_PREFIX_EARLY,
+        MINIMAL_PREFIX_EARLY,
+        MINIMAL_PREFIX_EARLY,
+        MINIMAL_PREFIX_LATE,
+    ];
+    let (url, server) = spawn_metrics_server_seq(&bodies);
     let output = Command::cargo_bin("profile")
         .unwrap()
-        .arg("diagnose")
-        .arg("--duration")
-        .arg("2s")
-        .arg("--url")
+        .args(["diagnose", "--duration", "2s", "-m", "256", "--url"])
         .arg(&url)
         .output()
         .expect("run profile diagnose");
@@ -117,6 +148,10 @@ fn diagnose_exits_success() {
     );
 
     let out = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        !out.contains("[i]"),
+        "minimal scrape should not emit metric advisories; got:\n{out}"
+    );
     assert!(
         out.contains("PROFILE v") && out.contains('[') && out.contains(" UTC]"),
         "stdout should show PROFILE header with model/GPU and bracketed UTC timestamp; got:\n{out}"
@@ -144,6 +179,10 @@ fn diagnose_exits_success() {
     assert!(
         out.contains("THROUGHPUT") && out.contains("tok/s"),
         "stdout should include THROUGHPUT row; got:\n{out}"
+    );
+    assert!(
+        out.contains("TRAFFIC"),
+        "stdout should always include TRAFFIC row; got:\n{out}"
     );
     assert!(
         out.contains("pfix_cache "),

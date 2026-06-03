@@ -17,7 +17,7 @@ pub fn execute(
 
     let aggregate_win = context::RuntimeWindow::from_snapshot(result.snapshot.clone());
     let summary_input = context::AnalysisInput::new(&result.static_ctx, &aggregate_win);
-    let report = engine::build_report(summary_input);
+    let report = engine::build_report_for_diagnose(&result.windows, summary_input);
 
     profiler::loop_runner::run(vllm_metrics_input, max_num_seqs, duration, result, report)?;
 

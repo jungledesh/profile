@@ -66,9 +66,11 @@ python -m vllm.entrypoints.openai.api_server \
   --host 0.0.0.0 \
   --port 8000 \
   --dtype auto \
-  --gpu-memory-utilization 0.55 \
+  --gpu-memory-utilization 0.50 \
   --tensor-parallel-size 1 \
   --enforce-eager \
+  --max-model-len 4096 \
+  --max-num-seqs 64 \
   --enable-prefix-caching \
   2>&1 | tee \"$LOG_FILE\"'"
 

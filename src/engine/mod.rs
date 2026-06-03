@@ -1,7 +1,7 @@
 pub mod baseline;
 mod rules;
 
-use crate::context::AnalysisInput;
+use crate::context::{AnalysisInput, RuntimeWindow};
 
 pub use baseline::{CeilingEstimate, PhysicsBaseline, WeightDtypeSource};
 pub use rules::*;
@@ -14,6 +14,20 @@ pub struct Report {
     pub r2_suppressed_by_r4: bool,
 }
 
+/// Single-window aggregate report, or multi-window significance report when `windows.len() > 1`.
+///
+/// On the first diagnose iteration there is typically only one collected window, so the
+/// single-window path fires. Subsequent iterations (after `run_diagnose` re-collects) accumulate
+/// enough windows for the multi-window significance gates to apply. This is intentional: the
+/// loop's exit decision and the UI rule text always use the same report.
+pub fn build_report_for_diagnose(windows: &[RuntimeWindow], input: AnalysisInput<'_>) -> Report {
+    if windows.len() <= 1 {
+        build_report(input)
+    } else {
+        rules::build_report_for_windows(windows, input)
+    }
+}
+
 pub fn build_report(input: AnalysisInput<'_>) -> Report {
     let baseline = baseline::compute(&input);
     let snapshot = &input.window.snapshot;
@@ -21,7 +35,7 @@ pub fn build_report(input: AnalysisInput<'_>) -> Report {
     let tp = input.ctx.config.tensor_parallel_size;
 
     let mut recs: Vec<Recommendation> = [
-        rules::r1_recommendation(snapshot),
+        rules::r1_recommendation(snapshot, input.ctx.config.max_num_seqs),
         rules::r2_recommendation(snapshot, input.ctx.config.max_model_len),
         rules::r3_recommendation(snapshot),
         rules::r4_recommendation(kv_headroom, tp),
@@ -35,6 +49,7 @@ pub fn build_report(input: AnalysisInput<'_>) -> Report {
         if let Some(r5) = rules::r5_recommendation(
             snapshot,
             snapshot.vllm.kv_cache_usage_perc,
+            input.ctx.config.max_num_seqs,
             input.ctx.config.max_model_len,
         ) {
             recs.push(r5);

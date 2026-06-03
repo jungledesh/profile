@@ -25,12 +25,17 @@ pub struct ConcurrencySaturationDetail {
 pub fn rule5_concurrency_saturation(
     snapshot: &RawSnapshot,
     kv_cache_usage_perc: Option<f64>,
+    config_max_num_seqs: Option<u32>,
 ) -> Option<ConcurrencySaturationDetail> {
     let run = snapshot
         .vllm
         .num_requests_running
         .filter(|v| v.is_finite() && *v > 0.0)?;
-    let max_seqs = snapshot.vllm.max_num_seqs.filter(|&n| n > 0)?;
+    let max_seqs = snapshot
+        .vllm
+        .max_num_seqs
+        .or(config_max_num_seqs)
+        .filter(|&n| n > 0)?;
     // Exact equality: scheduler cap is the bottleneck.
     // run > max_seqs means chunked prefill is batching across steps — cap is not the constraint.
     if (run - f64::from(max_seqs)).abs() > 0.5 {
@@ -129,9 +134,10 @@ pub(super) fn format_concurrency_saturation_window_issue(
 pub fn r5_recommendation(
     snapshot: &RawSnapshot,
     kv_cache_usage_perc: Option<f64>,
+    config_max_num_seqs: Option<u32>,
     max_model_len: Option<u32>,
 ) -> Option<Recommendation> {
-    let d = rule5_concurrency_saturation(snapshot, kv_cache_usage_perc)?;
+    let d = rule5_concurrency_saturation(snapshot, kv_cache_usage_perc, config_max_num_seqs)?;
     let max_label = d
         .max_num_seqs
         .map(|n| n.to_string())
@@ -222,7 +228,7 @@ mod tests {
 
     #[test]
     fn fires_when_at_max_num_seqs_and_ratio_at_least_0_30() {
-        let d = rule5_concurrency_saturation(&snap(sat_vllm(32.0, 15.0, Some(32))), None)
+        let d = rule5_concurrency_saturation(&snap(sat_vllm(32.0, 15.0, Some(32))), None, None)
             .expect("fired");
         assert_eq!(d.max_num_seqs, Some(32));
         assert!((d.queue_ratio - (15.0 / 47.0)).abs() < 1e-9);
@@ -232,31 +238,45 @@ mod tests {
     #[test]
     fn silent_when_run_below_max_num_seqs() {
         assert!(
-            rule5_concurrency_saturation(&snap(sat_vllm(31.0, 15.0, Some(32))), None).is_none()
+            rule5_concurrency_saturation(&snap(sat_vllm(31.0, 15.0, Some(32))), None, None)
+                .is_none()
         );
     }
 
     #[test]
     fn silent_when_ratio_below_0_30() {
-        assert!(rule5_concurrency_saturation(&snap(sat_vllm(32.0, 2.0, Some(32))), None).is_none());
+        assert!(
+            rule5_concurrency_saturation(&snap(sat_vllm(32.0, 2.0, Some(32))), None, None)
+                .is_none()
+        );
     }
 
     #[test]
     fn silent_when_max_num_seqs_missing() {
-        assert!(rule5_concurrency_saturation(&snap(sat_vllm(32.0, 15.0, None)), None).is_none());
+        assert!(
+            rule5_concurrency_saturation(&snap(sat_vllm(32.0, 15.0, None)), None, None).is_none()
+        );
+    }
+
+    #[test]
+    fn fires_when_max_num_seqs_from_config_fallback() {
+        let d = rule5_concurrency_saturation(&snap(sat_vllm(32.0, 15.0, None)), None, Some(32))
+            .expect("config max_num_seqs");
+        assert_eq!(d.max_num_seqs, Some(32));
     }
 
     #[test]
     fn silent_when_num_requests_waiting_missing() {
         let mut v = sat_vllm(32.0, 15.0, Some(32));
         v.num_requests_waiting = None;
-        assert!(rule5_concurrency_saturation(&snap(v), None).is_none());
+        assert!(rule5_concurrency_saturation(&snap(v), None, None).is_none());
     }
 
     #[test]
     fn silent_when_run_exceeds_max_num_seqs_chunked_prefill() {
         assert!(
-            rule5_concurrency_saturation(&snap(sat_vllm(40.0, 15.0, Some(32))), None).is_none()
+            rule5_concurrency_saturation(&snap(sat_vllm(40.0, 15.0, Some(32))), None, None)
+                .is_none()
         );
     }
 

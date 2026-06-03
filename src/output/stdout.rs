@@ -82,7 +82,7 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
         "{:<width$}{}{}",
         "GPU =>",
         VLLM_LABEL_METRICS_GAP,
-        gpu_gauges_line(g, report.baseline.as_ref().and_then(|b| b.efficiency_pct)),
+        gpu_gauges_line(g, report.baseline.as_ref(), v.generation_tokens_per_sec,),
         width = VLLM_LABEL_W
     ));
     if verbose_rules {
@@ -96,7 +96,10 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
     }
     lines.push(String::new());
     lines.push(vllm_label_row("vLLM:", ""));
-    lines.push(vllm_label_row("REQUESTS", &vllm_requests_value(v)));
+    lines.push(vllm_label_row(
+        "REQUESTS",
+        &vllm_requests_value(v, result.static_ctx.config.max_num_seqs),
+    ));
     lines.push(vllm_label_row(
         "LATENCY",
         &vllm_latency_value(v, verbose_rules),
@@ -106,9 +109,9 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
         &vllm_prompt_value(v, verbose_rules),
     ));
     lines.push(vllm_label_row("THROUGHPUT", &vllm_throughput_value(v)));
+    lines.push(vllm_label_row("TRAFFIC", &vllm_traffic_value(v)));
     if verbose_rules {
         lines.push(vllm_label_row("MEMORY", &vllm_memory_value(v)));
-        lines.push(vllm_label_row("TRAFFIC", &vllm_traffic_value(v)));
         lines.push(vllm_label_row("CACHE CFG", &vllm_cache_cfg_value(v)));
         lines.push(String::new());
         lines.push(vllm_label_row("Config:", ""));
@@ -119,9 +122,14 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
     }
 
     let rule_lines = if result.windows.len() <= 1 {
-        engine::format_diagnose_rules(summary_input, verbose_rules)
+        engine::format_diagnose_rules(summary_input, verbose_rules, &result.metrics_input)
     } else {
-        engine::format_diagnose_rules_for_windows(&result.windows, summary_input, verbose_rules)
+        engine::format_diagnose_rules_for_windows(
+            &result.windows,
+            summary_input,
+            verbose_rules,
+            &result.metrics_input,
+        )
     };
     if !rule_lines.is_empty() {
         lines.push(String::new());
@@ -250,10 +258,16 @@ fn print_boxed(lines: &[String]) {
     println!("{}", border);
 }
 
-fn gpu_gauges_line(g: &GpuRawMetrics, efficiency_pct: Option<f64>) -> String {
-    let efficiency = efficiency_pct
-        .map(|e| format!("EFFICIENCY {:.1}%", e))
-        .unwrap_or_else(|| "EFFICIENCY —".to_string());
+fn gpu_gauges_line(
+    g: &GpuRawMetrics,
+    baseline: Option<&crate::engine::PhysicsBaseline>,
+    actual_tps: Option<f64>,
+) -> String {
+    let efficiency = format_efficiency_label(
+        baseline.and_then(|b| b.efficiency_pct),
+        actual_tps,
+        baseline.map(|b| b.decode.expected),
+    );
 
     let power = g
         .power_watts
@@ -279,11 +293,29 @@ fn gpu_gauges_line(g: &GpuRawMetrics, efficiency_pct: Option<f64>) -> String {
     format!("{efficiency} | {power} | {mem}")
 }
 
-fn vllm_requests_value(v: &VllmRawMetrics) -> String {
+fn format_efficiency_label(
+    efficiency_pct: Option<f64>,
+    actual_tps: Option<f64>,
+    decode_ceiling: Option<f64>,
+) -> String {
+    if let Some(e) = efficiency_pct.filter(|e| e.is_finite()) {
+        return format!("EFFICIENCY {:.1}%", e);
+    }
+    let actual = actual_tps.filter(|t| t.is_finite() && *t > 0.0);
+    let ceiling = decode_ceiling.filter(|c| c.is_finite() && *c > 0.0);
+    if actual.is_some() && ceiling.is_some() {
+        "EFFICIENCY ?".to_string()
+    } else {
+        "EFFICIENCY —".to_string()
+    }
+}
+
+fn vllm_requests_value(v: &VllmRawMetrics, config_max_num_seqs: Option<u32>) -> String {
+    let max_n = v.max_num_seqs.or(config_max_num_seqs).filter(|&m| m > 0);
     let run = match v.num_requests_running.filter(|x| x.is_finite()) {
         Some(avg) => {
             let rounded = avg.round();
-            if let Some(max_n) = v.max_num_seqs.filter(|&m| m > 0) {
+            if let Some(max_n) = max_n {
                 let pct = (avg / f64::from(max_n)) * 100.0;
                 format!("run {:.0} ({:.1}%)", rounded, pct)
             } else {
@@ -296,8 +328,7 @@ fn vllm_requests_value(v: &VllmRawMetrics) -> String {
         Some(w) => format!("wait {:.0}", w.round()),
         None => "wait —".to_string(),
     };
-    let max_seq = v
-        .max_num_seqs
+    let max_seq = max_n
         .map(|n| format!("max {n}"))
         .unwrap_or_else(|| "max —".to_string());
 
@@ -769,6 +800,26 @@ mod tests {
         );
     }
 
+    fn baseline_efficiency(eff: f64) -> crate::engine::PhysicsBaseline {
+        use crate::engine::baseline::{CeilingEstimate, PhysicsBaseline, WeightDtypeSource};
+        PhysicsBaseline {
+            decode: CeilingEstimate {
+                lower: 100.0,
+                expected: 100.0,
+                upper: 100.0,
+            },
+            prefill: None,
+            efficiency_pct: Some(eff),
+            headroom_pct: None,
+            weight_dtype_source: WeightDtypeSource::Fallback,
+            weight_gb: 1.0,
+            kv_headroom_gb: None,
+            tpot_floor_ms: 10.0,
+            prefill_latency_floor_ms: None,
+            ridge_batch_size: 1.0,
+        }
+    }
+
     #[test]
     fn gpu_gauges_line_formats_mem_gb() {
         let g = GpuRawMetrics {
@@ -779,7 +830,7 @@ mod tests {
             vram_total_mb: Some(80 * 1024),
             ..Default::default()
         };
-        let s = gpu_gauges_line(&g, Some(28.0));
+        let s = gpu_gauges_line(&g, Some(&baseline_efficiency(28.0)), None);
         assert!(s.contains("EFFICIENCY 28.0%"));
         assert!(s.contains("POWER 310W"));
         assert!(s.contains("vRAM 72/80GB"));
@@ -791,7 +842,7 @@ mod tests {
             vram_total_mb: Some(80 * 1024),
             ..Default::default()
         };
-        let s_peak = gpu_gauges_line(&g_peak, None);
+        let s_peak = gpu_gauges_line(&g_peak, None, None);
         assert!(s_peak.contains("vRAM 60/80GB (peak 78GB)"));
         let g_peak_below_frac = GpuRawMetrics {
             gpu_util_pct: Some(28.0),
@@ -801,7 +852,7 @@ mod tests {
             vram_total_mb: Some(80 * 1024),
             ..Default::default()
         };
-        assert!(!gpu_gauges_line(&g_peak_below_frac, None).contains("peak"));
+        assert!(!gpu_gauges_line(&g_peak_below_frac, None, None).contains("peak"));
         let g_no_recovery = GpuRawMetrics {
             gpu_util_pct: Some(28.0),
             power_watts: Some(310.0),
@@ -810,7 +861,16 @@ mod tests {
             vram_total_mb: Some(80 * 1024),
             ..Default::default()
         };
-        assert!(!gpu_gauges_line(&g_no_recovery, None).contains("peak"));
+        assert!(!gpu_gauges_line(&g_no_recovery, None, None).contains("peak"));
+    }
+
+    #[test]
+    fn gpu_gauges_line_efficiency_unknown_when_throughput_exceeds_ceiling_model() {
+        let g = GpuRawMetrics::default();
+        let mut b = baseline_efficiency(50.0);
+        b.efficiency_pct = None;
+        let s = gpu_gauges_line(&g, Some(&b), Some(200.0));
+        assert!(s.contains("EFFICIENCY ?"));
     }
 
     #[test]
@@ -853,7 +913,10 @@ mod tests {
             max_num_seqs: Some(256),
             ..Default::default()
         };
-        assert_eq!(vllm_requests_value(&v), "run 2 (0.8%) | wait 1 | max 256");
+        assert_eq!(
+            vllm_requests_value(&v, Some(256)),
+            "run 2 (0.8%) | wait 1 | max 256"
+        );
     }
 
     #[test]
@@ -864,7 +927,11 @@ mod tests {
             max_num_seqs: None,
             ..Default::default()
         };
-        assert_eq!(vllm_requests_value(&v), "run 4 | wait 0 | max —");
+        assert_eq!(vllm_requests_value(&v, None), "run 4 | wait 0 | max —");
+        assert_eq!(
+            vllm_requests_value(&v, Some(64)),
+            "run 4 (6.2%) | wait 0 | max 64"
+        );
     }
 
     #[test]

@@ -30,9 +30,11 @@ pub enum Rule1Outcome {
     NotFired,
 }
 
-pub fn rule1_under_batching(snapshot: &RawSnapshot) -> Rule1Outcome {
+pub fn rule1_under_batching(
+    snapshot: &RawSnapshot,
+    config_max_num_seqs: Option<u32>,
+) -> Rule1Outcome {
     let running = snapshot.vllm.num_requests_running;
-    let max_num_seqs = snapshot.vllm.max_num_seqs;
 
     // 1. Hard abort — window duration required
     let window_secs = match snapshot.vllm.window_duration_secs {
@@ -40,8 +42,13 @@ pub fn rule1_under_batching(snapshot: &RawSnapshot) -> Rule1Outcome {
         _ => return Rule1Outcome::NotFired,
     };
 
-    // 2. Hard abort — max_num_seqs required
-    let Some(max_n) = max_num_seqs.filter(|&n| n > 0) else {
+    // 2. Hard abort — max_num_seqs required (scrape or config)
+    let Some(max_n) = snapshot
+        .vllm
+        .max_num_seqs
+        .or(config_max_num_seqs)
+        .filter(|&n| n > 0)
+    else {
         return Rule1Outcome::NotFired;
     };
 
@@ -79,8 +86,11 @@ pub fn rule1_under_batching(snapshot: &RawSnapshot) -> Rule1Outcome {
     })
 }
 
-pub fn r1_recommendation(snapshot: &RawSnapshot) -> Option<Recommendation> {
-    let Rule1Outcome::Fired(d) = rule1_under_batching(snapshot) else {
+pub fn r1_recommendation(
+    snapshot: &RawSnapshot,
+    config_max_num_seqs: Option<u32>,
+) -> Option<Recommendation> {
+    let Rule1Outcome::Fired(d) = rule1_under_batching(snapshot, config_max_num_seqs) else {
         return None;
     };
     Some(Recommendation {
@@ -95,8 +105,10 @@ pub fn r1_recommendation(snapshot: &RawSnapshot) -> Option<Recommendation> {
 
 pub(super) fn format_under_batching_fired(d: &UnderBatchingDetail, confidence: f64) -> Vec<String> {
     let Some(max_n) = d.max_num_seqs else {
-        // Structurally unreachable — r1 hard-aborts without max_num_seqs.
-        return vec!["[!] Under-batching — Insufficient Concurrency".to_string()];
+        // Structurally unreachable: r1 hard-aborts without max_num_seqs.
+        unreachable!(
+            "format_under_batching_fired called without max_num_seqs — r1 hard-aborts before reaching this"
+        );
     };
     let threshold = UNDER_BATCHING_OCCUPANCY_PCT * 100.0;
     let max_str = max_n.to_string();
@@ -200,7 +212,7 @@ mod tests {
     #[test]
     fn fires_when_occupancy_low() {
         let s = snap(Some(5.0), Some(256), Some(0.0));
-        match rule1_under_batching(&s) {
+        match rule1_under_batching(&s, None) {
             Rule1Outcome::Fired(d) => {
                 assert!((d.occupancy_pct - (5.0 / 256.0 * 100.0)).abs() < 0.1);
             }
@@ -211,7 +223,7 @@ mod tests {
     #[test]
     fn fires_at_occupancy_below_threshold() {
         let s = snap(Some(63.0), Some(256), Some(0.0));
-        match rule1_under_batching(&s) {
+        match rule1_under_batching(&s, None) {
             Rule1Outcome::Fired(d) => {
                 assert!(d.occupancy_pct < 25.0);
             }
@@ -222,49 +234,94 @@ mod tests {
     #[test]
     fn mutes_at_occupancy_threshold() {
         let s = snap(Some(64.0), Some(256), Some(0.0));
-        assert!(matches!(rule1_under_batching(&s), Rule1Outcome::NotFired));
+        assert!(matches!(
+            rule1_under_batching(&s, None),
+            Rule1Outcome::NotFired
+        ));
     }
 
     #[test]
     fn mutes_when_no_traffic() {
         let s = snap(Some(0.0), Some(256), Some(0.0));
-        assert!(matches!(rule1_under_batching(&s), Rule1Outcome::NotFired));
+        assert!(matches!(
+            rule1_under_batching(&s, None),
+            Rule1Outcome::NotFired
+        ));
     }
 
     #[test]
     fn mutes_when_backpressure_at_two() {
         let s = snap(Some(5.0), Some(256), Some(2.0));
-        assert!(matches!(rule1_under_batching(&s), Rule1Outcome::NotFired));
+        assert!(matches!(
+            rule1_under_batching(&s, None),
+            Rule1Outcome::NotFired
+        ));
     }
 
     #[test]
     fn fires_when_waiting_one_below_backpressure_gate() {
         let s = snap(Some(5.0), Some(256), Some(1.0));
-        assert!(matches!(rule1_under_batching(&s), Rule1Outcome::Fired(_)));
+        assert!(matches!(
+            rule1_under_batching(&s, None),
+            Rule1Outcome::Fired(_)
+        ));
     }
 
     #[test]
     fn mutes_when_max_num_seqs_missing() {
         let s = snap(Some(5.0), None, Some(0.0));
-        assert!(matches!(rule1_under_batching(&s), Rule1Outcome::NotFired));
+        assert!(matches!(
+            rule1_under_batching(&s, None),
+            Rule1Outcome::NotFired
+        ));
     }
 
     #[test]
     fn mutes_when_max_num_seqs_is_zero() {
         let s = snap(Some(5.0), Some(0), Some(0.0));
-        assert!(matches!(rule1_under_batching(&s), Rule1Outcome::NotFired));
+        assert!(matches!(
+            rule1_under_batching(&s, None),
+            Rule1Outcome::NotFired
+        ));
+    }
+
+    #[test]
+    fn fires_when_config_max_provides_capacity_and_occupancy_low() {
+        let s = snap(Some(4.0), None, Some(0.0));
+        match rule1_under_batching(&s, Some(64)) {
+            Rule1Outcome::Fired(d) => {
+                assert_eq!(d.max_num_seqs, Some(64));
+                assert!((d.occupancy_pct - (4.0 / 64.0 * 100.0)).abs() < 0.1);
+            }
+            Rule1Outcome::NotFired => panic!("expected fired with config max 64"),
+        }
+    }
+
+    #[test]
+    fn mutes_at_occupancy_threshold_with_config_max_only() {
+        let s = snap(Some(64.0), None, Some(0.0));
+        assert!(matches!(
+            rule1_under_batching(&s, Some(64)),
+            Rule1Outcome::NotFired
+        ));
     }
 
     #[test]
     fn mutes_when_running_missing() {
         let s = snap(None, Some(256), Some(0.0));
-        assert!(matches!(rule1_under_batching(&s), Rule1Outcome::NotFired));
+        assert!(matches!(
+            rule1_under_batching(&s, None),
+            Rule1Outcome::NotFired
+        ));
     }
 
     #[test]
     fn mutes_when_window_duration_missing() {
         let s = snap_with_gates(Some(5.0), Some(256), Some(0.0), None, None);
-        assert!(matches!(rule1_under_batching(&s), Rule1Outcome::NotFired));
+        assert!(matches!(
+            rule1_under_batching(&s, None),
+            Rule1Outcome::NotFired
+        ));
     }
 
     #[test]
@@ -279,7 +336,10 @@ mod tests {
             }),
             Some(10.0),
         );
-        assert!(matches!(rule1_under_batching(&s), Rule1Outcome::NotFired));
+        assert!(matches!(
+            rule1_under_batching(&s, None),
+            Rule1Outcome::NotFired
+        ));
     }
 
     #[test]
@@ -294,7 +354,10 @@ mod tests {
             }),
             Some(100.0),
         );
-        assert!(matches!(rule1_under_batching(&s), Rule1Outcome::NotFired));
+        assert!(matches!(
+            rule1_under_batching(&s, None),
+            Rule1Outcome::NotFired
+        ));
     }
 
     #[test]
@@ -309,13 +372,16 @@ mod tests {
             }),
             Some(10.0),
         );
-        assert!(matches!(rule1_under_batching(&s), Rule1Outcome::Fired(_)));
+        assert!(matches!(
+            rule1_under_batching(&s, None),
+            Rule1Outcome::Fired(_)
+        ));
     }
 
     #[test]
     fn r1_recommendation_fires_without_baseline() {
         let s = entry_fired_snap();
-        let r = r1_recommendation(&s).expect("fired");
+        let r = r1_recommendation(&s, None).expect("fired");
         assert_eq!(r.rule_name, "under_batching");
         assert!((r.confidence - 0.8).abs() < 1e-9);
     }
