@@ -1,7 +1,7 @@
 pub mod baseline;
 mod rules;
 
-use crate::context::AnalysisInput;
+use crate::context::{AnalysisInput, RuntimeWindow};
 
 pub use baseline::{CeilingEstimate, PhysicsBaseline, WeightDtypeSource};
 pub use rules::*;
@@ -12,6 +12,20 @@ pub struct Report {
     pub groups: Vec<IssueGroup>,
     /// True when r4 removed a `kv_cache_pressure` recommendation from this report.
     pub r2_suppressed_by_r4: bool,
+}
+
+/// Single-window aggregate report, or multi-window significance report when `windows.len() > 1`.
+///
+/// On the first diagnose iteration there is typically only one collected window, so the
+/// single-window path fires. Subsequent iterations (after `run_diagnose` re-collects) accumulate
+/// enough windows for the multi-window significance gates to apply. This is intentional: the
+/// loop's exit decision and the UI rule text always use the same report.
+pub fn build_report_for_diagnose(windows: &[RuntimeWindow], input: AnalysisInput<'_>) -> Report {
+    if windows.len() <= 1 {
+        build_report(input)
+    } else {
+        rules::build_report_for_windows(windows, input)
+    }
 }
 
 pub fn build_report(input: AnalysisInput<'_>) -> Report {

@@ -306,16 +306,63 @@ pub fn format_diagnose_rules(
     out
 }
 
-pub fn format_diagnose_rules_for_windows(
-    windows: &[RuntimeWindow],
-    summary: AnalysisInput<'_>,
-    verbose_rules: bool,
-    metrics_url: &str,
-) -> Vec<String> {
-    if windows.is_empty() {
-        return no_evaluable_diagnose_lines(verbose_rules, &[]);
+struct WindowRuleEval {
+    total: usize,
+    skipped: usize,
+    n_eval: usize,
+    r1_fired: usize,
+    r1_details: Vec<UnderBatchingDetail>,
+    r2_fired: usize,
+    r2_details: Vec<KvCachePressureDetail>,
+    r2_backlog_fired: usize,
+    r2_backlog_details: Vec<KvAdmissionBacklogDetail>,
+    r3_fired: usize,
+    r3_details: Vec<LowPrefixReuseDetail>,
+    r5_fired: usize,
+    r5_details: Vec<ConcurrencySaturationDetail>,
+}
+
+impl WindowRuleEval {
+    fn no_fires(&self) -> bool {
+        self.r1_fired + self.r2_fired + self.r2_backlog_fired + self.r3_fired + self.r5_fired == 0
     }
 
+    fn r1_significant(&self) -> bool {
+        rule_is_significant(self.r1_fired, self.n_eval)
+    }
+
+    fn r2_significant(&self) -> bool {
+        let r2_any_preemptions = self.r2_details.iter().any(|d| d.preemptions_active);
+        let r2_critical_windows = self
+            .r2_details
+            .iter()
+            .filter(|d| d.kv_cache_usage_perc >= KV_CACHE_CRITICAL_THRESHOLD_PCT)
+            .count();
+        r2_any_preemptions
+            || r2_critical_windows >= 2
+            || rule_is_significant(self.r2_fired, self.n_eval)
+    }
+
+    fn r2_backlog_significant(&self) -> bool {
+        rule_is_significant(self.r2_backlog_fired, self.n_eval)
+    }
+
+    fn r3_significant(&self) -> bool {
+        rule_is_significant(self.r3_fired, self.n_eval)
+    }
+
+    fn r5_significant(&self) -> bool {
+        rule_is_significant(self.r5_fired, self.n_eval)
+    }
+}
+
+fn eval_window_rules(
+    windows: &[RuntimeWindow],
+    summary: &AnalysisInput<'_>,
+) -> Option<WindowRuleEval> {
+    if windows.is_empty() {
+        return None;
+    }
     let total = windows.len();
     let skipped = windows
         .iter()
@@ -327,46 +374,45 @@ pub fn format_diagnose_rules_for_windows(
         .collect();
     let n_eval = evaluable.len();
 
-    if n_eval == 0 {
-        return no_evaluable_diagnose_lines(verbose_rules, windows);
-    }
+    let mut eval = WindowRuleEval {
+        total,
+        skipped,
+        n_eval,
+        r1_fired: 0,
+        r1_details: Vec::new(),
+        r2_fired: 0,
+        r2_details: Vec::new(),
+        r2_backlog_fired: 0,
+        r2_backlog_details: Vec::new(),
+        r3_fired: 0,
+        r3_details: Vec::new(),
+        r5_fired: 0,
+        r5_details: Vec::new(),
+    };
 
-    let mut r1_fired = 0usize;
-    let mut r2_fired = 0usize;
-    let mut r2_backlog_fired = 0usize;
-    let mut r3_fired = 0usize;
-    let mut r5_fired = 0usize;
-
-    let mut r1_details = Vec::new();
-    let mut r2_details = Vec::new();
-    let mut r2_backlog_details: Vec<KvAdmissionBacklogDetail> = Vec::new();
-    let mut r3_details = Vec::new();
-    let mut r5_details: Vec<ConcurrencySaturationDetail> = Vec::new();
-
-    let summary_baseline = baseline::compute(&summary);
     for w in &evaluable {
         match rule1_under_batching(&w.snapshot, summary.ctx.config.max_num_seqs) {
             Rule1Outcome::Fired(d) => {
-                r1_fired += 1;
-                r1_details.push(d);
+                eval.r1_fired += 1;
+                eval.r1_details.push(d);
             }
             Rule1Outcome::NotFired => {}
         }
         match rule2_kv_cache_pressure(&w.snapshot) {
             Rule2Outcome::Fired(d) => {
-                r2_fired += 1;
-                r2_details.push(d);
+                eval.r2_fired += 1;
+                eval.r2_details.push(d);
             }
             Rule2Outcome::NotFired(_) => {}
         }
         if let Some(d) = rule2_kv_admission_backlog(&w.snapshot) {
-            r2_backlog_fired += 1;
-            r2_backlog_details.push(d);
+            eval.r2_backlog_fired += 1;
+            eval.r2_backlog_details.push(d);
         }
         match rule3_low_prefix_reuse(&w.snapshot) {
             Rule3Outcome::Fired(d) => {
-                r3_fired += 1;
-                r3_details.push(d);
+                eval.r3_fired += 1;
+                eval.r3_details.push(d);
             }
             Rule3Outcome::NotFired => {}
         }
@@ -375,14 +421,206 @@ pub fn format_diagnose_rules_for_windows(
             w.snapshot.vllm.kv_cache_usage_perc,
             summary.ctx.config.max_num_seqs,
         ) {
-            r5_fired += 1;
-            r5_details.push(d);
+            eval.r5_fired += 1;
+            eval.r5_details.push(d);
         }
     }
 
+    Some(eval)
+}
+
+fn finalize_report_groups(
+    mut recs: Vec<Recommendation>,
+    baseline: Option<baseline::PhysicsBaseline>,
+) -> super::Report {
+    let r2_present_before = recs.iter().any(|r| r.rule_name == "kv_cache_pressure");
+    let r4_fired = recs.iter().any(|r| r.rule_name == "parallelism_mismatch");
+    let r2_suppressed_by_r4 = r4_fired && r2_present_before;
+    if r4_fired {
+        recs.retain(|r| r.rule_name != "kv_cache_pressure");
+    }
+    recs.sort_by(|a, b| {
+        let sa = a.impact as f64 * a.confidence;
+        let sb = b.impact as f64 * b.confidence;
+        sb.total_cmp(&sa)
+    });
+    let groups = recs
+        .into_iter()
+        .map(|r| IssueGroup {
+            primary: r,
+            secondary: Vec::new(),
+        })
+        .collect();
+    super::Report {
+        baseline,
+        groups,
+        r2_suppressed_by_r4,
+    }
+}
+
+/// Multi-window rule evaluation — same significance gates as `format_diagnose_rules_for_windows`.
+pub fn build_report_for_windows(
+    windows: &[RuntimeWindow],
+    summary: AnalysisInput<'_>,
+) -> super::Report {
+    let baseline = baseline::compute(&summary);
+    let Some(eval) = eval_window_rules(windows, &summary) else {
+        return super::Report {
+            baseline,
+            groups: Vec::new(),
+            r2_suppressed_by_r4: false,
+        };
+    };
+    if eval.n_eval == 0 {
+        return super::Report {
+            baseline,
+            groups: Vec::new(),
+            r2_suppressed_by_r4: false,
+        };
+    }
+
+    let summary_snap = &summary.window.snapshot;
+    let max_model_len = summary.ctx.config.max_model_len;
+    let kv_headroom_gb = baseline.as_ref().and_then(|b| b.kv_headroom_gb);
+    let r2_significant = eval.r2_significant();
+    let r2_backlog_significant = eval.r2_backlog_significant();
+
+    let mut recs: Vec<Recommendation> = Vec::new();
+
+    if eval.r1_significant() {
+        let d = aggregate_r1_detail(&eval.r1_details);
+        recs.push(Recommendation {
+            rule_name: "under_batching",
+            impact: 4,
+            confidence: 0.8,
+            action: "Increase client concurrency".to_string(),
+            expected_impact: "Higher throughput, stable TPOT".to_string(),
+            display_lines: format_under_batching_window_issue(
+                &d,
+                pct(eval.r1_fired, eval.n_eval),
+                0.8,
+            ),
+        });
+    }
+
+    if r2_significant {
+        let r2_agg = aggregate_r2_detail(&eval.r2_details, summary_snap);
+        let conf = kv_pressure_confidence(&r2_agg);
+        recs.push(Recommendation {
+            rule_name: "kv_cache_pressure",
+            impact: 5,
+            confidence: conf,
+            action: "Reduce max_num_seqs or add tensor parallelism".to_string(),
+            expected_impact: "Reduced KV evictions and lower latency variance".to_string(),
+            display_lines: format_kv_cache_window_issue(
+                &r2_agg,
+                pct(eval.r2_fired, eval.n_eval),
+                summary_snap,
+                conf,
+                max_model_len,
+            ),
+        });
+    } else if r2_backlog_significant {
+        let agg = aggregate_backlog_detail(&eval.r2_backlog_details);
+        recs.push(Recommendation {
+            rule_name: "kv_cache_pressure",
+            impact: 5,
+            confidence: 0.85,
+            action: "Raise --gpu-memory-utilization or reduce KV footprint".to_string(),
+            expected_impact: "Wait queue drains, TTFT recovers.".to_string(),
+            display_lines: format_kv_admission_backlog_issue(
+                &agg,
+                pct(eval.r2_backlog_fired, eval.n_eval),
+                max_model_len,
+                kv_headroom_gb,
+            ),
+        });
+    }
+
+    if eval.r5_significant() && !r2_significant && !r2_backlog_significant {
+        if let Some(agg) = aggregate_concurrency_saturation_detail(&eval.r5_details) {
+            let max_label = agg
+                .max_num_seqs
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            recs.push(Recommendation {
+                rule_name: "concurrency_saturation",
+                impact: 4,
+                confidence: match (agg.ttft_ms, agg.kv_cache_usage_perc) {
+                    (Some(_), Some(_)) => 0.9,
+                    _ => 0.6,
+                },
+                action: format!(
+                    "Raise --max-num-seqs above {} (scheduler at cap, {:.0}% of requests waiting)",
+                    max_label,
+                    agg.queue_ratio * 100.0
+                ),
+                expected_impact: "Queue drains, TTFT recovers.".to_string(),
+                display_lines: format_concurrency_saturation_window_issue(
+                    &agg,
+                    pct(eval.r5_fired, eval.n_eval),
+                    max_model_len,
+                ),
+            });
+        }
+    }
+
+    if eval.r3_significant() {
+        let d = aggregate_r3_detail(&eval.r3_details, summary_snap);
+        recs.push(Recommendation {
+            rule_name: "low_prefix_reuse",
+            impact: 2,
+            confidence: 0.9,
+            action: "Move shared context to prompt prefix; standardize prompt templates"
+                .to_string(),
+            expected_impact: "Higher prefix cache hit rate and lower TTFT".to_string(),
+            display_lines: format_low_prefix_window_issue(
+                &d,
+                pct(eval.r3_fired, eval.n_eval),
+                summary_snap.vllm.cache_config.enable_prefix_caching,
+            ),
+        });
+    }
+
+    if let Some(r4) = r4_recommendation(kv_headroom_gb, summary.ctx.config.tensor_parallel_size) {
+        recs.push(r4);
+    }
+
+    finalize_report_groups(recs, baseline)
+}
+
+pub fn format_diagnose_rules_for_windows(
+    windows: &[RuntimeWindow],
+    summary: AnalysisInput<'_>,
+    verbose_rules: bool,
+    metrics_url: &str,
+) -> Vec<String> {
+    let Some(eval) = eval_window_rules(windows, &summary) else {
+        return no_evaluable_diagnose_lines(verbose_rules, &[]);
+    };
+
+    if eval.n_eval == 0 {
+        return no_evaluable_diagnose_lines(verbose_rules, windows);
+    }
+
+    let total = eval.total;
+    let skipped = eval.skipped;
+    let n_eval = eval.n_eval;
+    let r1_fired = eval.r1_fired;
+    let r2_fired = eval.r2_fired;
+    let r2_backlog_fired = eval.r2_backlog_fired;
+    let r3_fired = eval.r3_fired;
+    let r5_fired = eval.r5_fired;
+    let r1_details = &eval.r1_details;
+    let r2_details = &eval.r2_details;
+    let r2_backlog_details = &eval.r2_backlog_details;
+    let r3_details = &eval.r3_details;
+    let r5_details = &eval.r5_details;
+
+    let summary_baseline = baseline::compute(&summary);
     let summary_snap = &summary.window.snapshot;
 
-    if r1_fired + r2_fired + r2_backlog_fired + r3_fired + r5_fired == 0 {
+    if eval.no_fires() {
         let mut out = Vec::new();
         let config_max = summary.ctx.config.max_num_seqs;
         let r1_adv = r1_max_num_seqs_advisory(summary_snap, config_max);
@@ -450,7 +688,7 @@ pub fn format_diagnose_rules_for_windows(
 
     if r1_significant {
         warnings.extend(format_under_batching_window_issue(
-            &aggregate_r1_detail(&r1_details),
+            &aggregate_r1_detail(r1_details),
             pct(r1_fired, n_eval),
             0.8,
         ));
@@ -461,7 +699,7 @@ pub fn format_diagnose_rules_for_windows(
     }
 
     if r2_significant {
-        let r2_agg = aggregate_r2_detail(&r2_details, summary_snap);
+        let r2_agg = aggregate_r2_detail(r2_details, summary_snap);
         warnings.extend(format_kv_cache_window_issue(
             &r2_agg,
             pct(r2_fired, n_eval),
@@ -471,7 +709,7 @@ pub fn format_diagnose_rules_for_windows(
         ));
         warnings.push(String::new());
     } else if r2_backlog_significant {
-        let agg = aggregate_backlog_detail(&r2_backlog_details);
+        let agg = aggregate_backlog_detail(r2_backlog_details);
         warnings.extend(format_kv_admission_backlog_issue(
             &agg,
             pct(r2_backlog_fired, n_eval),
@@ -485,7 +723,7 @@ pub fn format_diagnose_rules_for_windows(
     }
 
     if r5_significant && !r2_significant && !r2_backlog_significant {
-        if let Some(agg) = aggregate_concurrency_saturation_detail(&r5_details) {
+        if let Some(agg) = aggregate_concurrency_saturation_detail(r5_details) {
             warnings.extend(format_concurrency_saturation_window_issue(
                 &agg,
                 pct(r5_fired, n_eval),
@@ -500,7 +738,7 @@ pub fn format_diagnose_rules_for_windows(
 
     if r3_significant {
         warnings.extend(format_low_prefix_window_issue(
-            &aggregate_r3_detail(&r3_details, summary_snap),
+            &aggregate_r3_detail(r3_details, summary_snap),
             pct(r3_fired, n_eval),
             summary_snap.vllm.cache_config.enable_prefix_caching,
         ));
@@ -510,19 +748,26 @@ pub fn format_diagnose_rules_for_windows(
         verbose_miss.push(String::new());
     }
 
-    let summary_report = super::build_report(summary);
-    for g in summary_report
-        .groups
-        .iter()
-        .filter(|g| g.primary.rule_name == "parallelism_mismatch")
-    {
+    let r4 = r4_recommendation(
+        summary_baseline.as_ref().and_then(|b| b.kv_headroom_gb),
+        summary.ctx.config.tensor_parallel_size,
+    );
+    let r2_suppressed_by_r4_display = r4.is_some();
+    let r4_groups: Vec<_> = r4
+        .into_iter()
+        .map(|r| IssueGroup {
+            primary: r,
+            secondary: Vec::new(),
+        })
+        .collect();
+    for g in &r4_groups {
         if !warnings.is_empty() && !warnings.last().is_some_and(|l| l.is_empty()) {
             warnings.push(String::new());
         }
         warnings.extend(rule_display_block(
             g,
             verbose_rules,
-            summary_report.r2_suppressed_by_r4,
+            r2_suppressed_by_r4_display,
         ));
         warnings.push(String::new());
     }
@@ -570,6 +815,7 @@ pub fn format_diagnose_rules_for_windows(
         advisories.push(String::new());
     }
 
+    let advisories_present = !advisories.is_empty();
     let mut out = warnings;
     out.append(&mut advisories);
     out.append(&mut verbose_miss);
@@ -596,11 +842,8 @@ pub fn format_diagnose_rules_for_windows(
         || r2_backlog_significant
         || r3_significant
         || r5_warning
-        || summary_report
-            .groups
-            .iter()
-            .any(|g| g.primary.rule_name == "parallelism_mismatch");
-    if !any_warning && advisories.is_empty() && !verbose_rules {
+        || !r4_groups.is_empty();
+    if !any_warning && !advisories_present && !verbose_rules {
         out.push(NO_ISSUES_LINE.to_string());
     }
     if skipped > 0 {
@@ -1538,6 +1781,44 @@ mod tests {
             "expected r5: {text}"
         );
         assert!(text.contains("--max-num-seqs=32 hit:"));
+    }
+
+    #[test]
+    fn build_report_for_windows_r5_when_aggregate_snapshot_misses() {
+        let mut windows: Vec<_> = (0..15)
+            .map(|_| mk_evaluable_kv_window(50.0, false))
+            .collect();
+        for w in windows.iter_mut().take(4) {
+            *w = mk_evaluable_concurrency_saturation_window(32.0, 15.0, 32);
+        }
+        let ctx = mk_ctx();
+        let summary = ai(&ctx, windows.last().expect("windows"));
+        let aggregate_report = crate::engine::build_report(summary);
+        assert!(
+            !aggregate_report
+                .groups
+                .iter()
+                .any(|g| g.primary.rule_name == "concurrency_saturation"),
+            "aggregate snapshot should not reproduce r5: {:?}",
+            aggregate_report
+                .groups
+                .iter()
+                .map(|g| g.primary.rule_name)
+                .collect::<Vec<_>>()
+        );
+        let multi_report = build_report_for_windows(&windows, summary);
+        assert!(
+            multi_report
+                .groups
+                .iter()
+                .any(|g| g.primary.rule_name == "concurrency_saturation"),
+            "multi-window report should include r5: {:?}",
+            multi_report
+                .groups
+                .iter()
+                .map(|g| g.primary.rule_name)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
