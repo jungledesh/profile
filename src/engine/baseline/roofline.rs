@@ -65,15 +65,24 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
     });
 
     let ceiling = decode.expected;
+    let num_running = input
+        .window
+        .snapshot
+        .vllm
+        .num_requests_running
+        .filter(|v| v.is_finite() && *v > 0.0);
+
     let efficiency_pct = input
         .window
         .snapshot
         .vllm
         .generation_tokens_per_sec
-        .filter(|v| v.is_finite())
-        .and_then(|actual| {
-            if actual > 0.0 && actual <= ceiling {
-                let pct = math::efficiency_pct(actual, ceiling);
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .zip(num_running)
+        .and_then(|(actual, running)| {
+            let aggregate_ceiling = ceiling * running;
+            if actual <= aggregate_ceiling {
+                let pct = math::efficiency_pct(actual, aggregate_ceiling);
                 pct.is_finite().then_some(pct)
             } else {
                 None
@@ -299,6 +308,7 @@ mod tests {
         };
         let snap = VllmRawMetrics {
             generation_tokens_per_sec: Some(300.0),
+            num_requests_running: Some(1.0),
             ..Default::default()
         };
         let (ctx, win) = baseline_input(
@@ -330,6 +340,7 @@ mod tests {
         };
         let snap = VllmRawMetrics {
             generation_tokens_per_sec: Some(50.0),
+            num_requests_running: Some(1.0),
             ..Default::default()
         };
         let (ctx, win) = baseline_input(
@@ -496,5 +507,93 @@ mod tests {
         assert!(out.is_some());
         let b = out.unwrap();
         assert_eq!(b.weight_dtype_source, WeightDtypeSource::Fallback);
+    }
+
+    #[test]
+    fn efficiency_accounts_for_batch_size() {
+        let cfg = VllmConfig {
+            kv_cache_dtype: Some("bf16".to_string()),
+            max_model_len: Some(2048),
+            ..Default::default()
+        };
+        let snap = VllmRawMetrics {
+            generation_tokens_per_sec: Some(6043.0),
+            num_requests_running: Some(64.0),
+            ..Default::default()
+        };
+        let (ctx, win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(67.0),
+            Some(4800.0),
+            cfg,
+            snap,
+        );
+        let input = AnalysisInput::new(&ctx, &win);
+        let b = compute(&input).expect("baseline");
+        let per_seq_ceiling = b.decode.expected;
+        let aggregate_ceiling = per_seq_ceiling * 64.0;
+        let expected = math::efficiency_pct(6043.0, aggregate_ceiling);
+        let eff = b.efficiency_pct.expect("efficiency");
+        assert!(
+            (eff - expected).abs() < 0.05,
+            "expected ~{expected:.1}%, got {eff:.1}%"
+        );
+        assert!((eff - 31.5).abs() < 0.5, "expected ~31.5%, got {eff:.1}%");
+    }
+
+    #[test]
+    fn efficiency_none_when_num_running_zero() {
+        let cfg = VllmConfig {
+            kv_cache_dtype: Some("bf16".to_string()),
+            max_model_len: Some(2048),
+            ..Default::default()
+        };
+        let snap = VllmRawMetrics {
+            generation_tokens_per_sec: Some(6043.0),
+            num_requests_running: Some(0.0),
+            ..Default::default()
+        };
+        let (ctx, win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(67.0),
+            Some(4800.0),
+            cfg,
+            snap,
+        );
+        let input = AnalysisInput::new(&ctx, &win);
+        let b = compute(&input).expect("baseline");
+        assert!(b.efficiency_pct.is_none());
+        assert!(b.headroom_pct.is_none());
+    }
+
+    #[test]
+    fn efficiency_none_when_num_running_missing() {
+        let cfg = VllmConfig {
+            kv_cache_dtype: Some("bf16".to_string()),
+            max_model_len: Some(2048),
+            ..Default::default()
+        };
+        let snap = VllmRawMetrics {
+            generation_tokens_per_sec: Some(6043.0),
+            num_requests_running: None,
+            ..Default::default()
+        };
+        let (ctx, win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(67.0),
+            Some(4800.0),
+            cfg,
+            snap,
+        );
+        let input = AnalysisInput::new(&ctx, &win);
+        let b = compute(&input).expect("baseline");
+        assert!(b.efficiency_pct.is_none());
+        assert!(b.headroom_pct.is_none());
     }
 }
