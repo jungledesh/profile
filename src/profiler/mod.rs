@@ -49,15 +49,7 @@ pub fn run_diagnose(
         )
     };
     let config = build_config(vllm_metrics_input, &snapshot, max_num_seqs);
-    eprintln!(
-        "[debug] model_name={:?} model_root={:?}",
-        config.model_name, config.model_root
-    );
     let static_ctx = StaticContext::from_snapshot(&snapshot, config);
-    eprintln!(
-        "[debug] param_count={:?} gpu_bw={:?}",
-        static_ctx.model.param_count, static_ctx.gpu.peak_bw_gbps,
-    );
     let windows: Vec<RuntimeWindow> = raw_windows
         .into_iter()
         .map(RuntimeWindow::from_snapshot)

@@ -825,16 +825,18 @@ pub fn format_diagnose_rules_for_windows(
         not_fired.push("Under-batching");
     }
     if !r2_significant && !r2_backlog_significant && !r5_significant && !r2_adv_present {
-        not_fired.push("KV Cache Pressure");
+        not_fired.push("KV cache pressure");
     }
     if !r3_significant && !r3_adv_present {
-        not_fired.push("Low Prefix Cache");
+        not_fired.push("Low prefix cache");
     }
     if !r5_significant && !r5_adv_present {
-        not_fired.push("Concurrency Saturation");
+        not_fired.push("Concurrency saturation");
     }
-    if !verbose_rules && !not_fired.is_empty() {
-        out.push(format!("No issues for {}", join_rule_names(&not_fired)));
+    if !verbose_rules {
+        for name in &not_fired {
+            out.push(format!("{name}: not triggered"));
+        }
     }
     let r5_warning = r5_significant && !r2_significant && !r2_backlog_significant;
     let any_warning = r1_significant
@@ -875,19 +877,6 @@ fn pct(fired: usize, total: usize) -> u32 {
 fn trim_trailing_blank_lines(lines: &mut Vec<String>) {
     while lines.last().is_some_and(|l| l.is_empty()) {
         lines.pop();
-    }
-}
-
-fn join_rule_names(items: &[&str]) -> String {
-    match items {
-        [] => String::new(),
-        [one] => one.to_string(),
-        [a, b] => format!("{a} and {b}"),
-        _ => {
-            let head = &items[..items.len() - 1];
-            let last = items[items.len() - 1];
-            format!("{}, and {}", head.join(", "), last)
-        }
     }
 }
 
@@ -1603,7 +1592,7 @@ mod tests {
         windows[0] = mk_evaluable_kv_window(96.0, false);
         let text = r2_issue_lines(windows).join("\n");
         assert!(!text.contains("[!] KV Cache Pressure"));
-        assert!(text.contains("KV Cache Pressure"));
+        assert!(text.contains("KV cache pressure: not triggered"));
         assert!(!text.contains("Seen in"));
     }
 
@@ -1694,9 +1683,9 @@ mod tests {
         assert!(text.contains("Occupancy"));
         assert!(text.contains("  Cause:"));
         assert!(text.contains("Batch more requests or increase client concurrency"));
-        assert!(text.contains(
-            "No issues for KV Cache Pressure, Low Prefix Cache, and Concurrency Saturation"
-        ));
+        assert!(text.contains("KV cache pressure: not triggered"));
+        assert!(text.contains("Low prefix cache: not triggered"));
+        assert!(text.contains("Concurrency saturation: not triggered"));
     }
 
     #[test]
