@@ -1,7 +1,8 @@
-# GitHub Pages — deploy only when the landing page changes.
+# GitHub Pages — manual release only (workflow_dispatch).
 #
-# Repo Settings → Pages → Build and deployment → Source: GitHub Actions
-# (disables the automatic "pages-build-deployment" run on every main push)
+# Requires repo Settings → Pages → Build and deployment → Source: GitHub Actions.
+# If Source is "Deploy from a branch" (legacy /docs on main), GitHub runs
+# pages-build-deployment on every push to main — independent of this file.
 
 name: Deploy GitHub Pages
 
