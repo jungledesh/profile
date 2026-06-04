@@ -94,27 +94,6 @@ impl IssueGroup {
 const NO_ISSUES_LINE: &str = "No issues detected in this snapshot.";
 const R2_SUPPRESSED_BY_R4_VERBOSE_LINE: &str = "  ↳ KV pressure suppressed — symptom of the above";
 
-/// R1 core metric: `max_num_seqs` on the scrape; config (`-m`) satisfies the metric when scrape lacks it.
-fn r1_max_num_seqs_advisory(
-    snapshot: &RawSnapshot,
-    config_max_num_seqs: Option<u32>,
-) -> Option<Vec<String>> {
-    if snapshot.vllm.max_num_seqs.is_some() || config_max_num_seqs.is_some() {
-        return None;
-    }
-    if !snapshot
-        .vllm
-        .num_requests_running
-        .is_some_and(|r| r.is_finite() && r > 0.0)
-    {
-        return None;
-    }
-    Some(vec![
-        "[i] Under-batching: max_num_seqs not in metrics. Pass -m <value> to enable batching analysis."
-            .to_string(),
-    ])
-}
-
 fn metrics_scrape_url(metrics_input: &str) -> String {
     let base = metrics_input.trim_end_matches('/');
     if base.ends_with("/metrics") {
@@ -134,39 +113,17 @@ fn r2_kv_cache_advisory(snapshot: &RawSnapshot, metrics_url: &str) -> Option<Vec
     {
         return None;
     }
+    if !snapshot
+        .vllm
+        .num_requests_running
+        .is_some_and(|r| r.is_finite() && r > 0.0)
+    {
+        return None;
+    }
     let url = metrics_scrape_url(metrics_url);
     Some(vec![format!(
         "[i] KV Cache Pressure: core metric unavailable. Run: curl {url} | grep gpu_cache_usage_perc"
     )])
-}
-
-/// R3 core metric: prefix cache hit rate.
-fn r3_prefix_cache_advisory(snapshot: &RawSnapshot) -> Option<Vec<String>> {
-    if snapshot
-        .vllm
-        .prefix_cache_hit_rate
-        .filter(|v| v.is_finite())
-        .is_some()
-    {
-        return None;
-    }
-    Some(vec![
-        "[i] Low Prefix Cache: prefix_cache_hit_rate not in metrics. Verify --enable-prefix-caching is set and your vLLM version emits this gauge.".to_string(),
-    ])
-}
-
-/// R5 core metric: `max_num_seqs` on the scrape; config (`-m`) satisfies the metric when scrape lacks it.
-fn r5_max_num_seqs_advisory(
-    snapshot: &RawSnapshot,
-    config_max_num_seqs: Option<u32>,
-) -> Option<Vec<String>> {
-    if snapshot.vllm.max_num_seqs.is_some() || config_max_num_seqs.is_some() {
-        return None;
-    }
-    Some(vec![
-        "[i] Concurrency Saturation: max_num_seqs not in metrics. Pass -m <value> to enable concurrency analysis."
-            .to_string(),
-    ])
 }
 
 fn rule_display_block(
@@ -299,38 +256,14 @@ pub fn format_diagnose_rules(
         append_waste_line(&mut out, rule_name, baseline_ref, tps);
     }
 
-    let r1_adv = if !fired_names.contains("under_batching") {
-        r1_max_num_seqs_advisory(snapshot, input.ctx.config.max_num_seqs)
-    } else {
-        None
-    };
     let r2_adv = if !fired_names.contains("kv_cache_pressure") && !report.r2_suppressed_by_r4 {
         r2_kv_cache_advisory(snapshot, metrics_url)
     } else {
         None
     };
-    let r3_adv = if !fired_names.contains("low_prefix_reuse") {
-        r3_prefix_cache_advisory(snapshot)
-    } else {
-        None
-    };
-    let r5_adv = if !fired_names.contains("concurrency_saturation") {
-        r5_max_num_seqs_advisory(snapshot, input.ctx.config.max_num_seqs)
-    } else {
-        None
-    };
 
-    let any_advisory = r1_adv.is_some() || r2_adv.is_some() || r3_adv.is_some() || r5_adv.is_some();
-    if let Some(lines) = r1_adv {
-        append_display_block(&mut out, lines);
-    }
+    let any_advisory = r2_adv.is_some();
     if let Some(lines) = r2_adv {
-        append_display_block(&mut out, lines);
-    }
-    if let Some(lines) = r3_adv {
-        append_display_block(&mut out, lines);
-    }
-    if let Some(lines) = r5_adv {
         append_display_block(&mut out, lines);
     }
 
@@ -686,26 +619,9 @@ pub fn format_diagnose_rules_for_windows(
 
     if eval.no_fires() {
         let mut out = Vec::new();
-        let config_max = summary.ctx.config.max_num_seqs;
-        let r1_adv = r1_max_num_seqs_advisory(summary_snap, config_max);
         let r2_adv = r2_kv_cache_advisory(summary_snap, metrics_url);
-        let r3_adv = r3_prefix_cache_advisory(summary_snap);
-        let r5_adv = r5_max_num_seqs_advisory(summary_snap, config_max);
-        let any_advisory =
-            r1_adv.is_some() || r2_adv.is_some() || r3_adv.is_some() || r5_adv.is_some();
-        if let Some(lines) = r1_adv {
-            out.extend(lines);
-            out.push(String::new());
-        }
+        let any_advisory = r2_adv.is_some();
         if let Some(lines) = r2_adv {
-            out.extend(lines);
-            out.push(String::new());
-        }
-        if let Some(lines) = r3_adv {
-            out.extend(lines);
-            out.push(String::new());
-        }
-        if let Some(lines) = r5_adv {
             out.extend(lines);
             out.push(String::new());
         }
@@ -845,45 +761,14 @@ pub fn format_diagnose_rules_for_windows(
         append_waste_line(&mut warnings, rule_name, baseline_ref, tps);
     }
 
-    let config_max = summary.ctx.config.max_num_seqs;
-    let r1_adv = if !r1_significant {
-        r1_max_num_seqs_advisory(summary_snap, config_max)
-    } else {
-        None
-    };
     let r2_adv = if !r2_significant && !r2_backlog_significant {
         r2_kv_cache_advisory(summary_snap, metrics_url)
     } else {
         None
     };
-    let r3_adv = if !r3_significant {
-        r3_prefix_cache_advisory(summary_snap)
-    } else {
-        None
-    };
-    let r5_adv = if !r5_significant && !r2_significant && !r2_backlog_significant {
-        r5_max_num_seqs_advisory(summary_snap, config_max)
-    } else {
-        None
-    };
-    let r1_adv_present = r1_adv.is_some();
     let r2_adv_present = r2_adv.is_some();
-    let r3_adv_present = r3_adv.is_some();
-    let r5_adv_present = r5_adv.is_some();
     let mut advisories = Vec::new();
-    if let Some(lines) = r1_adv {
-        advisories.extend(lines);
-        advisories.push(String::new());
-    }
     if let Some(lines) = r2_adv {
-        advisories.extend(lines);
-        advisories.push(String::new());
-    }
-    if let Some(lines) = r3_adv {
-        advisories.extend(lines);
-        advisories.push(String::new());
-    }
-    if let Some(lines) = r5_adv {
         advisories.extend(lines);
         advisories.push(String::new());
     }
@@ -894,16 +779,13 @@ pub fn format_diagnose_rules_for_windows(
     out.append(&mut verbose_miss);
 
     let mut not_fired = Vec::new();
-    if !r1_significant && !r1_adv_present {
+    if !r1_significant {
         not_fired.push("Under-batching");
     }
     if !r2_significant && !r2_backlog_significant && !r2_adv_present {
         not_fired.push("KV cache pressure");
     }
-    if !r3_significant && !r3_adv_present {
-        not_fired.push("Low prefix cache");
-    }
-    if !r5_significant && !r5_adv_present {
+    if !r5_significant {
         not_fired.push("Concurrency saturation");
     }
     if !verbose_rules {
@@ -1131,73 +1013,23 @@ mod tests {
     }
 
     #[test]
-    fn max_num_seqs_none_with_traffic_shows_advisory() {
-        let t = SystemTime::UNIX_EPOCH;
-        let windows: Vec<_> = (0..15)
-            .map(|_| {
-                let mut v = vllm_base();
-                v.max_num_seqs = None;
-                v.num_requests_running = Some(20.0);
-                v.generation_tokens_per_sec = Some(100.0);
-                mk_win(snap(t, t, v, gpu_busy()))
-            })
-            .collect();
-        let ctx = mk_ctx();
-        let summary = ai(&ctx, windows.last().expect("windows"));
-        let text = format_diagnose_rules_for_windows(
-            &windows,
-            summary,
-            false,
-            "http://127.0.0.1:8000/metrics",
-        )
-        .join("\n");
-        assert!(text.contains("max_num_seqs not in metrics"));
-    }
-
-    #[test]
-    fn r1_advisory_suppressed_when_config_max_num_seqs_set() {
+    fn r2_advisory_requires_active_traffic() {
+        let url = "http://127.0.0.1:8000/metrics";
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
-        v.max_num_seqs = None;
-        v.num_requests_running = Some(20.0);
-        let s = snap(t, t, v, gpu_busy());
-        let cfg = VllmConfig {
-            max_num_seqs: Some(64),
-            ..Default::default()
-        };
-        let ctx = StaticContext::from_snapshot(&s, cfg);
-        let win = mk_win(s);
-        let text = format_diagnose_rules(ai(&ctx, &win), false, "http://127.0.0.1:8000/metrics")
-            .join("\n");
-        assert!(!text.contains("[i] Under-batching: max_num_seqs not in metrics"));
-    }
+        v.kv_cache_usage_perc = None;
+        v.num_requests_running = None;
+        let raw = snap(t, t, v.clone(), gpu_busy());
+        assert!(r2_kv_cache_advisory(&raw, url).is_none());
 
-    #[test]
-    fn r5_advisory_suppressed_when_config_max_num_seqs_set() {
-        let t = SystemTime::UNIX_EPOCH;
-        let windows: Vec<_> = (0..15)
-            .map(|_| {
-                let mut v = vllm_base();
-                v.max_num_seqs = None;
-                v.num_requests_running = Some(20.0);
-                v.generation_tokens_per_sec = Some(100.0);
-                mk_win(snap(t, t, v, gpu_busy()))
-            })
-            .collect();
-        let cfg = VllmConfig {
-            max_num_seqs: Some(64),
-            ..Default::default()
-        };
-        let ctx = StaticContext::from_snapshot(&windows[0].snapshot, cfg);
-        let summary = ai(&ctx, windows.last().expect("windows"));
-        let text = format_diagnose_rules_for_windows(
-            &windows,
-            summary,
-            false,
-            "http://127.0.0.1:8000/metrics",
-        )
-        .join("\n");
-        assert!(!text.contains("[i] Concurrency Saturation: max_num_seqs not in metrics"));
+        v.num_requests_running = Some(0.0);
+        let raw = snap(t, t, v.clone(), gpu_busy());
+        assert!(r2_kv_cache_advisory(&raw, url).is_none());
+
+        v.num_requests_running = Some(3.0);
+        let raw = snap(t, t, v, gpu_busy());
+        let lines = r2_kv_cache_advisory(&raw, url).expect("r2 advisory");
+        assert!(lines[0].contains("core metric unavailable"));
     }
 
     #[test]
@@ -1237,7 +1069,7 @@ mod tests {
         let (ctx, win) = input_r4_suppresses_r2();
         let text =
             format_diagnose_rules(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics").join("\n");
-        assert!(text.contains("Parallelism Mismatch"));
+        assert!(text.contains("[!] Parallelism Mismatch"));
         assert!(text.contains(R2_SUPPRESSED_BY_R4_VERBOSE_LINE));
         assert!(!text.contains("KV cache pressure: not triggered"));
         assert!(!text.contains("[!] KV Cache Pressure"));
@@ -1248,7 +1080,7 @@ mod tests {
         let (ctx, win) = input_r4_suppresses_r2();
         let text = format_diagnose_rules(ai(&ctx, &win), false, "http://127.0.0.1:8000/metrics")
             .join("\n");
-        assert!(text.contains("Parallelism Mismatch"));
+        assert!(text.contains("[!] Parallelism Mismatch"));
         assert!(!text.contains(R2_SUPPRESSED_BY_R4_VERBOSE_LINE));
         assert!(!text.contains("[!] KV Cache Pressure"));
     }
@@ -1839,7 +1671,6 @@ mod tests {
         assert!(text.contains("  Cause:"));
         assert!(text.contains("Batch more requests or increase client concurrency"));
         assert!(text.contains("KV cache pressure: not triggered"));
-        assert!(text.contains("Low prefix cache: not triggered"));
         assert!(text.contains("Concurrency saturation: not triggered"));
     }
 
