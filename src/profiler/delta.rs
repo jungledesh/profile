@@ -133,6 +133,7 @@ mod tests {
                 tpot_floor_ms: 1.0,
                 prefill_latency_floor_ms: None,
                 ridge_batch_size: 1.0,
+                cost: None,
             }),
             groups: Vec::new(),
             r2_suppressed_by_r4: false,
