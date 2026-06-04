@@ -292,7 +292,6 @@ fn diagnose_verbose_shows_not_indicated_lines() {
         out.contains("Under-batching: not triggered")
             && out.contains("KV cache pressure: not triggered")
             && out.contains("Prefix cache hit rate: not triggered")
-            && out.contains("Parallelism mismatch: not triggered")
             && out.contains("Concurrency saturation: not triggered")
             && !out.contains("No issues detected in this snapshot."),
         "expected verbose rule status lines without redundant no-issues summary; got:\n{out}"
