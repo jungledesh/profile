@@ -23,20 +23,19 @@ pub fn r4_recommendation(
         ),
         expected_impact: "Model fits in memory; eliminates OOM risk".to_string(),
         display_lines: vec![
-            "Parallelism Mismatch".to_string(),
-            format!(
-                "Cause: KV headroom {:.1}GB (threshold: ≥0GB); model weights exceed GPU VRAM by ~{:.0}GB",
-                h, overflow
-            ),
+            "[!] Parallelism Mismatch".to_string(),
             String::new(),
-            "Recommendation:".to_string(),
+            "  Cause:".to_string(),
+            format!("    • Model weights exceed GPU VRAM by ~{:.0}GB", overflow),
+            String::new(),
+            "  Fix:".to_string(),
             format!(
-                "  • Increase --tensor-parallel-size (weights overflow by ~{:.0}GB)",
+                "    • Increase --tensor-parallel-size (need ~{:.0}GB more VRAM)",
                 overflow
             ),
             String::new(),
-            "Expected: Model fits in VRAM; eliminates OOM risk".to_string(),
-            "Confidence: High".to_string(),
+            "  Expected: Model fits in VRAM; eliminates OOM risk.".to_string(),
+            "  Confidence: High".to_string(),
         ],
     })
 }
@@ -52,10 +51,15 @@ mod tests {
         assert_eq!(r.impact, 5);
         assert!((r.confidence - 0.95).abs() < 1e-9);
         assert!(r.action.contains("tensor-parallel-size"));
-        let cause = r.display_lines[1].as_str();
-        assert!(cause.contains("KV headroom"));
-        assert!(cause.contains("threshold: ≥0GB"));
-        assert!(!cause.contains("TP "));
+        let text = r.display_lines.join("\n");
+        assert!(text.contains("[!] Parallelism Mismatch"));
+        assert!(text.contains("  Cause:"));
+        assert!(text.contains("    • Model weights exceed GPU VRAM by ~12GB"));
+        assert!(text.contains("  Fix:"));
+        assert!(text.contains("    • Increase --tensor-parallel-size (need ~12GB more VRAM)"));
+        assert!(text.contains("  Expected: Model fits in VRAM; eliminates OOM risk."));
+        assert!(text.contains("  Confidence: High"));
+        assert!(!text.contains("Recommendation:"));
     }
 
     #[test]
