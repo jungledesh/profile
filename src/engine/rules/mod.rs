@@ -233,7 +233,9 @@ pub(super) fn append_waste_line(
     }
     let waste_fraction = (1.0 - eff / 100.0).max(0.0);
     let waste_per_hr = cost_per_hr * waste_fraction;
-    lines.push(String::new());
+    if !lines.is_empty() && !lines.last().is_some_and(|l| l.is_empty()) {
+        lines.push(String::new());
+    }
     lines.push(format!(
         "At current efficiency, ~{:.0}% of compute cost is wasted — ~${:.2}/hr recoverable.",
         waste_fraction * 100.0,
@@ -285,25 +287,16 @@ pub fn format_diagnose_rules(
         report.groups.iter().map(|g| g.primary.rule_name).collect();
 
     let mut out = Vec::new();
-    let mut append = |block: Vec<String>| {
-        if !out.is_empty() && !block.is_empty() {
-            out.push(String::new());
-        }
-        out.extend(block);
-    };
 
     for g in &report.groups {
-        append(rule_display_block(
-            g,
-            verbose_rules,
-            report.r2_suppressed_by_r4,
-        ));
+        append_display_block(
+            &mut out,
+            rule_display_block(g, verbose_rules, report.r2_suppressed_by_r4),
+        );
     }
 
     if let Some(rule_name) = waste_gate_rule_name(&report.groups) {
-        let mut waste = Vec::new();
-        append_waste_line(&mut waste, rule_name, baseline_ref, tps);
-        append(waste);
+        append_waste_line(&mut out, rule_name, baseline_ref, tps);
     }
 
     let r1_adv = if !fired_names.contains("under_batching") {
@@ -329,16 +322,16 @@ pub fn format_diagnose_rules(
 
     let any_advisory = r1_adv.is_some() || r2_adv.is_some() || r3_adv.is_some() || r5_adv.is_some();
     if let Some(lines) = r1_adv {
-        append(lines);
+        append_display_block(&mut out, lines);
     }
     if let Some(lines) = r2_adv {
-        append(lines);
+        append_display_block(&mut out, lines);
     }
     if let Some(lines) = r3_adv {
-        append(lines);
+        append_display_block(&mut out, lines);
     }
     if let Some(lines) = r5_adv {
-        append(lines);
+        append_display_block(&mut out, lines);
     }
 
     let mut verbose_miss = Vec::new();
@@ -850,7 +843,6 @@ pub fn format_diagnose_rules_for_windows(
     let ranked_report = build_report_for_windows(windows, summary);
     if let Some(rule_name) = waste_gate_rule_name(&ranked_report.groups) {
         append_waste_line(&mut warnings, rule_name, baseline_ref, tps);
-        warnings.push(String::new());
     }
 
     let config_max = summary.ctx.config.max_num_seqs;
@@ -953,6 +945,13 @@ fn pct(fired: usize, total: usize) -> u32 {
         return 0;
     }
     ((fired as f64 / total as f64) * 100.0).round() as u32
+}
+
+fn append_display_block(out: &mut Vec<String>, block: Vec<String>) {
+    if !out.is_empty() && !block.is_empty() {
+        out.push(String::new());
+    }
+    out.extend(block);
 }
 
 fn trim_trailing_blank_lines(lines: &mut Vec<String>) {
