@@ -173,15 +173,24 @@ fn rule_display_block(
     g: &IssueGroup,
     verbose_rules: bool,
     r2_suppressed_by_r4: bool,
-    baseline: Option<&PhysicsBaseline>,
-    tps: Option<f64>,
 ) -> Vec<String> {
     let mut block = g.primary.display_lines.clone();
-    append_waste_line(&mut block, g.primary.rule_name, baseline, tps);
     if verbose_rules && r2_suppressed_by_r4 && g.primary.rule_name == "parallelism_mismatch" {
         block.push(R2_SUPPRESSED_BY_R4_VERBOSE_LINE.to_string());
     }
     block
+}
+
+/// Highest-ranked fired rule eligible for the shared waste line (R1/R2/R5).
+fn waste_gate_rule_name(groups: &[IssueGroup]) -> Option<&str> {
+    groups.iter().find_map(|g| {
+        let name = g.primary.rule_name;
+        matches!(
+            name,
+            "under_batching" | "kv_cache_pressure" | "concurrency_saturation"
+        )
+        .then_some(name)
+    })
 }
 
 /// Appends per-issue waste line when efficiency and cost data are available (R1/R2/R5 only).
@@ -226,7 +235,7 @@ pub(super) fn append_waste_line(
     let waste_per_hr = cost_per_hr * waste_fraction;
     lines.push(String::new());
     lines.push(format!(
-        "At current efficiency, ~{:.0}% of compute cost is waste — ~${:.2}/hr unrecovered.",
+        "At current efficiency, ~{:.0}% of compute cost is wasted — ~${:.2}/hr recoverable.",
         waste_fraction * 100.0,
         waste_per_hr
     ));
@@ -288,9 +297,13 @@ pub fn format_diagnose_rules(
             g,
             verbose_rules,
             report.r2_suppressed_by_r4,
-            baseline_ref,
-            tps,
         ));
+    }
+
+    if let Some(rule_name) = waste_gate_rule_name(&report.groups) {
+        let mut waste = Vec::new();
+        append_waste_line(&mut waste, rule_name, baseline_ref, tps);
+        append(waste);
     }
 
     let r1_adv = if !fired_names.contains("under_batching") {
@@ -537,8 +550,6 @@ pub fn build_report_for_windows(
     let summary_snap = &summary.window.snapshot;
     let max_model_len = summary.ctx.config.max_model_len;
     let kv_headroom_gb = baseline.as_ref().and_then(|b| b.kv_headroom_gb);
-    let baseline_ref = baseline.as_ref();
-    let tps = summary_snap.vllm.generation_tokens_per_sec;
     let r2_significant = eval.r2_significant();
     let r2_backlog_significant = eval.r2_backlog_significant();
 
@@ -546,9 +557,8 @@ pub fn build_report_for_windows(
 
     if eval.r1_significant() {
         let d = aggregate_r1_detail(&eval.r1_details);
-        let mut display_lines =
+        let display_lines =
             format_under_batching_window_issue(&d, pct(eval.r1_fired, eval.n_eval), 0.8);
-        append_waste_line(&mut display_lines, "under_batching", baseline_ref, tps);
         recs.push(Recommendation {
             rule_name: "under_batching",
             impact: 4,
@@ -562,14 +572,13 @@ pub fn build_report_for_windows(
     if r2_significant {
         let r2_agg = aggregate_r2_detail(&eval.r2_details, summary_snap);
         let conf = kv_pressure_confidence(&r2_agg);
-        let mut display_lines = format_kv_cache_window_issue(
+        let display_lines = format_kv_cache_window_issue(
             &r2_agg,
             pct(eval.r2_fired, eval.n_eval),
             summary_snap,
             conf,
             max_model_len,
         );
-        append_waste_line(&mut display_lines, "kv_cache_pressure", baseline_ref, tps);
         recs.push(Recommendation {
             rule_name: "kv_cache_pressure",
             impact: 5,
@@ -580,13 +589,12 @@ pub fn build_report_for_windows(
         });
     } else if r2_backlog_significant {
         let agg = aggregate_backlog_detail(&eval.r2_backlog_details);
-        let mut display_lines = format_kv_admission_backlog_issue(
+        let display_lines = format_kv_admission_backlog_issue(
             &agg,
             pct(eval.r2_backlog_fired, eval.n_eval),
             max_model_len,
             kv_headroom_gb,
         );
-        append_waste_line(&mut display_lines, "kv_cache_pressure", baseline_ref, tps);
         recs.push(Recommendation {
             rule_name: "kv_cache_pressure",
             impact: 5,
@@ -603,16 +611,10 @@ pub fn build_report_for_windows(
                 .max_num_seqs
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "?".to_string());
-            let mut display_lines = format_concurrency_saturation_window_issue(
+            let display_lines = format_concurrency_saturation_window_issue(
                 &agg,
                 pct(eval.r5_fired, eval.n_eval),
                 max_model_len,
-            );
-            append_waste_line(
-                &mut display_lines,
-                "concurrency_saturation",
-                baseline_ref,
-                tps,
             );
             recs.push(Recommendation {
                 rule_name: "concurrency_saturation",
@@ -756,12 +758,11 @@ pub fn format_diagnose_rules_for_windows(
     let mut verbose_miss = Vec::new();
 
     if r1_significant {
-        let mut block = format_under_batching_window_issue(
+        let block = format_under_batching_window_issue(
             &aggregate_r1_detail(r1_details),
             pct(r1_fired, n_eval),
             0.8,
         );
-        append_waste_line(&mut block, "under_batching", baseline_ref, tps);
         warnings.extend(block);
         warnings.push(String::new());
     } else if verbose_rules {
@@ -771,25 +772,23 @@ pub fn format_diagnose_rules_for_windows(
 
     if r2_significant {
         let r2_agg = aggregate_r2_detail(r2_details, summary_snap);
-        let mut block = format_kv_cache_window_issue(
+        let block = format_kv_cache_window_issue(
             &r2_agg,
             pct(r2_fired, n_eval),
             summary_snap,
             kv_pressure_confidence(&r2_agg),
             summary.ctx.config.max_model_len,
         );
-        append_waste_line(&mut block, "kv_cache_pressure", baseline_ref, tps);
         warnings.extend(block);
         warnings.push(String::new());
     } else if r2_backlog_significant {
         let agg = aggregate_backlog_detail(r2_backlog_details);
-        let mut block = format_kv_admission_backlog_issue(
+        let block = format_kv_admission_backlog_issue(
             &agg,
             pct(r2_backlog_fired, n_eval),
             summary.ctx.config.max_model_len,
             summary_baseline.as_ref().and_then(|b| b.kv_headroom_gb),
         );
-        append_waste_line(&mut block, "kv_cache_pressure", baseline_ref, tps);
         warnings.extend(block);
         warnings.push(String::new());
     } else if verbose_rules {
@@ -799,12 +798,11 @@ pub fn format_diagnose_rules_for_windows(
 
     if r5_significant && !r2_significant && !r2_backlog_significant {
         if let Some(agg) = aggregate_concurrency_saturation_detail(r5_details) {
-            let mut block = format_concurrency_saturation_window_issue(
+            let block = format_concurrency_saturation_window_issue(
                 &agg,
                 pct(r5_fired, n_eval),
                 summary.ctx.config.max_model_len,
             );
-            append_waste_line(&mut block, "concurrency_saturation", baseline_ref, tps);
             warnings.extend(block);
             warnings.push(String::new());
         }
@@ -845,9 +843,13 @@ pub fn format_diagnose_rules_for_windows(
             g,
             verbose_rules,
             r2_suppressed_by_r4_display,
-            baseline_ref,
-            tps,
         ));
+        warnings.push(String::new());
+    }
+
+    let ranked_report = build_report_for_windows(windows, summary);
+    if let Some(rule_name) = waste_gate_rule_name(&ranked_report.groups) {
+        append_waste_line(&mut warnings, rule_name, baseline_ref, tps);
         warnings.push(String::new());
     }
 
@@ -903,7 +905,7 @@ pub fn format_diagnose_rules_for_windows(
     if !r1_significant && !r1_adv_present {
         not_fired.push("Under-batching");
     }
-    if !r2_significant && !r2_backlog_significant && !r5_significant && !r2_adv_present {
+    if !r2_significant && !r2_backlog_significant && !r2_adv_present {
         not_fired.push("KV cache pressure");
     }
     if !r3_significant && !r3_adv_present {
@@ -1620,6 +1622,81 @@ mod tests {
             !lines.iter().any(|l| l.contains("No issues detected")),
             "should not append no-issues line when at least one rule fired"
         );
+        let waste_lines: Vec<_> = lines.iter().filter(|l| l.contains("recoverable")).collect();
+        assert_eq!(
+            waste_lines.len(),
+            1,
+            "expected one shared waste line: {lines:?}"
+        );
+        assert!(waste_lines[0].contains("wasted"));
+    }
+
+    #[test]
+    fn waste_gate_rule_name_uses_highest_ranked_waste_eligible_rule() {
+        let groups = vec![
+            IssueGroup {
+                primary: Recommendation {
+                    rule_name: "kv_cache_pressure",
+                    impact: 5,
+                    confidence: 0.85,
+                    action: String::new(),
+                    expected_impact: String::new(),
+                    display_lines: Vec::new(),
+                },
+                secondary: Vec::new(),
+            },
+            IssueGroup {
+                primary: Recommendation {
+                    rule_name: "under_batching",
+                    impact: 4,
+                    confidence: 0.8,
+                    action: String::new(),
+                    expected_impact: String::new(),
+                    display_lines: Vec::new(),
+                },
+                secondary: Vec::new(),
+            },
+        ];
+        assert_eq!(waste_gate_rule_name(&groups), Some("kv_cache_pressure"));
+        let groups = vec![
+            IssueGroup {
+                primary: Recommendation {
+                    rule_name: "low_prefix_reuse",
+                    impact: 2,
+                    confidence: 0.9,
+                    action: String::new(),
+                    expected_impact: String::new(),
+                    display_lines: Vec::new(),
+                },
+                secondary: Vec::new(),
+            },
+            IssueGroup {
+                primary: Recommendation {
+                    rule_name: "under_batching",
+                    impact: 4,
+                    confidence: 0.8,
+                    action: String::new(),
+                    expected_impact: String::new(),
+                    display_lines: Vec::new(),
+                },
+                secondary: Vec::new(),
+            },
+        ];
+        assert_eq!(waste_gate_rule_name(&groups), Some("under_batching"));
+        assert_eq!(
+            waste_gate_rule_name(&[IssueGroup {
+                primary: Recommendation {
+                    rule_name: "parallelism_mismatch",
+                    impact: 5,
+                    confidence: 0.9,
+                    action: String::new(),
+                    expected_impact: String::new(),
+                    display_lines: Vec::new(),
+                },
+                secondary: Vec::new(),
+            }]),
+            None
+        );
     }
 
     #[test]
@@ -1976,7 +2053,7 @@ mod tests {
             let mut lines = vec!["issue".to_string()];
             append_waste_line(&mut lines, rule, Some(&b), tps);
             assert!(
-                lines.iter().any(|l| l.contains("compute cost is waste")),
+                lines.iter().any(|l| l.contains("compute cost is wasted")),
                 "rule {rule}"
             );
         }
