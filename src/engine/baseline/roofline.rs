@@ -1,6 +1,26 @@
-use crate::context::AnalysisInput;
+use crate::context::{gpu_prices, AnalysisInput};
 
 use super::math;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CostEstimate {
+    /// Tokens generated per watt of power draw. None if power_watts unavailable.
+    pub tok_per_watt: Option<f64>,
+    /// Estimated cost per 1M tokens (USD). None if no price source available.
+    pub cost_per_million_tokens: Option<f64>,
+    /// Source of the cost estimate.
+    pub cost_source: CostSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CostSource {
+    /// Operator-supplied via --cost-per-hour flag.
+    UserProvided,
+    /// From gpu_prices.json catalog. Always labeled (est).
+    Catalog,
+    /// No cost data available.
+    None,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CeilingEstimate {
@@ -34,6 +54,7 @@ pub struct PhysicsBaseline {
     pub prefill_latency_floor_ms: Option<f64>,
     /// Concurrent batch size at which decode crosses from BW-bound to compute-bound (roofline ridge).
     pub ridge_batch_size: f64,
+    pub cost: Option<CostEstimate>,
 }
 
 pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
@@ -96,6 +117,50 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
     let tpot_floor_ms = math::latency_floor_ms(decode.expected);
     let prefill_latency_floor_ms = prefill.map(|p| math::latency_floor_ms(p.expected));
 
+    let snap = &input.window.snapshot;
+    let tps = snap
+        .vllm
+        .generation_tokens_per_sec
+        .filter(|v| v.is_finite() && *v > 0.0);
+    let power_watts = snap.gpu.power_watts.filter(|v| v.is_finite() && *v > 0.0);
+
+    let tok_per_watt = match (tps, power_watts) {
+        (Some(t), Some(p)) => Some(t / p),
+        _ => None,
+    };
+
+    let (cost_per_hr, cost_source) = if let Some(hr) = ctx
+        .config
+        .cost_per_hour
+        .filter(|v| v.is_finite() && *v > 0.0)
+    {
+        (Some(hr), CostSource::UserProvided)
+    } else if let Some(gpu_name) = ctx.gpu.name.as_deref() {
+        gpu_prices::lookup_gpu_price(gpu_name)
+            .map(|p| (Some(p.on_demand_per_hr), CostSource::Catalog))
+            .unwrap_or((None, CostSource::None))
+    } else {
+        (None, CostSource::None)
+    };
+
+    let cost_per_million_tokens = match (cost_per_hr, tps, cost_source) {
+        (Some(hr), Some(t), CostSource::UserProvided | CostSource::Catalog) if t > 0.0 => {
+            let cpm = hr * 1_000_000.0 / (t * 3600.0);
+            cpm.is_finite().then_some(cpm)
+        }
+        _ => None,
+    };
+
+    let cost = if tok_per_watt.is_some() || cost_per_million_tokens.is_some() {
+        Some(CostEstimate {
+            tok_per_watt,
+            cost_per_million_tokens,
+            cost_source,
+        })
+    } else {
+        None
+    };
+
     Some(PhysicsBaseline {
         decode,
         prefill,
@@ -107,6 +172,7 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
         tpot_floor_ms,
         prefill_latency_floor_ms,
         ridge_batch_size,
+        cost,
     })
 }
 
@@ -595,5 +661,143 @@ mod tests {
         let b = compute(&input).expect("baseline");
         assert!(b.efficiency_pct.is_none());
         assert!(b.headroom_pct.is_none());
+    }
+
+    #[test]
+    fn tok_per_watt_from_power_and_generation_tps() {
+        let cfg = VllmConfig {
+            kv_cache_dtype: Some("bf16".to_string()),
+            max_model_len: Some(2048),
+            ..Default::default()
+        };
+        let snap = VllmRawMetrics {
+            generation_tokens_per_sec: Some(100.0),
+            num_requests_running: Some(1.0),
+            ..Default::default()
+        };
+        let (mut ctx, mut win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(67.0),
+            Some(3350.0),
+            cfg,
+            snap,
+        );
+        ctx.gpu.name = Some("NVIDIA H100 80GB HBM3".to_string());
+        win.snapshot.gpu.power_watts = Some(50.0);
+        let input = AnalysisInput::new(&ctx, &win);
+        let b = compute(&input).expect("baseline");
+        let cost = b.cost.expect("cost block");
+        let tpw = cost.tok_per_watt.expect("tok/W");
+        assert!((tpw - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cost_per_million_tokens_catalog_h100() {
+        let cfg = VllmConfig {
+            kv_cache_dtype: Some("bf16".to_string()),
+            max_model_len: Some(2048),
+            ..Default::default()
+        };
+        let snap = VllmRawMetrics {
+            generation_tokens_per_sec: Some(100.0),
+            num_requests_running: Some(1.0),
+            ..Default::default()
+        };
+        let (mut ctx, win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(67.0),
+            Some(3350.0),
+            cfg,
+            snap,
+        );
+        ctx.gpu.name = Some("NVIDIA H100 80GB HBM3".to_string());
+        let input = AnalysisInput::new(&ctx, &win);
+        let b = compute(&input).expect("baseline");
+        let cost = b.cost.expect("cost");
+        assert_eq!(cost.cost_source, CostSource::Catalog);
+        let cpm = cost.cost_per_million_tokens.expect("cpm");
+        let expected = 2.80 * 1_000_000.0 / (100.0 * 3600.0);
+        assert!((cpm - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cost_source_user_provided_overrides_catalog() {
+        let cfg = VllmConfig {
+            cost_per_hour: Some(5.0),
+            kv_cache_dtype: Some("bf16".to_string()),
+            max_model_len: Some(2048),
+            ..Default::default()
+        };
+        let snap = VllmRawMetrics {
+            generation_tokens_per_sec: Some(200.0),
+            num_requests_running: Some(1.0),
+            ..Default::default()
+        };
+        let (mut ctx, win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(67.0),
+            Some(3350.0),
+            cfg,
+            snap,
+        );
+        ctx.gpu.name = Some("NVIDIA H100 80GB HBM3".to_string());
+        let input = AnalysisInput::new(&ctx, &win);
+        let cost = compute(&input).expect("baseline").cost.expect("cost");
+        assert_eq!(cost.cost_source, CostSource::UserProvided);
+        let expected = 5.0 * 1_000_000.0 / (200.0 * 3600.0);
+        assert!((cost.cost_per_million_tokens.unwrap() - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cost_none_when_power_or_tps_missing() {
+        let cfg = VllmConfig {
+            kv_cache_dtype: Some("bf16".to_string()),
+            max_model_len: Some(2048),
+            ..Default::default()
+        };
+        let (mut ctx, win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(67.0),
+            Some(3350.0),
+            cfg.clone(),
+            VllmRawMetrics {
+                generation_tokens_per_sec: None,
+                num_requests_running: Some(1.0),
+                ..Default::default()
+            },
+        );
+        ctx.gpu.name = Some("NVIDIA H100 80GB HBM3".to_string());
+        let no_tps = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+        assert!(no_tps.cost.is_none());
+
+        let (mut ctx2, mut win2) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(67.0),
+            Some(3350.0),
+            cfg,
+            VllmRawMetrics {
+                generation_tokens_per_sec: Some(100.0),
+                num_requests_running: Some(1.0),
+                ..Default::default()
+            },
+        );
+        ctx2.gpu.name = Some("NVIDIA H100 80GB HBM3".to_string());
+        win2.snapshot.gpu.power_watts = None;
+        let cost = compute(&AnalysisInput::new(&ctx2, &win2))
+            .expect("baseline")
+            .cost
+            .expect("cost without power");
+        assert!(cost.tok_per_watt.is_none());
+        assert!(cost.cost_per_million_tokens.is_some());
     }
 }

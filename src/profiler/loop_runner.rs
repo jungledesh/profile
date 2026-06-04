@@ -10,6 +10,7 @@ const CEILING_HEADROOM_THRESHOLD_PCT: f64 = 10.0;
 pub fn run(
     url: &str,
     max_num_seqs: u32,
+    cost_per_hour: Option<f64>,
     duration: Duration,
     initial_result: DiagnoseResult,
     initial_report: engine::Report,
@@ -54,7 +55,7 @@ pub fn run(
         let _outcome = poll::wait_for_restart_or_skip(url, &stdin_rx);
 
         println!("\nMeasuring...");
-        let new_result = run_diagnose(url, max_num_seqs, duration)?;
+        let new_result = run_diagnose(url, max_num_seqs, cost_per_hour, duration)?;
         let agg_win = RuntimeWindow::from_snapshot(new_result.snapshot.clone());
         let summary = AnalysisInput::new(&new_result.static_ctx, &agg_win);
         let new_report = engine::build_report_for_diagnose(&new_result.windows, summary);

@@ -1,0 +1,41 @@
+{
+  "note": "Market-average estimates across major cloud providers (AWS, GCP, Azure, Lambda, RunPod, CoreWeave, GMI Cloud). Not precise — use --cost-per-hour for exact rates. On-demand and spot are approximate midpoints of observed market range as of 2026-06.",
+  "updated": "2026-06",
+  "gpus": {
+    "a10g": {
+      "name": "NVIDIA A10G",
+      "on_demand_per_hr": 1.00,
+      "spot_per_hr": 0.40
+    },
+    "a100": {
+      "name": "NVIDIA A100 80GB",
+      "on_demand_per_hr": 1.50,
+      "spot_per_hr": 0.60
+    },
+    "l40s": {
+      "name": "NVIDIA L40S",
+      "on_demand_per_hr": 1.80,
+      "spot_per_hr": 0.80
+    },
+    "h100": {
+      "name": "NVIDIA H100 SXM",
+      "on_demand_per_hr": 2.80,
+      "spot_per_hr": 1.40
+    },
+    "h200": {
+      "name": "NVIDIA H200",
+      "on_demand_per_hr": 3.50,
+      "spot_per_hr": 1.80
+    },
+    "b200": {
+      "name": "NVIDIA B200",
+      "on_demand_per_hr": 6.00,
+      "spot_per_hr": 3.50
+    },
+    "gb200": {
+      "name": "NVIDIA GB200",
+      "on_demand_per_hr": 8.50,
+      "spot_per_hr": 4.00
+    }
+  }
+}

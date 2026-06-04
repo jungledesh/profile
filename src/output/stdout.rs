@@ -274,6 +274,33 @@ fn gpu_gauges_line(
         .map(|draw| format!("POWER {:.0}W", draw))
         .unwrap_or_else(|| "POWER —".to_string());
 
+    let mut segments = vec![efficiency, power];
+
+    if let (Some(tps), Some(watts)) = (
+        actual_tps.filter(|v| v.is_finite() && *v > 0.0),
+        g.power_watts.filter(|v| v.is_finite() && *v > 0.0),
+    ) {
+        if watts > 0.0 {
+            segments.push(format!("{:.1} tok/W", tps / watts));
+        }
+    }
+
+    if let Some(cost) = baseline.and_then(|b| b.cost.as_ref()) {
+        if let Some(cpm) = cost
+            .cost_per_million_tokens
+            .filter(|v| v.is_finite() && *v > 0.0)
+        {
+            let label = match cost.cost_source {
+                engine::CostSource::Catalog => format!("${:.2}/1M tok (est)", cpm),
+                engine::CostSource::UserProvided => format!("${:.2}/1M tok", cpm),
+                engine::CostSource::None => String::new(),
+            };
+            if !label.is_empty() {
+                segments.push(label);
+            }
+        }
+    }
+
     let mem = match (g.vram_used_mb, g.vram_total_mb) {
         (Some(used), Some(total)) if total > 0 => {
             let u_gb = used as f64 / 1024.0;
@@ -290,7 +317,8 @@ fn gpu_gauges_line(
         _ => "vRAM —".to_string(),
     };
 
-    format!("{efficiency} | {power} | {mem}")
+    segments.push(mem);
+    segments.join(" | ")
 }
 
 fn format_efficiency_label(
@@ -659,6 +687,7 @@ mod tests {
             tpot_floor_ms: 10.0,
             prefill_latency_floor_ms: Some(20.0),
             ridge_batch_size: 40.0,
+            cost: None,
         };
         let lines = baseline_lines(Some(b), None, None);
         assert_eq!(
@@ -693,6 +722,7 @@ mod tests {
             tpot_floor_ms: 10.0,
             prefill_latency_floor_ms: Some(42.0),
             ridge_batch_size: 40.0,
+            cost: None,
         };
         let above = baseline_lines(Some(base()), Some(40.0), None);
         assert!(
@@ -729,6 +759,7 @@ mod tests {
             tpot_floor_ms: 10.0,
             prefill_latency_floor_ms: Some(200.0),
             ridge_batch_size: 40.0,
+            cost: None,
         };
         let lines = baseline_lines(Some(b), Some(5.0), None);
         assert!(
@@ -764,6 +795,7 @@ mod tests {
             tpot_floor_ms: 10.0,
             prefill_latency_floor_ms: Some(20.0),
             ridge_batch_size: 40.0,
+            cost: None,
         };
         let lines = baseline_lines(Some(b), Some(10.0), None);
         assert!(
@@ -817,7 +849,67 @@ mod tests {
             tpot_floor_ms: 10.0,
             prefill_latency_floor_ms: None,
             ridge_batch_size: 1.0,
+            cost: None,
         }
+    }
+
+    fn baseline_with_cost(
+        eff: f64,
+        source: engine::CostSource,
+        cpm: f64,
+        tok_per_watt: Option<f64>,
+    ) -> crate::engine::PhysicsBaseline {
+        use crate::engine::baseline::{
+            CeilingEstimate, CostEstimate, PhysicsBaseline, WeightDtypeSource,
+        };
+        PhysicsBaseline {
+            decode: CeilingEstimate {
+                lower: 100.0,
+                expected: 100.0,
+                upper: 100.0,
+            },
+            prefill: None,
+            efficiency_pct: Some(eff),
+            headroom_pct: None,
+            weight_dtype_source: WeightDtypeSource::Fallback,
+            weight_gb: 1.0,
+            kv_headroom_gb: None,
+            tpot_floor_ms: 10.0,
+            prefill_latency_floor_ms: None,
+            ridge_batch_size: 1.0,
+            cost: Some(CostEstimate {
+                tok_per_watt,
+                cost_per_million_tokens: Some(cpm),
+                cost_source: source,
+            }),
+        }
+    }
+
+    #[test]
+    fn gpu_gauges_line_includes_tok_per_watt_and_catalog_cost_est() {
+        let g = GpuRawMetrics {
+            power_watts: Some(421.0),
+            ..Default::default()
+        };
+        let b = baseline_with_cost(31.7, engine::CostSource::Catalog, 1.84, Some(14.2));
+        let s = gpu_gauges_line(&g, Some(&b), Some(5978.2));
+        assert!(s.contains("EFFICIENCY 31.7%"));
+        assert!(s.contains("POWER 421W"));
+        assert!(s.contains("14.2 tok/W"));
+        assert!(s.contains("$1.84/1M tok (est)"));
+    }
+
+    #[test]
+    fn gpu_gauges_line_user_cost_without_est_suffix() {
+        let g = GpuRawMetrics {
+            power_watts: Some(100.0),
+            ..Default::default()
+        };
+        let b = baseline_with_cost(50.0, engine::CostSource::UserProvided, 2.50, None);
+        let s = gpu_gauges_line(&g, Some(&b), None);
+        assert!(s.contains("$2.50/1M tok"));
+        assert!(!s.contains("(est)"));
+        assert!(!s.contains("tok/W"));
     }
 
     #[test]

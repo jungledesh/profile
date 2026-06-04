@@ -2,7 +2,7 @@ use std::time::SystemTime;
 
 use crate::collectors::{window_is_evaluable, RawSnapshot};
 use crate::context::{AnalysisInput, RuntimeWindow};
-use crate::engine::baseline;
+use crate::engine::baseline::{self, CostSource, PhysicsBaseline};
 
 mod r1_under_batching;
 mod r2_kv_cache_pressure;
@@ -173,12 +173,63 @@ fn rule_display_block(
     g: &IssueGroup,
     verbose_rules: bool,
     r2_suppressed_by_r4: bool,
+    baseline: Option<&PhysicsBaseline>,
+    tps: Option<f64>,
 ) -> Vec<String> {
     let mut block = g.primary.display_lines.clone();
+    append_waste_line(&mut block, g.primary.rule_name, baseline, tps);
     if verbose_rules && r2_suppressed_by_r4 && g.primary.rule_name == "parallelism_mismatch" {
         block.push(R2_SUPPRESSED_BY_R4_VERBOSE_LINE.to_string());
     }
     block
+}
+
+/// Appends per-issue waste line when efficiency and cost data are available (R1/R2/R5 only).
+pub(super) fn append_waste_line(
+    lines: &mut Vec<String>,
+    rule_name: &str,
+    baseline: Option<&PhysicsBaseline>,
+    tps: Option<f64>,
+) {
+    if !matches!(
+        rule_name,
+        "under_batching" | "kv_cache_pressure" | "concurrency_saturation"
+    ) {
+        return;
+    }
+    let Some(b) = baseline else {
+        return;
+    };
+    let Some(eff) = b.efficiency_pct.filter(|e| e.is_finite()) else {
+        return;
+    };
+    let Some(cost) = b.cost.as_ref() else {
+        return;
+    };
+    let Some(cpm) = cost.cost_per_million_tokens else {
+        return;
+    };
+    if !matches!(
+        cost.cost_source,
+        CostSource::UserProvided | CostSource::Catalog
+    ) {
+        return;
+    }
+    let Some(tps) = tps.filter(|v| v.is_finite() && *v > 0.0) else {
+        return;
+    };
+    let cost_per_hr = cpm * tps * 3600.0 / 1_000_000.0;
+    if !cost_per_hr.is_finite() || cost_per_hr <= 0.0 {
+        return;
+    }
+    let waste_fraction = (1.0 - eff / 100.0).max(0.0);
+    let waste_per_hr = cost_per_hr * waste_fraction;
+    lines.push(String::new());
+    lines.push(format!(
+        "At current efficiency, ~{:.0}% of compute cost is waste — ~${:.2}/hr unrecovered.",
+        waste_fraction * 100.0,
+        waste_per_hr
+    ));
 }
 
 /// User-facing lines when no window met `window_is_evaluable` (shared by stdout and rule formatters).
@@ -218,6 +269,8 @@ pub fn format_diagnose_rules(
 
     let report = super::build_report(input);
     let any_issue = !report.groups.is_empty();
+    let baseline_ref = report.baseline.as_ref();
+    let tps = snapshot.vllm.generation_tokens_per_sec;
 
     let fired_names: std::collections::HashSet<&'static str> =
         report.groups.iter().map(|g| g.primary.rule_name).collect();
@@ -235,6 +288,8 @@ pub fn format_diagnose_rules(
             g,
             verbose_rules,
             report.r2_suppressed_by_r4,
+            baseline_ref,
+            tps,
         ));
     }
 
@@ -482,6 +537,8 @@ pub fn build_report_for_windows(
     let summary_snap = &summary.window.snapshot;
     let max_model_len = summary.ctx.config.max_model_len;
     let kv_headroom_gb = baseline.as_ref().and_then(|b| b.kv_headroom_gb);
+    let baseline_ref = baseline.as_ref();
+    let tps = summary_snap.vllm.generation_tokens_per_sec;
     let r2_significant = eval.r2_significant();
     let r2_backlog_significant = eval.r2_backlog_significant();
 
@@ -489,51 +546,54 @@ pub fn build_report_for_windows(
 
     if eval.r1_significant() {
         let d = aggregate_r1_detail(&eval.r1_details);
+        let mut display_lines =
+            format_under_batching_window_issue(&d, pct(eval.r1_fired, eval.n_eval), 0.8);
+        append_waste_line(&mut display_lines, "under_batching", baseline_ref, tps);
         recs.push(Recommendation {
             rule_name: "under_batching",
             impact: 4,
             confidence: 0.8,
             action: "Increase client concurrency".to_string(),
             expected_impact: "Higher throughput, stable TPOT".to_string(),
-            display_lines: format_under_batching_window_issue(
-                &d,
-                pct(eval.r1_fired, eval.n_eval),
-                0.8,
-            ),
+            display_lines,
         });
     }
 
     if r2_significant {
         let r2_agg = aggregate_r2_detail(&eval.r2_details, summary_snap);
         let conf = kv_pressure_confidence(&r2_agg);
+        let mut display_lines = format_kv_cache_window_issue(
+            &r2_agg,
+            pct(eval.r2_fired, eval.n_eval),
+            summary_snap,
+            conf,
+            max_model_len,
+        );
+        append_waste_line(&mut display_lines, "kv_cache_pressure", baseline_ref, tps);
         recs.push(Recommendation {
             rule_name: "kv_cache_pressure",
             impact: 5,
             confidence: conf,
             action: "Reduce max_num_seqs or add tensor parallelism".to_string(),
             expected_impact: "Reduced KV evictions and lower latency variance".to_string(),
-            display_lines: format_kv_cache_window_issue(
-                &r2_agg,
-                pct(eval.r2_fired, eval.n_eval),
-                summary_snap,
-                conf,
-                max_model_len,
-            ),
+            display_lines,
         });
     } else if r2_backlog_significant {
         let agg = aggregate_backlog_detail(&eval.r2_backlog_details);
+        let mut display_lines = format_kv_admission_backlog_issue(
+            &agg,
+            pct(eval.r2_backlog_fired, eval.n_eval),
+            max_model_len,
+            kv_headroom_gb,
+        );
+        append_waste_line(&mut display_lines, "kv_cache_pressure", baseline_ref, tps);
         recs.push(Recommendation {
             rule_name: "kv_cache_pressure",
             impact: 5,
             confidence: 0.85,
             action: "Raise --gpu-memory-utilization or reduce KV footprint".to_string(),
             expected_impact: "Wait queue drains, TTFT recovers.".to_string(),
-            display_lines: format_kv_admission_backlog_issue(
-                &agg,
-                pct(eval.r2_backlog_fired, eval.n_eval),
-                max_model_len,
-                kv_headroom_gb,
-            ),
+            display_lines,
         });
     }
 
@@ -543,6 +603,17 @@ pub fn build_report_for_windows(
                 .max_num_seqs
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "?".to_string());
+            let mut display_lines = format_concurrency_saturation_window_issue(
+                &agg,
+                pct(eval.r5_fired, eval.n_eval),
+                max_model_len,
+            );
+            append_waste_line(
+                &mut display_lines,
+                "concurrency_saturation",
+                baseline_ref,
+                tps,
+            );
             recs.push(Recommendation {
                 rule_name: "concurrency_saturation",
                 impact: 4,
@@ -556,11 +627,7 @@ pub fn build_report_for_windows(
                     agg.queue_ratio * 100.0
                 ),
                 expected_impact: "Queue drains, TTFT recovers.".to_string(),
-                display_lines: format_concurrency_saturation_window_issue(
-                    &agg,
-                    pct(eval.r5_fired, eval.n_eval),
-                    max_model_len,
-                ),
+                display_lines,
             });
         }
     }
@@ -619,6 +686,8 @@ pub fn format_diagnose_rules_for_windows(
 
     let summary_baseline = baseline::compute(&summary);
     let summary_snap = &summary.window.snapshot;
+    let baseline_ref = summary_baseline.as_ref();
+    let tps = summary_snap.vllm.generation_tokens_per_sec;
 
     if eval.no_fires() {
         let mut out = Vec::new();
@@ -687,11 +756,13 @@ pub fn format_diagnose_rules_for_windows(
     let mut verbose_miss = Vec::new();
 
     if r1_significant {
-        warnings.extend(format_under_batching_window_issue(
+        let mut block = format_under_batching_window_issue(
             &aggregate_r1_detail(r1_details),
             pct(r1_fired, n_eval),
             0.8,
-        ));
+        );
+        append_waste_line(&mut block, "under_batching", baseline_ref, tps);
+        warnings.extend(block);
         warnings.push(String::new());
     } else if verbose_rules {
         verbose_miss.push("Under-batching: not triggered".to_string());
@@ -700,22 +771,26 @@ pub fn format_diagnose_rules_for_windows(
 
     if r2_significant {
         let r2_agg = aggregate_r2_detail(r2_details, summary_snap);
-        warnings.extend(format_kv_cache_window_issue(
+        let mut block = format_kv_cache_window_issue(
             &r2_agg,
             pct(r2_fired, n_eval),
             summary_snap,
             kv_pressure_confidence(&r2_agg),
             summary.ctx.config.max_model_len,
-        ));
+        );
+        append_waste_line(&mut block, "kv_cache_pressure", baseline_ref, tps);
+        warnings.extend(block);
         warnings.push(String::new());
     } else if r2_backlog_significant {
         let agg = aggregate_backlog_detail(r2_backlog_details);
-        warnings.extend(format_kv_admission_backlog_issue(
+        let mut block = format_kv_admission_backlog_issue(
             &agg,
             pct(r2_backlog_fired, n_eval),
             summary.ctx.config.max_model_len,
             summary_baseline.as_ref().and_then(|b| b.kv_headroom_gb),
-        ));
+        );
+        append_waste_line(&mut block, "kv_cache_pressure", baseline_ref, tps);
+        warnings.extend(block);
         warnings.push(String::new());
     } else if verbose_rules {
         verbose_miss.push("KV cache pressure: not triggered".to_string());
@@ -724,11 +799,13 @@ pub fn format_diagnose_rules_for_windows(
 
     if r5_significant && !r2_significant && !r2_backlog_significant {
         if let Some(agg) = aggregate_concurrency_saturation_detail(r5_details) {
-            warnings.extend(format_concurrency_saturation_window_issue(
+            let mut block = format_concurrency_saturation_window_issue(
                 &agg,
                 pct(r5_fired, n_eval),
                 summary.ctx.config.max_model_len,
-            ));
+            );
+            append_waste_line(&mut block, "concurrency_saturation", baseline_ref, tps);
+            warnings.extend(block);
             warnings.push(String::new());
         }
     } else if verbose_rules && !r2_significant && !r2_backlog_significant {
@@ -768,6 +845,8 @@ pub fn format_diagnose_rules_for_windows(
             g,
             verbose_rules,
             r2_suppressed_by_r4_display,
+            baseline_ref,
+            tps,
         ));
         warnings.push(String::new());
     }
@@ -1857,5 +1936,73 @@ mod tests {
         assert!(vlines
             .iter()
             .any(|l| l.contains("2 of 2 collected windows")));
+    }
+
+    use crate::engine::baseline::{CeilingEstimate, CostEstimate, WeightDtypeSource};
+
+    fn baseline_for_waste(eff: f64, source: CostSource, cpm: f64) -> PhysicsBaseline {
+        PhysicsBaseline {
+            decode: CeilingEstimate {
+                lower: 1.0,
+                expected: 100.0,
+                upper: 1.0,
+            },
+            prefill: None,
+            efficiency_pct: Some(eff),
+            headroom_pct: Some(100.0 - eff),
+            weight_dtype_source: WeightDtypeSource::Fallback,
+            weight_gb: 1.0,
+            kv_headroom_gb: None,
+            tpot_floor_ms: 10.0,
+            prefill_latency_floor_ms: None,
+            ridge_batch_size: 1.0,
+            cost: Some(CostEstimate {
+                tok_per_watt: None,
+                cost_per_million_tokens: Some(cpm),
+                cost_source: source,
+            }),
+        }
+    }
+
+    #[test]
+    fn waste_line_appended_for_r1_r2_r5() {
+        let b = baseline_for_waste(32.0, CostSource::Catalog, 1.84);
+        let tps = Some(14.2_f64);
+        for rule in [
+            "under_batching",
+            "kv_cache_pressure",
+            "concurrency_saturation",
+        ] {
+            let mut lines = vec!["issue".to_string()];
+            append_waste_line(&mut lines, rule, Some(&b), tps);
+            assert!(
+                lines.iter().any(|l| l.contains("compute cost is waste")),
+                "rule {rule}"
+            );
+        }
+    }
+
+    #[test]
+    fn waste_line_absent_for_r3_r4() {
+        let b = baseline_for_waste(32.0, CostSource::UserProvided, 1.0);
+        for rule in ["low_prefix_reuse", "parallelism_mismatch"] {
+            let mut lines = vec!["issue".to_string()];
+            append_waste_line(&mut lines, rule, Some(&b), Some(100.0));
+            assert_eq!(lines.len(), 1, "rule {rule}");
+        }
+    }
+
+    #[test]
+    fn waste_line_absent_without_cost_or_efficiency() {
+        let mut b = baseline_for_waste(32.0, CostSource::Catalog, 1.84);
+        b.efficiency_pct = None;
+        let mut lines = vec!["issue".to_string()];
+        append_waste_line(&mut lines, "under_batching", Some(&b), Some(10.0));
+        assert_eq!(lines.len(), 1);
+
+        b.efficiency_pct = Some(32.0);
+        b.cost = None;
+        append_waste_line(&mut lines, "under_batching", Some(&b), Some(10.0));
+        assert_eq!(lines.len(), 1);
     }
 }

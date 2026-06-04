@@ -28,6 +28,7 @@ pub struct DiagnoseResult {
 pub fn run_diagnose(
     vllm_metrics_input: &str,
     max_num_seqs: u32,
+    cost_per_hour: Option<f64>,
     duration: Duration,
 ) -> anyhow::Result<DiagnoseResult> {
     let started_at = SystemTime::now();
@@ -48,7 +49,8 @@ pub fn run_diagnose(
             started_at,
         )
     };
-    let config = build_config(vllm_metrics_input, &snapshot, max_num_seqs);
+    let mut config = build_config(vllm_metrics_input, &snapshot, max_num_seqs);
+    config.cost_per_hour = cost_per_hour;
     let static_ctx = StaticContext::from_snapshot(&snapshot, config);
     let windows: Vec<RuntimeWindow> = raw_windows
         .into_iter()
