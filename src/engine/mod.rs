@@ -3,7 +3,7 @@ mod rules;
 
 use crate::context::{AnalysisInput, RuntimeWindow};
 
-pub use baseline::{CeilingEstimate, PhysicsBaseline, WeightDtypeSource};
+pub use baseline::{CeilingEstimate, CostEstimate, CostSource, PhysicsBaseline, WeightDtypeSource};
 pub use rules::*;
 
 #[derive(Debug, Clone)]

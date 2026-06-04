@@ -47,6 +47,15 @@ pub struct Cli {
     pub max_num_seqs: u32,
 
     #[arg(
+        long = "cost-per-hour",
+        global = true,
+        value_parser = parse_cost_per_hour_arg,
+        help = "GPU cost in USD/hr (overrides catalog estimate)",
+        display_order = 3
+    )]
+    pub cost_per_hour: Option<f64>,
+
+    #[arg(
         short = 'u',
         long,
         global = true,
@@ -104,9 +113,13 @@ pub enum Commands {
 
 pub fn run(cli: Cli) -> anyhow::Result<()> {
     match &cli.command {
-        Commands::Diagnose { duration } => {
-            diagnose::execute(&cli.url, cli.max_num_seqs, cli.verbose > 0, *duration)?
-        }
+        Commands::Diagnose { duration } => diagnose::execute(
+            &cli.url,
+            cli.max_num_seqs,
+            cli.cost_per_hour,
+            cli.verbose > 0,
+            *duration,
+        )?,
         Commands::Help => {
             Cli::command().print_long_help()?;
             println!();
@@ -150,6 +163,16 @@ fn parse_duration_arg(input: &str) -> Result<Duration, String> {
     Ok(duration)
 }
 
+fn parse_cost_per_hour_arg(input: &str) -> Result<f64, String> {
+    let v: f64 = input
+        .parse()
+        .map_err(|_| format!("invalid --cost-per-hour value \"{input}\""))?;
+    if !(v.is_finite() && v > 0.0) {
+        return Err("--cost-per-hour must be a positive number".to_string());
+    }
+    Ok(v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,5 +204,16 @@ mod tests {
             parse_duration_arg("1801s").unwrap_err(),
             "maximum duration is 30m"
         );
+    }
+
+    #[test]
+    fn parse_cost_per_hour_accepts_positive() {
+        assert!((parse_cost_per_hour_arg("3.5").unwrap() - 3.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_cost_per_hour_rejects_non_positive() {
+        assert!(parse_cost_per_hour_arg("0").is_err());
+        assert!(parse_cost_per_hour_arg("-1").is_err());
     }
 }

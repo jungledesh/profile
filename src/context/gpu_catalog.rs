@@ -133,7 +133,7 @@ static CATALOG: &[GpuEntry] = &[
 ];
 
 /// Lowercase the name; replace non-alphanumeric characters (except `.`) with spaces.
-fn normalize(name: &str) -> String {
+pub(crate) fn normalize_gpu_name(name: &str) -> String {
     name.chars()
         .map(|c| {
             if c.is_alphanumeric() || c == '.' {
@@ -148,7 +148,7 @@ fn normalize(name: &str) -> String {
 /// Return the first catalog entry whose tokens all appear as substrings in
 /// the normalized GPU name, or `None` if no entry matches.
 pub fn lookup_gpu(name: &str) -> Option<&'static GpuCatalogEntry> {
-    let norm = normalize(name);
+    let norm = normalize_gpu_name(name);
     CATALOG.iter().find_map(|e| {
         if e.tokens.iter().all(|t| norm.contains(*t)) {
             Some(&e.entry)

@@ -25,6 +25,8 @@ pub struct VllmConfig {
     pub enable_chunked_prefill: Option<bool>,
     pub block_size: Option<u32>,
     pub enable_prefix_caching: Option<bool>,
+    /// Operator-supplied GPU cost ($/hr). Overrides catalog estimate when set.
+    pub cost_per_hour: Option<f64>,
 }
 
 /// Build config from snapshot fields + env vars. No I/O.
@@ -69,6 +71,7 @@ pub(crate) fn config_from_snapshot(snapshot: &RawSnapshot, cli_max_num_seqs: u32
             .enable_prefix_caching
             .or_else(|| env_bool("ENABLE_PREFIX_CACHING"))
             .or_else(|| env_bool("VLLM_ENABLE_PREFIX_CACHING")),
+        cost_per_hour: None,
     }
 }
 
