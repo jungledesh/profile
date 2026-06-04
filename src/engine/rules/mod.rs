@@ -281,10 +281,6 @@ pub fn format_diagnose_rules(
             verbose_miss.extend(format_rule3_verbose_miss(snapshot));
             verbose_miss.push(String::new());
         }
-        if !fired_names.contains("parallelism_mismatch") {
-            verbose_miss.push("Parallelism mismatch: not triggered".to_string());
-            verbose_miss.push(String::new());
-        }
         if !fired_names.contains("concurrency_saturation") {
             verbose_miss.push("Concurrency saturation: not triggered".to_string());
             verbose_miss.push(String::new());
@@ -633,8 +629,6 @@ pub fn format_diagnose_rules_for_windows(
             verbose_miss.push(String::new());
             verbose_miss.extend(format_rule3_verbose_miss(summary_snap));
             verbose_miss.push(String::new());
-            verbose_miss.push("Parallelism mismatch: not triggered".to_string());
-            verbose_miss.push(String::new());
             verbose_miss.push("Concurrency saturation: not triggered".to_string());
             verbose_miss.push(String::new());
         }
@@ -784,6 +778,9 @@ pub fn format_diagnose_rules_for_windows(
     }
     if !r2_significant && !r2_backlog_significant && !r2_adv_present {
         not_fired.push("KV cache pressure");
+    }
+    if r4_groups.is_empty() {
+        not_fired.push("Parallelism mismatch");
     }
     if !r5_significant {
         not_fired.push("Concurrency saturation");
@@ -1100,7 +1097,6 @@ mod tests {
         assert!(text.contains("Under-batching: not triggered"));
         assert!(text.contains("KV cache pressure: not triggered"));
         assert!(text.contains("Prefix cache hit rate: 50.0% (not triggered)"));
-        assert!(text.contains("Parallelism mismatch: not triggered"));
         assert!(text.contains("Concurrency saturation: not triggered"));
         assert!(!text.contains("No issues detected in this snapshot."));
     }
@@ -1234,7 +1230,6 @@ mod tests {
             text.contains("Prefix cache hit rate: 50.0% (not triggered)")
                 || text.contains("Prefix cache hit rate: not triggered")
         );
-        assert!(text.contains("Parallelism mismatch: not triggered"));
         assert!(text.contains("Concurrency saturation: not triggered"));
         assert!(!text.contains("No issues detected in this snapshot."));
     }
@@ -1307,7 +1302,6 @@ mod tests {
         assert!(text.contains("KV cache pressure: not triggered"));
         assert!(text.contains("[i] KV Cache Pressure: core metric unavailable"));
         assert!(text.contains("Prefix cache hit rate: 50.0% (not triggered)"));
-        assert!(text.contains("Parallelism mismatch: not triggered"));
         assert!(text.contains("Concurrency saturation: not triggered"));
         assert!(!text.contains("No issues detected in this snapshot."));
     }
