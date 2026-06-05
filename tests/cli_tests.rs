@@ -149,8 +149,10 @@ fn diagnose_exits_success() {
 
     let out = String::from_utf8_lossy(&output.stdout).into_owned();
     assert!(
-        !out.contains("[i]"),
-        "minimal scrape should not emit metric advisories; got:\n{out}"
+        !out.contains("[i] Under-batching:")
+            && !out.contains("[i] KV Cache Pressure:")
+            && !out.contains("[i] Concurrency Saturation:"),
+        "minimal scrape should not emit R1/R2/R5 metric advisories; got:\n{out}"
     );
     assert!(
         out.contains("PROFILE v") && out.contains('[') && out.contains(" UTC]"),
@@ -189,8 +191,12 @@ fn diagnose_exits_success() {
         "stdout should include pfix_cache % on THROUGHPUT row; got:\n{out}"
     );
     assert!(
-        out.contains("No issues detected in this snapshot."),
-        "default diagnose should report no issues when nothing fires; got:\n{out}"
+        !out.contains("[!]"),
+        "default diagnose should not fire rules; got:\n{out}"
+    );
+    assert!(
+        out.contains("No issues detected"),
+        "default diagnose should report healthy when nothing fires; got:\n{out}"
     );
     assert!(
         !out.contains("ISSUE:") && !out.contains("not indicated"),

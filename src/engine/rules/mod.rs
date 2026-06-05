@@ -2,12 +2,12 @@ use std::time::SystemTime;
 
 use crate::collectors::{window_is_evaluable, RawSnapshot};
 use crate::context::{AnalysisInput, RuntimeWindow};
-use crate::engine::baseline::{self, CostSource, PhysicsBaseline};
+use crate::engine::baseline::{self, CostSource, PhysicsBaseline, WeightDtypeSource};
 
 mod r1_under_batching;
 mod r2_kv_cache_pressure;
 mod r3_low_prefix_reuse;
-mod r4_parallelism;
+mod r4_oom_risk;
 mod r5_concurrency_saturation;
 
 pub use r1_under_batching::{
@@ -20,7 +20,7 @@ pub use r2_kv_cache_pressure::{
 pub use r3_low_prefix_reuse::{
     r3_recommendation, rule3_low_prefix_reuse, LowPrefixReuseDetail, Rule3Outcome,
 };
-pub use r4_parallelism::r4_recommendation;
+pub use r4_oom_risk::{r4_advisory, r4_recommendation};
 pub use r5_concurrency_saturation::{
     r5_recommendation, rule5_concurrency_saturation, ConcurrencySaturationDetail,
 };
@@ -132,7 +132,7 @@ fn rule_display_block(
     r2_suppressed_by_r4: bool,
 ) -> Vec<String> {
     let mut block = g.primary.display_lines.clone();
-    if verbose_rules && r2_suppressed_by_r4 && g.primary.rule_name == "parallelism_mismatch" {
+    if verbose_rules && r2_suppressed_by_r4 && g.primary.rule_name == "oom_risk" {
         block.push(R2_SUPPRESSED_BY_R4_VERBOSE_LINE.to_string());
     }
     block
@@ -261,9 +261,17 @@ pub fn format_diagnose_rules(
     } else {
         None
     };
+    let r4_adv = r4_advisory(
+        report.baseline.as_ref().and_then(|b| b.kv_headroom_gb),
+        input.ctx.gpu.vram_gb,
+        report.baseline.as_ref().map(|b| b.weight_gb),
+    );
 
-    let any_advisory = r2_adv.is_some();
+    let any_advisory = r2_adv.is_some() || r4_adv.is_some();
     if let Some(lines) = r2_adv {
+        append_display_block(&mut out, lines);
+    }
+    if let Some(lines) = r4_adv {
         append_display_block(&mut out, lines);
     }
 
@@ -424,7 +432,7 @@ fn finalize_report_groups(
     baseline: Option<baseline::PhysicsBaseline>,
 ) -> super::Report {
     let r2_present_before = recs.iter().any(|r| r.rule_name == "kv_cache_pressure");
-    let r4_fired = recs.iter().any(|r| r.rule_name == "parallelism_mismatch");
+    let r4_fired = recs.iter().any(|r| r.rule_name == "oom_risk");
     let r2_suppressed_by_r4 = r4_fired && r2_present_before;
     if r4_fired {
         recs.retain(|r| r.rule_name != "kv_cache_pressure");
@@ -573,7 +581,17 @@ pub fn build_report_for_windows(
         });
     }
 
-    if let Some(r4) = r4_recommendation(kv_headroom_gb, summary.ctx.config.tensor_parallel_size) {
+    if let Some(r4) = r4_recommendation(
+        baseline.as_ref().and_then(|b| b.kv_headroom_gb),
+        summary.ctx.config.tensor_parallel_size,
+        baseline.as_ref().map(|b| b.weight_gb),
+        summary.ctx.gpu.vram_gb,
+        summary.ctx.config.gpu_memory_utilization,
+        baseline
+            .as_ref()
+            .map(|b| b.weight_dtype_source)
+            .unwrap_or(WeightDtypeSource::Fallback),
+    ) {
         recs.push(r4);
     }
 
@@ -616,8 +634,17 @@ pub fn format_diagnose_rules_for_windows(
     if eval.no_fires() {
         let mut out = Vec::new();
         let r2_adv = r2_kv_cache_advisory(summary_snap, metrics_url);
-        let any_advisory = r2_adv.is_some();
+        let r4_adv = r4_advisory(
+            summary_baseline.as_ref().and_then(|b| b.kv_headroom_gb),
+            summary.ctx.gpu.vram_gb,
+            summary_baseline.as_ref().map(|b| b.weight_gb),
+        );
+        let any_advisory = r2_adv.is_some() || r4_adv.is_some();
         if let Some(lines) = r2_adv {
+            out.extend(lines);
+            out.push(String::new());
+        }
+        if let Some(lines) = r4_adv {
             out.extend(lines);
             out.push(String::new());
         }
@@ -729,6 +756,13 @@ pub fn format_diagnose_rules_for_windows(
     let r4 = r4_recommendation(
         summary_baseline.as_ref().and_then(|b| b.kv_headroom_gb),
         summary.ctx.config.tensor_parallel_size,
+        summary_baseline.as_ref().map(|b| b.weight_gb),
+        summary.ctx.gpu.vram_gb,
+        summary.ctx.config.gpu_memory_utilization,
+        summary_baseline
+            .as_ref()
+            .map(|b| b.weight_dtype_source)
+            .unwrap_or(WeightDtypeSource::Fallback),
     );
     let r2_suppressed_by_r4_display = r4.is_some();
     let r4_groups: Vec<_> = r4
@@ -760,9 +794,19 @@ pub fn format_diagnose_rules_for_windows(
     } else {
         None
     };
+    let r4_adv = r4_advisory(
+        summary_baseline.as_ref().and_then(|b| b.kv_headroom_gb),
+        summary.ctx.gpu.vram_gb,
+        summary_baseline.as_ref().map(|b| b.weight_gb),
+    );
     let r2_adv_present = r2_adv.is_some();
+    let r4_adv_present = r4_adv.is_some();
     let mut advisories = Vec::new();
     if let Some(lines) = r2_adv {
+        advisories.extend(lines);
+        advisories.push(String::new());
+    }
+    if let Some(lines) = r4_adv {
         advisories.extend(lines);
         advisories.push(String::new());
     }
@@ -779,8 +823,8 @@ pub fn format_diagnose_rules_for_windows(
     if !r2_significant && !r2_backlog_significant && !r2_adv_present {
         not_fired.push("KV cache pressure");
     }
-    if r4_groups.is_empty() {
-        not_fired.push("Parallelism mismatch");
+    if r4_groups.is_empty() && !r4_adv_present {
+        not_fired.push("OOM risk");
     }
     if !r5_significant {
         not_fired.push("Concurrency saturation");
@@ -1066,7 +1110,7 @@ mod tests {
         let (ctx, win) = input_r4_suppresses_r2();
         let text =
             format_diagnose_rules(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics").join("\n");
-        assert!(text.contains("[!] Parallelism Mismatch"));
+        assert!(text.contains("[!] OOM Risk"));
         assert!(text.contains(R2_SUPPRESSED_BY_R4_VERBOSE_LINE));
         assert!(!text.contains("KV cache pressure: not triggered"));
         assert!(!text.contains("[!] KV Cache Pressure"));
@@ -1077,7 +1121,7 @@ mod tests {
         let (ctx, win) = input_r4_suppresses_r2();
         let text = format_diagnose_rules(ai(&ctx, &win), false, "http://127.0.0.1:8000/metrics")
             .join("\n");
-        assert!(text.contains("[!] Parallelism Mismatch"));
+        assert!(text.contains("[!] OOM Risk"));
         assert!(!text.contains(R2_SUPPRESSED_BY_R4_VERBOSE_LINE));
         assert!(!text.contains("[!] KV Cache Pressure"));
     }
@@ -1392,10 +1436,18 @@ mod tests {
         let t = SystemTime::UNIX_EPOCH;
         let mut g = gpu_low();
         g.gpu_util_pct = Some(75.0);
+        g.gpu_name = Some("NVIDIA H100 80GB HBM3".to_string());
+        g.vram_total_mb = Some(80 * 1024);
         let mut v = vllm_base();
         v.num_requests_running = Some(64.0);
+        v.model_name = Some("meta-llama/Llama-3.1-8B-Instruct".to_string());
         let s = snap(t, t, v, g);
-        let ctx = mk_ctx();
+        let cfg = VllmConfig {
+            dtype: Some("bf16".to_string()),
+            max_model_len: Some(2048),
+            ..Default::default()
+        };
+        let ctx = StaticContext::from_snapshot(&s, cfg);
         let win = mk_win(s);
         let lines = format_diagnose_rules(ai(&ctx, &win), false, "http://127.0.0.1:8000/metrics");
         assert_eq!(
@@ -1511,7 +1563,7 @@ mod tests {
         assert_eq!(
             waste_gate_rule_name(&[IssueGroup {
                 primary: Recommendation {
-                    rule_name: "parallelism_mismatch",
+                    rule_name: "oom_risk",
                     impact: 5,
                     confidence: 0.9,
                     action: String::new(),
@@ -1671,7 +1723,6 @@ mod tests {
     #[test]
     fn format_diagnose_rules_for_windows_no_fires_is_single_no_issues_line() {
         let t = SystemTime::UNIX_EPOCH;
-        let ctx = mk_ctx();
         let mut v = vllm_base();
         v.num_requests_running = Some(20.0);
         v.num_requests_waiting = Some(3.0);
@@ -1679,9 +1730,19 @@ mod tests {
         v.prefix_cache_hit_rate = Some(0.524);
         v.prompt_tokens_mean = Some(128.0);
         v.generation_tokens_per_sec = Some(100.0);
+        v.model_name = Some("meta-llama/Llama-3.1-8B-Instruct".to_string());
         let mut g = gpu_busy();
         g.gpu_util_pct = Some(74.0);
-        let windows = vec![mk_win(snap(t, t, v, g))];
+        g.gpu_name = Some("NVIDIA H100 80GB HBM3".to_string());
+        g.vram_total_mb = Some(80 * 1024);
+        let snap = snap(t, t, v, g);
+        let cfg = VllmConfig {
+            dtype: Some("bf16".to_string()),
+            max_model_len: Some(2048),
+            ..Default::default()
+        };
+        let ctx = StaticContext::from_snapshot(&snap, cfg);
+        let windows = vec![mk_win(snap)];
         let summary = ai(&ctx, windows.last().unwrap());
         let lines = format_diagnose_rules_for_windows(
             &windows,
@@ -1884,13 +1945,11 @@ mod tests {
     }
 
     #[test]
-    fn waste_line_absent_for_r3_r4() {
+    fn waste_line_absent_for_r4() {
         let b = baseline_for_waste(32.0, CostSource::UserProvided, 1.0);
-        for rule in ["low_prefix_reuse", "parallelism_mismatch"] {
-            let mut lines = vec!["issue".to_string()];
-            append_waste_line(&mut lines, rule, Some(&b), Some(100.0));
-            assert_eq!(lines.len(), 1, "rule {rule}");
-        }
+        let mut lines = vec!["issue".to_string()];
+        append_waste_line(&mut lines, "oom_risk", Some(&b), Some(100.0));
+        assert_eq!(lines.len(), 1);
     }
 
     #[test]
