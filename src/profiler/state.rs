@@ -9,7 +9,7 @@ const OSCILLATION_WINDOW: usize = 3;
 /// cycle (user applies a change, profile re-measures). In practice a single session
 /// rarely exceeds a handful of iterations; 20 is a generous upper bound that costs
 /// essentially nothing.
-const MAX_LOOP_ITERATIONS: usize = 20;
+pub const MAX_LOOP_ITERATIONS: usize = 20;
 
 pub struct IterationRecord {
     pub result: DiagnoseResult,
@@ -85,6 +85,19 @@ impl LoopState {
             .take(OSCILLATION_WINDOW)
             .collect();
         v[0] == v[2] && v[0] != v[1]
+    }
+
+    /// Returns `(rule_a, rule_b)` when oscillating A→B→A. `rule_a` is the repeated one.
+    pub fn oscillating_pair(&self) -> Option<(&'static str, &'static str)> {
+        if !self.is_oscillating() {
+            return None;
+        }
+        let v: Vec<_> = self.rec_history.iter().rev().take(3).collect();
+        Some((*v[0], *v[1]))
+    }
+
+    pub fn iteration_count(&self) -> usize {
+        self.history.len().saturating_sub(1)
     }
 
     pub fn current_primary_recommendation(&self) -> Option<&Recommendation> {
@@ -186,5 +199,54 @@ mod tests {
         s.record_recommendation("a");
         s.record_recommendation("b");
         assert!(!s.is_oscillating());
+    }
+
+    #[test]
+    fn iteration_count_zero_on_init() {
+        let s = LoopState::new(minimal_diagnose(), empty_report());
+        assert_eq!(s.iteration_count(), 0);
+    }
+
+    #[test]
+    fn iteration_count_increments_on_push() {
+        let r = minimal_diagnose();
+        let mut s = LoopState::new(r, empty_report());
+        for i in 1..=3 {
+            s.push(minimal_diagnose(), empty_report(), None);
+            assert_eq!(s.iteration_count(), i);
+        }
+    }
+
+    #[test]
+    fn oscillating_pair_returns_ab_on_aba() {
+        let r = minimal_diagnose();
+        let mut s = LoopState::new(r, empty_report());
+        s.record_recommendation("under_batching");
+        s.record_recommendation("kv_cache_pressure");
+        s.record_recommendation("under_batching");
+        assert_eq!(
+            s.oscillating_pair(),
+            Some(("under_batching", "kv_cache_pressure"))
+        );
+    }
+
+    #[test]
+    fn iteration_cap_reached_after_twenty_pushes() {
+        let r = minimal_diagnose();
+        let mut s = LoopState::new(r, empty_report());
+        for _ in 0..MAX_LOOP_ITERATIONS {
+            s.push(minimal_diagnose(), empty_report(), None);
+        }
+        assert_eq!(s.iteration_count(), MAX_LOOP_ITERATIONS);
+        assert!(s.iteration_count() >= MAX_LOOP_ITERATIONS);
+    }
+
+    #[test]
+    fn oscillating_pair_none_when_not_oscillating() {
+        let r = minimal_diagnose();
+        let mut s = LoopState::new(r, empty_report());
+        s.record_recommendation("a");
+        s.record_recommendation("b");
+        assert!(s.oscillating_pair().is_none());
     }
 }
