@@ -43,10 +43,23 @@ pub fn run(
         };
 
         if state.is_oscillating() {
+            if let Some((a, b)) = state.oscillating_pair() {
+                println!(
+                    "\nCycling between [{a}] and [{b}]. No further improvement found. Stopping."
+                );
+            } else {
+                println!(
+                    "\nCycling between recommendations. No further improvement found. Stopping."
+                );
+            }
+            break;
+        }
+
+        if state.iteration_count() >= super::state::MAX_LOOP_ITERATIONS {
             println!(
-                "\nOscillating between recommendations — hardware likely at Pareto frontier for this workload."
+                "\nNo further improvement found after {} iterations. Stopping.",
+                super::state::MAX_LOOP_ITERATIONS
             );
-            println!("Stopping.");
             break;
         }
 
@@ -74,8 +87,15 @@ pub fn run(
             drifted,
         );
         print_delta(&d);
-
         output::stdout::print_diagnose_table(&new_result, false);
+
+        let headroom = new_report.baseline.as_ref().and_then(|b| b.headroom_pct);
+        if at_hardware_ceiling(headroom) {
+            println!(
+                "\nHardware ceiling reached. Headroom < {CEILING_HEADROOM_THRESHOLD_PCT:.0}% — further gains require scaling hardware."
+            );
+            break;
+        }
 
         match d.direction {
             delta::Direction::Worse => {
@@ -92,6 +112,10 @@ pub fn run(
     }
 
     Ok(())
+}
+
+fn at_hardware_ceiling(headroom_pct: Option<f64>) -> bool {
+    headroom_pct.is_some_and(|h| h < CEILING_HEADROOM_THRESHOLD_PCT)
 }
 
 fn print_delta(d: &delta::Delta) {
@@ -127,6 +151,46 @@ fn print_delta(d: &delta::Delta) {
         Some(v) if v < 0.0 => println!("  Efficiency  {v:.1}pp ↓"),
         _ => {}
     }
+    match (d.cost_per_million_before, d.cost_per_million_after) {
+        (Some(before), Some(after)) if before.is_finite() && after.is_finite() => {
+            let arrow = if after < before {
+                "↓"
+            } else if after > before {
+                "↑"
+            } else {
+                ""
+            };
+            let est = match d.cost_source_after {
+                Some(engine::CostSource::Catalog) | None => " (est)",
+                _ => "",
+            };
+            println!("  Cost/1M tok  ${before:.2} → ${after:.2} {arrow}{est}");
+        }
+        _ => {}
+    }
+    if let (Some(cpm_b), Some(cpm_a), Some(tps_b), Some(tps_a), Some(eff_b), Some(eff_a)) = (
+        d.cost_per_million_before,
+        d.cost_per_million_after,
+        d.throughput_before,
+        d.throughput_after,
+        d.efficiency_pct_before,
+        d.efficiency_pct_after,
+    ) {
+        if cpm_b.is_finite() && cpm_a.is_finite() && tps_b > 0.0 && tps_a > 0.0 {
+            let waste_b = (cpm_b * tps_b * 3600.0 / 1_000_000.0) * (1.0 - eff_b / 100.0).max(0.0);
+            let waste_a = (cpm_a * tps_a * 3600.0 / 1_000_000.0) * (1.0 - eff_a / 100.0).max(0.0);
+            if waste_b.is_finite() && waste_a.is_finite() {
+                let arrow = if waste_a < waste_b {
+                    "↓"
+                } else if waste_a > waste_b {
+                    "↑"
+                } else {
+                    ""
+                };
+                println!("  Recoverable  ${waste_b:.2} → ${waste_a:.2}/hr {arrow}");
+            }
+        }
+    }
 }
 
 fn throughput_arrow(before: f64, after: f64) -> &'static str {
@@ -146,5 +210,25 @@ fn latency_arrow(delta_ms: f64) -> &'static str {
         "↑"
     } else {
         ""
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn at_hardware_ceiling_below_threshold() {
+        assert!(at_hardware_ceiling(Some(9.0)));
+    }
+
+    #[test]
+    fn at_hardware_ceiling_at_threshold_not_reached() {
+        assert!(!at_hardware_ceiling(Some(10.0)));
+    }
+
+    #[test]
+    fn at_hardware_ceiling_none_not_reached() {
+        assert!(!at_hardware_ceiling(None));
     }
 }
