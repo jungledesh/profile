@@ -30,14 +30,7 @@ pub fn run(
             let efficiency = baseline.and_then(|b| b.efficiency_pct);
             let headroom = baseline.and_then(|b| b.headroom_pct);
 
-            let msg = if efficiency.is_some_and(|e| e > 100.0) {
-                "No issues detected. Server is healthy under current load."
-            } else if headroom.is_some_and(|h| h < CEILING_HEADROOM_THRESHOLD_PCT) {
-                "No issues detected. Server is at hardware capacity."
-            } else {
-                "No issues detected. Server is healthy under current load."
-            };
-
+            let msg = healthy_exit_message(efficiency, headroom);
             println!("\n{msg}");
             break;
         };
@@ -97,15 +90,12 @@ pub fn run(
             break;
         }
 
-        match d.direction {
-            delta::Direction::Worse => {
-                println!("Throughput dropped. Check if workload changed before acting on this.");
-                println!("Trying next recommendation.");
-            }
-            delta::Direction::Plateau => {
-                println!("No significant change. Trying next recommendation.");
-            }
-            delta::Direction::Better => {}
+        let next_fix = new_report
+            .groups
+            .first()
+            .map(|g| g.primary.short_action.as_str());
+        for line in direction_followup_lines(d.direction, next_fix) {
+            println!("{line}");
         }
 
         state.push(new_result, new_report, Some(rule_name));
@@ -116,6 +106,47 @@ pub fn run(
 
 fn at_hardware_ceiling(headroom_pct: Option<f64>) -> bool {
     headroom_pct.is_some_and(|h| h < CEILING_HEADROOM_THRESHOLD_PCT)
+}
+
+fn healthy_exit_message(efficiency: Option<f64>, headroom: Option<f64>) -> String {
+    match (efficiency, headroom) {
+        (Some(e), _) if headroom.is_some_and(|h| h < CEILING_HEADROOM_THRESHOLD_PCT) => {
+            format!("No issues detected. Server is at hardware capacity — {e:.1}% of ceiling.")
+        }
+        (Some(e), _) => {
+            format!(
+                "No issues detected in current windows. Efficiency: {e:.1}% of hardware ceiling."
+            )
+        }
+        (None, _) => {
+            "No issues detected. Efficiency unavailable — GPU or model data missing.".to_string()
+        }
+    }
+}
+
+fn direction_followup_lines(
+    direction: delta::Direction,
+    short_action: Option<&str>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    match direction {
+        delta::Direction::Worse => {
+            lines.push(
+                "Throughput dropped. Check if workload changed before acting on this.".to_string(),
+            );
+            if let Some(fix) = short_action {
+                lines.push(format!("Apply fix: {fix}, then re-measure."));
+            }
+        }
+        delta::Direction::Plateau => {
+            lines.push("No significant change.".to_string());
+            if let Some(fix) = short_action {
+                lines.push(format!("Apply fix: {fix}, then re-measure."));
+            }
+        }
+        delta::Direction::Better => {}
+    }
+    lines
 }
 
 fn print_delta(d: &delta::Delta) {
@@ -230,5 +261,54 @@ mod tests {
     #[test]
     fn at_hardware_ceiling_none_not_reached() {
         assert!(!at_hardware_ceiling(None));
+    }
+
+    #[test]
+    fn healthy_exit_includes_efficiency_when_available() {
+        let msg = healthy_exit_message(Some(42.5), Some(57.5));
+        assert!(msg.contains("Efficiency: 42.5% of hardware ceiling."));
+    }
+
+    #[test]
+    fn healthy_exit_at_capacity_when_headroom_low() {
+        let msg = healthy_exit_message(Some(91.0), Some(9.0));
+        assert!(msg.contains("at hardware capacity — 91.0% of ceiling."));
+    }
+
+    #[test]
+    fn healthy_exit_unavailable_when_efficiency_missing() {
+        let msg = healthy_exit_message(None, Some(50.0));
+        assert!(msg.contains("Efficiency unavailable"));
+    }
+
+    #[test]
+    fn direction_followup_includes_short_action_on_plateau() {
+        let lines = direction_followup_lines(
+            delta::Direction::Plateau,
+            Some("raise --max-num-seqs above 32"),
+        );
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "No significant change.");
+        assert_eq!(
+            lines[1],
+            "Apply fix: raise --max-num-seqs above 32, then re-measure."
+        );
+    }
+
+    #[test]
+    fn direction_followup_includes_short_action_on_worse() {
+        let lines = direction_followup_lines(
+            delta::Direction::Worse,
+            Some("increase client concurrency — 10 slots idle"),
+        );
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("Throughput dropped"));
+        assert!(lines[1].contains("increase client concurrency — 10 slots idle"));
+    }
+
+    #[test]
+    fn direction_followup_omits_fix_when_short_action_missing() {
+        let lines = direction_followup_lines(delta::Direction::Plateau, None);
+        assert_eq!(lines, vec!["No significant change.".to_string()]);
     }
 }

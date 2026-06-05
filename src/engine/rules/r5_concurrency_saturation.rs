@@ -154,9 +154,25 @@ pub fn r5_recommendation(
             max_label,
             d.queue_ratio * 100.0
         ),
+        short_action: r5_short_action(&d),
         expected_impact: "Queue drains, TTFT recovers.".to_string(),
         display_lines: format_concurrency_saturation_issue(&d, max_model_len),
     })
+}
+
+pub(super) fn r5_short_action(d: &ConcurrencySaturationDetail) -> String {
+    let max_str = d
+        .max_num_seqs
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    let kv_safe = d
+        .kv_cache_usage_perc
+        .is_none_or(|pct| pct < KV_CACHE_SAFE_TO_SCALE_PCT);
+    if kv_safe {
+        format!("raise --max-num-seqs above {max_str}")
+    } else {
+        "add a replica or lower --max-model-len to free KV blocks".to_string()
+    }
 }
 
 pub(super) fn aggregate_concurrency_saturation_detail(
@@ -353,5 +369,39 @@ mod tests {
     fn window_issue_inserts_seen_pct() {
         let lines = format_concurrency_saturation_window_issue(&fired_detail(None, None), 40, None);
         assert_eq!(lines[1], "  Seen in 40% of windows");
+    }
+
+    #[test]
+    fn short_action_raises_cap_when_kv_safe() {
+        let d = fired_detail(None, Some(70.0));
+        assert_eq!(r5_short_action(&d), "raise --max-num-seqs above 32");
+        let r = r5_recommendation(
+            &snap(sat_vllm(32.0, 15.0, Some(32))),
+            Some(70.0),
+            None,
+            None,
+        )
+        .expect("fired");
+        assert_eq!(r.short_action, "raise --max-num-seqs above 32");
+    }
+
+    #[test]
+    fn short_action_scales_out_when_kv_not_safe() {
+        let d = fired_detail(None, Some(85.0));
+        assert_eq!(
+            r5_short_action(&d),
+            "add a replica or lower --max-model-len to free KV blocks"
+        );
+        let r = r5_recommendation(
+            &snap(sat_vllm(32.0, 15.0, Some(32))),
+            Some(85.0),
+            None,
+            None,
+        )
+        .expect("fired");
+        assert_eq!(
+            r.short_action,
+            "add a replica or lower --max-model-len to free KV blocks"
+        );
     }
 }

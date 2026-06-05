@@ -146,9 +146,18 @@ pub fn r2_recommendation(
         impact: 5,
         confidence,
         action: "Reduce max_num_seqs or add tensor parallelism".to_string(),
+        short_action: r2_kv_pressure_short_action(),
         expected_impact: "Reduced KV evictions and lower latency variance".to_string(),
         display_lines: format_kv_cache_pressure_fired(&d, snapshot, confidence, max_model_len),
     })
+}
+
+pub(super) fn r2_kv_pressure_short_action() -> String {
+    "lower --max-num-seqs or switch to fp8 KV cache (--kv-cache-dtype fp8)".to_string()
+}
+
+pub(super) fn r2_backlog_short_action() -> String {
+    "raise --gpu-memory-utilization or reduce --max-model-len".to_string()
 }
 
 pub(super) fn kv_pressure_confidence(d: &KvCachePressureDetail) -> f64 {
@@ -549,5 +558,27 @@ mod tests {
         let text =
             format_kv_admission_backlog_issue(&sample_backlog_detail(), 27, None, None).join("\n");
         assert!(text.contains("if VRAM headroom exists"));
+    }
+
+    #[test]
+    fn kv_pressure_short_action_matches_spec() {
+        let v = VllmRawMetrics {
+            kv_cache_usage_perc: Some(90.0),
+            generation_tokens_per_sec: Some(100.0),
+            ..Default::default()
+        };
+        let r = r2_recommendation(&snap(v), None).expect("fired");
+        assert_eq!(
+            r.short_action,
+            "lower --max-num-seqs or switch to fp8 KV cache (--kv-cache-dtype fp8)"
+        );
+    }
+
+    #[test]
+    fn backlog_short_action_matches_spec() {
+        assert_eq!(
+            r2_backlog_short_action(),
+            "raise --gpu-memory-utilization or reduce --max-model-len"
+        );
     }
 }
