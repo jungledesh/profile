@@ -31,14 +31,22 @@ pub fn build_report_for_diagnose(windows: &[RuntimeWindow], input: AnalysisInput
 pub fn build_report(input: AnalysisInput<'_>) -> Report {
     let baseline = baseline::compute(&input);
     let snapshot = &input.window.snapshot;
-    let kv_headroom = baseline.as_ref().and_then(|b| b.kv_headroom_gb);
-    let tp = input.ctx.config.tensor_parallel_size;
 
     let mut recs: Vec<Recommendation> = [
         rules::r1_recommendation(snapshot, input.ctx.config.max_num_seqs),
         rules::r2_recommendation(snapshot, input.ctx.config.max_model_len),
         rules::r3_recommendation(snapshot),
-        rules::r4_recommendation(kv_headroom, tp),
+        rules::r4_recommendation(
+            baseline.as_ref().and_then(|b| b.kv_headroom_gb),
+            input.ctx.config.tensor_parallel_size,
+            baseline.as_ref().map(|b| b.weight_gb),
+            input.ctx.gpu.vram_gb,
+            input.ctx.config.gpu_memory_utilization,
+            baseline
+                .as_ref()
+                .map(|b| b.weight_dtype_source)
+                .unwrap_or(WeightDtypeSource::Fallback),
+        ),
     ]
     .into_iter()
     .flatten()
@@ -57,7 +65,7 @@ pub fn build_report(input: AnalysisInput<'_>) -> Report {
     }
 
     let r2_present_before = recs.iter().any(|r| r.rule_name == "kv_cache_pressure");
-    let r4_fired = recs.iter().any(|r| r.rule_name == "parallelism_mismatch");
+    let r4_fired = recs.iter().any(|r| r.rule_name == "oom_risk");
     let r2_suppressed_by_r4 = r4_fired && r2_present_before;
     if r4_fired {
         recs.retain(|r| r.rule_name != "kv_cache_pressure");
@@ -199,7 +207,7 @@ mod build_report_tests {
         assert!(report
             .groups
             .iter()
-            .any(|g| g.primary.rule_name == "parallelism_mismatch"));
+            .any(|g| g.primary.rule_name == "oom_risk"));
         assert!(!report
             .groups
             .iter()
