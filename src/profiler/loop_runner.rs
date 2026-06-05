@@ -60,7 +60,7 @@ pub fn run(
 
         let _outcome = poll::wait_for_restart_or_skip(url, &stdin_rx);
 
-        println!("\nMeasuring...");
+        println!("\nMeasuring delta...");
         let new_result = run_diagnose(url, max_num_seqs, cost_per_hour, duration)?;
         let agg_win = RuntimeWindow::from_snapshot(new_result.snapshot.clone());
         let summary = AnalysisInput::new(&new_result.static_ctx, &agg_win);
@@ -182,6 +182,10 @@ fn print_delta(d: &delta::Delta) {
         Some(v) if v < 0.0 => println!("  Efficiency  {v:.1}pp ↓"),
         _ => {}
     }
+    let has_cost = d.cost_per_million_before.is_some() && d.cost_per_million_after.is_some();
+    if has_cost {
+        println!("ECONOMICS:");
+    }
     match (d.cost_per_million_before, d.cost_per_million_after) {
         (Some(before), Some(after)) if before.is_finite() && after.is_finite() => {
             let arrow = cost_change_arrow(before, after);
@@ -189,7 +193,7 @@ fn print_delta(d: &delta::Delta) {
                 Some(engine::CostSource::Catalog) | None => " (est)",
                 _ => "",
             };
-            println!("  Cost/1M tok  ${before:.2} → ${after:.2} {arrow}{est}");
+            println!("  Cost/1M tok   ${before:.2} → ${after:.2} {arrow}{est}");
         }
         _ => {}
     }
@@ -206,7 +210,7 @@ fn print_delta(d: &delta::Delta) {
             let waste_a = (cpm_a * tps_a * 3600.0 / 1_000_000.0) * (1.0 - eff_a / 100.0).max(0.0);
             if waste_b.is_finite() && waste_a.is_finite() {
                 let arrow = recoverable_waste_arrow(waste_b, waste_a);
-                println!("  Recoverable  ${waste_b:.2} → ${waste_a:.2}/hr {arrow}");
+                println!("  Recoverable   ${waste_b:.2} → ${waste_a:.2}/hr {arrow}");
             }
         }
     }
