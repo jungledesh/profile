@@ -184,13 +184,7 @@ fn print_delta(d: &delta::Delta) {
     }
     match (d.cost_per_million_before, d.cost_per_million_after) {
         (Some(before), Some(after)) if before.is_finite() && after.is_finite() => {
-            let arrow = if after < before {
-                "↓"
-            } else if after > before {
-                "↑"
-            } else {
-                ""
-            };
+            let arrow = cost_change_arrow(before, after);
             let est = match d.cost_source_after {
                 Some(engine::CostSource::Catalog) | None => " (est)",
                 _ => "",
@@ -211,16 +205,35 @@ fn print_delta(d: &delta::Delta) {
             let waste_b = (cpm_b * tps_b * 3600.0 / 1_000_000.0) * (1.0 - eff_b / 100.0).max(0.0);
             let waste_a = (cpm_a * tps_a * 3600.0 / 1_000_000.0) * (1.0 - eff_a / 100.0).max(0.0);
             if waste_b.is_finite() && waste_a.is_finite() {
-                let arrow = if waste_a < waste_b {
-                    "↓"
-                } else if waste_a > waste_b {
-                    "↑"
-                } else {
-                    ""
-                };
+                let arrow = recoverable_waste_arrow(waste_b, waste_a);
                 println!("  Recoverable  ${waste_b:.2} → ${waste_a:.2}/hr {arrow}");
             }
         }
+    }
+}
+
+const COST_ARROW_THRESHOLD_USD: f64 = 0.01;
+const RECOVERABLE_ARROW_THRESHOLD_USD_PER_HR: f64 = 0.05;
+
+fn cost_change_arrow(before: f64, after: f64) -> &'static str {
+    let diff = after - before;
+    if diff < -COST_ARROW_THRESHOLD_USD {
+        "↓"
+    } else if diff > COST_ARROW_THRESHOLD_USD {
+        "↑"
+    } else {
+        ""
+    }
+}
+
+fn recoverable_waste_arrow(waste_before: f64, waste_after: f64) -> &'static str {
+    let waste_diff = waste_after - waste_before;
+    if waste_diff < -RECOVERABLE_ARROW_THRESHOLD_USD_PER_HR {
+        "↓"
+    } else if waste_diff > RECOVERABLE_ARROW_THRESHOLD_USD_PER_HR {
+        "↑"
+    } else {
+        ""
     }
 }
 
@@ -310,5 +323,25 @@ mod tests {
     fn direction_followup_omits_fix_when_short_action_missing() {
         let lines = direction_followup_lines(delta::Direction::Plateau, None);
         assert_eq!(lines, vec!["No significant change.".to_string()]);
+    }
+
+    #[test]
+    fn cost_arrow_suppressed_when_delta_below_threshold() {
+        assert_eq!(cost_change_arrow(2.00, 2.005), "");
+    }
+
+    #[test]
+    fn cost_arrow_down_when_improvement_above_threshold() {
+        assert_eq!(cost_change_arrow(2.00, 1.98), "↓");
+    }
+
+    #[test]
+    fn recoverable_arrow_suppressed_when_delta_below_threshold() {
+        assert_eq!(recoverable_waste_arrow(10.0, 9.97), "");
+    }
+
+    #[test]
+    fn recoverable_arrow_down_when_waste_reduced_above_threshold() {
+        assert_eq!(recoverable_waste_arrow(10.0, 9.94), "↓");
     }
 }
