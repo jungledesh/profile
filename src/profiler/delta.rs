@@ -6,7 +6,7 @@ use super::DiagnoseResult;
 pub enum Direction {
     Better,
     Worse,
-    /// &lt; 2% relative change in throughput (when known).
+    /// &lt; 10% relative change in throughput (when known).
     Plateau,
 }
 
@@ -31,7 +31,7 @@ pub struct Delta {
     pub config_drifted: bool,
 }
 
-const PLATEAU_THRESHOLD_PCT: f64 = 2.0;
+const PLATEAU_THRESHOLD_PCT: f64 = 10.0;
 
 pub fn compute(
     prev_result: &DiagnoseResult,
@@ -177,14 +177,14 @@ mod tests {
         let d = compute(
             &diagnose(Some(100.0)),
             &report_eff(Some(50.0), None),
-            &diagnose(Some(110.0)),
+            &diagnose(Some(112.0)),
             &report_eff(Some(55.0), None),
             false,
         );
         assert_eq!(d.direction, Direction::Better);
-        assert!((d.throughput_delta_pct.unwrap() - 10.0).abs() < 1e-9);
+        assert!((d.throughput_delta_pct.unwrap() - 12.0).abs() < 1e-9);
         assert_eq!(d.throughput_before, Some(100.0));
-        assert_eq!(d.throughput_after, Some(110.0));
+        assert_eq!(d.throughput_after, Some(112.0));
     }
 
     #[test]
@@ -210,6 +210,32 @@ mod tests {
             false,
         );
         assert_eq!(d.direction, Direction::Plateau);
+    }
+
+    #[test]
+    fn direction_plateau_at_nine_pct_drop() {
+        let d = compute(
+            &diagnose(Some(100.0)),
+            &report_eff(Some(50.0), None),
+            &diagnose(Some(91.0)),
+            &report_eff(Some(45.0), None),
+            false,
+        );
+        assert_eq!(d.direction, Direction::Plateau);
+        assert!((d.throughput_delta_pct.unwrap() + 9.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn direction_worse_at_eleven_pct_drop() {
+        let d = compute(
+            &diagnose(Some(100.0)),
+            &report_eff(Some(50.0), None),
+            &diagnose(Some(89.0)),
+            &report_eff(Some(45.0), None),
+            false,
+        );
+        assert_eq!(d.direction, Direction::Worse);
+        assert!((d.throughput_delta_pct.unwrap() + 11.0).abs() < 1e-9);
     }
 
     #[test]

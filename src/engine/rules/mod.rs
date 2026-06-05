@@ -25,10 +25,11 @@ pub use r5_concurrency_saturation::{
     r5_recommendation, rule5_concurrency_saturation, ConcurrencySaturationDetail,
 };
 
-use r1_under_batching::{aggregate_r1_detail, format_under_batching_window_issue};
+use r1_under_batching::{aggregate_r1_detail, format_under_batching_window_issue, r1_short_action};
 use r2_kv_cache_pressure::{
     aggregate_backlog_detail, aggregate_r2_detail, format_kv_admission_backlog_issue,
-    format_kv_cache_window_issue, kv_pressure_confidence, KV_CACHE_CRITICAL_THRESHOLD_PCT,
+    format_kv_cache_window_issue, kv_pressure_confidence, r2_backlog_short_action,
+    r2_kv_pressure_short_action, KV_CACHE_CRITICAL_THRESHOLD_PCT,
 };
 #[cfg(test)]
 use r3_low_prefix_reuse::format_low_prefix_hit_rate_fired;
@@ -37,6 +38,7 @@ use r3_low_prefix_reuse::{
 };
 use r5_concurrency_saturation::{
     aggregate_concurrency_saturation_detail, format_concurrency_saturation_window_issue,
+    r5_short_action,
 };
 
 pub(super) const MAX_OBSERVATION_SKEW_SECS: f64 = 1.0;
@@ -74,6 +76,8 @@ pub struct Recommendation {
     pub confidence: f64,
     /// Prescriptive: what to change
     pub action: String,
+    /// One-liner for closed-loop direction block
+    pub short_action: String,
     pub expected_impact: String,
     /// Pre-formatted cause + recommendation lines for stdout
     pub display_lines: Vec<String>,
@@ -494,6 +498,7 @@ pub fn build_report_for_windows(
             impact: 4,
             confidence: 0.8,
             action: "Increase client concurrency".to_string(),
+            short_action: r1_short_action(&d),
             expected_impact: "Higher throughput, stable TPOT".to_string(),
             display_lines,
         });
@@ -514,6 +519,7 @@ pub fn build_report_for_windows(
             impact: 5,
             confidence: conf,
             action: "Reduce max_num_seqs or add tensor parallelism".to_string(),
+            short_action: r2_kv_pressure_short_action(),
             expected_impact: "Reduced KV evictions and lower latency variance".to_string(),
             display_lines,
         });
@@ -530,6 +536,7 @@ pub fn build_report_for_windows(
             impact: 5,
             confidence: 0.85,
             action: "Raise --gpu-memory-utilization or reduce KV footprint".to_string(),
+            short_action: r2_backlog_short_action(),
             expected_impact: "Wait queue drains, TTFT recovers.".to_string(),
             display_lines,
         });
@@ -558,6 +565,7 @@ pub fn build_report_for_windows(
                     max_label,
                     agg.queue_ratio * 100.0
                 ),
+                short_action: r5_short_action(&agg),
                 expected_impact: "Queue drains, TTFT recovers.".to_string(),
                 display_lines,
             });
@@ -572,6 +580,7 @@ pub fn build_report_for_windows(
             confidence: 0.9,
             action: "Move shared context to prompt prefix; standardize prompt templates"
                 .to_string(),
+            short_action: "standardize prompts to share prefix context".to_string(),
             expected_impact: "Higher prefix cache hit rate and lower TTFT".to_string(),
             display_lines: format_low_prefix_window_issue(
                 &d,
@@ -1517,6 +1526,7 @@ mod tests {
                     impact: 5,
                     confidence: 0.85,
                     action: String::new(),
+                    short_action: String::new(),
                     expected_impact: String::new(),
                     display_lines: Vec::new(),
                 },
@@ -1528,6 +1538,7 @@ mod tests {
                     impact: 4,
                     confidence: 0.8,
                     action: String::new(),
+                    short_action: String::new(),
                     expected_impact: String::new(),
                     display_lines: Vec::new(),
                 },
@@ -1542,6 +1553,7 @@ mod tests {
                     impact: 2,
                     confidence: 0.9,
                     action: String::new(),
+                    short_action: String::new(),
                     expected_impact: String::new(),
                     display_lines: Vec::new(),
                 },
@@ -1553,6 +1565,7 @@ mod tests {
                     impact: 4,
                     confidence: 0.8,
                     action: String::new(),
+                    short_action: String::new(),
                     expected_impact: String::new(),
                     display_lines: Vec::new(),
                 },
@@ -1567,6 +1580,7 @@ mod tests {
                     impact: 5,
                     confidence: 0.9,
                     action: String::new(),
+                    short_action: String::new(),
                     expected_impact: String::new(),
                     display_lines: Vec::new(),
                 },

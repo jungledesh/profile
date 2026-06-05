@@ -66,6 +66,7 @@ pub fn r3_recommendation(snapshot: &RawSnapshot) -> Option<Recommendation> {
         impact: 2,
         confidence: 0.9,
         action: "Move shared context to prompt prefix; standardize prompt templates".to_string(),
+        short_action: "standardize prompts to share prefix context".to_string(),
         expected_impact: "Higher prefix cache hit rate and lower TTFT".to_string(),
         display_lines: format_low_prefix_hit_rate_fired(&d, enable_prefix),
     })
