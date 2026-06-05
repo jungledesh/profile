@@ -98,9 +98,16 @@ pub fn r1_recommendation(
         impact: 4,
         confidence: 0.8,
         action: "Increase client concurrency".to_string(),
+        short_action: r1_short_action(&d),
         expected_impact: "Higher throughput, stable TPOT".to_string(),
         display_lines: format_under_batching_fired(&d, 0.8),
     })
+}
+
+pub(super) fn r1_short_action(d: &UnderBatchingDetail) -> String {
+    let max_n = d.max_num_seqs.unwrap_or(0);
+    let idle_slots = f64::from(max_n) - d.running;
+    format!("increase client concurrency — {idle_slots:.0} slots idle")
 }
 
 pub(super) fn format_under_batching_fired(d: &UnderBatchingDetail, confidence: f64) -> Vec<String> {
@@ -384,5 +391,13 @@ mod tests {
         let r = r1_recommendation(&s, None).expect("fired");
         assert_eq!(r.rule_name, "under_batching");
         assert!((r.confidence - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn short_action_includes_idle_slots() {
+        let s = entry_fired_snap();
+        let r = r1_recommendation(&s, None).expect("fired");
+        assert!(r.short_action.contains("increase client concurrency"));
+        assert!(r.short_action.contains("251 slots idle"));
     }
 }

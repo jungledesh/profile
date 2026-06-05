@@ -71,6 +71,11 @@ pub fn r4_recommendation(
         ),
     };
 
+    let short_action = match computed_min_tp {
+        Some(n) => format!("set --tensor-parallel-size to at least {n}"),
+        None => format!("increase --tensor-parallel-size (weights overflow by ~{overflow:.0}GB)"),
+    };
+
     Some(Recommendation {
         rule_name: "oom_risk",
         impact: 5,
@@ -78,6 +83,7 @@ pub fn r4_recommendation(
         action: format!(
             "Model weights exceed GPU VRAM by {overflow:.0}GB — server will OOM without tensor parallelism"
         ),
+        short_action,
         expected_impact: "Model fits in memory; eliminates OOM risk".to_string(),
         display_lines: vec![
             "[!] OOM Risk".to_string(),
@@ -232,6 +238,23 @@ mod tests {
         assert!(text.contains("[!] OOM Risk"));
         assert!(text.contains("    • Model weights exceed GPU VRAM by ~12GB"));
         assert!(text.contains("weights overflow by ~12GB"));
+        assert!(r
+            .short_action
+            .contains("increase --tensor-parallel-size (weights overflow by ~12GB)"));
+    }
+
+    #[test]
+    fn short_action_includes_min_tp_when_weight_and_vram_known() {
+        let r = r4_recommendation(
+            Some(-12.5),
+            Some(1),
+            Some(140.0),
+            Some(80.0),
+            Some(0.9),
+            WeightDtypeSource::EnvVar,
+        )
+        .expect("fired");
+        assert_eq!(r.short_action, "set --tensor-parallel-size to at least 3");
     }
 
     #[test]
