@@ -1,104 +1,95 @@
-# profile — vLLM Inference Diagnoser
+# Profile
 
-Find and fix inference bottlenecks. Know what your hardware is capable of, and whether you're getting it.
+A physics-grounded, cost-aware optimizer for vLLM inference nodes.
 
-**v2 is work in progress.**
-
----
-
-## What it does
-
-Samples GPU + vLLM signals every 250ms. Computes a physics baseline (roofline). Runs gap analysis. Tells you what's wrong, why, and what to fix first.
-
-- Filters idle windows, reports only under-load behavior
-- Every number is hardware-referenced: your GPU, your model, your actual ceiling
-- Aggregated across your observation window, not a single noisy sample
-
-**Detects real production bottlenecks:**
-
-- **Under-batching** — GPU has headroom, scheduler occupancy too low
-- **KV Cache Pressure** — KV usage near capacity, eviction risk
-- **Concurrency Saturation** — scheduler pinned at `max_num_seqs` cap, queue building
+Profile measures live telemetry against the absolute physical limits of your hardware to expose waste, surface immediate configuration fixes, and reclaim infrastructure spend.
 
 ---
 
-## Example Output
+## Direct Value
 
-```
-+------------------------------------------------------------------------------------------+
-|PROFILE v2.0.0 [llama3] [NVIDIA H200] (2m from 2026-06-03 22:25:45 UTC)                  |
-|GPU =>     EFFICIENCY 31.7% | POWER 421W | vRAM 70/140GB                                  |
-|                                                                                          |
-|vLLM:                                                                                     |
-|REQUESTS   run 63 (98.0%) | wait 25 | max 64                                              |
-|LATENCY    ttft 656ms | tpot 11ms                                                         |
-|PROMPT     kv_cache 1.1% avg                                                              |
-|THROUGHPUT 5970 tok/s | pfix_cache 88.9%                                                  |
-|TRAFFIC    qps 46.5 | req_total 6336 | gen_total 812499 | preempt/s 0.00 | preempt_total 0|
-|                                                                                          |
-|ISSUES:                                                                                   |
-|                                                                                          |
-|[!] Concurrency Saturation                                                                |
-|  Seen in 58% of windows                                                                  |
-|                                                                                          |
-|  Cause:                                                                                  |
-|    • --max-num-seqs=64 hit: scheduler won't admit more sequences                         |
-|    • 33% of requests waiting (32 of 96 active)                                           |
-|    • TTFT 0.6s                                                                           |
-|                                                                                          |
-|  Fix:                                                                                    |
-|    • Raise --max-num-seqs above 64 (KV cache 1% used, pool has room)                     |
-|                                                                                          |
-|  Expected: Queue drains, TTFT recovers.                                                  |
-|  Confidence: High                                                                        |
-|                                                                                          |
-|No issues for Under-batching and KV cache pressure                                        |
-+------------------------------------------------------------------------------------------+
-```
+- **Ground Truth.** Maps live decode and prefill phases against your hardware's exact memory bandwidth and compute ceilings. Efficiency is derived from silicon physics, never estimated. If a metric is missing or telemetry is low-confidence, Profile flags it explicitly, zero artificial certainty.
+- **Zero Noise.** Traffic-gated profiling. The analyzer sleeps during idle cycles and only samples when the node is actively crunching tokens. Idle state is not waste; Profile only measures when there is actual work to optimize.
+- **Closed Loop.** Tracks configuration changes across container restarts to output precise performance and cost deltas. To prevent alert fatigue, Profile surfaces exactly one high-priority signal per iteration — isolate the bottleneck, deploy the fix, re-measure.
 
 ---
 
-## Installation
+## 1-Minute Value
 
-**Linux binary**
-Download from the [latest release](https://github.com/jungledesh/profile/releases).
+### 1. Download and Run
+
+Download the latest binary from [releases](https://github.com/jungledesh/profile/releases), then:
 
 ```bash
 chmod +x profile
-./profile diagnose --url http://localhost:8000/metrics --duration 5m
+./profile diagnose --url http://localhost:8000/metrics --duration 2m -m 256
 ```
 
-**Cargo**
+Or build from source — no `chmod` needed:
 
 ```bash
 cargo install --git https://github.com/jungledesh/profile
 ```
 
----
+### 2. Live Interactive Optimization
 
-## Usage
+```
+Measuring delta...
+  Throughput      6125 → 6084 tok/s ↓
+  TTFT            36685 → 37849ms ↑
+  Efficiency      -0.2pp ↓
 
-```bash
-# Instant snapshot
-./profile diagnose --url http://localhost:8000/metrics
+ECONOMICS:
+  Cost/1M tok     $0.16 → $0.16 (est)
+  Recoverable     $2.38 → $2.39/hr ↑
 
-# Recommended: 5-minute window
-./profile diagnose --url http://localhost:8000/metrics --duration 5m
+No significant change.
+Apply fix: raise --max-num-seqs above 64, then re-measure.
 
-# Verbose mode
-./profile -v diagnose --url http://localhost:8000/metrics --duration 5m
+Apply your change to vLLM.
+Profile will detect when vLLM restarts automatically.
+Press Enter to skip and re-measure now.
 ```
 
 ---
 
-Built to make vLLM inference diagnostics predictable, truthful, and actionable.  
-Feedback and real-world usage are welcome.
+## Production Bottlenecks Detected
+
+- **Concurrency Saturation:** `max_num_seqs` cap hit under high load. Requests stack in the queue, destroying TTFT.
+- **KV Cache Pressure:** VRAM near capacity, driving high token-eviction and preemption risks.
+- **Under-Batching:** Upstream orchestration or client failure leaving massive GPU compute headroom unutilized.
+- **OOM Risk:** Model weight configuration structurally exceeds physical VRAM topology before execution begins.
+
+---
+
+## Configuration Reference
+
+```bash
+./profile diagnose [flags]
+```
+
+
+| Flag              | Default                         | Description                                                   |
+| ----------------- | ------------------------------- | ------------------------------------------------------------- |
+| `--url`           | `http://localhost:8000/metrics` | Target vLLM metrics endpoint                                  |
+| `--duration`      | `30s`                           | Sampling window (e.g., `30s`, `2m`, `5m`)                     |
+| `-m`              | `256`                           | Fallback value for `max_num_seqs` if absent from metrics      |
+| `--cost-per-hour` | catalog estimate                | Exact host instance rate for raw dollar tracking              |
+| `-v`              | off                             | Verbose mode. Exposes non-triggered rules and physical limits |
+
+
+---
+
+## Environment Requirements
+
+- vLLM instance exporting standard Prometheus metrics
+- NVIDIA Linux runtime with native NVML (`libnvidia-ml.so`) access
 
 ---
 
 ## License
 
-**Profile** is open source software licensed under the **Apache License 2.0**.  
+Profile is open source under the **Apache License 2.0**.
 See the full [LICENSE](LICENSE) file for details.
 
 ```
@@ -117,8 +108,4 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-## Commercial Use
-
-The core of Profile is and will remain fully open source under the Apache 2.0 license.  
-
-If you're using Profile in production or want to discuss commercial licensing, support contracts, or custom development, reach out: **jungledesh@gmail.com**
+For production teams requiring cluster-wide aggregation, specialized hardware cataloging, or custom architecture support: **[jungledesh@gmail.com](mailto:jungledesh@gmail.com)**
