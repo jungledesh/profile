@@ -6,6 +6,7 @@ use crate::engine;
 use crate::output;
 
 const CEILING_HEADROOM_THRESHOLD_PCT: f64 = 10.0;
+const LOW_OCCUPANCY_THRESHOLD: f64 = 0.25;
 
 pub fn run(
     url: &str,
@@ -30,7 +31,9 @@ pub fn run(
             let efficiency = baseline.and_then(|b| b.efficiency_pct);
             let headroom = baseline.and_then(|b| b.headroom_pct);
 
-            let msg = healthy_exit_message(efficiency, headroom);
+            let num_running = state.last().result.snapshot.vllm.num_requests_running;
+            let max_num_seqs = state.last().result.static_ctx.config.max_num_seqs;
+            let msg = healthy_exit_message(efficiency, headroom, num_running, max_num_seqs);
             println!("\n{msg}");
             break;
         };
@@ -108,10 +111,23 @@ fn at_hardware_ceiling(headroom_pct: Option<f64>) -> bool {
     headroom_pct.is_some_and(|h| h < CEILING_HEADROOM_THRESHOLD_PCT)
 }
 
-fn healthy_exit_message(efficiency: Option<f64>, headroom: Option<f64>) -> String {
+fn healthy_exit_message(
+    efficiency: Option<f64>,
+    headroom: Option<f64>,
+    num_running: Option<f64>,
+    max_num_seqs: Option<u32>,
+) -> String {
+    let load_is_low = match (num_running, max_num_seqs) {
+        (Some(r), Some(m)) if m > 0 => (r / f64::from(m)) < LOW_OCCUPANCY_THRESHOLD,
+        _ => false,
+    };
+
     match (efficiency, headroom) {
         (Some(e), _) if headroom.is_some_and(|h| h < CEILING_HEADROOM_THRESHOLD_PCT) => {
             format!("No issues detected. Server is at hardware capacity — {e:.1}% of ceiling.")
+        }
+        (Some(e), _) if load_is_low => {
+            format!("No issues detected. Efficiency: {e:.1}% — hardware is under-fed, not misconfigured.")
         }
         (Some(e), _) => {
             format!(
@@ -306,20 +322,34 @@ mod tests {
 
     #[test]
     fn healthy_exit_includes_efficiency_when_available() {
-        let msg = healthy_exit_message(Some(42.5), Some(57.5));
+        let msg = healthy_exit_message(Some(42.5), Some(57.5), None, None);
         assert!(msg.contains("Efficiency: 42.5% of hardware ceiling."));
     }
 
     #[test]
     fn healthy_exit_at_capacity_when_headroom_low() {
-        let msg = healthy_exit_message(Some(91.0), Some(9.0));
+        let msg = healthy_exit_message(Some(91.0), Some(9.0), None, None);
         assert!(msg.contains("at hardware capacity — 91.0% of ceiling."));
     }
 
     #[test]
     fn healthy_exit_unavailable_when_efficiency_missing() {
-        let msg = healthy_exit_message(None, Some(50.0));
+        let msg = healthy_exit_message(None, Some(50.0), None, None);
         assert!(msg.contains("Efficiency unavailable"));
+    }
+
+    #[test]
+    fn healthy_exit_under_fed_when_occupancy_low() {
+        let msg = healthy_exit_message(Some(34.0), Some(66.0), Some(2.0), Some(256));
+        assert!(msg.contains("under-fed, not misconfigured"));
+        assert!(msg.contains("34.0%"));
+    }
+
+    #[test]
+    fn healthy_exit_no_under_fed_label_when_occupancy_high() {
+        let msg = healthy_exit_message(Some(34.0), Some(66.0), Some(200.0), Some(256));
+        assert!(msg.contains("of hardware ceiling"));
+        assert!(!msg.contains("under-fed"));
     }
 
     #[test]
