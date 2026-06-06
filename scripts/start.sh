@@ -70,7 +70,7 @@ python -m vllm.entrypoints.openai.api_server \
   --tensor-parallel-size 1 \
   --enforce-eager \
   --max-model-len 4096 \
-  --max-num-seqs 64 \
+  --max-num-seqs 32 \
   --enable-prefix-caching \
   2>&1 | tee \"$LOG_FILE\"'"
 

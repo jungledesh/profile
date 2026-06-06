@@ -838,7 +838,10 @@ pub fn format_diagnose_rules_for_windows(
     if !r5_significant {
         not_fired.push("Concurrency saturation");
     }
-    if !verbose_rules {
+    if !verbose_rules && !not_fired.is_empty() {
+        if !out.is_empty() && !out.last().is_some_and(|l| l.is_empty()) {
+            out.push(String::new());
+        }
         for name in &not_fired {
             out.push(format!("{name}: not triggered"));
         }

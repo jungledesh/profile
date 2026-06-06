@@ -78,6 +78,9 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
         return lines;
     }
 
+    if !verbose_rules {
+        lines.push(String::new());
+    }
     lines.push(format!(
         "{:<width$}{}{}",
         "GPU =>",
