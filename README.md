@@ -9,7 +9,7 @@ Profile measures live telemetry against the absolute physical limits of your har
 
 ---
 
-## Direct Value
+## Design
 
 - **Ground Truth.** Maps live decode and prefill phases against your hardware's exact memory bandwidth and compute ceilings. Efficiency is derived from silicon physics, never estimated. If a metric is missing or telemetry is low-confidence, Profile flags it explicitly, zero artificial certainty.
 - **Zero Noise.** Traffic-gated profiling. The analyzer sleeps during idle cycles and only samples when the node is actively crunching tokens. Idle state is not waste; Profile only measures when there is actual work to optimize.
