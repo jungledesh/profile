@@ -197,6 +197,25 @@ fn aggregate_windows(
         .or_else(|| weighted_metric_pairs(&pairs, |w| w.vllm.ttft_ms));
     agg_v.tpot_ms = aggregate_histogram_from_mass(&pairs, |v| v.tpot_window_mass, 1000.0)
         .or_else(|| weighted_metric_pairs(&pairs, |w| w.vllm.tpot_ms));
+    // p99: merge per-window delta bucket vectors, recompute quantile from merged result.
+    // This is mathematically correct — averaging quantiles across windows is not.
+    {
+        let ttft_vecs: Vec<&[collectors::HistogramCount]> = pairs
+            .iter()
+            .map(|(w, _)| w.vllm.ttft_p99_buckets.as_slice())
+            .collect();
+        let merged_ttft = collectors::merge_p99_bucket_vecs(&ttft_vecs);
+        agg_v.ttft_p99_ms =
+            collectors::vllm::histogram_quantile(0.99, &merged_ttft).map(|s| s * 1000.0);
+
+        let tpot_vecs: Vec<&[collectors::HistogramCount]> = pairs
+            .iter()
+            .map(|(w, _)| w.vllm.tpot_p99_buckets.as_slice())
+            .collect();
+        let merged_tpot = collectors::merge_p99_bucket_vecs(&tpot_vecs);
+        agg_v.tpot_p99_ms =
+            collectors::vllm::histogram_quantile(0.99, &merged_tpot).map(|s| s * 1000.0);
+    }
     agg_v.prefill_latency_ms =
         aggregate_histogram_from_mass(&pairs, |v| v.prefill_window_mass, 1000.0)
             .or_else(|| weighted_metric_pairs(&pairs, |w| w.vllm.prefill_latency_ms));
