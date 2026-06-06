@@ -6,6 +6,7 @@ use crate::engine;
 use crate::output;
 
 const CEILING_HEADROOM_THRESHOLD_PCT: f64 = 10.0;
+const LOW_OCCUPANCY_THRESHOLD: f64 = 0.25;
 
 pub fn run(
     url: &str,
@@ -30,7 +31,9 @@ pub fn run(
             let efficiency = baseline.and_then(|b| b.efficiency_pct);
             let headroom = baseline.and_then(|b| b.headroom_pct);
 
-            let msg = healthy_exit_message(efficiency, headroom);
+            let num_running = state.last().result.snapshot.vllm.num_requests_running;
+            let max_num_seqs = state.last().result.static_ctx.config.max_num_seqs;
+            let msg = healthy_exit_message(efficiency, headroom, num_running, max_num_seqs);
             println!("\n{msg}");
             break;
         };
@@ -108,10 +111,23 @@ fn at_hardware_ceiling(headroom_pct: Option<f64>) -> bool {
     headroom_pct.is_some_and(|h| h < CEILING_HEADROOM_THRESHOLD_PCT)
 }
 
-fn healthy_exit_message(efficiency: Option<f64>, headroom: Option<f64>) -> String {
+fn healthy_exit_message(
+    efficiency: Option<f64>,
+    headroom: Option<f64>,
+    num_running: Option<f64>,
+    max_num_seqs: Option<u32>,
+) -> String {
+    let load_is_low = match (num_running, max_num_seqs) {
+        (Some(r), Some(m)) if m > 0 => (r / f64::from(m)) < LOW_OCCUPANCY_THRESHOLD,
+        _ => false,
+    };
+
     match (efficiency, headroom) {
         (Some(e), _) if headroom.is_some_and(|h| h < CEILING_HEADROOM_THRESHOLD_PCT) => {
             format!("No issues detected. Server is at hardware capacity — {e:.1}% of ceiling.")
+        }
+        (Some(e), _) if load_is_low => {
+            format!("No issues detected. Efficiency: {e:.1}% — hardware is under-fed, not misconfigured.")
         }
         (Some(e), _) => {
             format!(
@@ -182,9 +198,16 @@ fn print_delta(d: &delta::Delta) {
         Some(v) if v < 0.0 => println!("  Efficiency  {v:.1}pp ↓"),
         _ => {}
     }
-    let has_cost = d.cost_per_million_before.is_some() && d.cost_per_million_after.is_some();
+    let has_cost = economics_section_active(d);
     if has_cost {
         println!("ECONOMICS:");
+    }
+    match (d.joules_per_token_before, d.joules_per_token_after) {
+        (Some(before), Some(after)) if before.is_finite() && after.is_finite() => {
+            let arrow = jtok_change_arrow(before, after);
+            println!("  J/tok         {before:.2} → {after:.2} {arrow}");
+        }
+        _ => {}
     }
     match (d.cost_per_million_before, d.cost_per_million_after) {
         (Some(before), Some(after)) if before.is_finite() && after.is_finite() => {
@@ -218,6 +241,23 @@ fn print_delta(d: &delta::Delta) {
 
 const COST_ARROW_THRESHOLD_USD: f64 = 0.01;
 const RECOVERABLE_ARROW_THRESHOLD_USD_PER_HR: f64 = 0.05;
+const JTOK_ARROW_THRESHOLD: f64 = 0.02;
+
+fn economics_section_active(d: &delta::Delta) -> bool {
+    (d.cost_per_million_before.is_some() && d.cost_per_million_after.is_some())
+        || (d.joules_per_token_before.is_some() && d.joules_per_token_after.is_some())
+}
+
+fn jtok_change_arrow(before: f64, after: f64) -> &'static str {
+    let diff = after - before;
+    if diff < -JTOK_ARROW_THRESHOLD {
+        "↓"
+    } else if diff > JTOK_ARROW_THRESHOLD {
+        "↑"
+    } else {
+        ""
+    }
+}
 
 fn cost_change_arrow(before: f64, after: f64) -> &'static str {
     let diff = after - before;
@@ -282,20 +322,34 @@ mod tests {
 
     #[test]
     fn healthy_exit_includes_efficiency_when_available() {
-        let msg = healthy_exit_message(Some(42.5), Some(57.5));
+        let msg = healthy_exit_message(Some(42.5), Some(57.5), None, None);
         assert!(msg.contains("Efficiency: 42.5% of hardware ceiling."));
     }
 
     #[test]
     fn healthy_exit_at_capacity_when_headroom_low() {
-        let msg = healthy_exit_message(Some(91.0), Some(9.0));
+        let msg = healthy_exit_message(Some(91.0), Some(9.0), None, None);
         assert!(msg.contains("at hardware capacity — 91.0% of ceiling."));
     }
 
     #[test]
     fn healthy_exit_unavailable_when_efficiency_missing() {
-        let msg = healthy_exit_message(None, Some(50.0));
+        let msg = healthy_exit_message(None, Some(50.0), None, None);
         assert!(msg.contains("Efficiency unavailable"));
+    }
+
+    #[test]
+    fn healthy_exit_under_fed_when_occupancy_low() {
+        let msg = healthy_exit_message(Some(34.0), Some(66.0), Some(2.0), Some(256));
+        assert!(msg.contains("under-fed, not misconfigured"));
+        assert!(msg.contains("34.0%"));
+    }
+
+    #[test]
+    fn healthy_exit_no_under_fed_label_when_occupancy_high() {
+        let msg = healthy_exit_message(Some(34.0), Some(66.0), Some(200.0), Some(256));
+        assert!(msg.contains("of hardware ceiling"));
+        assert!(!msg.contains("under-fed"));
     }
 
     #[test]
@@ -347,5 +401,39 @@ mod tests {
     #[test]
     fn recoverable_arrow_down_when_waste_reduced_above_threshold() {
         assert_eq!(recoverable_waste_arrow(10.0, 9.94), "↓");
+    }
+
+    #[test]
+    fn jtok_arrow_down_when_energy_improves() {
+        assert_eq!(jtok_change_arrow(0.31, 0.28), "↓");
+    }
+
+    #[test]
+    fn jtok_arrow_suppressed_below_threshold() {
+        assert_eq!(jtok_change_arrow(0.31, 0.30), "");
+    }
+
+    #[test]
+    fn economics_header_shown_when_only_jtok_available() {
+        let d = delta::Delta {
+            throughput_delta_pct: None,
+            throughput_before: None,
+            throughput_after: None,
+            efficiency_delta_pp: None,
+            efficiency_pct_before: None,
+            efficiency_pct_after: None,
+            cost_per_million_before: None,
+            cost_per_million_after: None,
+            joules_per_token_before: Some(0.31),
+            joules_per_token_after: Some(0.28),
+            cost_source_after: None,
+            ttft_before_ms: None,
+            ttft_after_ms: None,
+            tpot_before_ms: None,
+            tpot_after_ms: None,
+            direction: delta::Direction::Plateau,
+            config_drifted: false,
+        };
+        assert!(economics_section_active(&d));
     }
 }
