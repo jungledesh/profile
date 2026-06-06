@@ -2,7 +2,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
-use prometheus_parse::{Scrape, Value};
+use prometheus_parse::{HistogramCount, Scrape, Value};
 
 use super::sampling::{sample_count_for, SAMPLE_INTERVAL};
 use super::types::{
@@ -256,6 +256,141 @@ fn tpot_window_ms(first: &Scrape, last: &Scrape) -> Option<f64> {
     })
 }
 
+/// Collect all `Value::Histogram` samples matching `base`, merge counts by position.
+/// Assumes identical bucket boundaries across label sets (vLLM guarantees this per metric).
+/// Returns empty Vec if none found or boundary mismatch.
+fn merge_histogram_buckets(scrape: &Scrape, base: &str) -> Vec<HistogramCount> {
+    let mut merged_counts: Vec<f64> = Vec::new();
+    let mut bounds: Vec<f64> = Vec::new();
+    for s in &scrape.samples {
+        if s.metric != base {
+            continue;
+        }
+        if let Value::Histogram(buckets) = &s.value {
+            if merged_counts.is_empty() {
+                bounds = buckets.iter().map(|b| b.less_than).collect();
+                merged_counts = buckets.iter().map(|b| b.count).collect();
+            } else if merged_counts.len() == buckets.len() {
+                for (sum, b) in merged_counts.iter_mut().zip(buckets.iter()) {
+                    *sum += b.count;
+                }
+            }
+            // Boundary mismatch: skip (degrade gracefully)
+        }
+    }
+    bounds
+        .into_iter()
+        .zip(merged_counts)
+        .map(|(lt, c)| HistogramCount {
+            less_than: lt,
+            count: c,
+        })
+        .collect()
+}
+
+/// Standard linear interpolation quantile from cumulative histogram buckets.
+/// Buckets must be sorted by less_than ascending (prometheus_parse guarantees this).
+/// If the target quantile falls in the +Inf bucket, returns the last finite bucket's upper bound.
+/// Returns None if total == 0 or buckets empty.
+pub(crate) fn histogram_quantile(q: f64, buckets: &[HistogramCount]) -> Option<f64> {
+    let total = buckets
+        .iter()
+        .find(|b| b.less_than.is_infinite() && b.less_than > 0.0)
+        .map(|b| b.count)?;
+    if total <= 0.0 {
+        return None;
+    }
+    let target = q * total;
+    let mut prev_upper = 0.0_f64;
+    let mut prev_count = 0.0_f64;
+    for b in buckets {
+        if b.less_than.is_infinite() {
+            break;
+        }
+        if b.count >= target {
+            let width = b.less_than - prev_upper;
+            let span = b.count - prev_count;
+            return Some(if span <= 0.0 {
+                b.less_than
+            } else {
+                prev_upper + (target - prev_count) / span * width
+            });
+        }
+        prev_upper = b.less_than;
+        prev_count = b.count;
+    }
+    // All observations in +Inf bucket — return last finite bound
+    buckets
+        .iter()
+        .rfind(|b| b.less_than.is_finite())
+        .map(|b| b.less_than)
+}
+
+/// p99 of requests completed in this window (delta buckets between first and last scrape).
+/// Returns None on counter reset (any bucket delta < 0), bucket count mismatch, or zero traffic.
+/// No fallback to cumulative — stale historical p99 is worse than no value.
+fn histogram_window_p99_ms(first: &Scrape, last: &Scrape, base: &str) -> Option<f64> {
+    let delta = histogram_window_delta_buckets(first, last, base);
+    histogram_quantile(0.99, &delta).map(|s| s * 1000.0)
+}
+
+/// Returns the per-window delta bucket vector (last − first) for `base` metric.
+/// Returns empty Vec on counter reset, bucket mismatch, or no traffic (same conditions as histogram_window_p99_ms).
+fn histogram_window_delta_buckets(
+    first: &Scrape,
+    last: &Scrape,
+    base: &str,
+) -> Vec<HistogramCount> {
+    let fb = merge_histogram_buckets(first, base);
+    let lb = merge_histogram_buckets(last, base);
+    if fb.is_empty() || fb.len() != lb.len() {
+        return Vec::new();
+    }
+    fb.iter()
+        .zip(lb.iter())
+        .map(|(f, l)| {
+            let d = l.count - f.count;
+            if d < 0.0 {
+                None
+            } else {
+                Some(HistogramCount {
+                    less_than: l.less_than,
+                    count: d,
+                })
+            }
+        })
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default()
+}
+
+/// Merge per-window histogram delta bucket vectors into one vector by summing counts at each boundary.
+/// All input vecs must have identical boundaries (guaranteed when sourced from the same metric).
+/// Returns empty Vec if input is empty or boundaries mismatch across vecs.
+pub(crate) fn merge_p99_bucket_vecs(vecs: &[&[HistogramCount]]) -> Vec<HistogramCount> {
+    let vecs: Vec<&[HistogramCount]> = vecs.iter().copied().filter(|v| !v.is_empty()).collect();
+    if vecs.is_empty() {
+        return Vec::new();
+    }
+    let bounds: Vec<f64> = vecs[0].iter().map(|b| b.less_than).collect();
+    let mut merged: Vec<f64> = vecs[0].iter().map(|b| b.count).collect();
+    for v in &vecs[1..] {
+        if v.len() != bounds.len() {
+            return Vec::new();
+        }
+        for (sum, b) in merged.iter_mut().zip(v.iter()) {
+            *sum += b.count;
+        }
+    }
+    bounds
+        .into_iter()
+        .zip(merged)
+        .map(|(lt, c)| HistogramCount {
+            less_than: lt,
+            count: c,
+        })
+        .collect()
+}
+
 /// `first` = scrape from sample 1, `last` = scrape from sample [`SAMPLE_COUNT`] (~2s later).
 fn apply_histogram_window(first: &Scrape, last: &Scrape, m: &mut VllmRawMetrics) {
     m.ttft_window_mass = histogram_window_mass(first, last, "vllm_time_to_first_token_seconds");
@@ -278,6 +413,18 @@ fn apply_histogram_window(first: &Scrape, last: &Scrape, m: &mut VllmRawMetrics)
         .or_else(|| histogram_mean_ms_from_scrape(last, "vllm_request_queue_time_seconds"));
     m.prompt_tokens_mean = histogram_window_mean(first, last, "vllm_request_prompt_tokens")
         .or_else(|| histogram_mean_from_scrape(last, "vllm_request_prompt_tokens"));
+    m.ttft_p99_ms = histogram_window_p99_ms(first, last, "vllm_time_to_first_token_seconds");
+    m.tpot_p99_ms =
+        histogram_window_p99_ms(first, last, "vllm_request_time_per_output_token_seconds")
+            .or_else(|| histogram_window_p99_ms(first, last, "vllm_time_per_output_token_seconds"));
+    m.ttft_p99_buckets =
+        histogram_window_delta_buckets(first, last, "vllm_time_to_first_token_seconds");
+    m.tpot_p99_buckets =
+        histogram_window_delta_buckets(first, last, "vllm_request_time_per_output_token_seconds");
+    if m.tpot_p99_buckets.is_empty() {
+        m.tpot_p99_buckets =
+            histogram_window_delta_buckets(first, last, "vllm_time_per_output_token_seconds");
+    }
 }
 
 fn max_num_seqs_from_gauge(scrape: &Scrape) -> Option<u32> {
@@ -430,6 +577,10 @@ fn parse_vllm_metrics(scrape: &Scrape) -> Result<VllmRawMetrics> {
         kv_cache_peak_perc: None,
         ttft_ms,
         tpot_ms,
+        ttft_p99_ms: None,
+        tpot_p99_ms: None,
+        ttft_p99_buckets: vec![],
+        tpot_p99_buckets: vec![],
         prefill_latency_ms,
         queue_delay_ms,
         prompt_tokens_mean,
@@ -940,5 +1091,125 @@ vllm:cache_config_info{block_size="32",cache_dtype="fp8",enable_prefix_caching="
         assert_eq!(cc.block_size, Some(32));
         assert_eq!(cc.cache_dtype.as_deref(), Some("fp8"));
         assert_eq!(cc.enable_prefix_caching, Some(false));
+    }
+
+    mod histogram_tests {
+        use super::*;
+        use prometheus_parse::HistogramCount;
+
+        #[test]
+        fn histogram_quantile_p99_interpolates_correctly() {
+            // 100 obs: 50 in [0, 0.1), 50 in [0.1, 0.2)
+            let buckets = vec![
+                HistogramCount {
+                    less_than: 0.1,
+                    count: 50.0,
+                },
+                HistogramCount {
+                    less_than: 0.2,
+                    count: 100.0,
+                },
+                HistogramCount {
+                    less_than: f64::INFINITY,
+                    count: 100.0,
+                },
+            ];
+            let p99 = histogram_quantile(0.99, &buckets).unwrap();
+            // target=99; in second bucket: 0.1 + (99-50)/50 * 0.1 = 0.198
+            assert!((p99 - 0.198).abs() < 1e-9);
+        }
+
+        #[test]
+        fn histogram_quantile_returns_none_when_total_zero() {
+            let buckets = vec![
+                HistogramCount {
+                    less_than: 1.0,
+                    count: 0.0,
+                },
+                HistogramCount {
+                    less_than: f64::INFINITY,
+                    count: 0.0,
+                },
+            ];
+            assert!(histogram_quantile(0.99, &buckets).is_none());
+        }
+
+        #[test]
+        fn histogram_quantile_returns_last_finite_bound_when_all_in_inf_bucket() {
+            let buckets = vec![
+                HistogramCount {
+                    less_than: 1.0,
+                    count: 0.0,
+                },
+                HistogramCount {
+                    less_than: 5.0,
+                    count: 0.0,
+                },
+                HistogramCount {
+                    less_than: f64::INFINITY,
+                    count: 100.0,
+                },
+            ];
+            let p99 = histogram_quantile(0.99, &buckets).unwrap();
+            assert!((p99 - 5.0).abs() < 1e-9);
+        }
+
+        #[test]
+        fn merge_p99_bucket_vecs_sums_counts_correctly() {
+            let buckets = vec![
+                HistogramCount {
+                    less_than: 0.1,
+                    count: 50.0,
+                },
+                HistogramCount {
+                    less_than: 0.2,
+                    count: 100.0,
+                },
+                HistogramCount {
+                    less_than: f64::INFINITY,
+                    count: 100.0,
+                },
+            ];
+            let merged = merge_p99_bucket_vecs(&[&buckets, &buckets]);
+            assert_eq!(merged[0].count, 100.0);
+            assert_eq!(merged[1].count, 200.0);
+            assert_eq!(merged[2].count, 200.0);
+            let p99 = histogram_quantile(0.99, &merged).unwrap();
+            assert!((p99 - 0.198).abs() < 1e-9);
+        }
+
+        #[test]
+        fn merge_p99_bucket_vecs_empty_input_returns_empty() {
+            assert!(merge_p99_bucket_vecs(&[]).is_empty());
+        }
+
+        #[test]
+        fn merge_p99_bucket_vecs_boundary_mismatch_returns_empty() {
+            let a = vec![
+                HistogramCount {
+                    less_than: 0.1,
+                    count: 50.0,
+                },
+                HistogramCount {
+                    less_than: f64::INFINITY,
+                    count: 50.0,
+                },
+            ];
+            let b = vec![
+                HistogramCount {
+                    less_than: 0.1,
+                    count: 10.0,
+                },
+                HistogramCount {
+                    less_than: 0.2,
+                    count: 20.0,
+                },
+                HistogramCount {
+                    less_than: f64::INFINITY,
+                    count: 20.0,
+                },
+            ];
+            assert!(merge_p99_bucket_vecs(&[&a, &b]).is_empty());
+        }
     }
 }

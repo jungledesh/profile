@@ -1,5 +1,7 @@
 use std::time::SystemTime;
 
+pub use prometheus_parse::HistogramCount;
+
 /// Config fields extracted from the `vllm:cache_config_info` labeled gauge.
 /// All `Option<T>` — absent when the metric isn't present in the scrape.
 #[derive(Debug, Clone, Default)]
@@ -61,6 +63,15 @@ pub struct VllmRawMetrics {
     // else cumulative mean from the last scrape.
     pub ttft_ms: Option<f64>,
     pub tpot_ms: Option<f64>,
+    /// p99 TTFT from histogram bucket delta (first→last scrape in window). None if no traffic or counter reset.
+    pub ttft_p99_ms: Option<f64>,
+    /// p99 TPOT from histogram bucket delta (first→last scrape in window). None if no traffic or counter reset.
+    pub tpot_p99_ms: Option<f64>,
+    /// Raw histogram delta buckets for TTFT (first→last scrape in window). Empty if no traffic, reset, or histogram unavailable.
+    /// Used for mathematically correct multi-window p99 aggregation — merge vectors, then recompute quantile.
+    pub ttft_p99_buckets: Vec<HistogramCount>,
+    /// Raw histogram delta buckets for TPOT (first→last scrape in window). Empty if no traffic, reset, or histogram unavailable.
+    pub tpot_p99_buckets: Vec<HistogramCount>,
     pub prefill_latency_ms: Option<f64>,
     pub queue_delay_ms: Option<f64>,
     /// `request_prompt_tokens` histogram: mean tokens (Δ window or last-scrape fallback).

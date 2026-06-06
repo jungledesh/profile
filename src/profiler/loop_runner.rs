@@ -180,7 +180,13 @@ fn print_delta(d: &delta::Delta) {
             let delta = after - before;
             if delta.abs() > 5.0 {
                 let arrow = latency_arrow(delta);
-                println!("  TTFT        {before:.0} → {after:.0}ms {arrow}");
+                let p99_suffix = match (d.ttft_p99_before_ms, d.ttft_p99_after_ms) {
+                    (Some(pb), Some(pa)) if pb.is_finite() && pa.is_finite() => {
+                        format!("  (p99 {pb:.0} → {pa:.0}ms {})", latency_arrow(pa - pb))
+                    }
+                    _ => String::new(),
+                };
+                println!("  TTFT        {before:.0} → {after:.0}ms {arrow}{p99_suffix}");
             }
         }
     }
@@ -189,7 +195,13 @@ fn print_delta(d: &delta::Delta) {
             let delta = after - before;
             if delta.abs() > 0.5 {
                 let arrow = latency_arrow(delta);
-                println!("  TPOT        {before:.1} → {after:.1}ms {arrow}");
+                let p99_suffix = match (d.tpot_p99_before_ms, d.tpot_p99_after_ms) {
+                    (Some(pb), Some(pa)) if pb.is_finite() && pa.is_finite() => {
+                        format!("  (p99 {pb:.1} → {pa:.1}ms {})", latency_arrow(pa - pb))
+                    }
+                    _ => String::new(),
+                };
+                println!("  TPOT        {before:.1} → {after:.1}ms {arrow}{p99_suffix}");
             }
         }
     }
@@ -431,6 +443,10 @@ mod tests {
             ttft_after_ms: None,
             tpot_before_ms: None,
             tpot_after_ms: None,
+            ttft_p99_before_ms: None,
+            ttft_p99_after_ms: None,
+            tpot_p99_before_ms: None,
+            tpot_p99_after_ms: None,
             direction: delta::Direction::Plateau,
             config_drifted: false,
         };

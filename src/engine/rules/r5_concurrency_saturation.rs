@@ -12,13 +12,15 @@ const CONCURRENCY_SATURATION_QUEUE_RATIO_MIN: f64 = 0.30;
 /// won't immediately trigger KV pressure. At or above: hardware is near capacity, scale out.
 const KV_CACHE_SAFE_TO_SCALE_PCT: f64 = 80.0;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct ConcurrencySaturationDetail {
     pub requests_running: f64,
     pub requests_waiting: f64,
     pub max_num_seqs: Option<u32>,
     pub queue_ratio: f64,
     pub ttft_ms: Option<f64>,
+    pub ttft_p99_ms: Option<f64>,
+    pub ttft_p99_buckets: Vec<crate::collectors::HistogramCount>,
     pub kv_cache_usage_perc: Option<f64>,
 }
 
@@ -59,6 +61,8 @@ pub fn rule5_concurrency_saturation(
         max_num_seqs: Some(max_seqs),
         queue_ratio: ratio,
         ttft_ms: snapshot.vllm.ttft_ms,
+        ttft_p99_ms: snapshot.vllm.ttft_p99_ms,
+        ttft_p99_buckets: snapshot.vllm.ttft_p99_buckets.clone(),
         kv_cache_usage_perc,
     })
 }
@@ -71,7 +75,7 @@ pub(super) fn format_concurrency_saturation_issue(
         .max_num_seqs
         .map(|n| n.to_string())
         .unwrap_or_else(|| "?".to_string());
-    let confidence = match (d.ttft_ms, d.kv_cache_usage_perc) {
+    let confidence = match (d.ttft_ms.or(d.ttft_p99_ms), d.kv_cache_usage_perc) {
         (Some(_), Some(_)) => "High",
         _ => "Medium",
     };
@@ -88,8 +92,18 @@ pub(super) fn format_concurrency_saturation_issue(
             d.requests_waiting + d.requests_running
         ),
     ];
-    if let Some(ttft_ms) = d.ttft_ms.filter(|t| t.is_finite()) {
-        lines.push(format!("    • TTFT {:.1}s", ttft_ms / 1000.0,));
+    match (
+        d.ttft_p99_ms.filter(|t| t.is_finite()),
+        d.ttft_ms.filter(|t| t.is_finite()),
+    ) {
+        (Some(p99), Some(avg)) => lines.push(format!(
+            "    • TTFT {:.1}s p99 ({:.1}s avg)",
+            p99 / 1000.0,
+            avg / 1000.0
+        )),
+        (Some(p99), None) => lines.push(format!("    • TTFT {:.1}s p99", p99 / 1000.0)),
+        (None, Some(avg)) => lines.push(format!("    • TTFT {:.1}s", avg / 1000.0)),
+        (None, None) => {}
     }
     lines.push(String::new());
     lines.push("  Fix:".to_string());
@@ -145,7 +159,7 @@ pub fn r5_recommendation(
     Some(Recommendation {
         rule_name: "concurrency_saturation",
         impact: 4,
-        confidence: match (d.ttft_ms, d.kv_cache_usage_perc) {
+        confidence: match (d.ttft_ms.or(d.ttft_p99_ms), d.kv_cache_usage_perc) {
             (Some(_), Some(_)) => 0.9,
             _ => 0.6,
         },
@@ -191,6 +205,13 @@ pub(super) fn aggregate_concurrency_saturation_detail(
         .filter_map(|d| d.ttft_ms)
         .fold((0.0_f64, 0usize), |(s, c), v| (s + v, c + 1));
     let ttft_ms = (ttft_count > 0).then_some(ttft_sum / ttft_count as f64);
+    let ttft_p99_vecs: Vec<&[crate::collectors::HistogramCount]> = details
+        .iter()
+        .map(|d| d.ttft_p99_buckets.as_slice())
+        .collect();
+    let merged_ttft = crate::collectors::merge_p99_bucket_vecs(&ttft_p99_vecs);
+    let ttft_p99_ms =
+        crate::collectors::vllm::histogram_quantile(0.99, &merged_ttft).map(|s| s * 1000.0);
     let kv_cache_usage_perc = details.last().and_then(|d| d.kv_cache_usage_perc);
     Some(ConcurrencySaturationDetail {
         requests_running: run,
@@ -198,6 +219,8 @@ pub(super) fn aggregate_concurrency_saturation_detail(
         max_num_seqs: max_seqs,
         queue_ratio: ratio,
         ttft_ms,
+        ttft_p99_ms,
+        ttft_p99_buckets: merged_ttft,
         kv_cache_usage_perc,
     })
 }
@@ -238,6 +261,8 @@ mod tests {
             max_num_seqs: Some(32),
             queue_ratio: 15.0 / 47.0,
             ttft_ms,
+            ttft_p99_ms: None,
+            ttft_p99_buckets: vec![],
             kv_cache_usage_perc,
         }
     }
@@ -353,6 +378,23 @@ mod tests {
     }
 
     #[test]
+    fn cause_shows_ttft_p99_primary_when_both_available() {
+        let mut d = fired_detail(Some(5000.0), None);
+        d.ttft_p99_ms = Some(12400.0);
+        let text = format_concurrency_saturation_issue(&d, None).join("\n");
+        assert!(text.contains("TTFT 12.4s p99 (5.0s avg)"));
+    }
+
+    #[test]
+    fn cause_shows_ttft_p99_only_when_mean_missing() {
+        let mut d = fired_detail(None, None);
+        d.ttft_p99_ms = Some(12400.0);
+        let text = format_concurrency_saturation_issue(&d, None).join("\n");
+        assert!(text.contains("TTFT 12.4s p99"));
+        assert!(!text.contains("avg"));
+    }
+
+    #[test]
     fn cause_omits_ttft_when_none() {
         let text = format_concurrency_saturation_issue(&fired_detail(None, None), None).join("\n");
         assert!(!text.contains("requests queued ahead"));
@@ -363,6 +405,49 @@ mod tests {
         let agg =
             aggregate_concurrency_saturation_detail(&[fired_detail(None, None)]).expect("agg");
         assert_eq!(agg.max_num_seqs, Some(32));
+    }
+
+    #[test]
+    fn aggregate_uses_merged_buckets_not_average() {
+        use crate::collectors::HistogramCount;
+
+        let mut d1 = fired_detail(None, None);
+        d1.ttft_p99_ms = Some(99.0);
+        d1.ttft_p99_buckets = vec![
+            HistogramCount {
+                less_than: 0.1,
+                count: 100.0,
+            },
+            HistogramCount {
+                less_than: 0.2,
+                count: 100.0,
+            },
+            HistogramCount {
+                less_than: f64::INFINITY,
+                count: 100.0,
+            },
+        ];
+        let mut d2 = fired_detail(None, None);
+        d2.ttft_p99_ms = Some(199.0);
+        d2.ttft_p99_buckets = vec![
+            HistogramCount {
+                less_than: 0.1,
+                count: 0.0,
+            },
+            HistogramCount {
+                less_than: 0.2,
+                count: 100.0,
+            },
+            HistogramCount {
+                less_than: f64::INFINITY,
+                count: 100.0,
+            },
+        ];
+        let agg = aggregate_concurrency_saturation_detail(&[d1, d2]).expect("agg");
+        let p99 = agg.ttft_p99_ms.expect("merged p99");
+        // Merged: 200 obs, p99 ≈ 198ms. Simple average of 99ms and 199ms would be 149ms.
+        assert!((p99 - 198.0).abs() < 1.0);
+        assert!((p99 - 149.0).abs() > 10.0);
     }
 
     #[test]

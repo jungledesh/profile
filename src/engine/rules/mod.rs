@@ -556,7 +556,7 @@ pub fn build_report_for_windows(
             recs.push(Recommendation {
                 rule_name: "concurrency_saturation",
                 impact: 4,
-                confidence: match (agg.ttft_ms, agg.kv_cache_usage_perc) {
+                confidence: match (agg.ttft_ms.or(agg.ttft_p99_ms), agg.kv_cache_usage_perc) {
                     (Some(_), Some(_)) => 0.9,
                     _ => 0.6,
                 },
@@ -838,7 +838,10 @@ pub fn format_diagnose_rules_for_windows(
     if !r5_significant {
         not_fired.push("Concurrency saturation");
     }
-    if !verbose_rules {
+    if !verbose_rules && !not_fired.is_empty() {
+        if !out.is_empty() && !out.last().is_some_and(|l| l.is_empty()) {
+            out.push(String::new());
+        }
         for name in &not_fired {
             out.push(format!("{name}: not triggered"));
         }
