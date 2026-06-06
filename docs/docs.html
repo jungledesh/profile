@@ -1,0 +1,600 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Profile | Docs</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/geist@1.3.0/dist/fonts/geist-mono/style.css" rel="stylesheet">
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 16px;
+  line-height: 1.7;
+  color: #111;
+  background:
+    linear-gradient(rgba(255,255,255,0.5), rgba(255,255,255,0.5)),
+    url("assets/bg.jpeg") center center / cover fixed;
+  min-height: 100vh;
+}
+
+/* ── Header ── */
+header {
+  position: sticky; top: 0; z-index: 10;
+  background: rgba(245,242,237,0.92);
+  backdrop-filter: blur(4px);
+  border-bottom: 1px solid rgba(0,0,0,0.1);
+  padding: 12px 0;
+}
+header .wrap {
+  max-width: 1080px; margin: 0 auto; padding: 0 24px;
+  display: flex; align-items: center; justify-content: space-between;
+}
+header .site-title {
+  font-size: 1.2rem; font-weight: 700; letter-spacing: 0.1em;
+  color: #111; text-decoration: none;
+}
+header nav a {
+  font-size: 0.85rem; color: #666; text-decoration: none;
+  margin-left: 20px; letter-spacing: 0.04em;
+}
+header nav a:hover, header nav a.active { color: #111; }
+
+/* ── Layout ── */
+.layout {
+  max-width: 720px; margin: 0 auto; padding: 0 24px;
+  min-height: calc(100vh - 60px);
+}
+
+/* ── Pages ── */
+.page { display: none; padding: 40px 0 80px; }
+.page.visible { display: block; }
+
+/* ── Typography ── */
+h1 { font-size: 2.8rem; font-weight: 700; letter-spacing: 0.02em; margin-bottom: 8px; line-height: 1.1; }
+h2 { font-size: 1.7rem; font-weight: 600; margin: 40px 0 12px; }
+h3 { font-size: 1.2rem; font-weight: 600; margin: 28px 0 8px; }
+p { margin-bottom: 14px; }
+a { color: #111; }
+a:hover { opacity: 0.6; }
+.subtitle { font-size: 1.1rem; color: #666; margin-bottom: 32px; font-style: italic; }
+
+/* ── Tables ── */
+table { width: 100%; border-collapse: collapse; margin: 20px 0; font-size: 0.9rem; }
+th { text-align: left; font-size: 0.65rem; letter-spacing: 0.1em; text-transform: uppercase;
+     color: #aaa; border-bottom: 1px solid rgba(0,0,0,0.15); padding: 6px 12px 6px 0; }
+td { border-bottom: 1px solid rgba(0,0,0,0.07); padding: 9px 12px 9px 0; vertical-align: top; }
+tr:last-child td { border-bottom: none; }
+
+/* ── Code ── */
+code {
+  font-family: "Geist Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: 0.8rem; background: rgba(0,0,0,0.06);
+  padding: 2px 5px; border-radius: 2px;
+}
+pre {
+  background: #1a1a18; color: #eceae7;
+  padding: 18px; overflow-x: auto; margin: 18px 0;
+  font-family: "Geist Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: 0.8rem; line-height: 1.6;
+}
+pre code { background: none; padding: 0; color: inherit; }
+
+/* ── Callout ── */
+.callout {
+  border-left: 2px solid rgba(0,0,0,0.25);
+  padding: 10px 16px; margin: 18px 0;
+  font-size: 0.9rem; color: #555;
+  background: rgba(0,0,0,0.03);
+}
+.callout.warn { border-left-color: #8a6000; }
+
+hr { border: none; border-top: 1px solid rgba(0,0,0,0.1); margin: 36px 0; }
+
+/* ── TL;DR ── */
+.tldr {
+  border-left: 2px solid #111; padding: 14px 18px;
+  margin-bottom: 36px; background: rgba(0,0,0,0.03);
+}
+.tldr .label {
+  font-size: 0.65rem; letter-spacing: 0.14em; text-transform: uppercase;
+  color: #aaa; margin-bottom: 8px;
+}
+.tldr ul { list-style: none; }
+.tldr ul li { padding: 2px 0 2px 16px; position: relative; font-size: 0.95rem; }
+.tldr ul li::before { content: "→"; position: absolute; left: 0; color: #aaa; font-size: 0.75rem; top: 6px; }
+
+/* ── Stats ── */
+.stats-row { display: flex; gap: 24px; margin: 24px 0; flex-wrap: wrap; }
+.stat-block { flex: 1; min-width: 120px; border-top: 1px solid #111; padding-top: 8px; }
+.stat { font-size: 2rem; font-weight: 700; display: block; }
+.stat-label { font-size: 0.8rem; color: #666; line-height: 1.4; }
+
+blockquote {
+  border-left: 2px solid rgba(0,0,0,0.15);
+  padding: 4px 0 4px 16px; margin: 20px 0;
+  color: #555; font-style: italic;
+}
+
+.post-title { font-size: 3rem; font-weight: 700; line-height: 1.1; margin-bottom: 6px; }
+.post-meta { font-size: 0.8rem; color: #aaa; margin-bottom: 28px; letter-spacing: 0.04em; }
+.sources { margin-top: 36px; border-top: 1px solid rgba(0,0,0,0.1); padding-top: 16px; }
+.sources p { font-size: 0.8rem; color: #888; margin-bottom: 4px; }
+
+.diagram { margin: 24px auto; text-align: center; }
+.diagram figcaption { font-size: 0.75rem; color: #aaa; margin-top: 8px; }
+
+/* ── Footer ── */
+footer {
+  border-top: 1px solid rgba(0,0,0,0.1);
+  padding: 24px; margin-top: 40px;
+  display: flex; justify-content: center; align-items: center;
+  gap: 1.6rem; font-size: 0.65rem;
+  letter-spacing: 0.15em; text-transform: uppercase; opacity: 0.55;
+}
+.divider { width: 24px; height: 1px; background: #111; flex-shrink: 0; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <a class="site-title" href="index.html">PROFILE</a>
+    <nav>
+      <a href="#data" data-page="data">Data</a>
+      <a href="#math" data-page="math">Maths</a>
+      <a href="#rules" data-page="rules">Rules</a>
+      <a href="#limitations" data-page="limitations">Limitations</a>
+      <a href="#design" data-page="design">Design</a>
+      <a href="#blog" data-page="blog">Blog</a>
+      <a href="https://github.com/jungledesh/profile" target="_blank" rel="noopener">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="layout" id="layout">
+
+  <!-- HOME -->
+  <article id="page-home" class="page">
+    <h1>Profile</h1>
+    <p class="subtitle">Physics-aware optimization loop for vLLM inference servers.</p>
+
+    <div class="tldr">
+      <p class="label">What it does</p>
+      <ul>
+        <li>Computes the hardware ceiling for your model + GPU. Shows how far below it you are.</li>
+        <li>Detects the bottleneck: batching gap, KV pressure, concurrency cap, prefix cache miss.</li>
+        <li>Measures before and after. Every recommendation is accountable.</li>
+      </ul>
+    </div>
+
+    <h2>Install</h2>
+    <pre><code># Linux x86_64
+wget https://github.com/jungledesh/profile/releases/latest/download/profile
+chmod +x profile
+./profile diagnose --url http://localhost:8000/metrics
+
+# Rust toolchain
+cargo install profile-vllm</code></pre>
+
+    <h2>Usage</h2>
+    <pre><code>profile diagnose --url http://HOST:8000/metrics
+profile diagnose --url http://HOST:8000/metrics --duration 2m
+profile diagnose --url http://HOST:8000/metrics -m 256</code></pre>
+
+    <h2>What profile detects</h2>
+    <table>
+      <thead><tr><th>Rule</th><th>Symptom</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr><td><strong>R1</strong> Under-batching</td><td>GPU fed &lt;25% of capacity</td><td>Raise concurrency or fix client</td></tr>
+        <tr><td><strong>R2</strong> KV cache pressure</td><td>KV usage ≥85%</td><td>Reduce max_num_seqs or add memory</td></tr>
+        <tr><td><strong>R3</strong> Low prefix reuse</td><td>Hit rate &lt;35%</td><td>Enable prefix caching</td></tr>
+        <tr><td><strong>R4</strong> OOM risk</td><td>Weights exceed VRAM</td><td>Add tensor parallelism</td></tr>
+        <tr><td><strong>R5</strong> Concurrency saturation</td><td>max_num_seqs hit, queue building</td><td>Raise --max-num-seqs</td></tr>
+      </tbody>
+    </table>
+  </article>
+
+  <!-- MATH -->
+  <article id="page-math" class="page">
+    <h1>Maths</h1>
+    <p class="subtitle">What Profile computes from the data it collects. Every formula, every derivation.</p>
+
+    <h2>Roofline: hardware ceilings</h2>
+    <p>Two ceilings, two binding constraints. LLM serving is memory-bandwidth-bound at decode and compute-bound at prefill.</p>
+    <table>
+      <thead><tr><th>Phase</th><th>Formula</th><th>Binding constraint</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Decode ceiling</strong></td>
+          <td><code>peak_bw_gbps × 1e9 / (params × bytes_per_param)</code> tok/s</td>
+          <td>Memory bandwidth, binding in steady-state serving</td>
+        </tr>
+        <tr>
+          <td><strong>Prefill ceiling</strong></td>
+          <td><code>peak_flops × 1e12 / (6 × params × seq_len)</code> tok/s</td>
+          <td>Compute, binding during prompt processing</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>All three inputs (<code>peak_bw_gbps</code>, <code>peak_flops</code>, <code>params</code>) come from catalogs, not live measurement. Output labeled <code>(est)</code>.</p>
+
+    <h2>Efficiency %</h2>
+    <pre><code>efficiency_pct = actual_throughput / decode_ceiling × 100</code></pre>
+    <p>Decode ceiling is the binding constraint in steady-state. Efficiency % answers: what fraction of what this hardware can do are you actually getting?</p>
+    <div class="callout warn">Calibrated for decode-bound workloads. Prefill-heavy workloads (long prompts, short outputs) show artificially low efficiency %. The prefill ceiling is the relevant constraint there, not decode.</div>
+
+    <h2>Weight footprint and headroom</h2>
+    <pre><code>weight_gb        = params × bytes_per_param / 1e9
+kv_headroom_gb   = vram_total_gb − weight_gb
+tpot_floor_ms    = 1000 / decode_ceiling_tps
+prefill_floor_ms = 1000 / prefill_ceiling_tps</code></pre>
+    <p><code>kv_headroom_gb</code> negative means the model requires tensor parallelism to fit. <code>tpot_floor_ms</code> and <code>prefill_floor_ms</code> are the theoretical minimum latencies at ceiling. Actual values above these indicate headroom or overhead.</p>
+
+    <h2>Economics</h2>
+    <table>
+      <thead><tr><th>Metric</th><th>Formula</th></tr></thead>
+      <tbody>
+        <tr><td>Joules / token</td><td><code>power_watts / generation_tokens_per_sec</code></td></tr>
+        <tr><td>$ / 1M tokens</td><td><code>gpu_cost_per_hr / tok_per_sec × 1e6 / 3600</code></td></tr>
+        <tr><td>Recoverable waste $/hr</td><td><code>cost_per_hr × (1 − efficiency_pct / 100)</code></td></tr>
+      </tbody>
+    </table>
+
+    <h2>Aggregation: combining windows</h2>
+    <p>Each ~2s collection window produces one snapshot. When multiple windows are combined (e.g. a 2-minute diagnose run), different field types aggregate differently.</p>
+    <table>
+      <thead><tr><th>Field type</th><th>Method</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>State gauges (KV usage, VRAM, running)</td><td>Last evaluable window's value</td><td>State at end of active period, not average</td></tr>
+        <tr><td>Utilization (GPU %, power, running mean)</td><td>Time-weighted mean, evaluable windows only</td><td>Average load while server was active</td></tr>
+        <tr><td>Rates (tok/s, req/s, preemptions/s)</td><td>Time-weighted mean, evaluable windows only</td><td>Effective throughput while active</td></tr>
+        <tr><td>Histogram means (TTFT, TPOT)</td><td>ΣΔsum / ΣΔcount across evaluable windows</td><td>Weighted by observation count, not time</td></tr>
+        <tr><td>p99</td><td>Merge bucket vectors, recompute quantile</td><td>Averaging p99 scalars is mathematically wrong</td></tr>
+        <tr><td>Prefix cache hit rate</td><td>Σ Δhits / Σ Δqueries, last evaluable window</td><td>Most recent active behavior</td></tr>
+        <tr><td>Cumulative counters (total tokens, total reqs)</td><td>Chronologically last window</td><td>True server totals since process start</td></tr>
+      </tbody>
+    </table>
+  </article>
+
+  <!-- RULES -->
+  <article id="page-rules" class="page">
+    <h1>Rules</h1>
+    <p class="subtitle">Five rules. Each fires when a specific bottleneck is confirmed under load.</p>
+
+    <div class="callout">Rules only evaluate during active traffic. Idle windows are skipped.</div>
+
+    <h2>R1: Under-batching</h2>
+    <table>
+      <thead><tr><th>Condition</th><th>Threshold</th></tr></thead>
+      <tbody>
+        <tr><td>Scheduler occupancy</td><td>&lt;25% of max_num_seqs</td></tr>
+        <tr><td>No backlog</td><td>waiting &lt; 2</td></tr>
+        <tr><td>Prefill not saturated</td><td>&lt;40% of prefill ceiling</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Fix:</strong> Raise client concurrency.</p>
+
+    <h2>R2: KV cache pressure</h2>
+    <table>
+      <thead><tr><th>Condition</th><th>Threshold</th></tr></thead>
+      <tbody>
+        <tr><td>KV cache usage</td><td>≥85%</td></tr>
+        <tr><td>VRAM corroboration</td><td>≥78%</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Fix:</strong> Reduce <code>--max-num-seqs</code> or <code>--max-model-len</code>.</p>
+    <div class="callout">R2 evaluates against <code>kv_cache_peak_perc</code>, the maximum KV usage across all 9 scrapes in the window, not the average. A window that averaged 70% but peaked at 92% will still fire. The spike is what causes preemptions — the average hides it.</div>
+    <div class="callout">R2 is the only rule that cross-references a live GPU reading (VRAM from NVML) with a live vLLM reading (KV cache usage). If <code>gpu_observed_at</code> and <code>vllm_observed_at</code> are more than 1 second apart, R2 is skipped. The other rules draw from a single source and don't have this constraint.</div>
+
+    <h2>R3: Low prefix reuse</h2>
+    <table>
+      <thead><tr><th>Condition</th><th>Threshold</th></tr></thead>
+      <tbody>
+        <tr><td>Prefix cache hit rate</td><td>&lt;35%</td></tr>
+        <tr><td>Mean prompt tokens</td><td>≥20</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Fix:</strong> Enable <code>--enable-prefix-caching</code>. Put shared prefixes at the front.</p>
+
+    <h2>R4: OOM risk</h2>
+    <p>Fires regardless of traffic. Configuration fact, not runtime observation.</p>
+    <p><strong>Fix:</strong> Profile computes required TP degree: <em>"Set --tensor-parallel-size N"</em>.</p>
+
+    <h2>R5: Concurrency saturation</h2>
+    <table>
+      <thead><tr><th>Condition</th><th>Threshold</th></tr></thead>
+      <tbody>
+        <tr><td>running ≈ max_num_seqs</td><td>Within 0.5</td></tr>
+        <tr><td>Queue ratio</td><td>waiting / (running + waiting) ≥ 30%</td></tr>
+        <tr><td>Sustained</td><td>≥3 windows, ≥25% of evaluable</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Fix:</strong> Raise <code>--max-num-seqs</code> if KV usage &lt;80%.</p>
+    <div class="callout warn">vLLM ≤0.18.0 doesn't expose <code>vllm_max_num_seqs</code>. Pass <code>-m &lt;value&gt;</code> or R5 won't fire.</div>
+
+    <h2>Confidence formula</h2>
+    <pre><code>confidence = weighted_mean(
+  metric_completeness,
+  sample_stability,
+  rule_agreement,
+  baseline_certainty
+)</code></pre>
+    <p>Same formula across all rules. When data is incomplete, confidence degrades and output says so.</p>
+
+    <h2>Ranking</h2>
+    <pre><code>score = impact × confidence  // impact: 1–5</code></pre>
+    <p>Grouped by root cause into <code>IssueGroup</code>. One primary recommendation per group.</p>
+  </article>
+
+  <!-- DATA -->
+  <article id="page-data" class="page">
+    <h1>Data</h1>
+    <p class="subtitle">What, when, and how we collect.</p>
+
+    <h2>Cadence</h2>
+    <p>GPU and vLLM scraped in parallel, 250ms apart. One window is 9 scrapes, ~2 seconds total. Each collector timestamps on completion. If the two timestamps diverge by more than 1 second, rules that cross-reference both sources are skipped.</p>
+    <p>Within each window, different metric types are treated differently:</p>
+    <table>
+      <thead><tr><th>Type</th><th>Treatment</th><th>Edge cases</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Gauges</td>
+          <td>Last scrape in the window</td>
+          <td><code>kv_cache_peak_perc</code> is max across all 9 scrapes, not last. KV cache can spike and recover within a window — last scrape alone misses it. Shown in output when peak &gt; avg + 10pp or peak ≥ 95%. Same pattern for VRAM peak (≥90% of total) and GPU temp peak (≥80°C).</td>
+        </tr>
+        <tr>
+          <td>Histograms</td>
+          <td>Δsum/Δcount, first to last scrape</td>
+          <td>Falls back to last-scrape cumulative mean when Δcount ≤ 0 (no new completions in window). p99 has no fallback — stale p99 is worse than none, so it shows <code>—</code> instead.</td>
+        </tr>
+        <tr>
+          <td>Counters</td>
+          <td>Rates = Δ / window duration. Raw totals from last scrape.</td>
+          <td><code>None</code> on counter reset (negative delta) or zero-duration window. Zero delta is valid — it means no activity, not missing data.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>Evaluable window gate</h2>
+    <p>A window is evaluable when two conditions hold:</p>
+    <pre><code>window_duration_secs  is present and positive
+num_requests_running  is Some (even if zero)</code></pre>
+    <p>That's it. The gate is structural — did the endpoint respond and does the window have a valid duration? <code>running = 0</code> passes. <code>None</code> means the endpoint didn't respond, which is different from an idle server.</p>
+    <p>Load-based filtering happens inside individual rules, not here. Each rule decides independently whether there is enough traffic to fire. How evaluable windows are combined across a run is covered in <a href="#math" data-page="math">Maths</a>.</p>
+
+    <h2>Source 1: NVML</h2>
+    <table>
+      <thead><tr><th>Field</th><th>What it is</th></tr></thead>
+      <tbody>
+        <tr><td><code>gpu_util_pct</code></td><td>SM utilization, 0–100%</td></tr>
+        <tr><td><code>mem_util_pct</code></td><td>Memory interface utilization, 0–100%</td></tr>
+        <tr><td><code>power_watts</code></td><td>Instantaneous draw (W)</td></tr>
+        <tr><td><code>power_limit_watts</code></td><td>Driver-set TDP limit (W)</td></tr>
+        <tr><td><code>vram_used_mb</code></td><td>VRAM in use (MiB)</td></tr>
+        <tr><td><code>vram_peak_mb</code></td><td>Peak VRAM used in window (MiB)</td></tr>
+        <tr><td><code>vram_total_mb</code></td><td>Total device VRAM (MiB), static</td></tr>
+        <tr><td><code>temperature_c</code></td><td>GPU core temp (°C)</td></tr>
+        <tr><td><code>temperature_peak_c</code></td><td>Peak temp in window (°C)</td></tr>
+        <tr><td><code>sm_clock_mhz</code></td><td>SM clock frequency</td></tr>
+      </tbody>
+    </table>
+    <div class="callout">NVML does not expose theoretical peak FLOPs or memory bandwidth. Those come from the GPU catalog, looked up once at startup from <code>gpu_name</code>, labeled <code>(est)</code> in output.</div>
+
+    <h2>Source 2: vLLM Prometheus</h2>
+    <p>Scraped from <code>/metrics</code> 9 times per window. <code>None</code> when the endpoint didn't respond, counters reset, or Δcount ≤ 0.</p>
+    <table>
+      <thead><tr><th>Metric</th><th>Type</th><th>Used for</th></tr></thead>
+      <tbody>
+        <tr><td><code>vllm:num_requests_running</code></td><td>Gauge</td><td>R1, R5, window gate</td></tr>
+        <tr><td><code>vllm:num_requests_waiting</code></td><td>Gauge</td><td>R1, R5 queue ratio</td></tr>
+        <tr><td><code>vllm:num_requests_swapped</code></td><td>Gauge</td><td>CPU offload detection</td></tr>
+        <tr><td><code>vllm:gpu_cache_usage_perc</code></td><td>Gauge</td><td>R2, R5 fix decision</td></tr>
+        <tr><td><code>vllm:cpu_cache_usage_perc</code></td><td>Gauge</td><td>CPU KV pressure</td></tr>
+        <tr><td><code>vllm:time_to_first_token_seconds</code></td><td>Histogram</td><td>TTFT mean + p99</td></tr>
+        <tr><td><code>vllm:request_time_per_output_token_seconds</code></td><td>Histogram</td><td>TPOT mean + p99</td></tr>
+        <tr><td><code>vllm:time_per_output_token_seconds</code></td><td>Histogram</td><td>TPOT (alt metric name, older vLLM)</td></tr>
+        <tr><td><code>vllm:time_per_schedule_step_seconds</code></td><td>Histogram</td><td>Prefill latency</td></tr>
+        <tr><td><code>vllm:request_queue_time_seconds</code></td><td>Histogram</td><td>Queue delay</td></tr>
+        <tr><td><code>vllm:request_prompt_tokens</code></td><td>Histogram</td><td>Mean prompt length</td></tr>
+        <tr><td><code>vllm:generation_tokens_total</code></td><td>Counter</td><td>Throughput, efficiency %</td></tr>
+        <tr><td><code>vllm:request_success_total</code></td><td>Counter</td><td>QPS</td></tr>
+        <tr><td><code>vllm:num_preemptions_total</code></td><td>Counter</td><td>Preemption rate</td></tr>
+        <tr><td><code>vllm:cache_config_info</code></td><td>Gauge (labels)</td><td>block_size, cache_dtype, prefix_caching, chunked_prefill</td></tr>
+        <tr><td><code>vllm:max_num_seqs</code></td><td>Gauge</td><td>R1, R5 cap. Absent in vLLM ≤0.18.0, pass <code>-m</code></td></tr>
+        <tr><td>Prefix cache counters</td><td>Counter</td><td>R3 hit rate</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Catalog-derived fields</h2>
+    <p>NVML doesn't expose peak FLOPs or memory bandwidth. Model param counts aren't in vLLM metrics. Profile looks these up once at startup from internal catalogs keyed on <code>gpu_name</code> and <code>model_name</code>.</p>
+    <table>
+      <thead><tr><th>Field</th><th>Source</th><th>If absent</th></tr></thead>
+      <tbody>
+        <tr><td><code>peak_flops_f32_tflops</code>, <code>peak_bw_gbps</code></td><td>GPU catalog, non-tensor-core FP32, conservative roofline input</td><td>Ceilings not computed</td></tr>
+        <tr><td><code>param_count</code>, <code>num_layers</code>, <code>hidden_dim</code></td><td>Model catalog</td><td>Roofline skipped</td></tr>
+        <tr><td><code>bytes_per_param</code></td><td><code>DTYPE</code> env → <code>kv_cache_dtype</code> → catalog default → bf16 (2 bytes)</td><td>bf16 fallback, labeled in output</td></tr>
+      </tbody>
+    </table>
+    <div class="callout">All catalog-derived numbers are labeled <code>(est)</code> in output. Upper-bound approximations, not measured values.</div>
+
+    <h2>Fallbacks</h2>
+    <table>
+      <thead><tr><th>Field</th><th>Primary</th><th>Fallback</th><th>If absent</th></tr></thead>
+      <tbody>
+        <tr><td><code>max_num_seqs</code></td><td><code>vllm:max_num_seqs</code> gauge</td><td><code>-m</code> CLI flag</td><td>R1 occupancy gate and R5 silent</td></tr>
+        <tr><td>TPOT histogram</td><td><code>request_time_per_output_token</code></td><td><code>time_per_output_token</code></td><td><code>None</code></td></tr>
+        <tr><td><code>bytes_per_param</code></td><td><code>DTYPE</code> env var</td><td><code>kv_cache_dtype</code> → catalog → bf16</td><td>bf16, labeled in output</td></tr>
+        <tr><td>All windows non-evaluable</td><td>—</td><td>Chronologically last raw window</td><td>Labeled as non-evaluable</td></tr>
+      </tbody>
+    </table>
+  </article>
+
+  <!-- LIMITATIONS -->
+  <article id="page-limitations" class="page">
+    <h1>Limitations</h1>
+    <p class="subtitle">Where the math is approximate and why.</p>
+
+    <table>
+      <thead><tr><th>Gap</th><th>Affects</th><th>In practice</th></tr></thead>
+      <tbody>
+        <tr><td>Efficiency % uses theoretical BW ceiling, not measured HBM</td><td>All rules</td><td>Can't distinguish BW bottleneck from scheduler under-feeding</td></tr>
+        <tr><td>FLOPs/s not measurable via NVML</td><td>R1</td><td>Prefill-heavy workloads show artificially low efficiency %</td></tr>
+        <tr><td><code>vllm_max_num_seqs</code> absent in vLLM ≤0.18.0</td><td>R5</td><td>Requires <code>-m</code> flag</td></tr>
+        <tr><td>Chunked prefill: run can exceed max_num_seqs</td><td>R5</td><td>R5 skips. Cap is not the constraint</td></tr>
+        <tr><td>GPU and model specs from catalog, not measured</td><td>Baseline</td><td>Output labels ceilings <code>(est)</code></td></tr>
+        <tr><td>p99 shows — on counter reset or zero-traffic window</td><td>Display</td><td>By design. Stale p99 is worse than none.</td></tr>
+      </tbody>
+    </table>
+  </article>
+
+  <!-- DESIGN -->
+  <article id="page-design" class="page">
+    <h1>Design</h1>
+    <p class="subtitle">The non-obvious choices and the reasoning behind them.</p>
+
+    <h2>Option&lt;T&gt; over sentinels</h2>
+    <p><code>Some(0.0) ≠ None</code>. Every metric is optional. Missing data and zero are different. Treating them the same produces confident wrong answers.</p>
+
+    <h2>Physics ceiling as a range</h2>
+    <p><code>CeilingEstimate { lower, expected, upper }</code>. Catalog-derived specs carry uncertainty. Output labels ceilings <code>(est)</code>.</p>
+
+    <h2>One recommendation per iteration</h2>
+    <p>Rules grouped by root cause. One primary signal per group. Five simultaneous recommendations produce paralysis, not action.</p>
+
+    <h2>Delta, not snapshot</h2>
+    <p>Each iteration reports what changed since the last: direction, magnitude, likely cause. A snapshot without temporal comparison is a status report, not a diagnosis.</p>
+
+    <h2>Shared traffic gate</h2>
+    <p><code>window_is_evaluable</code> is one function, called once, used by all rules. Idle state has no waste to measure.</p>
+
+    <h2>Engine never imports CLI</h2>
+    <p>The reasoning layer is deterministic and testable in isolation. Adding a new interface (SGLang, API) doesn't touch the engine.</p>
+
+    <h2>250ms collection interval</h2>
+    <p>Fast enough to catch GPU utilization transients that a 1s or 5s poll would average away. Slow enough that 9 scrapes per window add no meaningful load to the vLLM endpoint or NVML. A profiler that taxes its target is worse than no profiler.</p>
+
+    <h2>Peak over average for KV cache</h2>
+    <p>KV cache usage is tracked as the maximum across all 9 scrapes in a window, not the last value. A spike that causes preemptions and latency degradation can recover before the window ends — the last scrape reports a safe number while the damage already happened. The peak is the signal. The average buries it.</p>
+
+    <h2>Zero allocation in the hot loop</h2>
+    <p><code>AnalysisInput&lt;'a&gt;</code> borrows both contexts. No clones per 250ms window. A profiler that eats its target's resources is worse than no profiler.</p>
+
+    <h2>Security</h2>
+    <p>rustls only, no OpenSSL. Read-only NVML. No external API calls. No telemetry. <code>cargo audit</code> clean before every release tag.</p>
+  </article>
+
+  <!-- BLOG -->
+  <article id="page-blog" class="page">
+    <h1 class="post-title">The Inference Problem</h1>
+    <p class="post-meta">Apr 19, 2026</p>
+
+    <div class="tldr">
+      <p class="label">TL;DR</p>
+      <ul>
+        <li>Inference is 80–90% of your AI system's lifetime cost, not training.</li>
+        <li>Production servers bleed compute across batching gaps, KV cache pressure, prefill overhead, low throughput, and high latency.</li>
+        <li>The problems are fixable. Most teams can't see them.</li>
+      </ul>
+    </div>
+
+    <p>You send a prompt. A GPU somewhere processes it and sends back a response, one token at a time. That loop is inference. It is also where most of the money goes.</p>
+
+    <figure style="margin: 28px 0;">
+      <img src="https://jungledesh.github.io/profile/assets/inference-metrics.jpeg" alt="The AI inference cycle" style="width: 100%; border: 1px solid rgba(0,0,0,0.08);">
+      <figcaption style="font-size: 0.8rem; opacity: 0.5; margin-top: 8px;">The AI inference cycle. <a href="https://www.linkedin.com/posts/jungledesh_models-have-been-trained-huge-investments-activity-7437963429077819392-6rxt" target="_blank" rel="noopener">Full post.</a></figcaption>
+    </figure>
+
+    <div class="stats-row">
+      <div class="stat-block">
+        <span class="stat">80–90%</span>
+        <span class="stat-label">of a production AI system's lifetime cost is inference, not training <a href="https://arxiv.org/html/2510.26136v1">[1]</a></span>
+      </div>
+      <div class="stat-block">
+        <span class="stat">15×</span>
+        <span class="stat-label">GPT-4 inference cost vs training cost. $2.3B in inference by end of 2024 vs ~$150M to train</span>
+      </div>
+    </div>
+
+    <p>Training gets the headlines. Inference pays the bills.</p>
+
+    <p>An H100 rents for roughly $3/hr. When your GPU is underutilized, you get fewer tokens than the hardware can deliver. Same bill, lower output. That is over $1,000/month in cloud compute per GPU, wasted.</p>
+
+    <p>Most teams are bad at it. The waste is in:</p>
+
+    <p><strong>Throughput.</strong> A misconfigured vLLM server runs well below its hardware ceiling. When batching, memory, and scheduling are off, GPU utilization collapses. The hardware is not the problem. The configuration is.</p>
+
+    <p><strong>Latency.</strong> Real-time applications need time-to-first-token under 100ms. Most production setups don't get there without deliberate tuning.</p>
+
+    <p><strong>KV cache pressure.</strong> Every token generated needs to remember everything before it. When that memory fills up, the system evicts. Throughput drops. Latency spikes. At 90% usage, you're already in trouble.</p>
+
+    <p><strong>Batching.</strong> When batch size is 2 out of a possible 16, you're using 12% of the machine. The rest idles. You pay full price.</p>
+
+    <p><strong>Prefill overhead.</strong> Before the first output token, the model processes your entire prompt. In workloads with 500+ token prompts, prefill alone dominates response time.</p>
+
+    <p><strong>Observability.</strong> Most teams look at raw Prometheus metrics and guess. There is no standard path from "throughput is low" to "here is exactly why, here is the fix."</p>
+
+    <p>These are not edge cases. This is the normal state of a production inference server that has not been tuned.</p>
+
+    <h2>Why This Matters Now</h2>
+
+    <p>The standard story about early tech: Amazon lost money for years. Uber still does. Growth first, economics later. AI inference does not fit that story.</p>
+
+    <p>Amazon chose to lose money, a deliberate bet on demand. Companies running AI inference are burning money on hardware they already paid for, because it is sitting misconfigured. That is not a growth strategy. It is waste that shows up on your cloud compute bill this month.</p>
+
+    <p>Enterprises running production AI spend $50,000 to $500,000 per month on inference infrastructure. <a href="https://www.tensormesh.ai/blog-posts/ai-inference-costs-2025-energy-crisis">[2]</a> Inference costs have dropped 280× since 2022, from $20 to $0.07 per million tokens. That gap between what hardware can do and what most teams extract from it is your cost problem today.</p>
+
+    <blockquote>
+      "The AI inferencing market will be much, much larger than the AI training market. People are running out of usable inference computing capacity." — Larry Ellison, Oracle earnings call <a href="https://www.benzinga.com/markets/earnings/25/09/47587481/larry-ellison-targets-multi-trillion-dollar-ai-inference-market-for-oracle-ai-will-change-everything">[3]</a>
+    </blockquote>
+
+    <p>The shortage is not GPUs. It is efficient use of the GPUs already running in production, including yours.</p>
+
+    <div class="sources">
+      <p><strong>Sources</strong></p>
+      <p><a href="https://arxiv.org/html/2510.26136v1">1. Beyond Benchmarks: The Economics of AI Inference, arXiv</a></p>
+      <p><a href="https://www.tensormesh.ai/blog-posts/ai-inference-costs-2025-energy-crisis">2. AI Inference Costs in 2025, TensorMesh</a></p>
+      <p><a href="https://www.benzinga.com/markets/earnings/25/09/47587481/larry-ellison-targets-multi-trillion-dollar-ai-inference-market-for-oracle-ai-will-change-everything">3. Larry Ellison Targets Multi-Trillion-Dollar AI Inference Market, Benzinga</a></p>
+    </div>
+  </article>
+
+</div>
+
+<footer>
+  <span>Profile</span>
+  <div class="divider"></div>
+  <span>v2.0</span>
+  <div class="divider"></div>
+  <span>Open Source</span>
+  <div class="divider"></div>
+  <span>2026</span>
+</footer>
+
+<script>
+  const TITLES = {
+    math: 'Maths | Profile',
+    rules: 'Rules | Profile',
+    data: 'Data | Profile',
+    limitations: 'Limitations | Profile',
+    design: 'Design | Profile',
+    blog: 'The Inference Problem | Profile',
+  };
+
+  function show(hash) {
+    const id = (hash || '#math').replace('#','');
+    document.querySelectorAll('.page').forEach(p => p.classList.remove('visible'));
+    const target = document.getElementById('page-' + id);
+    if (target) target.classList.add('visible');
+    document.querySelectorAll('[data-page]').forEach(a =>
+      a.classList.toggle('active', a.dataset.page === id));
+    document.title = TITLES[id] || 'Profile | Docs';
+  }
+
+  window.addEventListener('hashchange', () => show(window.location.hash));
+  show(window.location.hash || '#data');
+</script>
+
+</body>
+</html>

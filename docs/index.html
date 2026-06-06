@@ -1,389 +1,337 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>The Inference Problem | profile</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Profile</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/geist@1.3.0/dist/fonts/geist-mono/style.css" rel="stylesheet">
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { height: 100%; overflow: hidden; }
+body {
+    background:
+        linear-gradient(rgba(255,255,255,0.5), rgba(255,255,255,0.5)),
+        url("assets/bg.jpeg") center center / cover no-repeat;
+    color: #111;
+    font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    display: flex;
+    flex-direction: column;
+    padding: 1.6rem 2rem;
+    gap: 1rem;
+}
+/* ── Top bar ── */
+.top-bar {
+    flex-shrink: 0;
+    display: flex;
+    align-items: baseline;
+    gap: 2rem;
+}
+.github-link {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.82rem;
+    font-weight: 600;
+    color: #000;
+    text-decoration: none;
+    opacity: 0.8;
+    flex-shrink: 0;
+    transition: opacity 0.15s;
+}
+.github-link:hover { opacity: 1; }
+.github-link svg { flex-shrink: 0; }
 
-  <!-- Open Graph -->
-  <meta property="og:title" content="The Inference Problem" />
-  <meta property="og:description" content="Where inference compute goes to waste, and what it costs. A breakdown of vLLM bottlenecks: batching, KV cache, prefill, and the observability gap." />
-  <meta property="og:url" content="https://jungledesh.github.io/profile/" />
-  <meta property="og:type" content="article" />
-  <meta property="og:image" content="https://jungledesh.github.io/profile/assets/inference-metrics.jpeg" />
-  <meta name="twitter:card" content="summary_large_image" />
-  <meta name="twitter:title" content="The Inference Problem" />
-  <meta name="twitter:description" content="Where inference compute goes to waste, and what it costs." />
-  <meta name="twitter:image" content="https://jungledesh.github.io/profile/assets/inference-metrics.jpeg" />
+.brand {
+    font-size: clamp(0.95rem, 1.3vw, 1.1rem);
+    font-weight: 700;
+    letter-spacing: 0.18em;
+    text-decoration: none;
+    color: #111;
+    flex-shrink: 0;
+}
+.hero {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.3rem;
+}
+.tagline {
+    font-size: clamp(0.95rem, 1.3vw, 1.1rem);
+    opacity: 0.95;
+    color: #000;
+    text-align: center;
+}
+.loop {
+    font-size: clamp(0.75rem, 0.95vw, 0.85rem);
+    letter-spacing: 0.08em;
+    opacity: 0.8;
+    font-weight: 600;
+    color: #000;
+}
+/* ── Body ── */
+.body-row {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+}
+/* New wrapper to guarantee tops perfectly align while pushed down */
+.content-wrapper {
+    margin-top: auto;
+    display: flex;
+    flex-direction: row;
+    gap: 2.5rem;
+    align-items: flex-start;
+    padding-bottom: 1.5rem;
+    width: 100%;
+}
+/* ── Left ── */
+.left {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-start;
+    gap: 0.9rem;
+    min-height: 0;
+    padding-top: 1.4rem;
+}
+.pitch-group {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+}
+.pitch {
+    font-size: clamp(0.9rem, 1.15vw, 1.05rem);
+    line-height: 1.72;
+    opacity: 1;
+    color: #000;
+}
+.cite { color: inherit; text-decoration: none; opacity: 0.38; }
+.cite:hover { opacity: 1; }
+/* sources — horizontal */
+.sources {
+    display: flex;
+    flex-direction: row;
+    gap: 1.2rem;
+    align-items: center;
+}
+.source-link {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    text-decoration: none;
+    color: #000;
+    opacity: 0.75;
+    font-size: 0.7rem;
+    letter-spacing: 0.04em;
+    font-weight: 600;
+    transition: opacity 0.15s;
+}
+.source-link:hover { opacity: 0.7; }
+.source-link img { width: 18px; height: 18px; object-fit: contain; filter: grayscale(1) brightness(0.4); }
+/* cmd list */
+.cmd-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+}
+.cmd-row {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+}
+.cmd-label {
+    font-family: "Geist Mono", "SFMono-Regular", Consolas, monospace;
+    font-size: clamp(0.6rem, 0.8vw, 0.72rem);
+    opacity: 0.4;
+    letter-spacing: 0.04em;
+    width: 4rem;
+    flex-shrink: 0;
+}
+.cmd-text {
+    font-family: "Geist Mono", "SFMono-Regular", Consolas, monospace;
+    font-size: clamp(0.63rem, 0.85vw, 0.76rem);
+    background: rgba(0,0,0,0.08);
+    padding: 7px 14px;
+    letter-spacing: 0.02em;
+    color: #000;
+    font-weight: 500;
+}
+.copy-btn {
+    font-family: "Geist Mono", "SFMono-Regular", Consolas, monospace;
+    font-size: 0.62rem;
+    background: none;
+    border: 1px solid rgba(0,0,0,0.18);
+    padding: 4px 8px;
+    cursor: pointer;
+    color: #111;
+    opacity: 0.45;
+    letter-spacing: 0.04em;
+    transition: opacity 0.15s;
+}
+.copy-btn:hover { opacity: 1; }
 
-  <style>
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+.req-note {
+    font-family: "Geist Mono", "SFMono-Regular", Consolas, monospace;
+    font-size: clamp(0.58rem, 0.75vw, 0.68rem);
+    opacity: 0.7;
+    color: #000;
+    letter-spacing: 0.02em;
+    line-height: 1.7;
+}
 
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-      font-size: 16px;
-      line-height: 1.7;
-      color: #111;
-      background: #fdfdfd;
-    }
-
-    header {
-      border-bottom: 1px solid #e8e8e8;
-      padding: 16px 0;
-    }
-
-    header .wrap {
-      max-width: 740px;
-      margin: 0 auto;
-      padding: 0 24px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-    }
-
-    header .site-title {
-      font-size: 18px;
-      font-weight: 700;
-      color: #111;
-      text-decoration: none;
-    }
-
-    header nav a {
-      font-size: 14px;
-      color: #555;
-      text-decoration: none;
-      margin-left: 20px;
-    }
-
-    .page {
-      max-width: 740px;
-      margin: 52px auto;
-      padding: 0 24px;
-    }
-
-    .post-title {
-      font-size: 30px;
-      font-weight: 700;
-      line-height: 1.2;
-      letter-spacing: -0.4px;
-      margin-bottom: 6px;
-    }
-
-    .post-meta {
-      font-size: 13px;
-      color: #888;
-      margin-bottom: 32px;
-    }
-
-    .tldr {
-      background: #f4f4f4;
-      border-left: 3px solid #111;
-      padding: 16px 20px;
-      margin-bottom: 40px;
-      border-radius: 0 4px 4px 0;
-    }
-
-    .tldr p.label {
-      font-size: 11px;
-      font-weight: 700;
-      letter-spacing: 1.2px;
-      text-transform: uppercase;
-      color: #888;
-      margin-bottom: 10px;
-    }
-
-    .tldr ul {
-      list-style: none;
-      padding: 0;
-    }
-
-    .tldr ul li {
-      font-size: 15px;
-      color: #222;
-      padding: 3px 0 3px 18px;
-      position: relative;
-    }
-
-    .tldr ul li::before {
-      content: "→";
-      position: absolute;
-      left: 0;
-      color: #888;
-      font-size: 12px;
-      top: 6px;
-    }
-
-    h2 {
-      font-size: 21px;
-      font-weight: 700;
-      margin: 44px 0 14px;
-      letter-spacing: -0.3px;
-    }
-
-    p {
-      margin-bottom: 16px;
-      color: #2b2b2b;
-      font-size: 16px;
-    }
-
-    .diagram {
-      margin: 28px auto;
-      text-align: center;
-    }
-
-    .diagram figcaption {
-      font-size: 12px;
-      color: #999;
-      margin-top: 10px;
-    }
-
-    .stats-row {
-      display: flex;
-      gap: 28px;
-      margin: 28px 0;
-      flex-wrap: wrap;
-    }
-
-    .stat-block {
-      flex: 1;
-      min-width: 130px;
-      border-top: 2px solid #111;
-      padding-top: 10px;
-    }
-
-    .stat {
-      font-size: 26px;
-      font-weight: 700;
-      color: #111;
-      display: block;
-      margin-bottom: 2px;
-    }
-
-    .stat-label {
-      font-size: 13px;
-      color: #777;
-      display: block;
-      line-height: 1.4;
-    }
-
-    strong { font-weight: 600; color: #111; }
-    a { color: #1a6ee6; text-decoration: none; }
-    a:hover { text-decoration: underline; }
-
-    blockquote {
-      border-left: 3px solid #ddd;
-      padding: 4px 0 4px 18px;
-      margin: 24px 0;
-      color: #444;
-      font-style: italic;
-    }
-
-    hr {
-      border: none;
-      border-top: 1px solid #e8e8e8;
-      margin: 40px 0;
-    }
-
-    .sources {
-      margin-top: 40px;
-    }
-
-    .sources p {
-      font-size: 13px;
-      color: #888;
-      margin-bottom: 4px;
-    }
-
-    .sources a { color: #888; }
-
-    footer {
-      border-top: 1px solid #e8e8e8;
-      margin-top: 64px;
-      padding: 24px 0;
-    }
-
-    footer .wrap {
-      max-width: 740px;
-      margin: 0 auto;
-      padding: 0 24px;
-      font-size: 13px;
-      color: #aaa;
-    }
-  </style>
+.value-label {
+    font-size: clamp(0.9rem, 1.15vw, 1.05rem);
+    opacity: 0.55;
+    font-weight: 600;
+}
+/* sample output */
+.sample-output {
+    font-family: "Geist Mono", "SFMono-Regular", Consolas, monospace;
+    font-size: clamp(0.58rem, 0.78vw, 0.7rem);
+    line-height: 1.6;
+    background: rgba(0,0,0,0.04);
+    border: 1px solid rgba(0,0,0,0.08);
+    padding: 0.75rem 1rem;
+    color: #222;
+    white-space: pre;
+    opacity: 0.8;
+    width: 100%;
+}
+/* ── Right ── */
+.right {
+    width: 46%;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    min-height: 0;
+    margin-right: 4rem;
+}
+.demo-label {
+    font-size: 0.6rem;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    opacity: 0.75;
+    font-weight: 700;
+    color: #000;
+}
+.video-block {
+    height: 500px;
+    flex-shrink: 0;
+    background: rgba(0,0,0,0.04);
+    border: 1px solid rgba(0,0,0,0.08);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.video-block span {
+    font-size: 0.62rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    opacity: 0.18;
+}
+.links {
+    display: flex;
+    gap: 1.6rem;
+    justify-content: center;
+    flex-shrink: 0;
+    padding-top: 0.2rem;
+}
+.links a {
+    color: #000;
+    text-decoration: none;
+    font-size: 0.82rem;
+    opacity: 1;
+    font-weight: 600;
+    border-bottom: 1px solid transparent;
+    transition: opacity 0.15s, border-color 0.15s;
+}
+.links a:hover { opacity: 1; border-color: #111; }
+@media (max-width: 700px) {
+    html, body { overflow: auto; height: auto; }
+    .content-wrapper { flex-direction: column; margin-top: 0; padding-top: 1.5rem; }
+    .right { width: 100%; margin-right: 0; }
+    .hero { align-items: flex-start; }
+}
+</style>
 </head>
 <body>
-
-<header>
-  <div class="wrap">
-    <a class="site-title" href="#">profile</a>
-    <nav>
-      <a href="#">Posts</a>
-      <a href="https://github.com/jungledesh/profile">GitHub</a>
-    </nav>
-  </div>
-</header>
-
-<div class="page">
-  <article>
-
-    <h1 class="post-title">The Inference Problem</h1>
-
-    <div class="tldr">
-      <p class="label">TL;DR</p>
-      <ul>
-        <li>Inference is 80 to 90% of your AI system's lifetime cost, not training.</li>
-        <li>Production servers bleed compute across batching gaps, KV cache pressure, prefill overhead, low throughput, and high latency.</li>
-        <li>The problems are fixable. Most teams can't see them.</li>
-      </ul>
+<div class="top-bar">
+    <a class="brand" href="index.html">PROFILE</a>
+    <div class="hero">
+        <p class="tagline">A physics-grounded, cost-aware optimizer for vLLM.</p>
+        <p class="loop">Waste → Cause → Fix</p>
     </div>
-
-    <h2>The Inference Problem</h2>
-
-    <p>You send a prompt. A GPU somewhere processes it and sends back a response, one token at a time. That loop is inference.</p>
-
-    <figure class="diagram">
-      <svg width="320" height="420" viewBox="0 0 320 420" xmlns="http://www.w3.org/2000/svg"
-           style="font-family: 'Segoe UI', sans-serif; background: #fafafa; border: 1px solid #e8e8e8; border-radius: 8px; padding: 8px;">
-
-        <!-- Title -->
-        <text x="160" y="34" text-anchor="middle" font-size="17" font-weight="700" fill="#111">AI Inference Cycle</text>
-
-        <!-- Arrow: title to step 1 -->
-        <line x1="160" y1="42" x2="160" y2="58" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
-
-        <!-- Step 1: Input: Prompt -->
-        <text x="80" y="74" font-size="14" fill="#222">Input: Prompt</text>
-
-        <!-- Arrow -->
-        <line x1="160" y1="80" x2="160" y2="96" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
-
-        <!-- Step 2: Tokenization + Embeddings -->
-        <text x="55" y="112" font-size="14" fill="#222">Tokenization + Embeddings</text>
-
-        <!-- Arrow -->
-        <line x1="160" y1="118" x2="160" y2="134" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
-
-        <!-- Step 3: Memory Load -->
-        <text x="62" y="150" font-size="14" fill="#222">Memory Load: Weights +</text>
-        <text x="62" y="168" font-size="14" fill="#222">KV Cache (Prefill phase)</text>
-
-        <!-- Arrow -->
-        <line x1="160" y1="176" x2="160" y2="208" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
-
-        <!-- Step 4: Forward Pass -->
-        <text x="52" y="224" font-size="14" fill="#222">Forward Pass: Transformer</text>
-        <text x="52" y="242" font-size="14" fill="#222">Layers</text>
-
-        <!-- Arrow -->
-        <line x1="160" y1="250" x2="160" y2="266" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
-
-        <!-- Step 5: LM Head -->
-        <text x="62" y="282" font-size="14" fill="#222">LM Head + Sampling</text>
-        <text x="62" y="300" font-size="14" fill="#222">(pick next token)</text>
-
-        <!-- Arrow -->
-        <line x1="160" y1="308" x2="160" y2="324" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
-
-        <!-- Step 6: Decode & Loop -->
-        <text x="52" y="340" font-size="14" fill="#222">Decode &amp; Loop: Append</text>
-        <text x="52" y="358" font-size="14" fill="#222">token → back to Memory</text>
-
-        <!-- Repeat until EOS -->
-        <text x="160" y="392" text-anchor="middle" font-size="13" fill="#888" font-style="italic">Repeat until EOS</text>
-
-        <!-- Curved back arrow: Decode → Memory Load -->
-        <path d="M 285 348 C 310 348, 310 157, 285 157" stroke="#999" stroke-width="1.4" fill="none" stroke-dasharray="4,3" marker-end="url(#arr2)"/>
-
-        <!-- Curved back arrow: LM Head → Forward Pass -->
-        <path d="M 50 291 C 22 291, 22 233, 50 233" stroke="#999" stroke-width="1.4" fill="none" stroke-dasharray="4,3" marker-end="url(#arr2)"/>
-
-        <defs>
-          <marker id="arr" markerWidth="8" markerHeight="8" refX="4" refY="3" orient="auto">
-            <path d="M0,0 L0,6 L7,3 z" fill="#555"/>
-          </marker>
-          <marker id="arr2" markerWidth="8" markerHeight="8" refX="4" refY="3" orient="auto">
-            <path d="M0,0 L0,6 L7,3 z" fill="#999"/>
-          </marker>
-        </defs>
-      </svg>
-      <figcaption>The AI inference cycle. <a href="https://www.linkedin.com/posts/jungledesh_models-have-been-trained-huge-investments-activity-7437963429077819392-6rxt">Full post.</a></figcaption>
-    </figure>
-
-    <p>It is also where most of the money goes.</p>
-
-    <div class="stats-row">
-      <div class="stat-block">
-        <span class="stat">80–90%</span>
-        <span class="stat-label">of a production AI system's lifetime cost is inference, not training <a href="https://arxiv.org/html/2510.26136v1">[1]</a></span>
-      </div>
-      <div class="stat-block">
-        <span class="stat">15x</span>
-        <span class="stat-label">GPT-4 inference cost vs training cost. $2.3B in inference by end of 2024 vs ~$150M to train. <a href="https://primitiva.substack.com/p/all-you-need-to-know-about-inference">[Barclays via Primitiva]</a></span>
-      </div>
-    </div>
-
-    <p>Training gets the headlines. Inference pays the bills.</p>
-
-    <p>An H100 rents for roughly $3/hr. When your GPU is underutilized, you get fewer tokens than the hardware can deliver. Same bill, lower output. <strong>That is over $1,000/month in cloud compute per GPU, wasted.</strong></p>
-
-    <p>Most teams are bad at it. The waste is in:</p>
-
-    <p><strong>Throughput.</strong> A misconfigured vLLM server runs well below its hardware ceiling. When batching, memory, and scheduling are off, GPU utilization collapses. The hardware is not the problem. The configuration is.</p>
-
-    <p><strong>Latency.</strong> Real-time applications need time-to-first-token under 100ms. Most production setups don't get there without deliberate tuning.</p>
-
-    <p><strong>KV cache pressure.</strong> Every token generated needs to remember everything before it. When that memory fills up, the system evicts. Throughput drops. Latency spikes. At 90% usage, you're already in trouble.</p>
-
-    <p><strong>Batching.</strong> When batch size is 2 out of a possible 16, you're using 12% of the machine. The rest idles. You pay full price.</p>
-
-    <p><strong>Prefill overhead.</strong> Before the first output token, the model processes your entire prompt. In workloads with 500+ token prompts, prefill alone dominates response time.</p>
-
-    <p><strong>Observability.</strong> Most teams look at raw Prometheus metrics and guess. There is no standard path from "throughput is low" to "here is exactly why, here is the fix."</p>
-
-    <p>These are not edge cases. This is the normal state of a production inference server that has not been tuned.</p>
-
-    <hr>
-
-    <h2>Why This Matters Now</h2>
-
-    <p>The standard story about early tech: Amazon lost money for years. Uber still does. Growth first, economics later.</p>
-
-    <p>AI inference does not fit that story.</p>
-
-    <p>Amazon chose to lose money, a deliberate bet on demand. <strong>Companies running AI inference are burning money on hardware they already paid for, because it is sitting misconfigured.</strong> That is not a growth strategy. It is waste that shows up on your cloud compute bill this month.</p>
-
-    <p>Enterprises running production AI spend $50,000 to $500,000 per month on inference infrastructure. <a href="https://www.tensormesh.ai/blog-posts/ai-inference-costs-2025-energy-crisis">[2]</a> Inference costs have dropped 280x since 2022, from $20 to $0.07 per million tokens. That gap between what hardware can do and what most teams extract from it is your cost problem today.</p>
-
-    <p>Larry Ellison, Oracle earnings call:</p>
-
-    <blockquote>
-      "The AI inferencing market will be much, much larger than the AI training market. People are running out of usable inference computing capacity." <a href="https://www.benzinga.com/markets/earnings/25/09/47587481/larry-ellison-targets-multi-trillion-dollar-ai-inference-market-for-oracle-ai-will-change-everything">[3]</a>
-    </blockquote>
-
-    <p>The shortage is not GPUs. It is efficient use of the GPUs already running in production, including yours.</p>
-
-    <hr>
-
-    <p style="font-size: 15px; color: #111; font-weight: 500; margin-bottom: 32px;">We ran workloads. H100, RTX 4090. Qwen 2.5 under production load. Not theory. Measurement. The findings arrive in the next section. They will change what you check first.</p>
-
-    <p style="font-size:13px; color:#999; margin-bottom: 32px;"><em>Engineering work underway. Results published as they arrive.</em></p>
-
-    <div class="sources">
-      <p><strong>Sources</strong></p>
-      <p>1. <a href="https://arxiv.org/html/2510.26136v1">Beyond Benchmarks: The Economics of AI Inference, arXiv</a></p>
-      <p>2. <a href="https://www.tensormesh.ai/blog-posts/ai-inference-costs-2025-energy-crisis">AI Inference Costs in 2025, TensorMesh</a></p>
-      <p>3. <a href="https://www.benzinga.com/markets/earnings/25/09/47587481/larry-ellison-targets-multi-trillion-dollar-ai-inference-market-for-oracle-ai-will-change-everything">Larry Ellison Targets Multi-Trillion-Dollar AI Inference Market, Benzinga</a></p>
-    </div>
-
-  </article>
+    <a class="github-link" href="https://github.com/jungledesh/profile" target="_blank" rel="noopener">
+        <svg height="18" width="18" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+        GitHub
+    </a>
 </div>
-
-<footer>
-  <div class="wrap">
-    <p style="font-size: 12px; color: #aaa; margin-bottom: 8px;">Updated: Apr 19, 2026.</p>
-    <p>profile, vLLM inference diagnoser</p>
-  </div>
-</footer>
-
+<div class="body-row">
+    <div class="content-wrapper">
+        <div class="left">
+            <div class="pitch-group">
+                <p class="pitch">Making AI serving profitable starts with knowing where you're losing. Profile measures your hardware ceiling against live telemetry, finds the exact gap, and gives you the fix, one change at a time.<a class="cite" href="https://www.sequoiacap.com/article/ais-600b-question/" target="_blank" rel="noopener"><sup>1</sup></a><a class="cite" href="https://fortune.com/2026/05/22/microsoft-ai-cost-problem-tokens-agents/" target="_blank" rel="noopener"><sup>2</sup></a><a class="cite" href="https://arxiv.org/abs/2510.26136" target="_blank" rel="noopener"><sup>3</sup></a></p>
+                <div class="sources">
+                    <a class="source-link" href="https://www.sequoiacap.com/article/ais-600b-question/" target="_blank" rel="noopener">
+                        <img src="https://www.google.com/s2/favicons?domain=sequoiacap.com&sz=32" alt=""><span>¹ Sequoia Capital</span>
+                    </a>
+                    <a class="source-link" href="https://fortune.com/2026/05/22/microsoft-ai-cost-problem-tokens-agents/" target="_blank" rel="noopener">
+                        <img src="https://www.google.com/s2/favicons?domain=fortune.com&sz=32" alt=""><span>² Fortune</span>
+                    </a>
+                    <a class="source-link" href="https://arxiv.org/abs/2510.26136" target="_blank" rel="noopener">
+                        <img src="https://www.google.com/s2/favicons?domain=arxiv.org&sz=32" alt=""><span>³ arXiv</span>
+                    </a>
+                </div>
+            </div>
+            <div style="height: 1rem"></div>
+            <p class="value-label">Value in a minute</p>
+            <div class="cmd-list">
+                <div class="cmd-row">
+                    <span class="cmd-label">download</span>
+                    <span class="cmd-text" id="cmd-download">curl -L https://github.com/jungledesh/profile/releases/latest/download/profile -o profile</span>
+                    <button class="copy-btn" onclick="copyCmd('cmd-download',this)">copy</button>
+                </div>
+                <div class="cmd-row">
+                    <span class="cmd-label">install</span>
+                    <span class="cmd-text" id="cmd-install">chmod +x profile && mv profile /usr/local/bin/</span>
+                    <button class="copy-btn" onclick="copyCmd('cmd-install',this)">copy</button>
+                </div>
+                <div class="cmd-row">
+                    <span class="cmd-label">run</span>
+                    <span class="cmd-text" id="cmd-run">profile diagnose --url http://localhost:8000/metrics</span>
+                    <button class="copy-btn" onclick="copyCmd('cmd-run',this)">copy</button>
+                </div>
+            </div>
+            <div style="height: 0.75rem"></div>
+            <div class="req-note">
+                Requirements:<br>
+                — vLLM instance exporting standard Prometheus metrics<br>
+                — NVIDIA Linux runtime with native NVML (<code>libnvidia-ml.so</code>) access
+            </div>
+        </div>
+        <div class="right">
+            <p class="demo-label">Less Words. Less Noise. More Signal. More Value.</p>
+            <div class="video-block">
+                <span>Demo video coming soon</span>
+            </div>
+            <nav class="links">
+                <a href="docs.html" target="_blank" rel="noopener">Docs</a>
+                <a href="docs.html#blog" target="_blank" rel="noopener">Blog</a>
+            </nav>
+        </div>
+    </div>
+</div>
+<script>
+function copyCmd(id, btn) {
+    navigator.clipboard.writeText(document.getElementById(id).textContent).then(() => {
+        btn.textContent = 'copied';
+        setTimeout(() => btn.textContent = 'copy', 1500);
+    });
+}
+</script>
 </body>
 </html>

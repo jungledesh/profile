@@ -1,6 +1,9 @@
 # Profile
 
-A physics-grounded, cost-aware optimizer for vLLM inference nodes.
+Less Words. Less Noise. More Signal. More Value.
+
+
+A physics-grounded, cost-aware optimizer for vLLM.
 
 Profile measures live telemetry against the absolute physical limits of your hardware to expose waste, surface immediate configuration fixes, and reclaim infrastructure spend.
 
@@ -14,21 +17,31 @@ Profile measures live telemetry against the absolute physical limits of your har
 
 ---
 
-## 1-Minute Value
+## Value in a Minute
 
-### 1. Download and Run
-
-Download the latest binary from [releases](https://github.com/jungledesh/profile/releases), then:
+### 1. Download
 
 ```bash
-chmod +x profile
-./profile diagnose --url http://localhost:8000/metrics --duration 2m -m 256
+curl -L https://github.com/jungledesh/profile/releases/latest/download/profile -o profile
 ```
 
-Or build from source — no `chmod` needed:
+### 2. Install
+
+```bash
+chmod +x profile && mv profile /usr/local/bin/
+```
+
+### 3. Run
+
+```bash
+profile diagnose --url http://localhost:8000/metrics
+```
+
+Or build from source & run:
 
 ```bash
 cargo install --git https://github.com/jungledesh/profile
+profile diagnose --url http://localhost:8000/metrics
 ```
 
 ### 2. Live Interactive Optimization
