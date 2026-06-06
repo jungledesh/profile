@@ -1934,6 +1934,7 @@ mod tests {
             ridge_batch_size: 1.0,
             cost: Some(CostEstimate {
                 tok_per_watt: None,
+                joules_per_token: None,
                 cost_per_million_tokens: Some(cpm),
                 cost_source: source,
             }),

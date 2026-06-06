@@ -182,9 +182,16 @@ fn print_delta(d: &delta::Delta) {
         Some(v) if v < 0.0 => println!("  Efficiency  {v:.1}pp ↓"),
         _ => {}
     }
-    let has_cost = d.cost_per_million_before.is_some() && d.cost_per_million_after.is_some();
+    let has_cost = economics_section_active(d);
     if has_cost {
         println!("ECONOMICS:");
+    }
+    match (d.joules_per_token_before, d.joules_per_token_after) {
+        (Some(before), Some(after)) if before.is_finite() && after.is_finite() => {
+            let arrow = jtok_change_arrow(before, after);
+            println!("  J/tok         {before:.2} → {after:.2} {arrow}");
+        }
+        _ => {}
     }
     match (d.cost_per_million_before, d.cost_per_million_after) {
         (Some(before), Some(after)) if before.is_finite() && after.is_finite() => {
@@ -218,6 +225,23 @@ fn print_delta(d: &delta::Delta) {
 
 const COST_ARROW_THRESHOLD_USD: f64 = 0.01;
 const RECOVERABLE_ARROW_THRESHOLD_USD_PER_HR: f64 = 0.05;
+const JTOK_ARROW_THRESHOLD: f64 = 0.02;
+
+fn economics_section_active(d: &delta::Delta) -> bool {
+    (d.cost_per_million_before.is_some() && d.cost_per_million_after.is_some())
+        || (d.joules_per_token_before.is_some() && d.joules_per_token_after.is_some())
+}
+
+fn jtok_change_arrow(before: f64, after: f64) -> &'static str {
+    let diff = after - before;
+    if diff < -JTOK_ARROW_THRESHOLD {
+        "↓"
+    } else if diff > JTOK_ARROW_THRESHOLD {
+        "↑"
+    } else {
+        ""
+    }
+}
 
 fn cost_change_arrow(before: f64, after: f64) -> &'static str {
     let diff = after - before;
@@ -347,5 +371,39 @@ mod tests {
     #[test]
     fn recoverable_arrow_down_when_waste_reduced_above_threshold() {
         assert_eq!(recoverable_waste_arrow(10.0, 9.94), "↓");
+    }
+
+    #[test]
+    fn jtok_arrow_down_when_energy_improves() {
+        assert_eq!(jtok_change_arrow(0.31, 0.28), "↓");
+    }
+
+    #[test]
+    fn jtok_arrow_suppressed_below_threshold() {
+        assert_eq!(jtok_change_arrow(0.31, 0.30), "");
+    }
+
+    #[test]
+    fn economics_header_shown_when_only_jtok_available() {
+        let d = delta::Delta {
+            throughput_delta_pct: None,
+            throughput_before: None,
+            throughput_after: None,
+            efficiency_delta_pp: None,
+            efficiency_pct_before: None,
+            efficiency_pct_after: None,
+            cost_per_million_before: None,
+            cost_per_million_after: None,
+            joules_per_token_before: Some(0.31),
+            joules_per_token_after: Some(0.28),
+            cost_source_after: None,
+            ttft_before_ms: None,
+            ttft_after_ms: None,
+            tpot_before_ms: None,
+            tpot_after_ms: None,
+            direction: delta::Direction::Plateau,
+            config_drifted: false,
+        };
+        assert!(economics_section_active(&d));
     }
 }

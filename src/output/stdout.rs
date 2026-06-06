@@ -82,7 +82,12 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
         "{:<width$}{}{}",
         "GPU =>",
         VLLM_LABEL_METRICS_GAP,
-        gpu_gauges_line(g, report.baseline.as_ref(), v.generation_tokens_per_sec,),
+        gpu_gauges_line(
+            g,
+            report.baseline.as_ref(),
+            v.generation_tokens_per_sec,
+            verbose_rules,
+        ),
         width = VLLM_LABEL_W
     ));
     if verbose_rules {
@@ -262,6 +267,7 @@ fn gpu_gauges_line(
     g: &GpuRawMetrics,
     baseline: Option<&crate::engine::PhysicsBaseline>,
     actual_tps: Option<f64>,
+    verbose: bool,
 ) -> String {
     let efficiency = format_efficiency_label(
         baseline.and_then(|b| b.efficiency_pct),
@@ -276,16 +282,15 @@ fn gpu_gauges_line(
 
     let mut segments = vec![efficiency, power];
 
-    if let (Some(tps), Some(watts)) = (
-        actual_tps.filter(|v| v.is_finite() && *v > 0.0),
-        g.power_watts.filter(|v| v.is_finite() && *v > 0.0),
-    ) {
-        if watts > 0.0 {
-            segments.push(format!("{:.1} tok/W", tps / watts));
-        }
-    }
-
     if let Some(cost) = baseline.and_then(|b| b.cost.as_ref()) {
+        if let Some(jtok) = cost.joules_per_token.filter(|v| v.is_finite() && *v > 0.0) {
+            segments.push(format!("{:.2} J/tok", jtok));
+        }
+        if verbose {
+            if let Some(tpw) = cost.tok_per_watt.filter(|v| v.is_finite() && *v > 0.0) {
+                segments.push(format!("{:.1} tok/W", tpw));
+            }
+        }
         if let Some(cpm) = cost
             .cost_per_million_tokens
             .filter(|v| v.is_finite() && *v > 0.0)
@@ -858,6 +863,7 @@ mod tests {
         source: engine::CostSource,
         cpm: f64,
         tok_per_watt: Option<f64>,
+        joules_per_token: Option<f64>,
     ) -> crate::engine::PhysicsBaseline {
         use crate::engine::baseline::{
             CeilingEstimate, CostEstimate, PhysicsBaseline, WeightDtypeSource,
@@ -879,6 +885,7 @@ mod tests {
             ridge_batch_size: 1.0,
             cost: Some(CostEstimate {
                 tok_per_watt,
+                joules_per_token,
                 cost_per_million_tokens: Some(cpm),
                 cost_source: source,
             }),
@@ -886,17 +893,42 @@ mod tests {
     }
 
     #[test]
-    fn gpu_gauges_line_includes_tok_per_watt_and_catalog_cost_est() {
+    fn gpu_gauges_line_includes_jtok_and_catalog_cost_est() {
         let g = GpuRawMetrics {
             power_watts: Some(421.0),
             ..Default::default()
         };
-        let b = baseline_with_cost(31.7, engine::CostSource::Catalog, 1.84, Some(14.2));
-        let s = gpu_gauges_line(&g, Some(&b), Some(5978.2));
+        let b = baseline_with_cost(
+            31.7,
+            engine::CostSource::Catalog,
+            1.84,
+            Some(14.2),
+            Some(0.31),
+        );
+        let s = gpu_gauges_line(&g, Some(&b), Some(5978.2), false);
         assert!(s.contains("EFFICIENCY 31.7%"));
         assert!(s.contains("POWER 421W"));
-        assert!(s.contains("14.2 tok/W"));
+        assert!(s.contains("0.31 J/tok"));
+        assert!(!s.contains("tok/W"));
         assert!(s.contains("$1.84/1M tok (est)"));
+    }
+
+    #[test]
+    fn gpu_gauges_line_verbose_shows_both_jtok_and_tok_per_watt() {
+        let g = GpuRawMetrics {
+            power_watts: Some(421.0),
+            ..Default::default()
+        };
+        let b = baseline_with_cost(
+            31.7,
+            engine::CostSource::Catalog,
+            1.84,
+            Some(14.2),
+            Some(0.31),
+        );
+        let s = gpu_gauges_line(&g, Some(&b), Some(5978.2), true);
+        assert!(s.contains("0.31 J/tok"));
+        assert!(s.contains("14.2 tok/W"));
     }
 
     #[test]
@@ -905,8 +937,8 @@ mod tests {
             power_watts: Some(100.0),
             ..Default::default()
         };
-        let b = baseline_with_cost(50.0, engine::CostSource::UserProvided, 2.50, None);
-        let s = gpu_gauges_line(&g, Some(&b), None);
+        let b = baseline_with_cost(50.0, engine::CostSource::UserProvided, 2.50, None, None);
+        let s = gpu_gauges_line(&g, Some(&b), None, false);
         assert!(s.contains("$2.50/1M tok"));
         assert!(!s.contains("(est)"));
         assert!(!s.contains("tok/W"));
@@ -922,7 +954,7 @@ mod tests {
             vram_total_mb: Some(80 * 1024),
             ..Default::default()
         };
-        let s = gpu_gauges_line(&g, Some(&baseline_efficiency(28.0)), None);
+        let s = gpu_gauges_line(&g, Some(&baseline_efficiency(28.0)), None, false);
         assert!(s.contains("EFFICIENCY 28.0%"));
         assert!(s.contains("POWER 310W"));
         assert!(s.contains("vRAM 72/80GB"));
@@ -934,7 +966,7 @@ mod tests {
             vram_total_mb: Some(80 * 1024),
             ..Default::default()
         };
-        let s_peak = gpu_gauges_line(&g_peak, None, None);
+        let s_peak = gpu_gauges_line(&g_peak, None, None, false);
         assert!(s_peak.contains("vRAM 60/80GB (peak 78GB)"));
         let g_peak_below_frac = GpuRawMetrics {
             gpu_util_pct: Some(28.0),
@@ -944,7 +976,7 @@ mod tests {
             vram_total_mb: Some(80 * 1024),
             ..Default::default()
         };
-        assert!(!gpu_gauges_line(&g_peak_below_frac, None, None).contains("peak"));
+        assert!(!gpu_gauges_line(&g_peak_below_frac, None, None, false).contains("peak"));
         let g_no_recovery = GpuRawMetrics {
             gpu_util_pct: Some(28.0),
             power_watts: Some(310.0),
@@ -953,7 +985,7 @@ mod tests {
             vram_total_mb: Some(80 * 1024),
             ..Default::default()
         };
-        assert!(!gpu_gauges_line(&g_no_recovery, None, None).contains("peak"));
+        assert!(!gpu_gauges_line(&g_no_recovery, None, None, false).contains("peak"));
     }
 
     #[test]
@@ -961,7 +993,7 @@ mod tests {
         let g = GpuRawMetrics::default();
         let mut b = baseline_efficiency(50.0);
         b.efficiency_pct = None;
-        let s = gpu_gauges_line(&g, Some(&b), Some(200.0));
+        let s = gpu_gauges_line(&g, Some(&b), Some(200.0), false);
         assert!(s.contains("EFFICIENCY ?"));
     }
 
