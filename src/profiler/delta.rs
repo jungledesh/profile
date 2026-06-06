@@ -29,6 +29,10 @@ pub struct Delta {
     pub ttft_after_ms: Option<f64>,
     pub tpot_before_ms: Option<f64>,
     pub tpot_after_ms: Option<f64>,
+    pub ttft_p99_before_ms: Option<f64>,
+    pub ttft_p99_after_ms: Option<f64>,
+    pub tpot_p99_before_ms: Option<f64>,
+    pub tpot_p99_after_ms: Option<f64>,
     pub direction: Direction,
     pub config_drifted: bool,
 }
@@ -50,6 +54,11 @@ pub fn compute(
 
     let tpot_before_ms = prev_result.snapshot.vllm.tpot_ms;
     let tpot_after_ms = curr_result.snapshot.vllm.tpot_ms;
+
+    let ttft_p99_before_ms = prev_result.snapshot.vllm.ttft_p99_ms;
+    let ttft_p99_after_ms = curr_result.snapshot.vllm.ttft_p99_ms;
+    let tpot_p99_before_ms = prev_result.snapshot.vllm.tpot_p99_ms;
+    let tpot_p99_after_ms = curr_result.snapshot.vllm.tpot_p99_ms;
 
     let throughput_delta_pct = match (throughput_before, throughput_after) {
         (Some(p), Some(c)) if p > 0.0 && p.is_finite() && c.is_finite() => {
@@ -116,6 +125,10 @@ pub fn compute(
         ttft_after_ms,
         tpot_before_ms,
         tpot_after_ms,
+        ttft_p99_before_ms,
+        ttft_p99_after_ms,
+        tpot_p99_before_ms,
+        tpot_p99_after_ms,
         direction,
         config_drifted,
     }
@@ -327,5 +340,26 @@ mod tests {
         );
         assert_eq!(d.joules_per_token_before, Some(0.31));
         assert_eq!(d.joules_per_token_after, Some(0.28));
+    }
+
+    #[test]
+    fn populates_p99_before_after() {
+        let mut prev = diagnose(Some(100.0));
+        prev.snapshot.vllm.ttft_p99_ms = Some(500.0);
+        prev.snapshot.vllm.tpot_p99_ms = Some(80.0);
+        let mut curr = diagnose(Some(110.0));
+        curr.snapshot.vllm.ttft_p99_ms = Some(450.0);
+        curr.snapshot.vllm.tpot_p99_ms = Some(75.0);
+        let d = compute(
+            &prev,
+            &report_eff(Some(40.0), None, None),
+            &curr,
+            &report_eff(Some(45.0), None, None),
+            false,
+        );
+        assert_eq!(d.ttft_p99_before_ms, Some(500.0));
+        assert_eq!(d.ttft_p99_after_ms, Some(450.0));
+        assert_eq!(d.tpot_p99_before_ms, Some(80.0));
+        assert_eq!(d.tpot_p99_after_ms, Some(75.0));
     }
 }

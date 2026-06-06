@@ -556,7 +556,7 @@ pub fn build_report_for_windows(
             recs.push(Recommendation {
                 rule_name: "concurrency_saturation",
                 impact: 4,
-                confidence: match (agg.ttft_ms, agg.kv_cache_usage_perc) {
+                confidence: match (agg.ttft_ms.or(agg.ttft_p99_ms), agg.kv_cache_usage_perc) {
                     (Some(_), Some(_)) => 0.9,
                     _ => 0.6,
                 },

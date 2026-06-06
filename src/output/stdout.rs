@@ -385,8 +385,16 @@ fn vllm_latency_value(v: &VllmRawMetrics, verbose: bool) -> String {
         .tpot_ms
         .map(fmt_seconds_from_ms)
         .unwrap_or_else(|| "—".to_string());
+    let ttft_p99 = v
+        .ttft_p99_ms
+        .map(|p| format!(" (p99 {})", fmt_seconds_from_ms(p)))
+        .unwrap_or_default();
+    let tpot_p99 = v
+        .tpot_p99_ms
+        .map(|p| format!(" (p99 {})", fmt_seconds_from_ms(p)))
+        .unwrap_or_default();
     if !verbose {
-        return format!("ttft {ttft} | tpot {tpot}");
+        return format!("ttft {ttft}{ttft_p99} | tpot {tpot}{tpot_p99}");
     }
     let prefill = v
         .prefill_latency_ms
@@ -396,7 +404,7 @@ fn vllm_latency_value(v: &VllmRawMetrics, verbose: bool) -> String {
         .queue_delay_ms
         .map(fmt_seconds_from_ms)
         .unwrap_or_else(|| "—".to_string());
-    format!("ttft {ttft} | tpot {tpot} | prefill {prefill} | queue {queue}")
+    format!("ttft {ttft}{ttft_p99} | tpot {tpot}{tpot_p99} | prefill {prefill} | queue {queue}")
 }
 
 fn vllm_prompt_kv_fragment(v: &VllmRawMetrics) -> String {
@@ -1144,6 +1152,21 @@ mod tests {
         assert_eq!(
             vllm_latency_value(&v, true),
             "ttft 120ms | tpot 50ms | prefill 200ms | queue 10ms"
+        );
+    }
+
+    #[test]
+    fn vllm_latency_value_shows_p99_when_available() {
+        let v = VllmRawMetrics {
+            ttft_ms: Some(120.0),
+            tpot_ms: Some(50.0),
+            ttft_p99_ms: Some(892.0),
+            tpot_p99_ms: Some(180.0),
+            ..Default::default()
+        };
+        assert_eq!(
+            vllm_latency_value(&v, false),
+            "ttft 120ms (p99 892ms) | tpot 50ms (p99 180ms)"
         );
     }
 
