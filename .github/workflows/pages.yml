@@ -30,8 +30,8 @@ jobs:
 
       - name: Prepare site
         run: |
+          cp -r docs/. site/
           mkdir -p site/assets
-          cp docs/index.html site/
           if [ -d assets ]; then
             cp -r assets/. site/assets/
           fi
