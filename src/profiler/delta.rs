@@ -22,6 +22,8 @@ pub struct Delta {
     pub efficiency_pct_after: Option<f64>,
     pub cost_per_million_before: Option<f64>,
     pub cost_per_million_after: Option<f64>,
+    pub joules_per_token_before: Option<f64>,
+    pub joules_per_token_after: Option<f64>,
     pub cost_source_after: Option<crate::engine::CostSource>,
     pub ttft_before_ms: Option<f64>,
     pub ttft_after_ms: Option<f64>,
@@ -80,6 +82,17 @@ pub fn compute(
         .and_then(|b| b.cost.as_ref())
         .map(|c| c.cost_source);
 
+    let joules_per_token_before = prev_report
+        .baseline
+        .as_ref()
+        .and_then(|b| b.cost.as_ref())
+        .and_then(|c| c.joules_per_token);
+    let joules_per_token_after = curr_report
+        .baseline
+        .as_ref()
+        .and_then(|b| b.cost.as_ref())
+        .and_then(|c| c.joules_per_token);
+
     let direction = match throughput_delta_pct {
         Some(d) if d > PLATEAU_THRESHOLD_PCT => Direction::Better,
         Some(d) if d < -PLATEAU_THRESHOLD_PCT => Direction::Worse,
@@ -96,6 +109,8 @@ pub fn compute(
         efficiency_pct_after,
         cost_per_million_before,
         cost_per_million_after,
+        joules_per_token_before,
+        joules_per_token_after,
         cost_source_after,
         ttft_before_ms,
         ttft_after_ms,
@@ -143,12 +158,21 @@ mod tests {
         }
     }
 
-    fn report_eff(eff: Option<f64>, cost_cpm: Option<f64>) -> Report {
-        let cost = cost_cpm.map(|cost_per_million_tokens| CostEstimate {
-            tok_per_watt: None,
-            cost_per_million_tokens: Some(cost_per_million_tokens),
-            cost_source: CostSource::Catalog,
-        });
+    fn report_eff(
+        eff: Option<f64>,
+        cost_cpm: Option<f64>,
+        joules_per_token: Option<f64>,
+    ) -> Report {
+        let cost = if cost_cpm.is_some() || joules_per_token.is_some() {
+            Some(CostEstimate {
+                tok_per_watt: None,
+                joules_per_token,
+                cost_per_million_tokens: cost_cpm,
+                cost_source: CostSource::Catalog,
+            })
+        } else {
+            None
+        };
         Report {
             baseline: Some(PhysicsBaseline {
                 decode: CeilingEstimate {
@@ -176,9 +200,9 @@ mod tests {
     fn direction_better_above_threshold() {
         let d = compute(
             &diagnose(Some(100.0)),
-            &report_eff(Some(50.0), None),
+            &report_eff(Some(50.0), None, None),
             &diagnose(Some(112.0)),
-            &report_eff(Some(55.0), None),
+            &report_eff(Some(55.0), None, None),
             false,
         );
         assert_eq!(d.direction, Direction::Better);
@@ -191,9 +215,9 @@ mod tests {
     fn direction_worse_below_neg_threshold() {
         let d = compute(
             &diagnose(Some(100.0)),
-            &report_eff(Some(50.0), None),
+            &report_eff(Some(50.0), None, None),
             &diagnose(Some(80.0)),
-            &report_eff(Some(45.0), None),
+            &report_eff(Some(45.0), None, None),
             false,
         );
         assert_eq!(d.direction, Direction::Worse);
@@ -204,9 +228,9 @@ mod tests {
     fn direction_plateau_within_band() {
         let d = compute(
             &diagnose(Some(100.0)),
-            &report_eff(Some(50.0), None),
+            &report_eff(Some(50.0), None, None),
             &diagnose(Some(101.0)),
-            &report_eff(Some(50.5), None),
+            &report_eff(Some(50.5), None, None),
             false,
         );
         assert_eq!(d.direction, Direction::Plateau);
@@ -216,9 +240,9 @@ mod tests {
     fn direction_plateau_at_nine_pct_drop() {
         let d = compute(
             &diagnose(Some(100.0)),
-            &report_eff(Some(50.0), None),
+            &report_eff(Some(50.0), None, None),
             &diagnose(Some(91.0)),
-            &report_eff(Some(45.0), None),
+            &report_eff(Some(45.0), None, None),
             false,
         );
         assert_eq!(d.direction, Direction::Plateau);
@@ -229,9 +253,9 @@ mod tests {
     fn direction_worse_at_eleven_pct_drop() {
         let d = compute(
             &diagnose(Some(100.0)),
-            &report_eff(Some(50.0), None),
+            &report_eff(Some(50.0), None, None),
             &diagnose(Some(89.0)),
-            &report_eff(Some(45.0), None),
+            &report_eff(Some(45.0), None, None),
             false,
         );
         assert_eq!(d.direction, Direction::Worse);
@@ -242,9 +266,9 @@ mod tests {
     fn throughput_delta_none_when_prev_zero() {
         let d = compute(
             &diagnose(Some(0.0)),
-            &report_eff(None, None),
+            &report_eff(None, None, None),
             &diagnose(Some(50.0)),
-            &report_eff(Some(10.0), None),
+            &report_eff(Some(10.0), None, None),
             false,
         );
         assert!(d.throughput_delta_pct.is_none());
@@ -255,9 +279,9 @@ mod tests {
     fn throughput_delta_none_when_missing_gauge() {
         let d = compute(
             &diagnose(None),
-            &report_eff(None, None),
+            &report_eff(None, None, None),
             &diagnose(Some(50.0)),
-            &report_eff(None, None),
+            &report_eff(None, None, None),
             false,
         );
         assert!(d.throughput_delta_pct.is_none());
@@ -267,9 +291,9 @@ mod tests {
     fn config_drifted_passthrough() {
         let d = compute(
             &diagnose(Some(100.0)),
-            &report_eff(Some(50.0), None),
+            &report_eff(Some(50.0), None, None),
             &diagnose(Some(100.0)),
-            &report_eff(Some(50.0), None),
+            &report_eff(Some(50.0), None, None),
             true,
         );
         assert!(d.config_drifted);
@@ -279,9 +303,9 @@ mod tests {
     fn populates_cost_and_efficiency_before_after() {
         let d = compute(
             &diagnose(Some(100.0)),
-            &report_eff(Some(40.0), Some(2.50)),
+            &report_eff(Some(40.0), Some(2.50), Some(0.31)),
             &diagnose(Some(120.0)),
-            &report_eff(Some(55.0), Some(2.00)),
+            &report_eff(Some(55.0), Some(2.00), Some(0.28)),
             false,
         );
         assert_eq!(d.efficiency_pct_before, Some(40.0));
@@ -290,5 +314,18 @@ mod tests {
         assert_eq!(d.cost_per_million_after, Some(2.00));
         assert_eq!(d.cost_source_after, Some(CostSource::Catalog));
         assert!((d.efficiency_delta_pp.unwrap() - 15.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn populates_joules_per_token_before_after() {
+        let d = compute(
+            &diagnose(Some(100.0)),
+            &report_eff(Some(40.0), None, Some(0.31)),
+            &diagnose(Some(110.0)),
+            &report_eff(Some(45.0), None, Some(0.28)),
+            false,
+        );
+        assert_eq!(d.joules_per_token_before, Some(0.31));
+        assert_eq!(d.joules_per_token_after, Some(0.28));
     }
 }

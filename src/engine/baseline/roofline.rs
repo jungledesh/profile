@@ -6,6 +6,8 @@ use super::math;
 pub struct CostEstimate {
     /// Tokens generated per watt of power draw. None if power_watts unavailable.
     pub tok_per_watt: Option<f64>,
+    /// Energy per generated token (J/tok). None if power or throughput unavailable.
+    pub joules_per_token: Option<f64>,
     /// Estimated cost per 1M tokens (USD). None if no price source available.
     pub cost_per_million_tokens: Option<f64>,
     /// Source of the cost estimate.
@@ -129,6 +131,11 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
         _ => None,
     };
 
+    let joules_per_token = match (power_watts, tps) {
+        (Some(p), Some(t)) if p > 0.0 && t > 0.0 => Some(p / t),
+        _ => None,
+    };
+
     let (cost_per_hr, cost_source) = if let Some(hr) = ctx
         .config
         .cost_per_hour
@@ -151,9 +158,13 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
         _ => None,
     };
 
-    let cost = if tok_per_watt.is_some() || cost_per_million_tokens.is_some() {
+    let cost = if tok_per_watt.is_some()
+        || joules_per_token.is_some()
+        || cost_per_million_tokens.is_some()
+    {
         Some(CostEstimate {
             tok_per_watt,
+            joules_per_token,
             cost_per_million_tokens,
             cost_source,
         })
@@ -691,6 +702,96 @@ mod tests {
         let cost = b.cost.expect("cost block");
         let tpw = cost.tok_per_watt.expect("tok/W");
         assert!((tpw - 2.0).abs() < 1e-9);
+        assert_eq!(cost.joules_per_token, Some(0.5));
+    }
+
+    #[test]
+    fn joules_per_token_none_when_power_missing() {
+        let cfg = VllmConfig {
+            kv_cache_dtype: Some("bf16".to_string()),
+            max_model_len: Some(2048),
+            ..Default::default()
+        };
+        let snap = VllmRawMetrics {
+            generation_tokens_per_sec: Some(100.0),
+            num_requests_running: Some(1.0),
+            ..Default::default()
+        };
+        let (mut ctx, mut win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(67.0),
+            Some(3350.0),
+            cfg,
+            snap,
+        );
+        ctx.gpu.name = Some("NVIDIA H100 80GB HBM3".to_string());
+        win.snapshot.gpu.power_watts = None;
+        let cost = compute(&AnalysisInput::new(&ctx, &win))
+            .expect("baseline")
+            .cost
+            .expect("cost");
+        assert!(cost.joules_per_token.is_none());
+    }
+
+    #[test]
+    fn joules_per_token_none_when_tps_zero() {
+        let cfg = VllmConfig {
+            kv_cache_dtype: Some("bf16".to_string()),
+            max_model_len: Some(2048),
+            ..Default::default()
+        };
+        let snap = VllmRawMetrics {
+            generation_tokens_per_sec: Some(0.0),
+            num_requests_running: Some(1.0),
+            ..Default::default()
+        };
+        let (mut ctx, mut win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(67.0),
+            Some(3350.0),
+            cfg,
+            snap,
+        );
+        ctx.gpu.name = Some("NVIDIA H100 80GB HBM3".to_string());
+        win.snapshot.gpu.power_watts = Some(50.0);
+        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+        assert!(b.cost.is_none_or(|c| c.joules_per_token.is_none()));
+    }
+
+    #[test]
+    fn joules_per_token_is_inverse_of_tok_per_watt() {
+        let cfg = VllmConfig {
+            kv_cache_dtype: Some("bf16".to_string()),
+            max_model_len: Some(2048),
+            ..Default::default()
+        };
+        let snap = VllmRawMetrics {
+            generation_tokens_per_sec: Some(200.0),
+            num_requests_running: Some(1.0),
+            ..Default::default()
+        };
+        let (mut ctx, mut win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(67.0),
+            Some(3350.0),
+            cfg,
+            snap,
+        );
+        ctx.gpu.name = Some("NVIDIA H100 80GB HBM3".to_string());
+        win.snapshot.gpu.power_watts = Some(100.0);
+        let cost = compute(&AnalysisInput::new(&ctx, &win))
+            .expect("baseline")
+            .cost
+            .expect("cost");
+        let tpw = cost.tok_per_watt.expect("tok/W");
+        let jpt = cost.joules_per_token.expect("J/tok");
+        assert!((tpw * jpt - 1.0).abs() < 1e-9);
     }
 
     #[test]
