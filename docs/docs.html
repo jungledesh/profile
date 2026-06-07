@@ -144,6 +144,7 @@ footer {
     <a class="site-title" href="index.html">PROFILE</a>
     <nav>
       <a href="#data" data-page="data">Data</a>
+      <a href="#catalog" data-page="catalog">Catalog</a>
       <a href="#math" data-page="math">Maths</a>
       <a href="#rules" data-page="rules">Rules</a>
       <a href="#limitations" data-page="limitations">Limitations</a>
@@ -195,6 +196,74 @@ profile diagnose --url http://HOST:8000/metrics -m 256</code></pre>
         <tr><td><strong>R5</strong> Concurrency saturation</td><td>max_num_seqs hit, queue building</td><td>Raise --max-num-seqs</td></tr>
       </tbody>
     </table>
+  </article>
+
+  <!-- CATALOG -->
+  <article id="page-catalog" class="page">
+    <h1>Catalog</h1>
+    <p class="subtitle">Static data resolved at startup. If your GPU or model is not listed, roofline ceilings are not computed.</p>
+
+    <h2>GPUs</h2>
+    <p>FP32 TFLOPs and memory bandwidth are used for roofline math. Prices are market-average estimates across AWS, GCP, Azure, Lambda, RunPod, CoreWeave, and GMI Cloud as of 2026-06. Use <code>--cost-per-hour</code> for exact rates.</p>
+    <table>
+      <thead><tr><th>GPU</th><th>Arch</th><th>FP32 TFLOPs</th><th>Mem BW GB/s</th><th>On-demand $/hr</th><th>Spot $/hr</th></tr></thead>
+      <tbody>
+        <tr><td>H100 PCIe</td><td>Hopper</td><td>60.0</td><td>2,000</td><td>—</td><td>—</td></tr>
+        <tr><td>H100 SXM</td><td>Hopper</td><td>67.0</td><td>3,350</td><td>$2.80</td><td>$1.40</td></tr>
+        <tr><td>H200</td><td>Hopper</td><td>67.0</td><td>4,800</td><td>$3.50</td><td>$1.80</td></tr>
+        <tr><td>A100 80GB</td><td>Ampere</td><td>19.5</td><td>2,039</td><td>$1.50</td><td>$0.60</td></tr>
+        <tr><td>A100 40GB</td><td>Ampere</td><td>19.5</td><td>1,555</td><td>$1.50</td><td>$0.60</td></tr>
+        <tr><td>A10G</td><td>Ampere</td><td>—</td><td>—</td><td>$1.00</td><td>$0.40</td></tr>
+        <tr><td>L40S</td><td>Ada</td><td>91.6</td><td>864</td><td>$1.80</td><td>$0.80</td></tr>
+        <tr><td>RTX 4090</td><td>Ada</td><td>82.6</td><td>1,008</td><td>—</td><td>—</td></tr>
+        <tr><td>RTX Pro 6000 Blackwell</td><td>Blackwell</td><td>125.0</td><td>960</td><td>—</td><td>—</td></tr>
+        <tr><td>B200</td><td>Blackwell</td><td>20.0</td><td>8,000</td><td>$6.00</td><td>$3.50</td></tr>
+        <tr><td>GB200</td><td>Blackwell</td><td>—</td><td>—</td><td>$8.50</td><td>$4.00</td></tr>
+        <tr><td>GB10 (DGX Spark)</td><td>Blackwell</td><td>20.0</td><td>273</td><td>—</td><td>—</td></tr>
+      </tbody>
+    </table>
+    <div class="callout">FP32 TFLOPs are non-tensor-core throughput — the conservative roofline input. All values labeled <code>(est)</code> in output. A10G and GB200 have price entries only; roofline is skipped for those GPUs. A plain "A100" without a size token (80GB or 40GB) in the NVML name does not match — Profile requires the size to disambiguate.</div>
+
+    <h2>Models</h2>
+    <p>Matched against the model name reported by vLLM at startup. For MoE models, active params drive the decode roofline; total params drive the weight footprint and OOM check.</p>
+    <table>
+      <thead><tr><th>Model</th><th>Total params</th><th>Active params</th><th>MoE</th></tr></thead>
+      <tbody>
+        <tr><td>Llama 4 Maverick</td><td>400B</td><td>17B</td><td>Yes</td></tr>
+        <tr><td>Llama 4 Scout</td><td>109B</td><td>17B</td><td>Yes</td></tr>
+        <tr><td>Llama 3 405B</td><td>405B</td><td>—</td><td>No</td></tr>
+        <tr><td>Llama 3 70B</td><td>70B</td><td>—</td><td>No</td></tr>
+        <tr><td>Llama 3 8B</td><td>8B</td><td>—</td><td>No</td></tr>
+        <tr><td>Nemotron 70B</td><td>70B</td><td>—</td><td>No</td></tr>
+        <tr><td>Nemotron 8B</td><td>8B</td><td>—</td><td>No</td></tr>
+        <tr><td>Qwen3 235B</td><td>235B</td><td>22B</td><td>Yes</td></tr>
+        <tr><td>Qwen3 72B</td><td>72B</td><td>—</td><td>No</td></tr>
+        <tr><td>Qwen3 32B</td><td>32B</td><td>—</td><td>No</td></tr>
+        <tr><td>Qwen3 30B</td><td>30B</td><td>3B</td><td>Yes</td></tr>
+        <tr><td>Qwen3 14B</td><td>14B</td><td>—</td><td>No</td></tr>
+        <tr><td>Qwen3 7B</td><td>7B</td><td>—</td><td>No</td></tr>
+        <tr><td>Qwen2.5 72B</td><td>72B</td><td>—</td><td>No</td></tr>
+        <tr><td>Qwen2.5 32B</td><td>32B</td><td>—</td><td>No</td></tr>
+        <tr><td>Qwen2.5 14B</td><td>14B</td><td>—</td><td>No</td></tr>
+        <tr><td>Qwen2.5 7B</td><td>7B</td><td>—</td><td>No</td></tr>
+        <tr><td>DeepSeek 671B / R1 / V3</td><td>671B</td><td>37B</td><td>Yes</td></tr>
+        <tr><td>DeepSeek 70B</td><td>70B</td><td>—</td><td>No</td></tr>
+        <tr><td>DeepSeek 7B</td><td>7B</td><td>—</td><td>No</td></tr>
+        <tr><td>Mistral Large 675B</td><td>675B</td><td>52B</td><td>Yes</td></tr>
+        <tr><td>Mistral Large 123B</td><td>123B</td><td>—</td><td>No</td></tr>
+        <tr><td>Mixtral 8x22B</td><td>141B</td><td>39B</td><td>Yes</td></tr>
+        <tr><td>Mixtral 8x7B</td><td>47B</td><td>13B</td><td>Yes</td></tr>
+        <tr><td>Mistral 7B</td><td>7B</td><td>—</td><td>No</td></tr>
+        <tr><td>Gemma 27B</td><td>27B</td><td>—</td><td>No</td></tr>
+        <tr><td>Gemma 9B</td><td>9B</td><td>—</td><td>No</td></tr>
+        <tr><td>Kimi K2</td><td>1,000B</td><td>32B</td><td>Yes</td></tr>
+        <tr><td>GLM 744B</td><td>744B</td><td>56B</td><td>Yes</td></tr>
+        <tr><td>GLM 32B</td><td>32B</td><td>—</td><td>No</td></tr>
+        <tr><td>Phi 4 32B</td><td>32B</td><td>—</td><td>No</td></tr>
+        <tr><td>Phi 4 14B</td><td>14B</td><td>—</td><td>No</td></tr>
+      </tbody>
+    </table>
+    <div class="callout">Matching is token-based against the model name string vLLM reports. Unrecognized models skip roofline entirely. To add a model or GPU, open an issue or submit a PR to the catalog files in <code>src/context/</code>.</div>
   </article>
 
   <!-- MATH -->
@@ -286,7 +355,7 @@ prefill_floor_ms = 1000 / prefill_ceiling_tps</code></pre>
       </tbody>
     </table>
     <p><strong>Fix:</strong> Reduce <code>--max-num-seqs</code> or <code>--max-model-len</code>.</p>
-    <div class="callout">R2 evaluates against <code>kv_cache_peak_perc</code>, the maximum KV usage across all 9 scrapes in the window, not the average. A window that averaged 70% but peaked at 92% will still fire. The spike is what causes preemptions — the average hides it.</div>
+    <div class="callout">R2 evaluates against <code>kv_cache_peak_perc</code>, the maximum KV usage across all 9 scrapes in the window, not the average. A window that averaged 70% but peaked at 92% will still fire. The spike is what causes preemptions. The average hides it.</div>
     <div class="callout">R2 is the only rule that cross-references a live GPU reading (VRAM from NVML) with a live vLLM reading (KV cache usage). If <code>gpu_observed_at</code> and <code>vllm_observed_at</code> are more than 1 second apart, R2 is skipped. The other rules draw from a single source and don't have this constraint.</div>
 
     <h2>R3: Low prefix reuse</h2>
@@ -343,79 +412,87 @@ prefill_floor_ms = 1000 / prefill_ceiling_tps</code></pre>
         <tr>
           <td>Gauges</td>
           <td>Last scrape in the window</td>
-          <td><code>kv_cache_peak_perc</code> is max across all 9 scrapes, not last. KV cache can spike and recover within a window — last scrape alone misses it. Shown in output when peak &gt; avg + 10pp or peak ≥ 95%. Same pattern for VRAM peak (≥90% of total) and GPU temp peak (≥80°C).</td>
+          <td><code>kv_cache_peak_perc</code> is max across all 9 scrapes, not last. KV cache can spike and recover within a window; last scrape alone misses it. Shown in output when peak &gt; avg + 10pp or peak ≥ 95%. Same pattern for VRAM peak (≥90% of total) and GPU temp peak (≥80°C).</td>
         </tr>
         <tr>
           <td>Histograms</td>
           <td>Δsum/Δcount, first to last scrape</td>
-          <td>Falls back to last-scrape cumulative mean when Δcount ≤ 0 (no new completions in window). p99 has no fallback — stale p99 is worse than none, so it shows <code>—</code> instead.</td>
+          <td>Falls back to last-scrape cumulative mean when Δcount ≤ 0 (no new completions in window). p99 has no fallback. Stale p99 is worse than none, so it shows <code>—</code> instead.</td>
         </tr>
         <tr>
           <td>Counters</td>
           <td>Rates = Δ / window duration. Raw totals from last scrape.</td>
-          <td><code>None</code> on counter reset (negative delta) or zero-duration window. Zero delta is valid — it means no activity, not missing data.</td>
+          <td><code>None</code> on counter reset (negative delta) or zero-duration window. Zero delta is valid: no activity, not missing data.</td>
         </tr>
       </tbody>
     </table>
 
     <h2>Evaluable window gate</h2>
-    <p>A window is evaluable when two conditions hold:</p>
+    <p>Two-tier gate. Structural validity and active traffic are separate checks.</p>
+    <p><strong>Tier 1: structural.</strong> Did the endpoint respond and does the window have a valid duration? All rules use this check.</p>
     <pre><code>window_duration_secs  is present and positive
 num_requests_running  is Some (even if zero)</code></pre>
-    <p>That's it. The gate is structural — did the endpoint respond and does the window have a valid duration? <code>running = 0</code> passes. <code>None</code> means the endpoint didn't respond, which is different from an idle server.</p>
-    <p>Load-based filtering happens inside individual rules, not here. Each rule decides independently whether there is enough traffic to fire. How evaluable windows are combined across a run is covered in <a href="#math" data-page="math">Maths</a>.</p>
+    <p><code>running = 0</code> is valid data: the server responded and reported no active requests. <code>None</code> is different: the endpoint did not respond. An idle server and an unresponsive server are not the same thing.</p>
+    <p><strong>Tier 2: active.</strong> Was the server doing real work? Aggregated means use this check. Throughput, efficiency %, GPU utilization, and latency averages are computed over active windows only.</p>
+    <pre><code>running_reqs > 0
+AND (kv_cache_pct > 30%  OR  gpu_util_pct > 20%)
+
+// both absent: running_reqs > 0 alone
+// one absent:  evaluate the other arm only</code></pre>
+    <p><code>kv_cache_pct</code> catches decode and sustained load. <code>gpu_util_pct</code> catches prefill bursts where the KV cache is still near-empty. Idle windows pass tier 1 but not tier 2 and are excluded from the averages.</p>
+    <p>How active windows are combined across a run is covered in <a href="#math" data-page="math">Maths</a>.</p>
 
     <h2>Source 1: NVML</h2>
+    <p>NVIDIA Management Library. Direct access to GPU hardware state, polled at 250ms intervals.</p>
     <table>
-      <thead><tr><th>Field</th><th>What it is</th></tr></thead>
+      <thead><tr><th>Field</th><th>Type</th><th>What it is</th><th>How collected</th></tr></thead>
       <tbody>
-        <tr><td><code>gpu_util_pct</code></td><td>SM utilization, 0–100%</td></tr>
-        <tr><td><code>mem_util_pct</code></td><td>Memory interface utilization, 0–100%</td></tr>
-        <tr><td><code>power_watts</code></td><td>Instantaneous draw (W)</td></tr>
-        <tr><td><code>power_limit_watts</code></td><td>Driver-set TDP limit (W)</td></tr>
-        <tr><td><code>vram_used_mb</code></td><td>VRAM in use (MiB)</td></tr>
-        <tr><td><code>vram_peak_mb</code></td><td>Peak VRAM used in window (MiB)</td></tr>
-        <tr><td><code>vram_total_mb</code></td><td>Total device VRAM (MiB), static</td></tr>
-        <tr><td><code>temperature_c</code></td><td>GPU core temp (°C)</td></tr>
-        <tr><td><code>temperature_peak_c</code></td><td>Peak temp in window (°C)</td></tr>
-        <tr><td><code>sm_clock_mhz</code></td><td>SM clock frequency</td></tr>
+        <tr><td><code>gpu_util_pct</code></td><td>Gauge</td><td>Fraction of time any kernel was executing. Not SM occupancy.</td><td>Mean across window polls</td></tr>
+        <tr><td><code>mem_util_pct</code></td><td>Gauge</td><td>Fraction of time the memory controller was busy</td><td>Mean across window polls</td></tr>
+        <tr><td><code>power_watts</code></td><td>Gauge</td><td>Power draw (W)</td><td>Mean across window polls</td></tr>
+        <tr><td><code>power_limit_watts</code></td><td>Gauge</td><td>Driver-set TDP limit (W)</td><td>Once at startup</td></tr>
+        <tr><td><code>vram_used_mb</code></td><td>Gauge</td><td>VRAM in use (MiB)</td><td>Last poll</td></tr>
+        <tr><td><code>vram_total_mb</code></td><td>Gauge</td><td>Total device VRAM (MiB)</td><td>Last poll</td></tr>
+        <tr><td><code>temperature_c</code></td><td>Gauge</td><td>GPU core temp (°C)</td><td>Last poll</td></tr>
+        <tr><td><code>sm_clock_mhz</code></td><td>Gauge</td><td>SM clock frequency (MHz)</td><td>Last poll</td></tr>
       </tbody>
     </table>
+    <div class="callout">Two values are computed from the polls, not read directly from NVML: <code>vram_peak_mb</code> (max of <code>vram_used_mb</code> across all polls) and <code>temperature_peak_c</code> (max of <code>temperature_c</code> across all polls). Derived within the window, not collected.</div>
     <div class="callout">NVML does not expose theoretical peak FLOPs or memory bandwidth. Those come from the GPU catalog, looked up once at startup from <code>gpu_name</code>, labeled <code>(est)</code> in output.</div>
 
     <h2>Source 2: vLLM Prometheus</h2>
-    <p>Scraped from <code>/metrics</code> 9 times per window. <code>None</code> when the endpoint didn't respond, counters reset, or Δcount ≤ 0.</p>
+    <p>Scraped from <code>/metrics</code> 9 times per window. See <a href="https://docs.vllm.ai/en/stable/" target="_blank" rel="noopener">vLLM docs</a> for the full metric reference.</p>
     <table>
-      <thead><tr><th>Metric</th><th>Type</th><th>Used for</th></tr></thead>
+      <thead><tr><th>Field</th><th>Type</th><th>What it is</th></tr></thead>
       <tbody>
-        <tr><td><code>vllm:num_requests_running</code></td><td>Gauge</td><td>R1, R5, window gate</td></tr>
-        <tr><td><code>vllm:num_requests_waiting</code></td><td>Gauge</td><td>R1, R5 queue ratio</td></tr>
-        <tr><td><code>vllm:num_requests_swapped</code></td><td>Gauge</td><td>CPU offload detection</td></tr>
-        <tr><td><code>vllm:gpu_cache_usage_perc</code></td><td>Gauge</td><td>R2, R5 fix decision</td></tr>
-        <tr><td><code>vllm:cpu_cache_usage_perc</code></td><td>Gauge</td><td>CPU KV pressure</td></tr>
-        <tr><td><code>vllm:time_to_first_token_seconds</code></td><td>Histogram</td><td>TTFT mean + p99</td></tr>
-        <tr><td><code>vllm:request_time_per_output_token_seconds</code></td><td>Histogram</td><td>TPOT mean + p99</td></tr>
-        <tr><td><code>vllm:time_per_output_token_seconds</code></td><td>Histogram</td><td>TPOT (alt metric name, older vLLM)</td></tr>
-        <tr><td><code>vllm:time_per_schedule_step_seconds</code></td><td>Histogram</td><td>Prefill latency</td></tr>
-        <tr><td><code>vllm:request_queue_time_seconds</code></td><td>Histogram</td><td>Queue delay</td></tr>
-        <tr><td><code>vllm:request_prompt_tokens</code></td><td>Histogram</td><td>Mean prompt length</td></tr>
-        <tr><td><code>vllm:generation_tokens_total</code></td><td>Counter</td><td>Throughput, efficiency %</td></tr>
-        <tr><td><code>vllm:request_success_total</code></td><td>Counter</td><td>QPS</td></tr>
-        <tr><td><code>vllm:num_preemptions_total</code></td><td>Counter</td><td>Preemption rate</td></tr>
-        <tr><td><code>vllm:cache_config_info</code></td><td>Gauge (labels)</td><td>block_size, cache_dtype, prefix_caching, chunked_prefill</td></tr>
-        <tr><td><code>vllm:max_num_seqs</code></td><td>Gauge</td><td>R1, R5 cap. Absent in vLLM ≤0.18.0, pass <code>-m</code></td></tr>
-        <tr><td>Prefix cache counters</td><td>Counter</td><td>R3 hit rate</td></tr>
+        <tr><td><code>vllm:num_requests_running</code></td><td>Gauge</td><td>Active requests in flight</td></tr>
+        <tr><td><code>vllm:num_requests_waiting</code></td><td>Gauge</td><td>Requests queued, not yet scheduled</td></tr>
+        <tr><td><code>vllm:num_requests_swapped</code></td><td>Gauge</td><td>Requests with KV blocks evicted to CPU</td></tr>
+        <tr><td><code>vllm:kv_cache_usage_perc</code> / <code>vllm:gpu_cache_usage_perc</code></td><td>Gauge</td><td>KV cache fill ratio, 0–1. Primary name is <code>kv_cache_usage_perc</code>; falls back to <code>gpu_cache_usage_perc</code> on older vLLM.</td></tr>
+        <tr><td><code>vllm:cpu_cache_usage_perc</code></td><td>Gauge</td><td>CPU KV cache fill ratio</td></tr>
+        <tr><td><code>vllm:time_to_first_token_seconds</code></td><td>Histogram</td><td>Time from request arrival to first output token. TTFT mean + p99.</td></tr>
+        <tr><td><code>vllm:request_time_per_output_token_seconds</code></td><td>Histogram</td><td>Per-token decode latency. TPOT mean + p99.</td></tr>
+        <tr><td><code>vllm:time_per_output_token_seconds</code></td><td>Histogram</td><td>TPOT, older metric name. Fallback when primary is absent.</td></tr>
+        <tr><td><code>vllm:request_prefill_time_seconds</code></td><td>Histogram</td><td>Prefill latency per request</td></tr>
+        <tr><td><code>vllm:request_queue_time_seconds</code></td><td>Histogram</td><td>Time spent waiting before scheduling</td></tr>
+        <tr><td><code>vllm:request_prompt_tokens</code></td><td>Histogram</td><td>Prompt token count per request</td></tr>
+        <tr><td><code>vllm:generation_tokens_total</code> / <code>vllm:iteration_tokens_total_sum</code></td><td>Counter</td><td>Cumulative tokens generated. Primary is <code>generation_tokens_total</code>; falls back to <code>iteration_tokens_total_sum</code> on older vLLM.</td></tr>
+        <tr><td><code>vllm:request_success_total</code></td><td>Counter</td><td>Cumulative completed requests. Legacy name: <code>vllm:request_success</code>.</td></tr>
+        <tr><td><code>vllm:num_preemptions_total</code></td><td>Counter</td><td>Cumulative KV cache preemptions. Legacy name: <code>vllm:num_preemptions</code>.</td></tr>
+        <tr><td><code>vllm:cache_config_info</code></td><td>Gauge (labels)</td><td>Static cache config: block_size, cache_dtype, prefix_caching, chunked_prefill</td></tr>
+        <tr><td><code>vllm:max_num_seqs</code></td><td>Gauge</td><td>Concurrency cap. Absent in vLLM ≤0.18.0 — pass <code>-m</code>.</td></tr>
+        <tr><td><code>vllm:prefix_cache_hits_total</code>, <code>vllm:prefix_cache_queries_total</code>, <code>vllm:external_prefix_cache_hits_total</code>, <code>vllm:external_prefix_cache_queries_total</code></td><td>Counter</td><td>Internal and external prefix cache hits and queries. Legacy names without <code>_total</code> also supported.</td></tr>
       </tbody>
     </table>
 
     <h2>Catalog-derived fields</h2>
-    <p>NVML doesn't expose peak FLOPs or memory bandwidth. Model param counts aren't in vLLM metrics. Profile looks these up once at startup from internal catalogs keyed on <code>gpu_name</code> and <code>model_name</code>.</p>
+    <p>Looked up once at startup. See <a href="#catalog" data-page="catalog">Catalog</a> for supported GPUs and models.</p>
     <table>
       <thead><tr><th>Field</th><th>Source</th><th>If absent</th></tr></thead>
       <tbody>
-        <tr><td><code>peak_flops_f32_tflops</code>, <code>peak_bw_gbps</code></td><td>GPU catalog, non-tensor-core FP32, conservative roofline input</td><td>Ceilings not computed</td></tr>
-        <tr><td><code>param_count</code>, <code>num_layers</code>, <code>hidden_dim</code></td><td>Model catalog</td><td>Roofline skipped</td></tr>
-        <tr><td><code>bytes_per_param</code></td><td><code>DTYPE</code> env → <code>kv_cache_dtype</code> → catalog default → bf16 (2 bytes)</td><td>bf16 fallback, labeled in output</td></tr>
+        <tr><td><code>peak_flops_f32_tflops</code>, <code>peak_bw_gbps</code></td><td>GPU catalog. Non-tensor-core FP32, conservative roofline input.</td><td>Ceilings not computed</td></tr>
+        <tr><td><code>param_count</code></td><td>Model catalog</td><td>Roofline skipped</td></tr>
+        <tr><td><code>bytes_per_param</code></td><td><code>DTYPE</code> / <code>VLLM_DTYPE</code> env → <code>kv_cache_dtype</code> → catalog default → bf16 (2 bytes)</td><td>bf16 fallback, labeled in output</td></tr>
       </tbody>
     </table>
     <div class="callout">All catalog-derived numbers are labeled <code>(est)</code> in output. Upper-bound approximations, not measured values.</div>
@@ -424,9 +501,9 @@ num_requests_running  is Some (even if zero)</code></pre>
     <table>
       <thead><tr><th>Field</th><th>Primary</th><th>Fallback</th><th>If absent</th></tr></thead>
       <tbody>
-        <tr><td><code>max_num_seqs</code></td><td><code>vllm:max_num_seqs</code> gauge</td><td><code>-m</code> CLI flag</td><td>R1 occupancy gate and R5 silent</td></tr>
+        <tr><td><code>max_num_seqs</code></td><td><code>vllm:max_num_seqs</code> gauge</td><td><code>-m</code> CLI flag</td><td>R1 and R5 silent</td></tr>
         <tr><td>TPOT histogram</td><td><code>request_time_per_output_token</code></td><td><code>time_per_output_token</code></td><td><code>None</code></td></tr>
-        <tr><td><code>bytes_per_param</code></td><td><code>DTYPE</code> env var</td><td><code>kv_cache_dtype</code> → catalog → bf16</td><td>bf16, labeled in output</td></tr>
+        <tr><td><code>bytes_per_param</code></td><td><code>DTYPE</code> / <code>VLLM_DTYPE</code> env var</td><td><code>kv_cache_dtype</code> → catalog → bf16</td><td>bf16, labeled in output</td></tr>
         <tr><td>All windows non-evaluable</td><td>—</td><td>Chronologically last raw window</td><td>Labeled as non-evaluable</td></tr>
       </tbody>
     </table>
@@ -477,7 +554,7 @@ num_requests_running  is Some (even if zero)</code></pre>
     <p>Fast enough to catch GPU utilization transients that a 1s or 5s poll would average away. Slow enough that 9 scrapes per window add no meaningful load to the vLLM endpoint or NVML. A profiler that taxes its target is worse than no profiler.</p>
 
     <h2>Peak over average for KV cache</h2>
-    <p>KV cache usage is tracked as the maximum across all 9 scrapes in a window, not the last value. A spike that causes preemptions and latency degradation can recover before the window ends — the last scrape reports a safe number while the damage already happened. The peak is the signal. The average buries it.</p>
+    <p>KV cache usage is tracked as the maximum across all 9 scrapes in a window, not the last value. A spike that causes preemptions and latency degradation can recover before the window ends. The last scrape reports a safe number while the damage already happened. The peak is the signal. The average buries it.</p>
 
     <h2>Zero allocation in the hot loop</h2>
     <p><code>AnalysisInput&lt;'a&gt;</code> borrows both contexts. No clones per 250ms window. A profiler that eats its target's resources is worse than no profiler.</p>
@@ -574,6 +651,7 @@ num_requests_running  is Some (even if zero)</code></pre>
 
 <script>
   const TITLES = {
+    catalog: 'Catalog | Profile',
     math: 'Maths | Profile',
     rules: 'Rules | Profile',
     data: 'Data | Profile',

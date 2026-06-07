@@ -94,6 +94,104 @@ fn spawn_metrics_server_seq(bodies: &[&'static str]) -> (String, thread::JoinHan
     (url, handle)
 }
 
+fn nine_scrape_window(early: &'static str, late: &'static str) -> [&'static str; 9] {
+    [early, early, early, early, early, early, early, early, late]
+}
+
+fn spawn_metrics_server_multi_window(
+    windows: &[(&'static str, &'static str)],
+) -> (String, thread::JoinHandle<()>) {
+    let mut bodies: Vec<&'static str> = Vec::new();
+    for &(early, late) in windows {
+        bodies.extend_from_slice(&nine_scrape_window(early, late));
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test metrics server");
+    let port = listener.local_addr().expect("local_addr").port();
+    let url = format!("http://127.0.0.1:{port}");
+
+    let handle = thread::spawn(move || {
+        for body in bodies {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 4096];
+            let mut n = 0usize;
+            while n < buf.len() {
+                let got = stream.read(&mut buf[n..]).expect("read");
+                if got == 0 {
+                    break;
+                }
+                n += got;
+                if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(resp.as_bytes()).expect("write response");
+        }
+    });
+
+    (url, handle)
+}
+
+const IDLE_WINDOW_EARLY: &str = r#"vllm_num_requests_running 0
+vllm_kv_cache_usage_perc 10
+vllm_generation_tokens_total 1000
+"#;
+const IDLE_WINDOW_LATE: &str = r#"vllm_num_requests_running 0
+vllm_kv_cache_usage_perc 10
+vllm_generation_tokens_total 1010
+"#;
+const ACTIVE_WINDOW_EARLY: &str = r#"vllm_num_requests_running 20
+vllm_kv_cache_usage_perc 50
+vllm_generation_tokens_total 2000
+"#;
+const ACTIVE_WINDOW_LATE: &str = r#"vllm_num_requests_running 20
+vllm_kv_cache_usage_perc 50
+vllm_generation_tokens_total 2100
+"#;
+
+#[test]
+fn diagnose_aggregate_means_use_active_windows_only() {
+    let windows = [
+        (IDLE_WINDOW_EARLY, IDLE_WINDOW_LATE),
+        (ACTIVE_WINDOW_EARLY, ACTIVE_WINDOW_LATE),
+        (ACTIVE_WINDOW_EARLY, ACTIVE_WINDOW_LATE),
+    ];
+    let (url, server) = spawn_metrics_server_multi_window(&windows);
+    let output = Command::cargo_bin("profile")
+        .unwrap()
+        .args(["diagnose", "--duration", "6s", "-m", "256", "--url"])
+        .arg(&url)
+        .output()
+        .expect("run profile diagnose");
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let out = String::from_utf8_lossy(&output.stdout).into_owned();
+    let throughput_line = out.lines().find(|l| l.contains("THROUGHPUT")).unwrap_or("");
+    let tps: f64 = throughput_line
+        .split("tok/s")
+        .next()
+        .and_then(|s| s.split_whitespace().last())
+        .and_then(|s| s.parse().ok())
+        .expect("parse THROUGHPUT tok/s");
+    assert!(
+        (tps - 50.0).abs() < 2.0,
+        "expected active-only throughput ~50 tok/s; got {tps} in:\n{throughput_line}\nfull:\n{out}"
+    );
+    assert!(
+        (tps - 35.0).abs() > 10.0,
+        "throughput should not blend idle window (~35 tok/s); got {tps}"
+    );
+    server.join().expect("metrics server thread");
+}
+
 #[test]
 fn help_exits_success() {
     Command::cargo_bin("profile")
@@ -212,8 +310,8 @@ fn diagnose_exits_success() {
 
 #[test]
 fn diagnose_shows_gen_tok_per_sec_when_counters_increase() {
-    const G100: &str = "vllm_num_requests_running 0\nvllm_generation_tokens_total 100\n";
-    const G250: &str = "vllm_num_requests_running 0\nvllm_generation_tokens_total 250\n";
+    const G100: &str = "vllm_num_requests_running 20\nvllm_kv_cache_usage_perc 50\nvllm_generation_tokens_total 100\n";
+    const G250: &str = "vllm_num_requests_running 20\nvllm_kv_cache_usage_perc 50\nvllm_generation_tokens_total 250\n";
     let bodies = [G100, G100, G100, G100, G100, G100, G100, G100, G250];
     let (url, server) = spawn_metrics_server_seq(&bodies);
     let output = Command::cargo_bin("profile")
