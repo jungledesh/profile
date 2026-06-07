@@ -12,8 +12,8 @@ pub mod vllm;
 pub use config::{build_config, VllmConfig};
 pub use traffic::{traffic_from_snapshot, TrafficSource, TrafficState};
 pub use types::{
-    window_is_evaluable, CacheConfigLabels, GpuRawMetrics, HistogramCount, HistogramWindowMass,
-    PrefixCacheScrapeSample, RawSnapshot, VllmRawMetrics,
+    window_is_active, window_is_evaluable, CacheConfigLabels, GpuRawMetrics, HistogramCount,
+    HistogramWindowMass, PrefixCacheScrapeSample, RawSnapshot, VllmRawMetrics,
 };
 pub(crate) use vllm::merge_p99_bucket_vecs;
 

@@ -2,7 +2,9 @@
 //!
 //! Multi-window aggregation rules: **`docs/collection-policy.md`**.
 
-use crate::collectors::{self, build_config, window_is_evaluable, HistogramWindowMass};
+use crate::collectors::{
+    self, build_config, window_is_active, window_is_evaluable, HistogramWindowMass,
+};
 use crate::context::{RuntimeWindow, StaticContext};
 use std::time::{Duration, SystemTime};
 
@@ -149,7 +151,7 @@ fn aggregate_windows(
         return empty_snapshot(started_at);
     }
 
-    let pairs: Vec<(&collectors::RawSnapshot, Duration)> = windows
+    let evaluable_pairs: Vec<(&collectors::RawSnapshot, Duration)> = windows
         .iter()
         .enumerate()
         .filter_map(|(i, w)| {
@@ -161,15 +163,21 @@ fn aggregate_windows(
         })
         .collect();
 
+    let active_pairs: Vec<(&collectors::RawSnapshot, Duration)> = evaluable_pairs
+        .iter()
+        .copied()
+        .filter(|(w, _)| window_is_active(w))
+        .collect();
+
     // Cumulative Prometheus counters: chronologically last collection (idle tail included).
     let chronological_last = windows.last().expect("windows non-empty: checked above");
 
-    if pairs.is_empty() {
+    if evaluable_pairs.is_empty() {
         return chronological_last.clone();
     }
 
     // Last *evaluable* window — state, static, prefix rate, GPU state gauges.
-    let (last, _) = pairs.last().expect("pairs non-empty");
+    let (last, _) = evaluable_pairs.last().expect("evaluable_pairs non-empty");
     let last = *last;
     let mut agg_v = collectors::VllmRawMetrics {
         model_name: last.vllm.model_name.clone(),
@@ -184,23 +192,25 @@ fn aggregate_windows(
         ..Default::default()
     };
 
-    // Running / waiting: duration-weighted mean over evaluable windows (same weight story as gpu_util_pct).
-    agg_v.num_requests_running = weighted_metric_pairs(&pairs, |w| w.vllm.num_requests_running);
-    agg_v.num_requests_waiting = weighted_metric_pairs(&pairs, |w| w.vllm.num_requests_waiting);
-    let kv_avg = aggregate_kv_cache_avg_perc(&pairs);
+    // Running / waiting: duration-weighted mean over active windows (evaluable fallback if none active).
+    agg_v.num_requests_running =
+        weighted_metric_pairs(&active_pairs, |w| w.vllm.num_requests_running);
+    agg_v.num_requests_waiting =
+        weighted_metric_pairs(&active_pairs, |w| w.vllm.num_requests_waiting);
+    let kv_avg = aggregate_kv_cache_avg_perc(&evaluable_pairs);
     agg_v.kv_cache_usage_perc = kv_avg;
     agg_v.kv_cache_avg_perc = kv_avg;
-    agg_v.kv_cache_peak_perc = aggregate_kv_cache_peak_perc(&pairs, last);
+    agg_v.kv_cache_peak_perc = aggregate_kv_cache_peak_perc(&evaluable_pairs, last);
     agg_v.num_requests_swapped = last.vllm.num_requests_swapped;
     agg_v.cpu_cache_usage_perc = last.vllm.cpu_cache_usage_perc;
-    agg_v.ttft_ms = aggregate_histogram_from_mass(&pairs, |v| v.ttft_window_mass, 1000.0)
-        .or_else(|| weighted_metric_pairs(&pairs, |w| w.vllm.ttft_ms));
-    agg_v.tpot_ms = aggregate_histogram_from_mass(&pairs, |v| v.tpot_window_mass, 1000.0)
-        .or_else(|| weighted_metric_pairs(&pairs, |w| w.vllm.tpot_ms));
+    agg_v.ttft_ms = aggregate_histogram_from_mass(&active_pairs, |v| v.ttft_window_mass, 1000.0)
+        .or_else(|| weighted_metric_pairs(&active_pairs, |w| w.vllm.ttft_ms));
+    agg_v.tpot_ms = aggregate_histogram_from_mass(&active_pairs, |v| v.tpot_window_mass, 1000.0)
+        .or_else(|| weighted_metric_pairs(&active_pairs, |w| w.vllm.tpot_ms));
     // p99: merge per-window delta bucket vectors, recompute quantile from merged result.
     // This is mathematically correct — averaging quantiles across windows is not.
     {
-        let ttft_vecs: Vec<&[collectors::HistogramCount]> = pairs
+        let ttft_vecs: Vec<&[collectors::HistogramCount]> = active_pairs
             .iter()
             .map(|(w, _)| w.vllm.ttft_p99_buckets.as_slice())
             .collect();
@@ -208,7 +218,7 @@ fn aggregate_windows(
         agg_v.ttft_p99_ms =
             collectors::vllm::histogram_quantile(0.99, &merged_ttft).map(|s| s * 1000.0);
 
-        let tpot_vecs: Vec<&[collectors::HistogramCount]> = pairs
+        let tpot_vecs: Vec<&[collectors::HistogramCount]> = active_pairs
             .iter()
             .map(|(w, _)| w.vllm.tpot_p99_buckets.as_slice())
             .collect();
@@ -217,25 +227,34 @@ fn aggregate_windows(
             collectors::vllm::histogram_quantile(0.99, &merged_tpot).map(|s| s * 1000.0);
     }
     agg_v.prefill_latency_ms =
-        aggregate_histogram_from_mass(&pairs, |v| v.prefill_window_mass, 1000.0)
-            .or_else(|| weighted_metric_pairs(&pairs, |w| w.vllm.prefill_latency_ms));
-    agg_v.queue_delay_ms = aggregate_histogram_from_mass(&pairs, |v| v.queue_window_mass, 1000.0)
-        .or_else(|| weighted_metric_pairs(&pairs, |w| w.vllm.queue_delay_ms));
+        aggregate_histogram_from_mass(&active_pairs, |v| v.prefill_window_mass, 1000.0)
+            .or_else(|| weighted_metric_pairs(&active_pairs, |w| w.vllm.prefill_latency_ms));
+    agg_v.queue_delay_ms =
+        aggregate_histogram_from_mass(&active_pairs, |v| v.queue_window_mass, 1000.0)
+            .or_else(|| weighted_metric_pairs(&active_pairs, |w| w.vllm.queue_delay_ms));
     agg_v.prompt_tokens_mean =
-        aggregate_histogram_from_mass(&pairs, |v| v.prompt_tokens_window_mass, 1.0)
-            .or_else(|| weighted_metric_pairs(&pairs, |w| w.vllm.prompt_tokens_mean));
-    let total_window_secs: f64 = pairs.iter().map(|(_, d)| d.as_secs_f64()).sum();
+        aggregate_histogram_from_mass(&evaluable_pairs, |v| v.prompt_tokens_window_mass, 1.0)
+            .or_else(|| weighted_metric_pairs(&evaluable_pairs, |w| w.vllm.prompt_tokens_mean));
+    let total_window_secs: f64 = evaluable_pairs.iter().map(|(_, d)| d.as_secs_f64()).sum();
     if total_window_secs.is_finite() && total_window_secs > f64::EPSILON {
         agg_v.window_duration_secs = Some(total_window_secs);
     }
-    agg_v.prefill_window_mass = aggregate_histogram_window_mass(&pairs, |v| v.prefill_window_mass);
+    agg_v.prefill_window_mass =
+        aggregate_histogram_window_mass(&active_pairs, |v| v.prefill_window_mass);
+    agg_v.ttft_window_mass = aggregate_histogram_window_mass(&active_pairs, |v| v.ttft_window_mass);
+    agg_v.tpot_window_mass = aggregate_histogram_window_mass(&active_pairs, |v| v.tpot_window_mass);
+    agg_v.queue_window_mass =
+        aggregate_histogram_window_mass(&active_pairs, |v| v.queue_window_mass);
+    agg_v.prompt_tokens_window_mass =
+        aggregate_histogram_window_mass(&evaluable_pairs, |v| v.prompt_tokens_window_mass);
     agg_v.generation_tokens_per_sec =
-        weighted_metric_pairs(&pairs, |w| w.vllm.generation_tokens_per_sec);
+        weighted_metric_pairs(&active_pairs, |w| w.vllm.generation_tokens_per_sec);
     agg_v.request_success_per_sec =
-        weighted_metric_pairs(&pairs, |w| w.vllm.request_success_per_sec);
+        weighted_metric_pairs(&active_pairs, |w| w.vllm.request_success_per_sec);
     agg_v.num_preemptions_per_sec =
-        weighted_metric_pairs(&pairs, |w| w.vllm.num_preemptions_per_sec);
-    let eval_refs: Vec<&collectors::RawSnapshot> = pairs.iter().map(|(w, _)| *w).collect();
+        weighted_metric_pairs(&active_pairs, |w| w.vllm.num_preemptions_per_sec);
+    let eval_refs: Vec<&collectors::RawSnapshot> =
+        evaluable_pairs.iter().map(|(w, _)| *w).collect();
     agg_v.prefix_cache_hit_rate = prefix_hit_rate_sum_of_window_deltas(&eval_refs);
     agg_v.generation_tokens_total = chronological_last.vllm.generation_tokens_total;
     agg_v.request_success_total = chronological_last.vllm.request_success_total;
@@ -244,14 +263,14 @@ fn aggregate_windows(
     // Static config labels don't change across windows — carry from last.
     agg_v.cache_config = last.vllm.cache_config.clone();
 
-    agg_g.gpu_util_pct = weighted_metric_pairs(&pairs, |w| w.gpu.gpu_util_pct);
-    agg_g.mem_util_pct = weighted_metric_pairs(&pairs, |w| w.gpu.mem_util_pct);
-    agg_g.power_watts = weighted_metric_pairs(&pairs, |w| w.gpu.power_watts);
+    agg_g.gpu_util_pct = weighted_metric_pairs(&active_pairs, |w| w.gpu.gpu_util_pct);
+    agg_g.mem_util_pct = weighted_metric_pairs(&active_pairs, |w| w.gpu.mem_util_pct);
+    agg_g.power_watts = weighted_metric_pairs(&active_pairs, |w| w.gpu.power_watts);
     agg_g.temperature_c = last.gpu.temperature_c;
-    agg_g.temperature_peak_c = aggregate_temperature_peak_c(&pairs, last);
+    agg_g.temperature_peak_c = aggregate_temperature_peak_c(&evaluable_pairs, last);
     agg_g.sm_clock_mhz = last.gpu.sm_clock_mhz;
     agg_g.vram_used_mb = last.gpu.vram_used_mb;
-    agg_g.vram_peak_mb = aggregate_vram_peak_mb(&pairs, last);
+    agg_g.vram_peak_mb = aggregate_vram_peak_mb(&evaluable_pairs, last);
     agg_g.vram_total_mb = last.gpu.vram_total_mb;
 
     collectors::RawSnapshot {
@@ -319,10 +338,10 @@ fn aggregate_temperature_peak_c(
     }
 }
 
-/// Sum histogram Δmass across evaluable windows (for saturation gates on aggregated snapshots).
-fn aggregate_histogram_window_mass<M>(
+/// Sum histogram Δmass across windows — shared accumulation for mean and mass helpers.
+fn accumulate_histogram_mass<M>(
     pairs: &[(&collectors::RawSnapshot, Duration)],
-    mass: M,
+    get_mass: M,
 ) -> Option<HistogramWindowMass>
 where
     M: Fn(&collectors::VllmRawMetrics) -> Option<HistogramWindowMass>,
@@ -330,7 +349,7 @@ where
     let mut sum = 0.0_f64;
     let mut count = 0.0_f64;
     for (w, _) in pairs {
-        let Some(m) = mass(&w.vllm) else {
+        let Some(m) = get_mass(&w.vllm) else {
             continue;
         };
         if m.count_delta <= 0.0 || m.sum_delta < 0.0 {
@@ -352,6 +371,17 @@ where
     }
 }
 
+/// Sum histogram Δmass across evaluable windows (for saturation gates on aggregated snapshots).
+fn aggregate_histogram_window_mass<M>(
+    pairs: &[(&collectors::RawSnapshot, Duration)],
+    mass: M,
+) -> Option<HistogramWindowMass>
+where
+    M: Fn(&collectors::VllmRawMetrics) -> Option<HistogramWindowMass>,
+{
+    accumulate_histogram_mass(pairs, mass)
+}
+
 /// Multi-window mean for Prometheus histograms: **ΣΔsum / ΣΔcount** over evaluable windows.
 /// `scale` converts Prometheus units to display units (1000 for latency seconds→ms, 1 for prompt tokens).
 fn aggregate_histogram_from_mass<M>(
@@ -362,27 +392,10 @@ fn aggregate_histogram_from_mass<M>(
 where
     M: Fn(&collectors::VllmRawMetrics) -> Option<HistogramWindowMass>,
 {
-    let mut sum = 0.0_f64;
-    let mut count = 0.0_f64;
-    for (w, _) in pairs {
-        let Some(m) = mass(&w.vllm) else {
-            continue;
-        };
-        if m.count_delta <= 0.0 || m.sum_delta < 0.0 {
-            continue;
-        }
-        if !(m.sum_delta.is_finite() && m.count_delta.is_finite()) {
-            continue;
-        }
-        sum += m.sum_delta;
-        count += m.count_delta;
-    }
-    if count > 0.0 && sum.is_finite() {
-        let mean = (sum / count) * scale;
+    accumulate_histogram_mass(pairs, mass).and_then(|m| {
+        let mean = (m.sum_delta / m.count_delta) * scale;
         mean.is_finite().then_some(mean)
-    } else {
-        None
-    }
+    })
 }
 
 fn weighted_metric_pairs<F>(
@@ -481,12 +494,16 @@ mod tests {
             ],
             _ => vec![],
         };
+        // kv_cache_usage_perc and gpu_util_pct intentionally None.
+        // window_is_active falls back to running > 0 alone.
+        // Tests needing specific active/inactive behavior must set these fields explicitly.
         RawSnapshot {
             gpu_observed_at: SystemTime::UNIX_EPOCH,
             vllm_observed_at: SystemTime::UNIX_EPOCH,
             timestamp: SystemTime::UNIX_EPOCH,
             vllm: VllmRawMetrics {
                 num_requests_running: run,
+                kv_cache_usage_perc: None,
                 generation_tokens_per_sec: tps,
                 prefix_cache_hit_rate: prefix_hit_rate,
                 prefix_cache_scrape_samples: samples,
@@ -496,6 +513,28 @@ mod tests {
             },
             gpu,
         }
+    }
+
+    fn mk_active_snap(
+        run: Option<f64>,
+        tps: Option<f64>,
+        hits: Option<(f64, f64)>,
+        q: Option<(f64, f64)>,
+        prefix_hit_rate: Option<f64>,
+        gpu: GpuRawMetrics,
+        generation_tokens_total: Option<f64>,
+    ) -> RawSnapshot {
+        let mut snap = mk_snap(
+            run,
+            tps,
+            hits,
+            q,
+            prefix_hit_rate,
+            gpu,
+            generation_tokens_total,
+        );
+        snap.vllm.kv_cache_usage_perc = Some(50.0);
+        snap
     }
 
     #[test]
@@ -538,7 +577,7 @@ mod tests {
                 g1,
                 None,
             ),
-            mk_snap(
+            mk_active_snap(
                 Some(10.0),
                 Some(500.0),
                 Some((0.0, 10.0)),
@@ -550,13 +589,12 @@ mod tests {
         ];
         let durations = vec![Duration::from_secs(2), Duration::from_secs(10)];
         let agg = aggregate_windows(&windows, &durations, SystemTime::UNIX_EPOCH);
-        // (2×2s + 10×10s) / 12s — not last window's 10.
-        let expected_run = (2.0 * 2.0 + 10.0 * 10.0) / 12.0;
-        assert!((agg.vllm.num_requests_running.unwrap() - expected_run).abs() < 1e-9);
-        assert!((agg.vllm.generation_tokens_per_sec.unwrap() - 433.3333333).abs() < 1e-4);
+        // Window 1 inactive (gpu 10%); window 2 active (gpu 50%) — means use active only.
+        assert!((agg.vllm.num_requests_running.unwrap() - 10.0).abs() < 1e-9);
+        assert!((agg.vllm.generation_tokens_per_sec.unwrap() - 500.0).abs() < 1e-4);
         // (10+10)/(80+10) = 20/90 — sum of Δhits / sum of Δqueries, not last window only.
         assert!((agg.vllm.prefix_cache_hit_rate.unwrap() - 20.0 / 90.0).abs() < 1e-9);
-        assert!((agg.gpu.gpu_util_pct.unwrap() - 43.3333333).abs() < 1e-4);
+        assert!((agg.gpu.gpu_util_pct.unwrap() - 50.0).abs() < 1e-4);
         assert_eq!(agg.gpu.vram_used_mb, Some(2000));
         assert!((agg.gpu.temperature_c.unwrap() - 60.0).abs() < 1e-9);
         assert_eq!(agg.gpu.sm_clock_mhz, Some(2000));
@@ -595,7 +633,7 @@ mod tests {
     #[test]
     fn aggregate_cumulative_tokens_from_chronological_last_not_last_evaluable() {
         let g = GpuRawMetrics::default();
-        let w1 = mk_snap(
+        let w1 = mk_active_snap(
             Some(2.0),
             Some(100.0),
             None,
@@ -824,6 +862,7 @@ mod tests {
         let g = GpuRawMetrics::default();
         let v1 = VllmRawMetrics {
             num_requests_running: Some(2.0),
+            kv_cache_usage_perc: Some(50.0),
             generation_tokens_per_sec: Some(100.0),
             window_duration_secs: Some(10.0),
             ttft_ms: Some(5000.0),
@@ -835,6 +874,7 @@ mod tests {
         };
         let v2 = VllmRawMetrics {
             num_requests_running: Some(2.0),
+            kv_cache_usage_perc: Some(50.0),
             generation_tokens_per_sec: Some(100.0),
             window_duration_secs: Some(2.0),
             ttft_ms: Some(50.0),
@@ -867,5 +907,150 @@ mod tests {
         assert!((agg.vllm.ttft_ms.unwrap() - expected_ms).abs() < 1e-6);
         let duration_weighted_ms = (5000.0 * 10.0 + 50.0 * 2.0) / 12.0;
         assert!((agg.vllm.ttft_ms.unwrap() - duration_weighted_ms).abs() > 100.0);
+    }
+
+    #[test]
+    fn aggregate_stores_mass_fields_on_aggregate() {
+        let g = GpuRawMetrics::default();
+        let v1 = VllmRawMetrics {
+            num_requests_running: Some(2.0),
+            kv_cache_usage_perc: Some(50.0),
+            window_duration_secs: Some(2.0),
+            ttft_window_mass: Some(HistogramWindowMass {
+                sum_delta: 2.0,
+                count_delta: 4.0,
+            }),
+            tpot_window_mass: Some(HistogramWindowMass {
+                sum_delta: 1.0,
+                count_delta: 10.0,
+            }),
+            queue_window_mass: Some(HistogramWindowMass {
+                sum_delta: 0.5,
+                count_delta: 5.0,
+            }),
+            prompt_tokens_window_mass: Some(HistogramWindowMass {
+                sum_delta: 100.0,
+                count_delta: 2.0,
+            }),
+            ..Default::default()
+        };
+        let v2 = VllmRawMetrics {
+            num_requests_running: Some(2.0),
+            kv_cache_usage_perc: Some(50.0),
+            window_duration_secs: Some(2.0),
+            ttft_window_mass: Some(HistogramWindowMass {
+                sum_delta: 3.0,
+                count_delta: 6.0,
+            }),
+            tpot_window_mass: Some(HistogramWindowMass {
+                sum_delta: 2.0,
+                count_delta: 20.0,
+            }),
+            queue_window_mass: Some(HistogramWindowMass {
+                sum_delta: 1.5,
+                count_delta: 15.0,
+            }),
+            prompt_tokens_window_mass: Some(HistogramWindowMass {
+                sum_delta: 200.0,
+                count_delta: 4.0,
+            }),
+            ..Default::default()
+        };
+        let w1 = RawSnapshot {
+            gpu_observed_at: SystemTime::UNIX_EPOCH,
+            vllm_observed_at: SystemTime::UNIX_EPOCH,
+            timestamp: SystemTime::UNIX_EPOCH,
+            vllm: v1,
+            gpu: g.clone(),
+        };
+        let w2 = RawSnapshot {
+            gpu_observed_at: SystemTime::UNIX_EPOCH,
+            vllm_observed_at: SystemTime::UNIX_EPOCH,
+            timestamp: SystemTime::UNIX_EPOCH,
+            vllm: v2,
+            gpu: g,
+        };
+        let agg = aggregate_windows(
+            &[w1, w2],
+            &[Duration::from_secs(2), Duration::from_secs(2)],
+            SystemTime::UNIX_EPOCH,
+        );
+        assert_eq!(
+            agg.vllm.ttft_window_mass,
+            Some(HistogramWindowMass {
+                sum_delta: 5.0,
+                count_delta: 10.0,
+            })
+        );
+        assert_eq!(
+            agg.vllm.tpot_window_mass,
+            Some(HistogramWindowMass {
+                sum_delta: 3.0,
+                count_delta: 30.0,
+            })
+        );
+        assert_eq!(
+            agg.vllm.queue_window_mass,
+            Some(HistogramWindowMass {
+                sum_delta: 2.0,
+                count_delta: 20.0,
+            })
+        );
+        assert_eq!(
+            agg.vllm.prompt_tokens_window_mass,
+            Some(HistogramWindowMass {
+                sum_delta: 300.0,
+                count_delta: 6.0,
+            })
+        );
+    }
+
+    #[test]
+    fn aggregate_means_use_active_windows_only() {
+        let idle_v = VllmRawMetrics {
+            num_requests_running: Some(8.0),
+            kv_cache_usage_perc: Some(10.0),
+            generation_tokens_per_sec: Some(10.0),
+            window_duration_secs: Some(2.0),
+            ..Default::default()
+        };
+        let idle_g = GpuRawMetrics {
+            gpu_util_pct: Some(5.0),
+            ..Default::default()
+        };
+        let active_v = VllmRawMetrics {
+            num_requests_running: Some(20.0),
+            kv_cache_usage_perc: Some(50.0),
+            generation_tokens_per_sec: Some(100.0),
+            window_duration_secs: Some(2.0),
+            ..Default::default()
+        };
+        let active_g = GpuRawMetrics {
+            gpu_util_pct: Some(60.0),
+            ..Default::default()
+        };
+        let mk = |v: VllmRawMetrics, g: GpuRawMetrics| RawSnapshot {
+            gpu_observed_at: SystemTime::UNIX_EPOCH,
+            vllm_observed_at: SystemTime::UNIX_EPOCH,
+            timestamp: SystemTime::UNIX_EPOCH,
+            vllm: v,
+            gpu: g,
+        };
+        let windows = vec![
+            mk(idle_v, idle_g),
+            mk(active_v.clone(), active_g.clone()),
+            mk(active_v, active_g),
+        ];
+        let durations = vec![
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        ];
+        let agg = aggregate_windows(&windows, &durations, SystemTime::UNIX_EPOCH);
+        assert!((agg.vllm.generation_tokens_per_sec.unwrap() - 100.0).abs() < 1e-9);
+        assert!((agg.vllm.num_requests_running.unwrap() - 20.0).abs() < 1e-9);
+        assert!((agg.gpu.gpu_util_pct.unwrap() - 60.0).abs() < 1e-9);
+        // Evaluable blend would be (10+100+100)/3 weighted by equal duration = 70 tok/s.
+        assert!((agg.vllm.generation_tokens_per_sec.unwrap() - 70.0).abs() > 10.0);
     }
 }

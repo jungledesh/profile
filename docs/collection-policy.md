@@ -3,11 +3,15 @@
 Normative rules for how Profile combines vLLM `/metrics` scrapes and NVML polls.
 
 **What Profile measures — and what it doesn't.**
-Profile reports on the character of the server under load, not the aggregate experience of every request in a session. Latency, throughput, GPU utilization, and cache hit rates are computed over **evaluable windows only** — periods where `num_requests_running > 0.75` OR `tok/s > 20`. Idle periods are excluded entirely from these aggregates.
+Profile reports on the character of the server under load, not the aggregate experience of every request in a session. Latency, throughput, GPU utilization, and cache hit rates are computed over **active windows only**. Idle periods are excluded from these aggregates.
 
-This is a deliberate design choice: time-weighting across evaluable windows acts as a low-pass filter against volumetric noise. A 1-second burst of 10,000 tiny fast requests gets 1 second of vote; 59 seconds of steady-state 100ms latency keeps its dominance. Profile measures the stability of the provider, not the distribution of the workload that hit it.
+Two-tier gate:
 
-**Evaluable window gate:** `window_is_evaluable` is true when there is enough concurrent load or tok/s. Diagnostic aggregates prioritize **what happened under load** while still exposing **true cumulative counters** from the latest collection.
+**Tier 1 — structurally evaluable** (`window_is_evaluable`): `window_duration_secs` present and positive AND `num_requests_running` is `Some` (even if zero). Used by the rule engine. `running = 0` passes.
+
+**Tier 2 — active** (`window_is_active`): `running_reqs > 0` AND (`kv_cache_pct > 30%` OR `gpu_util_pct > 20%`). If both metrics are absent, `running_reqs > 0` alone is the fallback. Used by aggregated means. Idle windows are excluded here.
+
+This is a deliberate design choice: time-weighting across active windows acts as a low-pass filter against idle dilution. Profile measures behavior under load. Idle state has no waste to measure.
 
 ---
 

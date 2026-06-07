@@ -23,7 +23,7 @@ pub struct PrefixCacheScrapeSample {
 
 /// Δ(sum) and Δ(count) for a Prometheus histogram between **first → last** scrape in a window.
 /// Sum units match the histogram (seconds for latency histograms, token-sum for `request_prompt_tokens`).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HistogramWindowMass {
     pub sum_delta: f64,
     pub count_delta: f64,
@@ -173,6 +173,39 @@ pub fn window_is_evaluable(s: &RawSnapshot) -> bool {
     duration_ok && vllm_ok
 }
 
+pub const ACTIVE_KV_CACHE_PCT_THRESHOLD: f64 = 30.0;
+pub const ACTIVE_GPU_UTIL_PCT_THRESHOLD: f64 = 20.0;
+
+/// A window contributed real work — used to gate aggregated means.
+/// Separate from `window_is_evaluable`, which only checks structural validity.
+///
+/// Requires `running_reqs > 0` plus at least one activity signal:
+///   - kv_cache_pct > 30%  (decode + sustained load)
+///   - gpu_util_pct > 20%  (prefill bursts; secondary — NVML is coarse)
+///
+/// If both signals are absent, `running_reqs > 0` alone is the fallback.
+pub fn window_is_active(s: &RawSnapshot) -> bool {
+    let running = s
+        .vllm
+        .num_requests_running
+        .filter(|r| r.is_finite() && *r > 0.0);
+    let Some(_) = running else {
+        return false;
+    };
+
+    let kv = s.vllm.kv_cache_usage_perc;
+    let gpu = s.gpu.gpu_util_pct;
+
+    match (kv, gpu) {
+        (None, None) => true,
+        (Some(k), None) => k > ACTIVE_KV_CACHE_PCT_THRESHOLD,
+        (None, Some(g)) => g > ACTIVE_GPU_UTIL_PCT_THRESHOLD,
+        (Some(k), Some(g)) => {
+            k > ACTIVE_KV_CACHE_PCT_THRESHOLD || g > ACTIVE_GPU_UTIL_PCT_THRESHOLD
+        }
+    }
+}
+
 #[cfg(test)]
 mod window_evaluable_tests {
     use super::*;
@@ -210,5 +243,67 @@ mod window_evaluable_tests {
     #[test]
     fn false_when_duration_zero() {
         assert!(!window_is_evaluable(&snap(Some(1.0), Some(0.0))));
+    }
+}
+
+#[cfg(test)]
+mod window_active_tests {
+    use super::*;
+    use std::time::SystemTime;
+
+    fn snap(run: f64, kv: Option<f64>, gpu: Option<f64>) -> RawSnapshot {
+        RawSnapshot {
+            gpu_observed_at: SystemTime::UNIX_EPOCH,
+            vllm_observed_at: SystemTime::UNIX_EPOCH,
+            timestamp: SystemTime::UNIX_EPOCH,
+            vllm: VllmRawMetrics {
+                num_requests_running: Some(run),
+                kv_cache_usage_perc: kv,
+                window_duration_secs: Some(2.0),
+                ..Default::default()
+            },
+            gpu: GpuRawMetrics {
+                gpu_util_pct: gpu,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn false_when_running_zero() {
+        assert!(!window_is_active(&snap(0.0, Some(50.0), Some(50.0))));
+    }
+
+    #[test]
+    fn false_when_running_zero_and_both_signals_absent() {
+        assert!(!window_is_active(&snap(0.0, None, None)));
+    }
+
+    #[test]
+    fn true_when_both_signals_absent_and_running_positive() {
+        assert!(window_is_active(&snap(5.0, None, None)));
+    }
+
+    #[test]
+    fn true_when_kv_above_threshold() {
+        assert!(window_is_active(&snap(5.0, Some(31.0), None)));
+        assert!(!window_is_active(&snap(5.0, Some(30.0), None)));
+    }
+
+    #[test]
+    fn true_when_gpu_above_threshold() {
+        assert!(window_is_active(&snap(5.0, None, Some(21.0))));
+        assert!(!window_is_active(&snap(5.0, None, Some(20.0))));
+    }
+
+    #[test]
+    fn false_when_both_present_neither_above_threshold() {
+        assert!(!window_is_active(&snap(5.0, Some(10.0), Some(10.0))));
+    }
+
+    #[test]
+    fn true_when_both_present_either_above_threshold() {
+        assert!(window_is_active(&snap(5.0, Some(10.0), Some(25.0))));
+        assert!(window_is_active(&snap(5.0, Some(35.0), Some(10.0))));
     }
 }
