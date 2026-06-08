@@ -11,7 +11,8 @@ mod r4_oom_risk;
 mod r5_concurrency_saturation;
 
 pub use r1_under_batching::{
-    r1_recommendation, rule1_under_batching, R1MissReport, Rule1Outcome, UnderBatchingDetail,
+    r1_recommendation, r1_verbose_miss_line, rule1_under_batching, R1MissReport, Rule1Outcome,
+    UnderBatchingDetail,
 };
 pub use r2_kv_cache_pressure::{
     r2_recommendation, rule2_kv_admission_backlog, rule2_kv_cache_pressure,
@@ -33,9 +34,7 @@ use r2_kv_cache_pressure::{
 };
 #[cfg(test)]
 use r3_low_prefix_reuse::format_low_prefix_hit_rate_fired;
-use r3_low_prefix_reuse::{
-    aggregate_r3_detail, format_low_prefix_window_issue, format_rule3_verbose_miss,
-};
+use r3_low_prefix_reuse::{aggregate_r3_detail, format_low_prefix_window_issue};
 use r5_concurrency_saturation::{
     aggregate_concurrency_saturation_detail, format_concurrency_saturation_window_issue,
     r5_short_action,
@@ -229,20 +228,58 @@ pub fn no_evaluable_diagnose_lines(verbose: bool, windows: &[RuntimeWindow]) -> 
     out
 }
 
-fn r1_verbose_miss_line(snapshot: &RawSnapshot, config_max_num_seqs: Option<u32>) -> String {
-    match rule1_under_batching(snapshot, config_max_num_seqs) {
-        Rule1Outcome::NotFired(m) => {
-            if let Some(ratio) = m.prefill_saturation_ratio {
-                format!(
-                    "Under-batching: not triggered (prefill saturated at {:.0}%)",
-                    ratio * 100.0
-                )
-            } else {
-                "Under-batching: not triggered".to_string()
-            }
-        }
-        Rule1Outcome::Fired(_) => "Under-batching: not triggered".to_string(),
+fn append_not_triggered_lines(
+    out: &mut Vec<String>,
+    names: &[&str],
+    verbose_rules: bool,
+    r1_context: Option<(&RawSnapshot, Option<u32>)>,
+) {
+    if names.is_empty() {
+        return;
     }
+    if !out.is_empty() && !out.last().is_some_and(|l| l.is_empty()) {
+        out.push(String::new());
+    }
+    for name in names {
+        let line = if *name == "Under-batching" && verbose_rules {
+            match r1_context {
+                Some((snap, max_seqs)) => r1_verbose_miss_line(snap, max_seqs),
+                None => format!("{name}: not triggered"),
+            }
+        } else {
+            format!("{name}: not triggered")
+        };
+        out.push(line);
+    }
+}
+
+fn should_show_not_triggered(verbose_rules: bool, any_issue: bool, any_advisory: bool) -> bool {
+    verbose_rules || any_issue || any_advisory
+}
+
+fn not_triggered_from_fired_names(
+    fired_names: &std::collections::HashSet<&'static str>,
+    r2_suppressed_by_r4: bool,
+    r2_adv_present: bool,
+    r4_adv_present: bool,
+) -> Vec<&'static str> {
+    let mut names = Vec::new();
+    if !fired_names.contains("under_batching") {
+        names.push("Under-batching");
+    }
+    if !fired_names.contains("kv_cache_pressure") && !r2_suppressed_by_r4 && !r2_adv_present {
+        names.push("KV cache pressure");
+    }
+    if !fired_names.contains("oom_risk") && !r4_adv_present {
+        names.push("OOM risk");
+    }
+    if !fired_names.contains("concurrency_saturation") {
+        names.push("Concurrency saturation");
+    }
+    if !fired_names.contains("low_prefix_reuse") {
+        names.push("Low prefix reuse");
+    }
+    names
 }
 
 pub fn format_diagnose_rules(
@@ -288,6 +325,8 @@ pub fn format_diagnose_rules(
     );
 
     let any_advisory = r2_adv.is_some() || r4_adv.is_some();
+    let r2_adv_present = r2_adv.is_some();
+    let r4_adv_present = r4_adv.is_some();
     if let Some(lines) = r2_adv {
         append_display_block(&mut out, lines);
     }
@@ -295,29 +334,20 @@ pub fn format_diagnose_rules(
         append_display_block(&mut out, lines);
     }
 
-    let mut verbose_miss = Vec::new();
-    if verbose_rules {
-        if !fired_names.contains("under_batching") {
-            verbose_miss.push(r1_verbose_miss_line(
-                snapshot,
-                input.ctx.config.max_num_seqs,
-            ));
-            verbose_miss.push(String::new());
-        }
-        if !fired_names.contains("kv_cache_pressure") && !report.r2_suppressed_by_r4 {
-            verbose_miss.push("KV cache pressure: not triggered".to_string());
-            verbose_miss.push(String::new());
-        }
-        if !fired_names.contains("low_prefix_reuse") {
-            verbose_miss.extend(format_rule3_verbose_miss(snapshot));
-            verbose_miss.push(String::new());
-        }
-        if !fired_names.contains("concurrency_saturation") {
-            verbose_miss.push("Concurrency saturation: not triggered".to_string());
-            verbose_miss.push(String::new());
-        }
+    let not_fired = not_triggered_from_fired_names(
+        &fired_names,
+        report.r2_suppressed_by_r4,
+        r2_adv_present,
+        r4_adv_present,
+    );
+    if should_show_not_triggered(verbose_rules, any_issue, any_advisory) {
+        append_not_triggered_lines(
+            &mut out,
+            &not_fired,
+            verbose_rules,
+            Some((snapshot, input.ctx.config.max_num_seqs)),
+        );
     }
-    out.append(&mut verbose_miss);
 
     if !any_issue && !any_advisory && !verbose_rules {
         out.push(NO_ISSUES_LINE.to_string());
@@ -596,18 +626,33 @@ pub fn build_report_for_windows(
 
     if eval.r3_significant() {
         let d = aggregate_r3_detail(&eval.r3_details, summary_snap);
+        let enable_prefix = summary_snap.vllm.cache_config.enable_prefix_caching;
+        let (action, short_action, impact, confidence) = if d.hit_rate.is_none() {
+            (
+                "Enable --enable-prefix-caching".to_string(),
+                "enable prefix caching".to_string(),
+                3,
+                0.95_f64,
+            )
+        } else {
+            (
+                "Move shared context to prompt prefix; standardize prompt templates".to_string(),
+                "standardize prompts to share prefix context".to_string(),
+                2,
+                0.9_f64,
+            )
+        };
         recs.push(Recommendation {
             rule_name: "low_prefix_reuse",
-            impact: 2,
-            confidence: 0.9,
-            action: "Move shared context to prompt prefix; standardize prompt templates"
-                .to_string(),
-            short_action: "standardize prompts to share prefix context".to_string(),
+            impact,
+            confidence,
+            action,
+            short_action,
             expected_impact: "Higher prefix cache hit rate and lower TTFT".to_string(),
             display_lines: format_low_prefix_window_issue(
                 &d,
                 pct(eval.r3_fired, eval.n_eval),
-                summary_snap.vllm.cache_config.enable_prefix_caching,
+                enable_prefix,
             ),
         });
     }
@@ -671,6 +716,8 @@ pub fn format_diagnose_rules_for_windows(
             summary_baseline.as_ref().map(|b| b.weight_gb),
         );
         let any_advisory = r2_adv.is_some() || r4_adv.is_some();
+        let r2_adv_present = r2_adv.is_some();
+        let r4_adv_present = r4_adv.is_some();
         if let Some(lines) = r2_adv {
             out.extend(lines);
             out.push(String::new());
@@ -679,21 +726,20 @@ pub fn format_diagnose_rules_for_windows(
             out.extend(lines);
             out.push(String::new());
         }
-        let mut verbose_miss = Vec::new();
         if verbose_rules {
-            verbose_miss.push(r1_verbose_miss_line(
-                summary_snap,
-                summary.ctx.config.max_num_seqs,
-            ));
-            verbose_miss.push(String::new());
-            verbose_miss.push("KV cache pressure: not triggered".to_string());
-            verbose_miss.push(String::new());
-            verbose_miss.extend(format_rule3_verbose_miss(summary_snap));
-            verbose_miss.push(String::new());
-            verbose_miss.push("Concurrency saturation: not triggered".to_string());
-            verbose_miss.push(String::new());
+            let not_fired = not_triggered_from_fired_names(
+                &std::collections::HashSet::new(),
+                false,
+                r2_adv_present,
+                r4_adv_present,
+            );
+            append_not_triggered_lines(
+                &mut out,
+                &not_fired,
+                verbose_rules,
+                Some((summary_snap, summary.ctx.config.max_num_seqs)),
+            );
         }
-        out.append(&mut verbose_miss);
         if !any_advisory && !verbose_rules {
             out.push(NO_ISSUES_LINE.to_string());
         }
@@ -719,7 +765,6 @@ pub fn format_diagnose_rules_for_windows(
     let r5_significant = rule_is_significant(r5_fired, n_eval);
 
     let mut warnings = Vec::new();
-    let mut verbose_miss = Vec::new();
 
     if r1_significant {
         let block = format_under_batching_window_issue(
@@ -729,12 +774,6 @@ pub fn format_diagnose_rules_for_windows(
         );
         warnings.extend(block);
         warnings.push(String::new());
-    } else if verbose_rules {
-        verbose_miss.push(r1_verbose_miss_line(
-            summary_snap,
-            summary.ctx.config.max_num_seqs,
-        ));
-        verbose_miss.push(String::new());
     }
 
     if r2_significant {
@@ -758,9 +797,6 @@ pub fn format_diagnose_rules_for_windows(
         );
         warnings.extend(block);
         warnings.push(String::new());
-    } else if verbose_rules {
-        verbose_miss.push("KV cache pressure: not triggered".to_string());
-        verbose_miss.push(String::new());
     }
 
     if r5_significant && !r2_significant && !r2_backlog_significant {
@@ -773,9 +809,6 @@ pub fn format_diagnose_rules_for_windows(
             warnings.extend(block);
             warnings.push(String::new());
         }
-    } else if verbose_rules && !r2_significant && !r2_backlog_significant {
-        verbose_miss.push("Concurrency saturation: not triggered".to_string());
-        verbose_miss.push(String::new());
     }
 
     if r3_significant {
@@ -785,9 +818,6 @@ pub fn format_diagnose_rules_for_windows(
             summary_snap.vllm.cache_config.enable_prefix_caching,
         ));
         warnings.push(String::new());
-    } else if verbose_rules {
-        verbose_miss.extend(format_rule3_verbose_miss(summary_snap));
-        verbose_miss.push(String::new());
     }
 
     let r4 = r4_recommendation(
@@ -851,7 +881,6 @@ pub fn format_diagnose_rules_for_windows(
     let advisories_present = !advisories.is_empty();
     let mut out = warnings;
     out.append(&mut advisories);
-    out.append(&mut verbose_miss);
 
     let mut not_fired = Vec::new();
     if !r1_significant {
@@ -866,13 +895,8 @@ pub fn format_diagnose_rules_for_windows(
     if !r5_significant {
         not_fired.push("Concurrency saturation");
     }
-    if !verbose_rules && !not_fired.is_empty() {
-        if !out.is_empty() && !out.last().is_some_and(|l| l.is_empty()) {
-            out.push(String::new());
-        }
-        for name in &not_fired {
-            out.push(format!("{name}: not triggered"));
-        }
+    if !r3_significant {
+        not_fired.push("Low prefix reuse");
     }
     let r5_warning = r5_significant && !r2_significant && !r2_backlog_significant;
     let any_warning = r1_significant
@@ -881,6 +905,14 @@ pub fn format_diagnose_rules_for_windows(
         || r3_significant
         || r5_warning
         || !r4_groups.is_empty();
+    if should_show_not_triggered(verbose_rules, any_warning, advisories_present) {
+        append_not_triggered_lines(
+            &mut out,
+            &not_fired,
+            verbose_rules,
+            Some((summary_snap, summary.ctx.config.max_num_seqs)),
+        );
+    }
     if !any_warning && !advisories_present && !verbose_rules {
         out.push(NO_ISSUES_LINE.to_string());
     }
@@ -1138,7 +1170,7 @@ mod tests {
         assert!(text.contains("under-fed by client"));
         assert!(text.contains("Batch more requests or increase client concurrency"));
         assert!(text.contains("slots idle"));
-        assert!(text.contains("Expected: Higher throughput, lower TPOT at scale."));
+        assert!(text.contains("Expected: Higher throughput, stable TPOT."));
         assert!(
             text.contains("Confidence: High") || text.contains("Confidence: Medium"),
             "confidence reflects efficiency availability: {text}"
@@ -1167,6 +1199,26 @@ mod tests {
     }
 
     #[test]
+    fn format_diagnose_verbose_r1_shows_prefill_saturation_when_gate_suppresses() {
+        use crate::collectors::HistogramWindowMass;
+        let t = SystemTime::UNIX_EPOCH;
+        let mut v = vllm_base();
+        v.num_requests_running = Some(5.0);
+        v.num_requests_waiting = Some(0.0);
+        v.prefill_window_mass = Some(HistogramWindowMass {
+            sum_delta: 1.6,
+            count_delta: 4.0,
+        });
+        v.window_duration_secs = Some(2.0);
+        let s = snap(t, t, v, gpu_busy());
+        let ctx = mk_ctx();
+        let win = mk_win(s);
+        let text =
+            format_diagnose_rules(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics").join("\n");
+        assert!(text.contains("Under-batching: not triggered (prefill saturated at 80%)"));
+    }
+
+    #[test]
     fn format_diagnose_verbose_shows_not_indicated_when_no_issue() {
         let t = SystemTime::UNIX_EPOCH;
         let mut g = gpu_low();
@@ -1180,7 +1232,7 @@ mod tests {
             format_diagnose_rules(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics").join("\n");
         assert!(text.contains("Under-batching: not triggered"));
         assert!(text.contains("KV cache pressure: not triggered"));
-        assert!(text.contains("Prefix cache hit rate: 50.0% (not triggered)"));
+        assert!(text.contains("Low prefix reuse: not triggered"));
         assert!(text.contains("Concurrency saturation: not triggered"));
         assert!(!text.contains("No issues detected in this snapshot."));
     }
@@ -1310,10 +1362,7 @@ mod tests {
             format_diagnose_rules(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics").join("\n");
         assert!(text.contains("Under-batching: not triggered"));
         assert!(text.contains("KV cache pressure: not triggered"));
-        assert!(
-            text.contains("Prefix cache hit rate: 50.0% (not triggered)")
-                || text.contains("Prefix cache hit rate: not triggered")
-        );
+        assert!(text.contains("Low prefix reuse: not triggered"));
         assert!(text.contains("Concurrency saturation: not triggered"));
         assert!(!text.contains("No issues detected in this snapshot."));
     }
@@ -1383,9 +1432,9 @@ mod tests {
         let text =
             format_diagnose_rules(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics").join("\n");
         assert!(text.contains("Under-batching: not triggered"));
-        assert!(text.contains("KV cache pressure: not triggered"));
         assert!(text.contains("[i] KV Cache Pressure: core metric unavailable"));
-        assert!(text.contains("Prefix cache hit rate: 50.0% (not triggered)"));
+        assert!(!text.contains("KV cache pressure: not triggered"));
+        assert!(text.contains("Low prefix reuse: not triggered"));
         assert!(text.contains("Concurrency saturation: not triggered"));
         assert!(!text.contains("No issues detected in this snapshot."));
     }
@@ -1401,7 +1450,7 @@ mod tests {
         let win = mk_win(s);
         match rule3_low_prefix_reuse(&win.snapshot) {
             Rule3Outcome::Fired(d) => {
-                assert!((d.hit_rate - 0.34).abs() < 1e-9);
+                assert_eq!(d.hit_rate, Some(0.34));
                 assert!((d.prompt_tokens_mean - 25.0).abs() < 1e-9);
             }
             Rule3Outcome::NotFired => panic!("expected fired"),
@@ -1426,7 +1475,7 @@ mod tests {
     #[test]
     fn format_low_prefix_hit_rate_fired_matches_template() {
         let d = LowPrefixReuseDetail {
-            hit_rate: 0.24,
+            hit_rate: Some(0.24),
             prompt_tokens_mean: 128.0,
         };
         let lines = format_low_prefix_hit_rate_fired(&d, Some(true));
@@ -1439,7 +1488,7 @@ mod tests {
         assert!(text.contains("Move shared instructions/system prompts to the very start"));
         assert!(text.contains("Standardize prompt templates across requests"));
         assert!(text.contains("Avoid unique tokens"));
-        assert!(text.contains("Expected: Reduced prefill time"));
+        assert!(text.contains("Expected: Lower TTFT on repeated prefixes"));
         assert!(text.contains("Confidence: High"));
     }
 
@@ -1453,7 +1502,7 @@ mod tests {
         let win = mk_win(s);
         let text =
             format_diagnose_rules(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics").join("\n");
-        assert!(text.contains("Prefix cache hit rate: 50.0% (not triggered)"));
+        assert!(text.contains("Low prefix reuse: not triggered"));
     }
 
     #[test]
@@ -1467,7 +1516,7 @@ mod tests {
         let win = mk_win(s);
         let text =
             format_diagnose_rules(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics").join("\n");
-        assert!(text.contains("Prefix cache hit rate: not triggered"));
+        assert!(text.contains("Low prefix reuse: not triggered"));
         assert!(!text.contains("working effectively"));
     }
 
@@ -1671,6 +1720,7 @@ mod tests {
         let text = r2_issue_lines(windows).join("\n");
         assert!(!text.contains("[!] KV Cache Pressure"));
         assert!(text.contains("KV cache pressure: not triggered"));
+        assert!(text.contains("Low prefix reuse: not triggered"));
         assert!(!text.contains("Seen in"));
     }
 
@@ -1762,6 +1812,7 @@ mod tests {
         assert!(text.contains("  Cause:"));
         assert!(text.contains("Batch more requests or increase client concurrency"));
         assert!(text.contains("KV cache pressure: not triggered"));
+        assert!(text.contains("Low prefix reuse: not triggered"));
         assert!(text.contains("Concurrency saturation: not triggered"));
     }
 

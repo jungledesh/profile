@@ -126,6 +126,22 @@ pub fn r1_recommendation(
     })
 }
 
+pub fn r1_verbose_miss_line(snapshot: &RawSnapshot, config_max_num_seqs: Option<u32>) -> String {
+    match rule1_under_batching(snapshot, config_max_num_seqs) {
+        Rule1Outcome::NotFired(m) => {
+            if let Some(ratio) = m.prefill_saturation_ratio {
+                format!(
+                    "Under-batching: not triggered (prefill saturated at {:.0}%)",
+                    ratio * 100.0
+                )
+            } else {
+                "Under-batching: not triggered".to_string()
+            }
+        }
+        Rule1Outcome::Fired(_) => "Under-batching: not triggered".to_string(),
+    }
+}
+
 pub(super) fn r1_short_action(d: &UnderBatchingDetail) -> String {
     let max_n = d.max_num_seqs.unwrap_or(0);
     let idle_slots = f64::from(max_n) - d.running;
@@ -166,7 +182,7 @@ pub(super) fn format_under_batching_fired(d: &UnderBatchingDetail, confidence: f
         "  Fix:".to_string(),
         fix_line,
         String::new(),
-        "  Expected: Higher throughput, lower TPOT at scale.".to_string(),
+        "  Expected: Higher throughput, stable TPOT.".to_string(),
         format!("  Confidence: {confidence_str}"),
     ]
 }
@@ -426,6 +442,22 @@ mod tests {
             }
             Rule1Outcome::Fired(_) => panic!("expected not fired"),
         }
+    }
+
+    #[test]
+    fn r1_verbose_miss_line_shows_prefill_saturation_ratio() {
+        let s = snap_with_gates(
+            Some(5.0),
+            Some(256),
+            Some(0.0),
+            Some(HistogramWindowMass {
+                sum_delta: 1.6,
+                count_delta: 4.0,
+            }),
+            Some(2.0),
+        );
+        let line = r1_verbose_miss_line(&s, None);
+        assert!(line.contains("prefill saturated at 80%"));
     }
 
     #[test]

@@ -273,8 +273,8 @@ fn diagnose_exits_success() {
         "stdout should include LATENCY row; got:\n{out}"
     );
     assert!(
-        out.contains("PROMPT") && out.contains("kv_cache"),
-        "stdout should include PROMPT row; got:\n{out}"
+        out.contains("CACHE") && out.contains("kv_cache"),
+        "stdout should include CACHE row; got:\n{out}"
     );
     assert!(
         out.contains("THROUGHPUT") && out.contains("tok/s"),
@@ -285,8 +285,14 @@ fn diagnose_exits_success() {
         "stdout should always include TRAFFIC row; got:\n{out}"
     );
     assert!(
-        out.contains("pfix_cache "),
-        "stdout should include pfix_cache % on THROUGHPUT row; got:\n{out}"
+        out.lines()
+            .any(|line| line.contains("CACHE") && line.contains("pfix_cache ")),
+        "stdout should include pfix_cache % on CACHE row; got:\n{out}"
+    );
+    assert!(
+        !out.lines()
+            .any(|line| { line.contains("THROUGHPUT") && line.contains("pfix_cache ") }),
+        "pfix_cache should not appear on THROUGHPUT row; got:\n{out}"
     );
     assert!(
         !out.contains("[!]"),
@@ -395,7 +401,7 @@ fn diagnose_verbose_shows_not_indicated_lines() {
     assert!(
         out.contains("Under-batching: not triggered")
             && out.contains("KV cache pressure: not triggered")
-            && out.contains("Prefix cache hit rate: not triggered")
+            && out.contains("Low prefix reuse: not triggered")
             && out.contains("Concurrency saturation: not triggered")
             && !out.contains("No issues detected in this snapshot."),
         "expected verbose rule status lines without redundant no-issues summary; got:\n{out}"
