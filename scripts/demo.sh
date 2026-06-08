@@ -68,7 +68,7 @@ tmux new-session -d -s "$TMUX_SESSION" \
 "bash -lc 'source \"$VENV_DIR/bin/activate\" && \
 python -m vllm.entrypoints.openai.api_server \
   --model \"$MODEL_PATH\" \
-  --served-model-name qwen-coder \
+  --served-model-name Qwen2.5-Coder-7B-Instruct \
   --host 0.0.0.0 \
   --port 8000 \
   --dtype auto \

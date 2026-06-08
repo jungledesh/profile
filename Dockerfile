@@ -20,13 +20,17 @@ RUN export DEBIAN_FRONTEND=noninteractive \
     jq \
     gawk \
     tmux \
+    ffmpeg \
+    sudo \
     ca-certificates \
     && /usr/sbin/useradd -m -u 1000 -s /bin/bash appuser \
+    && echo "appuser ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/appuser \
     && rm -rf /var/lib/apt/lists/*
 
 # VHS — terminal session recorder (v0.11.0)
 RUN curl -fsSL https://github.com/charmbracelet/vhs/releases/download/v0.11.0/vhs_0.11.0_Linux_x86_64.tar.gz \
-    | tar -xz --strip-components=1 -C /usr/local/bin vhs_0.11.0_Linux_x86_64/vhs \
+    | tar -xz -C /tmp \
+    && find /tmp -name vhs -type f -exec mv {} /usr/local/bin/vhs \; \
     && chmod 0755 /usr/local/bin/vhs
 
 # Do not mkdir VENV_DIR — an empty dir breaks start.sh's "create venv if missing" check
