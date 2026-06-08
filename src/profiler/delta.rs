@@ -2,11 +2,22 @@ use crate::engine::Report;
 
 use super::DiagnoseResult;
 
+// Direction thresholds — Provisional: calibrate against real workloads before hardening.
+const EFFICIENCY_BETTER_PP: f64 = 2.0;
+const EFFICIENCY_WORSE_PP: f64 = -5.0;
+const DEFAULT_LATENCY_VETO_PCT: f64 = 20.0;
+const THROUGHPUT_BETTER_PCT: f64 = 10.0; // fallback only
+const THROUGHPUT_WORSE_PCT: f64 = -10.0; // fallback only
+
+/// Placeholder until NLP `Goal` is wired from `cli/goal/`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Goal;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
     Better,
     Worse,
-    /// &lt; 10% relative change in throughput (when known).
+    /// Efficiency within band, latency-vetoed gain, or fallback throughput within band.
     Plateau,
 }
 
@@ -16,7 +27,12 @@ pub struct Delta {
     pub throughput_delta_pct: Option<f64>,
     pub throughput_before: Option<f64>,
     pub throughput_after: Option<f64>,
-    /// Absolute percentage-point change in `efficiency_pct`.
+    /// Absolute percentage-point change in efficiency.
+    ///
+    /// Efficiency = actual_tps / (decode_ceiling × num_running), where num_running
+    /// is the time-weighted average across active windows in the measurement period.
+    /// This normalization cancels traffic-induced concurrency changes so the signal
+    /// reflects per-request hardware utilization, not load volume.
     pub efficiency_delta_pp: Option<f64>,
     pub efficiency_pct_before: Option<f64>,
     pub efficiency_pct_after: Option<f64>,
@@ -34,10 +50,82 @@ pub struct Delta {
     pub tpot_p99_before_ms: Option<f64>,
     pub tpot_p99_after_ms: Option<f64>,
     pub direction: Direction,
+    /// True when the latency veto downgraded a Better signal to Plateau.
+    /// Set by `evaluate_efficiency_delta`; read by `direction_detail` for output.
+    pub veto_fired: bool,
     pub config_drifted: bool,
 }
 
-const PLATEAU_THRESHOLD_PCT: f64 = 10.0;
+fn ttft_p99_regression_pct(delta: &Delta) -> Option<f64> {
+    delta
+        .ttft_p99_after_ms
+        .zip(delta.ttft_p99_before_ms)
+        .and_then(|(after, before)| {
+            if before > 0.0 && after.is_finite() && before.is_finite() {
+                Some((after - before) / before * 100.0)
+            } else {
+                None
+            }
+        })
+}
+
+fn latency_veto_fires(delta: &Delta) -> bool {
+    delta
+        .efficiency_delta_pp
+        .is_some_and(|eff| eff > EFFICIENCY_BETTER_PP)
+        && ttft_p99_regression_pct(delta).is_some_and(|v| v > DEFAULT_LATENCY_VETO_PCT)
+}
+
+fn evaluate_efficiency_delta(delta: &Delta) -> Direction {
+    match delta.efficiency_delta_pp {
+        Some(d) if d > EFFICIENCY_BETTER_PP => {
+            // Veto: throughput gain that destroys latency is not an improvement.
+            // veto_fired set by caller — see compute()
+            if latency_veto_fires(delta) {
+                Direction::Plateau
+            } else {
+                Direction::Better
+            }
+        }
+        Some(d) if d < EFFICIENCY_WORSE_PP => Direction::Worse,
+        Some(_) => Direction::Plateau,
+        // Efficiency unavailable (no catalog match). Fall back to raw throughput.
+        // Latency veto skipped — without efficiency, we cannot reliably apply it.
+        None => match delta.throughput_delta_pct {
+            Some(d) if d > THROUGHPUT_BETTER_PCT => Direction::Better,
+            Some(d) if d < THROUGHPUT_WORSE_PCT => Direction::Worse,
+            _ => Direction::Plateau,
+        },
+    }
+}
+
+/// v2: Default/Throughput path only.
+///
+/// `goal` is reserved — exhaustive match ensures future objectives fail to compile until handled.
+pub fn calculate_direction(delta: &Delta, _goal: Option<&Goal>) -> Direction {
+    evaluate_efficiency_delta(delta)
+}
+
+/// Human-readable signal detail for direction output (no label prefix).
+pub fn direction_detail(delta: &Delta) -> String {
+    match delta.efficiency_delta_pp {
+        Some(eff) => {
+            if delta.veto_fired {
+                if let Some(veto) = ttft_p99_regression_pct(delta) {
+                    return format!(
+                        "efficiency Δ: {:+.1} pp  |  ttft_p99 Δ: {:+.1}%  latency veto",
+                        eff, veto
+                    );
+                }
+            }
+            format!("efficiency Δ: {:+.1} pp", eff)
+        }
+        None => match delta.throughput_delta_pct {
+            Some(t) => format!("efficiency unavailable  throughput Δ: {:+.1}%", t),
+            None => "efficiency unavailable".to_string(),
+        },
+    }
+}
 
 pub fn compute(
     prev_result: &DiagnoseResult,
@@ -102,14 +190,7 @@ pub fn compute(
         .and_then(|b| b.cost.as_ref())
         .and_then(|c| c.joules_per_token);
 
-    let direction = match throughput_delta_pct {
-        Some(d) if d > PLATEAU_THRESHOLD_PCT => Direction::Better,
-        Some(d) if d < -PLATEAU_THRESHOLD_PCT => Direction::Worse,
-        Some(_) => Direction::Plateau,
-        None => Direction::Plateau,
-    };
-
-    Delta {
+    let mut delta = Delta {
         throughput_delta_pct,
         throughput_before,
         throughput_after,
@@ -129,9 +210,13 @@ pub fn compute(
         ttft_p99_after_ms,
         tpot_p99_before_ms,
         tpot_p99_after_ms,
-        direction,
+        direction: Direction::Plateau,
+        veto_fired: false,
         config_drifted,
-    }
+    };
+    delta.direction = calculate_direction(&delta, None);
+    delta.veto_fired = latency_veto_fires(&delta);
+    delta
 }
 
 #[cfg(test)]
@@ -209,8 +294,133 @@ mod tests {
         }
     }
 
+    fn mk_delta(
+        eff_pp: Option<f64>,
+        throughput_pct: Option<f64>,
+        ttft_p99_before: Option<f64>,
+        ttft_p99_after: Option<f64>,
+    ) -> Delta {
+        Delta {
+            throughput_delta_pct: throughput_pct,
+            throughput_before: None,
+            throughput_after: None,
+            efficiency_delta_pp: eff_pp,
+            efficiency_pct_before: None,
+            efficiency_pct_after: None,
+            cost_per_million_before: None,
+            cost_per_million_after: None,
+            joules_per_token_before: None,
+            joules_per_token_after: None,
+            cost_source_after: None,
+            ttft_before_ms: None,
+            ttft_after_ms: None,
+            tpot_before_ms: None,
+            tpot_after_ms: None,
+            ttft_p99_before_ms: ttft_p99_before,
+            ttft_p99_after_ms: ttft_p99_after,
+            tpot_p99_before_ms: None,
+            tpot_p99_after_ms: None,
+            direction: Direction::Plateau,
+            veto_fired: false,
+            config_drifted: false,
+        }
+    }
+
+    fn finalize_delta(mut d: Delta) -> Delta {
+        d.direction = calculate_direction(&d, None);
+        d.veto_fired = latency_veto_fires(&d);
+        d
+    }
+
     #[test]
-    fn direction_better_above_threshold() {
+    fn efficiency_better_above_threshold() {
+        let mut d = mk_delta(Some(3.0), None, Some(500.0), Some(500.0));
+        d.direction = evaluate_efficiency_delta(&d);
+        assert_eq!(d.direction, Direction::Better);
+    }
+
+    #[test]
+    fn efficiency_worse_below_threshold() {
+        let d = mk_delta(Some(-6.0), None, None, None);
+        assert_eq!(evaluate_efficiency_delta(&d), Direction::Worse);
+    }
+
+    #[test]
+    fn efficiency_plateau_within_band() {
+        let d = mk_delta(Some(1.0), None, None, None);
+        assert_eq!(evaluate_efficiency_delta(&d), Direction::Plateau);
+    }
+
+    #[test]
+    fn latency_veto_fires_on_better() {
+        let d = mk_delta(Some(3.0), None, Some(400.0), Some(500.0));
+        assert_eq!(evaluate_efficiency_delta(&d), Direction::Plateau);
+    }
+
+    #[test]
+    fn latency_veto_does_not_fire_on_plateau() {
+        let d = mk_delta(Some(1.0), None, Some(400.0), Some(500.0));
+        assert_eq!(evaluate_efficiency_delta(&d), Direction::Plateau);
+    }
+
+    #[test]
+    fn latency_veto_does_not_fire_on_worse() {
+        let d = mk_delta(Some(-6.0), None, Some(400.0), Some(500.0));
+        assert_eq!(evaluate_efficiency_delta(&d), Direction::Worse);
+    }
+
+    #[test]
+    fn latency_veto_skipped_when_ttft_none() {
+        let d = mk_delta(Some(3.0), None, None, Some(500.0));
+        assert_eq!(evaluate_efficiency_delta(&d), Direction::Better);
+    }
+
+    #[test]
+    fn efficiency_none_fallback_better() {
+        let d = mk_delta(None, Some(12.0), None, None);
+        assert_eq!(evaluate_efficiency_delta(&d), Direction::Better);
+    }
+
+    #[test]
+    fn efficiency_none_fallback_worse() {
+        let d = mk_delta(None, Some(-15.0), None, None);
+        assert_eq!(evaluate_efficiency_delta(&d), Direction::Worse);
+    }
+
+    #[test]
+    fn efficiency_none_fallback_plateau() {
+        let d = mk_delta(None, Some(4.0), None, None);
+        assert_eq!(evaluate_efficiency_delta(&d), Direction::Plateau);
+    }
+
+    #[test]
+    fn efficiency_and_throughput_both_none() {
+        let d = mk_delta(None, None, None, None);
+        assert_eq!(evaluate_efficiency_delta(&d), Direction::Plateau);
+    }
+
+    #[test]
+    fn none_goal_uses_efficiency_path() {
+        let d = finalize_delta(mk_delta(Some(3.0), None, None, None));
+        assert_eq!(d.direction, Direction::Better);
+    }
+
+    #[test]
+    fn veto_fired_true_when_veto_fires() {
+        let d = finalize_delta(mk_delta(Some(3.0), None, Some(400.0), Some(500.0)));
+        assert!(d.veto_fired);
+        assert_eq!(d.direction, Direction::Plateau);
+    }
+
+    #[test]
+    fn veto_fired_false_when_no_veto() {
+        let d = finalize_delta(mk_delta(Some(3.0), None, Some(400.0), Some(410.0)));
+        assert!(!d.veto_fired);
+        assert_eq!(d.direction, Direction::Better);
+    }
+
+    #[test]
+    fn compute_direction_better_on_efficiency_not_raw_throughput() {
         let d = compute(
             &diagnose(Some(100.0)),
             &report_eff(Some(50.0), None, None),
@@ -219,60 +429,31 @@ mod tests {
             false,
         );
         assert_eq!(d.direction, Direction::Better);
-        assert!((d.throughput_delta_pct.unwrap() - 12.0).abs() < 1e-9);
-        assert_eq!(d.throughput_before, Some(100.0));
-        assert_eq!(d.throughput_after, Some(112.0));
+        assert!((d.efficiency_delta_pp.unwrap() - 5.0).abs() < 1e-9);
     }
 
     #[test]
-    fn direction_worse_below_neg_threshold() {
-        let d = compute(
-            &diagnose(Some(100.0)),
-            &report_eff(Some(50.0), None, None),
-            &diagnose(Some(80.0)),
-            &report_eff(Some(45.0), None, None),
-            false,
-        );
-        assert_eq!(d.direction, Direction::Worse);
-        assert!((d.throughput_delta_pct.unwrap() + 20.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn direction_plateau_within_band() {
-        let d = compute(
-            &diagnose(Some(100.0)),
-            &report_eff(Some(50.0), None, None),
-            &diagnose(Some(101.0)),
-            &report_eff(Some(50.5), None, None),
-            false,
-        );
-        assert_eq!(d.direction, Direction::Plateau);
-    }
-
-    #[test]
-    fn direction_plateau_at_nine_pct_drop() {
-        let d = compute(
-            &diagnose(Some(100.0)),
-            &report_eff(Some(50.0), None, None),
-            &diagnose(Some(91.0)),
-            &report_eff(Some(45.0), None, None),
-            false,
-        );
-        assert_eq!(d.direction, Direction::Plateau);
-        assert!((d.throughput_delta_pct.unwrap() + 9.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn direction_worse_at_eleven_pct_drop() {
+    fn compute_direction_worse_on_efficiency_drop() {
         let d = compute(
             &diagnose(Some(100.0)),
             &report_eff(Some(50.0), None, None),
             &diagnose(Some(89.0)),
-            &report_eff(Some(45.0), None, None),
+            &report_eff(Some(43.0), None, None),
             false,
         );
         assert_eq!(d.direction, Direction::Worse);
-        assert!((d.throughput_delta_pct.unwrap() + 11.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn compute_direction_plateau_when_efficiency_flat_despite_throughput_swing() {
+        let d = compute(
+            &diagnose(Some(100.0)),
+            &report_eff(Some(50.0), None, None),
+            &diagnose(Some(91.0)),
+            &report_eff(Some(50.0), None, None),
+            false,
+        );
+        assert_eq!(d.direction, Direction::Plateau);
     }
 
     #[test]

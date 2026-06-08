@@ -61,12 +61,23 @@ pub fn r3_recommendation(snapshot: &RawSnapshot) -> Option<Recommendation> {
         return None;
     };
     let enable_prefix = snapshot.vllm.cache_config.enable_prefix_caching;
+    let (action, short_action) = if enable_prefix == Some(false) {
+        (
+            "Enable --enable-prefix-caching".to_string(),
+            "enable prefix caching".to_string(),
+        )
+    } else {
+        (
+            "Move shared context to prompt prefix; standardize prompt templates".to_string(),
+            "standardize prompts to share prefix context".to_string(),
+        )
+    };
     Some(Recommendation {
         rule_name: "low_prefix_reuse",
         impact: 2,
         confidence: 0.9,
-        action: "Move shared context to prompt prefix; standardize prompt templates".to_string(),
-        short_action: "standardize prompts to share prefix context".to_string(),
+        action,
+        short_action,
         expected_impact: "Higher prefix cache hit rate and lower TTFT".to_string(),
         display_lines: format_low_prefix_hit_rate_fired(&d, enable_prefix),
     })
@@ -88,7 +99,21 @@ pub(super) fn format_low_prefix_hit_rate_fired(
     enable_prefix_caching: Option<bool>,
 ) -> Vec<String> {
     let hit = d.hit_rate * 100.0;
-    vec![
+    let fix_lines: Vec<String> = if enable_prefix_caching == Some(false) {
+        vec![
+            "  • Enable prefix caching: --enable-prefix-caching".to_string(),
+            "  • Then move shared instructions/system prompts to the very start".to_string(),
+            "  • Standardize prompt templates across requests".to_string(),
+        ]
+    } else {
+        vec![
+            "  • Move shared instructions/system prompts to the very start".to_string(),
+            "  • Standardize prompt templates across requests".to_string(),
+            "  • Avoid unique tokens (IDs, timestamps) at the beginning".to_string(),
+        ]
+    };
+
+    let mut lines = vec![
         "[!] Low Prefix Cache".to_string(),
         String::new(),
         "  Cause:".to_string(),
@@ -99,13 +124,12 @@ pub(super) fn format_low_prefix_hit_rate_fired(
         prefix_cause_bullet(enable_prefix_caching),
         String::new(),
         "  Fix:".to_string(),
-        "  • Move shared instructions/system prompts to the very start".to_string(),
-        "  • Standardize prompt templates across requests".to_string(),
-        "  • Avoid unique tokens (IDs, timestamps) at the beginning".to_string(),
-        String::new(),
-        "  Expected: Reduced prefill time".to_string(),
-        "  Confidence: High".to_string(),
-    ]
+    ];
+    lines.extend(fix_lines);
+    lines.push(String::new());
+    lines.push("  Expected: Reduced prefill time".to_string());
+    lines.push("  Confidence: High".to_string());
+    lines
 }
 
 pub(super) fn format_low_prefix_window_issue(
@@ -147,5 +171,55 @@ pub(super) fn aggregate_r3_detail(
     LowPrefixReuseDetail {
         hit_rate,
         prompt_tokens_mean,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fix_bullets_differ_when_prefix_caching_disabled() {
+        let d = LowPrefixReuseDetail {
+            hit_rate: 0.10,
+            prompt_tokens_mean: 64.0,
+        };
+        let disabled = format_low_prefix_hit_rate_fired(&d, Some(false));
+        let enabled = format_low_prefix_hit_rate_fired(&d, Some(true));
+        assert!(disabled
+            .iter()
+            .any(|l| l.contains("--enable-prefix-caching")));
+        assert!(!disabled.iter().any(|l| l.contains("Avoid unique tokens")));
+        assert!(enabled.iter().any(|l| l.contains("Avoid unique tokens")));
+        assert!(!enabled
+            .iter()
+            .any(|l| l.contains("--enable-prefix-caching")));
+    }
+
+    #[test]
+    fn short_action_is_enable_flag_when_prefix_caching_disabled() {
+        use crate::collectors::{CacheConfigLabels, RawSnapshot, VllmRawMetrics};
+        use std::time::SystemTime;
+        let t = SystemTime::UNIX_EPOCH;
+        let snap = RawSnapshot {
+            gpu_observed_at: t,
+            vllm_observed_at: t,
+            timestamp: t,
+            vllm: VllmRawMetrics {
+                prefix_cache_hit_rate: Some(0.10),
+                prompt_tokens_mean: Some(64.0),
+                num_requests_running: Some(5.0),
+                request_success_per_sec: Some(10.0),
+                cache_config: CacheConfigLabels {
+                    enable_prefix_caching: Some(false),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            gpu: Default::default(),
+        };
+        let r = r3_recommendation(&snap).expect("fired");
+        assert_eq!(r.short_action, "enable prefix caching");
+        assert_eq!(r.action, "Enable --enable-prefix-caching");
     }
 }
