@@ -2,7 +2,6 @@
 
 Less Words. Less Noise. More Signal. More Value.
 
-
 A physics-grounded, cost-aware optimizer for vLLM.
 
 Profile measures live telemetry against the absolute physical limits of your hardware to expose waste, surface immediate configuration fixes, and reclaim infrastructure spend.
@@ -34,34 +33,71 @@ chmod +x profile && mv profile /usr/local/bin/
 ### 3. Run
 
 ```bash
-profile diagnose --url http://localhost:8000/metrics
+profile diagnose --url http://localhost:8000/metrics --duration 2m
 ```
 
 Or build from source & run:
 
 ```bash
 cargo install --git https://github.com/jungledesh/profile
-profile diagnose --url http://localhost:8000/metrics
+profile diagnose --url http://localhost:8000/metrics --duration 2m
 ```
 
-### 2. Live Interactive Optimization
+### 4. Sample Output
+
+Initial diagnose:
 
 ```
-Measuring delta...
-  Throughput      6125 → 6084 tok/s ↓
-  TTFT            36685 → 37849ms ↑
-  Efficiency      -0.2pp ↓
+$ profile diagnose --url http://localhost:8000/metrics --duration 2m -m 256
 
-ECONOMICS:
-  Cost/1M tok     $0.16 → $0.16 (est)
-  Recoverable     $2.38 → $2.39/hr ↑
+PHYSICS:
+  Model      Meta-Llama-3-8B-Instruct (8.0B params, bf16)
+  GPU        NVIDIA H200 SXM (141GB, 4800 GB/s BW, 67 TFLOP/s)
+  Decode     282 tok/s ceiling (est) — at 184 tok/s — 65.2% efficient
+  Prefill    1,543 tok/s ceiling (est)
+  Weights    16.0 GB — 124.6 GB KV headroom
+  Floors     TPOT min 3.5ms | Prefill min 0.6ms
 
-No significant change.
-Apply fix: raise --max-num-seqs above 64, then re-measure.
+───────────────────────────────────────────────────────────────────────────────
+
+[!] Concurrency Saturation
+
+  Seen in 87% of windows
+
+  Cause:
+  - max_num_seqs cap (32) hit: 29.4 avg running / 32 max
+  - Queue ratio: 67.8% of requests waiting
+
+  Fix:
+  • Raise --max-num-seqs above 32 (start: 64–128)
+  • Monitor KV usage — keep below 88% after increase
+  • Reduce max_tokens if prompts are long
+
+  Expected: Queue drains, TTFT recovers.
+  Confidence: High
+
+───────────────────────────────────────────────────────────────────────────────
 
 Apply your change to vLLM.
 Profile will detect when vLLM restarts automatically.
 Press Enter to skip and re-measure now.
+```
+
+After applying the fix, Profile re-measures and reports the delta:
+
+```
+Measuring delta...
+  Throughput  142 → 281 tok/s ↑
+  TTFT        4823 → 1204ms ↓  (p99 9847 → 2156ms ↓)
+  Efficiency  +32.4pp ↑
+
+ECONOMICS:
+  Cost/1M tok   $0.42 → $0.21 ↓ (est)
+  Recoverable   $1.84 → $0.92/hr ↓
+
+Direction: Better
+
+No issues detected. Efficiency: 65.2% of hardware ceiling.
 ```
 
 ---
@@ -70,6 +106,7 @@ Press Enter to skip and re-measure now.
 
 - **Concurrency Saturation:** `max_num_seqs` cap hit under high load. Requests stack in the queue, destroying TTFT.
 - **KV Cache Pressure:** VRAM near capacity, driving high token-eviction and preemption risks.
+- **Low Prefix Reuse:** Prefix cache hit rate too low under load — prompts share too little common prefix, wasting prefill compute and inflating TTFT.
 - **Under-Batching:** Upstream orchestration or client failure leaving massive GPU compute headroom unutilized.
 - **OOM Risk:** Model weight configuration structurally exceeds physical VRAM topology before execution begins.
 
@@ -82,13 +119,14 @@ Press Enter to skip and re-measure now.
 ```
 
 
-| Flag              | Default                         | Description                                                   |
-| ----------------- | ------------------------------- | ------------------------------------------------------------- |
-| `--url`           | `http://localhost:8000/metrics` | Target vLLM metrics endpoint                                  |
-| `--duration`      | `30s`                           | Sampling window (e.g., `30s`, `2m`, `5m`)                     |
-| `-m`              | `256`                           | Fallback value for `max_num_seqs` if absent from metrics      |
-| `--cost-per-hour` | catalog estimate                | Exact host instance rate for raw dollar tracking              |
-| `-v`              | off                             | Verbose mode. Exposes non-triggered rules and physical limits |
+| Flag                     | Default                         | Description                                                   |
+| ------------------------ | ------------------------------- | ------------------------------------------------------------- |
+| `--url`                  | `http://localhost:8000/metrics` | Target vLLM metrics endpoint                                  |
+| `--duration`             | `30s`                           | Sampling window (e.g., `30s`, `2m`, `5m`)                     |
+| `-m`                     | `256`                           | Fallback value for `max_num_seqs` if absent from metrics      |
+| `--tensor-parallel-size` | env / unset                     | Tensor parallel degree (overrides `TENSOR_PARALLEL_SIZE`)     |
+| `--cost-per-hour`        | catalog estimate                | Exact host instance rate for raw dollar tracking              |
+| `-v`                     | off                             | Verbose mode. Exposes non-triggered rules and physical limits |
 
 
 ---

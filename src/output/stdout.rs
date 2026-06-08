@@ -135,7 +135,7 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
         &vllm_latency_value(v, verbose_rules),
     ));
     lines.push(vllm_label_row(
-        "PROMPT",
+        "CACHE",
         &vllm_prompt_value(v, verbose_rules),
     ));
     lines.push(vllm_label_row("THROUGHPUT", &vllm_throughput_value(v)));
@@ -449,14 +449,15 @@ fn vllm_prompt_kv_fragment(v: &VllmRawMetrics) -> String {
 
 fn vllm_prompt_value(v: &VllmRawMetrics, verbose: bool) -> String {
     let kv = vllm_prompt_kv_fragment(v);
+    let cache = cache_use_fragment(v);
     if !verbose {
-        return kv;
+        return format!("{kv} | {cache}");
     }
     let n = v
         .prompt_tokens_mean
         .map(fmt_tok)
         .unwrap_or_else(|| "—".to_string());
-    format!("{n} tok | {kv}")
+    format!("{n} tok | {kv} | {cache}")
 }
 
 fn fmt_tok(t: f64) -> String {
@@ -468,12 +469,9 @@ fn fmt_tok(t: f64) -> String {
 }
 
 fn vllm_throughput_value(v: &VllmRawMetrics) -> String {
-    let tps = v
-        .generation_tokens_per_sec
+    v.generation_tokens_per_sec
         .map(|t| format!("{:.0} tok/s", t))
-        .unwrap_or_else(|| "— tok/s".to_string());
-    let cache = cache_use_fragment(v);
-    format!("{tps} | {cache}")
+        .unwrap_or_else(|| "— tok/s".to_string())
 }
 
 fn cache_use_fragment(v: &VllmRawMetrics) -> String {
@@ -1092,42 +1090,51 @@ mod tests {
     }
 
     #[test]
-    fn vllm_throughput_value_tok_s_and_cache() {
+    fn vllm_throughput_value_tok_s_only() {
         let v = VllmRawMetrics {
             generation_tokens_per_sec: Some(59.0),
             prefix_cache_hit_rate: Some(0.5),
             ..Default::default()
         };
-        assert_eq!(vllm_throughput_value(&v), "59 tok/s | pfix_cache 50.0%");
+        assert_eq!(vllm_throughput_value(&v), "59 tok/s");
     }
 
     #[test]
-    fn vllm_prompt_value_default_is_kv_only() {
+    fn vllm_prompt_value_default_includes_kv_and_pfix_cache() {
         let v = VllmRawMetrics {
             prompt_tokens_mean: Some(18.0),
             kv_cache_usage_perc: Some(45.25),
+            prefix_cache_hit_rate: Some(0.5),
             ..Default::default()
         };
-        assert_eq!(vllm_prompt_value(&v, false), "kv_cache 45.2% avg");
+        assert_eq!(
+            vllm_prompt_value(&v, false),
+            "kv_cache 45.2% avg | pfix_cache 50.0%"
+        );
     }
 
     #[test]
-    fn vllm_prompt_value_verbose_includes_prompt_tok_and_kv() {
+    fn vllm_prompt_value_verbose_includes_prompt_tok_kv_and_pfix_cache() {
         let v = VllmRawMetrics {
             prompt_tokens_mean: Some(18.0),
             kv_cache_usage_perc: Some(45.25),
+            prefix_cache_hit_rate: Some(0.5),
             ..Default::default()
         };
-        assert_eq!(vllm_prompt_value(&v, true), "18 tok | kv_cache 45.2% avg");
+        assert_eq!(
+            vllm_prompt_value(&v, true),
+            "18 tok | kv_cache 45.2% avg | pfix_cache 50.0%"
+        );
         let v_peak = VllmRawMetrics {
             prompt_tokens_mean: Some(18.0),
             kv_cache_usage_perc: Some(40.0),
             kv_cache_peak_perc: Some(92.0),
+            prefix_cache_hit_rate: Some(0.5),
             ..Default::default()
         };
         assert_eq!(
             vllm_prompt_value(&v_peak, true),
-            "18 tok | kv_cache 40.0% avg (92.0% peak)"
+            "18 tok | kv_cache 40.0% avg (92.0% peak) | pfix_cache 50.0%"
         );
         let peak_ceiling = VllmRawMetrics {
             kv_cache_usage_perc: Some(92.0),
@@ -1155,13 +1162,16 @@ mod tests {
         };
         assert_eq!(
             vllm_prompt_value(&peak_not_above_avg, true),
-            "18 tok | kv_cache 92.0% avg"
+            "18 tok | kv_cache 92.0% avg | pfix_cache —"
         );
         let no_kv = VllmRawMetrics {
             prompt_tokens_mean: Some(512.0),
             ..Default::default()
         };
-        assert_eq!(vllm_prompt_value(&no_kv, true), "512 tok | kv_cache —");
+        assert_eq!(
+            vllm_prompt_value(&no_kv, true),
+            "512 tok | kv_cache — | pfix_cache —"
+        );
     }
 
     #[test]
@@ -1200,9 +1210,12 @@ mod tests {
         let line = vllm_label_row("REQUESTS", "run 2 (0.8%) | wait 1 | max 256");
         assert!(line.starts_with("REQUESTS"));
         assert!(line.contains(" run 2"));
-        let t = vllm_label_row("THROUGHPUT", "59 tok/s | pfix_cache 72.8%");
+        let t = vllm_label_row("THROUGHPUT", "59 tok/s");
         assert!(t.starts_with("THROUGHPUT"));
         assert!(t.contains(" 59 tok/s"));
+        let c = vllm_label_row("CACHE", "kv_cache 67.0% avg | pfix_cache 72.8%");
+        assert!(c.starts_with("CACHE"));
+        assert!(c.contains("pfix_cache 72.8%"));
     }
 
     #[test]
