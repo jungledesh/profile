@@ -3,7 +3,7 @@
 #
 # Prerequisites before hitting `vhs demo.tape`:
 #   1. vLLM running in tmux session "vllm" (demo.sh)
-#   2. Load running: MODEL=qwen-coder MODE=demo ./load.sh &
+#   2. Load running: MODEL=Qwen2.5-Coder-7B-Instruct MODE=demo ./load.sh &
 #   3. profile binary on PATH
 #
 # The tape runs profile inside tmux window 0, then opens window 1 to apply
@@ -28,7 +28,7 @@ Type "profile diagnose --url http://localhost:8000/metrics --duration 1m -m 32"
 Enter
 
 # Collection window (1m) + analysis
-Sleep 1m15s
+Sleep 75s
 
 # PHYSICS block + R5 fires. Profile prints:
 # "Apply your change to vLLM. Profile will detect when vLLM restarts."
@@ -36,7 +36,7 @@ Sleep 4s
 
 # ── Window 1: apply the fix ───────────────────────────────────────────────────
 Ctrl+b
-c
+Type "c"
 Sleep 500ms
 
 Type "./fix_r5.sh"
@@ -47,11 +47,11 @@ Sleep 70s
 
 # ── Back to profile ───────────────────────────────────────────────────────────
 Ctrl+b
-0
+Type "0"
 Sleep 500ms
 
 # Profile prints "Connection restored. Resuming in 5s..." then re-measures
-Sleep 1m15s
+Sleep 75s
 
 # Delta block: throughput ↑, TTFT ↓, Efficiency +Xpp
 # R3 may fire (low prefix hit rate) or "No issues detected"

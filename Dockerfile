@@ -23,9 +23,26 @@ RUN export DEBIAN_FRONTEND=noninteractive \
     ffmpeg \
     sudo \
     ca-certificates \
+    libnss3 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libdrm2 \
+    libxkbcommon0 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxrandr2 \
+    libgbm1 \
+    libasound2 \
     && /usr/sbin/useradd -m -u 1000 -s /bin/bash appuser \
     && echo "appuser ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/appuser \
     && rm -rf /var/lib/apt/lists/*
+
+# ttyd — terminal-to-browser bridge required by VHS
+RUN curl -fsSL https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64 \
+    -o /usr/local/bin/ttyd \
+    && chmod 0755 /usr/local/bin/ttyd
 
 # VHS — terminal session recorder (v0.11.0)
 RUN curl -fsSL https://github.com/charmbracelet/vhs/releases/download/v0.11.0/vhs_0.11.0_Linux_x86_64.tar.gz \
@@ -52,4 +69,4 @@ RUN chmod 0755 ./start.sh ./load.sh ./test.sh ./test2.sh ./demo.sh ./fix_r5.sh .
 
 USER appuser
 
-CMD ["bash", "-lc", "/home/appuser/app/start.sh"]
+CMD ["bash", "-lc", "/home/appuser/app/demo.sh"]
