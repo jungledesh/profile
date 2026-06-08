@@ -24,9 +24,10 @@ RUN export DEBIAN_FRONTEND=noninteractive \
     && /usr/sbin/useradd -m -u 1000 -s /bin/bash appuser \
     && rm -rf /var/lib/apt/lists/*
 
-# VHS — terminal session recorder (pinned release)
-RUN curl -fsSL https://github.com/charmbracelet/vhs/releases/download/v0.9.0/vhs_0.9.0_Linux_x86_64.tar.gz \
-    | tar -xz -C /usr/local/bin vhs \
+# VHS — terminal session recorder (v0.11.0)
+RUN curl -fsSL https://github.com/charmbracelet/vhs/releases/download/v0.11.0/vhs_0.11.0_Linux_x86_64.tar.gz \
+    | tar -xz -C /tmp \
+    && mv /tmp/vhs /usr/local/bin/vhs \
     && chmod 0755 /usr/local/bin/vhs
 
 # Do not mkdir VENV_DIR — an empty dir breaks start.sh's "create venv if missing" check
