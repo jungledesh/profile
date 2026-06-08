@@ -25,9 +25,16 @@ pub struct UnderBatchingDetail {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct R1MissReport {
+    /// Ratio of prefill time to window duration when the prefill gate suppressed.
+    /// None when suppressed for any other reason (missing data, occupancy, backlog).
+    pub prefill_saturation_ratio: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Rule1Outcome {
     Fired(UnderBatchingDetail),
-    NotFired,
+    NotFired(R1MissReport),
 }
 
 pub fn rule1_under_batching(
@@ -39,7 +46,11 @@ pub fn rule1_under_batching(
     // 1. Hard abort — window duration required
     let window_secs = match snapshot.vllm.window_duration_secs {
         Some(w) if w.is_finite() && w > f64::EPSILON => w,
-        _ => return Rule1Outcome::NotFired,
+        _ => {
+            return Rule1Outcome::NotFired(R1MissReport {
+                prefill_saturation_ratio: None,
+            });
+        }
     };
 
     // 2. Hard abort — max_num_seqs required (scrape or config)
@@ -49,21 +60,29 @@ pub fn rule1_under_batching(
         .or(config_max_num_seqs)
         .filter(|&n| n > 0)
     else {
-        return Rule1Outcome::NotFired;
+        return Rule1Outcome::NotFired(R1MissReport {
+            prefill_saturation_ratio: None,
+        });
     };
 
     // 3. Hard abort — running required and > 0
     let Some(run) = running.filter(|v| v.is_finite() && *v > 0.0) else {
-        return Rule1Outcome::NotFired;
+        return Rule1Outcome::NotFired(R1MissReport {
+            prefill_saturation_ratio: None,
+        });
     };
 
     // 4. Occupancy + backlog check
     let occupancy = run / f64::from(max_n);
     let Some(wait) = snapshot.vllm.num_requests_waiting.filter(|v| v.is_finite()) else {
-        return Rule1Outcome::NotFired;
+        return Rule1Outcome::NotFired(R1MissReport {
+            prefill_saturation_ratio: None,
+        });
     };
     if occupancy >= UNDER_BATCHING_OCCUPANCY_PCT || wait >= UNDER_BATCHING_WAITING_LT {
-        return Rule1Outcome::NotFired;
+        return Rule1Outcome::NotFired(R1MissReport {
+            prefill_saturation_ratio: None,
+        });
     }
 
     // 5. Gate 1 — prefill saturation
@@ -71,10 +90,13 @@ pub fn rule1_under_batching(
     // A chunked prefill spanning the full window duration will read sum_delta=0
     // and bypass this gate until the request completes. Accepted — documented limitation.
     if let Some(mass) = snapshot.vllm.prefill_window_mass {
-        let by_ratio = (mass.sum_delta / window_secs) > UNDER_BATCHING_PREFILL_SATURATION_MAX;
+        let ratio = mass.sum_delta / window_secs;
+        let by_ratio = ratio > UNDER_BATCHING_PREFILL_SATURATION_MAX;
         let by_abs = mass.sum_delta > UNDER_BATCHING_PREFILL_ABS_SECS;
         if by_ratio || by_abs {
-            return Rule1Outcome::NotFired;
+            return Rule1Outcome::NotFired(R1MissReport {
+                prefill_saturation_ratio: Some(ratio),
+            });
         }
     }
 
@@ -223,7 +245,7 @@ mod tests {
             Rule1Outcome::Fired(d) => {
                 assert!((d.occupancy_pct - (5.0 / 256.0 * 100.0)).abs() < 0.1);
             }
-            Rule1Outcome::NotFired => panic!("expected fired"),
+            Rule1Outcome::NotFired(_) => panic!("expected fired"),
         }
     }
 
@@ -234,7 +256,7 @@ mod tests {
             Rule1Outcome::Fired(d) => {
                 assert!(d.occupancy_pct < 25.0);
             }
-            Rule1Outcome::NotFired => panic!("expected fired below 25% occupancy"),
+            Rule1Outcome::NotFired(_) => panic!("expected fired below 25% occupancy"),
         }
     }
 
@@ -243,7 +265,7 @@ mod tests {
         let s = snap(Some(64.0), Some(256), Some(0.0));
         assert!(matches!(
             rule1_under_batching(&s, None),
-            Rule1Outcome::NotFired
+            Rule1Outcome::NotFired(_)
         ));
     }
 
@@ -252,7 +274,7 @@ mod tests {
         let s = snap(Some(0.0), Some(256), Some(0.0));
         assert!(matches!(
             rule1_under_batching(&s, None),
-            Rule1Outcome::NotFired
+            Rule1Outcome::NotFired(_)
         ));
     }
 
@@ -261,7 +283,7 @@ mod tests {
         let s = snap(Some(5.0), Some(256), Some(2.0));
         assert!(matches!(
             rule1_under_batching(&s, None),
-            Rule1Outcome::NotFired
+            Rule1Outcome::NotFired(_)
         ));
     }
 
@@ -279,7 +301,7 @@ mod tests {
         let s = snap(Some(5.0), None, Some(0.0));
         assert!(matches!(
             rule1_under_batching(&s, None),
-            Rule1Outcome::NotFired
+            Rule1Outcome::NotFired(_)
         ));
     }
 
@@ -288,7 +310,7 @@ mod tests {
         let s = snap(Some(5.0), Some(0), Some(0.0));
         assert!(matches!(
             rule1_under_batching(&s, None),
-            Rule1Outcome::NotFired
+            Rule1Outcome::NotFired(_)
         ));
     }
 
@@ -300,7 +322,7 @@ mod tests {
                 assert_eq!(d.max_num_seqs, Some(64));
                 assert!((d.occupancy_pct - (4.0 / 64.0 * 100.0)).abs() < 0.1);
             }
-            Rule1Outcome::NotFired => panic!("expected fired with config max 64"),
+            Rule1Outcome::NotFired(_) => panic!("expected fired with config max 64"),
         }
     }
 
@@ -309,7 +331,7 @@ mod tests {
         let s = snap(Some(64.0), None, Some(0.0));
         assert!(matches!(
             rule1_under_batching(&s, Some(64)),
-            Rule1Outcome::NotFired
+            Rule1Outcome::NotFired(_)
         ));
     }
 
@@ -318,7 +340,7 @@ mod tests {
         let s = snap(None, Some(256), Some(0.0));
         assert!(matches!(
             rule1_under_batching(&s, None),
-            Rule1Outcome::NotFired
+            Rule1Outcome::NotFired(_)
         ));
     }
 
@@ -327,7 +349,7 @@ mod tests {
         let s = snap_with_gates(Some(5.0), Some(256), Some(0.0), None, None);
         assert!(matches!(
             rule1_under_batching(&s, None),
-            Rule1Outcome::NotFired
+            Rule1Outcome::NotFired(_)
         ));
     }
 
@@ -345,7 +367,7 @@ mod tests {
         );
         assert!(matches!(
             rule1_under_batching(&s, None),
-            Rule1Outcome::NotFired
+            Rule1Outcome::NotFired(_)
         ));
     }
 
@@ -363,7 +385,7 @@ mod tests {
         );
         assert!(matches!(
             rule1_under_batching(&s, None),
-            Rule1Outcome::NotFired
+            Rule1Outcome::NotFired(_)
         ));
     }
 
@@ -383,6 +405,27 @@ mod tests {
             rule1_under_batching(&s, None),
             Rule1Outcome::Fired(_)
         ));
+    }
+
+    #[test]
+    fn prefill_gate_miss_report_carries_ratio() {
+        let s = snap_with_gates(
+            Some(5.0),
+            Some(256),
+            Some(0.0),
+            Some(HistogramWindowMass {
+                sum_delta: 1.6,
+                count_delta: 4.0,
+            }),
+            Some(2.0),
+        );
+        match rule1_under_batching(&s, None) {
+            Rule1Outcome::NotFired(m) => {
+                let ratio = m.prefill_saturation_ratio.expect("ratio present");
+                assert!((ratio - 0.80).abs() < 1e-9);
+            }
+            Rule1Outcome::Fired(_) => panic!("expected not fired"),
+        }
     }
 
     #[test]

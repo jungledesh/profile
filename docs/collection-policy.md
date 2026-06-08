@@ -17,27 +17,28 @@ This is a deliberate design choice: time-weighting across active windows acts as
 
 ## Policy table
 
-| Category | Examples | Single ~2 s window (9 samples) | Multi-window aggregation | Rationale |
+| Category | Examples | Single ~2 s window (9 samples) | Multi-window aggregation | Rationale |
 |----------|----------|-------------------------------|---------------------------|-----------|
-| **State gauges** | `kv_cache_usage_perc`, `num_requests_swapped`, `cpu_cache_usage_perc`, `max_num_seqs`, `temperature_c`, `sm_clock_mhz`, `vram_used_mb` | **Last scrape / last poll** | **Last evaluable window’s last value** | State during the last **active** period (diagnostic focus). |
-| **Static / config** | `model_name`, `gpu_name`, `vram_total_mb`, `gpu_index`, `gpu_uuid`, `power_limit_watts`, `cache_config` | **Last scrape** | **Last evaluable window’s last value** | Stable for the lifetime of this run. |
-| **Catalog-resolved (model)** | `family`, `param_count`, `active_param_count`, `num_layers`, `hidden_dim`, `is_moe` | **Once at startup** — looked up from `model_name` via `model_catalog::lookup_model` | **Unchanged for run** | Static derivation from model name; `None` on no match. |
+| **State gauges** | `num_requests_swapped`, `cpu_cache_usage_perc`, `max_num_seqs`, `temperature_c`, `sm_clock_mhz`, `vram_used_mb` | **Last scrape / last poll** | **Last evaluable window's last value** | State at end of last evaluable window. |
+| **KV cache usage** | `kv_cache_usage_perc` (avg), `kv_cache_peak_perc` | Last scrape; peak = max across scrapes | Avg: time-weighted mean over **evaluable** windows. Peak: max(per-window peak, last landing) | Spike detection for R2; avg for display. |
+| **Static / config** | `model_name`, `gpu_name`, `vram_total_mb`, `gpu_index`, `gpu_uuid`, `power_limit_watts`, `cache_config` | **Last scrape** | **Last evaluable window's last value** | Stable for the lifetime of this run. |
+| **Catalog-resolved (model)** | `family`, `param_count`, `active_param_count`, `num_layers`, `hidden_dim`, `is_moe` | **Once at startup** — looked up from `model_name` via `model_catalog::lookup_model` | **Unchanged for run** | Static derivation from model name; `None` on no match. MoE: total params for weight; active params for roofline. |
 | **Catalog-resolved (GPU)** | `arch`, `peak_flops_f32_tflops`, `peak_bw_gbps` | **Once at startup** — looked up from `gpu_name` via `gpu_catalog::lookup_gpu` | **Unchanged for run** | Static derivation from GPU name; `None` on no match. NVML does not expose theoretical peak FLOPS. |
-| **Utilization** | `gpu_util_pct`, `mem_util_pct`, `power_watts`, `num_requests_running`, `num_requests_waiting` | **Mean of 9** (last scrape per window for running/waiting) | **Time-weighted mean** (evaluable windows only) | Average load / concurrency over the observed period. |
+| **Utilization** | `gpu_util_pct`, `mem_util_pct`, `power_watts`, `num_requests_running`, `num_requests_waiting` | **Mean of 9** (last scrape per window for running/waiting) | **Time-weighted mean** (**active** windows only) | Average load / concurrency while server was doing real work. |
 | **Counters (cumulative)** | `request_success_total`, `num_preemptions_total`, `generation_tokens_total` | **Last scrape (cumulative)** | **Chronologically last collected window** (evaluable or not) | True server cumulative totals at end of collection. |
-| **Rates** | `request_success_per_sec`, `num_preemptions_per_sec`, `generation_tokens_per_sec` | **Δ ÷ window duration** | **Time-weighted mean** of per-window rates (**evaluable windows only**) | Effective throughput while active. |
-| **Latency / histograms** | `ttft_ms`, `tpot_ms`, `prefill_latency_ms`, `queue_delay_ms`, `prompt_tokens_mean` | Per-window summary (Δ where possible) | **Time-weighted mean** (evaluable windows only) | Average behavior during active periods. |
-| **Derived ratios** | `prefix_cache_hit_rate` | **Δ hits / Δ queries** in window | **Last evaluable window only** | Most recent active behavior. |
+| **Rates** | `request_success_per_sec`, `num_preemptions_per_sec`, `generation_tokens_per_sec` | **Δ ÷ window duration** | **Time-weighted mean** of per-window rates (**active** windows only) | Effective throughput while active. |
+| **Latency / histograms** | `ttft_ms`, `tpot_ms`, `prefill_latency_ms`, `queue_delay_ms`, `prompt_tokens_mean` | Per-window summary (Δ where possible) | Histogram means: **ΣΔsum/ΣΔcount** over **active** windows (prompt tokens: **evaluable**). p99: merge delta buckets, recompute q=0.99. | Average behavior during active periods. |
+| **Derived ratios** | `prefix_cache_hit_rate` | **Δ hits / Δ queries** in window | **Σ Δhits / Σ Δqueries** over **evaluable** windows | Hit rate across the run, not last window only. |
 
 ---
 
 ## Precision notes
 
-- **Cumulative counters (multi-window):** Taken from **`windows.last()`** after collection order — not from the last *evaluable* window — so totals match Prometheus “since process start” even if the final slice was idle.
-- **Rates:** Per-window rate is already Δ ÷ that window’s duration. Multi-window = duration-weighted mean across **evaluable** windows only. If counters go backwards or reset inside a window, that window’s rate is `None` (no guessing).
+- **Cumulative counters (multi-window):** Taken from **`windows.last()`** after collection order — not from the last *evaluable* window — so totals match Prometheus "since process start" even if the final slice was idle.
+- **Rates:** Per-window rate is already Δ ÷ that window's duration. Multi-window = duration-weighted mean across **active** windows only. If counters go backwards or reset inside a window, that window's rate is `None` (no guessing).
 - **Static fields:** Treated as constant for the run; rare events (driver reload, GPU reset) can change them.
 - **Catalog-resolved fields:** Derived once from the raw `model_name` / `gpu_name` strings at `StaticContext` construction. Never re-queried mid-run. `None` when the name doesn't match any catalog entry — consumers must handle gracefully. GPU `peak_flops_f32_tflops` is non-tensor-core FP32 (conservative roofline input); B200 and GB10 values are estimates.
-- **State vs utilization:** State = what the system looks like at the **end of the last active window**. Utilization = how busy the GPU was **over time** (averages).
+- **State vs utilization:** State = what the system looks like at the **end of the last evaluable window**. Utilization = how busy the GPU was **over time** (averages over active windows).
 - **All windows non-evaluable:** The aggregated snapshot is the **chronologically last raw window** in full (nothing to weight).
 - **`sm_clock_mhz` min tracking deferred:** A sagged clock during evaluable windows indicates thermal or power throttling. Tracking the minimum would expose this, but idle gaps between polls make a low min ambiguous without a base/boost clock reference to compare against. Deferred until the GPU catalog carries per-GPU base and boost clock data. For now, temperature peak serves as the throttle signal.
 
@@ -47,7 +48,7 @@ This is a deliberate design choice: time-weighting across active windows acts as
 
 Profile reports three kinds of numbers. Only the first is documented here; the others are pending final policy decisions.
 
-**Under-load behavior** — evaluable windows only. Idle periods excluded.
+**Under-load behavior** — active windows for throughput, GPU util, and latency means; evaluable windows for prefix hit rate and KV avg. Idle periods excluded from aggregates.
 
 | Metric | Examples |
 |--------|---------|
@@ -62,7 +63,7 @@ A number in this category answers: *"While the server was actively handling requ
 
 ## Cadence
 
-- **250 ms** between samples; count = `sample_count_for(window)` (e.g. ~2 s → 9 ticks).
+- **250 ms** between samples; count = `sample_count_for(window)` (e.g. ~2 s → 9 ticks).
 - GPU and vLLM collection run **in parallel** (`collect_snapshot_for_window`).
 
 ---

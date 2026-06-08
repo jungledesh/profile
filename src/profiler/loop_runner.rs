@@ -1,3 +1,4 @@
+use std::io::{self, BufRead, Write};
 use std::time::Duration;
 
 use super::{delta, drift, poll, run_diagnose, state::LoopState, DiagnoseResult};
@@ -12,6 +13,7 @@ pub fn run(
     url: &str,
     max_num_seqs: u32,
     cost_per_hour: Option<f64>,
+    tensor_parallel_size: Option<u32>,
     duration: Duration,
     initial_result: DiagnoseResult,
     initial_report: engine::Report,
@@ -64,7 +66,13 @@ pub fn run(
         let _outcome = poll::wait_for_restart_or_skip(url, &stdin_rx);
 
         println!("\nMeasuring delta...");
-        let new_result = run_diagnose(url, max_num_seqs, cost_per_hour, duration)?;
+        let new_result = run_diagnose(
+            url,
+            max_num_seqs,
+            cost_per_hour,
+            tensor_parallel_size,
+            duration,
+        )?;
         let agg_win = RuntimeWindow::from_snapshot(new_result.snapshot.clone());
         let summary = AnalysisInput::new(&new_result.static_ctx, &agg_win);
         let new_report = engine::build_report_for_diagnose(&new_result.windows, summary);
@@ -83,25 +91,53 @@ pub fn run(
             drifted,
         );
         print_delta(&d);
+        output::stdout::print_direction_line(&d);
         output::stdout::print_diagnose_table(&new_result, false);
 
         let headroom = new_report.baseline.as_ref().and_then(|b| b.headroom_pct);
         if at_hardware_ceiling(headroom) {
             println!(
-                "\nHardware ceiling reached. Headroom < {CEILING_HEADROOM_THRESHOLD_PCT:.0}% — further gains require scaling hardware."
+                "\nHardware ceiling reached. Headroom < {CEILING_HEADROOM_THRESHOLD_PCT:.0}%: further gains require scaling hardware."
             );
             break;
         }
 
+        let applied_short_action = state
+            .last()
+            .report
+            .groups
+            .first()
+            .map(|g| g.primary.short_action.as_str());
         let next_fix = new_report
             .groups
             .first()
             .map(|g| g.primary.short_action.as_str());
-        for line in direction_followup_lines(d.direction, next_fix) {
-            println!("{line}");
-        }
 
-        state.push(new_result, new_report, Some(rule_name));
+        if d.direction == delta::Direction::Worse {
+            let choice = read_worse_regression_choice(&mut io::stdin().lock(), &mut io::stdout())?;
+            match choice {
+                WorseRegressionChoice::Continue => {
+                    for line in direction_followup_lines(delta::Direction::Plateau, next_fix) {
+                        println!("{line}");
+                    }
+                    let _ = apply_worse_regression_choice(
+                        &mut state, new_result, new_report, rule_name, choice,
+                    );
+                }
+                WorseRegressionChoice::Revert => {
+                    if let Some(action) = applied_short_action {
+                        println!("Revert: undo {action}, then re-measure when ready.");
+                    } else {
+                        println!("Revert: undo the last change, then re-measure when ready.");
+                    }
+                }
+            }
+        } else {
+            for line in direction_followup_lines(d.direction, next_fix) {
+                println!("{line}");
+            }
+            state.push(new_result, new_report, Some(rule_name));
+        }
     }
 
     Ok(())
@@ -146,14 +182,7 @@ fn direction_followup_lines(
 ) -> Vec<String> {
     let mut lines = Vec::new();
     match direction {
-        delta::Direction::Worse => {
-            lines.push(
-                "Throughput dropped. Check if workload changed before acting on this.".to_string(),
-            );
-            if let Some(fix) = short_action {
-                lines.push(format!("Apply fix: {fix}, then re-measure."));
-            }
-        }
+        delta::Direction::Worse => {}
         delta::Direction::Plateau => {
             lines.push("No significant change.".to_string());
             if let Some(fix) = short_action {
@@ -163,6 +192,55 @@ fn direction_followup_lines(
         delta::Direction::Better => {}
     }
     lines
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorseRegressionChoice {
+    Continue,
+    Revert,
+}
+
+pub(crate) fn parse_worse_regression_choice(line: &str) -> Option<WorseRegressionChoice> {
+    match line.trim() {
+        "c" | "C" => Some(WorseRegressionChoice::Continue),
+        "r" | "R" => Some(WorseRegressionChoice::Revert),
+        _ => None,
+    }
+}
+
+pub(crate) fn read_worse_regression_choice<R: BufRead>(
+    reader: &mut R,
+    prompt: &mut dyn Write,
+) -> io::Result<WorseRegressionChoice> {
+    writeln!(prompt, "  [r] revert   [c] continue")?;
+    loop {
+        write!(prompt, "> ")?;
+        prompt.flush()?;
+        let mut line = String::new();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
+            continue;
+        }
+        if let Some(choice) = parse_worse_regression_choice(&line) {
+            return Ok(choice);
+        }
+    }
+}
+
+pub(crate) fn apply_worse_regression_choice(
+    state: &mut LoopState,
+    new_result: DiagnoseResult,
+    new_report: engine::Report,
+    rule_name: &'static str,
+    choice: WorseRegressionChoice,
+) -> bool {
+    match choice {
+        WorseRegressionChoice::Continue => {
+            state.push(new_result, new_report, Some(rule_name));
+            true
+        }
+        WorseRegressionChoice::Revert => false,
+    }
 }
 
 fn print_delta(d: &delta::Delta) {
@@ -379,14 +457,98 @@ mod tests {
     }
 
     #[test]
-    fn direction_followup_includes_short_action_on_worse() {
-        let lines = direction_followup_lines(
-            delta::Direction::Worse,
-            Some("increase client concurrency — 10 slots idle"),
+    fn direction_followup_worse_is_empty() {
+        let lines =
+            direction_followup_lines(delta::Direction::Worse, Some("increase client concurrency"));
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn parse_worse_regression_choice_accepts_r_and_c() {
+        assert_eq!(
+            parse_worse_regression_choice("c\n"),
+            Some(WorseRegressionChoice::Continue)
         );
-        assert_eq!(lines.len(), 2);
-        assert!(lines[0].contains("Throughput dropped"));
-        assert!(lines[1].contains("increase client concurrency — 10 slots idle"));
+        assert_eq!(
+            parse_worse_regression_choice("R"),
+            Some(WorseRegressionChoice::Revert)
+        );
+        assert_eq!(parse_worse_regression_choice("x"), None);
+    }
+
+    #[test]
+    fn worse_pauses_loop_before_next_recommendation() {
+        assert!(!apply_worse_regression_choice(
+            &mut LoopState::new(minimal_diagnose(), empty_report()),
+            minimal_diagnose(),
+            empty_report(),
+            "under_batching",
+            WorseRegressionChoice::Revert,
+        ));
+    }
+
+    #[test]
+    fn acknowledge_sets_prev_to_curr() {
+        let mut s = LoopState::new(minimal_diagnose(), empty_report());
+        let mut new = minimal_diagnose();
+        new.snapshot.vllm.generation_tokens_per_sec = Some(80.0);
+        assert!(apply_worse_regression_choice(
+            &mut s,
+            new,
+            empty_report(),
+            "under_batching",
+            WorseRegressionChoice::Continue,
+        ));
+        assert_eq!(
+            s.last().result.snapshot.vllm.generation_tokens_per_sec,
+            Some(80.0)
+        );
+    }
+
+    #[test]
+    fn revert_does_not_update_prev() {
+        let mut prev = minimal_diagnose();
+        prev.snapshot.vllm.generation_tokens_per_sec = Some(100.0);
+        let mut s = LoopState::new(prev, empty_report());
+        let mut degraded = minimal_diagnose();
+        degraded.snapshot.vllm.generation_tokens_per_sec = Some(80.0);
+        assert!(!apply_worse_regression_choice(
+            &mut s,
+            degraded,
+            empty_report(),
+            "under_batching",
+            WorseRegressionChoice::Revert,
+        ));
+        assert_eq!(
+            s.last().result.snapshot.vllm.generation_tokens_per_sec,
+            Some(100.0)
+        );
+    }
+
+    fn minimal_diagnose() -> DiagnoseResult {
+        DiagnoseResult {
+            snapshot: crate::collectors::RawSnapshot {
+                gpu_observed_at: std::time::SystemTime::UNIX_EPOCH,
+                vllm_observed_at: std::time::SystemTime::UNIX_EPOCH,
+                timestamp: std::time::SystemTime::UNIX_EPOCH,
+                vllm: crate::collectors::VllmRawMetrics::default(),
+                gpu: crate::collectors::GpuRawMetrics::default(),
+            },
+            windows: Vec::new(),
+            static_ctx: crate::context::StaticContext::default(),
+            duration: Duration::from_secs(2),
+            started_at: std::time::SystemTime::UNIX_EPOCH,
+            any_evaluable: true,
+            metrics_input: String::new(),
+        }
+    }
+
+    fn empty_report() -> engine::Report {
+        engine::Report {
+            baseline: None,
+            groups: Vec::new(),
+            r2_suppressed_by_r4: false,
+        }
     }
 
     #[test]
@@ -448,6 +610,7 @@ mod tests {
             tpot_p99_before_ms: None,
             tpot_p99_after_ms: None,
             direction: delta::Direction::Plateau,
+            veto_fired: false,
             config_drifted: false,
         };
         assert!(economics_section_active(&d));

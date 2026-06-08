@@ -47,6 +47,14 @@ pub struct Cli {
     pub max_num_seqs: u32,
 
     #[arg(
+        long = "tensor-parallel-size",
+        global = true,
+        help = "Tensor parallel degree (overrides TENSOR_PARALLEL_SIZE env var)",
+        display_order = 2
+    )]
+    pub tensor_parallel_size: Option<u32>,
+
+    #[arg(
         long = "cost-per-hour",
         global = true,
         value_parser = parse_cost_per_hour_arg,
@@ -117,6 +125,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             &cli.url,
             cli.max_num_seqs,
             cli.cost_per_hour,
+            cli.tensor_parallel_size,
             cli.verbose > 0,
             *duration,
         )?,

@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use crate::collectors::{GpuRawMetrics, VllmConfig, VllmRawMetrics};
 use crate::context::AnalysisInput;
 use crate::engine;
+use crate::profiler::delta::{self, Delta, Direction};
 use crate::profiler::DiagnoseResult;
 
 const VLLM_LABEL_W: usize = 10;
@@ -29,6 +30,27 @@ fn show_vram_peak_parenthetical(used_mb: u64, peak_mb: u64, total_mb: u64) -> bo
 #[inline]
 fn show_gpu_temp_peak_parenthetical(current_c: f64, peak_c: f64) -> bool {
     peak_c > current_c && peak_c >= GPU_TEMP_PEAK_SHOW_THRESHOLD_C
+}
+
+fn direction_label(direction: Direction) -> &'static str {
+    match direction {
+        Direction::Better => "Better",
+        Direction::Worse => "Worse",
+        Direction::Plateau => "Plateau",
+    }
+}
+
+/// Raw signal values and which path fired, for closed-loop delta output.
+pub fn format_direction_line(d: &Delta) -> String {
+    format!(
+        "Direction: {}   ({})",
+        direction_label(d.direction),
+        delta::direction_detail(d)
+    )
+}
+
+pub fn print_direction_line(d: &Delta) {
+    println!("{}", format_direction_line(d));
 }
 
 pub fn print_diagnose_table(result: &DiagnoseResult, verbose_rules: bool) {
