@@ -219,11 +219,12 @@ pub(crate) fn read_worse_regression_choice<R: BufRead>(
         let mut line = String::new();
         let n = reader.read_line(&mut line)?;
         if n == 0 {
-            continue;
+            return Ok(WorseRegressionChoice::Continue);
         }
         if let Some(choice) = parse_worse_regression_choice(&line) {
             return Ok(choice);
         }
+        writeln!(prompt, " r = revert, c = continue")?;
     }
 }
 
@@ -333,9 +334,36 @@ const COST_ARROW_THRESHOLD_USD: f64 = 0.01;
 const RECOVERABLE_ARROW_THRESHOLD_USD_PER_HR: f64 = 0.05;
 const JTOK_ARROW_THRESHOLD: f64 = 0.02;
 
+fn recoverable_waste_available(d: &delta::Delta) -> bool {
+    matches!(
+        (
+            d.cost_per_million_before,
+            d.cost_per_million_after,
+            d.throughput_before,
+            d.throughput_after,
+            d.efficiency_pct_before,
+            d.efficiency_pct_after,
+        ),
+        (
+            Some(cpm_b),
+            Some(cpm_a),
+            Some(tps_b),
+            Some(tps_a),
+            Some(eff_b),
+            Some(eff_a),
+        ) if cpm_b.is_finite()
+            && cpm_a.is_finite()
+            && tps_b > 0.0
+            && tps_a > 0.0
+            && eff_b.is_finite()
+            && eff_a.is_finite()
+    )
+}
+
 fn economics_section_active(d: &delta::Delta) -> bool {
     (d.cost_per_million_before.is_some() && d.cost_per_million_after.is_some())
         || (d.joules_per_token_before.is_some() && d.joules_per_token_after.is_some())
+        || recoverable_waste_available(d)
 }
 
 fn jtok_change_arrow(before: f64, after: f64) -> &'static str {
@@ -477,6 +505,18 @@ mod tests {
     }
 
     #[test]
+    fn read_worse_regression_choice_reprompts_on_invalid_input() {
+        use std::io::Cursor;
+        let input = b"x\nr\n";
+        let mut reader = Cursor::new(input.as_slice());
+        let mut out = Vec::new();
+        let choice = read_worse_regression_choice(&mut reader, &mut out).unwrap();
+        assert_eq!(choice, WorseRegressionChoice::Revert);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains(" r = revert, c = continue"));
+    }
+
+    #[test]
     fn worse_pauses_loop_before_next_recommendation() {
         assert!(!apply_worse_regression_choice(
             &mut LoopState::new(minimal_diagnose(), empty_report()),
@@ -613,6 +653,36 @@ mod tests {
             veto_fired: false,
             config_drifted: false,
         };
+        assert!(economics_section_active(&d));
+    }
+
+    #[test]
+    fn economics_header_shown_for_recoverable_waste() {
+        let d = delta::Delta {
+            throughput_delta_pct: Some(160.8),
+            throughput_before: Some(1580.0),
+            throughput_after: Some(4120.0),
+            efficiency_delta_pp: Some(18.4),
+            efficiency_pct_before: Some(36.0),
+            efficiency_pct_after: Some(54.4),
+            cost_per_million_before: Some(0.16),
+            cost_per_million_after: Some(0.16),
+            joules_per_token_before: None,
+            joules_per_token_after: None,
+            cost_source_after: Some(engine::CostSource::Catalog),
+            ttft_before_ms: None,
+            ttft_after_ms: None,
+            tpot_before_ms: None,
+            tpot_after_ms: None,
+            ttft_p99_before_ms: None,
+            ttft_p99_after_ms: None,
+            tpot_p99_before_ms: None,
+            tpot_p99_after_ms: None,
+            direction: delta::Direction::Better,
+            veto_fired: false,
+            config_drifted: false,
+        };
+        assert!(recoverable_waste_available(&d));
         assert!(economics_section_active(&d));
     }
 }
