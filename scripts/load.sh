@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Usage:
-#   MODE=r1  ./load.sh         # under-batching: low concurrency, continuous, no gaps
-#   MODE=seq ./load.sh         # under-batching (extreme): 1 sequential request at a time
-#   MODE=r2  ./load.sh         # KV cache pressure: high concurrency, long context
-#   MODE=r5  ./load.sh         # concurrency saturation: more requests than max_num_seqs
+#   MODE=demo ./load.sh        # coding assistant: shared system prompt, varied code questions
+#   MODE=r1   ./load.sh        # under-batching: low concurrency, continuous, no gaps
+#   MODE=seq  ./load.sh        # under-batching (extreme): 1 sequential request at a time
+#   MODE=r2   ./load.sh        # KV cache pressure: high concurrency, long context
+#   MODE=r5   ./load.sh        # concurrency saturation: more requests than max_num_seqs
 #
 # Tuning env vars:
 #   CONCURRENCY=N              # number of concurrent requests (default: 2 for r1/seq, 8 for r2, 3× max_num_seqs for r5)
@@ -120,14 +121,68 @@ load_r5() {
   wait
 }
 
+load_demo() {
+  # Coding assistant scenario: all requests share a long system prompt (prefix),
+  # each user asks a different code question. Realistic mix — 70% shared prefix
+  # tokens, 30% unique. Concurrency tuned to fill max_num_seqs=32 and spill into
+  # the queue so R5 fires after R3 is addressed.
+  local concurrency="${CONCURRENCY:-50}"
+  local max_tokens="${MAX_TOKENS:-300}"
+
+  # Long shared system prompt — same across every request (prefix cache target)
+  local system_prompt="You are an expert software engineer and coding assistant. \
+You write clean, efficient, well-documented code. You follow best practices for \
+the language in use, prefer clarity over cleverness, and always explain your \
+reasoning. When asked to review code, you identify bugs, suggest improvements, \
+and explain the trade-offs. You are familiar with Python, Rust, Go, TypeScript, \
+and C++. You respond concisely unless asked for detail."
+
+  # Varied code questions — different each request to avoid trivial cache hits
+  # on the question itself, while the system prompt stays shared
+  local questions=(
+    "Write a Python function that flattens a nested list of arbitrary depth."
+    "Review this Rust code for memory safety issues: fn get(v: &Vec<i32>, i: usize) -> i32 { v[i] }"
+    "Implement a rate limiter in Go using a token bucket algorithm."
+    "What is the difference between a mutex and a semaphore? Give a code example in C++."
+    "Write a TypeScript utility type that makes all nested properties optional."
+    "Explain why this Python code has a bug: def append(x, lst=[]): lst.append(x); return lst"
+    "Write an async Rust function that retries an HTTP request up to 3 times with exponential backoff."
+    "How do I implement a trie in Python? Show insert and search."
+    "What does 'move semantics' mean in Rust? Give a before/after example."
+    "Write a Go function that finds all duplicate elements in a slice."
+    "Implement a debounce function in TypeScript."
+    "Explain the difference between heap and stack allocation with C++ examples."
+    "Write a Python decorator that measures and logs function execution time."
+    "How do I avoid data races in Rust when sharing state across threads?"
+    "Write a binary search implementation in Go with proper error handling."
+  )
+  local n=${#questions[@]}
+
+  for ((i = 0; i < concurrency; i++)); do
+    (
+      local idx=0
+      while true; do
+        local q="${questions[$((idx % n))]}"
+        idx=$((idx + 1))
+        local combined="${system_prompt}
+
+User: ${q}"
+        post "$combined" "$max_tokens"
+      done
+    ) &
+  done
+  wait
+}
+
 echo "load.sh — MODE=${MODE}  target=${VLLM_URL}"
 echo "Ctrl-C to stop."
 echo ""
 
 case "$MODE" in
-  r1)  load_r1 ;;
-  seq) load_seq ;;
-  r2)  load_r2 ;;
-  r5)  load_r5 ;;
-  *)   echo "Unknown MODE=${MODE}. Use r1, seq, r2, or r5." >&2; exit 1 ;;
+  demo) load_demo ;;
+  r1)   load_r1 ;;
+  seq)  load_seq ;;
+  r2)   load_r2 ;;
+  r5)   load_r5 ;;
+  *)    echo "Unknown MODE=${MODE}. Use demo, r1, seq, r2, or r5." >&2; exit 1 ;;
 esac
