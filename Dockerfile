@@ -34,9 +34,10 @@ COPY --chown=appuser:appuser scripts/start.sh ./start.sh
 COPY --chown=appuser:appuser scripts/load.sh ./load.sh
 COPY --chown=appuser:appuser scripts/test.sh ./test.sh
 COPY --chown=appuser:appuser scripts/test2.sh ./test2.sh
+COPY --chown=appuser:appuser scripts/demo.sh ./demo.sh
 COPY --chown=appuser:appuser target/release/profile ./profile
 
-RUN chmod 0755 ./start.sh ./load.sh ./test.sh ./test2.sh ./profile
+RUN chmod 0755 ./start.sh ./load.sh ./test.sh ./test2.sh ./demo.sh ./profile
 
 USER appuser
 
