@@ -63,8 +63,10 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
     let ctx = input.ctx;
     let peak_flops = ctx.gpu.peak_flops_f32_tflops?;
     let peak_bw = ctx.gpu.peak_bw_gbps?;
+    let tp = ctx.config.tensor_parallel_size.unwrap_or(1).max(1) as f64;
 
-    let model_params = ctx.model.active_param_count.or(ctx.model.param_count)?;
+    let roofline_params = ctx.model.active_param_count.or(ctx.model.param_count)?;
+    let weight_params = ctx.model.param_count.or(ctx.model.active_param_count)?;
     let catalog_default_dtype = ctx.model.default_weight_dtype.as_deref();
 
     let (bytes_per_param, weight_dtype_source) = resolve_bytes_per_param(
@@ -75,7 +77,7 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
 
     let ridge_batch_size = math::ridge_batch_size(peak_flops, peak_bw, bytes_per_param);
 
-    let decode_expected = math::decode_ceiling_tps(peak_bw, model_params, bytes_per_param);
+    let decode_expected = math::decode_ceiling_tps(peak_bw * tp, roofline_params, bytes_per_param);
     let decode = make_estimate(decode_expected)?;
 
     let seq_len = resolve_seq_len(
@@ -83,7 +85,7 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
         input.window.snapshot.vllm.prompt_tokens_mean,
     );
     let prefill = seq_len.and_then(|len| {
-        let expected = math::prefill_ceiling_tps(peak_flops, model_params, len);
+        let expected = math::prefill_ceiling_tps(peak_flops * tp, roofline_params, len);
         make_estimate(expected)
     });
 
@@ -114,8 +116,8 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
 
     let headroom_pct = efficiency_pct.map(|raw| 100.0 - raw.min(100.0));
 
-    let weight_gb = math::weight_gb(model_params, bytes_per_param);
-    let kv_headroom_gb = ctx.gpu.vram_gb.map(|vram| vram - weight_gb);
+    let weight_gb = math::weight_gb(weight_params, bytes_per_param);
+    let kv_headroom_gb = ctx.gpu.vram_gb.map(|vram| vram - (weight_gb / tp));
     let tpot_floor_ms = math::latency_floor_ms(decode.expected);
     let prefill_latency_floor_ms = prefill.map(|p| math::latency_floor_ms(p.expected));
 
@@ -347,6 +349,40 @@ mod tests {
         assert_eq!(b.weight_dtype_source, WeightDtypeSource::EnvVar);
         let expected_decode = math::decode_ceiling_tps(3350.0, 10_000_000_000, 4);
         assert!((b.decode.expected - expected_decode).abs() < 1e-9);
+        assert!(
+            (b.weight_gb - 400.0).abs() < 1e-3,
+            "weight_gb uses total param_count (100B × 4 bytes), got {}",
+            b.weight_gb
+        );
+    }
+
+    #[test]
+    fn moe_weight_uses_total_params_roofline_uses_active() {
+        let cfg = VllmConfig {
+            dtype: Some("bf16".to_string()),
+            max_model_len: Some(2048),
+            ..Default::default()
+        };
+        let snap = VllmRawMetrics {
+            generation_tokens_per_sec: Some(50.0),
+            prompt_tokens_mean: Some(512.0),
+            ..Default::default()
+        };
+        let (ctx, win) = baseline_input(
+            Some(671_000_000_000),
+            Some(37_000_000_000),
+            Some("bf16"),
+            Some(67.0),
+            Some(3350.0),
+            cfg,
+            snap,
+        );
+        let input = AnalysisInput::new(&ctx, &win);
+        let b = compute(&input).expect("baseline");
+        let expected_weight = math::weight_gb(671_000_000_000, 2);
+        assert!((b.weight_gb - expected_weight).abs() < 1e-3);
+        let expected_decode = math::decode_ceiling_tps(3350.0, 37_000_000_000, 2);
+        assert!((b.decode.expected - expected_decode).abs() < 1e-6);
     }
 
     #[test]
@@ -821,7 +857,7 @@ mod tests {
         let cost = b.cost.expect("cost");
         assert_eq!(cost.cost_source, CostSource::Catalog);
         let cpm = cost.cost_per_million_tokens.expect("cpm");
-        let expected = 2.80 * 1_000_000.0 / (100.0 * 3600.0);
+        let expected = 3.45 * 1_000_000.0 / (100.0 * 3600.0);
         assert!((cpm - expected).abs() < 1e-6);
     }
 
@@ -853,6 +889,82 @@ mod tests {
         assert_eq!(cost.cost_source, CostSource::UserProvided);
         let expected = 5.0 * 1_000_000.0 / (200.0 * 3600.0);
         assert!((cost.cost_per_million_tokens.unwrap() - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn tp2_doubles_decode_ceiling() {
+        let cfg_tp1 = VllmConfig {
+            dtype: Some("bf16".to_string()),
+            max_model_len: Some(2048),
+            tensor_parallel_size: Some(1),
+            ..Default::default()
+        };
+        let cfg_tp2 = VllmConfig {
+            tensor_parallel_size: Some(2),
+            ..cfg_tp1.clone()
+        };
+        let snap = VllmRawMetrics {
+            generation_tokens_per_sec: Some(50.0),
+            num_requests_running: Some(1.0),
+            ..Default::default()
+        };
+        let (ctx1, win1) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(67.0),
+            Some(3350.0),
+            cfg_tp1,
+            snap.clone(),
+        );
+        let (ctx2, win2) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(67.0),
+            Some(3350.0),
+            cfg_tp2,
+            snap,
+        );
+        let b1 = compute(&AnalysisInput::new(&ctx1, &win1)).expect("tp1 baseline");
+        let b2 = compute(&AnalysisInput::new(&ctx2, &win2)).expect("tp2 baseline");
+        assert!(
+            (b2.decode.expected - b1.decode.expected * 2.0).abs() < 1e-6,
+            "tp2 decode {} expected ~2× tp1 {}",
+            b2.decode.expected,
+            b1.decode.expected
+        );
+    }
+
+    #[test]
+    fn kv_headroom_accounts_for_tp() {
+        let cfg = VllmConfig {
+            dtype: Some("bf16".to_string()),
+            max_model_len: Some(2048),
+            tensor_parallel_size: Some(2),
+            ..Default::default()
+        };
+        let snap = VllmRawMetrics {
+            generation_tokens_per_sec: Some(50.0),
+            num_requests_running: Some(1.0),
+            ..Default::default()
+        };
+        let (ctx, win) = baseline_input(
+            Some(70_000_000_000),
+            None,
+            Some("bf16"),
+            Some(67.0),
+            Some(3350.0),
+            cfg,
+            snap,
+        );
+        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+        assert!((b.weight_gb - 140.0).abs() < 1e-3);
+        let headroom = b.kv_headroom_gb.expect("kv headroom");
+        assert!(
+            (headroom - 10.0).abs() < 1e-3,
+            "expected +10GB headroom per GPU, got {headroom}"
+        );
     }
 
     #[test]

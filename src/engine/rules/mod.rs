@@ -11,7 +11,7 @@ mod r4_oom_risk;
 mod r5_concurrency_saturation;
 
 pub use r1_under_batching::{
-    r1_recommendation, rule1_under_batching, Rule1Outcome, UnderBatchingDetail,
+    r1_recommendation, rule1_under_batching, R1MissReport, Rule1Outcome, UnderBatchingDetail,
 };
 pub use r2_kv_cache_pressure::{
     r2_recommendation, rule2_kv_admission_backlog, rule2_kv_cache_pressure,
@@ -229,6 +229,22 @@ pub fn no_evaluable_diagnose_lines(verbose: bool, windows: &[RuntimeWindow]) -> 
     out
 }
 
+fn r1_verbose_miss_line(snapshot: &RawSnapshot, config_max_num_seqs: Option<u32>) -> String {
+    match rule1_under_batching(snapshot, config_max_num_seqs) {
+        Rule1Outcome::NotFired(m) => {
+            if let Some(ratio) = m.prefill_saturation_ratio {
+                format!(
+                    "Under-batching: not triggered (prefill saturated at {:.0}%)",
+                    ratio * 100.0
+                )
+            } else {
+                "Under-batching: not triggered".to_string()
+            }
+        }
+        Rule1Outcome::Fired(_) => "Under-batching: not triggered".to_string(),
+    }
+}
+
 pub fn format_diagnose_rules(
     input: AnalysisInput<'_>,
     verbose_rules: bool,
@@ -282,7 +298,10 @@ pub fn format_diagnose_rules(
     let mut verbose_miss = Vec::new();
     if verbose_rules {
         if !fired_names.contains("under_batching") {
-            verbose_miss.push("Under-batching: not triggered".to_string());
+            verbose_miss.push(r1_verbose_miss_line(
+                snapshot,
+                input.ctx.config.max_num_seqs,
+            ));
             verbose_miss.push(String::new());
         }
         if !fired_names.contains("kv_cache_pressure") && !report.r2_suppressed_by_r4 {
@@ -398,7 +417,7 @@ fn eval_window_rules(
                 eval.r1_fired += 1;
                 eval.r1_details.push(d);
             }
-            Rule1Outcome::NotFired => {}
+            Rule1Outcome::NotFired(_) => {}
         }
         match rule2_kv_cache_pressure(&w.snapshot) {
             Rule2Outcome::Fired(d) => {
@@ -420,7 +439,10 @@ fn eval_window_rules(
         }
         if let Some(d) = rule5_concurrency_saturation(
             &w.snapshot,
-            w.snapshot.vllm.kv_cache_usage_perc,
+            w.snapshot
+                .vllm
+                .kv_cache_peak_perc
+                .or(w.snapshot.vllm.kv_cache_usage_perc),
             summary.ctx.config.max_num_seqs,
         ) {
             eval.r5_fired += 1;
@@ -659,7 +681,10 @@ pub fn format_diagnose_rules_for_windows(
         }
         let mut verbose_miss = Vec::new();
         if verbose_rules {
-            verbose_miss.push("Under-batching: not triggered".to_string());
+            verbose_miss.push(r1_verbose_miss_line(
+                summary_snap,
+                summary.ctx.config.max_num_seqs,
+            ));
             verbose_miss.push(String::new());
             verbose_miss.push("KV cache pressure: not triggered".to_string());
             verbose_miss.push(String::new());
@@ -705,7 +730,10 @@ pub fn format_diagnose_rules_for_windows(
         warnings.extend(block);
         warnings.push(String::new());
     } else if verbose_rules {
-        verbose_miss.push("Under-batching: not triggered".to_string());
+        verbose_miss.push(r1_verbose_miss_line(
+            summary_snap,
+            summary.ctx.config.max_num_seqs,
+        ));
         verbose_miss.push(String::new());
     }
 
@@ -1007,7 +1035,7 @@ mod tests {
                 assert_eq!(d.max_num_seqs, Some(256));
                 assert!(d.occupancy_pct < 25.0);
             }
-            Rule1Outcome::NotFired => panic!("expected fired"),
+            Rule1Outcome::NotFired(_) => panic!("expected fired"),
         }
     }
 

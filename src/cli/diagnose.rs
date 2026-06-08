@@ -6,10 +6,17 @@ pub fn execute(
     vllm_metrics_input: &str,
     max_num_seqs: u32,
     cost_per_hour: Option<f64>,
+    tensor_parallel_size: Option<u32>,
     verbose_rules: bool,
     duration: Duration,
 ) -> anyhow::Result<()> {
-    let result = profiler::run_diagnose(vllm_metrics_input, max_num_seqs, cost_per_hour, duration)?;
+    let result = profiler::run_diagnose(
+        vllm_metrics_input,
+        max_num_seqs,
+        cost_per_hour,
+        tensor_parallel_size,
+        duration,
+    )?;
     output::stdout::print_diagnose_table(&result, verbose_rules);
 
     if !result.any_evaluable {
@@ -24,6 +31,7 @@ pub fn execute(
         vllm_metrics_input,
         max_num_seqs,
         cost_per_hour,
+        tensor_parallel_size,
         duration,
         result,
         report,

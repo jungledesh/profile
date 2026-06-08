@@ -45,6 +45,12 @@ fn load_prices() -> &'static HashMap<String, GpuPriceEntry> {
     })
 }
 
+/// Returns true when every space-separated token in `key` appears in `norm`.
+fn price_key_matches(norm: &str, key: &str) -> bool {
+    key.split_whitespace()
+        .all(|token| !token.is_empty() && norm.contains(token))
+}
+
 /// Looks up price entry by GPU name tokens (loose substring match on catalog keys).
 /// Returns None if GPU not in catalog — caller must handle gracefully.
 pub fn lookup_gpu_price(gpu_name: &str) -> Option<GpuPriceEntry> {
@@ -53,7 +59,7 @@ pub fn lookup_gpu_price(gpu_name: &str) -> Option<GpuPriceEntry> {
     let mut keys: Vec<&String> = prices.keys().collect();
     keys.sort_by_key(|k| std::cmp::Reverse(k.len()));
     keys.into_iter().find_map(|key| {
-        if norm.contains(key.as_str()) {
+        if price_key_matches(&norm, key.as_str()) {
             prices.get(key.as_str()).copied()
         } else {
             None
@@ -69,6 +75,25 @@ mod tests {
     fn h200_matches_sxm_name() {
         let p = lookup_gpu_price("NVIDIA H200 SXM5").expect("h200 price");
         assert!((p.on_demand_per_hr - 3.50).abs() < 1e-9);
+        assert!((p.spot_per_hr - 2.00).abs() < 1e-9);
+    }
+
+    #[test]
+    fn h100_pcie_does_not_match_sxm_price() {
+        let p = lookup_gpu_price("NVIDIA H100 PCIe 80GB").expect("h100 pcie price");
+        assert!((p.on_demand_per_hr - 2.20).abs() < 1e-9);
+    }
+
+    #[test]
+    fn h100_sxm_price() {
+        let p = lookup_gpu_price("NVIDIA H100 SXM5 80GB HBM3").expect("h100 sxm price");
+        assert!((p.on_demand_per_hr - 3.45).abs() < 1e-9);
+    }
+
+    #[test]
+    fn h100_hbm3_price_without_sxm_token() {
+        let p = lookup_gpu_price("NVIDIA H100 80GB HBM3").expect("h100 hbm3 price");
+        assert!((p.on_demand_per_hr - 3.45).abs() < 1e-9);
     }
 
     #[test]

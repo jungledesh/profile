@@ -31,6 +31,7 @@ pub fn run_diagnose(
     vllm_metrics_input: &str,
     max_num_seqs: u32,
     cost_per_hour: Option<f64>,
+    tensor_parallel_size: Option<u32>,
     duration: Duration,
 ) -> anyhow::Result<DiagnoseResult> {
     let started_at = SystemTime::now();
@@ -53,6 +54,7 @@ pub fn run_diagnose(
     };
     let mut config = build_config(vllm_metrics_input, &snapshot, max_num_seqs);
     config.cost_per_hour = cost_per_hour;
+    config.tensor_parallel_size = tensor_parallel_size.or(config.tensor_parallel_size);
     let static_ctx = StaticContext::from_snapshot(&snapshot, config);
     let windows: Vec<RuntimeWindow> = raw_windows
         .into_iter()
@@ -158,7 +160,12 @@ fn aggregate_windows(
             if !window_is_evaluable(w) {
                 return None;
             }
-            let d = window_durations.get(i).copied()?;
+            let d = w
+                .vllm
+                .window_duration_secs
+                .filter(|s| s.is_finite() && *s > f64::EPSILON)
+                .map(Duration::from_secs_f64)
+                .or_else(|| window_durations.get(i).copied())?;
             Some((w, d))
         })
         .collect();
@@ -192,7 +199,7 @@ fn aggregate_windows(
         ..Default::default()
     };
 
-    // Running / waiting: duration-weighted mean over active windows (evaluable fallback if none active).
+    // Running / waiting: duration-weighted mean over active windows. None if no active windows.
     agg_v.num_requests_running =
         weighted_metric_pairs(&active_pairs, |w| w.vllm.num_requests_running);
     agg_v.num_requests_waiting =
@@ -598,6 +605,19 @@ mod tests {
         assert_eq!(agg.gpu.vram_used_mb, Some(2000));
         assert!((agg.gpu.temperature_c.unwrap() - 60.0).abs() < 1e-9);
         assert_eq!(agg.gpu.sm_clock_mhz, Some(2000));
+    }
+
+    #[test]
+    fn actual_duration_used_over_planned_when_present() {
+        let g = GpuRawMetrics::default();
+        let mut w1 = mk_active_snap(Some(2.0), Some(100.0), None, None, None, g.clone(), None);
+        w1.vllm.window_duration_secs = Some(2.0);
+        let mut w2 = mk_active_snap(Some(2.0), Some(200.0), None, None, None, g, None);
+        w2.vllm.window_duration_secs = Some(6.0);
+        let planned = vec![Duration::from_secs(2), Duration::from_secs(2)];
+        let agg = aggregate_windows(&[w1, w2], &planned, SystemTime::UNIX_EPOCH);
+        // Planned-only weighting would yield (100×2 + 200×2) / 4 = 150.0.
+        assert!((agg.vllm.generation_tokens_per_sec.unwrap() - 175.0).abs() < 1e-9);
     }
 
     #[test]
