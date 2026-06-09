@@ -219,15 +219,26 @@ body {
     color: #000;
 }
 .video-block {
-    height: 500px;
+    width: 100%;
+    aspect-ratio: 16 / 9;
     flex-shrink: 0;
     background: rgba(0,0,0,0.04);
     border: 1px solid rgba(0,0,0,0.08);
+    overflow: hidden;
+}
+.video-block iframe {
+    width: 100%;
+    height: 100%;
+    border: 0;
+    display: block;
+}
+.video-block .video-placeholder {
+    height: 100%;
     display: flex;
     align-items: center;
     justify-content: center;
 }
-.video-block span {
+.video-block .video-placeholder span {
     font-size: 0.62rem;
     letter-spacing: 0.1em;
     text-transform: uppercase;
@@ -315,8 +326,10 @@ body {
         </div>
         <div class="right">
             <p class="demo-label">Less Words. Less Noise. More Signal. More Value.</p>
-            <div class="video-block">
-                <span>Demo video coming soon</span>
+            <div class="video-block" id="demo-video">
+                <div class="video-placeholder">
+                    <span>Demo video coming soon</span>
+                </div>
             </div>
             <nav class="links">
                 <a href="docs.html" target="_blank" rel="noopener">Docs</a>
@@ -326,12 +339,44 @@ body {
     </div>
 </div>
 <script>
+// Paste full YouTube URL or video ID
+const PROFILE_DEMO_YOUTUBE = 'https://www.youtube.com/watch?v=Hy3sn49lhnw';
+
+function youtubeVideoId(input) {
+    const trimmed = input.trim();
+    if (!trimmed) return '';
+    if (!trimmed.includes('/') && !trimmed.includes('?')) return trimmed;
+    try {
+        const url = new URL(trimmed);
+        if (url.hostname === 'youtu.be') return url.pathname.slice(1);
+        return url.searchParams.get('v') || '';
+    } catch {
+        return trimmed;
+    }
+}
+
+function mountDemoVideo() {
+    const block = document.getElementById('demo-video');
+    const id = youtubeVideoId(PROFILE_DEMO_YOUTUBE);
+    if (!block || !id) return;
+    const iframe = document.createElement('iframe');
+    iframe.src = `https://www.youtube.com/embed/${id}`;
+    iframe.title = 'Profile demo';
+    iframe.loading = 'lazy';
+    iframe.allow = 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share';
+    iframe.referrerPolicy = 'strict-origin-when-cross-origin';
+    iframe.allowFullscreen = true;
+    block.replaceChildren(iframe);
+}
+
 function copyCmd(id, btn) {
     navigator.clipboard.writeText(document.getElementById(id).textContent).then(() => {
         btn.textContent = 'copied';
         setTimeout(() => btn.textContent = 'copy', 1500);
     });
 }
+
+mountDemoVideo();
 </script>
 </body>
 </html>
