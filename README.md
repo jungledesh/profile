@@ -45,45 +45,50 @@ profile diagnose --url http://localhost:8000/metrics --duration 2m
 
 ### 4. Sample Output
 
-Initial diagnose:
-
 ```
-$ profile diagnose --url http://localhost:8000/metrics --duration 2m -m 256
-
-PHYSICS:
-  Model      Meta-Llama-3-8B-Instruct (8.0B params, bf16)
-  GPU        NVIDIA H200 SXM (141GB, 4800 GB/s BW, 67 TFLOP/s)
-  Decode     282 tok/s ceiling (est) — at 184 tok/s — 65.2% efficient
-  Prefill    1,543 tok/s ceiling (est)
-  Weights    16.0 GB — 124.6 GB KV headroom
-  Floors     TPOT min 3.5ms | Prefill min 0.6ms
-
-───────────────────────────────────────────────────────────────────────────────
-
-[!] Concurrency Saturation
-
-  Seen in 87% of windows
-
-  Cause:
-  - max_num_seqs cap (32) hit: 29.4 avg running / 32 max
-  - Queue ratio: 67.8% of requests waiting
-
-  Fix:
-  • Raise --max-num-seqs above 32 (start: 64–128)
-  • Monitor KV usage — keep below 88% after increase
-  • Reduce max_tokens if prompts are long
-
-  Expected: Queue drains, TTFT recovers.
-  Confidence: High
-
-───────────────────────────────────────────────────────────────────────────────
++--------------------------------------------------------------------------------------------------+
+|PROFILE v2.0.0 [meta-llama/Llama-3.1-8B-Instruct] [NVIDIA H100 80GB HBM3] (30s from 2026-06-03 …)|
+|                                                                                                  |
+|GPU =>      EFFICIENCY 36.2% | POWER 312W | 0.20 J/tok | $0.16/1M tok (est) | vRAM 62/80GB      |
+|                                                                                                  |
+|vLLM:                                                                                             |
+|REQUESTS   run 8 (3.1%) | wait 1 | max 256                                                        |
+|LATENCY    ttft 420ms | tpot 35ms                                                                 |
+|CACHE      kv_cache 71.2% avg | pfix_cache 52.4%                                                  |
+|THROUGHPUT 1580 tok/s                                                                             |
+|TRAFFIC    12.4 req/s | preemptions 0.0/s                                                         |
+|                                                                                                  |
+|ISSUES:                                                                                           |
+|                                                                                                  |
+|[!] Under-batching — Insufficient Concurrency                                                       |
+|  Seen in 60% of windows                                                                          |
+|                                                                                                  |
+|  Occupancy  1.3%  (threshold: < 25%)                                                             |
+|  Requests   3 running, 1 waiting  (max: 256)                                                     |
+|                                                                                                  |
+|  Cause:                                                                                          |
+|    Hardware capacity under-fed by client. Not enough requests arriving to keep the server busy.  |
+|                                                                                                  |
+|  Fix:                                                                                            |
+|    • Batch more requests or increase client concurrency (253 slots idle)                         |
+|                                                                                                  |
+|  Expected: Higher throughput, stable TPOT.                                                       |
+|  Confidence: High                                                                                |
+|                                                                                                  |
+|At current efficiency, ~64% of compute cost is wasted — ~$2.24/hr recoverable.                    |
+|                                                                                                  |
+|KV cache pressure: not triggered                                                                   |
+|OOM risk: not triggered                                                                            |
+|Low prefix reuse: not triggered                                                                    |
+|Concurrency saturation: not triggered                                                              |
++--------------------------------------------------------------------------------------------------+
 
 Apply your change to vLLM.
 Profile will detect when vLLM restarts automatically.
 Press Enter to skip and re-measure now.
 ```
 
-After applying the fix, Profile re-measures and reports the delta:
+After you apply a fix and re-measure:
 
 ```
 Measuring delta...
@@ -98,6 +103,16 @@ ECONOMICS:
 Direction: Better
 
 No issues detected. Efficiency: 65.2% of hardware ceiling.
+```
+
+If performance regresses, Profile pauses and asks:
+
+```
+  [r] revert   [c] continue
+> x
+ r = revert, c = continue
+> r
+Revert: undo increase client concurrency — 253 slots idle, then re-measure when ready.
 ```
 
 ---
