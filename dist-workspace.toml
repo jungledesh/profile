@@ -1,5 +1,5 @@
 [workspace]
-members = ["."]
+members = ["dist:."]
 
 [dist]
 cargo-dist-version = "0.30.3"
