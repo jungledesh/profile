@@ -1,5 +1,5 @@
 {
-  "note": "Market-average estimates across major cloud providers (AWS, GCP, Azure, Lambda, Nebius, RunPod, CoreWeave, GMI Cloud). Not precise — use --cost-per-hour for exact rates. On-demand and spot are approximate midpoints of observed market range as of 2026-06.",
+  "note": "Market-average estimates across major cloud providers (AWS, GCP, Azure, Lambda, Nebius, RunPod, CoreWeave, GMI Cloud). Not precise — use --cost-per-hour for exact rates. On-demand and spot are approximate midpoints of observed market range as of 2026-06. On-prem devices (e.g. DGX Spark) use amortized hardware + electricity cost; spot_per_hr equals on_demand_per_hr (no spot concept).",
   "updated": "2026-06",
   "gpus": {
     "a10g": {
@@ -46,6 +46,11 @@
       "name": "NVIDIA GB200",
       "on_demand_per_hr": 8.50,
       "spot_per_hr": 4.00
+    },
+    "gb10": {
+      "name": "NVIDIA DGX Spark (GB10)",
+      "on_demand_per_hr": 0.13,
+      "spot_per_hr": 0.13
     }
   }
 }

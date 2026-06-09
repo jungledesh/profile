@@ -103,6 +103,13 @@ mod tests {
     }
 
     #[test]
+    fn dgx_spark_gb10_price() {
+        let p = lookup_gpu_price("NVIDIA GB10").expect("gb10 price");
+        assert!((p.on_demand_per_hr - 0.13).abs() < 1e-9);
+        assert!((p.spot_per_hr - 0.13).abs() < 1e-9);
+    }
+
+    #[test]
     fn unknown_gpu_returns_none() {
         assert!(lookup_gpu_price("NVIDIA Tesla V100").is_none());
     }

@@ -144,6 +144,22 @@ static CATALOG: &[ModelEntry] = &[
             default_weight_dtype: "bf16",
         },
     },
+    // ── Qwen 3.6 dense ───────────────────────────────────────────────────────
+    // Before generic qwen3 size entries — "7b" is a substring of "27b".
+    // Released April 2026. Dense 27B; hybrid gated-DeltaNet + attention blocks.
+    // hidden_dim 5120, 64 layers, FFN intermediate 17408.
+    ModelEntry {
+        tokens: &["qwen3.6", "27b"],
+        entry: CatalogEntry {
+            family: "qwen3.6",
+            param_count: 27 * B,
+            active_param_count: None,
+            num_layers: 64,
+            hidden_dim: 5120,
+            is_moe: false,
+            default_weight_dtype: "bf16",
+        },
+    },
     // ── Qwen 3 dense ─────────────────────────────────────────────────────────
     ModelEntry {
         tokens: &["qwen3", "72b"],
@@ -632,6 +648,16 @@ mod tests {
         let e = lookup_model("microsoft/phi-4").expect("no match");
         assert_eq!(e.family, "phi4");
         assert_eq!(e.param_count, 14 * B);
+    }
+
+    #[test]
+    fn qwen36_27b() {
+        let e = lookup_model("Qwen/Qwen3.6-27B").expect("no match");
+        assert_eq!(e.family, "qwen3.6");
+        assert_eq!(e.param_count, 27 * B);
+        assert!(!e.is_moe);
+        assert_eq!(e.num_layers, 64);
+        assert_eq!(e.hidden_dim, 5120);
     }
 
     #[test]
