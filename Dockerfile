@@ -35,6 +35,8 @@ RUN export DEBIAN_FRONTEND=noninteractive \
     libxrandr2 \
     libgbm1 \
     libasound2 \
+    openssh-client \
+    rsync \
     && /usr/sbin/useradd -m -u 1000 -s /bin/bash appuser \
     && echo "appuser ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/appuser \
     && rm -rf /var/lib/apt/lists/*
