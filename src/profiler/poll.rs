@@ -10,17 +10,17 @@ pub enum WaitOutcome {
     UserSkipped,
 }
 
-/// Spawns a single background thread that delivers one `()` per Enter keypress.
+/// Spawns a single background thread that delivers one line per stdin read.
 /// Call once before the loop and pass the receiver to `wait_for_restart_or_skip`
 /// each iteration so stdin is never double-owned.
-pub fn spawn_stdin_watcher() -> mpsc::Receiver<()> {
+pub fn spawn_stdin_watcher() -> mpsc::Receiver<String> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || loop {
         let mut buf = String::new();
         if std::io::stdin().read_line(&mut buf).is_err() {
             return;
         }
-        if tx.send(()).is_err() {
+        if tx.send(buf).is_err() {
             return;
         }
     });
@@ -29,10 +29,12 @@ pub fn spawn_stdin_watcher() -> mpsc::Receiver<()> {
 
 /// Waits until vLLM restarts (goes down then comes back up) OR user presses Enter.
 /// `stdin_rx` must come from `spawn_stdin_watcher`.
-pub fn wait_for_restart_or_skip(metrics_url: &str, stdin_rx: &mpsc::Receiver<()>) -> WaitOutcome {
-    println!("\nApply your change to vLLM.");
-    println!("Profile will detect when vLLM restarts automatically.");
-    println!("Press Enter to skip and re-measure now.");
+pub fn wait_for_restart_or_skip(
+    metrics_url: &str,
+    stdin_rx: &mpsc::Receiver<String>,
+) -> WaitOutcome {
+    println!("\nApply your change.");
+    println!("Press Enter to re-measure, or Profile will detect a vLLM restart automatically.");
 
     let url = metrics_url.to_string();
     let (tx, rx) = mpsc::channel::<WaitOutcome>();

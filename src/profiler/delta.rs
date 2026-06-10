@@ -2,12 +2,12 @@ use crate::engine::Report;
 
 use super::DiagnoseResult;
 
-// Direction thresholds — Provisional: calibrate against real workloads before hardening.
+// Direction thresholds. Provisional: calibrate against real workloads before hardening.
 const EFFICIENCY_BETTER_PP: f64 = 2.0;
 const EFFICIENCY_WORSE_PP: f64 = -5.0;
 const DEFAULT_LATENCY_VETO_PCT: f64 = 20.0;
-const THROUGHPUT_BETTER_PCT: f64 = 10.0; // fallback only
-const THROUGHPUT_WORSE_PCT: f64 = -10.0; // fallback only
+const THROUGHPUT_BETTER_PCT: f64 = 10.0;
+const THROUGHPUT_WORSE_PCT: f64 = -10.0;
 
 /// Placeholder until NLP `Goal` is wired from `cli/goal/`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +19,8 @@ pub enum Direction {
     Worse,
     /// Efficiency within band, latency-vetoed gain, or fallback throughput within band.
     Plateau,
+    /// No measurable signal; efficiency and throughput both unavailable.
+    Inconclusive,
 }
 
 #[derive(Debug, Clone)]
@@ -50,10 +52,49 @@ pub struct Delta {
     pub tpot_p99_before_ms: Option<f64>,
     pub tpot_p99_after_ms: Option<f64>,
     pub direction: Direction,
+    pub direction_reason: Option<&'static str>,
+    pub ttft_p99_delta_pct: Option<f64>,
     /// True when the latency veto downgraded a Better signal to Plateau.
-    /// Set by `evaluate_efficiency_delta`; read by `direction_detail` for output.
+    /// Set in `compute()`; read by `direction_detail` for output.
     pub veto_fired: bool,
     pub config_drifted: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Signal {
+    Up,
+    Flat,
+    Down,
+}
+
+fn eval_eff(pp: f64) -> Signal {
+    if pp >= EFFICIENCY_BETTER_PP {
+        Signal::Up
+    } else if pp <= EFFICIENCY_WORSE_PP {
+        Signal::Down
+    } else {
+        Signal::Flat
+    }
+}
+
+fn eval_ttft(pct: f64) -> Signal {
+    if pct <= -DEFAULT_LATENCY_VETO_PCT {
+        Signal::Up
+    } else if pct >= DEFAULT_LATENCY_VETO_PCT {
+        Signal::Down
+    } else {
+        Signal::Flat
+    }
+}
+
+fn eval_tput(pct: f64) -> Signal {
+    if pct >= THROUGHPUT_BETTER_PCT {
+        Signal::Up
+    } else if pct <= THROUGHPUT_WORSE_PCT {
+        Signal::Down
+    } else {
+        Signal::Flat
+    }
 }
 
 fn ttft_p99_regression_pct(delta: &Delta) -> Option<f64> {
@@ -76,33 +117,151 @@ fn latency_veto_fires(delta: &Delta) -> bool {
         && ttft_p99_regression_pct(delta).is_some_and(|v| v > DEFAULT_LATENCY_VETO_PCT)
 }
 
-fn evaluate_efficiency_delta(delta: &Delta) -> Direction {
-    match delta.efficiency_delta_pp {
-        Some(d) if d > EFFICIENCY_BETTER_PP => {
-            // Veto: throughput gain that destroys latency is not an improvement.
-            // veto_fired set by caller — see compute()
-            if latency_veto_fires(delta) {
-                Direction::Plateau
-            } else {
-                Direction::Better
-            }
+fn evaluate_efficiency_delta(delta: &Delta) -> (Direction, Option<&'static str>) {
+    use Signal::*;
+
+    let eff = match delta.efficiency_delta_pp {
+        Some(v) if v.is_finite() => eval_eff(v),
+        _ => {
+            return match delta.throughput_delta_pct {
+                Some(d) if d > THROUGHPUT_BETTER_PCT => (Direction::Better, None),
+                Some(d) if d < THROUGHPUT_WORSE_PCT => (Direction::Worse, None),
+                Some(_) => (Direction::Plateau, None),
+                None => (Direction::Inconclusive, None),
+            };
         }
-        Some(d) if d < EFFICIENCY_WORSE_PP => Direction::Worse,
-        Some(_) => Direction::Plateau,
-        // Efficiency unavailable (no catalog match). Fall back to raw throughput.
-        // Latency veto skipped — without efficiency, we cannot reliably apply it.
-        None => match delta.throughput_delta_pct {
-            Some(d) if d > THROUGHPUT_BETTER_PCT => Direction::Better,
-            Some(d) if d < THROUGHPUT_WORSE_PCT => Direction::Worse,
-            _ => Direction::Plateau,
-        },
+    };
+
+    let ttft = delta
+        .ttft_p99_delta_pct
+        .filter(|v| v.is_finite())
+        .map(eval_ttft)
+        .unwrap_or(Flat);
+
+    let tput = delta
+        .throughput_delta_pct
+        .filter(|v| v.is_finite())
+        .map(eval_tput)
+        .unwrap_or(Flat);
+
+    match (eff, ttft, tput) {
+        (Up, Up, Up) => (Direction::Better, None),
+        (Up, Up, Flat) => (Direction::Better, None),
+        (Up, Up, Down) => (
+            Direction::Better,
+            Some("efficiency + latency positive; throughput drop likely reduced concurrency"),
+        ),
+        (Up, Flat, Up) => (Direction::Better, None),
+        (Up, Flat, Flat) => (Direction::Better, None),
+        (Up, Flat, Down) => (
+            Direction::Better,
+            Some("efficiency primary; throughput drop likely load reduction"),
+        ),
+        (Up, Down, Up) => (Direction::Plateau, None),
+        (Up, Down, Flat) => (Direction::Plateau, None),
+        (Up, Down, Down) => (
+            Direction::Worse,
+            Some("latency broken, throughput fell; efficiency gain is artifact"),
+        ),
+
+        (Flat, Up, Up) => (
+            Direction::Better,
+            Some("efficiency flat, TTFT + throughput improved; scheduler win"),
+        ),
+        (Flat, Up, Flat) => (
+            Direction::Better,
+            Some("efficiency flat, p99 TTFT dropped significantly"),
+        ),
+        (Flat, Up, Down) => (
+            Direction::Plateau,
+            Some("latency improved but throughput fell; check load"),
+        ),
+        (Flat, Flat, Up) => (
+            Direction::Better,
+            Some("efficiency flat, throughput expanded"),
+        ),
+        (Flat, Flat, Flat) => (Direction::Plateau, None),
+        (Flat, Flat, Down) => (Direction::Worse, Some("efficiency flat, throughput fell")),
+        (Flat, Down, Up) => (
+            Direction::Plateau,
+            Some("capacity expanded at cost of latency; check KV pressure"),
+        ),
+        (Flat, Down, Flat) => (
+            Direction::Worse,
+            Some("efficiency flat, latency SLA violated"),
+        ),
+        (Flat, Down, Down) => (Direction::Worse, Some("latency spiked and throughput fell")),
+
+        (Down, Up, Up) => (
+            Direction::Better,
+            Some("scheduling improved; efficiency drop reflects larger batch"),
+        ),
+        (Down, Up, Flat) => (
+            Direction::Plateau,
+            Some("efficiency fell, latency better; verify load didn't drop"),
+        ),
+        (Down, Up, Down) => (
+            Direction::Worse,
+            Some("efficiency + throughput fell; latency gain is load artifact"),
+        ),
+        (Down, Flat, Up) => (
+            Direction::Plateau,
+            Some("per-slot efficiency fell, total throughput expanded; monitor fragmentation"),
+        ),
+        (Down, Flat, Flat) => (Direction::Worse, Some("clear regression")),
+        (Down, Flat, Down) => (
+            Direction::Worse,
+            Some("clear regression, throughput also fell"),
+        ),
+        (Down, Down, Up) => (
+            Direction::Worse,
+            Some("efficiency + latency broken; throughput gain doesn't save it"),
+        ),
+        (Down, Down, Flat) => (Direction::Worse, Some("efficiency + latency degraded")),
+        (Down, Down, Down) => (
+            Direction::Worse,
+            Some("severe regression; everything degraded"),
+        ),
+    }
+}
+
+fn rule_direction_reason(
+    prev_rule: Option<&'static str>,
+    new_rule: Option<&'static str>,
+    direction: Direction,
+) -> Option<&'static str> {
+    match (prev_rule, new_rule, direction) {
+        (Some("concurrency_saturation"), None, Direction::Better) => {
+            Some("scheduler bottleneck cleared")
+        }
+        (Some("concurrency_saturation"), Some("concurrency_saturation"), Direction::Plateau) => {
+            Some("scheduler still saturated")
+        }
+        (Some("kv_cache_pressure"), None, Direction::Better) => Some("KV pressure cleared"),
+        (Some("kv_cache_pressure"), Some("kv_cache_pressure"), Direction::Plateau) => {
+            Some("KV pressure persists")
+        }
+        (Some("under_batching"), None, Direction::Better) => Some("batch utilization improved"),
+        (Some("under_batching"), Some("under_batching"), Direction::Plateau) => {
+            Some("batch still under-utilized")
+        }
+        (Some("low_prefix_reuse"), None, Direction::Better) => {
+            Some("prefix cache hit rate improved")
+        }
+        (Some("low_prefix_reuse"), Some("low_prefix_reuse"), Direction::Plateau) => {
+            Some("prefix cache miss persists")
+        }
+        _ => None,
     }
 }
 
 /// v2: Default/Throughput path only.
 ///
-/// `goal` is reserved — exhaustive match ensures future objectives fail to compile until handled.
-pub fn calculate_direction(delta: &Delta, _goal: Option<&Goal>) -> Direction {
+/// `goal` is reserved; exhaustive match ensures future objectives fail to compile until handled.
+pub fn calculate_direction(
+    delta: &Delta,
+    _goal: Option<&Goal>,
+) -> (Direction, Option<&'static str>) {
     evaluate_efficiency_delta(delta)
 }
 
@@ -110,7 +269,7 @@ pub fn calculate_direction(delta: &Delta, _goal: Option<&Goal>) -> Direction {
 pub fn direction_detail(delta: &Delta) -> String {
     match delta.efficiency_delta_pp {
         Some(eff) => {
-            if delta.veto_fired {
+            if delta.veto_fired && delta.direction == Direction::Plateau {
                 if let Some(veto) = ttft_p99_regression_pct(delta) {
                     return format!(
                         "efficiency Δ: {:+.1} pp  |  ttft_p99 Δ: {:+.1}%  latency veto",
@@ -118,11 +277,14 @@ pub fn direction_detail(delta: &Delta) -> String {
                     );
                 }
             }
+            if let Some(reason) = delta.direction_reason {
+                return reason.to_string();
+            }
             format!("efficiency Δ: {:+.1} pp", eff)
         }
         None => match delta.throughput_delta_pct {
             Some(t) => format!("efficiency unavailable  throughput Δ: {:+.1}%", t),
-            None => "efficiency unavailable".to_string(),
+            None => "no measurable signal".to_string(),
         },
     }
 }
@@ -151,6 +313,13 @@ pub fn compute(
     let throughput_delta_pct = match (throughput_before, throughput_after) {
         (Some(p), Some(c)) if p > 0.0 && p.is_finite() && c.is_finite() => {
             Some((c - p) / p * 100.0)
+        }
+        _ => None,
+    };
+
+    let ttft_p99_delta_pct = match (ttft_p99_before_ms, ttft_p99_after_ms) {
+        (Some(b), Some(a)) if b > 0.0 && b.is_finite() && a.is_finite() => {
+            Some((a - b) / b * 100.0)
         }
         _ => None,
     };
@@ -211,10 +380,16 @@ pub fn compute(
         tpot_p99_before_ms,
         tpot_p99_after_ms,
         direction: Direction::Plateau,
+        direction_reason: None,
+        ttft_p99_delta_pct,
         veto_fired: false,
         config_drifted,
     };
-    delta.direction = calculate_direction(&delta, None);
+    let (direction, reason) = calculate_direction(&delta, None);
+    let prev_rule = prev_report.groups.first().map(|g| g.primary.rule_name);
+    let new_rule = curr_report.groups.first().map(|g| g.primary.rule_name);
+    delta.direction = direction;
+    delta.direction_reason = rule_direction_reason(prev_rule, new_rule, direction).or(reason);
     delta.veto_fired = latency_veto_fires(&delta);
     delta
 }
@@ -300,6 +475,12 @@ mod tests {
         ttft_p99_before: Option<f64>,
         ttft_p99_after: Option<f64>,
     ) -> Delta {
+        let ttft_p99_delta_pct = match (ttft_p99_before, ttft_p99_after) {
+            (Some(b), Some(a)) if b > 0.0 && b.is_finite() && a.is_finite() => {
+                Some((a - b) / b * 100.0)
+            }
+            _ => None,
+        };
         Delta {
             throughput_delta_pct: throughput_pct,
             throughput_before: None,
@@ -321,82 +502,168 @@ mod tests {
             tpot_p99_before_ms: None,
             tpot_p99_after_ms: None,
             direction: Direction::Plateau,
+            direction_reason: None,
+            ttft_p99_delta_pct,
             veto_fired: false,
             config_drifted: false,
         }
     }
 
     fn finalize_delta(mut d: Delta) -> Delta {
-        d.direction = calculate_direction(&d, None);
+        let (direction, reason) = calculate_direction(&d, None);
+        d.direction = direction;
+        d.direction_reason = reason;
         d.veto_fired = latency_veto_fires(&d);
         d
     }
 
+    fn eval_dir(d: &Delta) -> (Direction, Option<&'static str>) {
+        evaluate_efficiency_delta(d)
+    }
+
     #[test]
     fn efficiency_better_above_threshold() {
-        let mut d = mk_delta(Some(3.0), None, Some(500.0), Some(500.0));
-        d.direction = evaluate_efficiency_delta(&d);
-        assert_eq!(d.direction, Direction::Better);
+        let (dir, _) = eval_dir(&mk_delta(Some(3.0), None, Some(500.0), Some(500.0)));
+        assert_eq!(dir, Direction::Better);
     }
 
     #[test]
     fn efficiency_worse_below_threshold() {
-        let d = mk_delta(Some(-6.0), None, None, None);
-        assert_eq!(evaluate_efficiency_delta(&d), Direction::Worse);
+        let (dir, reason) = eval_dir(&mk_delta(Some(-6.0), None, None, None));
+        assert_eq!(dir, Direction::Worse);
+        assert_eq!(reason, Some("clear regression"));
     }
 
     #[test]
     fn efficiency_plateau_within_band() {
-        let d = mk_delta(Some(1.0), None, None, None);
-        assert_eq!(evaluate_efficiency_delta(&d), Direction::Plateau);
+        let (dir, reason) = eval_dir(&mk_delta(Some(1.0), None, None, None));
+        assert_eq!(dir, Direction::Plateau);
+        assert!(reason.is_none());
     }
 
     #[test]
     fn latency_veto_fires_on_better() {
-        let d = mk_delta(Some(3.0), None, Some(400.0), Some(500.0));
-        assert_eq!(evaluate_efficiency_delta(&d), Direction::Plateau);
+        let (dir, _) = eval_dir(&mk_delta(Some(3.0), None, Some(400.0), Some(500.0)));
+        assert_eq!(dir, Direction::Plateau);
     }
 
     #[test]
     fn latency_veto_does_not_fire_on_plateau() {
-        let d = mk_delta(Some(1.0), None, Some(400.0), Some(500.0));
-        assert_eq!(evaluate_efficiency_delta(&d), Direction::Plateau);
+        let d = finalize_delta(mk_delta(Some(1.0), None, None, None));
+        assert!(!d.veto_fired);
+        assert_eq!(d.direction, Direction::Plateau);
     }
 
     #[test]
     fn latency_veto_does_not_fire_on_worse() {
-        let d = mk_delta(Some(-6.0), None, Some(400.0), Some(500.0));
-        assert_eq!(evaluate_efficiency_delta(&d), Direction::Worse);
+        let (dir, _) = eval_dir(&mk_delta(Some(-6.0), None, Some(400.0), Some(500.0)));
+        assert_eq!(dir, Direction::Worse);
     }
 
     #[test]
     fn latency_veto_skipped_when_ttft_none() {
-        let d = mk_delta(Some(3.0), None, None, Some(500.0));
-        assert_eq!(evaluate_efficiency_delta(&d), Direction::Better);
+        let (dir, _) = eval_dir(&mk_delta(Some(3.0), None, None, Some(500.0)));
+        assert_eq!(dir, Direction::Better);
     }
 
     #[test]
     fn efficiency_none_fallback_better() {
-        let d = mk_delta(None, Some(12.0), None, None);
-        assert_eq!(evaluate_efficiency_delta(&d), Direction::Better);
+        let (dir, _) = eval_dir(&mk_delta(None, Some(12.0), None, None));
+        assert_eq!(dir, Direction::Better);
     }
 
     #[test]
     fn efficiency_none_fallback_worse() {
-        let d = mk_delta(None, Some(-15.0), None, None);
-        assert_eq!(evaluate_efficiency_delta(&d), Direction::Worse);
+        let (dir, _) = eval_dir(&mk_delta(None, Some(-15.0), None, None));
+        assert_eq!(dir, Direction::Worse);
     }
 
     #[test]
     fn efficiency_none_fallback_plateau() {
-        let d = mk_delta(None, Some(4.0), None, None);
-        assert_eq!(evaluate_efficiency_delta(&d), Direction::Plateau);
+        let (dir, _) = eval_dir(&mk_delta(None, Some(4.0), None, None));
+        assert_eq!(dir, Direction::Plateau);
     }
 
     #[test]
     fn efficiency_and_throughput_both_none() {
-        let d = mk_delta(None, None, None, None);
-        assert_eq!(evaluate_efficiency_delta(&d), Direction::Plateau);
+        let (dir, _) = eval_dir(&mk_delta(None, None, None, None));
+        assert_eq!(dir, Direction::Inconclusive);
+    }
+
+    #[test]
+    fn scheduler_win() {
+        let d = finalize_delta(mk_delta(Some(1.0), Some(15.0), Some(100.0), Some(75.0)));
+        assert_eq!(d.direction, Direction::Better);
+        assert!(d
+            .direction_reason
+            .is_some_and(|r| r.contains("scheduler win")));
+    }
+
+    #[test]
+    fn latency_only_win() {
+        let d = finalize_delta(mk_delta(Some(1.0), Some(5.0), Some(100.0), Some(75.0)));
+        assert_eq!(d.direction, Direction::Better);
+        assert!(d
+            .direction_reason
+            .is_some_and(|r| r.contains("TTFT dropped significantly")));
+    }
+
+    #[test]
+    fn tput_only_win() {
+        let d = finalize_delta(mk_delta(Some(1.0), Some(15.0), Some(100.0), Some(95.0)));
+        assert_eq!(d.direction, Direction::Better);
+        assert!(d
+            .direction_reason
+            .is_some_and(|r| r.contains("throughput expanded")));
+    }
+
+    #[test]
+    fn hidden_regression() {
+        let d = finalize_delta(mk_delta(Some(1.0), Some(15.0), Some(100.0), Some(125.0)));
+        assert_eq!(d.direction, Direction::Plateau);
+        assert!(d
+            .direction_reason
+            .is_some_and(|r| r.contains("capacity expanded at cost of latency")));
+    }
+
+    #[test]
+    fn downward_override() {
+        let d = finalize_delta(mk_delta(Some(1.0), Some(-5.0), Some(100.0), Some(125.0)));
+        assert_eq!(d.direction, Direction::Worse);
+        assert!(d
+            .direction_reason
+            .is_some_and(|r| r.contains("latency SLA violated")));
+    }
+
+    #[test]
+    fn eff_down_mixed() {
+        let d = finalize_delta(mk_delta(Some(-6.0), Some(15.0), Some(100.0), Some(75.0)));
+        assert_eq!(d.direction, Direction::Better);
+        assert!(d
+            .direction_reason
+            .is_some_and(|r| r.contains("scheduling improved")));
+    }
+
+    #[test]
+    fn severe_regression() {
+        let d = finalize_delta(mk_delta(Some(-6.0), Some(-15.0), Some(100.0), Some(125.0)));
+        assert_eq!(d.direction, Direction::Worse);
+        assert!(d
+            .direction_reason
+            .is_some_and(|r| r.contains("severe regression")));
+    }
+
+    #[test]
+    fn latency_veto_intact() {
+        let d = finalize_delta(mk_delta(Some(3.0), Some(15.0), Some(100.0), Some(125.0)));
+        assert_eq!(d.direction, Direction::Plateau);
+        assert!(d.veto_fired);
+    }
+
+    #[test]
+    fn no_signal() {
+        let d = finalize_delta(mk_delta(None, None, None, None));
+        assert_eq!(d.direction, Direction::Inconclusive);
     }
 
     #[test]
@@ -466,7 +733,7 @@ mod tests {
             false,
         );
         assert!(d.throughput_delta_pct.is_none());
-        assert_eq!(d.direction, Direction::Plateau);
+        assert_eq!(d.direction, Direction::Inconclusive);
     }
 
     #[test]
@@ -542,5 +809,6 @@ mod tests {
         assert_eq!(d.ttft_p99_after_ms, Some(450.0));
         assert_eq!(d.tpot_p99_before_ms, Some(80.0));
         assert_eq!(d.tpot_p99_after_ms, Some(75.0));
+        assert!((d.ttft_p99_delta_pct.unwrap() - (-10.0)).abs() < 1e-9);
     }
 }

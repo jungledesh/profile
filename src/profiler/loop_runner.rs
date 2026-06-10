@@ -8,6 +8,7 @@ use crate::output;
 
 const CEILING_HEADROOM_THRESHOLD_PCT: f64 = 10.0;
 const LOW_OCCUPANCY_THRESHOLD: f64 = 0.25;
+const EFFICIENCY_DISPLAY_MIN_PP: f64 = 0.05;
 
 pub fn run(
     url: &str,
@@ -67,8 +68,11 @@ pub fn run(
         let _outcome = poll::wait_for_restart_or_skip(url, &stdin_rx);
 
         if rule_name == "concurrency_saturation" {
+            println!();
             let current = current_max_num_seqs.unwrap_or(256);
-            current_max_num_seqs = Some(crate::cli::prompt_for_updated_max_num_seqs(current)?);
+            current_max_num_seqs = Some(crate::cli::prompt_for_updated_max_num_seqs(
+                current, &stdin_rx,
+            )?);
         }
 
         println!("\nMeasuring delta...");
@@ -123,7 +127,8 @@ pub fn run(
             let choice = read_worse_regression_choice(&mut io::stdin().lock(), &mut io::stdout())?;
             match choice {
                 WorseRegressionChoice::Continue => {
-                    for line in direction_followup_lines(delta::Direction::Plateau, next_fix) {
+                    for line in direction_followup_lines(delta::Direction::Plateau, None, next_fix)
+                    {
                         println!("{line}");
                     }
                     let _ = apply_worse_regression_choice(
@@ -139,7 +144,7 @@ pub fn run(
                 }
             }
         } else {
-            for line in direction_followup_lines(d.direction, next_fix) {
+            for line in direction_followup_lines(d.direction, d.direction_reason, next_fix) {
                 println!("{line}");
             }
             state.push(new_result, new_report, Some(rule_name));
@@ -184,15 +189,19 @@ fn healthy_exit_message(
 
 fn direction_followup_lines(
     direction: delta::Direction,
+    reason: Option<&'static str>,
     short_action: Option<&str>,
 ) -> Vec<String> {
     let mut lines = Vec::new();
     match direction {
         delta::Direction::Worse => {}
+        delta::Direction::Inconclusive => {}
         delta::Direction::Plateau => {
-            lines.push("No significant change.".to_string());
-            if let Some(fix) = short_action {
-                lines.push(format!("Apply fix: {fix}, then re-measure."));
+            if reason.is_none() {
+                lines.push("No significant change.".to_string());
+                if let Some(fix) = short_action {
+                    lines.push(format!("Apply fix: {fix}, then re-measure."));
+                }
             }
         }
         delta::Direction::Better => {}
@@ -250,6 +259,14 @@ pub(crate) fn apply_worse_regression_choice(
     }
 }
 
+fn format_efficiency_delta_line(delta_pp: Option<f64>) -> Option<String> {
+    match delta_pp {
+        Some(v) if v >= EFFICIENCY_DISPLAY_MIN_PP => Some(format!("  Efficiency  +{v:.1}pp ↑")),
+        Some(v) if v <= -EFFICIENCY_DISPLAY_MIN_PP => Some(format!("  Efficiency  {v:.1}pp ↓")),
+        _ => None,
+    }
+}
+
 fn print_delta(d: &delta::Delta) {
     if d.config_drifted {
         println!("  Config changed — baseline reset.");
@@ -290,10 +307,8 @@ fn print_delta(d: &delta::Delta) {
             }
         }
     }
-    match d.efficiency_delta_pp {
-        Some(v) if v > 0.0 => println!("  Efficiency  +{v:.1}pp ↑"),
-        Some(v) if v < 0.0 => println!("  Efficiency  {v:.1}pp ↓"),
-        _ => {}
+    if let Some(line) = format_efficiency_delta_line(d.efficiency_delta_pp) {
+        println!("{line}");
     }
     let has_cost = economics_section_active(d);
     if has_cost {
@@ -477,9 +492,23 @@ mod tests {
     }
 
     #[test]
+    fn efficiency_delta_near_zero_suppressed() {
+        assert!(format_efficiency_delta_line(Some(-0.04)).is_none());
+        assert!(format_efficiency_delta_line(Some(0.03)).is_none());
+    }
+
+    #[test]
+    fn efficiency_delta_below_threshold_prints_down() {
+        let line = format_efficiency_delta_line(Some(-0.06)).expect("line");
+        assert!(line.contains('↓'));
+        assert!(line.contains("-0.1pp"));
+    }
+
+    #[test]
     fn direction_followup_includes_short_action_on_plateau() {
         let lines = direction_followup_lines(
             delta::Direction::Plateau,
+            None,
             Some("raise --max-num-seqs above 32"),
         );
         assert_eq!(lines.len(), 2);
@@ -491,9 +520,22 @@ mod tests {
     }
 
     #[test]
+    fn direction_followup_plateau_with_reason_uses_mixed_result() {
+        let lines = direction_followup_lines(
+            delta::Direction::Plateau,
+            Some("efficiency flat, TTFT + throughput improved; scheduler win"),
+            Some("raise --max-num-seqs above 32"),
+        );
+        assert!(lines.is_empty());
+    }
+
+    #[test]
     fn direction_followup_worse_is_empty() {
-        let lines =
-            direction_followup_lines(delta::Direction::Worse, Some("increase client concurrency"));
+        let lines = direction_followup_lines(
+            delta::Direction::Worse,
+            None,
+            Some("increase client concurrency"),
+        );
         assert!(lines.is_empty());
     }
 
@@ -599,7 +641,7 @@ mod tests {
 
     #[test]
     fn direction_followup_omits_fix_when_short_action_missing() {
-        let lines = direction_followup_lines(delta::Direction::Plateau, None);
+        let lines = direction_followup_lines(delta::Direction::Plateau, None, None);
         assert_eq!(lines, vec!["No significant change.".to_string()]);
     }
 
@@ -656,6 +698,8 @@ mod tests {
             tpot_p99_before_ms: None,
             tpot_p99_after_ms: None,
             direction: delta::Direction::Plateau,
+            direction_reason: None,
+            ttft_p99_delta_pct: None,
             veto_fired: false,
             config_drifted: false,
         };
@@ -685,6 +729,8 @@ mod tests {
             tpot_p99_before_ms: None,
             tpot_p99_after_ms: None,
             direction: delta::Direction::Better,
+            direction_reason: None,
+            ttft_p99_delta_pct: None,
             veto_fired: false,
             config_drifted: false,
         };
