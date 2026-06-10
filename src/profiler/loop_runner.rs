@@ -67,8 +67,11 @@ pub fn run(
         let _outcome = poll::wait_for_restart_or_skip(url, &stdin_rx);
 
         if rule_name == "concurrency_saturation" {
+            println!();
             let current = current_max_num_seqs.unwrap_or(256);
-            current_max_num_seqs = Some(crate::cli::prompt_for_updated_max_num_seqs(current)?);
+            current_max_num_seqs = Some(crate::cli::prompt_for_updated_max_num_seqs(
+                current, &stdin_rx,
+            )?);
         }
 
         println!("\nMeasuring delta...");

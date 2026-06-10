@@ -66,28 +66,33 @@ fn pre_flight_max_num_seqs(url: &str) -> Option<u32> {
 }
 
 fn prompt_for_max_num_seqs() -> anyhow::Result<u32> {
+    println!();
     println!("Profile needs max_num_seqs for accurate diagnosis.");
+    println!();
     println!("Find it in your vLLM start command: --max-num-seqs N (default: 256 if not set).");
     prompt_u32_with_default(&mut io::stdin().lock(), &mut io::stdout(), 256)
 }
 
-pub(crate) fn prompt_for_updated_max_num_seqs(current: u32) -> anyhow::Result<u32> {
+pub(crate) fn prompt_for_updated_max_num_seqs(
+    current: u32,
+    stdin_rx: &std::sync::mpsc::Receiver<String>,
+) -> anyhow::Result<u32> {
     println!("Enter new --max-num-seqs value (current: {current}).");
-    prompt_u32_with_default(&mut io::stdin().lock(), &mut io::stdout(), current)
+    println!();
+    prompt_u32_from_channel(stdin_rx, &mut io::stdout(), current)
 }
 
-fn prompt_u32_with_default<R: BufRead, W: Write>(
-    reader: &mut R,
-    writer: &mut W,
-    default: u32,
-) -> anyhow::Result<u32> {
+fn retry_u32_loop<F, W>(writer: &mut W, default: u32, mut next_line: F) -> anyhow::Result<u32>
+where
+    F: FnMut() -> anyhow::Result<String>,
+    W: Write,
+{
     const MAX_ATTEMPTS: u8 = 4;
     let mut attempts: u8 = 0;
     loop {
-        write!(writer, "Enter value [{default}]: ")?;
+        write!(writer, "Enter value: ")?;
         writer.flush()?;
-        let mut line = String::new();
-        reader.read_line(&mut line)?;
+        let line = next_line()?;
         let trimmed = line.trim();
         if trimmed.is_empty() {
             return Ok(default);
@@ -114,6 +119,28 @@ fn prompt_u32_with_default<R: BufRead, W: Write>(
             }
         }
     }
+}
+
+fn prompt_u32_with_default<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    default: u32,
+) -> anyhow::Result<u32> {
+    retry_u32_loop(writer, default, || {
+        let mut l = String::new();
+        reader.read_line(&mut l)?;
+        Ok(l)
+    })
+}
+
+fn prompt_u32_from_channel<W: Write>(
+    stdin_rx: &std::sync::mpsc::Receiver<String>,
+    writer: &mut W,
+    default: u32,
+) -> anyhow::Result<u32> {
+    retry_u32_loop(writer, default, || {
+        stdin_rx.recv().map_err(|_| anyhow::anyhow!("stdin closed"))
+    })
 }
 
 #[cfg(test)]
