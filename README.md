@@ -8,16 +8,18 @@ A physics-grounded, cost-aware optimizer for vLLM inference servers.
 
 ## Profile vs other tools
 
-| | Profile | Other tools |
-| ------------------------------------ | ------- | ----------- |
-| Physics ceiling (roofline math) | ✓ | ✗ |
-| Filters idle, only analyzes under load | ✓ | ✗ |
-| Bottleneck detection | ✓ | ✓ |
-| Closed loop: measures delta after fix | ✓ | ✗ |
-| Cost per 1M tokens + recoverable waste | ✓ | ✗ |
-| Prescriptive fixes, not just alerts | ✓ | ✗ |
-| GPU metrics | ✓ | ✓ |
-| Prometheus `/metrics` | ✓ | ✓ |
+
+|                                        | Profile | Other tools |
+| -------------------------------------- | ------- | ----------- |
+| Physics ceiling (roofline math)        | ✓       | ✗           |
+| Filters idle, only analyzes under load | ✓       | ✗           |
+| Bottleneck detection                   | ✓       | ✓           |
+| Closed loop: measures delta after fix  | ✓       | ✗           |
+| Cost per 1M tokens + recoverable waste | ✓       | ✗           |
+| Prescriptive fixes, not just alerts    | ✓       | ✗           |
+| GPU metrics                            | ✓       | ✓           |
+| Prometheus `/metrics`                  | ✓       | ✓           |
+
 
 ---
 
@@ -58,21 +60,23 @@ profile diagnose [flags]
 
 **Requires:** vLLM instance exporting Prometheus metrics at `/metrics` and NVIDIA Linux runtime with NVML (`libnvidia-ml.so`) access.
 
-| Flag                       | Default                         | Description                                          |
-| -------------------------- | ------------------------------- | ---------------------------------------------------- |
-| `-u, --url`                | `http://localhost:8000/metrics` | vLLM metrics endpoint                                |
-| `--duration`               | `30s`                           | Sampling window (`30s`, `2m`, `5m`)                  |
-| `-m, --max-num-seqs`       | auto-detected                   | Read from `/metrics`; prompted if absent             |
-| `--tensor-parallel-size`   | env / unset                     | TP degree (overrides `TENSOR_PARALLEL_SIZE`)         |
-| `--cost-per-hour`          | catalog estimate                | GPU cost in USD/hr (overrides catalog estimate)      |
-| `-v`                       | off                             | Show non-triggered rules and physics limits          |
+
+| Flag                     | Default                         | Description                                     |
+| ------------------------ | ------------------------------- | ----------------------------------------------- |
+| `-u, --url`              | `http://localhost:8000/metrics` | vLLM metrics endpoint                           |
+| `--duration`             | `30s`                           | Sampling window (`30s`, `2m`, `5m`)             |
+| `-m, --max-num-seqs`     | prompted if absent              | Pass directly to skip prompt; auto-read from `/metrics` when available |
+| `--tensor-parallel-size` | env / unset                     | TP degree (overrides `TENSOR_PARALLEL_SIZE`)    |
+| `--cost-per-hour`        | catalog estimate                | GPU cost in USD/hr (overrides catalog estimate) |
+| `-v`                     | off                             | Show non-triggered rules and physics limits     |
+
 
 ---
 
 ## Sample output
 
 ```
-$ ./profile diagnose --duration 2m -v
+$ ./profile diagnose --duration 2m
 
 Profile needs max_num_seqs for accurate diagnosis.
 
@@ -110,10 +114,6 @@ Enter value: 32
 |                                                                                                  |
 |At current efficiency, ~64% of compute cost is wasted — ~$2.20/hr recoverable.                   |
 |                                                                                                  |
-|KV cache pressure: not triggered                                                                  |
-|OOM risk: not triggered                                                                           |
-|Low prefix reuse: not triggered                                                                   |
-|Concurrency saturation: not triggered                                                             |
 +--------------------------------------------------------------------------------------------------+
 
 Apply your change to vLLM.

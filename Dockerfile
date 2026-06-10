@@ -64,7 +64,6 @@ COPY --chown=appuser:appuser scripts/load.sh ./load.sh
 COPY --chown=appuser:appuser scripts/test.sh ./test.sh
 COPY --chown=appuser:appuser scripts/test2.sh ./test2.sh
 COPY --chown=appuser:appuser scripts/demo.sh ./demo.sh
-COPY --chown=appuser:appuser scripts/demo.tape ./demo.tape
 COPY --chown=appuser:appuser scripts/fix_r5.sh ./fix_r5.sh
 COPY --chown=appuser:appuser target/release/profile ./profile
 

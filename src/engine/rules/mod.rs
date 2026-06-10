@@ -253,10 +253,6 @@ fn append_not_triggered_lines(
     }
 }
 
-fn should_show_not_triggered(verbose_rules: bool, any_issue: bool, any_advisory: bool) -> bool {
-    verbose_rules || any_issue || any_advisory
-}
-
 fn not_triggered_from_fired_names(
     fired_names: &std::collections::HashSet<&'static str>,
     r2_suppressed_by_r4: bool,
@@ -340,7 +336,7 @@ pub fn format_diagnose_rules(
         r2_adv_present,
         r4_adv_present,
     );
-    if should_show_not_triggered(verbose_rules, any_issue, any_advisory) {
+    if verbose_rules {
         append_not_triggered_lines(
             &mut out,
             &not_fired,
@@ -905,7 +901,7 @@ pub fn format_diagnose_rules_for_windows(
         || r3_significant
         || r5_warning
         || !r4_groups.is_empty();
-    if should_show_not_triggered(verbose_rules, any_warning, advisories_present) {
+    if verbose_rules {
         append_not_triggered_lines(
             &mut out,
             &not_fired,
@@ -1719,8 +1715,8 @@ mod tests {
         windows[0] = mk_evaluable_kv_window(96.0, false);
         let text = r2_issue_lines(windows).join("\n");
         assert!(!text.contains("[!] KV Cache Pressure"));
-        assert!(text.contains("KV cache pressure: not triggered"));
-        assert!(text.contains("Low prefix reuse: not triggered"));
+        assert!(!text.contains("KV cache pressure: not triggered"));
+        assert!(!text.contains("Low prefix reuse: not triggered"));
         assert!(!text.contains("Seen in"));
     }
 
@@ -1811,9 +1807,9 @@ mod tests {
         assert!(text.contains("Occupancy"));
         assert!(text.contains("  Cause:"));
         assert!(text.contains("Batch more requests or increase client concurrency"));
-        assert!(text.contains("KV cache pressure: not triggered"));
-        assert!(text.contains("Low prefix reuse: not triggered"));
-        assert!(text.contains("Concurrency saturation: not triggered"));
+        assert!(!text.contains("KV cache pressure: not triggered"));
+        assert!(!text.contains("Low prefix reuse: not triggered"));
+        assert!(!text.contains("Concurrency saturation: not triggered"));
     }
 
     #[test]

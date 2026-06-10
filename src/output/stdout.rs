@@ -37,6 +37,7 @@ fn direction_label(direction: Direction) -> &'static str {
         Direction::Better => "Better",
         Direction::Worse => "Worse",
         Direction::Plateau => "Plateau",
+        Direction::Inconclusive => "Inconclusive",
     }
 }
 

@@ -8,6 +8,7 @@ use crate::output;
 
 const CEILING_HEADROOM_THRESHOLD_PCT: f64 = 10.0;
 const LOW_OCCUPANCY_THRESHOLD: f64 = 0.25;
+const EFFICIENCY_DISPLAY_MIN_PP: f64 = 0.05;
 
 pub fn run(
     url: &str,
@@ -192,6 +193,7 @@ fn direction_followup_lines(
     let mut lines = Vec::new();
     match direction {
         delta::Direction::Worse => {}
+        delta::Direction::Inconclusive => {}
         delta::Direction::Plateau => {
             lines.push("No significant change.".to_string());
             if let Some(fix) = short_action {
@@ -253,6 +255,14 @@ pub(crate) fn apply_worse_regression_choice(
     }
 }
 
+fn format_efficiency_delta_line(delta_pp: Option<f64>) -> Option<String> {
+    match delta_pp {
+        Some(v) if v >= EFFICIENCY_DISPLAY_MIN_PP => Some(format!("  Efficiency  +{v:.1}pp ↑")),
+        Some(v) if v <= -EFFICIENCY_DISPLAY_MIN_PP => Some(format!("  Efficiency  {v:.1}pp ↓")),
+        _ => None,
+    }
+}
+
 fn print_delta(d: &delta::Delta) {
     if d.config_drifted {
         println!("  Config changed — baseline reset.");
@@ -293,10 +303,8 @@ fn print_delta(d: &delta::Delta) {
             }
         }
     }
-    match d.efficiency_delta_pp {
-        Some(v) if v > 0.0 => println!("  Efficiency  +{v:.1}pp ↑"),
-        Some(v) if v < 0.0 => println!("  Efficiency  {v:.1}pp ↓"),
-        _ => {}
+    if let Some(line) = format_efficiency_delta_line(d.efficiency_delta_pp) {
+        println!("{line}");
     }
     let has_cost = economics_section_active(d);
     if has_cost {
@@ -480,6 +488,19 @@ mod tests {
     }
 
     #[test]
+    fn efficiency_delta_near_zero_suppressed() {
+        assert!(format_efficiency_delta_line(Some(-0.04)).is_none());
+        assert!(format_efficiency_delta_line(Some(0.03)).is_none());
+    }
+
+    #[test]
+    fn efficiency_delta_below_threshold_prints_down() {
+        let line = format_efficiency_delta_line(Some(-0.06)).expect("line");
+        assert!(line.contains('↓'));
+        assert!(line.contains("-0.1pp"));
+    }
+
+    #[test]
     fn direction_followup_includes_short_action_on_plateau() {
         let lines = direction_followup_lines(
             delta::Direction::Plateau,
@@ -659,6 +680,8 @@ mod tests {
             tpot_p99_before_ms: None,
             tpot_p99_after_ms: None,
             direction: delta::Direction::Plateau,
+            direction_reason: None,
+            ttft_p99_delta_pct: None,
             veto_fired: false,
             config_drifted: false,
         };
@@ -688,6 +711,8 @@ mod tests {
             tpot_p99_before_ms: None,
             tpot_p99_after_ms: None,
             direction: delta::Direction::Better,
+            direction_reason: None,
+            ttft_p99_delta_pct: None,
             veto_fired: false,
             config_drifted: false,
         };
