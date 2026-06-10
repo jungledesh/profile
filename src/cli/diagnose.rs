@@ -1,18 +1,31 @@
+use std::io::{self, BufRead, Write};
 use std::time::Duration;
 
 use crate::{context, engine, output, profiler};
 
+/// Fast-fail before collection starts. Longer hang is user-visible at startup.
+const PRE_FLIGHT_TIMEOUT: Duration = Duration::from_secs(2);
+
 pub fn execute(
     vllm_metrics_input: &str,
-    max_num_seqs: u32,
+    max_num_seqs: Option<u32>,
     cost_per_hour: Option<f64>,
     tensor_parallel_size: Option<u32>,
     verbose_rules: bool,
     duration: Duration,
 ) -> anyhow::Result<()> {
+    let resolved: Option<u32> = if max_num_seqs.is_some() {
+        max_num_seqs
+    } else {
+        match pre_flight_max_num_seqs(vllm_metrics_input) {
+            Some(v) => Some(v),
+            None => Some(prompt_for_max_num_seqs()?),
+        }
+    };
+
     let result = profiler::run_diagnose(
         vllm_metrics_input,
-        max_num_seqs,
+        resolved,
         cost_per_hour,
         tensor_parallel_size,
         duration,
@@ -29,7 +42,7 @@ pub fn execute(
 
     profiler::loop_runner::run(
         vllm_metrics_input,
-        max_num_seqs,
+        resolved,
         cost_per_hour,
         tensor_parallel_size,
         duration,
@@ -38,4 +51,115 @@ pub fn execute(
     )?;
 
     Ok(())
+}
+
+fn pre_flight_max_num_seqs(url: &str) -> Option<u32> {
+    let client = reqwest::blocking::Client::builder()
+        .use_rustls_tls()
+        .timeout(PRE_FLIGHT_TIMEOUT)
+        .build()
+        .ok()?;
+    let metrics_url = crate::collectors::vllm::metrics_url(url);
+    let body = crate::collectors::vllm::fetch_metrics_body(&client, &metrics_url).ok()?;
+    let scrape = crate::collectors::vllm::scrape_from_body(&body).ok()?;
+    crate::collectors::vllm::max_num_seqs_from_scrape(&scrape)
+}
+
+fn prompt_for_max_num_seqs() -> anyhow::Result<u32> {
+    println!("Profile needs max_num_seqs for accurate diagnosis.");
+    println!("Find it in your vLLM start command: --max-num-seqs N (default: 256 if not set).");
+    prompt_u32_with_default(&mut io::stdin().lock(), &mut io::stdout(), 256)
+}
+
+pub(crate) fn prompt_for_updated_max_num_seqs(current: u32) -> anyhow::Result<u32> {
+    println!("Enter new --max-num-seqs value (current: {current}).");
+    prompt_u32_with_default(&mut io::stdin().lock(), &mut io::stdout(), current)
+}
+
+fn prompt_u32_with_default<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    default: u32,
+) -> anyhow::Result<u32> {
+    const MAX_ATTEMPTS: u8 = 4;
+    let mut attempts: u8 = 0;
+    loop {
+        write!(writer, "Enter value [{default}]: ")?;
+        writer.flush()?;
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return Ok(default);
+        }
+        match trimmed.parse::<u32>() {
+            Ok(0) => {
+                attempts += 1;
+                if attempts >= MAX_ATTEMPTS {
+                    return Err(anyhow::anyhow!(
+                        "max_num_seqs: too many invalid attempts. Pass -m <value> to skip the prompt."
+                    ));
+                }
+                writeln!(writer, "max_num_seqs must be greater than zero.")?;
+            }
+            Ok(v) => return Ok(v),
+            Err(_) => {
+                attempts += 1;
+                if attempts >= MAX_ATTEMPTS {
+                    return Err(anyhow::anyhow!(
+                        "max_num_seqs: too many invalid attempts. Pass -m <value> to skip the prompt."
+                    ));
+                }
+                writeln!(writer, "expected a positive integer, got {trimmed:?}")?;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn run(input: &[u8], default: u32) -> anyhow::Result<u32> {
+        let mut out = Vec::new();
+        prompt_u32_with_default(&mut Cursor::new(input), &mut out, default)
+    }
+
+    #[test]
+    fn empty_input_returns_default() {
+        assert_eq!(run(b"\n", 256).unwrap(), 256);
+    }
+
+    #[test]
+    fn valid_input_returns_value() {
+        assert_eq!(run(b"128\n", 256).unwrap(), 128);
+    }
+
+    #[test]
+    fn three_bad_inputs_does_not_exit() {
+        // 3 bad + 1 valid — should succeed
+        assert_eq!(run(b"0\n0\n0\n64\n", 256).unwrap(), 64);
+    }
+
+    #[test]
+    fn four_bad_inputs_exits_with_error() {
+        assert!(run(b"0\n0\n0\n0\n", 256).is_err());
+    }
+
+    #[test]
+    fn four_non_numeric_inputs_exits_with_error() {
+        assert!(run(b"abc\nabc\nabc\nabc\n", 256).is_err());
+    }
+
+    #[test]
+    fn valid_input_after_one_bad_attempt_succeeds() {
+        assert_eq!(run(b"0\n64\n", 256).unwrap(), 64);
+    }
+
+    #[test]
+    fn error_message_contains_recovery_hint() {
+        let err = run(b"0\n0\n0\n0\n", 256).unwrap_err();
+        assert!(err.to_string().contains("Pass -m <value>"));
+    }
 }
