@@ -127,7 +127,8 @@ pub fn run(
             let choice = read_worse_regression_choice(&mut io::stdin().lock(), &mut io::stdout())?;
             match choice {
                 WorseRegressionChoice::Continue => {
-                    for line in direction_followup_lines(delta::Direction::Plateau, next_fix) {
+                    for line in direction_followup_lines(delta::Direction::Plateau, None, next_fix)
+                    {
                         println!("{line}");
                     }
                     let _ = apply_worse_regression_choice(
@@ -143,7 +144,7 @@ pub fn run(
                 }
             }
         } else {
-            for line in direction_followup_lines(d.direction, next_fix) {
+            for line in direction_followup_lines(d.direction, d.direction_reason, next_fix) {
                 println!("{line}");
             }
             state.push(new_result, new_report, Some(rule_name));
@@ -188,6 +189,7 @@ fn healthy_exit_message(
 
 fn direction_followup_lines(
     direction: delta::Direction,
+    reason: Option<&'static str>,
     short_action: Option<&str>,
 ) -> Vec<String> {
     let mut lines = Vec::new();
@@ -195,9 +197,11 @@ fn direction_followup_lines(
         delta::Direction::Worse => {}
         delta::Direction::Inconclusive => {}
         delta::Direction::Plateau => {
-            lines.push("No significant change.".to_string());
-            if let Some(fix) = short_action {
-                lines.push(format!("Apply fix: {fix}, then re-measure."));
+            if reason.is_none() {
+                lines.push("No significant change.".to_string());
+                if let Some(fix) = short_action {
+                    lines.push(format!("Apply fix: {fix}, then re-measure."));
+                }
             }
         }
         delta::Direction::Better => {}
@@ -504,6 +508,7 @@ mod tests {
     fn direction_followup_includes_short_action_on_plateau() {
         let lines = direction_followup_lines(
             delta::Direction::Plateau,
+            None,
             Some("raise --max-num-seqs above 32"),
         );
         assert_eq!(lines.len(), 2);
@@ -515,9 +520,22 @@ mod tests {
     }
 
     #[test]
+    fn direction_followup_plateau_with_reason_uses_mixed_result() {
+        let lines = direction_followup_lines(
+            delta::Direction::Plateau,
+            Some("efficiency flat, TTFT + throughput improved; scheduler win"),
+            Some("raise --max-num-seqs above 32"),
+        );
+        assert!(lines.is_empty());
+    }
+
+    #[test]
     fn direction_followup_worse_is_empty() {
-        let lines =
-            direction_followup_lines(delta::Direction::Worse, Some("increase client concurrency"));
+        let lines = direction_followup_lines(
+            delta::Direction::Worse,
+            None,
+            Some("increase client concurrency"),
+        );
         assert!(lines.is_empty());
     }
 
@@ -623,7 +641,7 @@ mod tests {
 
     #[test]
     fn direction_followup_omits_fix_when_short_action_missing() {
-        let lines = direction_followup_lines(delta::Direction::Plateau, None);
+        let lines = direction_followup_lines(delta::Direction::Plateau, None, None);
         assert_eq!(lines, vec!["No significant change.".to_string()]);
     }
 

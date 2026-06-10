@@ -2,7 +2,7 @@ use crate::engine::Report;
 
 use super::DiagnoseResult;
 
-// Direction thresholds — Provisional: calibrate against real workloads before hardening.
+// Direction thresholds. Provisional: calibrate against real workloads before hardening.
 const EFFICIENCY_BETTER_PP: f64 = 2.0;
 const EFFICIENCY_WORSE_PP: f64 = -5.0;
 const DEFAULT_LATENCY_VETO_PCT: f64 = 20.0;
@@ -19,7 +19,7 @@ pub enum Direction {
     Worse,
     /// Efficiency within band, latency-vetoed gain, or fallback throughput within band.
     Plateau,
-    /// No measurable signal — efficiency and throughput both unavailable.
+    /// No measurable signal; efficiency and throughput both unavailable.
     Inconclusive,
 }
 
@@ -166,7 +166,7 @@ fn evaluate_efficiency_delta(delta: &Delta) -> (Direction, Option<&'static str>)
 
         (Flat, Up, Up) => (
             Direction::Better,
-            Some("efficiency flat, TTFT + throughput improved — scheduler win"),
+            Some("efficiency flat, TTFT + throughput improved; scheduler win"),
         ),
         (Flat, Up, Flat) => (
             Direction::Better,
@@ -174,37 +174,31 @@ fn evaluate_efficiency_delta(delta: &Delta) -> (Direction, Option<&'static str>)
         ),
         (Flat, Up, Down) => (
             Direction::Plateau,
-            Some("mixed — latency improved but throughput fell; check load"),
+            Some("latency improved but throughput fell; check load"),
         ),
         (Flat, Flat, Up) => (
             Direction::Better,
             Some("efficiency flat, throughput expanded"),
         ),
         (Flat, Flat, Flat) => (Direction::Plateau, None),
-        (Flat, Flat, Down) => (
-            Direction::Worse,
-            Some("efficiency flat, throughput fell"),
-        ),
+        (Flat, Flat, Down) => (Direction::Worse, Some("efficiency flat, throughput fell")),
         (Flat, Down, Up) => (
             Direction::Plateau,
-            Some("mixed — capacity expanded at cost of latency; check KV pressure"),
+            Some("capacity expanded at cost of latency; check KV pressure"),
         ),
         (Flat, Down, Flat) => (
             Direction::Worse,
             Some("efficiency flat, latency SLA violated"),
         ),
-        (Flat, Down, Down) => (
-            Direction::Worse,
-            Some("latency spiked and throughput fell"),
-        ),
+        (Flat, Down, Down) => (Direction::Worse, Some("latency spiked and throughput fell")),
 
         (Down, Up, Up) => (
-            Direction::Plateau,
-            Some("mixed — efficiency fell but scheduling improved; monitor KV pressure"),
+            Direction::Better,
+            Some("scheduling improved; efficiency drop reflects larger batch"),
         ),
         (Down, Up, Flat) => (
             Direction::Plateau,
-            Some("mixed — efficiency fell, latency better; verify load didn't drop"),
+            Some("efficiency fell, latency better; verify load didn't drop"),
         ),
         (Down, Up, Down) => (
             Direction::Worse,
@@ -212,7 +206,7 @@ fn evaluate_efficiency_delta(delta: &Delta) -> (Direction, Option<&'static str>)
         ),
         (Down, Flat, Up) => (
             Direction::Plateau,
-            Some("mixed — per-slot efficiency fell, total throughput expanded; monitor fragmentation"),
+            Some("per-slot efficiency fell, total throughput expanded; monitor fragmentation"),
         ),
         (Down, Flat, Flat) => (Direction::Worse, Some("clear regression")),
         (Down, Flat, Down) => (
@@ -223,20 +217,47 @@ fn evaluate_efficiency_delta(delta: &Delta) -> (Direction, Option<&'static str>)
             Direction::Worse,
             Some("efficiency + latency broken; throughput gain doesn't save it"),
         ),
-        (Down, Down, Flat) => (
-            Direction::Worse,
-            Some("efficiency + latency degraded"),
-        ),
+        (Down, Down, Flat) => (Direction::Worse, Some("efficiency + latency degraded")),
         (Down, Down, Down) => (
             Direction::Worse,
-            Some("severe regression — everything degraded"),
+            Some("severe regression; everything degraded"),
         ),
+    }
+}
+
+fn rule_direction_reason(
+    prev_rule: Option<&'static str>,
+    new_rule: Option<&'static str>,
+    direction: Direction,
+) -> Option<&'static str> {
+    match (prev_rule, new_rule, direction) {
+        (Some("concurrency_saturation"), None, Direction::Better) => {
+            Some("scheduler bottleneck cleared")
+        }
+        (Some("concurrency_saturation"), Some("concurrency_saturation"), Direction::Plateau) => {
+            Some("scheduler still saturated")
+        }
+        (Some("kv_cache_pressure"), None, Direction::Better) => Some("KV pressure cleared"),
+        (Some("kv_cache_pressure"), Some("kv_cache_pressure"), Direction::Plateau) => {
+            Some("KV pressure persists")
+        }
+        (Some("under_batching"), None, Direction::Better) => Some("batch utilization improved"),
+        (Some("under_batching"), Some("under_batching"), Direction::Plateau) => {
+            Some("batch still under-utilized")
+        }
+        (Some("low_prefix_reuse"), None, Direction::Better) => {
+            Some("prefix cache hit rate improved")
+        }
+        (Some("low_prefix_reuse"), Some("low_prefix_reuse"), Direction::Plateau) => {
+            Some("prefix cache miss persists")
+        }
+        _ => None,
     }
 }
 
 /// v2: Default/Throughput path only.
 ///
-/// `goal` is reserved — exhaustive match ensures future objectives fail to compile until handled.
+/// `goal` is reserved; exhaustive match ensures future objectives fail to compile until handled.
 pub fn calculate_direction(
     delta: &Delta,
     _goal: Option<&Goal>,
@@ -365,8 +386,10 @@ pub fn compute(
         config_drifted,
     };
     let (direction, reason) = calculate_direction(&delta, None);
+    let prev_rule = prev_report.groups.first().map(|g| g.primary.rule_name);
+    let new_rule = curr_report.groups.first().map(|g| g.primary.rule_name);
     delta.direction = direction;
-    delta.direction_reason = reason;
+    delta.direction_reason = rule_direction_reason(prev_rule, new_rule, direction).or(reason);
     delta.veto_fired = latency_veto_fires(&delta);
     delta
 }
@@ -615,7 +638,7 @@ mod tests {
     #[test]
     fn eff_down_mixed() {
         let d = finalize_delta(mk_delta(Some(-6.0), Some(15.0), Some(100.0), Some(75.0)));
-        assert_eq!(d.direction, Direction::Plateau);
+        assert_eq!(d.direction, Direction::Better);
         assert!(d
             .direction_reason
             .is_some_and(|r| r.contains("scheduling improved")));
