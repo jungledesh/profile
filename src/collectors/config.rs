@@ -31,7 +31,10 @@ pub struct VllmConfig {
 
 /// Build config from snapshot fields + env vars. No I/O.
 /// `max_num_seqs` priority: scrape gauge → CLI flag → env var.
-pub(crate) fn config_from_snapshot(snapshot: &RawSnapshot, cli_max_num_seqs: u32) -> VllmConfig {
+pub(crate) fn config_from_snapshot(
+    snapshot: &RawSnapshot,
+    cli_max_num_seqs: Option<u32>,
+) -> VllmConfig {
     let cc = &snapshot.vllm.cache_config;
     VllmConfig {
         model_name: snapshot
@@ -43,7 +46,7 @@ pub(crate) fn config_from_snapshot(snapshot: &RawSnapshot, cli_max_num_seqs: u32
         max_num_seqs: snapshot
             .vllm
             .max_num_seqs
-            .or(Some(cli_max_num_seqs).filter(|&v| v > 0))
+            .or(cli_max_num_seqs)
             .or_else(|| env_u32("MAX_NUM_SEQS")),
         tensor_parallel_size: env_u32("TENSOR_PARALLEL_SIZE")
             .or_else(|| env_u32("VLLM_TENSOR_PARALLEL_SIZE")),
@@ -80,7 +83,7 @@ pub(crate) fn config_from_snapshot(snapshot: &RawSnapshot, cli_max_num_seqs: u32
 pub fn build_config(
     metrics_url: &str,
     snapshot: &RawSnapshot,
-    cli_max_num_seqs: u32,
+    cli_max_num_seqs: Option<u32>,
 ) -> VllmConfig {
     let mut cfg = config_from_snapshot(snapshot, cli_max_num_seqs);
     let base = base_url_from_metrics(metrics_url);
@@ -190,7 +193,7 @@ mod tests {
     #[test]
     fn config_from_snapshot_uses_snapshot_fields() {
         let s = mk_snap(Some("test-model"), Some(128));
-        let cfg = config_from_snapshot(&s, 0);
+        let cfg = config_from_snapshot(&s, None);
         assert_eq!(cfg.model_name, Some("test-model".to_string()));
         assert_eq!(cfg.max_num_seqs, Some(128));
     }
@@ -198,21 +201,28 @@ mod tests {
     #[test]
     fn config_from_snapshot_cli_fallback_when_scrape_missing() {
         let s = mk_snap(None, None);
-        let cfg = config_from_snapshot(&s, 64);
+        let cfg = config_from_snapshot(&s, Some(64));
         assert_eq!(cfg.max_num_seqs, Some(64));
     }
 
     #[test]
     fn config_from_snapshot_scrape_beats_cli() {
         let s = mk_snap(None, Some(256));
-        let cfg = config_from_snapshot(&s, 64);
+        let cfg = config_from_snapshot(&s, Some(64));
         assert_eq!(cfg.max_num_seqs, Some(256));
+    }
+
+    #[test]
+    fn config_from_snapshot_none_when_gauge_and_cli_absent() {
+        let s = mk_snap(None, None);
+        let cfg = config_from_snapshot(&s, None);
+        assert_eq!(cfg.max_num_seqs, None);
     }
 
     #[test]
     fn config_from_snapshot_handles_missing_fields() {
         let s = mk_snap(None, None);
-        let cfg = config_from_snapshot(&s, 0);
+        let cfg = config_from_snapshot(&s, None);
         assert!(cfg.tensor_parallel_size.is_none());
         assert!(cfg.pipeline_parallel_size.is_none());
         assert!(cfg.kv_cache_dtype.is_none());
@@ -232,7 +242,7 @@ mod tests {
             enable_prefix_caching: Some(true),
             enable_chunked_prefill: Some(false),
         };
-        let cfg = config_from_snapshot(&s, 0);
+        let cfg = config_from_snapshot(&s, None);
         assert_eq!(cfg.block_size, Some(32));
         assert_eq!(cfg.kv_cache_dtype.as_deref(), Some("fp8"));
         assert_eq!(cfg.enable_prefix_caching, Some(true));

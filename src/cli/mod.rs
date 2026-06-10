@@ -2,10 +2,11 @@
 
 mod diagnose;
 
+pub(crate) use diagnose::prompt_for_updated_max_num_seqs;
+
 use clap::{CommandFactory, Parser, Subcommand};
 use std::time::Duration;
 
-const DEFAULT_MAX_NUM_SEQS: u32 = 256;
 const DEFAULT_METRICS_URL: &str = "http://localhost:8000/metrics";
 const DEFAULT_DURATION: &str = "30s";
 
@@ -40,11 +41,10 @@ pub struct Cli {
         short = 'm',
         long = "max-num-seqs",
         global = true,
-        default_value_t = DEFAULT_MAX_NUM_SEQS,
-        help = "Engine max_num_seqs if absent on /metrics",
+        help = "Engine max_num_seqs (auto-detected from /metrics when available; prompted if absent)",
         display_order = 1
     )]
-    pub max_num_seqs: u32,
+    pub max_num_seqs: Option<u32>,
 
     #[arg(
         long = "tensor-parallel-size",

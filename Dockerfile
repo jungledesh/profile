@@ -21,6 +21,7 @@ RUN export DEBIAN_FRONTEND=noninteractive \
     gawk \
     tmux \
     ffmpeg \
+    vim \
     sudo \
     ca-certificates \
     libnss3 \

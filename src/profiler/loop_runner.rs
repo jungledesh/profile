@@ -11,7 +11,7 @@ const LOW_OCCUPANCY_THRESHOLD: f64 = 0.25;
 
 pub fn run(
     url: &str,
-    max_num_seqs: u32,
+    max_num_seqs: Option<u32>,
     cost_per_hour: Option<f64>,
     tensor_parallel_size: Option<u32>,
     duration: Duration,
@@ -20,6 +20,7 @@ pub fn run(
 ) -> anyhow::Result<()> {
     let mut state = LoopState::new(initial_result, initial_report);
     let stdin_rx = poll::spawn_stdin_watcher();
+    let mut current_max_num_seqs = max_num_seqs;
 
     loop {
         let Some(rule_name) = state
@@ -65,10 +66,15 @@ pub fn run(
 
         let _outcome = poll::wait_for_restart_or_skip(url, &stdin_rx);
 
+        if rule_name == "concurrency_saturation" {
+            let current = current_max_num_seqs.unwrap_or(256);
+            current_max_num_seqs = Some(crate::cli::prompt_for_updated_max_num_seqs(current)?);
+        }
+
         println!("\nMeasuring delta...");
         let new_result = run_diagnose(
             url,
-            max_num_seqs,
+            current_max_num_seqs,
             cost_per_hour,
             tensor_parallel_size,
             duration,
