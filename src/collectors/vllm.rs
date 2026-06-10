@@ -18,7 +18,7 @@ fn normalize_vllm_prometheus_text(body: &str) -> String {
 }
 
 /// Resolves the GET URL for Prometheus text. Accepts a server base URL or a URL that already ends with `/metrics`.
-fn metrics_url(input: &str) -> String {
+pub(crate) fn metrics_url(input: &str) -> String {
     let t = input.trim().trim_end_matches('/');
     if t.ends_with("/metrics") {
         t.to_string()
@@ -27,7 +27,7 @@ fn metrics_url(input: &str) -> String {
     }
 }
 
-fn fetch_metrics_body(client: &reqwest::blocking::Client, url: &str) -> Result<String> {
+pub(crate) fn fetch_metrics_body(client: &reqwest::blocking::Client, url: &str) -> Result<String> {
     client
         .get(url)
         .send()
@@ -38,7 +38,7 @@ fn fetch_metrics_body(client: &reqwest::blocking::Client, url: &str) -> Result<S
         .with_context(|| format!("failed to read response body from {}", url))
 }
 
-fn scrape_from_body(body: &str) -> Result<Scrape> {
+pub(crate) fn scrape_from_body(body: &str) -> Result<Scrape> {
     let normalized = normalize_vllm_prometheus_text(body);
     Scrape::parse(normalized.lines().map(|s| Ok(s.to_string())))
         .context("failed to parse Prometheus text format")
@@ -427,7 +427,7 @@ fn apply_histogram_window(first: &Scrape, last: &Scrape, m: &mut VllmRawMetrics)
     }
 }
 
-fn max_num_seqs_from_gauge(scrape: &Scrape) -> Option<u32> {
+pub(crate) fn max_num_seqs_from_scrape(scrape: &Scrape) -> Option<u32> {
     first_gauge(scrape, "vllm_max_num_seqs").and_then(|v| {
         if v.is_finite() && v >= 0.0 {
             let r = v.round();
@@ -560,7 +560,7 @@ fn parse_vllm_metrics(scrape: &Scrape) -> Result<VllmRawMetrics> {
 
     let generation_tokens_total = total_generation_tokens(scrape);
 
-    let max_num_seqs = max_num_seqs_from_gauge(scrape);
+    let max_num_seqs = max_num_seqs_from_scrape(scrape);
     let num_requests_swapped = first_gauge(scrape, "vllm_num_requests_swapped");
     let num_preemptions_total = total_preemptions(scrape);
     let cpu_cache_usage_perc = first_gauge(scrape, "vllm_cpu_cache_usage_perc").map(|v| v * 100.0);
@@ -654,17 +654,17 @@ vllm_max_num_seqs 256
     }
 
     #[test]
-    fn max_num_seqs_from_gauge_rounds() {
+    fn max_num_seqs_from_scrape_rounds() {
         let body = "vllm_max_num_seqs 15.7\n";
         let s = scrape_from_body(body).unwrap();
-        assert_eq!(max_num_seqs_from_gauge(&s), Some(16));
+        assert_eq!(max_num_seqs_from_scrape(&s), Some(16));
     }
 
     #[test]
     fn max_num_seqs_absent_is_none() {
         let body = "vllm_num_requests_running 1\n";
         let s = scrape_from_body(body).unwrap();
-        assert_eq!(max_num_seqs_from_gauge(&s), None);
+        assert_eq!(max_num_seqs_from_scrape(&s), None);
     }
 
     #[test]

@@ -20,6 +20,57 @@ vllm_generation_tokens_total 1000
 noop 0
 "#;
 
+/// One extra GET when diagnose runs without `-m` (pre-flight max_num_seqs scrape).
+const PREFLIGHT_SCRAPES: usize = 1;
+
+fn spawn_metrics_server_with_preflight(
+    body: &'static str,
+    response_count: usize,
+) -> (String, thread::JoinHandle<()>) {
+    spawn_metrics_server(body, response_count + PREFLIGHT_SCRAPES)
+}
+
+fn spawn_metrics_server_seq_with_preflight(
+    bodies: &[&'static str],
+) -> (String, thread::JoinHandle<()>) {
+    assert_eq!(
+        bodies.len(),
+        SAMPLE_COUNT,
+        "vLLM collector performs exactly {SAMPLE_COUNT} scrapes"
+    );
+    let mut extended = vec![bodies[0]];
+    extended.extend_from_slice(bodies);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test metrics server");
+    let port = listener.local_addr().expect("local_addr").port();
+    let url = format!("http://127.0.0.1:{port}");
+
+    let handle = thread::spawn(move || {
+        for body in extended {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 4096];
+            let mut n = 0usize;
+            while n < buf.len() {
+                let got = stream.read(&mut buf[n..]).expect("read");
+                if got == 0 {
+                    break;
+                }
+                n += got;
+                if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(resp.as_bytes()).expect("write response");
+        }
+    });
+
+    (url, handle)
+}
+
 fn spawn_metrics_server(
     body: &'static str,
     response_count: usize,
@@ -319,7 +370,7 @@ fn diagnose_shows_gen_tok_per_sec_when_counters_increase() {
     const G100: &str = "vllm_num_requests_running 20\nvllm_kv_cache_usage_perc 50\nvllm_generation_tokens_total 100\n";
     const G250: &str = "vllm_num_requests_running 20\nvllm_kv_cache_usage_perc 50\nvllm_generation_tokens_total 250\n";
     let bodies = [G100, G100, G100, G100, G100, G100, G100, G100, G250];
-    let (url, server) = spawn_metrics_server_seq(&bodies);
+    let (url, server) = spawn_metrics_server_seq_with_preflight(&bodies);
     let output = Command::cargo_bin("profile")
         .unwrap()
         .arg("diagnose")
@@ -357,7 +408,7 @@ fn diagnose_gen_tok_per_sec_na_when_counter_resets() {
         "vllm_generation_tokens_total 100\n"
     );
     let bodies = [B500, B500, B500, B500, B500, B500, B500, B500, B100];
-    let (url, server) = spawn_metrics_server_seq(&bodies);
+    let (url, server) = spawn_metrics_server_seq_with_preflight(&bodies);
     let output = Command::cargo_bin("profile")
         .unwrap()
         .arg("diagnose")
@@ -384,7 +435,7 @@ fn diagnose_gen_tok_per_sec_na_when_counter_resets() {
 
 #[test]
 fn diagnose_verbose_shows_not_indicated_lines() {
-    let (url, server) = spawn_metrics_server(MINIMAL_EVALUABLE_SCRAPE, SAMPLE_COUNT);
+    let (url, server) = spawn_metrics_server_with_preflight(MINIMAL_EVALUABLE_SCRAPE, SAMPLE_COUNT);
     let output = Command::cargo_bin("profile")
         .unwrap()
         .args(["-v", "diagnose", "--duration", "2s", "--url"])
@@ -432,8 +483,7 @@ fn diagnose_help_lists_usage_and_options() {
         "vLLM metrics endpoint",
         "[default: http://localhost:8000/metrics]",
         "-m, --max-num-seqs",
-        "Engine max_num_seqs if absent on /metrics",
-        "[default: 256]",
+        "Engine max_num_seqs (auto-detected from /metrics when available; prompted if absent)",
         "--duration",
         "m  minutes",
         "not ms (milliseconds)",
@@ -464,7 +514,7 @@ vllm_max_num_seqs 32
 vllm_generation_tokens_total 1000
 "#;
     let bodies = [SCRAPE; SAMPLE_COUNT];
-    let (url, server) = spawn_metrics_server_seq(&bodies);
+    let (url, server) = spawn_metrics_server_seq_with_preflight(&bodies);
     let output = Command::cargo_bin("profile")
         .unwrap()
         .args(["diagnose", "--duration", "2s", "--url"])
@@ -486,7 +536,7 @@ vllm_generation_tokens_total 1000
 
 #[test]
 fn verbose_prints_level_to_stderr() {
-    let (url, server) = spawn_metrics_server(MINIMAL_SCRAPE, SAMPLE_COUNT);
+    let (url, server) = spawn_metrics_server_with_preflight(MINIMAL_SCRAPE, SAMPLE_COUNT);
     Command::cargo_bin("profile")
         .unwrap()
         .args(["-vv", "diagnose", "--duration", "2s", "--url"])

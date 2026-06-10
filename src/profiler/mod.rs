@@ -29,7 +29,7 @@ pub struct DiagnoseResult {
 
 pub fn run_diagnose(
     vllm_metrics_input: &str,
-    max_num_seqs: u32,
+    max_num_seqs: Option<u32>,
     cost_per_hour: Option<f64>,
     tensor_parallel_size: Option<u32>,
     duration: Duration,
@@ -38,7 +38,7 @@ pub fn run_diagnose(
     let metrics_input = vllm_metrics_input.to_string();
     let window = logical_window_size(duration);
     let window_durations = build_window_durations(duration, window);
-    let raw_windows = collect_windows(vllm_metrics_input, max_num_seqs, &window_durations)?;
+    let raw_windows = collect_windows(vllm_metrics_input, &window_durations)?;
     let any_evaluable = raw_windows.iter().any(window_is_evaluable);
     let snapshot = if raw_windows.is_empty() {
         empty_snapshot(started_at)
@@ -96,13 +96,11 @@ fn build_window_durations(duration: Duration, logical_window: Duration) -> Vec<D
 
 fn collect_windows(
     vllm_metrics_input: &str,
-    max_num_seqs: u32,
     window_durations: &[Duration],
 ) -> anyhow::Result<Vec<collectors::RawSnapshot>> {
     let mut out = Vec::new();
     for &this_window in window_durations {
-        let snap =
-            collectors::collect_snapshot_for_window(vllm_metrics_input, max_num_seqs, this_window)?;
+        let snap = collectors::collect_snapshot_for_window(vllm_metrics_input, this_window)?;
         out.push(snap);
     }
     Ok(out)

@@ -2,52 +2,76 @@
 
 Less Words. Less Noise. More Signal. More Value.
 
-A physics-grounded, cost-aware optimizer for vLLM.
-
-Profile measures live telemetry against the absolute physical limits of your hardware to expose waste, surface immediate configuration fixes, and reclaim infrastructure spend.
+A physics-grounded, cost-aware optimizer for vLLM inference servers.
 
 ---
 
-## Design
+## Profile vs other tools
 
-- **Ground Truth.** Maps live decode and prefill phases against your hardware's exact memory bandwidth and compute ceilings. Efficiency is derived from silicon physics, never estimated. If a metric is missing or telemetry is low-confidence, Profile flags it explicitly, zero artificial certainty.
-- **Zero Noise.** Traffic-gated profiling. The analyzer sleeps during idle cycles and only samples when the node is actively crunching tokens. Idle state is not waste; Profile only measures when there is actual work to optimize.
-- **Closed Loop.** Tracks configuration changes across container restarts to output precise performance and cost deltas. To prevent alert fatigue, Profile surfaces exactly one high-priority signal per iteration — isolate the bottleneck, deploy the fix, re-measure.
+| | Profile | Other tools |
+| ------------------------------------ | ------- | ----------- |
+| Physics ceiling (roofline math) | ✓ | ✗ |
+| Filters idle, only analyzes under load | ✓ | ✗ |
+| Bottleneck detection | ✓ | ✓ |
+| Closed loop: measures delta after fix | ✓ | ✗ |
+| Cost per 1M tokens + recoverable waste | ✓ | ✗ |
+| Prescriptive fixes, not just alerts | ✓ | ✗ |
+| GPU metrics | ✓ | ✓ |
+| Prometheus `/metrics` | ✓ | ✓ |
 
 ---
 
-## Value in a Minute
+## How it works
 
-### 1. Download
+Profile watches your vLLM server under load. Computes the roofline for your exact model and GPU, shows where you stand against that ceiling, and tells you what to fix. Apply a change, Profile re-measures, reports the exact delta. Every recommendation is accountable.
+
+---
+
+## Value in a minute
+
+### Download
 
 ```bash
 curl -L https://github.com/jungledesh/profile/releases/latest/download/profile -o profile
-```
-
-### 2. Install
-
-```bash
 chmod +x profile && mv profile /usr/local/bin/
 ```
 
-### 3. Run
-
-```bash
-profile diagnose --url http://localhost:8000/metrics --duration 2m
-```
-
-Or build from source & run:
+### Or build from source
 
 ```bash
 cargo install --git https://github.com/jungledesh/profile
-profile diagnose --url http://localhost:8000/metrics --duration 2m
 ```
 
-### 4. Sample Output
+### Run
+
+```bash
+profile diagnose --url http://localhost:8000/metrics
+```
+
+---
+
+## Configuration
+
+```bash
+profile diagnose [flags]
+```
+
+| Flag                     | Default                         | Description                                               |
+| ------------------------ | ------------------------------- | --------------------------------------------------------- |
+| `--url`                  | `http://localhost:8000/metrics` | Target vLLM metrics endpoint                              |
+| `--duration`             | `30s`                           | Sampling window (`30s`, `2m`, `5m`)                       |
+| `-m`                     | auto-detected                   | `max_num_seqs`: read from `/metrics`; prompted on first run if absent |
+| `--tensor-parallel-size` | env / unset                     | TP degree (overrides `TENSOR_PARALLEL_SIZE`)              |
+| `--cost-per-hour`        | catalog estimate                | Exact instance rate for dollar tracking                   |
+| `-v`                     | off                             | Verbose: show non-triggered rules and physics limits      |
+
+---
+
+## Sample output
 
 ```
 +--------------------------------------------------------------------------------------------------+
-|PROFILE v2.0.0 [meta-llama/Llama-3.1-8B-Instruct] [NVIDIA H100 80GB HBM3] (30s from 2026-06-03 …)|
+|PROFILE v2.1.0 [meta-llama/Llama-3.1-8B-Instruct] [NVIDIA H100 80GB HBM3] (30s from 2026-06-03)|
 |                                                                                                  |
 |GPU =>      EFFICIENCY 36.2% | POWER 312W | 0.20 J/tok | $0.16/1M tok (est) | vRAM 62/80GB      |
 |                                                                                                  |
@@ -60,7 +84,7 @@ profile diagnose --url http://localhost:8000/metrics --duration 2m
 |                                                                                                  |
 |ISSUES:                                                                                           |
 |                                                                                                  |
-|[!] Under-batching — Insufficient Concurrency                                                       |
+|[!] Under-batching: Insufficient Concurrency                                                     |
 |  Seen in 60% of windows                                                                          |
 |                                                                                                  |
 |  Occupancy  1.3%  (threshold: < 25%)                                                             |
@@ -75,12 +99,12 @@ profile diagnose --url http://localhost:8000/metrics --duration 2m
 |  Expected: Higher throughput, stable TPOT.                                                       |
 |  Confidence: High                                                                                |
 |                                                                                                  |
-|At current efficiency, ~64% of compute cost is wasted — ~$2.24/hr recoverable.                    |
+|At current efficiency, ~64% of compute cost is wasted: ~$2.24/hr recoverable.                   |
 |                                                                                                  |
-|KV cache pressure: not triggered                                                                   |
-|OOM risk: not triggered                                                                            |
-|Low prefix reuse: not triggered                                                                    |
-|Concurrency saturation: not triggered                                                              |
+|KV cache pressure: not triggered                                                                  |
+|OOM risk: not triggered                                                                           |
+|Low prefix reuse: not triggered                                                                   |
+|Concurrency saturation: not triggered                                                             |
 +--------------------------------------------------------------------------------------------------+
 
 Apply your change to vLLM.
@@ -88,7 +112,7 @@ Profile will detect when vLLM restarts automatically.
 Press Enter to skip and re-measure now.
 ```
 
-After you apply a fix and re-measure:
+After you apply a fix:
 
 ```
 Measuring delta...
@@ -105,73 +129,42 @@ Direction: Better
 No issues detected. Efficiency: 65.2% of hardware ceiling.
 ```
 
-If performance regresses, Profile pauses and asks:
+---
 
-```
-  [r] revert   [c] continue
-> x
- r = revert, c = continue
-> r
-Revert: undo increase client concurrency — 253 slots idle, then re-measure when ready.
-```
+## Bottlenecks detected
+
+- **Under-batching**: hardware under-fed by client; compute headroom wasted
+- **KV cache pressure**: VRAM near capacity, preemption risk rising
+- **Low prefix reuse**: prefix cache hit rate too low; prefill compute wasted
+- **Concurrency saturation**: `max_num_seqs` cap hit; requests queueing, TTFT degrading
+- **OOM risk**: model weight footprint structurally exceeds available VRAM
 
 ---
 
-## Production Bottlenecks Detected
+## Crafted, not just engineered.
 
-- **Concurrency Saturation:** `max_num_seqs` cap hit under high load. Requests stack in the queue, destroying TTFT.
-- **KV Cache Pressure:** VRAM near capacity, driving high token-eviction and preemption risks.
-- **Low Prefix Reuse:** Prefix cache hit rate too low under load — prompts share too little common prefix, wasting prefill compute and inflating TTFT.
-- **Under-Batching:** Upstream orchestration or client failure leaving massive GPU compute headroom unutilized.
-- **OOM Risk:** Model weight configuration structurally exceeds physical VRAM topology before execution begins.
-
----
-
-## Configuration Reference
-
-```bash
-./profile diagnose [flags]
-```
-
-
-| Flag                     | Default                         | Description                                                   |
-| ------------------------ | ------------------------------- | ------------------------------------------------------------- |
-| `--url`                  | `http://localhost:8000/metrics` | Target vLLM metrics endpoint                                  |
-| `--duration`             | `30s`                           | Sampling window (e.g., `30s`, `2m`, `5m`)                     |
-| `-m`                     | `256`                           | Fallback value for `max_num_seqs` if absent from metrics      |
-| `--tensor-parallel-size` | env / unset                     | Tensor parallel degree (overrides `TENSOR_PARALLEL_SIZE`)     |
-| `--cost-per-hour`        | catalog estimate                | Exact host instance rate for raw dollar tracking              |
-| `-v`                     | off                             | Verbose mode. Exposes non-triggered rules and physical limits |
-
+- Every element in the UI earns its place. If it does not help the user, it is not there.
+- Plain language. No jargon, where a plain word works. The goal is to help, not impress.
+- Idle windows are ignored. Profile only measures behavior under active load. That is where waste lives.
+- Hardware and model agnostic. Roofline math derives limits fresh each run: peak memory bandwidth for decode, peak FLOPs for prefill. No calibration files, no pre-baked assumptions.
+- Honest under uncertainty. If a metric is unavailable, it shows `-` and moves on. No fabricated values.
+- Prescriptive. Profile tells you what to change and how. Waits while you apply it. Re-measures and reports the exact delta.
 
 ---
 
-## Environment Requirements
+## Requirements
 
-- vLLM instance exporting standard Prometheus metrics
-- NVIDIA Linux runtime with native NVML (`libnvidia-ml.so`) access
+- vLLM instance exporting standard Prometheus metrics at `/metrics`
+- NVIDIA Linux runtime with NVML (`libnvidia-ml.so`) access
 
 ---
 
 ## License
 
-Profile is open source under the **Apache License 2.0**.
-See the full [LICENSE](LICENSE) file for details.
+Apache License 2.0. See [LICENSE](LICENSE).
 
 ```
 Copyright 2026 Gagandeep Singh
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
 ```
 
-For production teams requiring cluster-wide aggregation, specialized hardware cataloging, or custom architecture support: **[jungledesh@gmail.com](mailto:jungledesh@gmail.com)**
+For production teams requiring cluster-wide aggregation, multi-engine support, or custom hardware cataloging: **[jungledesh@gmail.com](mailto:jungledesh@gmail.com)**

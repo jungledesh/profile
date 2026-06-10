@@ -22,7 +22,6 @@ use std::time::Duration;
 
 pub fn collect_snapshot_for_window(
     vllm_metrics_input: &str,
-    _max_num_seqs_from_cli: u32,
     window: Duration,
 ) -> anyhow::Result<RawSnapshot> {
     let url = vllm_metrics_input.to_string();
