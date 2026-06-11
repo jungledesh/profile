@@ -184,10 +184,10 @@ load_rag() {
   # specs, financial summaries, compliance text — paired with varied instructions.
   # Real text → realistic tokenization and model behavior. No synthetic gibberish.
   #
-  # Physics note (DGX Spark / GB10):
-  #   Decode ceiling ~5.1 tok/s (LPDDR5x-bound). KV cache saturates at ~19 concurrent
-  #   requests given 27B bf16 weights. 30 workers at 2 s mean think time keeps ~28
-  #   requests in-flight — reliably above the KV saturation point without runaway queues.
+  # Physics note (A100 SXM 80GB, Qwen3.6-27B BF16):
+  #   Decode ceiling ~37 tok/s. KV headroom ~18 GB; saturates at ~23 concurrent
+  #   at actual RAG usage (~2500 tokens, ~4 blocks/request, 784-token blocks).
+  #   30 workers at LAMBDA=0.5 keeps ~26 in-flight — above saturation. R2 fires.
   local workers="${CONCURRENCY:-30}"
   local mean_think="${LAMBDA:-2}"
 
