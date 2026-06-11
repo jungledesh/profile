@@ -1,0 +1,24 @@
+# syntax=docker/dockerfile:1.7
+# Builder
+FROM rust:slim-bookworm AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    musl-tools \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir -p src && echo "fn main() {}" > src/main.rs
+RUN rustup target add x86_64-unknown-linux-musl
+RUN cargo build --release --target x86_64-unknown-linux-musl
+COPY . .
+RUN cargo build --release --target x86_64-unknown-linux-musl
+# Runtime
+FROM nvidia/cuda:12.4.1-base-ubuntu22.04
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd -g 1000 profile \
+    && useradd -u 1000 -g 1000 -m -s /bin/false profile
+COPY --from=builder /build/target/x86_64-unknown-linux-musl/release/profile /usr/local/bin/profile
+USER profile
+ENTRYPOINT ["/usr/local/bin/profile"]
