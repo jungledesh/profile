@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Demo setup — Qwen3.6-27B-Instruct on RunPod A100 40GB (A100 SXM, TP=1)
+# Demo setup — Qwen3.6-27B on RunPod A100 40GB (A100 SXM, TP=1)
 # RAG scenario: realistic document load via MODE=rag, KV pressure expected under 30 workers.
 #
 # Hardware constraints:
@@ -28,7 +28,7 @@ MODEL_PATH="${MODEL_PATH:-$MODELS_DIR/qwen36-27b}"
 TMUX_SESSION="${TMUX_SESSION:-vllm}"
 LOG_FILE="${APP_DIR}/vllm.log"
 
-echo "Starting demo environment — Qwen3.6-27B-Instruct / A100 40GB..."
+echo "Starting demo environment — Qwen3.6-27B / A100 40GB..."
 
 mkdir -p "$APP_DIR" "$MODELS_DIR"
 
@@ -52,11 +52,11 @@ HF_CLI="${VENV_DIR}/bin/huggingface-cli"
 
 # Download model if not present
 if [[ ! -d "$MODEL_PATH" ]] || [[ -z "$(ls -A "$MODEL_PATH" 2>/dev/null)" ]]; then
-    echo "Downloading Qwen3.6-27B-Instruct (~27 GB FP8)..."
+    echo "Downloading Qwen3.6-27B (~27 GB FP8)..."
     mkdir -p "$MODEL_PATH"
     [[ -x "$HF_CLI" ]] || { echo "missing $HF_CLI after hub install" >&2; exit 1; }
     "$HF_CLI" download \
-        Qwen/Qwen3.6-27B-Instruct \
+        Qwen/Qwen3.6-27B \
         --local-dir "$MODEL_PATH"
 else
     echo "Model already present."
@@ -80,7 +80,7 @@ tmux new-session -d -s "$TMUX_SESSION" \
 "bash -lc 'source \"$VENV_DIR/bin/activate\" && \
 python -m vllm.entrypoints.openai.api_server \
   --model \"$MODEL_PATH\" \
-  --served-model-name Qwen3.6-27B-Instruct \
+  --served-model-name Qwen3.6-27B \
   --host 0.0.0.0 \
   --port 8000 \
   --dtype float8 \
@@ -92,7 +92,7 @@ python -m vllm.entrypoints.openai.api_server \
 
 echo
 echo "vLLM running in tmux session '$TMUX_SESSION'"
-echo "Model: Qwen3.6-27B-Instruct (FP8)"
+echo "Model: Qwen3.6-27B (FP8)"
 echo "GPU:   A100 40GB — ~9 GB KV headroom, saturates at ~18 concurrent RAG requests"
 echo "Log:   $LOG_FILE"
 echo "Attach: tmux attach -t $TMUX_SESSION"
@@ -100,7 +100,7 @@ echo ""
 echo "Wait for 'Application startup complete' in the log, then:"
 echo ""
 echo "  Terminal 2 — load:"
-echo "    MODEL=Qwen3.6-27B-Instruct MODE=rag CONCURRENCY=30 ./load.sh"
+echo "    MODEL=Qwen3.6-27B MODE=rag CONCURRENCY=30 ./load.sh"
 echo ""
 echo "  Terminal 3 — profile:"
 echo "    profile diagnose --url http://localhost:8000/metrics --tensor-parallel-size 1 --duration 2m"
