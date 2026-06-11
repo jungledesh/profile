@@ -75,7 +75,7 @@ pub fn run(
             )?);
         }
 
-        println!("\nMeasuring delta...");
+        println!("\nMeasuring delta...\n");
         let new_result = run_diagnose(
             url,
             current_max_num_seqs,
@@ -90,7 +90,7 @@ pub fn run(
         let drifted =
             drift::config_changed(&state.last().result.static_ctx, &new_result.static_ctx);
         if drifted {
-            println!("Config change detected — re-baselined.");
+            println!("Config change detected, re-baselined.");
         }
 
         let d = delta::compute(
@@ -101,7 +101,9 @@ pub fn run(
             drifted,
         );
         print_delta(&d);
+        println!();
         output::stdout::print_direction_line(&d);
+        println!();
         output::stdout::print_diagnose_table(&new_result, false);
 
         let headroom = new_report.baseline.as_ref().and_then(|b| b.headroom_pct);
@@ -127,8 +129,7 @@ pub fn run(
             let choice = read_worse_regression_choice(&mut io::stdin().lock(), &mut io::stdout())?;
             match choice {
                 WorseRegressionChoice::Continue => {
-                    for line in direction_followup_lines(delta::Direction::Plateau, None, next_fix)
-                    {
+                    for line in direction_followup_lines(delta::Direction::NoChange, next_fix) {
                         println!("{line}");
                     }
                     let _ = apply_worse_regression_choice(
@@ -144,7 +145,7 @@ pub fn run(
                 }
             }
         } else {
-            for line in direction_followup_lines(d.direction, d.direction_reason, next_fix) {
+            for line in direction_followup_lines(d.direction, next_fix) {
                 println!("{line}");
             }
             state.push(new_result, new_report, Some(rule_name));
@@ -171,39 +172,38 @@ fn healthy_exit_message(
 
     match (efficiency, headroom) {
         (Some(e), _) if headroom.is_some_and(|h| h < CEILING_HEADROOM_THRESHOLD_PCT) => {
-            format!("No issues detected. Server is at hardware capacity — {e:.1}% of ceiling.")
+            format!("No issues detected. Server is at hardware capacity: {e:.1}% of ceiling.")
         }
         (Some(e), _) if load_is_low => {
-            format!("No issues detected. Efficiency: {e:.1}% — hardware is under-fed, not misconfigured.")
+            format!("No issues detected. Efficiency: {e:.1}% (hardware is under-fed, not misconfigured).")
         }
         (Some(e), _) => {
-            format!(
-                "No issues detected in current windows. Efficiency: {e:.1}% of hardware ceiling."
-            )
+            format!("No significant change. Efficiency: {e:.1}% of hardware ceiling.")
         }
         (None, _) => {
-            "No issues detected. Efficiency unavailable — GPU or model data missing.".to_string()
+            "No issues detected. Efficiency unavailable; GPU or model data missing.".to_string()
         }
     }
 }
 
 fn direction_followup_lines(
     direction: delta::Direction,
-    reason: Option<&'static str>,
     short_action: Option<&str>,
 ) -> Vec<String> {
     let mut lines = Vec::new();
     match direction {
         delta::Direction::Worse => {}
-        delta::Direction::Inconclusive => {}
-        delta::Direction::Plateau => {
-            if reason.is_none() {
+        delta::Direction::Mixed => {
+            // Direction line carries the reason. Nothing to add.
+        }
+        delta::Direction::NoChange => {
+            if let Some(fix) = short_action {
                 lines.push("No significant change.".to_string());
-                if let Some(fix) = short_action {
-                    lines.push(format!("Apply fix: {fix}, then re-measure."));
-                }
+                lines.push(format!("Apply fix: {fix}, then re-measure."));
             }
         }
+        // Better: no followup needed. The table shows the improved state; the
+        // Direction line already carries the signal. Silence is the right output.
         delta::Direction::Better => {}
     }
     lines
@@ -269,7 +269,7 @@ fn format_efficiency_delta_line(delta_pp: Option<f64>) -> Option<String> {
 
 fn print_delta(d: &delta::Delta) {
     if d.config_drifted {
-        println!("  Config changed — baseline reset.");
+        println!("  Config changed, baseline reset.");
     }
     if let (Some(before), Some(after)) = (d.throughput_before, d.throughput_after) {
         if before.is_finite() && after.is_finite() {
@@ -312,6 +312,7 @@ fn print_delta(d: &delta::Delta) {
     }
     let has_cost = economics_section_active(d);
     if has_cost {
+        println!();
         println!("ECONOMICS:");
     }
     match (d.joules_per_token_before, d.joules_per_token_after) {
@@ -460,15 +461,18 @@ mod tests {
     }
 
     #[test]
-    fn healthy_exit_includes_efficiency_when_available() {
+    fn healthy_exit_no_issues_shows_no_significant_change_with_efficiency() {
         let msg = healthy_exit_message(Some(42.5), Some(57.5), None, None);
-        assert!(msg.contains("Efficiency: 42.5% of hardware ceiling."));
+        assert_eq!(
+            msg,
+            "No significant change. Efficiency: 42.5% of hardware ceiling."
+        );
     }
 
     #[test]
     fn healthy_exit_at_capacity_when_headroom_low() {
         let msg = healthy_exit_message(Some(91.0), Some(9.0), None, None);
-        assert!(msg.contains("at hardware capacity — 91.0% of ceiling."));
+        assert!(msg.contains("at hardware capacity: 91.0% of ceiling."));
     }
 
     #[test]
@@ -505,10 +509,9 @@ mod tests {
     }
 
     #[test]
-    fn direction_followup_includes_short_action_on_plateau() {
+    fn direction_followup_includes_short_action_on_no_change() {
         let lines = direction_followup_lines(
-            delta::Direction::Plateau,
-            None,
+            delta::Direction::NoChange,
             Some("raise --max-num-seqs above 32"),
         );
         assert_eq!(lines.len(), 2);
@@ -520,10 +523,9 @@ mod tests {
     }
 
     #[test]
-    fn direction_followup_plateau_with_reason_uses_mixed_result() {
+    fn direction_followup_mixed_is_empty() {
         let lines = direction_followup_lines(
-            delta::Direction::Plateau,
-            Some("efficiency flat, TTFT + throughput improved; scheduler win"),
+            delta::Direction::Mixed,
             Some("raise --max-num-seqs above 32"),
         );
         assert!(lines.is_empty());
@@ -531,11 +533,8 @@ mod tests {
 
     #[test]
     fn direction_followup_worse_is_empty() {
-        let lines = direction_followup_lines(
-            delta::Direction::Worse,
-            None,
-            Some("increase client concurrency"),
-        );
+        let lines =
+            direction_followup_lines(delta::Direction::Worse, Some("increase client concurrency"));
         assert!(lines.is_empty());
     }
 
@@ -641,8 +640,8 @@ mod tests {
 
     #[test]
     fn direction_followup_omits_fix_when_short_action_missing() {
-        let lines = direction_followup_lines(delta::Direction::Plateau, None, None);
-        assert_eq!(lines, vec!["No significant change.".to_string()]);
+        let lines = direction_followup_lines(delta::Direction::NoChange, None);
+        assert!(lines.is_empty());
     }
 
     #[test]
@@ -697,7 +696,7 @@ mod tests {
             ttft_p99_after_ms: None,
             tpot_p99_before_ms: None,
             tpot_p99_after_ms: None,
-            direction: delta::Direction::Plateau,
+            direction: delta::Direction::NoChange,
             direction_reason: None,
             ttft_p99_delta_pct: None,
             veto_fired: false,

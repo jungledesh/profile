@@ -17,10 +17,10 @@ pub struct Goal;
 pub enum Direction {
     Better,
     Worse,
-    /// Efficiency within band, latency-vetoed gain, or fallback throughput within band.
-    Plateau,
-    /// No measurable signal; efficiency and throughput both unavailable.
-    Inconclusive,
+    /// Signals contradict each other; reason always set.
+    Mixed,
+    /// No meaningful change, or no measurable signal.
+    NoChange,
 }
 
 #[derive(Debug, Clone)]
@@ -54,7 +54,7 @@ pub struct Delta {
     pub direction: Direction,
     pub direction_reason: Option<&'static str>,
     pub ttft_p99_delta_pct: Option<f64>,
-    /// True when the latency veto downgraded a Better signal to Plateau.
+    /// True when the latency veto condition is met (efficiency gain with ttft_p99 regression).
     /// Set in `compute()`; read by `direction_detail` for output.
     pub veto_fired: bool,
     pub config_drifted: bool,
@@ -126,8 +126,8 @@ fn evaluate_efficiency_delta(delta: &Delta) -> (Direction, Option<&'static str>)
             return match delta.throughput_delta_pct {
                 Some(d) if d > THROUGHPUT_BETTER_PCT => (Direction::Better, None),
                 Some(d) if d < THROUGHPUT_WORSE_PCT => (Direction::Worse, None),
-                Some(_) => (Direction::Plateau, None),
-                None => (Direction::Inconclusive, None),
+                Some(_) => (Direction::NoChange, None),
+                None => (Direction::NoChange, None),
             };
         }
     };
@@ -157,8 +157,14 @@ fn evaluate_efficiency_delta(delta: &Delta) -> (Direction, Option<&'static str>)
             Direction::Better,
             Some("efficiency primary; throughput drop likely load reduction"),
         ),
-        (Up, Down, Up) => (Direction::Plateau, None),
-        (Up, Down, Flat) => (Direction::Plateau, None),
+        (Up, Down, Up) => (
+            Direction::Mixed,
+            Some("efficiency up, TTFT worse; check latency SLA"),
+        ),
+        (Up, Down, Flat) => (
+            Direction::Mixed,
+            Some("efficiency up, TTFT degraded; throughput unchanged"),
+        ),
         (Up, Down, Down) => (
             Direction::Worse,
             Some("latency broken, throughput fell; efficiency gain is artifact"),
@@ -173,18 +179,18 @@ fn evaluate_efficiency_delta(delta: &Delta) -> (Direction, Option<&'static str>)
             Some("efficiency flat, p99 TTFT dropped significantly"),
         ),
         (Flat, Up, Down) => (
-            Direction::Plateau,
-            Some("latency improved but throughput fell; check load"),
+            Direction::Mixed,
+            Some("latency improved, throughput fell; check load"),
         ),
         (Flat, Flat, Up) => (
             Direction::Better,
             Some("efficiency flat, throughput expanded"),
         ),
-        (Flat, Flat, Flat) => (Direction::Plateau, None),
+        (Flat, Flat, Flat) => (Direction::NoChange, None),
         (Flat, Flat, Down) => (Direction::Worse, Some("efficiency flat, throughput fell")),
         (Flat, Down, Up) => (
-            Direction::Plateau,
-            Some("capacity expanded at cost of latency; check KV pressure"),
+            Direction::Mixed,
+            Some("throughput up, TTFT worse; check KV pressure"),
         ),
         (Flat, Down, Flat) => (
             Direction::Worse,
@@ -197,7 +203,7 @@ fn evaluate_efficiency_delta(delta: &Delta) -> (Direction, Option<&'static str>)
             Some("scheduling improved; efficiency drop reflects larger batch"),
         ),
         (Down, Up, Flat) => (
-            Direction::Plateau,
+            Direction::Mixed,
             Some("efficiency fell, latency better; verify load didn't drop"),
         ),
         (Down, Up, Down) => (
@@ -205,8 +211,8 @@ fn evaluate_efficiency_delta(delta: &Delta) -> (Direction, Option<&'static str>)
             Some("efficiency + throughput fell; latency gain is load artifact"),
         ),
         (Down, Flat, Up) => (
-            Direction::Plateau,
-            Some("per-slot efficiency fell, total throughput expanded; monitor fragmentation"),
+            Direction::Mixed,
+            Some("throughput expanded, efficiency fell; monitor fragmentation"),
         ),
         (Down, Flat, Flat) => (Direction::Worse, Some("clear regression")),
         (Down, Flat, Down) => (
@@ -234,21 +240,21 @@ fn rule_direction_reason(
         (Some("concurrency_saturation"), None, Direction::Better) => {
             Some("scheduler bottleneck cleared")
         }
-        (Some("concurrency_saturation"), Some("concurrency_saturation"), Direction::Plateau) => {
+        (Some("concurrency_saturation"), Some("concurrency_saturation"), Direction::NoChange) => {
             Some("scheduler still saturated")
         }
         (Some("kv_cache_pressure"), None, Direction::Better) => Some("KV pressure cleared"),
-        (Some("kv_cache_pressure"), Some("kv_cache_pressure"), Direction::Plateau) => {
+        (Some("kv_cache_pressure"), Some("kv_cache_pressure"), Direction::NoChange) => {
             Some("KV pressure persists")
         }
         (Some("under_batching"), None, Direction::Better) => Some("batch utilization improved"),
-        (Some("under_batching"), Some("under_batching"), Direction::Plateau) => {
+        (Some("under_batching"), Some("under_batching"), Direction::NoChange) => {
             Some("batch still under-utilized")
         }
         (Some("low_prefix_reuse"), None, Direction::Better) => {
             Some("prefix cache hit rate improved")
         }
-        (Some("low_prefix_reuse"), Some("low_prefix_reuse"), Direction::Plateau) => {
+        (Some("low_prefix_reuse"), Some("low_prefix_reuse"), Direction::NoChange) => {
             Some("prefix cache miss persists")
         }
         _ => None,
@@ -269,7 +275,7 @@ pub fn calculate_direction(
 pub fn direction_detail(delta: &Delta) -> String {
     match delta.efficiency_delta_pp {
         Some(eff) => {
-            if delta.veto_fired && delta.direction == Direction::Plateau {
+            if delta.veto_fired && delta.direction == Direction::Mixed {
                 if let Some(veto) = ttft_p99_regression_pct(delta) {
                     return format!(
                         "efficiency Δ: {:+.1} pp  |  ttft_p99 Δ: {:+.1}%  latency veto",
@@ -379,7 +385,7 @@ pub fn compute(
         ttft_p99_after_ms,
         tpot_p99_before_ms,
         tpot_p99_after_ms,
-        direction: Direction::Plateau,
+        direction: Direction::NoChange,
         direction_reason: None,
         ttft_p99_delta_pct,
         veto_fired: false,
@@ -501,7 +507,7 @@ mod tests {
             ttft_p99_after_ms: ttft_p99_after,
             tpot_p99_before_ms: None,
             tpot_p99_after_ms: None,
-            direction: Direction::Plateau,
+            direction: Direction::NoChange,
             direction_reason: None,
             ttft_p99_delta_pct,
             veto_fired: false,
@@ -535,23 +541,27 @@ mod tests {
     }
 
     #[test]
-    fn efficiency_plateau_within_band() {
+    fn efficiency_no_change_within_band() {
         let (dir, reason) = eval_dir(&mk_delta(Some(1.0), None, None, None));
-        assert_eq!(dir, Direction::Plateau);
+        assert_eq!(dir, Direction::NoChange);
         assert!(reason.is_none());
     }
 
     #[test]
     fn latency_veto_fires_on_better() {
-        let (dir, _) = eval_dir(&mk_delta(Some(3.0), None, Some(400.0), Some(500.0)));
-        assert_eq!(dir, Direction::Plateau);
+        let (dir, reason) = eval_dir(&mk_delta(Some(3.0), None, Some(400.0), Some(500.0)));
+        assert_eq!(dir, Direction::Mixed);
+        assert_eq!(
+            reason,
+            Some("efficiency up, TTFT degraded; throughput unchanged")
+        );
     }
 
     #[test]
-    fn latency_veto_does_not_fire_on_plateau() {
+    fn latency_veto_does_not_fire_on_no_change() {
         let d = finalize_delta(mk_delta(Some(1.0), None, None, None));
         assert!(!d.veto_fired);
-        assert_eq!(d.direction, Direction::Plateau);
+        assert_eq!(d.direction, Direction::NoChange);
     }
 
     #[test]
@@ -579,15 +589,15 @@ mod tests {
     }
 
     #[test]
-    fn efficiency_none_fallback_plateau() {
+    fn efficiency_none_fallback_no_change() {
         let (dir, _) = eval_dir(&mk_delta(None, Some(4.0), None, None));
-        assert_eq!(dir, Direction::Plateau);
+        assert_eq!(dir, Direction::NoChange);
     }
 
     #[test]
     fn efficiency_and_throughput_both_none() {
         let (dir, _) = eval_dir(&mk_delta(None, None, None, None));
-        assert_eq!(dir, Direction::Inconclusive);
+        assert_eq!(dir, Direction::NoChange);
     }
 
     #[test]
@@ -620,10 +630,10 @@ mod tests {
     #[test]
     fn hidden_regression() {
         let d = finalize_delta(mk_delta(Some(1.0), Some(15.0), Some(100.0), Some(125.0)));
-        assert_eq!(d.direction, Direction::Plateau);
+        assert_eq!(d.direction, Direction::Mixed);
         assert!(d
             .direction_reason
-            .is_some_and(|r| r.contains("capacity expanded at cost of latency")));
+            .is_some_and(|r| r.contains("throughput up, TTFT worse")));
     }
 
     #[test]
@@ -656,14 +666,14 @@ mod tests {
     #[test]
     fn latency_veto_intact() {
         let d = finalize_delta(mk_delta(Some(3.0), Some(15.0), Some(100.0), Some(125.0)));
-        assert_eq!(d.direction, Direction::Plateau);
+        assert_eq!(d.direction, Direction::Mixed);
         assert!(d.veto_fired);
     }
 
     #[test]
     fn no_signal() {
         let d = finalize_delta(mk_delta(None, None, None, None));
-        assert_eq!(d.direction, Direction::Inconclusive);
+        assert_eq!(d.direction, Direction::NoChange);
     }
 
     #[test]
@@ -676,7 +686,7 @@ mod tests {
     fn veto_fired_true_when_veto_fires() {
         let d = finalize_delta(mk_delta(Some(3.0), None, Some(400.0), Some(500.0)));
         assert!(d.veto_fired);
-        assert_eq!(d.direction, Direction::Plateau);
+        assert_eq!(d.direction, Direction::Mixed);
     }
 
     #[test]
@@ -712,7 +722,7 @@ mod tests {
     }
 
     #[test]
-    fn compute_direction_plateau_when_efficiency_flat_despite_throughput_swing() {
+    fn compute_direction_no_change_when_efficiency_flat_despite_throughput_swing() {
         let d = compute(
             &diagnose(Some(100.0)),
             &report_eff(Some(50.0), None, None),
@@ -720,7 +730,7 @@ mod tests {
             &report_eff(Some(50.0), None, None),
             false,
         );
-        assert_eq!(d.direction, Direction::Plateau);
+        assert_eq!(d.direction, Direction::NoChange);
     }
 
     #[test]
@@ -733,7 +743,7 @@ mod tests {
             false,
         );
         assert!(d.throughput_delta_pct.is_none());
-        assert_eq!(d.direction, Direction::Inconclusive);
+        assert_eq!(d.direction, Direction::NoChange);
     }
 
     #[test]

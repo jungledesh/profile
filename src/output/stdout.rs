@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use crate::collectors::{GpuRawMetrics, VllmConfig, VllmRawMetrics};
 use crate::context::AnalysisInput;
 use crate::engine;
-use crate::profiler::delta::{self, Delta, Direction};
+use crate::profiler::delta::{Delta, Direction};
 use crate::profiler::DiagnoseResult;
 
 const VLLM_LABEL_W: usize = 10;
@@ -36,18 +36,20 @@ fn direction_label(direction: Direction) -> &'static str {
     match direction {
         Direction::Better => "Better",
         Direction::Worse => "Worse",
-        Direction::Plateau => "Plateau",
-        Direction::Inconclusive => "Inconclusive",
+        Direction::Mixed => "Mixed",
+        Direction::NoChange => "No change",
     }
 }
 
 /// Raw signal values and which path fired, for closed-loop delta output.
 pub fn format_direction_line(d: &Delta) -> String {
-    format!(
-        "Direction: {}   ({})",
-        direction_label(d.direction),
-        delta::direction_detail(d)
-    )
+    match d.direction {
+        Direction::Mixed => {
+            let reason = d.direction_reason.unwrap_or("mixed signals");
+            format!("Result: Mixed   {reason}")
+        }
+        other => format!("Result: {}", direction_label(other)),
+    }
 }
 
 pub fn print_direction_line(d: &Delta) {
