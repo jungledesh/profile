@@ -3,7 +3,7 @@ name = "profile"
 version = "2.1.2"
 edition = "2021"
 authors = ["Gagandeep Singh <jungledesh@gmail.com>"]
-description = "Live bottleneck diagnosis for vLLM inference (rule-based, scrape-only)"
+description = "A closed loop, physics-grounded, cost-aware optimizer for vLLM."
 license = "Apache-2.0"
 repository = "https://github.com/jungledesh/profile"
 
