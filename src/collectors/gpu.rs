@@ -36,6 +36,100 @@ struct AggregatedPolls {
     sm_clock_mhz: Option<u32>,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct DeviceSample {
+    util_gpu: u32,
+    util_mem: u32,
+    power_watts: f64,
+    vram_used_mb: u64,
+    vram_total_mb: u64,
+    temperature_c: f64,
+}
+
+fn poll_tp_devices(nvml: &Nvml, tp: u32) -> GpuPoll {
+    let mut tick = GpuPoll::default();
+    let mut sum_util_gpu = 0u32;
+    let mut sum_util_mem = 0u32;
+    let mut n_util = 0u32;
+    let mut sum_power = 0.0f64;
+    let mut n_power = 0u32;
+    let mut vram_used = 0u64;
+    let mut vram_total = 0u64;
+    let mut max_temp: Option<f64> = None;
+
+    for dev_idx in 0..tp {
+        let Ok(dev) = nvml.device_by_index(dev_idx) else {
+            continue;
+        };
+
+        if let Ok(u) = dev.utilization_rates() {
+            sum_util_gpu += u.gpu;
+            sum_util_mem += u.memory;
+            n_util += 1;
+        }
+        if let Ok(mw) = dev.power_usage() {
+            sum_power += mw as f64 / 1000.0;
+            n_power += 1;
+        }
+        if let Ok(mem) = dev.memory_info() {
+            vram_used += mem.used / MIB;
+            vram_total += mem.total / MIB;
+        }
+        if let Ok(t) = dev.temperature(TemperatureSensor::Gpu) {
+            let tc = f64::from(t);
+            max_temp = Some(max_temp.map_or(tc, |prev: f64| prev.max(tc)));
+        }
+    }
+
+    let sm_clock = nvml
+        .device_by_index(0)
+        .ok()
+        .and_then(|primary| primary.clock(Clock::SM, ClockId::Current).ok());
+
+    tick.util_gpu = (n_util > 0).then_some(sum_util_gpu / n_util);
+    tick.util_mem = (n_util > 0).then_some(sum_util_mem / n_util);
+    tick.power_watts = (n_power > 0).then_some(sum_power);
+    tick.vram_used_mb = Some(vram_used);
+    tick.vram_total_mb = Some(vram_total);
+    tick.temperature_c = max_temp;
+    tick.sm_clock_mhz = sm_clock;
+    tick
+}
+
+#[cfg(test)]
+fn poll_tp_device_samples(samples: &[DeviceSample], sm_clock_mhz: Option<u32>) -> GpuPoll {
+    let mut tick = GpuPoll::default();
+    let mut sum_util_gpu = 0u32;
+    let mut sum_util_mem = 0u32;
+    let mut n_util = 0u32;
+    let mut sum_power = 0.0f64;
+    let mut n_power = 0u32;
+    let mut vram_used = 0u64;
+    let mut vram_total = 0u64;
+    let mut max_temp: Option<f64> = None;
+
+    for s in samples {
+        sum_util_gpu += s.util_gpu;
+        sum_util_mem += s.util_mem;
+        n_util += 1;
+        sum_power += s.power_watts;
+        n_power += 1;
+        vram_used += s.vram_used_mb;
+        vram_total += s.vram_total_mb;
+        max_temp = Some(max_temp.map_or(s.temperature_c, |prev| prev.max(s.temperature_c)));
+    }
+
+    tick.util_gpu = (n_util > 0).then_some(sum_util_gpu / n_util);
+    tick.util_mem = (n_util > 0).then_some(sum_util_mem / n_util);
+    tick.power_watts = (n_power > 0).then_some(sum_power);
+    tick.vram_used_mb = Some(vram_used);
+    tick.vram_total_mb = Some(vram_total);
+    tick.temperature_c = max_temp;
+    tick.sm_clock_mhz = sm_clock_mhz;
+    tick
+}
+
 fn aggregate_polls(polls: &[GpuPoll]) -> AggregatedPolls {
     let mut sum_gpu = 0.0f64;
     let mut sum_mem = 0.0f64;
@@ -102,7 +196,10 @@ fn aggregate_polls(polls: &[GpuPoll]) -> AggregatedPolls {
 }
 
 /// Returns `(metrics, observed_at)` after the last NVML poll for the requested window.
-pub fn collect_gpu_metrics_for(window: Duration) -> Result<(GpuRawMetrics, SystemTime)> {
+pub fn collect_gpu_metrics_for(
+    window: Duration,
+    tp_size: u32,
+) -> Result<(GpuRawMetrics, SystemTime)> {
     let Ok(nvml) = Nvml::init() else {
         return Ok((GpuRawMetrics::default(), SystemTime::now()));
     };
@@ -110,6 +207,9 @@ pub fn collect_gpu_metrics_for(window: Duration) -> Result<(GpuRawMetrics, Syste
         return Ok((GpuRawMetrics::default(), SystemTime::now()));
     };
 
+    let tp = tp_size.max(1);
+
+    // Static identifiers from GPU 0 (homogeneous setup — all GPUs same model)
     let gpu_name = device.name().ok();
     let gpu_index = device.index().ok();
     let gpu_uuid = device.uuid().ok();
@@ -122,31 +222,7 @@ pub fn collect_gpu_metrics_for(window: Duration) -> Result<(GpuRawMetrics, Syste
     let mut polls = Vec::with_capacity(sample_count);
 
     for i in 0..sample_count {
-        let mut tick = GpuPoll::default();
-
-        if let Ok(u) = device.utilization_rates() {
-            tick.util_gpu = Some(u.gpu);
-            tick.util_mem = Some(u.memory);
-        }
-
-        if let Ok(mw) = device.power_usage() {
-            tick.power_watts = Some(mw as f64 / 1000.0);
-        }
-
-        if let Ok(mem) = device.memory_info() {
-            tick.vram_used_mb = Some(mem.used / MIB);
-            tick.vram_total_mb = Some(mem.total / MIB);
-        }
-
-        if let Ok(t) = device.temperature(TemperatureSensor::Gpu) {
-            tick.temperature_c = Some(f64::from(t));
-        }
-
-        if let Ok(mhz) = device.clock(Clock::SM, ClockId::Current) {
-            tick.sm_clock_mhz = Some(mhz);
-        }
-
-        polls.push(tick);
+        polls.push(poll_tp_devices(&nvml, tp));
 
         if i + 1 < sample_count {
             thread::sleep(SAMPLE_INTERVAL);
@@ -160,6 +236,7 @@ pub fn collect_gpu_metrics_for(window: Duration) -> Result<(GpuRawMetrics, Syste
             gpu_name,
             gpu_index,
             gpu_uuid,
+            gpu_count: tp,
             gpu_util_pct: agg.gpu_util_pct,
             mem_util_pct: agg.mem_util_pct,
             power_watts: agg.power_watts,
@@ -186,6 +263,40 @@ fn sample_poll(ug: u32, um: u32, p: f64, vu: u64, vt: u64, temp: f64, sm: u32) -
         temperature_c: Some(temp),
         sm_clock_mhz: Some(sm),
     }
+}
+
+#[cfg(test)]
+#[test]
+fn tp2_doubles_power_and_vram() {
+    let single = DeviceSample {
+        util_gpu: 80,
+        util_mem: 20,
+        power_watts: 300.0,
+        vram_used_mb: 1000,
+        vram_total_mb: 8000,
+        temperature_c: 55.0,
+    };
+    let tp1 = poll_tp_device_samples(std::slice::from_ref(&single), Some(2100));
+    let tp2 = poll_tp_device_samples(&[single, single], Some(2100));
+
+    assert_eq!(tp1.util_gpu, tp2.util_gpu);
+    assert_eq!(tp1.power_watts, Some(300.0));
+    assert_eq!(tp2.power_watts, Some(600.0));
+    assert_eq!(tp1.vram_used_mb, Some(1000));
+    assert_eq!(tp2.vram_used_mb, Some(2000));
+    assert_eq!(tp1.vram_total_mb, Some(8000));
+    assert_eq!(tp2.vram_total_mb, Some(16000));
+
+    let a1 = aggregate_polls(&[tp1]);
+    let a2 = aggregate_polls(&[tp2]);
+    assert_eq!(a2.power_watts, Some(2.0 * a1.power_watts.unwrap()));
+    assert_eq!(a2.vram_used_mb, Some(2 * a1.vram_used_mb.unwrap()));
+
+    let metrics = GpuRawMetrics {
+        gpu_count: 2,
+        ..Default::default()
+    };
+    assert_eq!(metrics.gpu_count, 2);
 }
 
 #[cfg(test)]

@@ -37,8 +37,9 @@ pub fn run_diagnose(
     let started_at = SystemTime::now();
     let metrics_input = vllm_metrics_input.to_string();
     let window = logical_window_size(duration);
+    let tp_size = tensor_parallel_size.unwrap_or(1);
     let window_durations = build_window_durations(duration, window);
-    let raw_windows = collect_windows(vllm_metrics_input, &window_durations)?;
+    let raw_windows = collect_windows(vllm_metrics_input, &window_durations, tp_size)?;
     let any_evaluable = raw_windows.iter().any(window_is_evaluable);
     let snapshot = if raw_windows.is_empty() {
         empty_snapshot(started_at)
@@ -97,10 +98,12 @@ fn build_window_durations(duration: Duration, logical_window: Duration) -> Vec<D
 fn collect_windows(
     vllm_metrics_input: &str,
     window_durations: &[Duration],
+    tp_size: u32,
 ) -> anyhow::Result<Vec<collectors::RawSnapshot>> {
     let mut out = Vec::new();
     for &this_window in window_durations {
-        let snap = collectors::collect_snapshot_for_window(vllm_metrics_input, this_window)?;
+        let snap =
+            collectors::collect_snapshot_for_window(vllm_metrics_input, this_window, tp_size)?;
         out.push(snap);
     }
     Ok(out)
@@ -135,6 +138,7 @@ fn context_only_diagnose_snapshot(
             gpu_name: source.gpu.gpu_name.clone(),
             gpu_index: source.gpu.gpu_index,
             gpu_uuid: source.gpu.gpu_uuid.clone(),
+            gpu_count: source.gpu.gpu_count,
             power_limit_watts: source.gpu.power_limit_watts,
             vram_total_mb: source.gpu.vram_total_mb,
             ..Default::default()
@@ -193,6 +197,7 @@ fn aggregate_windows(
         gpu_name: last.gpu.gpu_name.clone(),
         gpu_index: last.gpu.gpu_index,
         gpu_uuid: last.gpu.gpu_uuid.clone(),
+        gpu_count: last.gpu.gpu_count,
         power_limit_watts: last.gpu.power_limit_watts,
         ..Default::default()
     };

@@ -69,12 +69,16 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
     let started_at = result.started_at;
 
     let model = v.model_name.as_deref().unwrap_or("(unknown model)");
-    let gpu_label = g.gpu_name.as_deref().unwrap_or("(no GPU)");
+    let gpu_label = match (g.gpu_name.as_deref(), g.gpu_count) {
+        (Some(name), n) if n > 1 => format!("{n}× {name}"),
+        (Some(name), _) => name.to_string(),
+        (None, _) => "(no GPU)".to_string(),
+    };
     let ts = format_profile_timestamp(started_at);
     let mut lines = vec![profile_header_line(
         env!("CARGO_PKG_VERSION"),
         model,
-        gpu_label,
+        &gpu_label,
         &ts,
         duration,
     )];

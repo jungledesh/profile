@@ -122,13 +122,15 @@ pub struct VllmRawMetrics {
 }
 
 /// NVML / DCGM / nvidia-smi scrape
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct GpuRawMetrics {
     pub gpu_name: Option<String>,
     /// Device index on this host (`CUDA_VISIBLE_DEVICES` / NVML ordering).
     pub gpu_index: Option<u32>,
     /// Stable per-device identifier from the driver (e.g. `GPU-xxxxxxxx-xxxx-...`).
     pub gpu_uuid: Option<String>,
+    /// Number of GPUs included in this sample (TP size).
+    pub gpu_count: u32,
     pub gpu_util_pct: Option<f64>,
     pub mem_util_pct: Option<f64>,
     pub power_watts: Option<f64>,
@@ -141,6 +143,27 @@ pub struct GpuRawMetrics {
     /// Max GPU temperature (°C) across NVML polls in this window. Multi-window: max over evaluable windows (with landing fold-in); stdout parenthetical uses threshold in `output/stdout.rs`.
     pub temperature_peak_c: Option<f64>,
     pub sm_clock_mhz: Option<u32>,
+}
+
+impl Default for GpuRawMetrics {
+    fn default() -> Self {
+        Self {
+            gpu_name: None,
+            gpu_index: None,
+            gpu_uuid: None,
+            gpu_count: 1,
+            gpu_util_pct: None,
+            mem_util_pct: None,
+            power_watts: None,
+            power_limit_watts: None,
+            vram_used_mb: None,
+            vram_peak_mb: None,
+            vram_total_mb: None,
+            temperature_c: None,
+            temperature_peak_c: None,
+            sm_clock_mhz: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

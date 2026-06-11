@@ -23,10 +23,12 @@ use std::time::Duration;
 pub fn collect_snapshot_for_window(
     vllm_metrics_input: &str,
     window: Duration,
+    tp_size: u32,
 ) -> anyhow::Result<RawSnapshot> {
     let url = vllm_metrics_input.to_string();
+    let tp = tp_size.max(1);
 
-    let gpu_handle = thread::spawn(move || gpu::collect_gpu_metrics_for(window));
+    let gpu_handle = thread::spawn(move || gpu::collect_gpu_metrics_for(window, tp));
     let vllm_handle = thread::spawn(move || vllm::collect_vllm_metrics_for(&url, window));
 
     let (gpu, gpu_observed_at) = gpu_handle
