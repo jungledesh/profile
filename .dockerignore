@@ -1,3 +1,6 @@
+target
 .git
-node_modules
-*.log
+.github
+tests
+*.md
+Dockerfile*
