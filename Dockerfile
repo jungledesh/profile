@@ -65,6 +65,7 @@ COPY --chown=appuser:appuser scripts/test.sh ./test.sh
 COPY --chown=appuser:appuser scripts/test2.sh ./test2.sh
 COPY --chown=appuser:appuser scripts/demo.sh ./demo.sh
 COPY --chown=appuser:appuser scripts/fix_r5.sh ./fix_r5.sh
+# Requires a pre-built binary: run `cargo build --release` before `docker build`
 COPY --chown=appuser:appuser target/release/profile ./profile
 
 RUN chmod 0755 ./start.sh ./load.sh ./test.sh ./test2.sh ./demo.sh ./fix_r5.sh ./profile
