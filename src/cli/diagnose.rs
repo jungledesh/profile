@@ -65,24 +65,32 @@ fn pre_flight_max_num_seqs(url: &str) -> Option<u32> {
     crate::collectors::vllm::max_num_seqs_from_scrape(&scrape)
 }
 
+const MAX_NUM_SEQS_PROMPT: &str =
+    "--max-num-seqs [Hint: check your vLLM start command] (default 256): ";
+
 fn prompt_for_max_num_seqs() -> anyhow::Result<u32> {
-    println!();
-    println!("Profile needs max_num_seqs for accurate diagnosis.");
-    println!();
-    println!("Find it in your vLLM start command: --max-num-seqs N (default: 256 if not set).");
-    prompt_u32_with_default(&mut io::stdin().lock(), &mut io::stdout(), 256)
+    prompt_u32_with_default(
+        &mut io::stdin().lock(),
+        &mut io::stdout(),
+        256,
+        MAX_NUM_SEQS_PROMPT,
+    )
 }
 
 pub(crate) fn prompt_for_updated_max_num_seqs(
     current: u32,
     stdin_rx: &std::sync::mpsc::Receiver<String>,
 ) -> anyhow::Result<u32> {
-    println!("Enter new --max-num-seqs value (current: {current}).");
-    println!();
-    prompt_u32_from_channel(stdin_rx, &mut io::stdout(), current)
+    let prompt = format!("New --max-num-seqs value (current: {current}): ");
+    prompt_u32_from_channel(stdin_rx, &mut io::stdout(), current, &prompt)
 }
 
-fn retry_u32_loop<F, W>(writer: &mut W, default: u32, mut next_line: F) -> anyhow::Result<u32>
+fn retry_u32_loop<F, W>(
+    writer: &mut W,
+    default: u32,
+    prompt: &str,
+    mut next_line: F,
+) -> anyhow::Result<u32>
 where
     F: FnMut() -> anyhow::Result<String>,
     W: Write,
@@ -90,7 +98,7 @@ where
     const MAX_ATTEMPTS: u8 = 4;
     let mut attempts: u8 = 0;
     loop {
-        write!(writer, "Enter value: ")?;
+        write!(writer, "{prompt}")?;
         writer.flush()?;
         let line = next_line()?;
         let trimmed = line.trim();
@@ -125,8 +133,9 @@ fn prompt_u32_with_default<R: BufRead, W: Write>(
     reader: &mut R,
     writer: &mut W,
     default: u32,
+    prompt: &str,
 ) -> anyhow::Result<u32> {
-    retry_u32_loop(writer, default, || {
+    retry_u32_loop(writer, default, prompt, || {
         let mut l = String::new();
         reader.read_line(&mut l)?;
         Ok(l)
@@ -137,8 +146,9 @@ fn prompt_u32_from_channel<W: Write>(
     stdin_rx: &std::sync::mpsc::Receiver<String>,
     writer: &mut W,
     default: u32,
+    prompt: &str,
 ) -> anyhow::Result<u32> {
-    retry_u32_loop(writer, default, || {
+    retry_u32_loop(writer, default, prompt, || {
         stdin_rx.recv().map_err(|_| anyhow::anyhow!("stdin closed"))
     })
 }
@@ -150,7 +160,12 @@ mod tests {
 
     fn run(input: &[u8], default: u32) -> anyhow::Result<u32> {
         let mut out = Vec::new();
-        prompt_u32_with_default(&mut Cursor::new(input), &mut out, default)
+        prompt_u32_with_default(
+            &mut Cursor::new(input),
+            &mut out,
+            default,
+            MAX_NUM_SEQS_PROMPT,
+        )
     }
 
     #[test]

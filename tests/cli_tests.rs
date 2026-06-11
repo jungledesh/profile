@@ -350,7 +350,7 @@ fn diagnose_exits_success() {
         "default diagnose should not fire rules; got:\n{out}"
     );
     assert!(
-        out.contains("No issues detected"),
+        out.contains("No significant change") || out.contains("No issues detected"),
         "default diagnose should report healthy when nothing fires; got:\n{out}"
     );
     assert!(

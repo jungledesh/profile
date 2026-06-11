@@ -33,8 +33,7 @@ pub fn wait_for_restart_or_skip(
     metrics_url: &str,
     stdin_rx: &mpsc::Receiver<String>,
 ) -> WaitOutcome {
-    println!("\nApply your change.");
-    println!("Press Enter to re-measure, or Profile will detect a vLLM restart automatically.");
+    println!("Apply your change. Press Enter when done.");
 
     let url = metrics_url.to_string();
     let (tx, rx) = mpsc::channel::<WaitOutcome>();
@@ -52,7 +51,6 @@ pub fn wait_for_restart_or_skip(
                 .unwrap_or(false);
             if !reachable && !was_down {
                 was_down = true;
-                println!("Waiting for vLLM to restart...");
             }
             if reachable && was_down {
                 println!(
