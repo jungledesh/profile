@@ -66,9 +66,6 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: Build
-        run: cargo build --release
-
       - name: Docker tags and whether to push
         id: docker_meta
         run: |
@@ -96,6 +93,8 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: ./Dockerfile.release
+          platforms: linux/amd64
           push: ${{ steps.docker_meta.outputs.push == 'true' }}
           tags: ${{ steps.docker_meta.outputs.tags }}
           cache-from: type=gha
