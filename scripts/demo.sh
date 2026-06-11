@@ -79,6 +79,7 @@ fi
 #                                   32768 would need ~42 blocks/seq → only 2 fit → crash.
 #   --tensor-parallel-size 1        single A100 — no TP needed
 #   --trust-remote-code             required for Qwen3.6 custom architecture
+#   --enforce-eager                 skip torch.compile (vLLM 0.18 / torch version mismatch on FakeTensorMode)
 #   no --max-num-seqs               let vLLM auto-size from available KV headroom
 tmux new-session -d -s "$TMUX_SESSION" \
 "bash -lc 'source \"$VENV_DIR/bin/activate\" && \
@@ -91,6 +92,7 @@ python -m vllm.entrypoints.openai.api_server \
   --gpu-memory-utilization 0.90 \
   --tensor-parallel-size 1 \
   --max-model-len 8192 \
+  --enforce-eager \
   --trust-remote-code \
   2>&1 | tee \"$LOG_FILE\"'"
 
