@@ -67,15 +67,7 @@ pub fn run(
 
         let _outcome = poll::wait_for_restart_or_skip(url, &stdin_rx);
 
-        let primary_action = state
-            .last()
-            .report
-            .groups
-            .first()
-            .map(|g| g.primary.action.as_str())
-            .unwrap_or("");
-
-        if needs_max_num_seqs_prompt(primary_action) {
+        if needs_max_num_seqs_prompt_for_groups(&state.last().report.groups) {
             println!();
             let current = current_max_num_seqs.unwrap_or(256);
             current_max_num_seqs = Some(crate::cli::prompt_for_updated_max_num_seqs(
@@ -170,6 +162,13 @@ fn at_hardware_ceiling(headroom_pct: Option<f64>) -> bool {
 // COUPLING: matches "--max-num-seqs" in rule action strings; update if flag name changes.
 fn needs_max_num_seqs_prompt(action: &str) -> bool {
     action.contains("--max-num-seqs")
+}
+
+fn needs_max_num_seqs_prompt_for_groups(groups: &[engine::IssueGroup]) -> bool {
+    groups
+        .iter()
+        .flat_map(|g| std::iter::once(&g.primary).chain(g.secondary.iter()))
+        .any(|r| needs_max_num_seqs_prompt(&r.short_action))
 }
 
 fn healthy_exit_message(
@@ -455,6 +454,7 @@ fn latency_arrow(delta_ms: f64) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use engine::IssueGroup;
 
     #[test]
     fn at_hardware_ceiling_below_threshold() {
@@ -749,16 +749,32 @@ mod tests {
     }
 
     #[test]
-    fn needs_max_num_seqs_prompt_true_when_flag_present() {
-        assert!(needs_max_num_seqs_prompt(
-            "Lower --max-num-seqs now to stop evictions"
-        ));
+    fn any_max_num_seqs_prompt_fires_on_secondary_short_action() {
+        let groups = vec![IssueGroup {
+            primary: test_rec("raise --gpu-memory-utilization"),
+            secondary: vec![test_rec("lower --max-num-seqs")],
+        }];
+        assert!(needs_max_num_seqs_prompt_for_groups(&groups));
     }
 
     #[test]
-    fn needs_max_num_seqs_prompt_false_when_flag_absent() {
-        assert!(!needs_max_num_seqs_prompt(
-            "Switch to fp8 KV cache (--kv-cache-dtype fp8) to halve KV memory footprint"
-        ));
+    fn any_max_num_seqs_prompt_skipped_when_absent_from_all() {
+        let groups = vec![IssueGroup {
+            primary: test_rec("Switch to fp8 KV cache (--kv-cache-dtype fp8)"),
+            secondary: vec![test_rec("raise --gpu-memory-utilization")],
+        }];
+        assert!(!needs_max_num_seqs_prompt_for_groups(&groups));
+    }
+
+    fn test_rec(short_action: &str) -> engine::Recommendation {
+        engine::Recommendation {
+            rule_name: "test",
+            impact: 1,
+            confidence: 0.5,
+            action: String::new(),
+            short_action: short_action.to_string(),
+            expected_impact: String::new(),
+            display_lines: Vec::new(),
+        }
     }
 }

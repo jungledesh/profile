@@ -22,7 +22,7 @@ fn fp8_kv_cache_fix_bullet() -> String {
     if nvcc_present {
         FP8_KV_CACHE_FIX.to_string()
     } else {
-        format!("{FP8_KV_CACHE_FIX} (requires nvcc — not available on this host)")
+        format!("{FP8_KV_CACHE_FIX} (requires nvcc)")
     }
 }
 
@@ -577,9 +577,10 @@ mod tests {
         let bullet = fp8_kv_cache_fix_bullet();
         assert!(bullet.contains("Switch to fp8 KV cache (--kv-cache-dtype fp8)"));
         if std::path::Path::new(NVCC_PATH).exists() {
-            assert!(!bullet.contains("not available on this host"));
+            assert!(!bullet.contains("requires nvcc"));
         } else {
-            assert!(bullet.contains("(requires nvcc — not available on this host)"));
+            assert!(bullet.contains("(requires nvcc)"));
+            assert!(!bullet.contains("not available on this host"));
         }
     }
 
