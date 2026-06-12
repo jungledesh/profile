@@ -154,7 +154,7 @@ fn compute_waste_per_hr(baseline: Option<&PhysicsBaseline>, tps: Option<f64>) ->
     let cpm = cost.cost_per_million_tokens?;
     let tps = tps.filter(|v| v.is_finite() && *v > 0.0)?;
     let cost_per_hr = cpm * tps * 3600.0 / 1_000_000.0;
-    if !cost_per_hr.is_finite() || cost_per_hr <= 0.0 {
+    if cost_per_hr <= 0.0 {
         return None;
     }
     let waste_fraction = (1.0 - eff / 100.0).max(0.0);
@@ -476,10 +476,7 @@ fn eval_window_rules(
     Some(eval)
 }
 
-fn build_report_from_eval(
-    eval: &WindowRuleEval,
-    summary: AnalysisInput<'_>,
-) -> super::Report {
+fn build_report_from_eval(eval: &WindowRuleEval, summary: AnalysisInput<'_>) -> super::Report {
     let baseline = baseline::compute(&summary);
     if eval.n_eval == 0 {
         return super::Report {
@@ -1978,9 +1975,9 @@ mod tests {
     fn baseline_for_waste(eff: f64, source: CostSource, cpm: f64) -> PhysicsBaseline {
         PhysicsBaseline {
             decode: CeilingEstimate {
-                lower: 1.0,
+                lower: 90.0,
                 expected: 100.0,
-                upper: 1.0,
+                upper: 110.0,
             },
             prefill: None,
             efficiency_pct: Some(eff),
@@ -2039,36 +2036,25 @@ mod tests {
         ];
         let mut lines = vec!["issue".to_string()];
         append_waste_line(&mut lines, &groups, Some(&b), Some(14.2));
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("lost to compounding bottlenecks"))
-        );
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("lost to compounding bottlenecks")));
     }
 
     #[test]
-    fn waste_line_unknown_rule_unclassified() {
-        let b = baseline_for_waste(32.0, CostSource::Catalog, 1.84);
+    fn waste_line_unknown_rule_name_unclassified() {
         let groups = vec![issue_group("oom_risk")];
+
+        let b = baseline_for_waste(32.0, CostSource::Catalog, 1.84);
         let mut lines = vec!["issue".to_string()];
         append_waste_line(&mut lines, &groups, Some(&b), Some(14.2));
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("unclassified overhead"))
-        );
-    }
+        assert!(lines.iter().any(|l| l.contains("unclassified overhead")));
 
-    #[test]
-    fn waste_line_oom_risk_unclassified() {
+        // UserProvided source is accepted; label still falls through to unclassified.
         let b = baseline_for_waste(32.0, CostSource::UserProvided, 1.0);
         let mut lines = vec!["issue".to_string()];
-        append_waste_line(&mut lines, &[issue_group("oom_risk")], Some(&b), Some(100.0));
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("unclassified overhead"))
-        );
+        append_waste_line(&mut lines, &groups, Some(&b), Some(100.0));
+        assert!(lines.iter().any(|l| l.contains("unclassified overhead")));
     }
 
     fn issue_group(rule_name: &'static str) -> IssueGroup {
@@ -2087,7 +2073,7 @@ mod tests {
     }
 
     #[test]
-    fn waste_line_efficiency_over_100_clamps_to_zero() {
+    fn waste_line_efficiency_over_100_omitted() {
         let b = baseline_for_waste(110.0, CostSource::Catalog, 1.84);
         let mut lines = vec!["issue".to_string()];
         append_waste_line(
@@ -2105,12 +2091,22 @@ mod tests {
         let mut b = baseline_for_waste(32.0, CostSource::Catalog, 1.84);
         b.efficiency_pct = None;
         let mut lines = vec!["issue".to_string()];
-        append_waste_line(&mut lines, &[issue_group("under_batching")], Some(&b), Some(10.0));
+        append_waste_line(
+            &mut lines,
+            &[issue_group("under_batching")],
+            Some(&b),
+            Some(10.0),
+        );
         assert_eq!(lines.len(), 1);
 
         b.efficiency_pct = Some(32.0);
         b.cost = None;
-        append_waste_line(&mut lines, &[issue_group("under_batching")], Some(&b), Some(10.0));
+        append_waste_line(
+            &mut lines,
+            &[issue_group("under_batching")],
+            Some(&b),
+            Some(10.0),
+        );
         assert_eq!(lines.len(), 1);
     }
 }
