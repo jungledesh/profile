@@ -69,12 +69,14 @@ const MAX_NUM_SEQS_PROMPT: &str =
     "--max-num-seqs [Hint: check your vLLM start command] (default 256): ";
 
 fn prompt_for_max_num_seqs() -> anyhow::Result<u32> {
-    prompt_u32_with_default(
+    let v = prompt_u32_with_default(
         &mut io::stdin().lock(),
         &mut io::stdout(),
         256,
         MAX_NUM_SEQS_PROMPT,
-    )
+    )?;
+    println!();
+    Ok(v)
 }
 
 pub(crate) fn prompt_for_updated_max_num_seqs(
