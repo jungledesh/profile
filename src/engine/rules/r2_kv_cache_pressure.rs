@@ -11,6 +11,20 @@ const KV_PRESSURE_THREAT_CONFIDENCE: f64 = 0.85;
 const KV_PRESSURE_WARNING_CONFIDENCE: f64 = 0.7;
 const KV_ADMISSION_BACKLOG_QUEUE_RATIO_MIN: f64 = 0.30;
 const KV_HEADROOM_SAFE_MIN_GB: f64 = 2.0;
+const NVCC_PATH: &str = "/usr/local/cuda/bin/nvcc";
+const FP8_KV_CACHE_FIX: &str =
+    "    • Switch to fp8 KV cache (--kv-cache-dtype fp8) to halve KV memory footprint";
+
+static NVCC_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn fp8_kv_cache_fix_bullet() -> String {
+    let nvcc_present = *NVCC_AVAILABLE.get_or_init(|| std::path::Path::new(NVCC_PATH).exists());
+    if nvcc_present {
+        FP8_KV_CACHE_FIX.to_string()
+    } else {
+        format!("{FP8_KV_CACHE_FIX} (requires nvcc — not available on this host)")
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct KvAdmissionBacklogDetail {
@@ -212,16 +226,14 @@ pub(super) fn format_kv_cache_pressure_fired(
         out.extend([
             "    • Lower --max-num-seqs now to stop evictions, pick a value below current running count"
                 .to_string(),
-            "    • Switch to fp8 KV cache (--kv-cache-dtype fp8) to halve KV memory footprint"
-                .to_string(),
+            fp8_kv_cache_fix_bullet(),
             model_len_bullet,
         ]);
     } else {
         out.extend([
             "    • Raise --gpu-memory-utilization if VRAM headroom exists (check header for available VRAM)"
                 .to_string(),
-            "    • Switch to fp8 KV cache (--kv-cache-dtype fp8) to halve KV memory footprint"
-                .to_string(),
+            fp8_kv_cache_fix_bullet(),
             model_len_bullet,
         ]);
     }
@@ -274,7 +286,7 @@ pub(super) fn format_kv_admission_backlog_issue(
         String::new(),
         "  Fix:".to_string(),
         gpu_mem_bullet,
-        "    • Switch to fp8 KV cache (--kv-cache-dtype fp8) to halve KV memory footprint".to_string(),
+        fp8_kv_cache_fix_bullet(),
         model_len_bullet,
         String::new(),
         "  Expected: Wait queue drains, TTFT recovers.".to_string(),
@@ -558,6 +570,17 @@ mod tests {
         let text =
             format_kv_admission_backlog_issue(&sample_backlog_detail(), 27, None, None).join("\n");
         assert!(text.contains("if VRAM headroom exists"));
+    }
+
+    #[test]
+    fn fp8_kv_cache_bullet_reflects_nvcc_availability() {
+        let bullet = fp8_kv_cache_fix_bullet();
+        assert!(bullet.contains("Switch to fp8 KV cache (--kv-cache-dtype fp8)"));
+        if std::path::Path::new(NVCC_PATH).exists() {
+            assert!(!bullet.contains("not available on this host"));
+        } else {
+            assert!(bullet.contains("(requires nvcc — not available on this host)"));
+        }
     }
 
     #[test]

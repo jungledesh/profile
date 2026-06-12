@@ -67,7 +67,15 @@ pub fn run(
 
         let _outcome = poll::wait_for_restart_or_skip(url, &stdin_rx);
 
-        if rule_name == "concurrency_saturation" {
+        let primary_action = state
+            .last()
+            .report
+            .groups
+            .first()
+            .map(|g| g.primary.action.as_str())
+            .unwrap_or("");
+
+        if needs_max_num_seqs_prompt(primary_action) {
             println!();
             let current = current_max_num_seqs.unwrap_or(256);
             current_max_num_seqs = Some(crate::cli::prompt_for_updated_max_num_seqs(
@@ -157,6 +165,11 @@ pub fn run(
 
 fn at_hardware_ceiling(headroom_pct: Option<f64>) -> bool {
     headroom_pct.is_some_and(|h| h < CEILING_HEADROOM_THRESHOLD_PCT)
+}
+
+// COUPLING: matches "--max-num-seqs" in rule action strings; update if flag name changes.
+fn needs_max_num_seqs_prompt(action: &str) -> bool {
+    action.contains("--max-num-seqs")
 }
 
 fn healthy_exit_message(
@@ -733,5 +746,19 @@ mod tests {
         };
         assert!(recoverable_waste_available(&d));
         assert!(economics_section_active(&d));
+    }
+
+    #[test]
+    fn needs_max_num_seqs_prompt_true_when_flag_present() {
+        assert!(needs_max_num_seqs_prompt(
+            "Lower --max-num-seqs now to stop evictions"
+        ));
+    }
+
+    #[test]
+    fn needs_max_num_seqs_prompt_false_when_flag_absent() {
+        assert!(!needs_max_num_seqs_prompt(
+            "Switch to fp8 KV cache (--kv-cache-dtype fp8) to halve KV memory footprint"
+        ));
     }
 }
