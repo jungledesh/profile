@@ -55,15 +55,16 @@ fn lookup_model_catalog(
 ) -> Option<&'static model_catalog::CatalogEntry> {
     let root = config.model_root.as_deref();
     let scrape = snapshot_model_name;
-    root.and_then(catalog_model_lookup)
-        .or_else(|| scrape.and_then(catalog_model_lookup))
-        .or_else(|| {
-            root.and_then(catalog_path_basename)
-                .and_then(catalog_model_lookup)
-        })
+    scrape
+        .and_then(catalog_model_lookup)
+        .or_else(|| root.and_then(catalog_model_lookup))
         .or_else(|| {
             scrape
                 .and_then(catalog_path_basename)
+                .and_then(catalog_model_lookup)
+        })
+        .or_else(|| {
+            root.and_then(catalog_path_basename)
                 .and_then(catalog_model_lookup)
         })
 }

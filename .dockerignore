@@ -1,4 +1,5 @@
 target
+!target/release/profile
 .git
 .github
 tests
