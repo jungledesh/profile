@@ -141,66 +141,59 @@ fn rule_display_block(
     block
 }
 
-/// Highest-ranked fired rule eligible for the shared waste line (R1/R2/R5).
-fn waste_gate_rule_name(groups: &[IssueGroup]) -> Option<&str> {
-    groups.iter().find_map(|g| {
-        let name = g.primary.rule_name;
-        matches!(
-            name,
-            "under_batching" | "kv_cache_pressure" | "concurrency_saturation"
-        )
-        .then_some(name)
-    })
-}
 
-/// Appends per-issue waste line when efficiency and cost data are available (R1/R2/R5 only).
-pub(super) fn append_waste_line(
-    lines: &mut Vec<String>,
-    rule_name: &str,
-    baseline: Option<&PhysicsBaseline>,
-    tps: Option<f64>,
-) {
-    if !matches!(
-        rule_name,
-        "under_batching" | "kv_cache_pressure" | "concurrency_saturation"
-    ) {
-        return;
-    }
-    let Some(b) = baseline else {
-        return;
-    };
-    let Some(eff) = b.efficiency_pct.filter(|e| e.is_finite()) else {
-        return;
-    };
-    let Some(cost) = b.cost.as_ref() else {
-        return;
-    };
-    let Some(cpm) = cost.cost_per_million_tokens else {
-        return;
-    };
+fn compute_waste_per_hr(baseline: Option<&PhysicsBaseline>, tps: Option<f64>) -> Option<f64> {
+    let b = baseline?;
+    let eff = b.efficiency_pct.filter(|e| e.is_finite())?;
+    let cost = b.cost.as_ref()?;
+    let cpm = cost.cost_per_million_tokens?;
     if !matches!(
         cost.cost_source,
         CostSource::UserProvided | CostSource::Catalog
     ) {
-        return;
+        return None;
     }
-    let Some(tps) = tps.filter(|v| v.is_finite() && *v > 0.0) else {
-        return;
-    };
+    let tps = tps.filter(|v| v.is_finite() && *v > 0.0)?;
     let cost_per_hr = cpm * tps * 3600.0 / 1_000_000.0;
     if !cost_per_hr.is_finite() || cost_per_hr <= 0.0 {
-        return;
+        return None;
     }
     let waste_fraction = (1.0 - eff / 100.0).max(0.0);
-    let waste_per_hr = cost_per_hr * waste_fraction;
+    Some(cost_per_hr * waste_fraction)
+}
+
+pub(super) fn waste_label_suffix(rule_names: &[&str]) -> Option<&'static str> {
+    match rule_names.len() {
+        0 => None,
+        1 => match rule_names[0] {
+            "under_batching" => Some("wasted on idle compute"),
+            "kv_cache_pressure" => Some("lost to memory thrashing"),
+            "low_prefix_reuse" => Some("wasted on redundant prefill"),
+            "concurrency_saturation" => Some("lost to scheduler queuing"),
+            _ => Some("unclassified overhead"),
+        },
+        _ => Some("lost to compounding bottlenecks"),
+    }
+}
+
+/// Appends per-issue waste line when efficiency and cost data are available.
+pub(super) fn append_waste_line(
+    lines: &mut Vec<String>,
+    groups: &[IssueGroup],
+    baseline: Option<&PhysicsBaseline>,
+    tps: Option<f64>,
+) {
+    let rule_names: Vec<&str> = groups.iter().map(|g| g.primary.rule_name).collect();
+    let Some(suffix) = waste_label_suffix(&rule_names) else {
+        return;
+    };
+    let Some(waste_per_hr) = compute_waste_per_hr(baseline, tps) else {
+        return;
+    };
     if !lines.is_empty() && !lines.last().is_some_and(|l| l.is_empty()) {
         lines.push(String::new());
     }
-    lines.push(format!(
-        "At current efficiency, ~{:.0}% of compute cost is wasted — ~${:.2}/hr recoverable.",
-        waste_fraction * 100.0,
-        waste_per_hr
-    ));
+    lines.push(format!("~${waste_per_hr:.2}/hr {suffix}"));
 }
 
 /// User-facing lines when no window met `window_is_evaluable` (shared by stdout and rule formatters).
@@ -305,9 +298,7 @@ pub fn format_diagnose_rules(
         );
     }
 
-    if let Some(rule_name) = waste_gate_rule_name(&report.groups) {
-        append_waste_line(&mut out, rule_name, baseline_ref, tps);
-    }
+    append_waste_line(&mut out, &report.groups, baseline_ref, tps);
 
     let r2_adv = if !fired_names.contains("kv_cache_pressure") && !report.r2_suppressed_by_r4 {
         r2_kv_cache_advisory(snapshot, metrics_url)
@@ -737,7 +728,11 @@ pub fn format_diagnose_rules_for_windows(
             );
         }
         if !any_advisory && !verbose_rules {
-            out.push(NO_ISSUES_LINE.to_string());
+            let before = out.len();
+            append_waste_line(&mut out, &[], summary_baseline.as_ref(), tps);
+            if out.len() == before {
+                out.push(NO_ISSUES_LINE.to_string());
+            }
         }
         if skipped > 0 {
             out.push(format!(
@@ -848,9 +843,7 @@ pub fn format_diagnose_rules_for_windows(
     }
 
     let ranked_report = build_report_for_windows(windows, summary);
-    if let Some(rule_name) = waste_gate_rule_name(&ranked_report.groups) {
-        append_waste_line(&mut warnings, rule_name, baseline_ref, tps);
-    }
+    append_waste_line(&mut warnings, &ranked_report.groups, baseline_ref, tps);
 
     let r2_adv = if !r2_significant && !r2_backlog_significant {
         r2_kv_cache_advisory(summary_snap, metrics_url)
@@ -1584,85 +1577,60 @@ mod tests {
             !lines.iter().any(|l| l.contains("No issues detected")),
             "should not append no-issues line when at least one rule fired"
         );
-        let waste_lines: Vec<_> = lines.iter().filter(|l| l.contains("recoverable")).collect();
+        let waste_lines: Vec<_> = lines.iter().filter(|l| l.contains("/hr ")).collect();
         assert_eq!(
             waste_lines.len(),
             1,
             "expected one shared waste line: {lines:?}"
         );
-        assert!(waste_lines[0].contains("wasted"));
+        assert!(waste_lines[0].contains("lost to compounding bottlenecks"));
     }
 
     #[test]
-    fn waste_gate_rule_name_uses_highest_ranked_waste_eligible_rule() {
-        let groups = vec![
-            IssueGroup {
-                primary: Recommendation {
-                    rule_name: "kv_cache_pressure",
-                    impact: 5,
-                    confidence: 0.85,
-                    action: String::new(),
-                    short_action: String::new(),
-                    expected_impact: String::new(),
-                    display_lines: Vec::new(),
-                },
-                secondary: Vec::new(),
-            },
-            IssueGroup {
-                primary: Recommendation {
-                    rule_name: "under_batching",
-                    impact: 4,
-                    confidence: 0.8,
-                    action: String::new(),
-                    short_action: String::new(),
-                    expected_impact: String::new(),
-                    display_lines: Vec::new(),
-                },
-                secondary: Vec::new(),
-            },
-        ];
-        assert_eq!(waste_gate_rule_name(&groups), Some("kv_cache_pressure"));
-        let groups = vec![
-            IssueGroup {
-                primary: Recommendation {
-                    rule_name: "low_prefix_reuse",
-                    impact: 2,
-                    confidence: 0.9,
-                    action: String::new(),
-                    short_action: String::new(),
-                    expected_impact: String::new(),
-                    display_lines: Vec::new(),
-                },
-                secondary: Vec::new(),
-            },
-            IssueGroup {
-                primary: Recommendation {
-                    rule_name: "under_batching",
-                    impact: 4,
-                    confidence: 0.8,
-                    action: String::new(),
-                    short_action: String::new(),
-                    expected_impact: String::new(),
-                    display_lines: Vec::new(),
-                },
-                secondary: Vec::new(),
-            },
-        ];
-        assert_eq!(waste_gate_rule_name(&groups), Some("under_batching"));
+    fn waste_label_r1_only() {
         assert_eq!(
-            waste_gate_rule_name(&[IssueGroup {
-                primary: Recommendation {
-                    rule_name: "oom_risk",
-                    impact: 5,
-                    confidence: 0.9,
-                    action: String::new(),
-                    short_action: String::new(),
-                    expected_impact: String::new(),
-                    display_lines: Vec::new(),
-                },
-                secondary: Vec::new(),
-            }]),
-            None
+            waste_label_suffix(&["under_batching"]),
+            Some("wasted on idle compute")
+        );
+    }
+
+    #[test]
+    fn waste_label_r2_only() {
+        assert_eq!(
+            waste_label_suffix(&["kv_cache_pressure"]),
+            Some("lost to memory thrashing")
+        );
+    }
+
+    #[test]
+    fn waste_label_r3_only() {
+        assert_eq!(
+            waste_label_suffix(&["low_prefix_reuse"]),
+            Some("wasted on redundant prefill")
+        );
+    }
+
+    #[test]
+    fn waste_label_r5_only() {
+        assert_eq!(
+            waste_label_suffix(&["concurrency_saturation"]),
+            Some("lost to scheduler queuing")
+        );
+    }
+
+    #[test]
+    fn waste_label_multi_rule() {
+        assert_eq!(
+            waste_label_suffix(&["under_batching", "kv_cache_pressure"]),
+            Some("lost to compounding bottlenecks")
+        );
+    }
+
+    #[test]
+    fn waste_label_unknown_rule() {
+        assert_eq!(
+            waste_label_suffix(&["oom_risk"]),
+            Some("unclassified overhead")
         );
     }
 
@@ -2020,29 +1988,89 @@ mod tests {
     }
 
     #[test]
-    fn waste_line_appended_for_r1_r2_r5() {
+    fn waste_line_appended_for_r1_r2_r3_r5() {
         let b = baseline_for_waste(32.0, CostSource::Catalog, 1.84);
         let tps = Some(14.2_f64);
-        for rule in [
-            "under_batching",
-            "kv_cache_pressure",
-            "concurrency_saturation",
-        ] {
+        let cases = [
+            (
+                vec![issue_group("under_batching")],
+                "wasted on idle compute",
+            ),
+            (
+                vec![issue_group("kv_cache_pressure")],
+                "lost to memory thrashing",
+            ),
+            (
+                vec![issue_group("low_prefix_reuse")],
+                "wasted on redundant prefill",
+            ),
+            (
+                vec![issue_group("concurrency_saturation")],
+                "lost to scheduler queuing",
+            ),
+        ];
+        for (groups, suffix) in cases {
             let mut lines = vec!["issue".to_string()];
-            append_waste_line(&mut lines, rule, Some(&b), tps);
-            assert!(
-                lines.iter().any(|l| l.contains("compute cost is wasted")),
-                "rule {rule}"
-            );
+            append_waste_line(&mut lines, &groups, Some(&b), tps);
+            let waste = lines.iter().find(|l| l.contains("/hr ")).expect(suffix);
+            assert!(waste.ends_with(suffix), "got {waste}");
         }
     }
 
     #[test]
-    fn waste_line_absent_for_r4() {
+    fn waste_line_multi_rule_compounding() {
+        let b = baseline_for_waste(32.0, CostSource::Catalog, 1.84);
+        let groups = vec![
+            issue_group("under_batching"),
+            issue_group("kv_cache_pressure"),
+        ];
+        let mut lines = vec!["issue".to_string()];
+        append_waste_line(&mut lines, &groups, Some(&b), Some(14.2));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("lost to compounding bottlenecks"))
+        );
+    }
+
+    #[test]
+    fn waste_line_unknown_rule_unclassified() {
+        let b = baseline_for_waste(32.0, CostSource::Catalog, 1.84);
+        let groups = vec![issue_group("oom_risk")];
+        let mut lines = vec!["issue".to_string()];
+        append_waste_line(&mut lines, &groups, Some(&b), Some(14.2));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("unclassified overhead"))
+        );
+    }
+
+    #[test]
+    fn waste_line_oom_risk_unclassified() {
         let b = baseline_for_waste(32.0, CostSource::UserProvided, 1.0);
         let mut lines = vec!["issue".to_string()];
-        append_waste_line(&mut lines, "oom_risk", Some(&b), Some(100.0));
-        assert_eq!(lines.len(), 1);
+        append_waste_line(&mut lines, &[issue_group("oom_risk")], Some(&b), Some(100.0));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("unclassified overhead"))
+        );
+    }
+
+    fn issue_group(rule_name: &'static str) -> IssueGroup {
+        IssueGroup {
+            primary: Recommendation {
+                rule_name,
+                impact: 4,
+                confidence: 0.8,
+                action: String::new(),
+                short_action: String::new(),
+                expected_impact: String::new(),
+                display_lines: Vec::new(),
+            },
+            secondary: Vec::new(),
+        }
     }
 
     #[test]
@@ -2050,12 +2078,12 @@ mod tests {
         let mut b = baseline_for_waste(32.0, CostSource::Catalog, 1.84);
         b.efficiency_pct = None;
         let mut lines = vec!["issue".to_string()];
-        append_waste_line(&mut lines, "under_batching", Some(&b), Some(10.0));
+        append_waste_line(&mut lines, &[issue_group("under_batching")], Some(&b), Some(10.0));
         assert_eq!(lines.len(), 1);
 
         b.efficiency_pct = Some(32.0);
         b.cost = None;
-        append_waste_line(&mut lines, "under_batching", Some(&b), Some(10.0));
+        append_waste_line(&mut lines, &[issue_group("under_batching")], Some(&b), Some(10.0));
         assert_eq!(lines.len(), 1);
     }
 }
