@@ -153,11 +153,11 @@ pub fn r2_recommendation(
 }
 
 pub(super) fn r2_kv_pressure_short_action() -> String {
-    "lower --max-num-seqs or switch to fp8 KV cache (--kv-cache-dtype fp8)".to_string()
+    "lower --max-num-seqs".to_string()
 }
 
 pub(super) fn r2_backlog_short_action() -> String {
-    "raise --gpu-memory-utilization or reduce --max-model-len".to_string()
+    "raise --gpu-memory-utilization".to_string()
 }
 
 pub(super) fn kv_pressure_confidence(d: &KvCachePressureDetail) -> f64 {
@@ -568,17 +568,11 @@ mod tests {
             ..Default::default()
         };
         let r = r2_recommendation(&snap(v), None).expect("fired");
-        assert_eq!(
-            r.short_action,
-            "lower --max-num-seqs or switch to fp8 KV cache (--kv-cache-dtype fp8)"
-        );
+        assert_eq!(r.short_action, "lower --max-num-seqs");
     }
 
     #[test]
     fn backlog_short_action_matches_spec() {
-        assert_eq!(
-            r2_backlog_short_action(),
-            "raise --gpu-memory-utilization or reduce --max-model-len"
-        );
+        assert_eq!(r2_backlog_short_action(), "raise --gpu-memory-utilization");
     }
 }
