@@ -141,18 +141,17 @@ fn rule_display_block(
     block
 }
 
-
 fn compute_waste_per_hr(baseline: Option<&PhysicsBaseline>, tps: Option<f64>) -> Option<f64> {
     let b = baseline?;
     let eff = b.efficiency_pct.filter(|e| e.is_finite())?;
     let cost = b.cost.as_ref()?;
-    let cpm = cost.cost_per_million_tokens?;
     if !matches!(
         cost.cost_source,
         CostSource::UserProvided | CostSource::Catalog
     ) {
         return None;
     }
+    let cpm = cost.cost_per_million_tokens?;
     let tps = tps.filter(|v| v.is_finite() && *v > 0.0)?;
     let cost_per_hr = cpm * tps * 3600.0 / 1_000_000.0;
     if !cost_per_hr.is_finite() || cost_per_hr <= 0.0 {
@@ -162,6 +161,7 @@ fn compute_waste_per_hr(baseline: Option<&PhysicsBaseline>, tps: Option<f64>) ->
     Some(cost_per_hr * waste_fraction)
 }
 
+// COUPLING: strings must match Recommendation.rule_name values in each rule file.
 pub(super) fn waste_label_suffix(rule_names: &[&str]) -> Option<&'static str> {
     match rule_names.len() {
         0 => None,
@@ -728,11 +728,7 @@ pub fn format_diagnose_rules_for_windows(
             );
         }
         if !any_advisory && !verbose_rules {
-            let before = out.len();
-            append_waste_line(&mut out, &[], summary_baseline.as_ref(), tps);
-            if out.len() == before {
-                out.push(NO_ISSUES_LINE.to_string());
-            }
+            out.push(NO_ISSUES_LINE.to_string());
         }
         if skipped > 0 {
             out.push(format!(
