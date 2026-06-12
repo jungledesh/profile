@@ -158,7 +158,11 @@ fn compute_waste_per_hr(baseline: Option<&PhysicsBaseline>, tps: Option<f64>) ->
         return None;
     }
     let waste_fraction = (1.0 - eff / 100.0).max(0.0);
-    Some(cost_per_hr * waste_fraction)
+    let waste = cost_per_hr * waste_fraction;
+    if !waste.is_finite() || waste <= 0.0 {
+        return None;
+    }
+    Some(waste)
 }
 
 // COUPLING: strings must match Recommendation.rule_name values in each rule file.
@@ -358,6 +362,7 @@ struct WindowRuleEval {
     r3_details: Vec<LowPrefixReuseDetail>,
     r5_fired: usize,
     r5_details: Vec<ConcurrencySaturationDetail>,
+    groups: Vec<IssueGroup>,
 }
 
 impl WindowRuleEval {
@@ -426,6 +431,7 @@ fn eval_window_rules(
         r3_details: Vec::new(),
         r5_fired: 0,
         r5_details: Vec::new(),
+        groups: Vec::new(),
     };
 
     for w in &evaluable {
@@ -470,48 +476,11 @@ fn eval_window_rules(
     Some(eval)
 }
 
-fn finalize_report_groups(
-    mut recs: Vec<Recommendation>,
-    baseline: Option<baseline::PhysicsBaseline>,
-) -> super::Report {
-    let r2_present_before = recs.iter().any(|r| r.rule_name == "kv_cache_pressure");
-    let r4_fired = recs.iter().any(|r| r.rule_name == "oom_risk");
-    let r2_suppressed_by_r4 = r4_fired && r2_present_before;
-    if r4_fired {
-        recs.retain(|r| r.rule_name != "kv_cache_pressure");
-    }
-    recs.sort_by(|a, b| {
-        let sa = a.impact as f64 * a.confidence;
-        let sb = b.impact as f64 * b.confidence;
-        sb.total_cmp(&sa)
-    });
-    let groups = recs
-        .into_iter()
-        .map(|r| IssueGroup {
-            primary: r,
-            secondary: Vec::new(),
-        })
-        .collect();
-    super::Report {
-        baseline,
-        groups,
-        r2_suppressed_by_r4,
-    }
-}
-
-/// Multi-window rule evaluation — same significance gates as `format_diagnose_rules_for_windows`.
-pub fn build_report_for_windows(
-    windows: &[RuntimeWindow],
+fn build_report_from_eval(
+    eval: &WindowRuleEval,
     summary: AnalysisInput<'_>,
 ) -> super::Report {
     let baseline = baseline::compute(&summary);
-    let Some(eval) = eval_window_rules(windows, &summary) else {
-        return super::Report {
-            baseline,
-            groups: Vec::new(),
-            r2_suppressed_by_r4: false,
-        };
-    };
     if eval.n_eval == 0 {
         return super::Report {
             baseline,
@@ -661,15 +630,64 @@ pub fn build_report_for_windows(
     finalize_report_groups(recs, baseline)
 }
 
+fn finalize_report_groups(
+    mut recs: Vec<Recommendation>,
+    baseline: Option<baseline::PhysicsBaseline>,
+) -> super::Report {
+    let r2_present_before = recs.iter().any(|r| r.rule_name == "kv_cache_pressure");
+    let r4_fired = recs.iter().any(|r| r.rule_name == "oom_risk");
+    let r2_suppressed_by_r4 = r4_fired && r2_present_before;
+    if r4_fired {
+        recs.retain(|r| r.rule_name != "kv_cache_pressure");
+    }
+    recs.sort_by(|a, b| {
+        let sa = a.impact as f64 * a.confidence;
+        let sb = b.impact as f64 * b.confidence;
+        sb.total_cmp(&sa)
+    });
+    let groups = recs
+        .into_iter()
+        .map(|r| IssueGroup {
+            primary: r,
+            secondary: Vec::new(),
+        })
+        .collect();
+    super::Report {
+        baseline,
+        groups,
+        r2_suppressed_by_r4,
+    }
+}
+
+/// Multi-window rule evaluation — same significance gates as `format_diagnose_rules_for_windows`.
+pub fn build_report_for_windows(
+    windows: &[RuntimeWindow],
+    summary: AnalysisInput<'_>,
+) -> super::Report {
+    let baseline = baseline::compute(&summary);
+    let Some(eval) = eval_window_rules(windows, &summary) else {
+        return super::Report {
+            baseline,
+            groups: Vec::new(),
+            r2_suppressed_by_r4: false,
+        };
+    };
+    build_report_from_eval(&eval, summary)
+}
+
 pub fn format_diagnose_rules_for_windows(
     windows: &[RuntimeWindow],
     summary: AnalysisInput<'_>,
     verbose_rules: bool,
     metrics_url: &str,
 ) -> Vec<String> {
-    let Some(eval) = eval_window_rules(windows, &summary) else {
+    let Some(mut eval) = eval_window_rules(windows, &summary) else {
         return no_evaluable_diagnose_lines(verbose_rules, &[]);
     };
+
+    if eval.n_eval > 0 {
+        eval.groups = build_report_from_eval(&eval, summary).groups;
+    }
 
     if eval.n_eval == 0 {
         return no_evaluable_diagnose_lines(verbose_rules, windows);
@@ -838,8 +856,7 @@ pub fn format_diagnose_rules_for_windows(
         warnings.push(String::new());
     }
 
-    let ranked_report = build_report_for_windows(windows, summary);
-    append_waste_line(&mut warnings, &ranked_report.groups, baseline_ref, tps);
+    append_waste_line(&mut warnings, &eval.groups, baseline_ref, tps);
 
     let r2_adv = if !r2_significant && !r2_backlog_significant {
         r2_kv_cache_advisory(summary_snap, metrics_url)
@@ -2067,6 +2084,20 @@ mod tests {
             },
             secondary: Vec::new(),
         }
+    }
+
+    #[test]
+    fn waste_line_efficiency_over_100_clamps_to_zero() {
+        let b = baseline_for_waste(110.0, CostSource::Catalog, 1.84);
+        let mut lines = vec!["issue".to_string()];
+        append_waste_line(
+            &mut lines,
+            &[issue_group("under_batching")],
+            Some(&b),
+            Some(14.2),
+        );
+        assert_eq!(lines.len(), 1);
+        assert!(!lines.iter().any(|l| l.contains("/hr ")));
     }
 
     #[test]
