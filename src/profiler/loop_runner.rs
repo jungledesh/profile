@@ -1,4 +1,4 @@
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 use std::time::Duration;
 
 use super::{delta, drift, poll, run_diagnose, state::LoopState, DiagnoseResult};
@@ -126,7 +126,7 @@ pub fn run(
             .map(|g| g.primary.short_action.as_str());
 
         if d.direction == delta::Direction::Worse {
-            let choice = read_worse_regression_choice(&mut io::stdin().lock(), &mut io::stdout())?;
+            let choice = read_worse_regression_choice(&stdin_rx, &mut io::stdout())?;
             match choice {
                 WorseRegressionChoice::Continue => {
                     for line in direction_followup_lines(delta::Direction::NoChange, next_fix) {
@@ -223,19 +223,17 @@ pub(crate) fn parse_worse_regression_choice(line: &str) -> Option<WorseRegressio
     }
 }
 
-pub(crate) fn read_worse_regression_choice<R: BufRead>(
-    reader: &mut R,
+pub(crate) fn read_worse_regression_choice(
+    stdin_rx: &std::sync::mpsc::Receiver<String>,
     prompt: &mut dyn Write,
 ) -> io::Result<WorseRegressionChoice> {
     writeln!(prompt, "  [r] revert   [c] continue")?;
     loop {
         write!(prompt, "> ")?;
         prompt.flush()?;
-        let mut line = String::new();
-        let n = reader.read_line(&mut line)?;
-        if n == 0 {
-            return Ok(WorseRegressionChoice::Continue);
-        }
+        let line = stdin_rx
+            .recv()
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stdin closed"))?;
         if let Some(choice) = parse_worse_regression_choice(&line) {
             return Ok(choice);
         }
@@ -553,11 +551,11 @@ mod tests {
 
     #[test]
     fn read_worse_regression_choice_reprompts_on_invalid_input() {
-        use std::io::Cursor;
-        let input = b"x\nr\n";
-        let mut reader = Cursor::new(input.as_slice());
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send("x\n".to_string()).unwrap();
+        tx.send("r\n".to_string()).unwrap();
         let mut out = Vec::new();
-        let choice = read_worse_regression_choice(&mut reader, &mut out).unwrap();
+        let choice = read_worse_regression_choice(&rx, &mut out).unwrap();
         assert_eq!(choice, WorseRegressionChoice::Revert);
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains(" r = revert, c = continue"));

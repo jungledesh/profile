@@ -185,7 +185,7 @@ pub(super) fn r5_short_action(d: &ConcurrencySaturationDetail) -> String {
     if kv_safe {
         format!("raise --max-num-seqs above {max_str}")
     } else {
-        "add a replica or lower --max-model-len to free KV blocks".to_string()
+        "add a replica to scale out".to_string()
     }
 }
 
@@ -473,10 +473,7 @@ mod tests {
     #[test]
     fn short_action_scales_out_when_kv_not_safe() {
         let d = fired_detail(None, Some(85.0));
-        assert_eq!(
-            r5_short_action(&d),
-            "add a replica or lower --max-model-len to free KV blocks"
-        );
+        assert_eq!(r5_short_action(&d), "add a replica to scale out");
         let r = r5_recommendation(
             &snap(sat_vllm(32.0, 15.0, Some(32))),
             Some(85.0),
@@ -484,9 +481,6 @@ mod tests {
             None,
         )
         .expect("fired");
-        assert_eq!(
-            r.short_action,
-            "add a replica or lower --max-model-len to free KV blocks"
-        );
+        assert_eq!(r.short_action, "add a replica to scale out");
     }
 }
