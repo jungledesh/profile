@@ -1,5 +1,5 @@
-# Re-pin with: docker buildx imagetools inspect nvidia/cuda:12.4.1-runtime-ubuntu22.04 --format '{{json .Manifest.Digest}}'
-FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+# Re-pin with: docker buildx imagetools inspect nvidia/cuda:12.4.1-devel-ubuntu22.04 --format '{{json .Manifest.Digest}}'
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04
 
 ENV APP_DIR=/home/appuser/app
 ENV MODELS_DIR=/workspace/models
