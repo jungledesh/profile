@@ -16,7 +16,7 @@ pub use r1_under_batching::{
 };
 pub use r2_kv_cache_pressure::{
     r2_recommendation, rule2_kv_admission_backlog, rule2_kv_cache_pressure,
-    KvAdmissionBacklogDetail, KvCachePressureDetail, Rule2MissReport, Rule2Outcome,
+    KvAdmissionBacklogDetail, KvCachePressureDetail, Rule2Outcome,
 };
 pub use r3_low_prefix_reuse::{
     r3_recommendation, rule3_low_prefix_reuse, LowPrefixReuseDetail, Rule3Outcome,
@@ -30,7 +30,7 @@ use r1_under_batching::{aggregate_r1_detail, format_under_batching_window_issue,
 use r2_kv_cache_pressure::{
     aggregate_backlog_detail, aggregate_r2_detail, format_kv_admission_backlog_issue,
     format_kv_cache_window_issue, kv_pressure_confidence, r2_backlog_short_action,
-    r2_kv_pressure_short_action, KV_CACHE_CRITICAL_THRESHOLD_PCT,
+    r2_kv_pressure_short_action,
 };
 #[cfg(test)]
 use r3_low_prefix_reuse::format_low_prefix_hit_rate_fired;
@@ -95,7 +95,7 @@ impl IssueGroup {
 }
 
 const NO_ISSUES_LINE: &str = "No issues detected in this snapshot.";
-const R2_SUPPRESSED_BY_R4_VERBOSE_LINE: &str = "  ↳ KV pressure suppressed — symptom of the above";
+const R2_SUPPRESSED_BY_R4_VERBOSE_LINE: &str = "  ↳ KV pressure suppressed (symptom of the above)";
 
 fn metrics_scrape_url(metrics_input: &str) -> String {
     let base = metrics_input.trim_end_matches('/');
@@ -217,7 +217,7 @@ pub fn no_evaluable_diagnose_lines(verbose: bool, windows: &[RuntimeWindow]) -> 
                 .count();
             if skipped > 0 {
                 out.push(format!(
-                    "Note: {skipped} of {total} collected windows dropped — telemetry failure. Diagnosis may be incomplete."
+                    "Note: {skipped} of {total} collected windows dropped. Telemetry failure. Diagnosis may be incomplete."
                 ));
             }
         }
@@ -375,15 +375,7 @@ impl WindowRuleEval {
     }
 
     fn r2_significant(&self) -> bool {
-        let r2_any_preemptions = self.r2_details.iter().any(|d| d.preemptions_active);
-        let r2_critical_windows = self
-            .r2_details
-            .iter()
-            .filter(|d| d.kv_cache_usage_perc >= KV_CACHE_CRITICAL_THRESHOLD_PCT)
-            .count();
-        r2_any_preemptions
-            || r2_critical_windows >= 2
-            || rule_is_significant(self.r2_fired, self.n_eval)
+        rule_is_significant(self.r2_fired, self.n_eval)
     }
 
     fn r2_backlog_significant(&self) -> bool {
@@ -447,7 +439,7 @@ fn eval_window_rules(
                 eval.r2_fired += 1;
                 eval.r2_details.push(d);
             }
-            Rule2Outcome::NotFired(_) => {}
+            Rule2Outcome::NotFired => {}
         }
         if let Some(d) = rule2_kv_admission_backlog(&w.snapshot) {
             eval.r2_backlog_fired += 1;
@@ -510,21 +502,30 @@ fn build_report_from_eval(eval: &WindowRuleEval, summary: AnalysisInput<'_>) -> 
     }
 
     if r2_significant {
-        let r2_agg = aggregate_r2_detail(&eval.r2_details, summary_snap);
-        let conf = kv_pressure_confidence(&r2_agg);
+        let r2_agg = aggregate_r2_detail(&eval.r2_details);
+        let conf = kv_pressure_confidence(eval.r2_fired, eval.n_eval);
         let display_lines = format_kv_cache_window_issue(
             &r2_agg,
             pct(eval.r2_fired, eval.n_eval),
             summary_snap,
-            conf,
+            eval.r2_fired,
+            eval.n_eval,
             max_model_len,
         );
         recs.push(Recommendation {
             rule_name: "kv_cache_pressure",
             impact: 5,
             confidence: conf,
-            action: "Reduce max_num_seqs or add tensor parallelism".to_string(),
-            short_action: r2_kv_pressure_short_action(),
+            action: if r2_agg.preemptions_active {
+                "Lower --max-num-seqs to stop evictions".to_string()
+            } else {
+                "Raise --gpu-memory-utilization if VRAM headroom exists".to_string()
+            },
+            short_action: if r2_agg.preemptions_active {
+                r2_kv_pressure_short_action().to_string()
+            } else {
+                r2_backlog_short_action().to_string()
+            },
             expected_impact: "Reduced KV evictions and lower latency variance".to_string(),
             display_lines,
         });
@@ -535,13 +536,15 @@ fn build_report_from_eval(eval: &WindowRuleEval, summary: AnalysisInput<'_>) -> 
             pct(eval.r2_backlog_fired, eval.n_eval),
             max_model_len,
             kv_headroom_gb,
+            eval.r2_backlog_fired,
+            eval.n_eval,
         );
         recs.push(Recommendation {
-            rule_name: "kv_cache_pressure",
+            rule_name: "kv_admission_backlog",
             impact: 5,
-            confidence: 0.85,
+            confidence: kv_pressure_confidence(eval.r2_backlog_fired, eval.n_eval),
             action: "Raise --gpu-memory-utilization or reduce KV footprint".to_string(),
-            short_action: r2_backlog_short_action(),
+            short_action: r2_backlog_short_action().to_string(),
             expected_impact: "Wait queue drains, TTFT recovers.".to_string(),
             display_lines,
         });
@@ -747,7 +750,7 @@ pub fn format_diagnose_rules_for_windows(
         }
         if skipped > 0 {
             out.push(format!(
-                "Note: {skipped} of {total} windows dropped — telemetry failure. Diagnosis may be incomplete."
+                "Note: {skipped} of {total} windows dropped. Telemetry failure. Diagnosis may be incomplete."
             ));
         }
         trim_trailing_blank_lines(&mut out);
@@ -755,13 +758,7 @@ pub fn format_diagnose_rules_for_windows(
     }
 
     let r1_significant = rule_is_significant(r1_fired, n_eval);
-    let r2_any_preemptions = r2_details.iter().any(|d| d.preemptions_active);
-    let r2_critical_windows = r2_details
-        .iter()
-        .filter(|d| d.kv_cache_usage_perc >= KV_CACHE_CRITICAL_THRESHOLD_PCT)
-        .count();
-    let r2_significant =
-        r2_any_preemptions || r2_critical_windows >= 2 || rule_is_significant(r2_fired, n_eval);
+    let r2_significant = rule_is_significant(r2_fired, n_eval);
     let r2_backlog_significant = rule_is_significant(r2_backlog_fired, n_eval);
     let r3_significant = rule_is_significant(r3_fired, n_eval);
     let r5_significant = rule_is_significant(r5_fired, n_eval);
@@ -779,12 +776,13 @@ pub fn format_diagnose_rules_for_windows(
     }
 
     if r2_significant {
-        let r2_agg = aggregate_r2_detail(r2_details, summary_snap);
+        let r2_agg = aggregate_r2_detail(r2_details);
         let block = format_kv_cache_window_issue(
             &r2_agg,
             pct(r2_fired, n_eval),
             summary_snap,
-            kv_pressure_confidence(&r2_agg),
+            r2_fired,
+            n_eval,
             summary.ctx.config.max_model_len,
         );
         warnings.extend(block);
@@ -796,6 +794,8 @@ pub fn format_diagnose_rules_for_windows(
             pct(r2_backlog_fired, n_eval),
             summary.ctx.config.max_model_len,
             summary_baseline.as_ref().and_then(|b| b.kv_headroom_gb),
+            r2_backlog_fired,
+            n_eval,
         );
         warnings.extend(block);
         warnings.push(String::new());
@@ -918,7 +918,7 @@ pub fn format_diagnose_rules_for_windows(
     if skipped > 0 {
         out.push(String::new());
         out.push(format!(
-            "Note: {skipped} of {total} windows dropped — telemetry failure. Diagnosis may be incomplete."
+            "Note: {skipped} of {total} windows dropped. Telemetry failure. Diagnosis may be incomplete."
         ));
     }
 
@@ -1000,6 +1000,7 @@ mod tests {
                 num_requests_waiting: Some(0.0),
                 max_num_seqs: Some(256),
                 kv_cache_usage_perc: Some(89.0),
+                num_preemptions_per_sec: Some(0.05),
                 generation_tokens_per_sec: Some(50.0),
                 request_success_per_sec: Some(10.0),
                 window_duration_secs: Some(2.0),
@@ -1162,7 +1163,7 @@ mod tests {
         let win = mk_win(s);
         let lines = format_diagnose_rules(ai(&ctx, &win), false, "http://127.0.0.1:8000/metrics");
         let text = lines.join("\n");
-        assert!(text.contains("[!] Under-batching — Insufficient Concurrency"));
+        assert!(text.contains("[!] Under-batching: Insufficient Concurrency"));
         assert!(text.contains("Occupancy"));
         assert!(text.contains("threshold: < 25%"));
         assert!(text.contains("  Cause:"));
@@ -1250,7 +1251,7 @@ mod tests {
         v.generation_tokens_per_sec = Some(100.0);
         v.num_requests_running = Some(100.0);
         if preemptions {
-            v.num_preemptions_per_sec = Some(1.0);
+            v.num_preemptions_per_sec = Some(0.05);
         }
         mk_win(snap(t, t, v, gpu_busy()))
     }
@@ -1285,44 +1286,43 @@ mod tests {
     }
 
     #[test]
-    fn r2_recommendation_critical_confidence_when_preemptions_active() {
+    fn r2_recommendation_confidence_from_density_counts() {
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_high_kv();
-        v.kv_cache_usage_perc = Some(50.0);
-        v.num_preemptions_per_sec = Some(0.5);
+        v.num_preemptions_per_sec = Some(0.05);
         let s = snap(t, t, v, gpu_low());
-        let r = r2_recommendation(&s, None).expect("fired");
+        let r = r2_recommendation(&s, None, 1, 4).expect("fired");
         assert_eq!(r.rule_name, "kv_cache_pressure");
         assert_eq!(r.impact, 5);
-        assert!((r.confidence - 0.95).abs() < 1e-9);
+        assert!((r.confidence - 0.5).abs() < 1e-9);
     }
 
     #[test]
-    fn r2_recommendation_warning_confidence_when_kv_high_only() {
+    fn r2_recommendation_includes_peak_from_detail() {
         let t = SystemTime::UNIX_EPOCH;
-        let mut g = gpu_low();
-        g.vram_used_mb = Some(78 * 1024);
-        g.vram_total_mb = Some(100 * 1024);
-        let s = snap(t, t, vllm_high_kv(), g);
-        let r = r2_recommendation(&s, None).expect("fired");
-        assert_eq!(r.rule_name, "kv_cache_pressure");
-        assert_eq!(r.impact, 5);
-        assert!((r.confidence - 0.7).abs() < 1e-9);
+        let mut v = vllm_high_kv();
+        v.kv_cache_usage_perc = Some(89.0);
+        v.kv_cache_peak_perc = Some(99.4);
+        v.num_preemptions_per_sec = Some(0.05);
+        let s = snap(t, t, v, gpu_low());
+        let r = r2_recommendation(&s, None, 1, 1).expect("fired");
+        let text = r.display_lines.join("\n");
+        assert!(text.contains("KV cache hit 99.4% peak (threshold: 88%)"));
     }
 
     #[test]
-    fn kv_cache_pressure_fires_at_88_boundary() {
+    fn kv_cache_pressure_fires_at_88_boundary_with_stress() {
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
         v.kv_cache_usage_perc = Some(88.0);
+        v.num_preemptions_per_sec = Some(0.05);
         let s = snap(t, t, v, gpu_low());
         match rule2_kv_cache_pressure(&s) {
             Rule2Outcome::Fired(d) => {
                 assert!((d.kv_cache_usage_perc - 88.0).abs() < 1e-9);
-                assert!(d.vram_usage_perc_corroborated.is_none());
-                assert!(!d.preemptions_active);
+                assert!(d.preemptions_active);
             }
-            Rule2Outcome::NotFired(_) => panic!("expected fired at 88%"),
+            Rule2Outcome::NotFired => panic!("expected fired at 88% with stress"),
         }
     }
 
@@ -1331,14 +1331,12 @@ mod tests {
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
         v.kv_cache_usage_perc = Some(87.9);
+        v.num_preemptions_per_sec = Some(0.05);
         let s = snap(t, t, v, gpu_low());
-        match rule2_kv_cache_pressure(&s) {
-            Rule2Outcome::NotFired(m) => {
-                assert!(!m.skew_exceeded);
-                assert_eq!(m.kv_cache_usage_perc, Some(87.9));
-            }
-            Rule2Outcome::Fired(_) => panic!("expected not fired"),
-        }
+        assert!(matches!(
+            rule2_kv_cache_pressure(&s),
+            Rule2Outcome::NotFired
+        ));
     }
 
     #[test]
@@ -1348,13 +1346,10 @@ mod tests {
         let mut v = vllm_high_kv();
         v.num_requests_running = Some(64.0);
         let s = snap(t0, t1, v, gpu_low());
-        match rule2_kv_cache_pressure(&s) {
-            Rule2Outcome::NotFired(m) => {
-                assert!(m.skew_exceeded);
-                assert_eq!(m.kv_cache_usage_perc, Some(89.0));
-            }
-            Rule2Outcome::Fired(_) => panic!("expected skew miss"),
-        }
+        assert!(matches!(
+            rule2_kv_cache_pressure(&s),
+            Rule2Outcome::NotFired
+        ));
         let ctx = mk_ctx();
         let win = mk_win(s);
         let text =
@@ -1366,26 +1361,25 @@ mod tests {
         assert!(!text.contains("No issues detected in this snapshot."));
     }
 
-    #[test]
-    fn kv_cache_pressure_vram_corroborates() {
-        let t = SystemTime::UNIX_EPOCH;
-        let mut g = gpu_low();
-        g.vram_used_mb = Some(78 * 1024);
-        g.vram_total_mb = Some(100 * 1024);
-        let s = snap(t, t, vllm_high_kv(), g);
-        match rule2_kv_cache_pressure(&s) {
-            Rule2Outcome::Fired(d) => {
-                let vp = d.vram_usage_perc_corroborated.expect("corroborated");
-                assert!((vp - 78.0).abs() < 0.01);
-            }
-            Rule2Outcome::NotFired(_) => panic!("expected fired"),
+    fn vllm_high_kv_stressed() -> VllmRawMetrics {
+        VllmRawMetrics {
+            kv_cache_usage_perc: Some(89.0),
+            num_preemptions_per_sec: Some(0.05),
+            ..vllm_base()
         }
-        let mut gb = gpu_busy();
-        gb.vram_used_mb = Some(78 * 1024);
-        gb.vram_total_mb = Some(100 * 1024);
-        let s_kv_only = snap(t, t, vllm_high_kv(), gb);
+    }
+
+    #[test]
+    fn kv_cache_pressure_preemption_displays_without_premature_confidence() {
+        let t = SystemTime::UNIX_EPOCH;
+        let s_kv_only = snap(t, t, vllm_high_kv_stressed(), gpu_busy());
         let ctx2 = mk_ctx();
         let win_kv_only = mk_win(s_kv_only);
+        let r2_text = r2_recommendation(&win_kv_only.snapshot, None, 1, 1)
+            .expect("r2 fired")
+            .display_lines
+            .join("\n");
+        assert!(!r2_text.contains("Confidence:"));
         let text = format_diagnose_rules(
             ai(&ctx2, &win_kv_only),
             false,
@@ -1393,30 +1387,10 @@ mod tests {
         )
         .join("\n");
         assert!(text.contains("Cause:"));
-        assert!(text.contains("  - KV cache 89.0% (threshold: 88%)"));
-        assert!(text.contains("Expected: Lower TTFT, stable TPOT once evictions stop."));
-        assert!(text.contains("check header for available VRAM"));
+        assert!(text.contains("KV cache hit 89.0% peak (threshold: 88%)"));
+        assert!(text.contains("Expected: TTFT and TPOT recover once evictions stop."));
+        assert!(text.contains("Lower --max-num-seqs now to stop evictions"));
         assert!(text.contains("Switch to fp8 KV cache (--kv-cache-dtype fp8)"));
-        assert!(text.contains("Confidence: Medium-High"));
-    }
-
-    #[test]
-    fn kv_cache_pressure_low_vram_not_corroborated() {
-        let t = SystemTime::UNIX_EPOCH;
-        let mut gb = gpu_busy();
-        gb.vram_used_mb = Some(50 * 1024);
-        gb.vram_total_mb = Some(100 * 1024);
-        let s = snap(t, t, vllm_high_kv(), gb);
-        match rule2_kv_cache_pressure(&s) {
-            Rule2Outcome::Fired(d) => assert!(d.vram_usage_perc_corroborated.is_none()),
-            Rule2Outcome::NotFired(_) => panic!("expected fired"),
-        }
-        let ctx = mk_ctx();
-        let win = mk_win(s);
-        let text = format_diagnose_rules(ai(&ctx, &win), false, "http://127.0.0.1:8000/metrics")
-            .join("\n");
-        assert!(text.contains("Confidence: Medium-High"));
-        assert!(text.contains("  - KV cache 89.0% (threshold: 88%)"));
     }
 
     #[test]
@@ -1482,7 +1456,7 @@ mod tests {
         assert!(text.contains("[!] Low Prefix Cache"));
         assert!(text.contains("  Cause:"));
         assert!(text.contains("  - Prefix hit rate 24.0% (threshold: 35%)"));
-        assert!(text.contains("restructure prompts to share common prefixes"));
+        assert!(text.contains("Restructure prompts to share common prefixes"));
         assert!(text.contains("  Fix:"));
         assert!(text.contains("Move shared instructions/system prompts to the very start"));
         assert!(text.contains("Standardize prompt templates across requests"));
@@ -1548,6 +1522,7 @@ mod tests {
     fn format_diagnose_rules_inserts_blank_between_rule_blocks() {
         let (ctx, win) = {
             let mut v = vllm_high_kv();
+            v.num_preemptions_per_sec = Some(0.05);
             v.tpot_ms = Some(35.0);
             v.generation_tokens_per_sec = Some(30.0);
             v.model_name = Some("meta-llama/Llama-3.1-8B-Instruct".to_string());
@@ -1567,7 +1542,7 @@ mod tests {
         let lines = format_diagnose_rules(ai(&ctx, &win), false, "http://127.0.0.1:8000/metrics");
         let idx_under = lines
             .iter()
-            .position(|l| l.contains("[!] Under-batching — Insufficient Concurrency"))
+            .position(|l| l.contains("[!] Under-batching: Insufficient Concurrency"))
             .expect("rule1");
         let idx_kv = lines
             .iter()
@@ -1671,7 +1646,7 @@ mod tests {
             .collect();
         windows[0] = mk_evaluable_kv_window(89.0, true);
         let text = r2_issue_lines(windows).join("\n");
-        assert!(text.contains("[!] KV Cache Pressure"));
+        assert!(!text.contains("[!] KV Cache Pressure"));
     }
 
     #[test]
@@ -1682,7 +1657,118 @@ mod tests {
         windows[0] = mk_evaluable_kv_window(96.0, false);
         windows[1] = mk_evaluable_kv_window(97.0, false);
         let text = r2_issue_lines(windows).join("\n");
-        assert!(text.contains("[!] KV Cache Pressure"));
+        assert!(!text.contains("[!] KV Cache Pressure"));
+    }
+
+    #[test]
+    fn r2_does_not_fire_when_kv_high_but_tpot_stable_and_no_preemptions() {
+        let mut windows: Vec<_> = (0..15)
+            .map(|_| mk_evaluable_kv_window(50.0, false))
+            .collect();
+        for w in windows.iter_mut().take(4) {
+            *w = mk_evaluable_kv_window(89.0, false);
+        }
+        let text = r2_issue_lines(windows).join("\n");
+        assert!(!text.contains("[!] KV Cache Pressure"));
+    }
+
+    #[test]
+    fn r2_confidence_equals_duration_density() {
+        let mut windows: Vec<_> = (0..15)
+            .map(|_| mk_evaluable_kv_window(50.0, false))
+            .collect();
+        for w in windows.iter_mut().take(4) {
+            *w = mk_evaluable_kv_window(89.0, true);
+        }
+        let ctx = mk_ctx();
+        let mut summary_win = windows.last().expect("windows").clone();
+        summary_win.snapshot.vllm.kv_cache_usage_perc = Some(72.5);
+        summary_win.snapshot.vllm.kv_cache_peak_perc = Some(99.4);
+        let summary = ai(&ctx, &summary_win);
+        let report = build_report_for_windows(&windows, summary);
+        let r2 = report
+            .groups
+            .iter()
+            .find(|g| g.primary.rule_name == "kv_cache_pressure")
+            .expect("r2 group");
+        assert!((r2.primary.confidence - (4.0 / 15.0)).abs() < 1e-9);
+        let text = format_diagnose_rules_for_windows(
+            &windows,
+            summary,
+            false,
+            "http://127.0.0.1:8000/metrics",
+        )
+        .join("\n");
+        assert!(text.contains("KV cache hit 99.4% peak (threshold: 88%)"));
+        assert!(text.contains("Seen in 27% of windows"));
+        assert!(text.contains("Confidence: Medium"));
+    }
+
+    #[test]
+    fn cause_line_peak_matches_summary_snapshot() {
+        // 4 windows fired at 95% KV; 11 windows below threshold (30%).
+        // Summary snapshot carries kv_cache_peak_perc=95.0 (realistic: profiler takes
+        // MAX across windows) and kv_cache_usage_perc=92.0 (different value so we can
+        // confirm the cause line reads kv_cache_peak_perc, not the usage fallback).
+        let mut windows: Vec<_> = (0..15)
+            .map(|_| mk_evaluable_kv_window(30.0, true))
+            .collect();
+        for w in windows.iter_mut().take(4) {
+            *w = mk_evaluable_kv_window(95.0, true);
+        }
+        let ctx = mk_ctx();
+        let mut summary_win = windows.last().expect("windows").clone();
+        summary_win.snapshot.vllm.kv_cache_usage_perc = Some(92.0);
+        summary_win.snapshot.vllm.kv_cache_peak_perc = Some(95.0);
+        let summary = ai(&ctx, &summary_win);
+        let text = format_diagnose_rules_for_windows(
+            &windows,
+            summary,
+            false,
+            "http://127.0.0.1:8000/metrics",
+        )
+        .join("\n");
+        assert!(text.contains("KV cache hit 95.0% peak (threshold: 88%)"));
+        assert!(!text.contains("92.0% peak"));
+    }
+
+    #[test]
+    fn cause_kv_line_precedes_preemptions_and_queue() {
+        // Verifies output ordering: KV peak line must appear before preemptions
+        // and queue backpressure lines (#1 fix).
+        // Uses a summary snapshot that has both signals active so all three
+        // cause lines appear, then checks position order.
+        let mut windows: Vec<_> = (0..15)
+            .map(|_| mk_evaluable_kv_window(30.0, false))
+            .collect();
+        for w in windows.iter_mut().take(6) {
+            *w = mk_evaluable_kv_window(91.0, true);
+            w.snapshot.vllm.num_requests_waiting = Some(5.0);
+        }
+        let ctx = mk_ctx();
+        let mut summary_win = windows.last().expect("windows").clone();
+        summary_win.snapshot.vllm.kv_cache_usage_perc = Some(91.0);
+        summary_win.snapshot.vllm.kv_cache_peak_perc = Some(91.0);
+        summary_win.snapshot.vllm.num_preemptions_per_sec = Some(0.05);
+        summary_win.snapshot.vllm.num_requests_waiting = Some(5.0);
+        let summary = ai(&ctx, &summary_win);
+        let text = format_diagnose_rules_for_windows(
+            &windows,
+            summary,
+            false,
+            "http://127.0.0.1:8000/metrics",
+        )
+        .join("\n");
+        let pos_kv = text.find("KV cache hit").expect("KV peak line missing");
+        let pos_preempt = text
+            .find("Active preemptions")
+            .expect("preemptions line missing");
+        let pos_queue = text.find("Queue backpressure").expect("queue line missing");
+        assert!(
+            pos_kv < pos_preempt,
+            "KV line must precede preemptions line"
+        );
+        assert!(pos_kv < pos_queue, "KV line must precede queue line");
     }
 
     #[test]
@@ -1708,9 +1794,32 @@ mod tests {
             *w = mk_evaluable_backlog_window(70.0, 15.0, 5.0, 40.0, 100, 16);
         }
         let text = r2_issue_lines(windows).join("\n");
-        assert!(text.contains("[!] KV Cache Pressure — Admission Backlog"));
+        assert!(text.contains("[!] KV Cache Pressure: Admission Backlog"));
         assert!(text.contains("Free KV tokens"));
         assert!(!text.contains("threshold: 88%"));
+    }
+
+    #[test]
+    fn backlog_short_action_matches_spec() {
+        let mut windows: Vec<_> = (0..15)
+            .map(|_| mk_evaluable_backlog_window(10.0, 1.0, 9.0, 10.0, 10_000, 16))
+            .collect();
+        for w in windows.iter_mut().take(4) {
+            *w = mk_evaluable_backlog_window(70.0, 15.0, 5.0, 40.0, 100, 16);
+        }
+        let ctx = mk_ctx();
+        let summary = ai(&ctx, windows.last().expect("windows"));
+        let report = build_report_for_windows(&windows, summary);
+        let r = report
+            .groups
+            .iter()
+            .find(|g| g.primary.rule_name == "kv_admission_backlog")
+            .expect("backlog kv recommendation")
+            .primary
+            .clone();
+        assert_eq!(r.short_action, "raise --gpu-memory-utilization");
+        let display = r.display_lines.join("\n");
+        assert!(display.contains("[!] KV Cache Pressure: Admission Backlog"));
     }
 
     #[test]
@@ -1732,7 +1841,7 @@ mod tests {
             .map(|_| mk_evaluable_kv_window(50.0, false))
             .collect();
         for w in windows.iter_mut().take(4) {
-            *w = mk_evaluable_kv_window(89.0, false);
+            *w = mk_evaluable_kv_window(89.0, true);
         }
         let text = r2_issue_lines(windows).join("\n");
         assert!(text.contains("[!] KV Cache Pressure"));
@@ -1780,7 +1889,7 @@ mod tests {
             "http://127.0.0.1:8000/metrics",
         );
         let text = lines.join("\n");
-        assert!(text.contains("Under-batching — Insufficient Concurrency"));
+        assert!(text.contains("Under-batching: Insufficient Concurrency"));
         assert!(text.contains("Seen in 60% of windows"));
         assert!(text.contains("Occupancy"));
         assert!(text.contains("  Cause:"));
@@ -1926,8 +2035,9 @@ mod tests {
         let mut windows: Vec<_> = (0..15)
             .map(|_| mk_evaluable_concurrency_saturation_window(32.0, 15.0, 32))
             .collect();
-        // one preemption window forces r2 significant
-        windows[0] = mk_evaluable_kv_window(89.0, true);
+        for w in windows.iter_mut().take(4) {
+            *w = mk_evaluable_kv_window(89.0, true);
+        }
         let ctx = mk_ctx();
         let summary = ai(&ctx, windows.last().expect("windows"));
         let text = format_diagnose_rules_for_windows(

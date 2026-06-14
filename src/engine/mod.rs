@@ -1,6 +1,7 @@
 pub mod baseline;
 mod rules;
 
+use crate::collectors::window_is_evaluable;
 use crate::context::{AnalysisInput, RuntimeWindow};
 
 pub use baseline::{CeilingEstimate, CostEstimate, CostSource, PhysicsBaseline, WeightDtypeSource};
@@ -31,10 +32,15 @@ pub fn build_report_for_diagnose(windows: &[RuntimeWindow], input: AnalysisInput
 pub fn build_report(input: AnalysisInput<'_>) -> Report {
     let baseline = baseline::compute(&input);
     let snapshot = &input.window.snapshot;
+    let n_eval = usize::from(window_is_evaluable(snapshot));
+    let r2_fired = usize::from(matches!(
+        rules::rule2_kv_cache_pressure(snapshot),
+        rules::Rule2Outcome::Fired(_)
+    ));
 
     let mut recs: Vec<Recommendation> = [
         rules::r1_recommendation(snapshot, input.ctx.config.max_num_seqs),
-        rules::r2_recommendation(snapshot, input.ctx.config.max_model_len),
+        rules::r2_recommendation(snapshot, input.ctx.config.max_model_len, r2_fired, n_eval),
         rules::r3_recommendation(snapshot),
         rules::r4_recommendation(
             baseline.as_ref().and_then(|b| b.kv_headroom_gb),
@@ -110,6 +116,7 @@ mod build_report_tests {
             num_requests_waiting: Some(0.0),
             max_num_seqs: Some(256),
             kv_cache_usage_perc: Some(89.0),
+            num_preemptions_per_sec: Some(0.05),
             tpot_ms: Some(35.0),
             generation_tokens_per_sec: Some(30.0),
             window_duration_secs: Some(2.0),
@@ -175,6 +182,7 @@ mod build_report_tests {
             num_requests_waiting: Some(0.0),
             max_num_seqs: Some(256),
             kv_cache_usage_perc: Some(89.0),
+            num_preemptions_per_sec: Some(0.05),
             generation_tokens_per_sec: Some(50.0),
             request_success_per_sec: Some(10.0),
             window_duration_secs: Some(2.0),

@@ -1,4 +1,5 @@
 use crate::collectors::RawSnapshot;
+use crate::fmt::fmt_seconds_from_ms;
 
 use super::{model_len_suffix, Recommendation};
 
@@ -97,12 +98,12 @@ pub(super) fn format_concurrency_saturation_issue(
         d.ttft_ms.filter(|t| t.is_finite()),
     ) {
         (Some(p99), Some(avg)) => lines.push(format!(
-            "    • TTFT {:.1}s p99 ({:.1}s avg)",
-            p99 / 1000.0,
-            avg / 1000.0
+            "    • TTFT {} p99 ({} avg)",
+            fmt_seconds_from_ms(p99),
+            fmt_seconds_from_ms(avg)
         )),
-        (Some(p99), None) => lines.push(format!("    • TTFT {:.1}s p99", p99 / 1000.0)),
-        (None, Some(avg)) => lines.push(format!("    • TTFT {:.1}s", avg / 1000.0)),
+        (Some(p99), None) => lines.push(format!("    • TTFT {} p99", fmt_seconds_from_ms(p99))),
+        (None, Some(avg)) => lines.push(format!("    • TTFT {}", fmt_seconds_from_ms(avg))),
         (None, None) => {}
     }
     lines.push(String::new());
@@ -115,11 +116,11 @@ pub(super) fn format_concurrency_saturation_issue(
         }
         Some(pct) => {
             lines.push(format!(
-                "    • KV cache at {pct:.0}%. Raising --max-num-seqs will cause thrashing."
+                "    • KV at {pct:.0}%: scheduler at cap, pool full. No config change helps."
             ));
-            lines.push("    • Add a replica".to_string());
+            lines.push("    • Add a replica to scale out.".to_string());
             lines.push(format!(
-                "    • Or lower --max-model-len{} to free KV blocks",
+                "    • Lower --max-model-len{} to free KV blocks.",
                 model_len_suffix(max_model_len)
             ));
         }
@@ -163,11 +164,18 @@ pub fn r5_recommendation(
             (Some(_), Some(_)) => 0.9,
             _ => 0.6,
         },
-        action: format!(
-            "Raise --max-num-seqs above {} (scheduler at cap, {:.0}% of requests waiting)",
-            max_label,
-            d.queue_ratio * 100.0
-        ),
+        action: if d
+            .kv_cache_usage_perc
+            .is_some_and(|p| p >= KV_CACHE_SAFE_TO_SCALE_PCT)
+        {
+            "Add a replica to scale out.".to_string()
+        } else {
+            format!(
+                "Raise --max-num-seqs above {} (scheduler at cap, {:.0}% of requests waiting)",
+                max_label,
+                d.queue_ratio * 100.0
+            )
+        },
         short_action: r5_short_action(&d),
         expected_impact: "Queue drains, TTFT recovers.".to_string(),
         display_lines: format_concurrency_saturation_issue(&d, max_model_len),
@@ -333,9 +341,9 @@ mod tests {
     fn fix_scales_out_when_kv_at_or_above_safe_threshold() {
         let text =
             format_concurrency_saturation_issue(&fired_detail(None, Some(85.0)), None).join("\n");
-        assert!(text.contains("KV cache at 85%"));
-        assert!(text.contains("will cause thrashing"));
-        assert!(text.contains("Add a replica"));
+        assert!(text.contains("KV at 85%"));
+        assert!(text.contains("No config change helps"));
+        assert!(text.contains("Add a replica to scale out"));
     }
 
     #[test]
@@ -482,5 +490,6 @@ mod tests {
         )
         .expect("fired");
         assert_eq!(r.short_action, "add a replica to scale out");
+        assert_eq!(r.action, "Add a replica to scale out.");
     }
 }

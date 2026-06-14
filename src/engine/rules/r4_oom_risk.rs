@@ -61,7 +61,7 @@ pub fn r4_recommendation(
             "    • Increase --tensor-parallel-size to at least {needed} (currently {current})"
         ),
         (Some(current), Some(needed)) if current >= needed => format!(
-            "    • TP={current} should fit weights, but KV cache or activation memory is exhausted — reduce --max-model-len or lower --gpu-memory-utilization"
+            "    • TP={current} should fit weights, but KV cache or activation memory is exhausted. Reduce --max-model-len or lower --gpu-memory-utilization"
         ),
         (None, Some(needed)) => {
             format!("    • Set --tensor-parallel-size to at least {needed}")
@@ -81,7 +81,7 @@ pub fn r4_recommendation(
         impact: 5,
         confidence,
         action: format!(
-            "Model weights exceed GPU VRAM by {overflow:.0}GB — server will OOM without tensor parallelism"
+            "Model weights exceed GPU VRAM by {overflow:.0}GB. Server will OOM without tensor parallelism"
         ),
         short_action,
         expected_impact: "Model fits in memory; eliminates OOM risk".to_string(),

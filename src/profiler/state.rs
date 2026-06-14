@@ -21,6 +21,7 @@ pub struct IterationRecord {
 pub struct LoopState {
     history: VecDeque<IterationRecord>,
     rec_history: VecDeque<&'static str>,
+    midpoint_suggested: bool,
 }
 
 impl LoopState {
@@ -34,7 +35,21 @@ impl LoopState {
         Self {
             history,
             rec_history: VecDeque::with_capacity(OSCILLATION_WINDOW + 1),
+            midpoint_suggested: false,
         }
+    }
+
+    pub fn history(&self) -> &VecDeque<IterationRecord> {
+        &self.history
+    }
+
+    pub fn midpoint_suggested(&self) -> bool {
+        self.midpoint_suggested
+    }
+
+    pub fn set_midpoint_suggested(&mut self) {
+        self.midpoint_suggested = true;
+        self.rec_history.clear();
     }
 
     pub fn push(
@@ -249,5 +264,17 @@ mod tests {
         s.record_recommendation("a");
         s.record_recommendation("b");
         assert!(s.oscillating_pair().is_none());
+    }
+
+    #[test]
+    fn set_midpoint_clears_oscillation() {
+        let mut s = LoopState::new(minimal_diagnose(), empty_report());
+        s.record_recommendation("kv_cache_pressure");
+        s.record_recommendation("concurrency_saturation");
+        s.record_recommendation("kv_cache_pressure");
+        assert!(s.is_oscillating());
+        s.set_midpoint_suggested();
+        assert!(!s.is_oscillating());
+        assert!(s.midpoint_suggested());
     }
 }

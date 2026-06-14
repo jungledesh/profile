@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use crate::collectors::{GpuRawMetrics, VllmConfig, VllmRawMetrics};
 use crate::context::AnalysisInput;
 use crate::engine;
+use crate::fmt::fmt_seconds_from_ms;
 use crate::profiler::delta::{Delta, Direction};
 use crate::profiler::DiagnoseResult;
 
@@ -215,7 +216,7 @@ fn baseline_lines(
     num_gpu_blocks: Option<u32>,
 ) -> Vec<String> {
     let Some(b) = baseline else {
-        return vec!["HW LIMITS  unavailable — model not recognized".to_string()];
+        return vec!["HW LIMITS  unavailable (model not recognized)".to_string()];
     };
 
     // Line 1: efficiency + throughput ceilings
@@ -260,7 +261,7 @@ fn baseline_lines(
         format!("           {}", seg2.join(" | ")),
     ];
     if b.weight_dtype_source == engine::WeightDtypeSource::Fallback {
-        out.push("           weight dtype assumed bf16 — set DTYPE env var to confirm".to_string());
+        out.push("           weight dtype assumed bf16. Set DTYPE env var to confirm".to_string());
     }
     out
 }
@@ -637,14 +638,6 @@ fn config_kv_value(cfg: &VllmConfig) -> String {
     format!("dtype {kv_dtype} | {block} | {prefix} | {chunked}")
 }
 
-fn fmt_seconds_from_ms(ms: f64) -> String {
-    if ms >= 1000.0 {
-        format!("{:.1}s", ms / 1000.0)
-    } else {
-        format!("{:.0}ms", ms)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -697,12 +690,6 @@ mod tests {
                 "PROFILE v{v} [llama3] [NVIDIA H100 80GB HBM3] (5m from 2026-04-13 10:42:31 UTC)"
             )
         );
-    }
-
-    #[test]
-    fn fmt_seconds_from_ms_prefers_seconds_when_large() {
-        assert_eq!(fmt_seconds_from_ms(1200.0), "1.2s");
-        assert_eq!(fmt_seconds_from_ms(50.0), "50ms");
     }
 
     #[test]

@@ -83,7 +83,7 @@ pub(crate) fn prompt_for_updated_max_num_seqs(
     current: u32,
     stdin_rx: &std::sync::mpsc::Receiver<String>,
 ) -> anyhow::Result<u32> {
-    let prompt = format!("New --max-num-seqs value (current: {current}): ");
+    let prompt = format!("New --max-num-seqs [{current}]: ");
     prompt_u32_from_channel(stdin_rx, &mut io::stdout(), current, &prompt)
 }
 

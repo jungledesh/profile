@@ -6,6 +6,7 @@ pub mod cli;
 pub mod collectors;
 pub mod context;
 pub mod engine;
+pub mod fmt;
 pub mod output;
 pub mod profiler;
 

@@ -94,10 +94,10 @@ pub fn r3_recommendation(snapshot: &RawSnapshot) -> Option<Recommendation> {
 fn prefix_cause_bullet(enable_prefix_caching: Option<bool>) -> String {
     match enable_prefix_caching {
         Some(false) => {
-            "  - Prefix caching is disabled — enable with --enable-prefix-caching".to_string()
+            "  - Prefix caching disabled. Enable with --enable-prefix-caching".to_string()
         }
         Some(true) | None => {
-            "  - Low prefix hit rate — restructure prompts to share common prefixes".to_string()
+            "  - Low prefix hit rate. Restructure prompts to share common prefixes".to_string()
         }
     }
 }
