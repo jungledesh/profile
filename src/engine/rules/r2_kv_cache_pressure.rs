@@ -1,16 +1,38 @@
-use crate::collectors::{GpuRawMetrics, RawSnapshot};
+use crate::collectors::RawSnapshot;
 
 use super::{model_len_suffix, skew_secs, Recommendation, MAX_OBSERVATION_SKEW_SECS};
 
 /// 88% matches observed vLLM production eviction onset; 85% was too conservative.
 const KV_CACHE_PRESSURE_MIN_PERC: f64 = 88.0;
-pub(super) const KV_CACHE_CRITICAL_THRESHOLD_PCT: f64 = 95.0;
-const KV_PRESSURE_VRAM_CORROBORATE_MIN_PERC: f64 = 78.0;
-const KV_PRESSURE_CRITICAL_CONFIDENCE: f64 = 0.95;
-const KV_PRESSURE_THREAT_CONFIDENCE: f64 = 0.85;
-const KV_PRESSURE_WARNING_CONFIDENCE: f64 = 0.7;
+/// 0.02/s = ~1 eviction/minute; below this the scheduler is recovering normally,
+/// not under sustained KV pressure. Avoids firing on a single-event spike.
+const PREEMPTION_RATE_MIN_PER_SEC: f64 = 0.02;
+/// Minimum concurrent swapped sequences before treating as active pressure.
+/// Avoids firing on a single stale counter reading.
+const SWAPPED_REQUESTS_MIN: f64 = 2.0;
+/// Low floor avoids firing on transient scheduling jitter; keeps R2 from co-firing
+/// with R5 when 1–2 requests queue at the concurrency cap.
+const QUEUE_BACKPRESSURE_MIN_WAITING: f64 = 2.0;
+/// 30% of active requests waiting signals the scheduler is consistently holding
+/// requests for KV capacity, not just transient batching delay.
 const KV_ADMISSION_BACKLOG_QUEUE_RATIO_MIN: f64 = 0.30;
+/// Minimum KV headroom (GB) before recommending --gpu-memory-utilization; below this,
+/// weights and allocator overhead leave no safe room to expand the KV pool.
 const KV_HEADROOM_SAFE_MIN_GB: f64 = 2.0;
+const NVCC_PATH: &str = "/usr/local/cuda/bin/nvcc";
+const FP8_KV_CACHE_FIX: &str =
+    "    • Switch to fp8 KV cache (--kv-cache-dtype fp8) to halve KV memory footprint";
+
+static NVCC_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn fp8_kv_cache_fix_bullet() -> String {
+    let nvcc_present = *NVCC_AVAILABLE.get_or_init(|| std::path::Path::new(NVCC_PATH).exists());
+    if nvcc_present {
+        FP8_KV_CACHE_FIX.to_string()
+    } else {
+        format!("{FP8_KV_CACHE_FIX} (requires nvcc)")
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct KvAdmissionBacklogDetail {
@@ -25,20 +47,15 @@ pub struct KvAdmissionBacklogDetail {
 #[derive(Debug, Clone, PartialEq)]
 pub struct KvCachePressureDetail {
     pub kv_cache_usage_perc: f64,
-    pub vram_usage_perc_corroborated: Option<f64>,
+    pub kv_peak_pct: Option<f64>,
     pub preemptions_active: bool,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Rule2MissReport {
-    pub skew_exceeded: bool,
-    pub kv_cache_usage_perc: Option<f64>,
+    pub queue_backpressure: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Rule2Outcome {
     Fired(KvCachePressureDetail),
-    NotFired(Rule2MissReport),
+    NotFired,
 }
 
 pub fn rule2_kv_admission_backlog(snapshot: &RawSnapshot) -> Option<KvAdmissionBacklogDetail> {
@@ -93,114 +110,162 @@ pub fn rule2_kv_admission_backlog(snapshot: &RawSnapshot) -> Option<KvAdmissionB
     })
 }
 
-pub fn rule2_kv_cache_pressure(snapshot: &RawSnapshot) -> Rule2Outcome {
-    let skew = skew_secs(snapshot.gpu_observed_at, snapshot.vllm_observed_at);
-    let kv = snapshot.vllm.kv_cache_usage_perc.filter(|v| v.is_finite());
-
-    let miss = |skew_exceeded: bool, kv_cache_usage_perc: Option<f64>| Rule2MissReport {
-        skew_exceeded,
-        kv_cache_usage_perc,
-    };
-
-    if skew > MAX_OBSERVATION_SKEW_SECS {
-        return Rule2Outcome::NotFired(miss(true, kv));
-    }
-
-    let preemptions_active = snapshot
+/// Returns true when there is evidence of active KV eviction pressure.
+/// Two distinct signals, either sufficient:
+///
+/// 1. Rate (velocity): preemptions/s > 0.02 — scheduler is actively evicting right now.
+/// 2. Debt (static): num_requests_swapped ≥ 2 — sequences parked on CPU. This is a
+///    gauge, not a delta. A non-zero count means eviction has already occurred and
+///    sequences haven't been rescheduled yet. Risk: stuck alarm if swapped count is
+///    stale and GPU has stabilized. A delta guard (swapped growing vs prior window)
+///    would eliminate this — deferred until per-rule state is available at eval time.
+fn eviction_signal_active(snapshot: &RawSnapshot) -> bool {
+    snapshot
         .vllm
         .num_preemptions_per_sec
-        .is_some_and(|p| p > 0.0)
-        || snapshot.vllm.num_requests_swapped.is_some_and(|s| s > 0.0);
+        .is_some_and(|p| p.is_finite() && p > PREEMPTION_RATE_MIN_PER_SEC)
+        || snapshot
+            .vllm
+            .num_requests_swapped
+            .is_some_and(|s| s.is_finite() && s >= SWAPPED_REQUESTS_MIN)
+}
 
+fn queue_backpressure(snapshot: &RawSnapshot) -> bool {
+    snapshot
+        .vllm
+        .num_requests_waiting
+        .is_some_and(|w| w.is_finite() && w > QUEUE_BACKPRESSURE_MIN_WAITING)
+}
+
+pub fn rule2_kv_cache_pressure(snapshot: &RawSnapshot) -> Rule2Outcome {
+    let skew = skew_secs(snapshot.gpu_observed_at, snapshot.vllm_observed_at);
+
+    if skew > MAX_OBSERVATION_SKEW_SECS {
+        return Rule2Outcome::NotFired;
+    }
+
+    let kv = snapshot.vllm.kv_cache_usage_perc.filter(|v| v.is_finite());
     let kv_high = kv.is_some_and(|kv_p| kv_p >= KV_CACHE_PRESSURE_MIN_PERC);
+    if !kv_high {
+        return Rule2Outcome::NotFired;
+    }
 
-    if !kv_high && !preemptions_active {
-        return Rule2Outcome::NotFired(miss(false, kv));
+    let preemptions_active = eviction_signal_active(snapshot);
+    let queue_backpressure = queue_backpressure(snapshot);
+    if !preemptions_active && !queue_backpressure {
+        return Rule2Outcome::NotFired;
     }
 
     let kv_p = kv.unwrap_or(0.0);
-    let vram = vram_usage_perc(&snapshot.gpu);
-    let corroborated = vram.filter(|&p| p >= KV_PRESSURE_VRAM_CORROBORATE_MIN_PERC);
+    let peak = snapshot
+        .vllm
+        .kv_cache_peak_perc
+        .filter(|v| v.is_finite())
+        .map(|peak| peak.max(kv_p));
 
     Rule2Outcome::Fired(KvCachePressureDetail {
         kv_cache_usage_perc: kv_p,
-        vram_usage_perc_corroborated: corroborated,
+        kv_peak_pct: peak,
         preemptions_active,
+        queue_backpressure,
     })
 }
 
 pub fn r2_recommendation(
     snapshot: &RawSnapshot,
     max_model_len: Option<u32>,
+    windows_fired: usize,
+    total_evaluable: usize,
 ) -> Option<Recommendation> {
     let Rule2Outcome::Fired(d) = rule2_kv_cache_pressure(snapshot) else {
         return None;
     };
-    let confidence = if d.preemptions_active {
-        KV_PRESSURE_CRITICAL_CONFIDENCE
+    let confidence = if super::rule_is_significant(windows_fired, total_evaluable) {
+        kv_pressure_confidence(windows_fired, total_evaluable)
     } else {
-        KV_PRESSURE_WARNING_CONFIDENCE
+        0.5
+    };
+    let (action, short_action) = if d.preemptions_active {
+        (
+            "Lower --max-num-seqs to stop evictions".to_string(),
+            r2_kv_pressure_short_action().to_string(),
+        )
+    } else {
+        (
+            "Raise --gpu-memory-utilization if VRAM headroom exists".to_string(),
+            r2_backlog_short_action().to_string(),
+        )
     };
     Some(Recommendation {
         rule_name: "kv_cache_pressure",
         impact: 5,
         confidence,
-        action: "Reduce max_num_seqs or add tensor parallelism".to_string(),
-        short_action: r2_kv_pressure_short_action(),
+        action,
+        short_action,
         expected_impact: "Reduced KV evictions and lower latency variance".to_string(),
-        display_lines: format_kv_cache_pressure_fired(&d, snapshot, confidence, max_model_len),
+        display_lines: format_kv_cache_pressure_fired(
+            &d,
+            snapshot,
+            windows_fired,
+            total_evaluable,
+            max_model_len,
+        ),
     })
 }
 
-pub(super) fn r2_kv_pressure_short_action() -> String {
-    "lower --max-num-seqs".to_string()
+pub(super) fn r2_kv_pressure_short_action() -> &'static str {
+    "lower --max-num-seqs"
 }
 
-pub(super) fn r2_backlog_short_action() -> String {
-    "raise --gpu-memory-utilization".to_string()
+pub(super) fn r2_backlog_short_action() -> &'static str {
+    "raise --gpu-memory-utilization"
 }
 
-pub(super) fn kv_pressure_confidence(d: &KvCachePressureDetail) -> f64 {
-    if d.preemptions_active {
-        KV_PRESSURE_CRITICAL_CONFIDENCE
-    } else if d.kv_cache_usage_perc >= KV_CACHE_CRITICAL_THRESHOLD_PCT {
-        KV_PRESSURE_THREAT_CONFIDENCE
+pub(super) fn kv_pressure_confidence(windows_fired: usize, total_evaluable: usize) -> f64 {
+    if total_evaluable == 0 {
+        return 0.0;
+    }
+    (windows_fired as f64 / total_evaluable as f64).clamp(0.0, 1.0)
+}
+
+pub(super) fn kv_pressure_confidence_label(confidence: f64) -> &'static str {
+    if confidence > 0.75 {
+        "Confidence: High"
+    } else if confidence >= 0.5 {
+        "Confidence: Medium-High"
     } else {
-        KV_PRESSURE_WARNING_CONFIDENCE
+        "Confidence: Medium"
     }
 }
 
 pub(super) fn format_kv_cache_pressure_fired(
     d: &KvCachePressureDetail,
     snapshot: &RawSnapshot,
-    confidence: f64,
+    windows_fired: usize,
+    total_evaluable: usize,
     max_model_len: Option<u32>,
 ) -> Vec<String> {
-    let kv_p = snapshot.vllm.kv_cache_usage_perc.filter(|v| v.is_finite());
-    let conf_label = if (confidence - KV_PRESSURE_CRITICAL_CONFIDENCE).abs() < 1e-9 {
-        "Confidence: High"
-    } else {
-        "Confidence: Medium-High"
-    };
+    let peak = snapshot
+        .vllm
+        .kv_cache_peak_perc
+        .filter(|v| v.is_finite())
+        .unwrap_or(d.kv_cache_usage_perc);
     let mut out = vec!["[!] KV Cache Pressure".to_string(), "  Cause:".to_string()];
+    out.push(format!(
+        "  - KV cache hit {peak:.1}% peak (threshold: {:.0}%)",
+        KV_CACHE_PRESSURE_MIN_PERC
+    ));
     if d.preemptions_active {
         out.push(
             "  - Active preemptions: scheduler evicting sequences to free KV blocks".to_string(),
         );
-        if let Some(k) = kv_p {
-            if let Some(peak) = snapshot.vllm.kv_cache_peak_perc.filter(|v| v.is_finite()) {
-                out.push(format!(
-                    "  - KV cache {k:.1}% avg ({peak:.1}% peak), peak triggered evictions"
-                ));
-            } else {
-                out.push(format!("  - KV cache {k:.1}%, evictions active"));
-            }
+    }
+    if d.queue_backpressure {
+        if let Some(wait) = snapshot.vllm.num_requests_waiting.filter(|v| v.is_finite()) {
+            out.push(format!(
+                "  - Queue backpressure: {wait:.0} requests waiting on KV admission"
+            ));
         }
-    } else {
-        out.push(format!(
-            "  - KV cache {:.1}% (threshold: {:.0}%), approaching capacity",
-            d.kv_cache_usage_perc, KV_CACHE_PRESSURE_MIN_PERC
-        ));
     }
     out.push(String::new());
     out.push("  Fix:".to_string());
@@ -212,29 +277,28 @@ pub(super) fn format_kv_cache_pressure_fired(
         out.extend([
             "    • Lower --max-num-seqs now to stop evictions, pick a value below current running count"
                 .to_string(),
-            "    • Switch to fp8 KV cache (--kv-cache-dtype fp8) to halve KV memory footprint"
-                .to_string(),
+            fp8_kv_cache_fix_bullet(),
             model_len_bullet,
         ]);
     } else {
         out.extend([
             "    • Raise --gpu-memory-utilization if VRAM headroom exists (check header for available VRAM)"
                 .to_string(),
-            "    • Switch to fp8 KV cache (--kv-cache-dtype fp8) to halve KV memory footprint"
-                .to_string(),
+            fp8_kv_cache_fix_bullet(),
             model_len_bullet,
         ]);
     }
     let expected = if d.preemptions_active {
         "  Expected: TTFT and TPOT recover once evictions stop."
     } else {
-        "  Expected: Lower TTFT, stable TPOT once evictions stop."
+        "  Expected: Wait queue drains, TTFT recovers once KV pool has capacity."
     };
-    out.extend([
-        String::new(),
-        expected.to_string(),
-        format!("  {conf_label}"),
-    ]);
+    out.push(String::new());
+    out.push(expected.to_string());
+    if super::rule_is_significant(windows_fired, total_evaluable) {
+        let confidence = kv_pressure_confidence(windows_fired, total_evaluable);
+        out.push(format!("  {}", kv_pressure_confidence_label(confidence)));
+    }
     out
 }
 
@@ -243,6 +307,8 @@ pub(super) fn format_kv_admission_backlog_issue(
     seen_pct: u32,
     max_model_len: Option<u32>,
     kv_headroom_gb: Option<f64>,
+    windows_fired: usize,
+    total_evaluable: usize,
 ) -> Vec<String> {
     let model_len_bullet = format!(
         "    • Lower --max-model-len{} if your workload allows shorter context",
@@ -258,8 +324,8 @@ pub(super) fn format_kv_admission_backlog_issue(
         }
         None => "    • Raise --gpu-memory-utilization if VRAM headroom exists".to_string(),
     };
-    vec![
-        "[!] KV Cache Pressure — Admission Backlog".to_string(),
+    let mut out = vec![
+        "[!] KV Cache Pressure: Admission Backlog".to_string(),
         format!("  Seen in {seen_pct}% of windows"),
         "  Cause:".to_string(),
         format!(
@@ -274,17 +340,25 @@ pub(super) fn format_kv_admission_backlog_issue(
         String::new(),
         "  Fix:".to_string(),
         gpu_mem_bullet,
-        "    • Switch to fp8 KV cache (--kv-cache-dtype fp8) to halve KV memory footprint".to_string(),
+        fp8_kv_cache_fix_bullet(),
         model_len_bullet,
         String::new(),
         "  Expected: Wait queue drains, TTFT recovers.".to_string(),
-        "  Confidence: Medium-High".to_string(),
-    ]
+    ];
+    if super::rule_is_significant(windows_fired, total_evaluable) {
+        let confidence = kv_pressure_confidence(windows_fired, total_evaluable);
+        out.push(format!("  {}", kv_pressure_confidence_label(confidence)));
+    }
+    out
 }
 
 pub(super) fn aggregate_backlog_detail(
     details: &[KvAdmissionBacklogDetail],
 ) -> KvAdmissionBacklogDetail {
+    debug_assert!(
+        !details.is_empty(),
+        "aggregate_backlog_detail called with no fired windows — caller should gate on r2_backlog_significant"
+    );
     let n = details.len() as f64;
     let kv = details.iter().map(|d| d.kv_cache_usage_perc).sum::<f64>() / n;
     let ratio = details.iter().map(|d| d.admission_ratio).sum::<f64>() / n;
@@ -306,47 +380,36 @@ pub(super) fn format_kv_cache_window_issue(
     d: &KvCachePressureDetail,
     seen_pct: u32,
     snapshot: &RawSnapshot,
-    confidence: f64,
+    windows_fired: usize,
+    total_evaluable: usize,
     max_model_len: Option<u32>,
 ) -> Vec<String> {
-    let mut lines = format_kv_cache_pressure_fired(d, snapshot, confidence, max_model_len);
+    let mut lines =
+        format_kv_cache_pressure_fired(d, snapshot, windows_fired, total_evaluable, max_model_len);
     lines.insert(1, format!("  Seen in {seen_pct}% of windows"));
     lines
 }
 
-pub(super) fn aggregate_r2_detail(
-    details: &[KvCachePressureDetail],
-    summary: &RawSnapshot,
-) -> KvCachePressureDetail {
-    if details.is_empty() {
-        let preemptions_active = summary
-            .vllm
-            .num_preemptions_per_sec
-            .is_some_and(|p| p > 0.0)
-            || summary.vllm.num_requests_swapped.is_some_and(|s| s > 0.0);
-        return KvCachePressureDetail {
-            kv_cache_usage_perc: summary.vllm.kv_cache_usage_perc.unwrap_or(0.0),
-            vram_usage_perc_corroborated: None,
-            preemptions_active,
-        };
-    }
+pub(super) fn aggregate_r2_detail(details: &[KvCachePressureDetail]) -> KvCachePressureDetail {
+    debug_assert!(
+        !details.is_empty(),
+        "aggregate_r2_detail called with no fired windows — caller should gate on r2_significant"
+    );
     let kv = details.iter().map(|d| d.kv_cache_usage_perc).sum::<f64>() / details.len() as f64;
-    let corroborated = details.iter().find_map(|d| d.vram_usage_perc_corroborated);
-    let preemptions_active = details.iter().any(|d| d.preemptions_active);
+    let peak = details
+        .iter()
+        .filter_map(|d| d.kv_peak_pct)
+        .chain(details.iter().map(|d| d.kv_cache_usage_perc))
+        .fold(f64::NEG_INFINITY, f64::max);
+    debug_assert!(
+        peak.is_finite(),
+        "kv_cache_usage_perc must be finite when R2 fired"
+    );
     KvCachePressureDetail {
         kv_cache_usage_perc: kv,
-        vram_usage_perc_corroborated: corroborated,
-        preemptions_active,
-    }
-}
-
-fn vram_usage_perc(gpu: &GpuRawMetrics) -> Option<f64> {
-    match (gpu.vram_used_mb, gpu.vram_total_mb) {
-        (Some(used), Some(total)) if total > 0 => {
-            let p = (used as f64 / total as f64) * 100.0;
-            p.is_finite().then_some(p)
-        }
-        _ => None,
+        kv_peak_pct: Some(peak),
+        preemptions_active: details.iter().any(|d| d.preemptions_active),
+        queue_backpressure: details.iter().any(|d| d.queue_backpressure),
     }
 }
 
@@ -482,47 +545,178 @@ mod tests {
     fn detail(kv: f64, preemptions: bool) -> KvCachePressureDetail {
         KvCachePressureDetail {
             kv_cache_usage_perc: kv,
-            vram_usage_perc_corroborated: None,
+            kv_peak_pct: Some(kv),
             preemptions_active: preemptions,
+            queue_backpressure: false,
         }
     }
 
     #[test]
-    fn kv_pressure_confidence_critical_when_preemptions_active() {
-        assert!((kv_pressure_confidence(&detail(50.0, true)) - 0.95).abs() < 1e-9);
+    fn kv_pressure_confidence_is_duration_density() {
+        assert!((kv_pressure_confidence(4, 15) - (4.0 / 15.0)).abs() < 1e-9);
+        assert!((kv_pressure_confidence(0, 15) - 0.0).abs() < 1e-9);
     }
 
     #[test]
-    fn kv_pressure_confidence_threat_when_kv_at_95_no_preemptions() {
-        assert!((kv_pressure_confidence(&detail(95.0, false)) - 0.85).abs() < 1e-9);
+    fn kv_pressure_confidence_label_maps_density() {
+        assert_eq!(kv_pressure_confidence_label(0.4), "Confidence: Medium");
+        assert_eq!(kv_pressure_confidence_label(0.5), "Confidence: Medium-High");
+        assert_eq!(kv_pressure_confidence_label(0.76), "Confidence: High");
     }
 
     #[test]
-    fn kv_pressure_confidence_warning_when_kv_below_95_no_preemptions() {
-        assert!((kv_pressure_confidence(&detail(90.0, false)) - 0.7).abs() < 1e-9);
+    fn kv_pressure_omits_confidence_until_significant() {
+        let v = VllmRawMetrics {
+            kv_cache_usage_perc: Some(90.0),
+            ..Default::default()
+        };
+        let single =
+            format_kv_cache_pressure_fired(&detail(90.0, true), &snap(v.clone()), 1, 1, None)
+                .join("\n");
+        assert!(!single.contains("Confidence:"));
+        let stable =
+            format_kv_cache_pressure_fired(&detail(90.0, true), &snap(v), 3, 4, None).join("\n");
+        assert!(stable.contains("Confidence: Medium-High"));
+    }
+
+    #[test]
+    fn swapped_requires_at_least_two() {
+        let base = VllmRawMetrics {
+            kv_cache_usage_perc: Some(90.0),
+            num_preemptions_per_sec: Some(0.0),
+            ..Default::default()
+        };
+        let mut one = base.clone();
+        one.num_requests_swapped = Some(1.0);
+        assert!(matches!(
+            rule2_kv_cache_pressure(&snap(one)),
+            Rule2Outcome::NotFired
+        ));
+        let mut two = base;
+        two.num_requests_swapped = Some(2.0);
+        assert!(matches!(
+            rule2_kv_cache_pressure(&snap(two)),
+            Rule2Outcome::Fired(_)
+        ));
+    }
+
+    #[test]
+    fn preemption_rate_requires_above_0_02() {
+        let mut v = VllmRawMetrics {
+            kv_cache_usage_perc: Some(90.0),
+            num_preemptions_per_sec: Some(0.01),
+            ..Default::default()
+        };
+        assert!(matches!(
+            rule2_kv_cache_pressure(&snap(v.clone())),
+            Rule2Outcome::NotFired
+        ));
+        v.num_preemptions_per_sec = Some(0.03);
+        assert!(matches!(
+            rule2_kv_cache_pressure(&snap(v)),
+            Rule2Outcome::Fired(_)
+        ));
+    }
+
+    #[test]
+    fn queue_backpressure_requires_more_than_two_waiting() {
+        let v_one_waiting = VllmRawMetrics {
+            kv_cache_usage_perc: Some(90.0),
+            num_requests_running: Some(10.0),
+            num_requests_waiting: Some(1.0),
+            ..Default::default()
+        };
+        assert!(matches!(
+            rule2_kv_cache_pressure(&snap(v_one_waiting)),
+            Rule2Outcome::NotFired
+        ));
+        let v_two_waiting = VllmRawMetrics {
+            kv_cache_usage_perc: Some(90.0),
+            num_requests_running: Some(10.0),
+            num_requests_waiting: Some(2.0),
+            ..Default::default()
+        };
+        assert!(matches!(
+            rule2_kv_cache_pressure(&snap(v_two_waiting)),
+            Rule2Outcome::NotFired
+        ));
+        let v_three_waiting = VllmRawMetrics {
+            kv_cache_usage_perc: Some(90.0),
+            num_requests_running: Some(10.0),
+            num_requests_waiting: Some(3.0),
+            ..Default::default()
+        };
+        match rule2_kv_cache_pressure(&snap(v_three_waiting)) {
+            Rule2Outcome::Fired(d) => assert!(d.queue_backpressure),
+            Rule2Outcome::NotFired => panic!("expected fired with queue backpressure"),
+        }
+    }
+
+    #[test]
+    fn high_kv_without_stress_does_not_fire() {
+        let v = VllmRawMetrics {
+            kv_cache_usage_perc: Some(95.0),
+            ..Default::default()
+        };
+        assert!(matches!(
+            rule2_kv_cache_pressure(&snap(v)),
+            Rule2Outcome::NotFired
+        ));
+    }
+
+    #[test]
+    fn queue_only_fire_uses_backlog_short_action() {
+        let v = VllmRawMetrics {
+            kv_cache_usage_perc: Some(90.0),
+            num_requests_running: Some(10.0),
+            num_requests_waiting: Some(5.0),
+            num_preemptions_per_sec: Some(0.0),
+            generation_tokens_per_sec: Some(100.0),
+            ..Default::default()
+        };
+        let r = r2_recommendation(&snap(v.clone()), None, 1, 1).expect("fired");
+        assert!(!r.display_lines.join("\n").contains("evictions stop"));
+        assert_eq!(r.short_action, "raise --gpu-memory-utilization");
+        assert!(r.action.contains("gpu-memory-utilization"));
+        assert!(matches!(
+            rule2_kv_cache_pressure(&snap(v)),
+            Rule2Outcome::Fired(d) if !d.preemptions_active && d.queue_backpressure
+        ));
+    }
+
+    #[test]
+    fn kv_pressure_short_action_matches_spec() {
+        let v = VllmRawMetrics {
+            kv_cache_usage_perc: Some(90.0),
+            num_preemptions_per_sec: Some(0.05),
+            generation_tokens_per_sec: Some(100.0),
+            ..Default::default()
+        };
+        let r = r2_recommendation(&snap(v), None, 1, 4).expect("fired");
+        assert_eq!(r.short_action, "lower --max-num-seqs");
+        assert_eq!(r.action, "Lower --max-num-seqs to stop evictions");
+        assert!((r.confidence - 0.5).abs() < 1e-9);
     }
 
     #[test]
     fn model_len_shown_when_some() {
-        let text = format_kv_cache_pressure_fired(
-            &detail(50.0, true),
-            &snap(VllmRawMetrics::default()),
-            KV_PRESSURE_CRITICAL_CONFIDENCE,
-            Some(4096),
-        )
-        .join("\n");
+        let v = VllmRawMetrics {
+            kv_cache_usage_perc: Some(50.0),
+            ..Default::default()
+        };
+        let text = format_kv_cache_pressure_fired(&detail(50.0, true), &snap(v), 3, 4, Some(4096))
+            .join("\n");
         assert!(text.contains("--max-model-len (currently 4096)"));
     }
 
     #[test]
     fn model_len_generic_when_none() {
-        let text = format_kv_cache_pressure_fired(
-            &detail(50.0, true),
-            &snap(VllmRawMetrics::default()),
-            KV_PRESSURE_CRITICAL_CONFIDENCE,
-            None,
-        )
-        .join("\n");
+        let v = VllmRawMetrics {
+            kv_cache_usage_perc: Some(50.0),
+            ..Default::default()
+        };
+        let text =
+            format_kv_cache_pressure_fired(&detail(50.0, true), &snap(v), 3, 4, None).join("\n");
         assert!(text.contains("--max-model-len if"));
         assert!(!text.contains("currently"));
     }
@@ -541,38 +735,63 @@ mod tests {
     #[test]
     fn backlog_shows_headroom_when_safe() {
         let text =
-            format_kv_admission_backlog_issue(&sample_backlog_detail(), 27, None, Some(30.0))
+            format_kv_admission_backlog_issue(&sample_backlog_detail(), 27, None, Some(30.0), 3, 4)
                 .join("\n");
         assert!(text.contains("30GB VRAM available"));
     }
 
     #[test]
     fn backlog_warns_when_vram_full() {
-        let text = format_kv_admission_backlog_issue(&sample_backlog_detail(), 27, None, Some(1.0))
-            .join("\n");
+        let text =
+            format_kv_admission_backlog_issue(&sample_backlog_detail(), 27, None, Some(1.0), 3, 4)
+                .join("\n");
         assert!(text.contains("GPU at VRAM capacity"));
     }
 
     #[test]
     fn backlog_generic_when_headroom_unknown() {
         let text =
-            format_kv_admission_backlog_issue(&sample_backlog_detail(), 27, None, None).join("\n");
+            format_kv_admission_backlog_issue(&sample_backlog_detail(), 27, None, None, 3, 4)
+                .join("\n");
         assert!(text.contains("if VRAM headroom exists"));
     }
 
     #[test]
-    fn kv_pressure_short_action_matches_spec() {
-        let v = VllmRawMetrics {
-            kv_cache_usage_perc: Some(90.0),
-            generation_tokens_per_sec: Some(100.0),
-            ..Default::default()
-        };
-        let r = r2_recommendation(&snap(v), None).expect("fired");
-        assert_eq!(r.short_action, "lower --max-num-seqs");
+    fn backlog_omits_confidence_until_significant() {
+        let d = sample_backlog_detail();
+        let single = format_kv_admission_backlog_issue(&d, 27, None, Some(30.0), 1, 1).join("\n");
+        assert!(!single.contains("Confidence:"));
+        let stable = format_kv_admission_backlog_issue(&d, 27, None, Some(30.0), 3, 4).join("\n");
+        assert!(stable.contains("Confidence: Medium-High"));
     }
 
     #[test]
-    fn backlog_short_action_matches_spec() {
-        assert_eq!(r2_backlog_short_action(), "raise --gpu-memory-utilization");
+    fn queue_backpressure_only_expected_does_not_mention_evictions() {
+        let d = KvCachePressureDetail {
+            kv_cache_usage_perc: 90.0,
+            kv_peak_pct: Some(90.0),
+            preemptions_active: false,
+            queue_backpressure: true,
+        };
+        let v = VllmRawMetrics {
+            kv_cache_usage_perc: Some(90.0),
+            num_requests_waiting: Some(5.0),
+            ..Default::default()
+        };
+        let text = format_kv_cache_pressure_fired(&d, &snap(v), 1, 1, None).join("\n");
+        assert!(text.contains("Wait queue drains"));
+        assert!(!text.contains("evictions stop"));
+    }
+
+    #[test]
+    fn fp8_kv_cache_bullet_reflects_nvcc_availability() {
+        let bullet = fp8_kv_cache_fix_bullet();
+        assert!(bullet.contains("Switch to fp8 KV cache (--kv-cache-dtype fp8)"));
+        if std::path::Path::new(NVCC_PATH).exists() {
+            assert!(!bullet.contains("requires nvcc"));
+        } else {
+            assert!(bullet.contains("(requires nvcc)"));
+            assert!(!bullet.contains("not available on this host"));
+        }
     }
 }

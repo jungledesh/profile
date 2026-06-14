@@ -145,7 +145,7 @@ pub fn r1_verbose_miss_line(snapshot: &RawSnapshot, config_max_num_seqs: Option<
 pub(super) fn r1_short_action(d: &UnderBatchingDetail) -> String {
     let max_n = d.max_num_seqs.unwrap_or(0);
     let idle_slots = f64::from(max_n) - d.running;
-    format!("increase client concurrency — {idle_slots:.0} slots idle")
+    format!("increase client concurrency ({idle_slots:.0} slots idle)")
 }
 
 pub(super) fn format_under_batching_fired(d: &UnderBatchingDetail, confidence: f64) -> Vec<String> {
@@ -164,7 +164,7 @@ pub(super) fn format_under_batching_fired(d: &UnderBatchingDetail, confidence: f
     let confidence_str = if confidence >= 0.8 { "High" } else { "Medium" };
 
     vec![
-        "[!] Under-batching — Insufficient Concurrency".to_string(),
+        "[!] Under-batching: Insufficient Concurrency".to_string(),
         String::new(),
         format!(
             "  Occupancy  {:.1}%  (threshold: < {threshold:.0}%)",

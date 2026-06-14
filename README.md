@@ -64,7 +64,7 @@ profile diagnose [flags]
 | Flag                     | Default                         | Description                                     |
 | ------------------------ | ------------------------------- | ----------------------------------------------- |
 | `-u, --url`              | `http://localhost:8000/metrics` | vLLM metrics endpoint                           |
-| `--duration`             | `30s`                           | Sampling window (`30s`, `2m`, `5m`)             |
+| `--duration`             | `30s`                           | Sampling window (`30s`, `1m`, `2m`, `3m`)             |
 | `-m, --max-num-seqs`     | prompted if absent              | Pass directly to skip prompt; auto-read from `/metrics` when available |
 | `--tensor-parallel-size` | env / unset                     | TP degree (overrides `TENSOR_PARALLEL_SIZE`)    |
 | `--cost-per-hour`        | catalog estimate                | GPU cost in USD/hr (overrides catalog estimate) |
@@ -97,7 +97,7 @@ Enter value: 32
 |                                                                                                  |
 |ISSUES:                                                                                           |
 |                                                                                                  |
-|[!] Under-batching — Insufficient Concurrency                                                     |
+|[!] Under-batching: Insufficient Concurrency                                                     |
 |  Seen in 60% of windows                                                                          |
 |                                                                                                  |
 |  Occupancy  3.1%  (threshold: < 25%)                                                             |

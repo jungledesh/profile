@@ -43,16 +43,63 @@ pub fn run(
         };
 
         if state.is_oscillating() {
-            if let Some((a, b)) = state.oscillating_pair() {
-                println!(
-                    "\nCycling between [{a}] and [{b}]. No further improvement found. Stopping."
-                );
-            } else {
-                println!(
-                    "\nCycling between recommendations. No further improvement found. Stopping."
-                );
+            match state.oscillating_pair() {
+                Some((a, b))
+                    if (a == "kv_cache_pressure" && b == "concurrency_saturation")
+                        || (a == "concurrency_saturation" && b == "kv_cache_pressure") =>
+                {
+                    if state.midpoint_suggested() {
+                        println!(
+                            "\nNo --max-num-seqs value resolves both KV pressure and queue saturation."
+                        );
+                        println!("Add a replica to scale out.");
+                        break;
+                    }
+
+                    let lo = state
+                        .history()
+                        .iter()
+                        .rev()
+                        .find(|r| r.recommendation_shown == Some("kv_cache_pressure"))
+                        .and_then(|r| r.result.static_ctx.config.max_num_seqs);
+                    let hi = state
+                        .history()
+                        .iter()
+                        .rev()
+                        .find(|r| r.recommendation_shown == Some("concurrency_saturation"))
+                        .and_then(|r| r.result.static_ctx.config.max_num_seqs);
+
+                    match (lo, hi) {
+                        (Some(lo), Some(hi)) if hi > lo + 2 => {
+                            let mid = (lo + hi) / 2;
+                            println!(
+                                "\n--max-num-seqs={hi} filled KV cache. --max-num-seqs={lo} saturated the queue."
+                            );
+                            println!("Try --max-num-seqs={mid}.");
+                            state.set_midpoint_suggested();
+                        }
+                        _ => {
+                            println!(
+                                "\nNo --max-num-seqs value resolves both KV pressure and queue saturation."
+                            );
+                            println!("Add a replica to scale out.");
+                            break;
+                        }
+                    }
+                }
+                Some((a, b)) => {
+                    println!(
+                        "\nCycling between [{a}] and [{b}]. No further improvement found. Stopping."
+                    );
+                    break;
+                }
+                None => {
+                    println!(
+                        "\nCycling between recommendations. No further improvement found. Stopping."
+                    );
+                    break;
+                }
             }
-            break;
         }
 
         if state.iteration_count() >= super::state::MAX_LOOP_ITERATIONS {
@@ -67,7 +114,7 @@ pub fn run(
 
         let _outcome = poll::wait_for_restart_or_skip(url, &stdin_rx);
 
-        if rule_name == "concurrency_saturation" {
+        {
             println!();
             let current = current_max_num_seqs.unwrap_or(256);
             current_max_num_seqs = Some(crate::cli::prompt_for_updated_max_num_seqs(
@@ -344,7 +391,7 @@ fn print_delta(d: &delta::Delta) {
             let waste_a = (cpm_a * tps_a * 3600.0 / 1_000_000.0) * (1.0 - eff_a / 100.0).max(0.0);
             if waste_b.is_finite() && waste_a.is_finite() {
                 let arrow = recoverable_waste_arrow(waste_b, waste_a);
-                println!("  Recoverable   ${waste_b:.2} → ${waste_a:.2}/hr {arrow}");
+                println!("  Waste         ${waste_b:.2} → ${waste_a:.2}/hr {arrow}");
             }
         }
     }

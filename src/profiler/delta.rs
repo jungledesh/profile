@@ -247,6 +247,12 @@ fn rule_direction_reason(
         (Some("kv_cache_pressure"), Some("kv_cache_pressure"), Direction::NoChange) => {
             Some("KV pressure persists")
         }
+        (Some("kv_admission_backlog"), None, Direction::Better) => {
+            Some("KV admission backlog cleared")
+        }
+        (Some("kv_admission_backlog"), Some("kv_admission_backlog"), Direction::NoChange) => {
+            Some("KV admission backlog persists")
+        }
         (Some("under_batching"), None, Direction::Better) => Some("batch utilization improved"),
         (Some("under_batching"), Some("under_batching"), Direction::NoChange) => {
             Some("batch still under-utilized")
