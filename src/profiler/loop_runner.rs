@@ -114,7 +114,7 @@ pub fn run(
 
         let _outcome = poll::wait_for_restart_or_skip(url, &stdin_rx);
 
-        if needs_max_num_seqs_prompt_for_groups(&state.last().report.groups) {
+        {
             println!();
             let current = current_max_num_seqs.unwrap_or(256);
             current_max_num_seqs = Some(crate::cli::prompt_for_updated_max_num_seqs(
@@ -204,17 +204,6 @@ pub fn run(
 
 fn at_hardware_ceiling(headroom_pct: Option<f64>) -> bool {
     headroom_pct.is_some_and(|h| h < CEILING_HEADROOM_THRESHOLD_PCT)
-}
-
-// COUPLING: matches "--max-num-seqs" in rule action strings; update if flag name changes.
-fn needs_max_num_seqs_prompt(action: &str) -> bool {
-    action.contains("--max-num-seqs")
-}
-
-fn needs_max_num_seqs_prompt_for_groups(groups: &[engine::IssueGroup]) -> bool {
-    groups
-        .iter()
-        .any(|g| needs_max_num_seqs_prompt(&g.primary.short_action))
 }
 
 fn healthy_exit_message(
@@ -500,7 +489,6 @@ fn latency_arrow(delta_ms: f64) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use engine::IssueGroup;
 
     #[test]
     fn at_hardware_ceiling_below_threshold() {
@@ -792,35 +780,5 @@ mod tests {
         };
         assert!(recoverable_waste_available(&d));
         assert!(economics_section_active(&d));
-    }
-
-    #[test]
-    fn max_num_seqs_prompt_ignored_when_only_in_secondary() {
-        let groups = vec![IssueGroup {
-            primary: test_rec("raise --gpu-memory-utilization"),
-            secondary: vec![test_rec("lower --max-num-seqs")],
-        }];
-        assert!(!needs_max_num_seqs_prompt_for_groups(&groups));
-    }
-
-    #[test]
-    fn any_max_num_seqs_prompt_skipped_when_absent_from_all() {
-        let groups = vec![IssueGroup {
-            primary: test_rec("Switch to fp8 KV cache (--kv-cache-dtype fp8)"),
-            secondary: vec![test_rec("raise --gpu-memory-utilization")],
-        }];
-        assert!(!needs_max_num_seqs_prompt_for_groups(&groups));
-    }
-
-    fn test_rec(short_action: &str) -> engine::Recommendation {
-        engine::Recommendation {
-            rule_name: "test",
-            impact: 1,
-            confidence: 0.5,
-            action: String::new(),
-            short_action: short_action.to_string(),
-            expected_impact: String::new(),
-            display_lines: Vec::new(),
-        }
     }
 }
