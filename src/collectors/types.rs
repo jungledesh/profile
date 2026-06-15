@@ -72,6 +72,10 @@ pub struct VllmRawMetrics {
     pub ttft_p99_buckets: Vec<HistogramCount>,
     /// Raw histogram delta buckets for TPOT (first→last scrape in window). Empty if no traffic, reset, or histogram unavailable.
     pub tpot_p99_buckets: Vec<HistogramCount>,
+    /// p95 TTFT from histogram bucket delta. None if no traffic or counter reset.
+    pub ttft_p95_ms: Option<f64>,
+    /// p95 TPOT from histogram bucket delta. None if no traffic or counter reset.
+    pub tpot_p95_ms: Option<f64>,
     pub prefill_latency_ms: Option<f64>,
     pub queue_delay_ms: Option<f64>,
     /// `request_prompt_tokens` histogram: mean tokens (Δ window or last-scrape fallback).
@@ -119,6 +123,9 @@ pub struct VllmRawMetrics {
 
     /// Fields extracted from `vllm:cache_config_info` labels. Default when absent.
     pub cache_config: CacheConfigLabels,
+
+    /// Model weight dtype from vLLM Prometheus label metrics (`vllm:model_config_info`, `vllm:info`), if present.
+    pub model_weight_dtype: Option<String>,
 }
 
 /// NVML / DCGM / nvidia-smi scrape

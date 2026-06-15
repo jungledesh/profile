@@ -334,6 +334,11 @@ fn histogram_window_p99_ms(first: &Scrape, last: &Scrape, base: &str) -> Option<
     histogram_quantile(0.99, &delta).map(|s| s * 1000.0)
 }
 
+fn histogram_window_p95_ms(first: &Scrape, last: &Scrape, base: &str) -> Option<f64> {
+    let delta = histogram_window_delta_buckets(first, last, base);
+    histogram_quantile(0.95, &delta).map(|s| s * 1000.0)
+}
+
 /// Returns the per-window delta bucket vector (last − first) for `base` metric.
 /// Returns empty Vec on counter reset, bucket mismatch, or no traffic (same conditions as histogram_window_p99_ms).
 fn histogram_window_delta_buckets(
@@ -417,6 +422,10 @@ fn apply_histogram_window(first: &Scrape, last: &Scrape, m: &mut VllmRawMetrics)
     m.tpot_p99_ms =
         histogram_window_p99_ms(first, last, "vllm_request_time_per_output_token_seconds")
             .or_else(|| histogram_window_p99_ms(first, last, "vllm_time_per_output_token_seconds"));
+    m.ttft_p95_ms = histogram_window_p95_ms(first, last, "vllm_time_to_first_token_seconds");
+    m.tpot_p95_ms =
+        histogram_window_p95_ms(first, last, "vllm_request_time_per_output_token_seconds")
+            .or_else(|| histogram_window_p95_ms(first, last, "vllm_time_per_output_token_seconds"));
     m.ttft_p99_buckets =
         histogram_window_delta_buckets(first, last, "vllm_time_to_first_token_seconds");
     m.tpot_p99_buckets =
@@ -513,6 +522,22 @@ pub fn collect_vllm_metrics_for(
     Ok((m, SystemTime::now()))
 }
 
+fn parse_model_weight_dtype(scrape: &Scrape) -> Option<String> {
+    const METRICS: &[&str] = &["vllm_model_config_info", "vllm_model_config", "vllm_info"];
+    for name in METRICS {
+        if let Some(dtype) = scrape
+            .samples
+            .iter()
+            .find(|s| s.metric == *name)
+            .and_then(|s| s.labels.get("dtype"))
+            .filter(|v| !v.is_empty())
+        {
+            return Some(dtype.to_string());
+        }
+    }
+    None
+}
+
 fn parse_cache_config_labels(scrape: &Scrape) -> CacheConfigLabels {
     let Some(s) = scrape
         .samples
@@ -567,6 +592,7 @@ fn parse_vllm_metrics(scrape: &Scrape) -> Result<VllmRawMetrics> {
     let request_success_total = total_request_success(scrape);
 
     let cache_config = parse_cache_config_labels(scrape);
+    let model_weight_dtype = parse_model_weight_dtype(scrape);
 
     Ok(VllmRawMetrics {
         model_name,
@@ -579,6 +605,8 @@ fn parse_vllm_metrics(scrape: &Scrape) -> Result<VllmRawMetrics> {
         tpot_ms,
         ttft_p99_ms: None,
         tpot_p99_ms: None,
+        ttft_p95_ms: None,
+        tpot_p95_ms: None,
         ttft_p99_buckets: vec![],
         tpot_p99_buckets: vec![],
         prefill_latency_ms,
@@ -602,6 +630,7 @@ fn parse_vllm_metrics(scrape: &Scrape) -> Result<VllmRawMetrics> {
         request_success_total,
         request_success_per_sec: None,
         cache_config,
+        model_weight_dtype,
     })
 }
 
@@ -951,6 +980,38 @@ vllm_prefix_cache_queries 20
     }
 
     #[test]
+    fn apply_histogram_window_p95_strictly_below_p99() {
+        fn ttft_histogram_body(cumulative: &[f64]) -> String {
+            let bounds = ["0.1", "0.5", "1.0", "2.0", "+Inf"];
+            let mut lines = String::from("# TYPE vllm_time_to_first_token_seconds histogram\n");
+            for (le, &c) in bounds.iter().zip(cumulative.iter()) {
+                lines.push_str(&format!(
+                    "vllm_time_to_first_token_seconds_bucket{{le=\"{le}\"}} {c}\n"
+                ));
+            }
+            let total = cumulative.last().copied().unwrap_or(0.0);
+            lines.push_str(&format!("vllm_time_to_first_token_seconds_sum {total}\n"));
+            lines.push_str(&format!("vllm_time_to_first_token_seconds_count {total}\n"));
+            lines
+        }
+
+        let first = scrape_from_body(&ttft_histogram_body(&[0.0, 0.0, 0.0, 0.0, 0.0])).unwrap();
+        let last = scrape_from_body(&ttft_histogram_body(&[18.0, 19.0, 20.0, 21.0, 22.0])).unwrap();
+
+        let p95 = histogram_window_p95_ms(&first, &last, "vllm_time_to_first_token_seconds");
+        let p99 = histogram_window_p99_ms(&first, &last, "vllm_time_to_first_token_seconds");
+
+        assert!(p95.is_some(), "p95 must be Some when traffic exists");
+        assert!(p99.is_some(), "p99 must be Some when traffic exists");
+        assert!(
+            p95.unwrap() < p99.unwrap(),
+            "p95 ({:.1}ms) must be strictly less than p99 ({:.1}ms)",
+            p95.unwrap(),
+            p99.unwrap()
+        );
+    }
+
+    #[test]
     fn tpot_window_ms_fallback_metric_name() {
         let fa = scrape_from_body(
             "vllm_time_per_output_token_seconds_sum 1\nvllm_time_per_output_token_seconds_count 2\n",
@@ -1091,6 +1152,36 @@ vllm:cache_config_info{block_size="32",cache_dtype="fp8",enable_prefix_caching="
         assert_eq!(cc.block_size, Some(32));
         assert_eq!(cc.cache_dtype.as_deref(), Some("fp8"));
         assert_eq!(cc.enable_prefix_caching, Some(false));
+    }
+
+    #[test]
+    fn model_config_info_dtype_parsed() {
+        let body = r#"
+vllm:model_config_info{dtype="bfloat16",model="meta-llama/Llama-3.1-8B"} 1.0
+"#;
+        let scrape = scrape_from_body(body).unwrap();
+        assert_eq!(
+            parse_model_weight_dtype(&scrape).as_deref(),
+            Some("bfloat16")
+        );
+        let m = parse_vllm_metrics(&scrape).unwrap();
+        assert_eq!(m.model_weight_dtype.as_deref(), Some("bfloat16"));
+    }
+
+    #[test]
+    fn vllm_info_dtype_parsed_when_model_config_absent() {
+        let body = r#"
+vllm:info{dtype="half",model_name="mistral"} 1.0
+"#;
+        let scrape = scrape_from_body(body).unwrap();
+        assert_eq!(parse_model_weight_dtype(&scrape).as_deref(), Some("half"));
+    }
+
+    #[test]
+    fn model_weight_dtype_none_when_no_label_metric() {
+        let body = "vllm_num_requests_running 1\n";
+        let scrape = scrape_from_body(body).unwrap();
+        assert!(parse_model_weight_dtype(&scrape).is_none());
     }
 
     mod histogram_tests {

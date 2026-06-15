@@ -7,7 +7,6 @@ use crate::engine;
 use crate::output;
 
 const CEILING_HEADROOM_THRESHOLD_PCT: f64 = 10.0;
-const LOW_OCCUPANCY_THRESHOLD: f64 = 0.25;
 const EFFICIENCY_DISPLAY_MIN_PP: f64 = 0.05;
 
 pub fn run(
@@ -33,11 +32,22 @@ pub fn run(
         else {
             let baseline = state.last().report.baseline.as_ref();
             let efficiency = baseline.and_then(|b| b.efficiency_pct);
-            let headroom = baseline.and_then(|b| b.headroom_pct);
-
+            let ridge_batch_size = baseline.map(|b| b.ridge_batch_size);
+            let tpot_floor_ms = baseline.map(|b| b.tpot_floor_ms);
+            let kv_cache_usage_perc = state.last().result.snapshot.vllm.kv_cache_usage_perc;
             let num_running = state.last().result.snapshot.vllm.num_requests_running;
-            let max_num_seqs = state.last().result.static_ctx.config.max_num_seqs;
-            let msg = healthy_exit_message(efficiency, headroom, num_running, max_num_seqs);
+            let tpot_ms = state.last().result.snapshot.vllm.tpot_ms;
+            let chunked_prefill_enabled =
+                state.last().result.static_ctx.config.enable_chunked_prefill;
+            let msg = healthy_exit_message(
+                efficiency,
+                kv_cache_usage_perc,
+                num_running,
+                ridge_batch_size,
+                tpot_ms,
+                tpot_floor_ms,
+                chunked_prefill_enabled,
+            );
             println!("\n{msg}");
             break;
         };
@@ -114,13 +124,11 @@ pub fn run(
 
         let _outcome = poll::wait_for_restart_or_skip(url, &stdin_rx);
 
-        {
-            println!();
-            let current = current_max_num_seqs.unwrap_or(256);
-            current_max_num_seqs = Some(crate::cli::prompt_for_updated_max_num_seqs(
-                current, &stdin_rx,
-            )?);
-        }
+        println!();
+        let current = current_max_num_seqs.unwrap_or(256);
+        current_max_num_seqs = Some(crate::cli::prompt_for_updated_max_num_seqs(
+            current, &stdin_rx,
+        )?);
 
         println!("\nMeasuring delta...\n");
         let new_result = run_diagnose(
@@ -208,29 +216,80 @@ fn at_hardware_ceiling(headroom_pct: Option<f64>) -> bool {
 
 fn healthy_exit_message(
     efficiency: Option<f64>,
-    headroom: Option<f64>,
+    kv_cache_usage_perc: Option<f64>,
     num_running: Option<f64>,
-    max_num_seqs: Option<u32>,
+    ridge_batch_size: Option<f64>,
+    tpot_ms: Option<f64>,
+    tpot_floor_ms: Option<f64>,
+    chunked_prefill_enabled: Option<bool>,
 ) -> String {
-    let load_is_low = match (num_running, max_num_seqs) {
-        (Some(r), Some(m)) if m > 0 => (r / f64::from(m)) < LOW_OCCUPANCY_THRESHOLD,
-        _ => false,
+    let eff_str = efficiency
+        .map(|e| format!("Efficiency: {e:.1}%"))
+        .unwrap_or_else(|| "Efficiency: unavailable".to_string());
+
+    let limiter = engine::limiter::identify(
+        kv_cache_usage_perc,
+        num_running,
+        ridge_batch_size,
+        tpot_ms,
+        tpot_floor_ms,
+        chunked_prefill_enabled,
+    );
+
+    let limiter_block = match limiter {
+        Some(engine::limiter::PrimaryLimiter::Capacity) => {
+            let kv = kv_cache_usage_perc
+                .map(|k| format!(" KV cache at {k:.0}%."))
+                .unwrap_or_default();
+            format!(
+                "Primary Limiter: VRAM Capacity\n\
+                 {eff_str} —{kv} concurrency is capped before bandwidth saturates.\n\
+                 Levers: enable prefix caching, apply KV quantization (FP8), or add TP to split KV cache."
+            )
+        }
+        Some(engine::limiter::PrimaryLimiter::Traffic) => {
+            format!(
+                "Primary Limiter: Traffic Density\n\
+                 {eff_str} — gap is idle time, not misconfiguration.\n\
+                 Lever: increase incoming QPS or consolidate traffic from other nodes."
+            )
+        }
+        Some(engine::limiter::PrimaryLimiter::Physics) => {
+            let floor_str = tpot_floor_ms
+                .zip(tpot_ms)
+                .map(|(floor, actual)| format!(" TPOT {actual:.1}ms vs floor {floor:.1}ms."))
+                .unwrap_or_default();
+            format!(
+                "Primary Limiter: Physics (Hardware Ceiling)\n\
+                 {eff_str} —{floor_str} Hardware is at the limits of this model and dtype.\n\
+                 Levers: quantize further (FP16→FP8/AWQ), speculative decoding, or scale out with TP."
+            )
+        }
+        Some(engine::limiter::PrimaryLimiter::PrefillInterference) => {
+            format!(
+                "Primary Limiter: Prefill Interference\n\
+                 {eff_str} — chunked prefill is sharing decode memory bandwidth with prefill GEMMs.\n\
+                 Levers: disaggregate prefill/decode onto separate workers, or tune chunk size."
+            )
+        }
+        Some(engine::limiter::PrimaryLimiter::FrameworkOverhead) => {
+            format!(
+                "Primary Limiter: Framework Overhead\n\
+                 {eff_str} — batch healthy, VRAM available, but GPU is waiting on the system.\n\
+                 Levers: test --enforce-eager, verify CPU/PCIe bottlenecks, or evaluate SGLang for this workload."
+            )
+        }
+        None => {
+            format!("{eff_str} — insufficient data to identify primary limiter.")
+        }
     };
 
-    match (efficiency, headroom) {
-        (Some(e), _) if headroom.is_some_and(|h| h < CEILING_HEADROOM_THRESHOLD_PCT) => {
-            format!("No issues detected. Server is at hardware capacity: {e:.1}% of ceiling.")
-        }
-        (Some(e), _) if load_is_low => {
-            format!("No issues detected. Efficiency: {e:.1}% (hardware is under-fed, not misconfigured).")
-        }
-        (Some(e), _) => {
-            format!("No significant change. Efficiency: {e:.1}% of hardware ceiling.")
-        }
-        (None, _) => {
-            "No issues detected. Efficiency unavailable; GPU or model data missing.".to_string()
-        }
-    }
+    let prefix = if limiter.is_some() {
+        "Rules clear. Server is optimally tuned for current constraints."
+    } else {
+        "Rules clear."
+    };
+    format!("{prefix}\n\n{limiter_block}")
 }
 
 fn direction_followup_lines(
@@ -506,38 +565,89 @@ mod tests {
     }
 
     #[test]
-    fn healthy_exit_no_issues_shows_no_significant_change_with_efficiency() {
-        let msg = healthy_exit_message(Some(42.5), Some(57.5), None, None);
-        assert_eq!(
-            msg,
-            "No significant change. Efficiency: 42.5% of hardware ceiling."
+    fn healthy_exit_capacity_limiter() {
+        let msg = healthy_exit_message(
+            Some(42.5),
+            Some(85.0),
+            Some(50.0),
+            Some(40.0),
+            Some(20.0),
+            Some(5.0),
+            Some(false),
         );
+        assert!(msg.contains("VRAM Capacity"));
+        assert!(msg.contains("Efficiency: 42.5%"));
+        assert!(msg.contains("KV cache at 85%"));
     }
 
     #[test]
-    fn healthy_exit_at_capacity_when_headroom_low() {
-        let msg = healthy_exit_message(Some(91.0), Some(9.0), None, None);
-        assert!(msg.contains("at hardware capacity: 91.0% of ceiling."));
+    fn healthy_exit_traffic_limiter() {
+        let msg = healthy_exit_message(
+            Some(34.0),
+            Some(50.0),
+            Some(5.0),
+            Some(100.0),
+            Some(20.0),
+            Some(5.0),
+            Some(false),
+        );
+        assert!(msg.contains("Traffic Density"));
+        assert!(msg.contains("Efficiency: 34.0%"));
     }
 
     #[test]
-    fn healthy_exit_unavailable_when_efficiency_missing() {
-        let msg = healthy_exit_message(None, Some(50.0), None, None);
-        assert!(msg.contains("Efficiency unavailable"));
+    fn healthy_exit_physics_limiter() {
+        let msg = healthy_exit_message(
+            Some(91.0),
+            Some(50.0),
+            Some(50.0),
+            Some(40.0),
+            Some(11.0),
+            Some(10.0),
+            Some(false),
+        );
+        assert!(msg.contains("Physics (Hardware Ceiling)"));
+        assert!(msg.contains("Efficiency: 91.0%"));
+        assert!(msg.contains("TPOT 11.0ms vs floor 10.0ms"));
     }
 
     #[test]
-    fn healthy_exit_under_fed_when_occupancy_low() {
-        let msg = healthy_exit_message(Some(34.0), Some(66.0), Some(2.0), Some(256));
-        assert!(msg.contains("under-fed, not misconfigured"));
-        assert!(msg.contains("34.0%"));
+    fn healthy_exit_prefill_interference_limiter() {
+        let msg = healthy_exit_message(
+            Some(55.0),
+            Some(50.0),
+            Some(50.0),
+            Some(40.0),
+            Some(50.0),
+            Some(10.0),
+            Some(true),
+        );
+        assert!(msg.contains("Prefill Interference"));
+        assert!(msg.contains("Efficiency: 55.0%"));
     }
 
     #[test]
-    fn healthy_exit_no_under_fed_label_when_occupancy_high() {
-        let msg = healthy_exit_message(Some(34.0), Some(66.0), Some(200.0), Some(256));
-        assert!(msg.contains("of hardware ceiling"));
-        assert!(!msg.contains("under-fed"));
+    fn healthy_exit_framework_overhead_limiter() {
+        let msg = healthy_exit_message(
+            Some(60.0),
+            Some(50.0),
+            Some(50.0),
+            Some(40.0),
+            Some(50.0),
+            Some(10.0),
+            Some(false),
+        );
+        assert!(msg.contains("Framework Overhead"));
+        assert!(msg.contains("Efficiency: 60.0%"));
+    }
+
+    #[test]
+    fn healthy_exit_insufficient_data_when_limiter_unknown() {
+        let msg = healthy_exit_message(None, None, None, None, None, None, None);
+        assert!(msg.contains("insufficient data to identify primary limiter"));
+        assert!(msg.contains("Efficiency: unavailable"));
+        assert!(!msg.contains("optimally tuned"));
+        assert_eq!(msg.matches("Rules clear.").count(), 1);
     }
 
     #[test]
@@ -741,10 +851,15 @@ mod tests {
             ttft_p99_after_ms: None,
             tpot_p99_before_ms: None,
             tpot_p99_after_ms: None,
+            ttft_p95_before_ms: None,
+            ttft_p95_after_ms: None,
+            tpot_p95_before_ms: None,
+            tpot_p95_after_ms: None,
             direction: delta::Direction::NoChange,
             direction_reason: None,
             ttft_p99_delta_pct: None,
-            veto_fired: false,
+            ttft_p95_delta_pct: None,
+            tpot_p95_delta_pct: None,
             config_drifted: false,
         };
         assert!(economics_section_active(&d));
@@ -772,10 +887,15 @@ mod tests {
             ttft_p99_after_ms: None,
             tpot_p99_before_ms: None,
             tpot_p99_after_ms: None,
+            ttft_p95_before_ms: None,
+            ttft_p95_after_ms: None,
+            tpot_p95_before_ms: None,
+            tpot_p95_after_ms: None,
             direction: delta::Direction::Better,
             direction_reason: None,
             ttft_p99_delta_pct: None,
-            veto_fired: false,
+            ttft_p95_delta_pct: None,
+            tpot_p95_delta_pct: None,
             config_drifted: false,
         };
         assert!(recoverable_waste_available(&d));

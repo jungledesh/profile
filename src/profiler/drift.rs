@@ -7,6 +7,8 @@ pub fn config_changed(prev: &StaticContext, curr: &StaticContext) -> bool {
         || prev.config.kv_cache_dtype != curr.config.kv_cache_dtype
         || prev.config.max_model_len != curr.config.max_model_len
         || prev.config.quantization != curr.config.quantization
+        || prev.config.vllm_reported_dtype != curr.config.vllm_reported_dtype
+        || prev.config.vllm_reported_quantization != curr.config.vllm_reported_quantization
 }
 
 #[cfg(test)]
@@ -74,6 +76,27 @@ mod tests {
     fn quantization_change_true() {
         let mut c2 = base_cfg();
         c2.quantization = Some("awq".into());
+        assert!(config_changed(&ctx(base_cfg()), &ctx(c2)));
+    }
+
+    #[test]
+    fn vllm_reported_dtype_change_true() {
+        let mut c2 = base_cfg();
+        c2.vllm_reported_dtype = Some("fp8".into());
+        assert!(config_changed(&ctx(base_cfg()), &ctx(c2)));
+    }
+
+    #[test]
+    fn vllm_reported_dtype_appearing_triggers_rebaseline() {
+        let mut c2 = base_cfg();
+        c2.vllm_reported_dtype = Some("bfloat16".into());
+        assert!(config_changed(&ctx(base_cfg()), &ctx(c2)));
+    }
+
+    #[test]
+    fn vllm_reported_quantization_change_triggers_rebaseline() {
+        let mut c2 = base_cfg();
+        c2.vllm_reported_quantization = Some("awq".into());
         assert!(config_changed(&ctx(base_cfg()), &ctx(c2)));
     }
 }

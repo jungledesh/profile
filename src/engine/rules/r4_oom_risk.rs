@@ -20,8 +20,11 @@ fn min_tp(weight_gb: f64, vram_gb: f64, gpu_memory_utilization: f64) -> u32 {
 
 fn confidence_for_source(weight_dtype_source: WeightDtypeSource) -> f64 {
     match weight_dtype_source {
+        WeightDtypeSource::VllmInfoQuantization => 0.90,
+        WeightDtypeSource::EnvVarQuantization => 0.95,
         WeightDtypeSource::EnvVar => 0.95,
-        WeightDtypeSource::KvCacheDtype => 0.90,
+        WeightDtypeSource::VllmConfig => 0.90,
+        WeightDtypeSource::VllmInfoEndpoint => 0.90,
         WeightDtypeSource::Catalog => 0.90,
         WeightDtypeSource::Fallback => 0.60,
     }
@@ -185,6 +188,66 @@ mod tests {
         .expect("fired");
         assert!((r.confidence - 0.60).abs() < 1e-9);
         assert!(r.display_lines.join("\n").contains("Confidence: Medium"));
+    }
+
+    #[test]
+    fn confidence_high_when_dtype_from_vllm_config() {
+        let r = r4_recommendation(
+            Some(-12.5),
+            None,
+            Some(140.0),
+            Some(80.0),
+            Some(0.9),
+            WeightDtypeSource::VllmConfig,
+        )
+        .expect("fired");
+        assert!((r.confidence - 0.90).abs() < 1e-9);
+        assert!(r.display_lines.join("\n").contains("Confidence: High"));
+    }
+
+    #[test]
+    fn confidence_high_when_dtype_from_vllm_info_endpoint() {
+        let r = r4_recommendation(
+            Some(-12.5),
+            None,
+            Some(140.0),
+            Some(80.0),
+            Some(0.9),
+            WeightDtypeSource::VllmInfoEndpoint,
+        )
+        .expect("fired");
+        assert!((r.confidence - 0.90).abs() < 1e-9);
+        assert!(r.display_lines.join("\n").contains("Confidence: High"));
+    }
+
+    #[test]
+    fn confidence_high_when_dtype_from_vllm_info_quantization() {
+        let r = r4_recommendation(
+            Some(-12.5),
+            None,
+            Some(140.0),
+            Some(80.0),
+            Some(0.9),
+            WeightDtypeSource::VllmInfoQuantization,
+        )
+        .expect("fired");
+        assert!((r.confidence - 0.90).abs() < 1e-9);
+        assert!(r.display_lines.join("\n").contains("Confidence: High"));
+    }
+
+    #[test]
+    fn confidence_high_when_dtype_from_env_quantization() {
+        let r = r4_recommendation(
+            Some(-12.5),
+            None,
+            Some(140.0),
+            Some(80.0),
+            Some(0.9),
+            WeightDtypeSource::EnvVarQuantization,
+        )
+        .expect("fired");
+        assert!((r.confidence - 0.95).abs() < 1e-9);
+        assert!(r.display_lines.join("\n").contains("Confidence: High"));
     }
 
     #[test]

@@ -33,8 +33,11 @@ pub struct CeilingEstimate {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum WeightDtypeSource {
+    VllmInfoQuantization,
+    EnvVarQuantization,
+    VllmConfig,
+    VllmInfoEndpoint,
     EnvVar,
-    KvCacheDtype,
     Catalog,
     Fallback,
 }
@@ -46,7 +49,7 @@ pub struct PhysicsBaseline {
     pub efficiency_pct: Option<f64>,
     pub headroom_pct: Option<f64>,
     pub weight_dtype_source: WeightDtypeSource,
-    /// Model weight memory footprint in GB (params × bytes_per_param).
+    /// Model weight memory footprint in GB. Derived from bits_per_param (quantization chain or dtype chain).
     pub weight_gb: f64,
     /// VRAM remaining after weights, if total VRAM is known. Negative means weights alone exceed VRAM.
     pub kv_headroom_gb: Option<f64>,
@@ -69,21 +72,27 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
     let weight_params = ctx.model.param_count.or(ctx.model.active_param_count)?;
     let catalog_default_dtype = ctx.model.default_weight_dtype.as_deref();
 
-    let (bytes_per_param, weight_dtype_source) = resolve_bytes_per_param(
+    let (bits_per_param, weight_dtype_source) = resolve_bits_per_param(
+        ctx.config.vllm_reported_dtype.as_deref(),
+        ctx.config.vllm_reported_dtype_resolved,
+        ctx.config.vllm_reported_quantization.as_deref(),
         ctx.config.dtype.as_deref(),
-        ctx.config.kv_cache_dtype.as_deref(),
+        ctx.config.quantization.as_deref(),
         catalog_default_dtype,
     );
 
-    let ridge_batch_size = math::ridge_batch_size(peak_flops, peak_bw, bytes_per_param);
+    let ridge_batch_size = math::ridge_batch_size(peak_flops, peak_bw, bits_per_param);
 
-    let decode_expected = math::decode_ceiling_tps(peak_bw * tp, roofline_params, bytes_per_param);
+    let decode_expected = math::decode_ceiling_tps(peak_bw * tp, roofline_params, bits_per_param);
     let decode = make_estimate(decode_expected)?;
 
     let seq_len = resolve_seq_len(
         ctx.config.max_model_len,
         input.window.snapshot.vllm.prompt_tokens_mean,
     );
+    // Note: Prefill ceiling assumes standard BF16 GEMM throughput. Fused dequantization
+    // kernels (e.g., Marlin/AWQ) introduce instruction overhead that typically lowers
+    // achievable compute utilization.
     let prefill = seq_len.and_then(|len| {
         let expected = math::prefill_ceiling_tps(peak_flops * tp, roofline_params, len);
         make_estimate(expected)
@@ -116,7 +125,7 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
 
     let headroom_pct = efficiency_pct.map(|raw| 100.0 - raw.min(100.0));
 
-    let weight_gb = math::weight_gb(weight_params, bytes_per_param);
+    let weight_gb = math::weight_gb(weight_params, bits_per_param);
     let kv_headroom_gb = ctx.gpu.vram_gb.map(|vram| vram - (weight_gb / tp));
     let tpot_floor_ms = math::latency_floor_ms(decode.expected);
     let prefill_latency_floor_ms = prefill.map(|p| math::latency_floor_ms(p.expected));
@@ -217,39 +226,61 @@ fn resolve_seq_len(max_model_len: Option<u32>, prompt_tokens_mean: Option<f64>) 
     max_model_len.filter(|v| *v > 0)
 }
 
-fn resolve_bytes_per_param(
+fn resolve_bits_per_param(
+    vllm_reported_dtype: Option<&str>,
+    vllm_reported_dtype_resolved: bool,
+    vllm_reported_quantization: Option<&str>,
     dtype_env: Option<&str>,
-    kv_cache_dtype: Option<&str>,
+    quant_env: Option<&str>,
     catalog_default_dtype: Option<&str>,
 ) -> (u8, WeightDtypeSource) {
-    if let Some(v) = dtype_env.and_then(dtype_to_bytes) {
-        return (v, WeightDtypeSource::EnvVar);
+    if let Some(bits) = vllm_reported_quantization.and_then(quantization_to_bits) {
+        return (bits, WeightDtypeSource::VllmInfoQuantization);
     }
-    if let Some(v) = kv_cache_dtype.and_then(dtype_to_bytes) {
-        return (v, WeightDtypeSource::KvCacheDtype);
+    if let Some(bits) = quant_env.and_then(quantization_to_bits) {
+        return (bits, WeightDtypeSource::EnvVarQuantization);
     }
-    if let Some(v) = catalog_default_dtype.and_then(dtype_to_bytes) {
-        return (v, WeightDtypeSource::Catalog);
+    if let Some(bits) = vllm_reported_dtype.and_then(dtype_to_bits) {
+        let source = if vllm_reported_dtype_resolved {
+            WeightDtypeSource::VllmInfoEndpoint
+        } else {
+            WeightDtypeSource::VllmConfig
+        };
+        return (bits, source);
     }
-    (2, WeightDtypeSource::Fallback)
+    if let Some(bits) = dtype_env.and_then(dtype_to_bits) {
+        return (bits, WeightDtypeSource::EnvVar);
+    }
+    if let Some(bits) = catalog_default_dtype.and_then(dtype_to_bits) {
+        return (bits, WeightDtypeSource::Catalog);
+    }
+    (16, WeightDtypeSource::Fallback)
 }
 
-fn dtype_to_bytes(dtype: &str) -> Option<u8> {
+fn dtype_to_bits(dtype: &str) -> Option<u8> {
     let d = dtype.trim().to_ascii_lowercase();
     if d.is_empty() {
         return None;
     }
 
     if d.contains("fp8") || d.contains("e4m3") || d.contains("e5m2") {
-        return Some(1);
+        return Some(8);
     }
     if d.contains("bf16") || d.contains("fp16") || d.contains("float16") || d == "half" {
-        return Some(2);
+        return Some(16);
     }
     if d.contains("fp32") || d.contains("float32") || d == "f32" {
-        return Some(4);
+        return Some(32);
     }
     None
+}
+
+fn quantization_to_bits(scheme: &str) -> Option<u8> {
+    match scheme.trim().to_ascii_lowercase().as_str() {
+        "awq" | "awq_marlin" | "gptq" | "gptq_marlin" | "marlin" => Some(4),
+        "int8" | "w8a8" | "fp8" => Some(8),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -347,13 +378,94 @@ mod tests {
             None => panic!("expected baseline"),
         };
         assert_eq!(b.weight_dtype_source, WeightDtypeSource::EnvVar);
-        let expected_decode = math::decode_ceiling_tps(3350.0, 10_000_000_000, 4);
+        let expected_decode = math::decode_ceiling_tps(3350.0, 10_000_000_000, 32);
         assert!((b.decode.expected - expected_decode).abs() < 1e-9);
         assert!(
             (b.weight_gb - 400.0).abs() < 1e-3,
-            "weight_gb uses total param_count (100B × 4 bytes), got {}",
+            "weight_gb uses total param_count (100B × 32 bits / 8), got {}",
             b.weight_gb
         );
+    }
+
+    #[test]
+    fn vllm_reported_dtype_beats_catalog() {
+        let cfg = VllmConfig {
+            vllm_reported_dtype: Some("fp8".to_string()),
+            max_model_len: Some(2048),
+            ..Default::default()
+        };
+        let snap = VllmRawMetrics {
+            generation_tokens_per_sec: Some(50.0),
+            num_requests_running: Some(1.0),
+            ..Default::default()
+        };
+        let (ctx, win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(67.0),
+            Some(3350.0),
+            cfg,
+            snap,
+        );
+        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+        assert_eq!(b.weight_dtype_source, WeightDtypeSource::VllmConfig);
+        let expected_decode = math::decode_ceiling_tps(3350.0, 8_000_000_000, 8);
+        assert!((b.decode.expected - expected_decode).abs() < 1e-9);
+    }
+
+    #[test]
+    fn vllm_info_endpoint_used_when_resolved_from_info() {
+        let cfg = VllmConfig {
+            vllm_reported_dtype: Some("bfloat16".to_string()),
+            vllm_reported_dtype_resolved: true,
+            max_model_len: Some(2048),
+            ..Default::default()
+        };
+        let snap = VllmRawMetrics {
+            generation_tokens_per_sec: Some(50.0),
+            num_requests_running: Some(1.0),
+            ..Default::default()
+        };
+        let (ctx, win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("fp32"),
+            Some(67.0),
+            Some(3350.0),
+            cfg,
+            snap,
+        );
+        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+        assert_eq!(b.weight_dtype_source, WeightDtypeSource::VllmInfoEndpoint);
+    }
+
+    #[test]
+    fn vllm_reported_dtype_beats_env_and_catalog() {
+        let cfg = VllmConfig {
+            vllm_reported_dtype: Some("fp8".to_string()),
+            dtype: Some("bf16".to_string()),
+            max_model_len: Some(2048),
+            ..Default::default()
+        };
+        let snap = VllmRawMetrics {
+            generation_tokens_per_sec: Some(50.0),
+            num_requests_running: Some(1.0),
+            ..Default::default()
+        };
+        let (ctx, win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(67.0),
+            Some(3350.0),
+            cfg,
+            snap,
+        );
+        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+        assert_eq!(b.weight_dtype_source, WeightDtypeSource::VllmConfig);
+        let expected_decode = math::decode_ceiling_tps(3350.0, 8_000_000_000, 8);
+        assert!((b.decode.expected - expected_decode).abs() < 1e-9);
     }
 
     #[test]
@@ -379,9 +491,9 @@ mod tests {
         );
         let input = AnalysisInput::new(&ctx, &win);
         let b = compute(&input).expect("baseline");
-        let expected_weight = math::weight_gb(671_000_000_000, 2);
+        let expected_weight = math::weight_gb(671_000_000_000, 16);
         assert!((b.weight_gb - expected_weight).abs() < 1e-3);
-        let expected_decode = math::decode_ceiling_tps(3350.0, 37_000_000_000, 2);
+        let expected_decode = math::decode_ceiling_tps(3350.0, 37_000_000_000, 16);
         assert!((b.decode.expected - expected_decode).abs() < 1e-6);
     }
 
@@ -496,8 +608,8 @@ mod tests {
     #[test]
     fn dtype_source_fallback_when_unrecognized_everywhere() {
         let cfg = VllmConfig {
+            vllm_reported_dtype: Some("unknown".to_string()),
             dtype: Some("mystery".to_string()),
-            kv_cache_dtype: Some("unknown".to_string()),
             max_model_len: Some(1024),
             ..Default::default()
         };
@@ -1012,5 +1124,122 @@ mod tests {
             .expect("cost without power");
         assert!(cost.tok_per_watt.is_none());
         assert!(cost.cost_per_million_tokens.is_some());
+    }
+
+    #[test]
+    fn awq_quantization_source_used_when_info_provides_scheme() {
+        let cfg = VllmConfig {
+            vllm_reported_quantization: Some("awq".to_string()),
+            max_model_len: Some(2048),
+            ..Default::default()
+        };
+        let snap = VllmRawMetrics {
+            generation_tokens_per_sec: Some(50.0),
+            num_requests_running: Some(1.0),
+            ..Default::default()
+        };
+        let (ctx, win) = baseline_input(
+            Some(70_000_000_000),
+            None,
+            Some("bf16"),
+            Some(67.0),
+            Some(3350.0),
+            cfg,
+            snap,
+        );
+        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+        assert_eq!(
+            b.weight_dtype_source,
+            WeightDtypeSource::VllmInfoQuantization
+        );
+        assert!((b.weight_gb - 35.0).abs() < 1e-3);
+        let expected_decode = math::decode_ceiling_tps(3350.0, 70_000_000_000, 4);
+        assert!(
+            (b.decode.expected - expected_decode).abs() < 1e-6,
+            "AWQ 4-bit decode ceiling should be 4× higher than bf16; got {}",
+            b.decode.expected
+        );
+    }
+
+    #[test]
+    fn env_var_quantization_used_when_info_missing() {
+        let cfg = VllmConfig {
+            quantization: Some("gptq".to_string()),
+            max_model_len: Some(2048),
+            ..Default::default()
+        };
+        let snap = VllmRawMetrics {
+            generation_tokens_per_sec: Some(50.0),
+            num_requests_running: Some(1.0),
+            ..Default::default()
+        };
+        let (ctx, win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(67.0),
+            Some(3350.0),
+            cfg,
+            snap,
+        );
+        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+        assert_eq!(b.weight_dtype_source, WeightDtypeSource::EnvVarQuantization);
+    }
+
+    #[test]
+    fn unrecognized_quantization_falls_through_to_dtype_chain() {
+        let cfg = VllmConfig {
+            vllm_reported_quantization: Some("gguf".to_string()),
+            dtype: Some("bf16".to_string()),
+            max_model_len: Some(2048),
+            ..Default::default()
+        };
+        let snap = VllmRawMetrics {
+            generation_tokens_per_sec: Some(50.0),
+            num_requests_running: Some(1.0),
+            ..Default::default()
+        };
+        let (ctx, win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(67.0),
+            Some(3350.0),
+            cfg,
+            snap,
+        );
+        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+        assert_eq!(b.weight_dtype_source, WeightDtypeSource::EnvVar);
+    }
+
+    #[test]
+    fn quantization_beats_prometheus_dtype_for_awq() {
+        let cfg = VllmConfig {
+            vllm_reported_dtype: Some("bfloat16".to_string()),
+            vllm_reported_quantization: Some("awq".to_string()),
+            max_model_len: Some(2048),
+            ..Default::default()
+        };
+        let snap = VllmRawMetrics {
+            generation_tokens_per_sec: Some(50.0),
+            num_requests_running: Some(1.0),
+            ..Default::default()
+        };
+        let (ctx, win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(67.0),
+            Some(3350.0),
+            cfg,
+            snap,
+        );
+        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+        assert_eq!(
+            b.weight_dtype_source,
+            WeightDtypeSource::VllmInfoQuantization
+        );
+        let expected_decode = math::decode_ceiling_tps(3350.0, 8_000_000_000, 4);
+        assert!((b.decode.expected - expected_decode).abs() < 1e-9);
     }
 }

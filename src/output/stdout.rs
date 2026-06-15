@@ -55,6 +55,10 @@ pub fn format_direction_line(d: &Delta) -> String {
 
 pub fn print_direction_line(d: &Delta) {
     println!("{}", format_direction_line(d));
+    println!("  {}", crate::profiler::delta::direction_detail(d));
+    if let Some(eff) = d.efficiency_delta_pp {
+        println!("  efficiency Δ: {:+.1} pp  (diagnostic)", eff);
+    }
 }
 
 pub fn print_diagnose_table(result: &DiagnoseResult, verbose_rules: bool) {
@@ -210,6 +214,19 @@ fn duration_short(duration: Duration) -> String {
     }
 }
 
+fn weight_dtype_display(source: engine::WeightDtypeSource, weight_gb: f64) -> String {
+    let suffix = match source {
+        engine::WeightDtypeSource::VllmInfoQuantization => "vLLM /info (quant)",
+        engine::WeightDtypeSource::EnvVarQuantization => "env (quant)",
+        engine::WeightDtypeSource::VllmConfig => "vLLM",
+        engine::WeightDtypeSource::VllmInfoEndpoint => "vLLM /info",
+        engine::WeightDtypeSource::EnvVar => "env",
+        engine::WeightDtypeSource::Catalog => "catalog",
+        engine::WeightDtypeSource::Fallback => "assumed bf16",
+    };
+    format!("weight {:.0}GB ({})", weight_gb, suffix)
+}
+
 fn baseline_lines(
     baseline: Option<engine::PhysicsBaseline>,
     num_requests_running: Option<f64>,
@@ -237,7 +254,7 @@ fn baseline_lines(
 
     // Line 2: memory budget + latency floors
     let mut seg2 = Vec::new();
-    seg2.push(format!("weight {:.0}GB", b.weight_gb));
+    seg2.push(weight_dtype_display(b.weight_dtype_source, b.weight_gb));
     if let Some(blocks) = num_gpu_blocks {
         seg2.push(format!("kv_blocks {blocks}"));
     } else if let Some(headroom) = b.kv_headroom_gb {
@@ -261,7 +278,10 @@ fn baseline_lines(
         format!("           {}", seg2.join(" | ")),
     ];
     if b.weight_dtype_source == engine::WeightDtypeSource::Fallback {
-        out.push("           weight dtype assumed bf16. Set DTYPE env var to confirm".to_string());
+        out.push(
+            "           weight dtype assumed bf16. Confirm via vLLM metrics or DTYPE env var"
+                .to_string(),
+        );
     }
     out
 }

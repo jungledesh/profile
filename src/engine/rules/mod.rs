@@ -1,6 +1,6 @@
 use std::time::SystemTime;
 
-use crate::collectors::{window_is_evaluable, RawSnapshot};
+use crate::collectors::{window_is_evaluable, RawSnapshot, VllmRawMetrics};
 use crate::context::{AnalysisInput, RuntimeWindow};
 use crate::engine::baseline::{self, CostSource, PhysicsBaseline, WeightDtypeSource};
 
@@ -391,6 +391,17 @@ impl WindowRuleEval {
     }
 }
 
+fn r3_display_args(snap: &VllmRawMetrics, d: &LowPrefixReuseDetail) -> (f64, Option<f64>) {
+    let qps = snap
+        .request_success_per_sec
+        .filter(|x| x.is_finite())
+        .unwrap_or(0.0);
+    let prompt_mean = d
+        .prompt_tokens_mean
+        .or_else(|| snap.prompt_tokens_mean.filter(|x| x.is_finite()));
+    (qps, prompt_mean)
+}
+
 fn eval_window_rules(
     windows: &[RuntimeWindow],
     summary: &AnalysisInput<'_>,
@@ -583,6 +594,7 @@ fn build_report_from_eval(eval: &WindowRuleEval, summary: AnalysisInput<'_>) -> 
     if eval.r3_significant() {
         let d = aggregate_r3_detail(&eval.r3_details, summary_snap);
         let enable_prefix = summary_snap.vllm.cache_config.enable_prefix_caching;
+        let (qps, prompt_mean) = r3_display_args(&summary_snap.vllm, &d);
         let (action, short_action, impact, confidence) = if d.hit_rate.is_none() {
             (
                 "Enable --enable-prefix-caching".to_string(),
@@ -609,6 +621,8 @@ fn build_report_from_eval(eval: &WindowRuleEval, summary: AnalysisInput<'_>) -> 
                 &d,
                 pct(eval.r3_fired, eval.n_eval),
                 enable_prefix,
+                qps,
+                prompt_mean,
             ),
         });
     }
@@ -814,10 +828,14 @@ pub fn format_diagnose_rules_for_windows(
     }
 
     if r3_significant {
+        let d = aggregate_r3_detail(r3_details, summary_snap);
+        let (qps, prompt_mean) = r3_display_args(&summary_snap.vllm, &d);
         warnings.extend(format_low_prefix_window_issue(
-            &aggregate_r3_detail(r3_details, summary_snap),
+            &d,
             pct(r3_fired, n_eval),
             summary_snap.vllm.cache_config.enable_prefix_caching,
+            qps,
+            prompt_mean,
         ));
         warnings.push(String::new());
     }
@@ -1418,13 +1436,14 @@ mod tests {
         let mut v = vllm_base();
         v.prefix_cache_hit_rate = Some(0.34);
         v.prompt_tokens_mean = Some(25.0);
+        v.request_success_per_sec = Some(40.0);
         v.num_requests_running = Some(1.0);
         let s = snap(t, t, v, gpu_busy());
         let win = mk_win(s);
         match rule3_low_prefix_reuse(&win.snapshot) {
             Rule3Outcome::Fired(d) => {
                 assert_eq!(d.hit_rate, Some(0.34));
-                assert!((d.prompt_tokens_mean - 25.0).abs() < 1e-9);
+                assert_eq!(d.prompt_tokens_mean, Some(25.0));
             }
             Rule3Outcome::NotFired => panic!("expected fired"),
         }
@@ -1440,6 +1459,7 @@ mod tests {
         let mut v = vllm_base();
         v.prefix_cache_hit_rate = Some(0.35);
         v.prompt_tokens_mean = Some(25.0);
+        v.request_success_per_sec = Some(40.0);
         v.num_requests_running = Some(1.0);
         let s = snap(t, t, v, gpu_busy());
         assert!(matches!(rule3_low_prefix_reuse(&s), Rule3Outcome::NotFired));
@@ -1449,13 +1469,14 @@ mod tests {
     fn format_low_prefix_hit_rate_fired_matches_template() {
         let d = LowPrefixReuseDetail {
             hit_rate: Some(0.24),
-            prompt_tokens_mean: 128.0,
+            prompt_tokens_mean: Some(128.0),
         };
-        let lines = format_low_prefix_hit_rate_fired(&d, Some(true));
+        let lines = format_low_prefix_hit_rate_fired(&d, Some(true), 10.0, Some(128.0));
         let text = lines.join("\n");
         assert!(text.contains("[!] Low Prefix Cache"));
         assert!(text.contains("  Cause:"));
         assert!(text.contains("  - Prefix hit rate 24.0% (threshold: 35%)"));
+        assert!(text.contains("  - Prompt throughput: 1280 tok/s (threshold: 1000)"));
         assert!(text.contains("Restructure prompts to share common prefixes"));
         assert!(text.contains("  Fix:"));
         assert!(text.contains("Move shared instructions/system prompts to the very start"));

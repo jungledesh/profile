@@ -257,7 +257,7 @@ load_rag() {
 
 ${instructions[$i_idx]}"
       max_tok=$(python3 -c "import random; print(random.randint(80, 480))")
-      think=$(python3 -c "import random; print(f'{random.expovariate(1/$mean_think):.2f}')")
+      think=$(python3 -c "import random; mt=max(float('$mean_think'),0.01); print(f'{random.expovariate(1/mt):.2f}')")
       post "$prompt" "$max_tok"
       sleep "$think"
     done

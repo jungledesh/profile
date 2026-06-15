@@ -196,11 +196,11 @@ vllm_kv_cache_usage_perc 10
 vllm_generation_tokens_total 1010
 "#;
 const ACTIVE_WINDOW_EARLY: &str = r#"vllm_num_requests_running 20
-vllm_kv_cache_usage_perc 50
+vllm_kv_cache_usage_perc 0.5
 vllm_generation_tokens_total 2000
 "#;
 const ACTIVE_WINDOW_LATE: &str = r#"vllm_num_requests_running 20
-vllm_kv_cache_usage_perc 50
+vllm_kv_cache_usage_perc 0.5
 vllm_generation_tokens_total 2100
 "#;
 
@@ -256,7 +256,7 @@ const MINIMAL_PREFIX_EARLY: &str = r#"vllm_prefix_cache_hits 0
 vllm_prefix_cache_queries 100
 vllm_num_requests_running 20
 vllm_max_num_seqs 256
-vllm_kv_cache_usage_perc 50
+vllm_kv_cache_usage_perc 0.5
 vllm_request_success_total 10
 vllm_generation_tokens_total 1000
 "#;
@@ -264,7 +264,7 @@ const MINIMAL_PREFIX_LATE: &str = r#"vllm_prefix_cache_hits 50
 vllm_prefix_cache_queries 200
 vllm_num_requests_running 20
 vllm_max_num_seqs 256
-vllm_kv_cache_usage_perc 50
+vllm_kv_cache_usage_perc 0.5
 vllm_request_success_total 10
 vllm_generation_tokens_total 1100
 "#;
@@ -350,7 +350,7 @@ fn diagnose_exits_success() {
         "default diagnose should not fire rules; got:\n{out}"
     );
     assert!(
-        out.contains("No significant change") || out.contains("No issues detected"),
+        out.contains("Rules clear"),
         "default diagnose should report healthy when nothing fires; got:\n{out}"
     );
     assert!(
@@ -367,8 +367,8 @@ fn diagnose_exits_success() {
 
 #[test]
 fn diagnose_shows_gen_tok_per_sec_when_counters_increase() {
-    const G100: &str = "vllm_num_requests_running 20\nvllm_kv_cache_usage_perc 50\nvllm_generation_tokens_total 100\n";
-    const G250: &str = "vllm_num_requests_running 20\nvllm_kv_cache_usage_perc 50\nvllm_generation_tokens_total 250\n";
+    const G100: &str = "vllm_num_requests_running 20\nvllm_kv_cache_usage_perc 0.5\nvllm_generation_tokens_total 100\n";
+    const G250: &str = "vllm_num_requests_running 20\nvllm_kv_cache_usage_perc 0.5\nvllm_generation_tokens_total 250\n";
     let bodies = [G100, G100, G100, G100, G100, G100, G100, G100, G250];
     let (url, server) = spawn_metrics_server_seq_with_preflight(&bodies);
     let output = Command::cargo_bin("profile")
