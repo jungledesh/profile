@@ -43,6 +43,25 @@ source "$VENV_DIR/bin/activate"
 python -m pip install "pip==${PIP_VERSION}"
 python -m pip install "uv==${UV_VERSION}"
 uv pip install "vllm==${VLLM_VERSION}" --torch-backend="${TORCH_BACKEND}"
+# Pin instrumentator — vLLM 0.18.0 pulls 8.0.0 which breaks on FastAPI 0.137+ (_IncludedRouter has no .path).
+# 7.0.2 satisfies vLLM's >=7.0.0 requirement and is the patched release after 7.0.1 was yanked.
+uv pip install "prometheus-fastapi-instrumentator==7.0.2"
+# Patch routing.py to guard against _IncludedRouter objects that lack .path (FastAPI 0.137+ regression).
+python3 -c "
+import re, pathlib
+p = pathlib.Path('${VENV_DIR}/lib/python3.10/site-packages/prometheus_fastapi_instrumentator/routing.py')
+if p.exists():
+    src = p.read_text()
+    old = '            route_name = route.path'
+    new = '            if not hasattr(route, \"path\"):\n                continue\n            route_name = route.path'
+    if old in src and new not in src:
+        p.write_text(src.replace(old, new, 1))
+        print('routing.py patched.')
+    else:
+        print('routing.py already patched or pattern not found — skipping.')
+else:
+    print('routing.py not found — skipping patch.')
+"
 uv pip install "huggingface-hub==${HUGGINGFACE_HUB_VERSION}"
 
 if [[ -n "${HF_TOKEN:-}" ]]; then

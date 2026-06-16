@@ -55,10 +55,6 @@ pub fn format_direction_line(d: &Delta) -> String {
 
 pub fn print_direction_line(d: &Delta) {
     println!("{}", format_direction_line(d));
-    println!("  {}", crate::profiler::delta::direction_detail(d));
-    if let Some(eff) = d.efficiency_delta_pp {
-        println!("  efficiency Δ: {:+.1} pp  (diagnostic)", eff);
-    }
 }
 
 pub fn print_diagnose_table(result: &DiagnoseResult, verbose_rules: bool) {
@@ -434,16 +430,16 @@ fn vllm_latency_value(v: &VllmRawMetrics, verbose: bool) -> String {
         .tpot_ms
         .map(fmt_seconds_from_ms)
         .unwrap_or_else(|| "—".to_string());
-    let ttft_p99 = v
-        .ttft_p99_ms
-        .map(|p| format!(" (p99 {})", fmt_seconds_from_ms(p)))
+    let ttft_p95 = v
+        .ttft_p95_ms
+        .map(|p| format!(" (p95 {})", fmt_seconds_from_ms(p)))
         .unwrap_or_default();
-    let tpot_p99 = v
-        .tpot_p99_ms
-        .map(|p| format!(" (p99 {})", fmt_seconds_from_ms(p)))
+    let tpot_p95 = v
+        .tpot_p95_ms
+        .map(|p| format!(" (p95 {})", fmt_seconds_from_ms(p)))
         .unwrap_or_default();
     if !verbose {
-        return format!("ttft {ttft}{ttft_p99} | tpot {tpot}{tpot_p99}");
+        return format!("ttft {ttft}{ttft_p95} | tpot {tpot}{tpot_p95}");
     }
     let prefill = v
         .prefill_latency_ms
@@ -453,7 +449,7 @@ fn vllm_latency_value(v: &VllmRawMetrics, verbose: bool) -> String {
         .queue_delay_ms
         .map(fmt_seconds_from_ms)
         .unwrap_or_else(|| "—".to_string());
-    format!("ttft {ttft}{ttft_p99} | tpot {tpot}{tpot_p99} | prefill {prefill} | queue {queue}")
+    format!("ttft {ttft}{ttft_p95} | tpot {tpot}{tpot_p95} | prefill {prefill} | queue {queue}")
 }
 
 fn vllm_prompt_kv_fragment(v: &VllmRawMetrics) -> String {
@@ -1201,17 +1197,17 @@ mod tests {
     }
 
     #[test]
-    fn vllm_latency_value_shows_p99_when_available() {
+    fn vllm_latency_value_shows_p95_when_available() {
         let v = VllmRawMetrics {
             ttft_ms: Some(120.0),
             tpot_ms: Some(50.0),
-            ttft_p99_ms: Some(892.0),
-            tpot_p99_ms: Some(180.0),
+            ttft_p95_ms: Some(892.0),
+            tpot_p95_ms: Some(180.0),
             ..Default::default()
         };
         assert_eq!(
             vllm_latency_value(&v, false),
-            "ttft 120ms (p99 892ms) | tpot 50ms (p99 180ms)"
+            "ttft 120ms (p95 892ms) | tpot 50ms (p95 180ms)"
         );
     }
 

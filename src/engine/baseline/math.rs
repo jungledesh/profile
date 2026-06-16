@@ -1,8 +1,8 @@
 /// Conservative activation memory buffer vLLM reserves inside the allocated VRAM block.
 pub const ACTIVATION_KV_BUFFER_GB: f64 = 3.0;
 
-pub fn prefill_ceiling_tps(peak_flops_f32_tflops: f64, param_count: u64, seq_len: u32) -> f64 {
-    (peak_flops_f32_tflops * 1e12_f64) / (2.0 * param_count as f64 * seq_len as f64)
+pub fn prefill_ceiling_tps(peak_flops_tc_tflops: f64, param_count: u64, seq_len: u32) -> f64 {
+    (peak_flops_tc_tflops * 1e12_f64) / (2.0 * param_count as f64 * seq_len as f64)
 }
 
 pub fn decode_ceiling_tps(peak_bw_gbps: f64, param_count: u64, bits_per_param: u8) -> f64 {
@@ -25,8 +25,8 @@ pub fn latency_floor_ms(ceiling_tps: f64) -> f64 {
 
 /// Batch size at which decode transitions from memory-BW-bound to compute-bound.
 /// Below this: throughput limited by peak_bw. At or above: limited by peak_flops.
-pub fn ridge_batch_size(peak_flops_f32_tflops: f64, peak_bw_gbps: f64, bits_per_param: u8) -> f64 {
-    (peak_flops_f32_tflops * 1e12 * bits_per_param as f64) / (peak_bw_gbps * 1e9 * 16.0)
+pub fn ridge_batch_size(peak_flops_tc_tflops: f64, peak_bw_gbps: f64, bits_per_param: u8) -> f64 {
+    (peak_flops_tc_tflops * 1e12 * bits_per_param as f64) / (peak_bw_gbps * 1e9 * 16.0)
 }
 
 #[cfg(test)]

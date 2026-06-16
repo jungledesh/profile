@@ -65,7 +65,7 @@ pub struct PhysicsBaseline {
 
 pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
     let ctx = input.ctx;
-    let peak_flops = ctx.gpu.peak_flops_f32_tflops?;
+    let peak_flops = ctx.gpu.peak_flops_tc_tflops?;
     let peak_bw = ctx.gpu.peak_bw_gbps?;
     let tp = ctx.config.tensor_parallel_size.unwrap_or(1).max(1) as f64;
 
@@ -321,7 +321,7 @@ mod tests {
                 name: Some("gpu".to_string()),
                 arch: Some("arch".to_string()),
                 vram_gb: Some(80.0),
-                peak_flops_f32_tflops: peak_flops,
+                peak_flops_tc_tflops: peak_flops,
                 peak_bw_gbps: peak_bw,
             },
             config: cfg,

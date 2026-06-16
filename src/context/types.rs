@@ -23,8 +23,8 @@ pub struct GPUModel {
     pub name: Option<String>,
     pub arch: Option<String>,
     pub vram_gb: Option<f64>,
-    /// Non-tensor-core FP32 TFLOPS. Conservative roofline input.
-    pub peak_flops_f32_tflops: Option<f64>,
+    /// BF16/FP16 Tensor Core TFLOPS.
+    pub peak_flops_tc_tflops: Option<f64>,
     /// Peak memory bandwidth GB/s.
     pub peak_bw_gbps: Option<f64>,
 }
@@ -97,14 +97,14 @@ impl StaticContext {
                 name: gpu_name,
                 arch: Some(e.arch.to_string()),
                 vram_gb,
-                peak_flops_f32_tflops: Some(e.peak_flops_f32_tflops),
+                peak_flops_tc_tflops: Some(e.peak_flops_tc_tflops),
                 peak_bw_gbps: Some(e.peak_bw_gbps),
             },
             None => GPUModel {
                 name: gpu_name,
                 arch: None,
                 vram_gb,
-                peak_flops_f32_tflops: None,
+                peak_flops_tc_tflops: None,
                 peak_bw_gbps: None,
             },
         };

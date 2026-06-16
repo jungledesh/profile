@@ -25,12 +25,16 @@ const FP8_KV_CACHE_FIX: &str =
 
 static NVCC_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
-fn fp8_kv_cache_fix_bullet() -> String {
+fn fp8_kv_cache_fix_bullet(gpu_arch: Option<&str>) -> Option<String> {
+    // A100 and older Ampere (SM80) have no native FP8 — suggestion would hurt.
+    if gpu_arch.is_some_and(|a| a == "ampere") {
+        return None;
+    }
     let nvcc_present = *NVCC_AVAILABLE.get_or_init(|| std::path::Path::new(NVCC_PATH).exists());
     if nvcc_present {
-        FP8_KV_CACHE_FIX.to_string()
+        Some(FP8_KV_CACHE_FIX.to_string())
     } else {
-        format!("{FP8_KV_CACHE_FIX} (requires nvcc)")
+        Some(format!("{FP8_KV_CACHE_FIX} (requires nvcc)"))
     }
 }
 
@@ -209,6 +213,7 @@ pub fn r2_recommendation(
             windows_fired,
             total_evaluable,
             max_model_len,
+            None,
         ),
     })
 }
@@ -244,6 +249,7 @@ pub(super) fn format_kv_cache_pressure_fired(
     windows_fired: usize,
     total_evaluable: usize,
     max_model_len: Option<u32>,
+    gpu_arch: Option<&str>,
 ) -> Vec<String> {
     let peak = snapshot
         .vllm
@@ -277,16 +283,16 @@ pub(super) fn format_kv_cache_pressure_fired(
         out.extend([
             "    • Lower --max-num-seqs now to stop evictions, pick a value below current running count"
                 .to_string(),
-            fp8_kv_cache_fix_bullet(),
             model_len_bullet,
         ]);
+        out.extend(fp8_kv_cache_fix_bullet(gpu_arch));
     } else {
         out.extend([
             "    • Raise --gpu-memory-utilization if VRAM headroom exists (check header for available VRAM)"
                 .to_string(),
-            fp8_kv_cache_fix_bullet(),
             model_len_bullet,
         ]);
+        out.extend(fp8_kv_cache_fix_bullet(gpu_arch));
     }
     let expected = if d.preemptions_active {
         "  Expected: TTFT and TPOT recover once evictions stop."
@@ -309,6 +315,7 @@ pub(super) fn format_kv_admission_backlog_issue(
     kv_headroom_gb: Option<f64>,
     windows_fired: usize,
     total_evaluable: usize,
+    gpu_arch: Option<&str>,
 ) -> Vec<String> {
     let model_len_bullet = format!(
         "    • Lower --max-model-len{} if your workload allows shorter context",
@@ -340,11 +347,11 @@ pub(super) fn format_kv_admission_backlog_issue(
         String::new(),
         "  Fix:".to_string(),
         gpu_mem_bullet,
-        fp8_kv_cache_fix_bullet(),
-        model_len_bullet,
-        String::new(),
-        "  Expected: Wait queue drains, TTFT recovers.".to_string(),
     ];
+    out.extend(fp8_kv_cache_fix_bullet(gpu_arch));
+    out.push(model_len_bullet);
+    out.push(String::new());
+    out.push("  Expected: Wait queue drains, TTFT recovers.".to_string());
     if super::rule_is_significant(windows_fired, total_evaluable) {
         let confidence = kv_pressure_confidence(windows_fired, total_evaluable);
         out.push(format!("  {}", kv_pressure_confidence_label(confidence)));
@@ -383,9 +390,16 @@ pub(super) fn format_kv_cache_window_issue(
     windows_fired: usize,
     total_evaluable: usize,
     max_model_len: Option<u32>,
+    gpu_arch: Option<&str>,
 ) -> Vec<String> {
-    let mut lines =
-        format_kv_cache_pressure_fired(d, snapshot, windows_fired, total_evaluable, max_model_len);
+    let mut lines = format_kv_cache_pressure_fired(
+        d,
+        snapshot,
+        windows_fired,
+        total_evaluable,
+        max_model_len,
+        gpu_arch,
+    );
     lines.insert(1, format!("  Seen in {seen_pct}% of windows"));
     lines
 }
@@ -571,11 +585,12 @@ mod tests {
             ..Default::default()
         };
         let single =
-            format_kv_cache_pressure_fired(&detail(90.0, true), &snap(v.clone()), 1, 1, None)
+            format_kv_cache_pressure_fired(&detail(90.0, true), &snap(v.clone()), 1, 1, None, None)
                 .join("\n");
         assert!(!single.contains("Confidence:"));
         let stable =
-            format_kv_cache_pressure_fired(&detail(90.0, true), &snap(v), 3, 4, None).join("\n");
+            format_kv_cache_pressure_fired(&detail(90.0, true), &snap(v), 3, 4, None, None)
+                .join("\n");
         assert!(stable.contains("Confidence: Medium-High"));
     }
 
@@ -704,8 +719,9 @@ mod tests {
             kv_cache_usage_perc: Some(50.0),
             ..Default::default()
         };
-        let text = format_kv_cache_pressure_fired(&detail(50.0, true), &snap(v), 3, 4, Some(4096))
-            .join("\n");
+        let text =
+            format_kv_cache_pressure_fired(&detail(50.0, true), &snap(v), 3, 4, Some(4096), None)
+                .join("\n");
         assert!(text.contains("--max-model-len (currently 4096)"));
     }
 
@@ -715,8 +731,8 @@ mod tests {
             kv_cache_usage_perc: Some(50.0),
             ..Default::default()
         };
-        let text =
-            format_kv_cache_pressure_fired(&detail(50.0, true), &snap(v), 3, 4, None).join("\n");
+        let text = format_kv_cache_pressure_fired(&detail(50.0, true), &snap(v), 3, 4, None, None)
+            .join("\n");
         assert!(text.contains("--max-model-len if"));
         assert!(!text.contains("currently"));
     }
@@ -734,24 +750,38 @@ mod tests {
 
     #[test]
     fn backlog_shows_headroom_when_safe() {
-        let text =
-            format_kv_admission_backlog_issue(&sample_backlog_detail(), 27, None, Some(30.0), 3, 4)
-                .join("\n");
+        let text = format_kv_admission_backlog_issue(
+            &sample_backlog_detail(),
+            27,
+            None,
+            Some(30.0),
+            3,
+            4,
+            None,
+        )
+        .join("\n");
         assert!(text.contains("30GB VRAM available"));
     }
 
     #[test]
     fn backlog_warns_when_vram_full() {
-        let text =
-            format_kv_admission_backlog_issue(&sample_backlog_detail(), 27, None, Some(1.0), 3, 4)
-                .join("\n");
+        let text = format_kv_admission_backlog_issue(
+            &sample_backlog_detail(),
+            27,
+            None,
+            Some(1.0),
+            3,
+            4,
+            None,
+        )
+        .join("\n");
         assert!(text.contains("GPU at VRAM capacity"));
     }
 
     #[test]
     fn backlog_generic_when_headroom_unknown() {
         let text =
-            format_kv_admission_backlog_issue(&sample_backlog_detail(), 27, None, None, 3, 4)
+            format_kv_admission_backlog_issue(&sample_backlog_detail(), 27, None, None, 3, 4, None)
                 .join("\n");
         assert!(text.contains("if VRAM headroom exists"));
     }
@@ -759,9 +789,11 @@ mod tests {
     #[test]
     fn backlog_omits_confidence_until_significant() {
         let d = sample_backlog_detail();
-        let single = format_kv_admission_backlog_issue(&d, 27, None, Some(30.0), 1, 1).join("\n");
+        let single =
+            format_kv_admission_backlog_issue(&d, 27, None, Some(30.0), 1, 1, None).join("\n");
         assert!(!single.contains("Confidence:"));
-        let stable = format_kv_admission_backlog_issue(&d, 27, None, Some(30.0), 3, 4).join("\n");
+        let stable =
+            format_kv_admission_backlog_issue(&d, 27, None, Some(30.0), 3, 4, None).join("\n");
         assert!(stable.contains("Confidence: Medium-High"));
     }
 
@@ -778,14 +810,14 @@ mod tests {
             num_requests_waiting: Some(5.0),
             ..Default::default()
         };
-        let text = format_kv_cache_pressure_fired(&d, &snap(v), 1, 1, None).join("\n");
+        let text = format_kv_cache_pressure_fired(&d, &snap(v), 1, 1, None, None).join("\n");
         assert!(text.contains("Wait queue drains"));
         assert!(!text.contains("evictions stop"));
     }
 
     #[test]
     fn fp8_kv_cache_bullet_reflects_nvcc_availability() {
-        let bullet = fp8_kv_cache_fix_bullet();
+        let bullet = fp8_kv_cache_fix_bullet(None).expect("bullet");
         assert!(bullet.contains("Switch to fp8 KV cache (--kv-cache-dtype fp8)"));
         if std::path::Path::new(NVCC_PATH).exists() {
             assert!(!bullet.contains("requires nvcc"));
@@ -793,5 +825,10 @@ mod tests {
             assert!(bullet.contains("(requires nvcc)"));
             assert!(!bullet.contains("not available on this host"));
         }
+    }
+
+    #[test]
+    fn fp8_kv_cache_bullet_suppressed_on_ampere() {
+        assert!(fp8_kv_cache_fix_bullet(Some("ampere")).is_none());
     }
 }

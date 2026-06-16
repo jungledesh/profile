@@ -275,29 +275,6 @@ pub fn calculate_direction(
     evaluate_direction(delta)
 }
 
-/// Human-readable signal detail for direction output (no label prefix).
-pub fn direction_detail(delta: &Delta) -> String {
-    // Mixed: reason is already on the Result line — show raw signals here instead.
-    if delta.direction != Direction::Mixed {
-        if let Some(reason) = delta.direction_reason {
-            return reason.to_string();
-        }
-    }
-    let tput = delta
-        .throughput_delta_pct
-        .map(|p| format!("tput Δ: {:+.1}%", p))
-        .unwrap_or_else(|| "tput: n/a".to_string());
-    let ttft = delta
-        .ttft_p95_delta_pct
-        .map(|p| format!("ttft_p95 Δ: {:+.1}%", p))
-        .unwrap_or_else(|| "ttft_p95: n/a".to_string());
-    let tpot = delta
-        .tpot_p95_delta_pct
-        .map(|p| format!("tpot_p95 Δ: {:+.1}%", p))
-        .unwrap_or_else(|| "tpot_p95: n/a".to_string());
-    format!("{}  {}  {}", tput, ttft, tpot)
-}
-
 pub fn compute(
     prev_result: &DiagnoseResult,
     prev_report: &Report,
@@ -688,26 +665,6 @@ mod tests {
     #[test]
     fn pct_delta_returns_correct_value() {
         assert!((pct_delta(Some(100.0), Some(110.0)).unwrap() - 10.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn direction_detail_mixed_shows_signals_not_reason() {
-        let mut d = mk_delta(Some(15.0), Some(100.0), Some(95.0), Some(50.0), Some(60.0));
-        d.direction = Direction::Mixed;
-        d.direction_reason = Some("throughput up, TPOT degraded; KV cache pressure likely");
-        let detail = direction_detail(&d);
-        assert!(
-            !detail.contains("KV cache pressure"),
-            "Mixed detail should show signals, not repeat the reason"
-        );
-        assert!(
-            detail.contains("tput Δ"),
-            "Mixed detail should show tput signal"
-        );
-        assert!(
-            detail.contains("tpot_p95 Δ"),
-            "Mixed detail should show tpot_p95 signal"
-        );
     }
 
     #[test]
