@@ -526,6 +526,7 @@ fn build_report_from_eval(eval: &WindowRuleEval, summary: AnalysisInput<'_>) -> 
             eval.r2_fired,
             eval.n_eval,
             max_model_len,
+            kv_headroom_gb,
         );
         recs.push(Recommendation {
             rule_name: "kv_cache_pressure",
@@ -845,6 +846,7 @@ pub fn format_diagnose_rules_for_windows(
             r2_fired,
             n_eval,
             summary.ctx.config.max_model_len,
+            summary_baseline.as_ref().and_then(|b| b.kv_headroom_gb),
         );
         warnings.extend(block);
         warnings.push(String::new());
@@ -1360,7 +1362,7 @@ mod tests {
         let mut v = vllm_high_kv();
         v.num_preemptions_per_sec = Some(0.05);
         let s = snap(t, t, v, gpu_low());
-        let r = r2_recommendation(&s, None, 1, 4).expect("fired");
+        let r = r2_recommendation(&s, None, None, 1, 4).expect("fired");
         assert_eq!(r.rule_name, "kv_cache_pressure");
         assert_eq!(r.impact, 5);
         assert!((r.confidence - 0.5).abs() < 1e-9);
@@ -1374,7 +1376,7 @@ mod tests {
         v.kv_cache_peak_perc = Some(99.4);
         v.num_preemptions_per_sec = Some(0.05);
         let s = snap(t, t, v, gpu_low());
-        let r = r2_recommendation(&s, None, 1, 1).expect("fired");
+        let r = r2_recommendation(&s, None, None, 1, 1).expect("fired");
         let text = r.display_lines.join("\n");
         assert!(text.contains("KV cache hit 99.4% peak (threshold: 88%)"));
     }
@@ -1444,7 +1446,7 @@ mod tests {
         let s_kv_only = snap(t, t, vllm_high_kv_stressed(), gpu_busy());
         let ctx2 = mk_ctx();
         let win_kv_only = mk_win(s_kv_only);
-        let r2_text = r2_recommendation(&win_kv_only.snapshot, None, 1, 1)
+        let r2_text = r2_recommendation(&win_kv_only.snapshot, None, None, 1, 1)
             .expect("r2 fired")
             .display_lines
             .join("\n");

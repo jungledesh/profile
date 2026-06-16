@@ -41,7 +41,13 @@ pub fn build_report(input: AnalysisInput<'_>) -> Report {
 
     let mut recs: Vec<Recommendation> = [
         rules::r1_recommendation(snapshot, input.ctx.config.max_num_seqs),
-        rules::r2_recommendation(snapshot, input.ctx.config.max_model_len, r2_fired, n_eval),
+        rules::r2_recommendation(
+            snapshot,
+            input.ctx.config.max_model_len,
+            baseline.as_ref().and_then(|b| b.kv_headroom_gb),
+            r2_fired,
+            n_eval,
+        ),
         rules::r3_recommendation(snapshot),
         rules::r4_recommendation(
             baseline.as_ref().and_then(|b| b.kv_headroom_gb),
