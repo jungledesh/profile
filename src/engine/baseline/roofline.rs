@@ -1,3 +1,4 @@
+use crate::collectors::config::DEFAULT_GPU_MEMORY_UTILIZATION;
 use crate::context::{gpu_prices, AnalysisInput};
 
 use super::math;
@@ -99,34 +100,36 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
     });
 
     let ceiling = decode.expected;
-    let num_running = input
-        .window
-        .snapshot
-        .vllm
-        .num_requests_running
-        .filter(|v| v.is_finite() && *v > 0.0);
 
-    let efficiency_pct = input
+    // hw_efficiency_pct: fraction of absolute hardware ceiling being used.
+    // Denominator is fixed at ceiling × ridge_batch_size (the compute ceiling) —
+    // independent of current traffic. This is the ROI metric: an idle server
+    // with 1 request reads low, correctly.
+    let hw_efficiency_pct = input
         .window
         .snapshot
         .vllm
         .generation_tokens_per_sec
         .filter(|v| v.is_finite() && *v > 0.0)
-        .zip(num_running)
-        .and_then(|(actual, running)| {
-            let aggregate_ceiling = ceiling * running;
-            if actual <= aggregate_ceiling {
-                let pct = math::efficiency_pct(actual, aggregate_ceiling);
-                pct.is_finite().then_some(pct)
-            } else {
-                None
-            }
-        });
+        .map(|actual| {
+            let absolute_ceiling = ceiling * ridge_batch_size;
+            let pct = math::efficiency_pct(actual, absolute_ceiling);
+            pct.min(100.0) // clamp: actual cannot exceed compute ceiling in practice
+        })
+        .filter(|pct| pct.is_finite());
+
+    let efficiency_pct = hw_efficiency_pct; // feeds PhysicsBaseline; name kept for all downstream
 
     let headroom_pct = efficiency_pct.map(|raw| 100.0 - raw.min(100.0));
 
     let weight_gb = math::weight_gb(weight_params, bits_per_param);
-    let kv_headroom_gb = ctx.gpu.vram_gb.map(|vram| vram - (weight_gb / tp));
+    let kv_headroom_gb = ctx.gpu.vram_gb.map(|vram| {
+        let gpu_util = ctx
+            .config
+            .gpu_memory_utilization
+            .unwrap_or(DEFAULT_GPU_MEMORY_UTILIZATION);
+        (vram * gpu_util) - math::ACTIVATION_KV_BUFFER_GB - (weight_gb / tp)
+    });
     let tpot_floor_ms = math::latency_floor_ms(decode.expected);
     let prefill_latency_floor_ms = prefill.map(|p| math::latency_floor_ms(p.expected));
 
@@ -525,14 +528,14 @@ mod tests {
     }
 
     #[test]
-    fn efficiency_none_when_actual_above_decode_ceiling() {
+    fn efficiency_clamped_at_100_when_above_hardware_ceiling() {
         let cfg = VllmConfig {
             kv_cache_dtype: Some("bf16".to_string()),
             max_model_len: Some(2048),
             ..Default::default()
         };
         let snap = VllmRawMetrics {
-            generation_tokens_per_sec: Some(300.0),
+            generation_tokens_per_sec: Some(10_000.0),
             num_requests_running: Some(1.0),
             ..Default::default()
         };
@@ -547,13 +550,14 @@ mod tests {
         );
         let input = AnalysisInput::new(&ctx, &win);
         let b = compute(&input).expect("baseline");
-        let ceiling = b.decode.expected;
+        let absolute_ceiling = b.decode.expected * b.ridge_batch_size;
         assert!(
-            300.0 > ceiling,
-            "test setup: actual must exceed ceiling (ceiling={ceiling})"
+            10_000.0 > absolute_ceiling,
+            "test setup: actual must exceed hardware ceiling (ceiling={absolute_ceiling})"
         );
-        assert!(b.efficiency_pct.is_none());
-        assert!(b.headroom_pct.is_none());
+        let eff = b.efficiency_pct.expect("efficiency");
+        assert!((eff - 100.0).abs() < 1e-9);
+        assert!((b.headroom_pct.expect("headroom") - 0.0).abs() < 1e-9);
     }
 
     #[test]
@@ -735,14 +739,14 @@ mod tests {
     }
 
     #[test]
-    fn efficiency_accounts_for_batch_size() {
+    fn hw_efficiency_uses_absolute_hardware_ceiling() {
         let cfg = VllmConfig {
             kv_cache_dtype: Some("bf16".to_string()),
             max_model_len: Some(2048),
             ..Default::default()
         };
         let snap = VllmRawMetrics {
-            generation_tokens_per_sec: Some(6043.0),
+            generation_tokens_per_sec: Some(4000.0),
             num_requests_running: Some(64.0),
             ..Default::default()
         };
@@ -757,19 +761,53 @@ mod tests {
         );
         let input = AnalysisInput::new(&ctx, &win);
         let b = compute(&input).expect("baseline");
-        let per_seq_ceiling = b.decode.expected;
-        let aggregate_ceiling = per_seq_ceiling * 64.0;
-        let expected = math::efficiency_pct(6043.0, aggregate_ceiling);
+        let absolute_ceiling = b.decode.expected * b.ridge_batch_size;
+        let expected = math::efficiency_pct(4000.0, absolute_ceiling);
         let eff = b.efficiency_pct.expect("efficiency");
         assert!(
             (eff - expected).abs() < 0.05,
             "expected ~{expected:.1}%, got {eff:.1}%"
         );
-        assert!((eff - 31.5).abs() < 0.5, "expected ~31.5%, got {eff:.1}%");
     }
 
     #[test]
-    fn efficiency_none_when_num_running_zero() {
+    fn hw_efficiency_is_traffic_independent() {
+        let cfg = VllmConfig {
+            kv_cache_dtype: Some("bf16".to_string()),
+            max_model_len: Some(2048),
+            ..Default::default()
+        };
+        let actual_tps = 4000.0;
+        let mut efficiencies = Vec::new();
+        for running in [1.0, 4.0, 8.0, 16.0, 32.0] {
+            let snap = VllmRawMetrics {
+                generation_tokens_per_sec: Some(actual_tps),
+                num_requests_running: Some(running),
+                ..Default::default()
+            };
+            let (ctx, win) = baseline_input(
+                Some(8_000_000_000),
+                None,
+                Some("bf16"),
+                Some(67.0),
+                Some(4800.0),
+                cfg.clone(),
+                snap,
+            );
+            let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+            efficiencies.push(b.efficiency_pct.expect("efficiency"));
+        }
+        let first = efficiencies[0];
+        for (i, eff) in efficiencies.iter().enumerate().skip(1) {
+            assert!(
+                (eff - first).abs() < 1e-9,
+                "running index {i}: expected {first}, got {eff}"
+            );
+        }
+    }
+
+    #[test]
+    fn efficiency_some_when_num_running_zero() {
         let cfg = VllmConfig {
             kv_cache_dtype: Some("bf16".to_string()),
             max_model_len: Some(2048),
@@ -791,12 +829,12 @@ mod tests {
         );
         let input = AnalysisInput::new(&ctx, &win);
         let b = compute(&input).expect("baseline");
-        assert!(b.efficiency_pct.is_none());
-        assert!(b.headroom_pct.is_none());
+        assert!(b.efficiency_pct.is_some());
+        assert!(b.headroom_pct.is_some());
     }
 
     #[test]
-    fn efficiency_none_when_num_running_missing() {
+    fn efficiency_some_when_num_running_missing() {
         let cfg = VllmConfig {
             kv_cache_dtype: Some("bf16".to_string()),
             max_model_len: Some(2048),
@@ -818,8 +856,8 @@ mod tests {
         );
         let input = AnalysisInput::new(&ctx, &win);
         let b = compute(&input).expect("baseline");
-        assert!(b.efficiency_pct.is_none());
-        assert!(b.headroom_pct.is_none());
+        assert!(b.efficiency_pct.is_some());
+        assert!(b.headroom_pct.is_some());
     }
 
     #[test]
@@ -1073,9 +1111,11 @@ mod tests {
         let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
         assert!((b.weight_gb - 140.0).abs() < 1e-3);
         let headroom = b.kv_headroom_gb.expect("kv headroom");
+        let expected =
+            (80.0 * DEFAULT_GPU_MEMORY_UTILIZATION) - math::ACTIVATION_KV_BUFFER_GB - (140.0 / 2.0);
         assert!(
-            (headroom - 10.0).abs() < 1e-3,
-            "expected +10GB headroom per GPU, got {headroom}"
+            (headroom - expected).abs() < 1e-3,
+            "expected {expected}GB kv headroom per GPU, got {headroom}"
         );
     }
 

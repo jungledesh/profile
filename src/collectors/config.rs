@@ -6,6 +6,9 @@ use crate::collectors::RawSnapshot;
 // 2s is enough for a local vLLM; longer hangs are user-visible at startup.
 const API_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// vLLM default when --gpu-memory-utilization is not set.
+pub const DEFAULT_GPU_MEMORY_UTILIZATION: f64 = 0.90;
+
 /// vLLM deployment configuration.
 /// All fields `Option<T>` — graceful degradation when sources are unavailable.
 #[derive(Debug, Clone, Default, PartialEq)]

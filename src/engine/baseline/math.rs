@@ -1,5 +1,8 @@
+/// Conservative activation memory buffer vLLM reserves inside the allocated VRAM block.
+pub const ACTIVATION_KV_BUFFER_GB: f64 = 3.0;
+
 pub fn prefill_ceiling_tps(peak_flops_f32_tflops: f64, param_count: u64, seq_len: u32) -> f64 {
-    (peak_flops_f32_tflops * 1e12_f64) / (6.0 * param_count as f64 * seq_len as f64)
+    (peak_flops_f32_tflops * 1e12_f64) / (2.0 * param_count as f64 * seq_len as f64)
 }
 
 pub fn decode_ceiling_tps(peak_bw_gbps: f64, param_count: u64, bits_per_param: u8) -> f64 {
@@ -23,7 +26,7 @@ pub fn latency_floor_ms(ceiling_tps: f64) -> f64 {
 /// Batch size at which decode transitions from memory-BW-bound to compute-bound.
 /// Below this: throughput limited by peak_bw. At or above: limited by peak_flops.
 pub fn ridge_batch_size(peak_flops_f32_tflops: f64, peak_bw_gbps: f64, bits_per_param: u8) -> f64 {
-    (peak_flops_f32_tflops * 1e12 * bits_per_param as f64) / (peak_bw_gbps * 1e9 * 8.0)
+    (peak_flops_f32_tflops * 1e12 * bits_per_param as f64) / (peak_bw_gbps * 1e9 * 16.0)
 }
 
 #[cfg(test)]
@@ -34,7 +37,7 @@ mod tests {
     fn prefill_happy_path() {
         let tps = prefill_ceiling_tps(67.0, 70_000_000_000, 2048);
         assert!(tps.is_finite());
-        assert!(tps > 0.0);
+        assert!((tps - 0.233_677_455_357_142_85).abs() < 1e-15);
     }
 
     #[test]
@@ -87,23 +90,23 @@ mod tests {
 
     #[test]
     fn ridge_batch_size_h100_sxm_bf16() {
-        // (67e12 × 16) / (3350e9 × 8) ≈ 40.0
+        // (67e12 × 16) / (3350e9 × 16) = 20.0
         let r = ridge_batch_size(67.0, 3350.0, 16);
-        assert!((r - 40.0).abs() < 0.05);
+        assert!((r - 20.0).abs() < 0.05);
     }
 
     #[test]
     fn ridge_batch_size_a100_80gb_bf16() {
-        // (19.5e12 × 16) / (2039e9 × 8) ≈ 19.1
+        // (19.5e12 × 16) / (2039e9 × 16) = 9.564
         let r = ridge_batch_size(19.5, 2039.0, 16);
-        assert!((r - 19.127).abs() < 0.05);
+        assert!((r - 9.564).abs() < 0.05);
     }
 
     #[test]
     fn ridge_batch_size_l40s_fp8() {
-        // (91.6e12 × 8) / (864e9 × 8) ≈ 106.0
+        // (91.6e12 × 8) / (864e9 × 16) = 53.009
         let r = ridge_batch_size(91.6, 864.0, 8);
-        assert!((r - 106.0185).abs() < 0.1);
+        assert!((r - 53.009).abs() < 0.1);
     }
 
     #[test]

@@ -44,7 +44,7 @@ pub(crate) fn scrape_from_body(body: &str) -> Result<Scrape> {
         .context("failed to parse Prometheus text format")
 }
 
-/// KV cache fill ratio 0–100, same as last scrape in `parse_vllm_metrics`.
+/// vLLM emits KV cache usage as a 0–1 ratio; ×100 converts to 0–100 for all downstream consumers.
 fn kv_cache_usage_perc_from_scrape(scrape: &Scrape) -> Option<f64> {
     first_gauge(scrape, "vllm_kv_cache_usage_perc")
         .or_else(|| first_gauge(scrape, "vllm_gpu_cache_usage_perc"))
@@ -379,8 +379,19 @@ pub(crate) fn merge_p99_bucket_vecs(vecs: &[&[HistogramCount]]) -> Vec<Histogram
     let bounds: Vec<f64> = vecs[0].iter().map(|b| b.less_than).collect();
     let mut merged: Vec<f64> = vecs[0].iter().map(|b| b.count).collect();
     for v in &vecs[1..] {
+        // Length mismatch: bucket schema changed (vLLM version skew or malformed scrape).
+        // Skip this window rather than aborting — one bad window should not destroy
+        // all accumulated data from the rest of the session.
         if v.len() != bounds.len() {
-            return Vec::new();
+            continue;
+        }
+        // Boundary mismatch: same bucket count but different `le` values — bins are
+        // incompatible and cannot be summed. Skip rather than produce a corrupt merge.
+        if v.iter()
+            .zip(bounds.iter())
+            .any(|(b, &expected)| (b.less_than - expected).abs() > 1e-9)
+        {
+            continue;
         }
         for (sum, b) in merged.iter_mut().zip(v.iter()) {
             *sum += b.count;
@@ -1275,7 +1286,7 @@ vllm:info{dtype="half",model_name="mistral"} 1.0
         }
 
         #[test]
-        fn merge_p99_bucket_vecs_boundary_mismatch_returns_empty() {
+        fn merge_p99_bucket_vecs_boundary_mismatch_returns_first_only() {
             let a = vec![
                 HistogramCount {
                     less_than: 0.1,
@@ -1300,7 +1311,51 @@ vllm:info{dtype="half",model_name="mistral"} 1.0
                     count: 20.0,
                 },
             ];
-            assert!(merge_p99_bucket_vecs(&[&a, &b]).is_empty());
+            let merged = merge_p99_bucket_vecs(&[&a, &b]);
+            assert_eq!(merged.len(), 2);
+            assert_eq!(merged[0].count, 50.0);
+            assert_eq!(merged[1].count, 50.0);
+        }
+
+        fn buckets_3(le_counts: [(f64, f64); 3]) -> Vec<HistogramCount> {
+            le_counts
+                .into_iter()
+                .map(|(less_than, count)| HistogramCount { less_than, count })
+                .collect()
+        }
+
+        #[test]
+        fn merge_p99_skips_length_mismatch_window() {
+            let w1 = buckets_3([(0.1, 10.0), (0.2, 20.0), (f64::INFINITY, 30.0)]);
+            let w2 = vec![
+                HistogramCount {
+                    less_than: 0.1,
+                    count: 5.0,
+                },
+                HistogramCount {
+                    less_than: f64::INFINITY,
+                    count: 5.0,
+                },
+            ];
+            let w3 = buckets_3([(0.1, 1.0), (0.2, 2.0), (f64::INFINITY, 3.0)]);
+            let expected = merge_p99_bucket_vecs(&[&w1, &w3]);
+            let merged = merge_p99_bucket_vecs(&[&w1, &w2, &w3]);
+            assert_eq!(merged, expected);
+        }
+
+        #[test]
+        fn merge_p99_skips_boundary_mismatch_window() {
+            let w1 = buckets_3([(0.1, 10.0), (0.2, 20.0), (f64::INFINITY, 30.0)]);
+            let w2 = buckets_3([(0.1, 100.0), (0.5, 200.0), (f64::INFINITY, 300.0)]);
+            let w3 = buckets_3([(0.1, 1.0), (0.2, 2.0), (f64::INFINITY, 3.0)]);
+            let expected = merge_p99_bucket_vecs(&[&w1, &w3]);
+            let merged = merge_p99_bucket_vecs(&[&w1, &w2, &w3]);
+            assert_eq!(merged, expected);
+        }
+
+        #[test]
+        fn merge_p99_returns_empty_when_all_windows_mismatch() {
+            assert!(merge_p99_bucket_vecs(&[&[], &[], &[]]).is_empty());
         }
     }
 }

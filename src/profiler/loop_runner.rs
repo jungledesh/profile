@@ -23,33 +23,42 @@ pub fn run(
     let mut current_max_num_seqs = max_num_seqs;
 
     loop {
-        let Some(rule_name) = state
-            .last()
-            .report
-            .groups
-            .first()
-            .map(|g| g.primary.rule_name)
-        else {
-            let baseline = state.last().report.baseline.as_ref();
-            let efficiency = baseline.and_then(|b| b.efficiency_pct);
-            let ridge_batch_size = baseline.map(|b| b.ridge_batch_size);
-            let tpot_floor_ms = baseline.map(|b| b.tpot_floor_ms);
-            let kv_cache_usage_perc = state.last().result.snapshot.vllm.kv_cache_usage_perc;
-            let num_running = state.last().result.snapshot.vllm.num_requests_running;
-            let tpot_ms = state.last().result.snapshot.vllm.tpot_ms;
-            let chunked_prefill_enabled =
-                state.last().result.static_ctx.config.enable_chunked_prefill;
-            let msg = healthy_exit_message(
-                efficiency,
-                kv_cache_usage_perc,
-                num_running,
-                ridge_batch_size,
-                tpot_ms,
-                tpot_floor_ms,
-                chunked_prefill_enabled,
-            );
-            println!("\n{msg}");
-            break;
+        let (rule_name, prev_result, prev_report) = {
+            let Some(last_state) = state.last() else {
+                break;
+            };
+            let Some(rule_name) = last_state
+                .report
+                .groups
+                .first()
+                .map(|g| g.primary.rule_name)
+            else {
+                let baseline = last_state.report.baseline.as_ref();
+                let efficiency = baseline.and_then(|b| b.efficiency_pct);
+                let ridge_batch_size = baseline.map(|b| b.ridge_batch_size);
+                let tpot_floor_ms = baseline.map(|b| b.tpot_floor_ms);
+                let kv_cache_usage_perc = last_state.result.snapshot.vllm.kv_cache_usage_perc;
+                let num_running = last_state.result.snapshot.vllm.num_requests_running;
+                let tpot_ms = last_state.result.snapshot.vllm.tpot_ms;
+                let chunked_prefill_enabled =
+                    last_state.result.static_ctx.config.enable_chunked_prefill;
+                let msg = healthy_exit_message(
+                    efficiency,
+                    kv_cache_usage_perc,
+                    num_running,
+                    ridge_batch_size,
+                    tpot_ms,
+                    tpot_floor_ms,
+                    chunked_prefill_enabled,
+                );
+                println!("\n{msg}");
+                break;
+            };
+            (
+                rule_name,
+                last_state.result.clone(),
+                last_state.report.clone(),
+            )
         };
 
         if state.is_oscillating() {
@@ -142,15 +151,14 @@ pub fn run(
         let summary = AnalysisInput::new(&new_result.static_ctx, &agg_win);
         let new_report = engine::build_report_for_diagnose(&new_result.windows, summary);
 
-        let drifted =
-            drift::config_changed(&state.last().result.static_ctx, &new_result.static_ctx);
+        let drifted = drift::config_changed(&prev_result.static_ctx, &new_result.static_ctx);
         if drifted {
             println!("Config change detected, re-baselined.");
         }
 
         let d = delta::compute(
-            &state.last().result,
-            &state.last().report,
+            &prev_result,
+            &prev_report,
             &new_result,
             &new_report,
             drifted,
@@ -169,9 +177,7 @@ pub fn run(
             break;
         }
 
-        let applied_short_action = state
-            .last()
-            .report
+        let applied_short_action = prev_report
             .groups
             .first()
             .map(|g| g.primary.short_action.as_str());
@@ -184,7 +190,7 @@ pub fn run(
             let choice = read_worse_regression_choice(&stdin_rx, &mut io::stdout())?;
             match choice {
                 WorseRegressionChoice::Continue => {
-                    for line in direction_followup_lines(delta::Direction::NoChange, next_fix) {
+                    for line in direction_followup_lines(delta::Direction::Worse, next_fix) {
                         println!("{line}");
                     }
                     let _ = apply_worse_regression_choice(
@@ -242,7 +248,7 @@ fn healthy_exit_message(
                 .map(|k| format!(" KV cache at {k:.0}%."))
                 .unwrap_or_default();
             format!(
-                "Primary Limiter: VRAM Capacity\n\
+                "Primary Limiter: KV Cache Capacity\n\
                  {eff_str} —{kv} concurrency is capped before bandwidth saturates.\n\
                  Levers: enable prefix caching, apply KV quantization (FP8), or add TP to split KV cache."
             )
@@ -284,10 +290,14 @@ fn healthy_exit_message(
         }
     };
 
-    let prefix = if limiter.is_some() {
-        "Rules clear. Server is optimally tuned for current constraints."
-    } else {
-        "Rules clear."
+    let prefix = match limiter {
+        Some(engine::limiter::PrimaryLimiter::Traffic) => {
+            "Rules clear. Server is under-utilized — not enough incoming traffic to stress the hardware."
+        }
+        Some(_) => {
+            "Rules clear. Server is optimally tuned for current constraints."
+        }
+        None => "Rules clear.",
     };
     format!("{prefix}\n\n{limiter_block}")
 }
@@ -298,7 +308,12 @@ fn direction_followup_lines(
 ) -> Vec<String> {
     let mut lines = Vec::new();
     match direction {
-        delta::Direction::Worse => {}
+        delta::Direction::Worse => {
+            if let Some(fix) = short_action {
+                lines.push("Override accepted. Keeping degraded configuration.".to_string());
+                lines.push(format!("Apply fix: {fix}, then re-measure."));
+            }
+        }
         delta::Direction::Mixed => {
             // Direction line carries the reason. Nothing to add.
         }
@@ -337,9 +352,12 @@ pub(crate) fn read_worse_regression_choice(
     loop {
         write!(prompt, "> ")?;
         prompt.flush()?;
-        let line = stdin_rx
-            .recv()
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stdin closed"))?;
+        let line = match stdin_rx.recv() {
+            Ok(l) => l,
+            // EOF (non-interactive shell, CI, piped input) — default to Revert.
+            // Keeps degraded config out and exits cleanly without a panic.
+            Err(_) => return Ok(WorseRegressionChoice::Revert),
+        };
         if let Some(choice) = parse_worse_regression_choice(&line) {
             return Ok(choice);
         }
@@ -386,13 +404,13 @@ fn print_delta(d: &delta::Delta) {
             let delta = after - before;
             if delta.abs() > 5.0 {
                 let arrow = latency_arrow(delta);
-                let p99_suffix = match (d.ttft_p99_before_ms, d.ttft_p99_after_ms) {
+                let p95_suffix = match (d.ttft_p95_before_ms, d.ttft_p95_after_ms) {
                     (Some(pb), Some(pa)) if pb.is_finite() && pa.is_finite() => {
-                        format!("  (p99 {pb:.0} → {pa:.0}ms {})", latency_arrow(pa - pb))
+                        format!("  (p95 {pb:.0} → {pa:.0}ms {})", latency_arrow(pa - pb))
                     }
                     _ => String::new(),
                 };
-                println!("  TTFT        {before:.0} → {after:.0}ms {arrow}{p99_suffix}");
+                println!("  TTFT        {before:.0} → {after:.0}ms {arrow}{p95_suffix}");
             }
         }
     }
@@ -401,13 +419,13 @@ fn print_delta(d: &delta::Delta) {
             let delta = after - before;
             if delta.abs() > 0.5 {
                 let arrow = latency_arrow(delta);
-                let p99_suffix = match (d.tpot_p99_before_ms, d.tpot_p99_after_ms) {
+                let p95_suffix = match (d.tpot_p95_before_ms, d.tpot_p95_after_ms) {
                     (Some(pb), Some(pa)) if pb.is_finite() && pa.is_finite() => {
-                        format!("  (p99 {pb:.1} → {pa:.1}ms {})", latency_arrow(pa - pb))
+                        format!("  (p95 {pb:.1} → {pa:.1}ms {})", latency_arrow(pa - pb))
                     }
                     _ => String::new(),
                 };
-                println!("  TPOT        {before:.1} → {after:.1}ms {arrow}{p99_suffix}");
+                println!("  TPOT        {before:.1} → {after:.1}ms {arrow}{p95_suffix}");
             }
         }
     }
@@ -575,7 +593,7 @@ mod tests {
             Some(5.0),
             Some(false),
         );
-        assert!(msg.contains("VRAM Capacity"));
+        assert!(msg.contains("KV Cache Capacity"));
         assert!(msg.contains("Efficiency: 42.5%"));
         assert!(msg.contains("KV cache at 85%"));
     }
@@ -593,6 +611,23 @@ mod tests {
         );
         assert!(msg.contains("Traffic Density"));
         assert!(msg.contains("Efficiency: 34.0%"));
+        assert!(msg.contains("under-utilized"));
+        assert!(!msg.contains("optimally tuned"));
+    }
+
+    #[test]
+    fn traffic_limiter_does_not_say_optimally_tuned() {
+        let msg = healthy_exit_message(
+            Some(34.0),
+            Some(50.0),
+            Some(5.0),
+            Some(100.0),
+            Some(20.0),
+            Some(5.0),
+            Some(false),
+        );
+        assert!(msg.contains("under-utilized"));
+        assert!(!msg.contains("optimally tuned"));
     }
 
     #[test]
@@ -687,10 +722,19 @@ mod tests {
     }
 
     #[test]
-    fn direction_followup_worse_is_empty() {
-        let lines =
-            direction_followup_lines(delta::Direction::Worse, Some("increase client concurrency"));
+    fn direction_followup_worse_is_empty_without_short_action() {
+        let lines = direction_followup_lines(delta::Direction::Worse, None);
         assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn continue_after_worse_shows_override_message() {
+        let fix = "raise --max-num-seqs above 32";
+        let lines = direction_followup_lines(delta::Direction::Worse, Some(fix));
+        let text = lines.join("\n");
+        assert!(text.contains("Override accepted"));
+        assert!(text.contains(fix));
+        assert!(!text.contains("No significant change"));
     }
 
     #[test]
@@ -742,7 +786,12 @@ mod tests {
             WorseRegressionChoice::Continue,
         ));
         assert_eq!(
-            s.last().result.snapshot.vllm.generation_tokens_per_sec,
+            s.last()
+                .unwrap()
+                .result
+                .snapshot
+                .vllm
+                .generation_tokens_per_sec,
             Some(80.0)
         );
     }
@@ -762,7 +811,12 @@ mod tests {
             WorseRegressionChoice::Revert,
         ));
         assert_eq!(
-            s.last().result.snapshot.vllm.generation_tokens_per_sec,
+            s.last()
+                .unwrap()
+                .result
+                .snapshot
+                .vllm
+                .generation_tokens_per_sec,
             Some(100.0)
         );
     }
@@ -860,6 +914,8 @@ mod tests {
             ttft_p99_delta_pct: None,
             ttft_p95_delta_pct: None,
             tpot_p95_delta_pct: None,
+            tpot_floor_ms: None,
+            prefill_latency_floor_ms: None,
             config_drifted: false,
         };
         assert!(economics_section_active(&d));
@@ -896,6 +952,8 @@ mod tests {
             ttft_p99_delta_pct: None,
             ttft_p95_delta_pct: None,
             tpot_p95_delta_pct: None,
+            tpot_floor_ms: None,
+            prefill_latency_floor_ms: None,
             config_drifted: false,
         };
         assert!(recoverable_waste_available(&d));

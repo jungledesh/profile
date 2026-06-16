@@ -260,7 +260,11 @@ fn not_triggered_from_fired_names(
     if !fired_names.contains("under_batching") {
         names.push("Under-batching");
     }
-    if !fired_names.contains("kv_cache_pressure") && !r2_suppressed_by_r4 && !r2_adv_present {
+    if !fired_names.contains("kv_cache_pressure")
+        && !fired_names.contains("kv_admission_backlog")
+        && !r2_suppressed_by_r4
+        && !r2_adv_present
+    {
         names.push("KV cache pressure");
     }
     if !fired_names.contains("oom_risk") && !r4_adv_present {
@@ -707,6 +711,29 @@ pub fn format_diagnose_rules_for_windows(
         return no_evaluable_diagnose_lines(verbose_rules, windows);
     }
 
+    if eval.n_eval < ENGINE_MIN_PERSISTENT_WINDOWS {
+        let mut out = vec![
+            "[!] Insufficient Sustained Load".to_string(),
+            String::new(),
+            format!(
+                "  Traffic detected but too brief for reliable diagnosis. \
+                 Required: {} evaluable windows. Captured: {}{}.",
+                ENGINE_MIN_PERSISTENT_WINDOWS,
+                eval.n_eval,
+                if eval.skipped > 0 {
+                    format!(" ({} windows dropped)", eval.skipped)
+                } else {
+                    String::new()
+                }
+            ),
+            String::new(),
+            "  Fix:".to_string(),
+            "    • Maintain steady traffic for the full diagnostic duration.".to_string(),
+        ];
+        trim_trailing_blank_lines(&mut out);
+        return out;
+    }
+
     let total = eval.total;
     let skipped = eval.skipped;
     let n_eval = eval.n_eval;
@@ -777,6 +804,26 @@ pub fn format_diagnose_rules_for_windows(
     let r3_significant = rule_is_significant(r3_fired, n_eval);
     let r5_significant = rule_is_significant(r5_fired, n_eval);
 
+    let r4 = r4_recommendation(
+        summary_baseline.as_ref().and_then(|b| b.kv_headroom_gb),
+        summary.ctx.config.tensor_parallel_size,
+        summary_baseline.as_ref().map(|b| b.weight_gb),
+        summary.ctx.gpu.vram_gb,
+        summary.ctx.config.gpu_memory_utilization,
+        summary_baseline
+            .as_ref()
+            .map(|b| b.weight_dtype_source)
+            .unwrap_or(WeightDtypeSource::Fallback),
+    );
+    let r2_suppressed_by_r4_display = r4.is_some();
+    let r4_groups: Vec<_> = r4
+        .into_iter()
+        .map(|r| IssueGroup {
+            primary: r,
+            secondary: Vec::new(),
+        })
+        .collect();
+
     let mut warnings = Vec::new();
 
     if r1_significant {
@@ -789,7 +836,7 @@ pub fn format_diagnose_rules_for_windows(
         warnings.push(String::new());
     }
 
-    if r2_significant {
+    if r2_significant && !r2_suppressed_by_r4_display {
         let r2_agg = aggregate_r2_detail(r2_details);
         let block = format_kv_cache_window_issue(
             &r2_agg,
@@ -840,25 +887,6 @@ pub fn format_diagnose_rules_for_windows(
         warnings.push(String::new());
     }
 
-    let r4 = r4_recommendation(
-        summary_baseline.as_ref().and_then(|b| b.kv_headroom_gb),
-        summary.ctx.config.tensor_parallel_size,
-        summary_baseline.as_ref().map(|b| b.weight_gb),
-        summary.ctx.gpu.vram_gb,
-        summary.ctx.config.gpu_memory_utilization,
-        summary_baseline
-            .as_ref()
-            .map(|b| b.weight_dtype_source)
-            .unwrap_or(WeightDtypeSource::Fallback),
-    );
-    let r2_suppressed_by_r4_display = r4.is_some();
-    let r4_groups: Vec<_> = r4
-        .into_iter()
-        .map(|r| IssueGroup {
-            primary: r,
-            secondary: Vec::new(),
-        })
-        .collect();
     for g in &r4_groups {
         if !warnings.is_empty() && !warnings.last().is_some_and(|l| l.is_empty()) {
             warnings.push(String::new());
@@ -1196,6 +1224,29 @@ mod tests {
     }
 
     #[test]
+    fn format_diagnose_rules_for_windows_r4_suppresses_r2_when_both_significant() {
+        let (ctx, _) = input_r4_suppresses_r2();
+        let mut windows: Vec<_> = (0..15)
+            .map(|_| mk_evaluable_kv_window(50.0, false))
+            .collect();
+        for w in windows.iter_mut().take(8) {
+            *w = mk_evaluable_kv_window(89.0, true);
+        }
+        let summary_win = windows.last().expect("windows");
+        let summary = ai(&ctx, summary_win);
+        let text = format_diagnose_rules_for_windows(
+            &windows,
+            summary,
+            true,
+            "http://127.0.0.1:8000/metrics",
+        )
+        .join("\n");
+        assert!(text.contains("[!] OOM Risk"));
+        assert!(!text.contains("[!] KV Cache Pressure"));
+        assert!(text.contains(R2_SUPPRESSED_BY_R4_VERBOSE_LINE));
+    }
+
+    #[test]
     fn format_diagnose_verbose_shows_r2_suppression_note_on_r4() {
         let (ctx, win) = input_r4_suppresses_r2();
         let text =
@@ -1225,9 +1276,9 @@ mod tests {
         v.num_requests_waiting = Some(0.0);
         v.prefill_window_mass = Some(HistogramWindowMass {
             sum_delta: 1.6,
-            count_delta: 4.0,
+            count_delta: 2.0,
         });
-        v.window_duration_secs = Some(2.0);
+        v.window_duration_secs = Some(1.0);
         let s = snap(t, t, v, gpu_busy());
         let ctx = mk_ctx();
         let win = mk_win(s);
@@ -1470,6 +1521,7 @@ mod tests {
         let d = LowPrefixReuseDetail {
             hit_rate: Some(0.24),
             prompt_tokens_mean: Some(128.0),
+            queries_delta: None,
         };
         let lines = format_low_prefix_hit_rate_fired(&d, Some(true), 10.0, Some(128.0));
         let text = lines.join("\n");
@@ -1921,6 +1973,25 @@ mod tests {
     }
 
     #[test]
+    fn insufficient_load_returns_advisory_not_no_issues() {
+        let windows = vec![
+            mk_evaluable_kv_window(89.0, true),
+            mk_evaluable_kv_window(89.0, true),
+        ];
+        let ctx = mk_ctx();
+        let summary = ai(&ctx, windows.last().expect("windows"));
+        let text = format_diagnose_rules_for_windows(
+            &windows,
+            summary,
+            false,
+            "http://127.0.0.1:8000/metrics",
+        )
+        .join("\n");
+        assert!(text.contains("Insufficient Sustained Load"));
+        assert!(!text.contains("No issues detected"));
+    }
+
+    #[test]
     fn format_diagnose_rules_for_windows_no_fires_is_single_no_issues_line() {
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
@@ -1942,7 +2013,8 @@ mod tests {
             ..Default::default()
         };
         let ctx = StaticContext::from_snapshot(&snap, cfg);
-        let windows = vec![mk_win(snap)];
+        let win = mk_win(snap);
+        let windows = vec![win.clone(), win.clone(), win];
         let summary = ai(&ctx, windows.last().unwrap());
         let lines = format_diagnose_rules_for_windows(
             &windows,

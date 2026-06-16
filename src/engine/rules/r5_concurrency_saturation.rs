@@ -220,7 +220,12 @@ pub(super) fn aggregate_concurrency_saturation_detail(
     let merged_ttft = crate::collectors::merge_p99_bucket_vecs(&ttft_p99_vecs);
     let ttft_p99_ms =
         crate::collectors::vllm::histogram_quantile(0.99, &merged_ttft).map(|s| s * 1000.0);
-    let kv_cache_usage_perc = details.last().and_then(|d| d.kv_cache_usage_perc);
+    // Use session-wide peak, not last window — a spike early in the run must
+    // block a "safe to raise concurrency" signal even if KV drained by end.
+    let kv_cache_usage_perc = details
+        .iter()
+        .filter_map(|d| d.kv_cache_usage_perc)
+        .reduce(f64::max);
     Some(ConcurrencySaturationDetail {
         requests_running: run,
         requests_waiting: wait,
@@ -456,6 +461,15 @@ mod tests {
         // Merged: 200 obs, p99 ≈ 198ms. Simple average of 99ms and 199ms would be 149ms.
         assert!((p99 - 198.0).abs() < 1.0);
         assert!((p99 - 149.0).abs() > 10.0);
+    }
+
+    #[test]
+    fn aggregate_r5_kv_uses_session_peak() {
+        let d1 = fired_detail(None, Some(60.0));
+        let d2 = fired_detail(None, Some(95.0));
+        let d3 = fired_detail(None, Some(70.0));
+        let agg = aggregate_concurrency_saturation_detail(&[d1, d2, d3]).expect("agg");
+        assert_eq!(agg.kv_cache_usage_perc, Some(95.0));
     }
 
     #[test]

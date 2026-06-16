@@ -12,10 +12,6 @@ const UNDER_BATCHING_WAITING_LT: f64 = 2.0;
 /// 40% of wall-clock time in prefill compute = server is not starved for work.
 const UNDER_BATCHING_PREFILL_SATURATION_MAX: f64 = 0.40;
 
-/// Absolute prefill time floor (seconds). Catches long windows where ratio dilutes.
-/// If sum_delta > 4.0s, server did substantial prefill work regardless of window length.
-const UNDER_BATCHING_PREFILL_ABS_SECS: f64 = 4.0;
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnderBatchingDetail {
     pub running: f64,
@@ -90,13 +86,14 @@ pub fn rule1_under_batching(
     // A chunked prefill spanning the full window duration will read sum_delta=0
     // and bypass this gate until the request completes. Accepted — documented limitation.
     if let Some(mass) = snapshot.vllm.prefill_window_mass {
-        let ratio = mass.sum_delta / window_secs;
-        let by_ratio = ratio > UNDER_BATCHING_PREFILL_SATURATION_MAX;
-        let by_abs = mass.sum_delta > UNDER_BATCHING_PREFILL_ABS_SECS;
-        if by_ratio || by_abs {
-            return Rule1Outcome::NotFired(R1MissReport {
-                prefill_saturation_ratio: Some(ratio),
-            });
+        if mass.count_delta > 0.0 {
+            let mean_prefill_secs = mass.sum_delta / mass.count_delta;
+            let ratio = mean_prefill_secs / window_secs;
+            if ratio > UNDER_BATCHING_PREFILL_SATURATION_MAX {
+                return Rule1Outcome::NotFired(R1MissReport {
+                    prefill_saturation_ratio: Some(ratio),
+                });
+            }
         }
     }
 
@@ -151,9 +148,7 @@ pub(super) fn r1_short_action(d: &UnderBatchingDetail) -> String {
 pub(super) fn format_under_batching_fired(d: &UnderBatchingDetail, confidence: f64) -> Vec<String> {
     let Some(max_n) = d.max_num_seqs else {
         // Structurally unreachable: r1 hard-aborts without max_num_seqs.
-        unreachable!(
-            "format_under_batching_fired called without max_num_seqs — r1 hard-aborts before reaching this"
-        );
+        return Vec::new();
     };
     let threshold = UNDER_BATCHING_OCCUPANCY_PCT * 100.0;
     let max_str = max_n.to_string();
@@ -376,10 +371,10 @@ mod tests {
             Some(256),
             Some(0.0),
             Some(HistogramWindowMass {
-                sum_delta: 5.0,
-                count_delta: 10.0,
+                sum_delta: 4.0,
+                count_delta: 2.0,
             }),
-            Some(10.0),
+            Some(4.0),
         );
         assert!(matches!(
             rule1_under_batching(&s, None),
@@ -388,20 +383,21 @@ mod tests {
     }
 
     #[test]
-    fn prefill_gate_suppresses_when_sum_delta_above_abs_floor() {
+    fn prefill_gate_does_not_suppress_when_concurrent_short_prefills_inflate_sum() {
+        // 10 requests × 0.2s prefill = sum_delta 2.0s, but mean = 0.2s in 1.0s window = 20%
         let s = snap_with_gates(
             Some(5.0),
             Some(256),
             Some(0.0),
             Some(HistogramWindowMass {
-                sum_delta: 5.0,
+                sum_delta: 2.0,
                 count_delta: 10.0,
             }),
-            Some(100.0),
+            Some(1.0),
         );
         assert!(matches!(
             rule1_under_batching(&s, None),
-            Rule1Outcome::NotFired(_)
+            Rule1Outcome::Fired(_)
         ));
     }
 
@@ -431,9 +427,9 @@ mod tests {
             Some(0.0),
             Some(HistogramWindowMass {
                 sum_delta: 1.6,
-                count_delta: 4.0,
+                count_delta: 2.0,
             }),
-            Some(2.0),
+            Some(1.0),
         );
         match rule1_under_batching(&s, None) {
             Rule1Outcome::NotFired(m) => {
@@ -452,9 +448,9 @@ mod tests {
             Some(0.0),
             Some(HistogramWindowMass {
                 sum_delta: 1.6,
-                count_delta: 4.0,
+                count_delta: 2.0,
             }),
-            Some(2.0),
+            Some(1.0),
         );
         let line = r1_verbose_miss_line(&s, None);
         assert!(line.contains("prefill saturated at 80%"));

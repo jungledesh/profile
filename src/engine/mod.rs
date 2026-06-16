@@ -63,7 +63,10 @@ pub fn build_report(input: AnalysisInput<'_>) -> Report {
     if !kv_pressure {
         if let Some(r5) = rules::r5_recommendation(
             snapshot,
-            snapshot.vllm.kv_cache_usage_perc,
+            snapshot
+                .vllm
+                .kv_cache_peak_perc
+                .or(snapshot.vllm.kv_cache_usage_perc),
             input.ctx.config.max_num_seqs,
             input.ctx.config.max_model_len,
         ) {

@@ -10,6 +10,11 @@ const TTFT_P95_DEGRADED_PCT: f64 = 20.0;
 const TPOT_P95_IMPROVED_PCT: f64 = -10.0; // negative = lower latency = better
 const TPOT_P95_DEGRADED_PCT: f64 = 15.0;
 
+// Minimum 2ms regardless of floor — safety net when baseline is unavailable
+const TPOT_JITTER_FLOOR_MS: f64 = 2.0;
+// Minimum 10ms regardless of floor
+const TTFT_JITTER_FLOOR_MS: f64 = 10.0;
+
 /// Placeholder until NLP `Goal` is wired from `cli/goal/`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Goal;
@@ -61,6 +66,8 @@ pub struct Delta {
     pub ttft_p99_delta_pct: Option<f64>,
     pub ttft_p95_delta_pct: Option<f64>,
     pub tpot_p95_delta_pct: Option<f64>,
+    pub tpot_floor_ms: Option<f64>,
+    pub prefill_latency_floor_ms: Option<f64>,
     pub config_drifted: bool,
 }
 
@@ -90,7 +97,16 @@ fn eval_throughput(pct: f64) -> Signal {
     }
 }
 
-fn eval_ttft_p95(pct: f64) -> Signal {
+fn eval_ttft_p95(pct: f64, delta_ms: f64, prefill_floor_ms: Option<f64>) -> Signal {
+    // Jitter margin: 1.5× the physics prefill floor.
+    // TTFT spikes by full prefill durations from queue timing alone —
+    // absorb at least one unlucky queue-wait before declaring regression.
+    let jitter = prefill_floor_ms
+        .map(|f| (f * 1.5).max(TTFT_JITTER_FLOOR_MS))
+        .unwrap_or(TTFT_JITTER_FLOOR_MS);
+    if delta_ms > 0.0 && delta_ms < jitter {
+        return Signal::Flat;
+    }
     if pct <= TTFT_P95_IMPROVED_PCT {
         Signal::Improved
     } else if pct >= TTFT_P95_DEGRADED_PCT {
@@ -100,7 +116,16 @@ fn eval_ttft_p95(pct: f64) -> Signal {
     }
 }
 
-fn eval_tpot_p95(pct: f64) -> Signal {
+fn eval_tpot_p95(pct: f64, delta_ms: f64, tpot_floor_ms: Option<f64>) -> Signal {
+    // Jitter margin: half the physics decode floor.
+    // At low latency, percentage swings are noisy — only flag degradation
+    // when the absolute increase exceeds hardware-level noise.
+    let jitter = tpot_floor_ms
+        .map(|f| (f * 0.5).max(TPOT_JITTER_FLOOR_MS))
+        .unwrap_or(TPOT_JITTER_FLOOR_MS);
+    if delta_ms > 0.0 && delta_ms < jitter {
+        return Signal::Flat;
+    }
     if pct <= TPOT_P95_IMPROVED_PCT {
         Signal::Improved
     } else if pct >= TPOT_P95_DEGRADED_PCT {
@@ -119,16 +144,25 @@ fn evaluate_direction(delta: &Delta) -> (Direction, Option<&'static str>) {
         .map(eval_throughput)
         .unwrap_or(Flat);
 
+    let tpot_delta_ms = match (delta.tpot_p95_before_ms, delta.tpot_p95_after_ms) {
+        (Some(b), Some(a)) => a - b,
+        _ => 0.0,
+    };
+    let ttft_delta_ms = match (delta.ttft_p95_before_ms, delta.ttft_p95_after_ms) {
+        (Some(b), Some(a)) => a - b,
+        _ => 0.0,
+    };
+
     let ttft = delta
         .ttft_p95_delta_pct
         .filter(|v| v.is_finite())
-        .map(eval_ttft_p95)
+        .map(|pct| eval_ttft_p95(pct, ttft_delta_ms, delta.prefill_latency_floor_ms))
         .unwrap_or(Flat);
 
     let tpot = delta
         .tpot_p95_delta_pct
         .filter(|v| v.is_finite())
-        .map(eval_tpot_p95)
+        .map(|pct| eval_tpot_p95(pct, tpot_delta_ms, delta.tpot_floor_ms))
         .unwrap_or(Flat);
 
     match (tput, ttft, tpot) {
@@ -329,6 +363,12 @@ pub fn compute(
         .and_then(|b| b.cost.as_ref())
         .and_then(|c| c.joules_per_token);
 
+    let tpot_floor_ms = curr_report.baseline.as_ref().map(|b| b.tpot_floor_ms);
+    let prefill_latency_floor_ms = curr_report
+        .baseline
+        .as_ref()
+        .and_then(|b| b.prefill_latency_floor_ms);
+
     let mut delta = Delta {
         throughput_delta_pct,
         throughput_before,
@@ -358,6 +398,8 @@ pub fn compute(
         ttft_p99_delta_pct,
         ttft_p95_delta_pct,
         tpot_p95_delta_pct,
+        tpot_floor_ms,
+        prefill_latency_floor_ms,
         config_drifted,
     };
     let (direction, reason) = calculate_direction(&delta, None);
@@ -450,6 +492,26 @@ mod tests {
         tpot_p95_before: Option<f64>,
         tpot_p95_after: Option<f64>,
     ) -> Delta {
+        mk_delta_with_floors(
+            throughput_pct,
+            ttft_p95_before,
+            ttft_p95_after,
+            tpot_p95_before,
+            tpot_p95_after,
+            None,
+            None,
+        )
+    }
+
+    fn mk_delta_with_floors(
+        throughput_pct: Option<f64>,
+        ttft_p95_before: Option<f64>,
+        ttft_p95_after: Option<f64>,
+        tpot_p95_before: Option<f64>,
+        tpot_p95_after: Option<f64>,
+        tpot_floor_ms: Option<f64>,
+        prefill_latency_floor_ms: Option<f64>,
+    ) -> Delta {
         Delta {
             throughput_delta_pct: throughput_pct,
             throughput_before: None,
@@ -479,6 +541,8 @@ mod tests {
             ttft_p99_delta_pct: None,
             ttft_p95_delta_pct: pct_delta(ttft_p95_before, ttft_p95_after),
             tpot_p95_delta_pct: pct_delta(tpot_p95_before, tpot_p95_after),
+            tpot_floor_ms,
+            prefill_latency_floor_ms,
             config_drifted: false,
         }
     }
@@ -793,5 +857,65 @@ mod tests {
         assert_eq!(d.tpot_p95_after_ms, Some(63.0));
         assert!((d.ttft_p95_delta_pct.unwrap() - (-15.0)).abs() < 1e-9);
         assert!((d.tpot_p95_delta_pct.unwrap() - (-10.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn tpot_jitter_suppresses_small_absolute_increase() {
+        let d = mk_delta_with_floors(
+            Some(0.0),
+            Some(100.0),
+            Some(100.0),
+            Some(10.0),
+            Some(12.0),
+            Some(8.0),
+            None,
+        );
+        assert_eq!(
+            eval_tpot_p95(d.tpot_p95_delta_pct.unwrap(), 2.0, d.tpot_floor_ms),
+            Signal::Flat
+        );
+    }
+
+    #[test]
+    fn tpot_jitter_does_not_suppress_large_absolute_increase() {
+        let d = mk_delta_with_floors(
+            Some(0.0),
+            Some(100.0),
+            Some(100.0),
+            Some(10.0),
+            Some(18.0),
+            Some(8.0),
+            None,
+        );
+        assert_eq!(
+            eval_tpot_p95(d.tpot_p95_delta_pct.unwrap(), 8.0, d.tpot_floor_ms),
+            Signal::Degraded
+        );
+    }
+
+    #[test]
+    fn ttft_jitter_absorbs_one_prefill_spike() {
+        let d = mk_delta_with_floors(
+            Some(0.0),
+            Some(50.0),
+            Some(110.0),
+            Some(50.0),
+            Some(50.0),
+            None,
+            Some(50.0),
+        );
+        assert_eq!(
+            eval_ttft_p95(
+                d.ttft_p95_delta_pct.unwrap(),
+                60.0,
+                d.prefill_latency_floor_ms
+            ),
+            Signal::Flat
+        );
+    }
+
+    #[test]
+    fn jitter_uses_minimum_floor_when_baseline_missing() {
+        assert_eq!(eval_tpot_p95(50.0, 1.0, None), Signal::Flat);
     }
 }

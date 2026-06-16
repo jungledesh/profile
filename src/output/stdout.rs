@@ -87,7 +87,7 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
     // Build AnalysisInput from the aggregate snapshot for baseline + single-window rule evaluation.
     let aggregate_win = crate::context::RuntimeWindow::from_snapshot(result.snapshot.clone());
     let summary_input = AnalysisInput::new(&result.static_ctx, &aggregate_win);
-    let report = engine::build_report(summary_input);
+    let report = engine::build_report_for_diagnose(&result.windows, summary_input);
     if verbose_rules {
         lines.push(String::new());
         lines.extend(baseline_lines(

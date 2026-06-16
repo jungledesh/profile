@@ -16,6 +16,7 @@ pub struct LowPrefixReuseDetail {
     /// None when prefix caching is disabled (path B).
     pub hit_rate: Option<f64>,
     pub prompt_tokens_mean: Option<f64>,
+    pub queries_delta: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -49,10 +50,21 @@ pub fn rule3_low_prefix_reuse(snapshot: &RawSnapshot) -> Rule3Outcome {
         return Rule3Outcome::NotFired;
     }
 
+    let queries_delta = {
+        let s = &v.prefix_cache_scrape_samples;
+        match (s.first(), s.last()) {
+            (Some(f), Some(l)) if s.len() >= 2 => {
+                f.queries.zip(l.queries).map(|(q0, q1)| (q1 - q0).max(0.0))
+            }
+            _ => None,
+        }
+    };
+
     if v.cache_config.enable_prefix_caching == Some(false) {
         return Rule3Outcome::Fired(LowPrefixReuseDetail {
             hit_rate: None,
             prompt_tokens_mean: Some(pm),
+            queries_delta,
         });
     }
 
@@ -65,6 +77,7 @@ pub fn rule3_low_prefix_reuse(snapshot: &RawSnapshot) -> Rule3Outcome {
     Rule3Outcome::Fired(LowPrefixReuseDetail {
         hit_rate: Some(hit_rate),
         prompt_tokens_mean: Some(pm),
+        queries_delta,
     })
 }
 
@@ -200,13 +213,37 @@ pub(super) fn aggregate_r3_detail(
         return LowPrefixReuseDetail {
             hit_rate: summary.vllm.prefix_cache_hit_rate.filter(|x| x.is_finite()),
             prompt_tokens_mean: summary.vllm.prompt_tokens_mean,
+            queries_delta: None,
         };
     }
     let hit_rate = if details.iter().any(|d| d.hit_rate.is_none()) {
         None
     } else {
-        let n = details.len() as f64;
-        Some(details.iter().filter_map(|d| d.hit_rate).sum::<f64>() / n)
+        // Weighted by query volume: Σ(rate × queries) / Σqueries
+        // Falls back to unweighted if any window is missing query count.
+        let weighted: Option<f64> = {
+            let mut wsum = 0.0_f64;
+            let mut wtotal = 0.0_f64;
+            let mut all_have_weight = true;
+            for d in details {
+                match (d.hit_rate, d.queries_delta.filter(|&q| q > 0.0)) {
+                    (Some(r), Some(q)) => {
+                        wsum += r * q;
+                        wtotal += q;
+                    }
+                    _ => {
+                        all_have_weight = false;
+                        break;
+                    }
+                }
+            }
+            (all_have_weight && wtotal > 0.0).then_some(wsum / wtotal)
+        };
+        weighted.or_else(|| {
+            // Fallback: unweighted (query counts unavailable)
+            let n = details.len() as f64;
+            Some(details.iter().filter_map(|d| d.hit_rate).sum::<f64>() / n)
+        })
     };
     let with_pm: Vec<f64> = details
         .iter()
@@ -220,6 +257,7 @@ pub(super) fn aggregate_r3_detail(
     LowPrefixReuseDetail {
         hit_rate,
         prompt_tokens_mean,
+        queries_delta: None,
     }
 }
 
@@ -299,6 +337,7 @@ mod tests {
         let d = LowPrefixReuseDetail {
             hit_rate: None,
             prompt_tokens_mean: Some(64.0),
+            queries_delta: None,
         };
         let text = format_low_prefix_hit_rate_fired(&d, Some(false), 20.0, Some(64.0)).join("\n");
         assert!(text.contains("Prefix caching is disabled (enable_prefix_caching=False)"));
@@ -323,6 +362,7 @@ mod tests {
         let d = LowPrefixReuseDetail {
             hit_rate: Some(0.10),
             prompt_tokens_mean: Some(64.0),
+            queries_delta: None,
         };
         let disabled = format_low_prefix_hit_rate_fired(&d, Some(false), 10.0, Some(64.0));
         let enabled = format_low_prefix_hit_rate_fired(&d, Some(true), 10.0, Some(64.0));
@@ -377,10 +417,32 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_r3_detail_weighted_by_query_volume() {
+        let details = [
+            LowPrefixReuseDetail {
+                hit_rate: Some(0.9),
+                prompt_tokens_mean: Some(64.0),
+                queries_delta: Some(2.0),
+            },
+            LowPrefixReuseDetail {
+                hit_rate: Some(0.1),
+                prompt_tokens_mean: Some(64.0),
+                queries_delta: Some(18.0),
+            },
+        ];
+        let snap = traffic_gates_snap(VllmRawMetrics::default());
+        let agg = aggregate_r3_detail(&details, &snap);
+        let hit = agg.hit_rate.expect("hit rate");
+        assert!((hit - 0.18).abs() < 1e-9, "weighted hit rate, got {hit}");
+        assert!((hit - 0.5).abs() > 0.1, "should not be unweighted average");
+    }
+
+    #[test]
     fn format_omits_throughput_line_when_prompt_mean_missing() {
         let d = LowPrefixReuseDetail {
             hit_rate: Some(0.10),
             prompt_tokens_mean: None,
+            queries_delta: None,
         };
         let text = format_low_prefix_hit_rate_fired(&d, Some(true), 10.0, None).join("\n");
         assert!(!text.contains("Prompt throughput"));

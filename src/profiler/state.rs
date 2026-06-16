@@ -65,11 +65,8 @@ impl LoopState {
         });
     }
 
-    pub fn last(&self) -> &IterationRecord {
-        let Some(rec) = self.history.back() else {
-            unreachable!("history is initialized with one entry and never cleared")
-        };
-        rec
+    pub fn last(&self) -> Option<&IterationRecord> {
+        self.history.back()
     }
 
     pub fn prev(&self) -> Option<&IterationRecord> {
@@ -116,7 +113,7 @@ impl LoopState {
     }
 
     pub fn current_primary_recommendation(&self) -> Option<&Recommendation> {
-        self.last().report.groups.first().map(|g| &g.primary)
+        self.last()?.report.groups.first().map(|g| &g.primary)
     }
 }
 
