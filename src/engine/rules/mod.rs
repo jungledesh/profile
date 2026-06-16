@@ -526,7 +526,6 @@ fn build_report_from_eval(eval: &WindowRuleEval, summary: AnalysisInput<'_>) -> 
             eval.r2_fired,
             eval.n_eval,
             max_model_len,
-            summary.ctx.gpu.arch.as_deref(),
         );
         recs.push(Recommendation {
             rule_name: "kv_cache_pressure",
@@ -554,7 +553,6 @@ fn build_report_from_eval(eval: &WindowRuleEval, summary: AnalysisInput<'_>) -> 
             kv_headroom_gb,
             eval.r2_backlog_fired,
             eval.n_eval,
-            summary.ctx.gpu.arch.as_deref(),
         );
         recs.push(Recommendation {
             rule_name: "kv_admission_backlog",
@@ -847,7 +845,6 @@ pub fn format_diagnose_rules_for_windows(
             r2_fired,
             n_eval,
             summary.ctx.config.max_model_len,
-            summary.ctx.gpu.arch.as_deref(),
         );
         warnings.extend(block);
         warnings.push(String::new());
@@ -860,7 +857,6 @@ pub fn format_diagnose_rules_for_windows(
             summary_baseline.as_ref().and_then(|b| b.kv_headroom_gb),
             r2_backlog_fired,
             n_eval,
-            summary.ctx.gpu.arch.as_deref(),
         );
         warnings.extend(block);
         warnings.push(String::new());
