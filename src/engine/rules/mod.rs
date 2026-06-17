@@ -26,7 +26,10 @@ pub use r5_concurrency_saturation::{
     r5_recommendation, rule5_concurrency_saturation, ConcurrencySaturationDetail,
 };
 
-use r1_under_batching::{aggregate_r1_detail, format_under_batching_window_issue, r1_short_action};
+use r1_under_batching::{
+    aggregate_r1_detail, format_under_batching_window_issue, r1_short_action,
+    rule1_under_batching_with_efficiency,
+};
 use r2_kv_cache_pressure::{
     aggregate_backlog_detail, aggregate_r2_detail, format_kv_admission_backlog_issue,
     format_kv_cache_window_issue, kv_pressure_confidence, r2_action, r2_backlog_short_action,
@@ -266,7 +269,7 @@ fn append_not_triggered_lines(
     out: &mut Vec<String>,
     names: &[&str],
     verbose_rules: bool,
-    r1_context: Option<(&RawSnapshot, Option<u32>)>,
+    r1_context: Option<(&RawSnapshot, Option<u32>, Option<f64>)>,
 ) {
     if names.is_empty() {
         return;
@@ -277,7 +280,9 @@ fn append_not_triggered_lines(
     for name in names {
         let line = if *name == "Under-batching" && verbose_rules {
             match r1_context {
-                Some((snap, max_seqs)) => r1_verbose_miss_line(snap, max_seqs),
+                Some((snap, max_seqs, efficiency_pct)) => {
+                    r1_verbose_miss_line(snap, max_seqs, efficiency_pct)
+                }
                 None => format!("{name}: not triggered"),
             }
         } else {
@@ -383,7 +388,11 @@ pub fn format_diagnose_rules(
             &mut out,
             &not_fired,
             verbose_rules,
-            Some((snapshot, input.ctx.config.max_num_seqs)),
+            Some((
+                snapshot,
+                input.ctx.config.max_num_seqs,
+                baseline_ref.and_then(|b| b.efficiency_pct),
+            )),
         );
     }
 
@@ -487,6 +496,7 @@ fn eval_window_rules(
         .filter(|w| window_is_evaluable(&w.snapshot))
         .collect();
     let n_eval = evaluable.len();
+    let summary_efficiency_pct = baseline::compute(summary).and_then(|b| b.efficiency_pct);
     let session_kv_peak = evaluable
         .iter()
         .filter_map(|w| {
@@ -517,7 +527,11 @@ fn eval_window_rules(
     };
 
     for w in &evaluable {
-        match rule1_under_batching(&w.snapshot, summary.ctx.config.max_num_seqs) {
+        match rule1_under_batching_with_efficiency(
+            &w.snapshot,
+            summary.ctx.config.max_num_seqs,
+            summary_efficiency_pct,
+        ) {
             Rule1Outcome::Fired(d) => {
                 eval.r1_fired += 1;
                 eval.r1_details.push(d);
@@ -590,19 +604,14 @@ fn build_report_from_eval(
 
     if eval.r1_significant() {
         let d = aggregate_r1_detail(&eval.r1_details);
-        let display_lines = format_under_batching_window_issue(
-            &d,
-            pct(eval.r1_fired, eval.n_eval),
-            0.8,
-            kv_max_seqs,
-            max_model_len,
-        );
+        let display_lines =
+            format_under_batching_window_issue(&d, pct(eval.r1_fired, eval.n_eval), 0.8);
         recs.push(Recommendation {
             rule_name: "under_batching",
             impact: 4,
             confidence: 0.8,
             action: "Increase client concurrency".to_string(),
-            short_action: r1_short_action(&d, kv_max_seqs, max_model_len),
+            short_action: r1_short_action(),
             expected_impact: "Higher throughput, stable TPOT".to_string(),
             display_lines,
         });
@@ -872,7 +881,11 @@ pub fn format_diagnose_rules_for_windows(
                 &mut out,
                 &not_fired,
                 verbose_rules,
-                Some((summary_snap, summary.ctx.config.max_num_seqs)),
+                Some((
+                    summary_snap,
+                    summary.ctx.config.max_num_seqs,
+                    summary_baseline.as_ref().and_then(|b| b.efficiency_pct),
+                )),
             );
         }
         if !any_advisory && !verbose_rules {
@@ -926,8 +939,6 @@ pub fn format_diagnose_rules_for_windows(
             &aggregate_r1_detail(r1_details),
             pct(r1_fired, n_eval),
             0.8,
-            kv_max_seqs,
-            summary.ctx.config.max_model_len,
         );
         warnings.extend(block);
         warnings.push(String::new());
@@ -1062,7 +1073,11 @@ pub fn format_diagnose_rules_for_windows(
             &mut out,
             &not_fired,
             verbose_rules,
-            Some((summary_snap, summary.ctx.config.max_num_seqs)),
+            Some((
+                summary_snap,
+                summary.ctx.config.max_num_seqs,
+                summary_baseline.as_ref().and_then(|b| b.efficiency_pct),
+            )),
         );
     }
     if !any_warning && !advisories_present && !verbose_rules {
@@ -1234,7 +1249,7 @@ mod tests {
         v.tpot_ms = Some(35.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        let r = r1_recommendation(&win.snapshot, None, None, None).expect("r1 fired");
+        let r = r1_recommendation(&win.snapshot, None, None).expect("r1 fired");
         assert_eq!(r.rule_name, "under_batching");
         assert_eq!(r.impact, 4);
         assert!((r.confidence - 0.8).abs() < 1e-9);
@@ -1256,7 +1271,7 @@ mod tests {
         v.tpot_ms = Some(35.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot, None, None, None).is_none());
+        assert!(r1_recommendation(&win.snapshot, None, None).is_none());
     }
 
     #[test]
@@ -1267,7 +1282,7 @@ mod tests {
         v.tpot_ms = Some(35.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot, None, None, None).is_none());
+        assert!(r1_recommendation(&win.snapshot, None, None).is_none());
     }
 
     #[test]
@@ -1277,7 +1292,7 @@ mod tests {
         v.num_requests_running = Some(64.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot, None, None, None).is_none());
+        assert!(r1_recommendation(&win.snapshot, None, None).is_none());
     }
 
     #[test]
@@ -1288,7 +1303,7 @@ mod tests {
         v.tpot_ms = Some(35.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot, None, None, None).is_none());
+        assert!(r1_recommendation(&win.snapshot, None, None).is_none());
     }
 
     #[test]
@@ -1299,7 +1314,7 @@ mod tests {
         v.tpot_ms = Some(35.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot, None, None, None).is_none());
+        assert!(r1_recommendation(&win.snapshot, None, None).is_none());
     }
 
     #[test]
@@ -1345,8 +1360,8 @@ mod tests {
         assert!(text.contains("threshold: < 25%"));
         assert!(text.contains("  Cause:"));
         assert!(text.contains("under-fed by client"));
-        assert!(text.contains("Increase client concurrency"));
-        assert!(text.contains("slots idle"));
+        assert!(text.contains("    • Increase client concurrency"));
+        assert!(!text.contains("slots idle"));
         assert!(text.contains("Expected: Higher throughput, stable TPOT."));
         assert!(
             text.contains("Confidence: High") || text.contains("Confidence: Medium"),
@@ -2094,8 +2109,9 @@ mod tests {
         );
         let text = lines.join("\n");
         assert!(text.contains("Under-batching: Insufficient Concurrency"));
-        assert!(text.contains("Seen in 60% of windows"));
-        assert!(text.contains("Occupancy"));
+        assert!(text.contains("Seen in 100% of windows"));
+        assert!(text.contains("Efficiency"));
+        assert!(text.contains("threshold: < 60%"));
         assert!(text.contains("  Cause:"));
         assert!(text.contains("Increase client concurrency"));
         assert!(!text.contains("KV cache pressure: not triggered"));

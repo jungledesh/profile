@@ -7,6 +7,8 @@ use crate::output;
 
 const CEILING_HEADROOM_THRESHOLD_PCT: f64 = 10.0;
 const EFFICIENCY_DISPLAY_MIN_PP: f64 = 0.05;
+const EFFICIENCY_PLATEAU_DELTA: f64 = 2.0;
+const PLATEAU_CONSECUTIVE_ITERS: u32 = 3;
 
 pub fn run(
     url: &str,
@@ -159,6 +161,8 @@ pub fn run(
             &new_report,
             drifted,
         );
+        let current_eff = new_report.baseline.as_ref().and_then(|b| b.efficiency_pct);
+        let plateau_count = state.update_efficiency_plateau(current_eff, EFFICIENCY_PLATEAU_DELTA);
         print_delta(&d);
         println!();
         output::stdout::print_diagnose_table(&new_result, false);
@@ -168,6 +172,19 @@ pub fn run(
             println!(
                 "\nHardware ceiling reached. Headroom < {CEILING_HEADROOM_THRESHOLD_PCT:.0}%: further gains require scaling hardware."
             );
+            break;
+        }
+        if plateau_count >= PLATEAU_CONSECUTIVE_ITERS {
+            let eff_display = current_eff
+                .filter(|e| e.is_finite())
+                .map(|e| format!("{e:.1}%"))
+                .unwrap_or_else(|| "unknown".to_string());
+            println!(
+                "\nEfficiency plateaued at {eff_display} over {PLATEAU_CONSECUTIVE_ITERS} iterations."
+            );
+            println!("No further improvement from current config.");
+            println!("Either the workload has hit the hardware ceiling, or");
+            println!("a bottleneck exists that profile cannot yet identify.");
             break;
         }
 
