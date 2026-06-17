@@ -80,6 +80,20 @@ pub(super) fn compute_kv_max_seqs(
     )
 }
 
+fn kv_ceiling_unknown_verbose_line(
+    kv_max_seqs: Option<u32>,
+    verbose_rules: bool,
+) -> Option<String> {
+    if verbose_rules && kv_max_seqs.is_none() {
+        Some(
+            "[i] KV max-num-seqs ceiling unavailable (missing baseline/model/config fields)."
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
 /// True when a rule fired in enough evaluable windows to be statistically stable.
 pub fn rule_is_significant(fired: usize, total_evaluable: usize) -> bool {
     if total_evaluable == 0 {
@@ -313,6 +327,12 @@ pub fn format_diagnose_rules(
     }
 
     let report = super::build_report(input);
+    let kv_max_seqs = compute_kv_max_seqs(
+        report.baseline.as_ref().and_then(|b| b.kv_headroom_gb),
+        input.ctx.config.max_model_len,
+        &input.ctx.model,
+        input.ctx.config.kv_cache_dtype.as_deref(),
+    );
     let any_issue = !report.groups.is_empty();
     let baseline_ref = report.baseline.as_ref();
     let tps = snapshot.vllm.generation_tokens_per_sec;
@@ -370,6 +390,9 @@ pub fn format_diagnose_rules(
     if !any_issue && !any_advisory && !verbose_rules {
         out.push(NO_ISSUES_LINE.to_string());
     }
+    if let Some(line) = kv_ceiling_unknown_verbose_line(kv_max_seqs, verbose_rules) {
+        append_display_block(&mut out, vec![line]);
+    }
 
     trim_trailing_blank_lines(&mut out);
     out
@@ -389,6 +412,7 @@ struct WindowRuleEval {
     r3_details: Vec<LowPrefixReuseDetail>,
     r5_fired: usize,
     r5_details: Vec<ConcurrencySaturationDetail>,
+    session_kv_peak: Option<f64>,
     groups: Vec<IssueGroup>,
 }
 
@@ -429,6 +453,23 @@ fn r3_display_args(snap: &VllmRawMetrics, d: &LowPrefixReuseDetail) -> (f64, Opt
     (qps, prompt_mean)
 }
 
+pub(crate) fn aggregate_prefix_hit_rate_for_windows(windows: &[RuntimeWindow]) -> Option<f64> {
+    // Average hit rate across ALL evaluable windows — not just windows where r3
+    // fired. Filtering by rule outcome biases the result low: high-performing
+    // windows (hit_rate above threshold, r3 silent) would be excluded.
+    let (sum, count) = windows
+        .iter()
+        .filter(|w| window_is_evaluable(&w.snapshot))
+        .filter_map(|w| {
+            w.snapshot
+                .vllm
+                .prefix_cache_hit_rate
+                .filter(|r| r.is_finite())
+        })
+        .fold((0.0_f64, 0usize), |(s, c), v| (s + v, c + 1));
+    (count > 0).then_some(sum / count as f64)
+}
+
 fn eval_window_rules(
     windows: &[RuntimeWindow],
     summary: &AnalysisInput<'_>,
@@ -446,6 +487,16 @@ fn eval_window_rules(
         .filter(|w| window_is_evaluable(&w.snapshot))
         .collect();
     let n_eval = evaluable.len();
+    let session_kv_peak = evaluable
+        .iter()
+        .filter_map(|w| {
+            w.snapshot
+                .vllm
+                .kv_cache_peak_perc
+                .or(w.snapshot.vllm.kv_cache_usage_perc)
+                .filter(|v| v.is_finite())
+        })
+        .reduce(f64::max);
 
     let mut eval = WindowRuleEval {
         total,
@@ -461,6 +512,7 @@ fn eval_window_rules(
         r3_details: Vec::new(),
         r5_fired: 0,
         r5_details: Vec::new(),
+        session_kv_peak,
         groups: Vec::new(),
     };
 
@@ -502,11 +554,17 @@ fn eval_window_rules(
             eval.r5_details.push(d);
         }
     }
-
     Some(eval)
 }
 
-fn build_report_from_eval(eval: &WindowRuleEval, summary: AnalysisInput<'_>) -> super::Report {
+// session_hit_rate: all-evaluable-windows average hit rate for display in r3 recommendation body.
+// Caller must compute this from the full window slice — not from r3-fired windows only.
+// Pass None on the single-window path (no session to average).
+fn build_report_from_eval(
+    eval: &WindowRuleEval,
+    summary: AnalysisInput<'_>,
+    session_hit_rate: Option<f64>,
+) -> super::Report {
     let baseline = baseline::compute(&summary);
     if eval.n_eval == 0 {
         return super::Report {
@@ -532,14 +590,19 @@ fn build_report_from_eval(eval: &WindowRuleEval, summary: AnalysisInput<'_>) -> 
 
     if eval.r1_significant() {
         let d = aggregate_r1_detail(&eval.r1_details);
-        let display_lines =
-            format_under_batching_window_issue(&d, pct(eval.r1_fired, eval.n_eval), 0.8);
+        let display_lines = format_under_batching_window_issue(
+            &d,
+            pct(eval.r1_fired, eval.n_eval),
+            0.8,
+            kv_max_seqs,
+            max_model_len,
+        );
         recs.push(Recommendation {
             rule_name: "under_batching",
             impact: 4,
             confidence: 0.8,
             action: "Increase client concurrency".to_string(),
-            short_action: r1_short_action(&d),
+            short_action: r1_short_action(&d, kv_max_seqs, max_model_len),
             expected_impact: "Higher throughput, stable TPOT".to_string(),
             display_lines,
         });
@@ -595,7 +658,9 @@ fn build_report_from_eval(eval: &WindowRuleEval, summary: AnalysisInput<'_>) -> 
     }
 
     if eval.r5_significant() && !r2_significant && !r2_backlog_significant {
-        if let Some(agg) = aggregate_concurrency_saturation_detail(&eval.r5_details) {
+        if let Some(agg) =
+            aggregate_concurrency_saturation_detail(&eval.r5_details, eval.session_kv_peak)
+        {
             let display_lines = format_concurrency_saturation_window_issue(
                 &agg,
                 pct(eval.r5_fired, eval.n_eval),
@@ -649,6 +714,7 @@ fn build_report_from_eval(eval: &WindowRuleEval, summary: AnalysisInput<'_>) -> 
                 enable_prefix,
                 qps,
                 prompt_mean,
+                session_hit_rate,
             ),
         });
     }
@@ -712,7 +778,7 @@ pub fn build_report_for_windows(
             r2_suppressed_by_r4: false,
         };
     };
-    build_report_from_eval(&eval, summary)
+    build_report_from_eval(&eval, summary, None)
 }
 
 pub fn format_diagnose_rules_for_windows(
@@ -724,9 +790,10 @@ pub fn format_diagnose_rules_for_windows(
     let Some(mut eval) = eval_window_rules(windows, &summary) else {
         return no_evaluable_diagnose_lines(verbose_rules, &[]);
     };
+    let session_hit_rate = aggregate_prefix_hit_rate_for_windows(windows);
 
     if eval.n_eval > 0 {
-        eval.groups = build_report_from_eval(&eval, summary).groups;
+        eval.groups = build_report_from_eval(&eval, summary, session_hit_rate).groups;
     }
 
     if eval.n_eval == 0 {
@@ -859,6 +926,8 @@ pub fn format_diagnose_rules_for_windows(
             &aggregate_r1_detail(r1_details),
             pct(r1_fired, n_eval),
             0.8,
+            kv_max_seqs,
+            summary.ctx.config.max_model_len,
         );
         warnings.extend(block);
         warnings.push(String::new());
@@ -895,7 +964,8 @@ pub fn format_diagnose_rules_for_windows(
     }
 
     if r5_significant && !r2_significant && !r2_backlog_significant {
-        if let Some(agg) = aggregate_concurrency_saturation_detail(r5_details) {
+        if let Some(agg) = aggregate_concurrency_saturation_detail(r5_details, eval.session_kv_peak)
+        {
             let block = format_concurrency_saturation_window_issue(
                 &agg,
                 pct(r5_fired, n_eval),
@@ -916,6 +986,7 @@ pub fn format_diagnose_rules_for_windows(
             summary_snap.vllm.cache_config.enable_prefix_caching,
             qps,
             prompt_mean,
+            None,
         ));
         warnings.push(String::new());
     }
@@ -959,6 +1030,9 @@ pub fn format_diagnose_rules_for_windows(
     let advisories_present = !advisories.is_empty();
     let mut out = warnings;
     out.append(&mut advisories);
+    if let Some(line) = kv_ceiling_unknown_verbose_line(kv_max_seqs, verbose_rules) {
+        append_display_block(&mut out, vec![line]);
+    }
 
     let mut not_fired = Vec::new();
     if !r1_significant {
@@ -1160,7 +1234,7 @@ mod tests {
         v.tpot_ms = Some(35.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        let r = r1_recommendation(&win.snapshot, None).expect("r1 fired");
+        let r = r1_recommendation(&win.snapshot, None, None, None).expect("r1 fired");
         assert_eq!(r.rule_name, "under_batching");
         assert_eq!(r.impact, 4);
         assert!((r.confidence - 0.8).abs() < 1e-9);
@@ -1182,7 +1256,7 @@ mod tests {
         v.tpot_ms = Some(35.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot, None).is_none());
+        assert!(r1_recommendation(&win.snapshot, None, None, None).is_none());
     }
 
     #[test]
@@ -1193,7 +1267,7 @@ mod tests {
         v.tpot_ms = Some(35.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot, None).is_none());
+        assert!(r1_recommendation(&win.snapshot, None, None, None).is_none());
     }
 
     #[test]
@@ -1203,7 +1277,7 @@ mod tests {
         v.num_requests_running = Some(64.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot, None).is_none());
+        assert!(r1_recommendation(&win.snapshot, None, None, None).is_none());
     }
 
     #[test]
@@ -1214,7 +1288,7 @@ mod tests {
         v.tpot_ms = Some(35.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot, None).is_none());
+        assert!(r1_recommendation(&win.snapshot, None, None, None).is_none());
     }
 
     #[test]
@@ -1225,7 +1299,7 @@ mod tests {
         v.tpot_ms = Some(35.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot, None).is_none());
+        assert!(r1_recommendation(&win.snapshot, None, None, None).is_none());
     }
 
     #[test]
@@ -1271,7 +1345,7 @@ mod tests {
         assert!(text.contains("threshold: < 25%"));
         assert!(text.contains("  Cause:"));
         assert!(text.contains("under-fed by client"));
-        assert!(text.contains("Batch more requests or increase client concurrency"));
+        assert!(text.contains("Increase client concurrency"));
         assert!(text.contains("slots idle"));
         assert!(text.contains("Expected: Higher throughput, stable TPOT."));
         assert!(
@@ -1580,7 +1654,7 @@ mod tests {
             prompt_tokens_mean: Some(128.0),
             queries_delta: None,
         };
-        let lines = format_low_prefix_hit_rate_fired(&d, Some(true), 10.0, Some(128.0));
+        let lines = format_low_prefix_hit_rate_fired(&d, Some(true), 10.0, Some(128.0), None);
         let text = lines.join("\n");
         assert!(text.contains("[!] Low Prefix Cache"));
         assert!(text.contains("  Cause:"));
@@ -2023,7 +2097,7 @@ mod tests {
         assert!(text.contains("Seen in 60% of windows"));
         assert!(text.contains("Occupancy"));
         assert!(text.contains("  Cause:"));
-        assert!(text.contains("Batch more requests or increase client concurrency"));
+        assert!(text.contains("Increase client concurrency"));
         assert!(!text.contains("KV cache pressure: not triggered"));
         assert!(!text.contains("Low prefix reuse: not triggered"));
         assert!(!text.contains("Concurrency saturation: not triggered"));
@@ -2199,6 +2273,74 @@ mod tests {
         .join("\n");
         assert!(text.contains("KV Cache Pressure"), "expected r2: {text}");
         assert!(!text.contains("[!] Concurrency Saturation"));
+    }
+
+    #[test]
+    fn r5_uses_session_kv_peak_from_non_r5_window() {
+        let mut windows: Vec<_> = (0..15)
+            .map(|_| mk_evaluable_kv_window(50.0, false))
+            .collect();
+        // r5-significant windows with moderate KV.
+        for w in windows.iter_mut().take(4) {
+            *w = mk_evaluable_concurrency_saturation_window(32.0, 15.0, 32);
+            w.snapshot.vllm.kv_cache_usage_perc = Some(70.0);
+        }
+        // One high-KV r2 window (non-significant for r2), should still set session peak.
+        windows[10] = mk_evaluable_kv_window(95.0, true);
+        // Simulate gauge drift: peak captures the spike, avg usage does not.
+        windows[10].snapshot.vllm.kv_cache_usage_perc = Some(60.0);
+        windows[10].snapshot.vllm.kv_cache_peak_perc = Some(95.0);
+        windows[10].snapshot.vllm.num_requests_running = Some(20.0);
+        windows[10].snapshot.vllm.max_num_seqs = Some(32);
+        windows[10].snapshot.vllm.num_requests_waiting = Some(1.0);
+
+        let ctx = mk_ctx();
+        let summary = ai(&ctx, windows.last().expect("windows"));
+        let text = format_diagnose_rules_for_windows(
+            &windows,
+            summary,
+            false,
+            "http://127.0.0.1:8000/metrics",
+        )
+        .join("\n");
+
+        assert!(
+            text.contains("[!] Concurrency Saturation"),
+            "expected r5: {text}"
+        );
+        assert!(text.contains("KV at 95%: scheduler at cap, pool full."));
+        assert!(!text.contains("KV pool has room (70%)"));
+    }
+
+    #[test]
+    fn session_kv_peak_from_non_r5_window_reaches_build_report_from_eval() {
+        let mut windows: Vec<_> = (0..15)
+            .map(|_| mk_evaluable_kv_window(50.0, false))
+            .collect();
+        for w in windows.iter_mut().take(4) {
+            *w = mk_evaluable_concurrency_saturation_window(32.0, 15.0, 32);
+            w.snapshot.vllm.kv_cache_usage_perc = Some(70.0);
+        }
+        // Non-r5 window carries session spike via peak metric.
+        windows[10] = mk_evaluable_kv_window(95.0, true);
+        windows[10].snapshot.vllm.kv_cache_usage_perc = Some(60.0);
+        windows[10].snapshot.vllm.kv_cache_peak_perc = Some(95.0);
+        windows[10].snapshot.vllm.num_requests_running = Some(20.0);
+        windows[10].snapshot.vllm.max_num_seqs = Some(32);
+        windows[10].snapshot.vllm.num_requests_waiting = Some(1.0);
+
+        let ctx = mk_ctx();
+        let summary = ai(&ctx, windows.last().expect("windows"));
+        let report = build_report_for_windows(&windows, summary);
+        let r5 = report
+            .groups
+            .iter()
+            .find(|g| g.primary.rule_name == "concurrency_saturation")
+            .expect("r5 group");
+        let text = r5.primary.display_lines.join("\n");
+        assert!(text.contains("KV at 95%: scheduler at cap, pool full."));
+        assert!(!text.contains("KV pool has room (70%)"));
+        assert_eq!(r5.primary.action, "Add a replica to scale out.");
     }
 
     #[test]

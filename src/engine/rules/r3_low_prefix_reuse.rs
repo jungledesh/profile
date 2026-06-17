@@ -112,7 +112,8 @@ pub fn r3_recommendation(snapshot: &RawSnapshot) -> Option<Recommendation> {
         action,
         short_action,
         expected_impact: "Higher prefix cache hit rate and lower TTFT".to_string(),
-        display_lines: format_low_prefix_hit_rate_fired(&d, enable_prefix, qps, prompt_mean),
+        // Single-window path has no session context — use hit rate from this window only.
+        display_lines: format_low_prefix_hit_rate_fired(&d, enable_prefix, qps, prompt_mean, None),
     })
 }
 
@@ -142,6 +143,7 @@ pub(super) fn format_low_prefix_hit_rate_fired(
     enable_prefix_caching: Option<bool>,
     qps: f64,
     prompt_mean: Option<f64>,
+    session_hit_rate: Option<f64>,
 ) -> Vec<String> {
     let cause_lines: Vec<String> = if d.hit_rate.is_none() {
         let mut lines = vec![
@@ -153,7 +155,7 @@ pub(super) fn format_low_prefix_hit_rate_fired(
         }
         lines
     } else {
-        let hit = d.hit_rate.unwrap_or(0.0) * 100.0;
+        let hit = session_hit_rate.or(d.hit_rate).unwrap_or(0.0) * 100.0;
         let mut lines = vec![
             "  Cause:".to_string(),
             format!(
@@ -199,8 +201,15 @@ pub(super) fn format_low_prefix_window_issue(
     enable_prefix_caching: Option<bool>,
     qps: f64,
     prompt_mean: Option<f64>,
+    session_hit_rate: Option<f64>,
 ) -> Vec<String> {
-    let mut lines = format_low_prefix_hit_rate_fired(d, enable_prefix_caching, qps, prompt_mean);
+    let mut lines = format_low_prefix_hit_rate_fired(
+        d,
+        enable_prefix_caching,
+        qps,
+        prompt_mean,
+        session_hit_rate,
+    );
     lines.insert(1, format!("  Seen in {seen_pct}% of windows"));
     lines
 }
@@ -339,7 +348,8 @@ mod tests {
             prompt_tokens_mean: Some(64.0),
             queries_delta: None,
         };
-        let text = format_low_prefix_hit_rate_fired(&d, Some(false), 20.0, Some(64.0)).join("\n");
+        let text =
+            format_low_prefix_hit_rate_fired(&d, Some(false), 20.0, Some(64.0), None).join("\n");
         assert!(text.contains("Prefix caching is disabled (enable_prefix_caching=False)"));
         assert!(!text.contains("Prefix hit rate"));
     }
@@ -364,8 +374,8 @@ mod tests {
             prompt_tokens_mean: Some(64.0),
             queries_delta: None,
         };
-        let disabled = format_low_prefix_hit_rate_fired(&d, Some(false), 10.0, Some(64.0));
-        let enabled = format_low_prefix_hit_rate_fired(&d, Some(true), 10.0, Some(64.0));
+        let disabled = format_low_prefix_hit_rate_fired(&d, Some(false), 10.0, Some(64.0), None);
+        let enabled = format_low_prefix_hit_rate_fired(&d, Some(true), 10.0, Some(64.0), None);
         assert!(disabled
             .iter()
             .any(|l| l.contains("--enable-prefix-caching")));
@@ -444,7 +454,20 @@ mod tests {
             prompt_tokens_mean: None,
             queries_delta: None,
         };
-        let text = format_low_prefix_hit_rate_fired(&d, Some(true), 10.0, None).join("\n");
+        let text = format_low_prefix_hit_rate_fired(&d, Some(true), 10.0, None, None).join("\n");
         assert!(!text.contains("Prompt throughput"));
+    }
+
+    #[test]
+    fn session_hit_rate_overrides_detail_hit_rate_in_display() {
+        let d = LowPrefixReuseDetail {
+            hit_rate: Some(0.38),
+            prompt_tokens_mean: Some(64.0),
+            queries_delta: None,
+        };
+        let text = format_low_prefix_hit_rate_fired(&d, Some(true), 10.0, Some(64.0), Some(0.616))
+            .join("\n");
+        assert!(text.contains("Prefix hit rate 61.6%"));
+        assert!(!text.contains("38.0%"));
     }
 }

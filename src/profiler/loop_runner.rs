@@ -1,4 +1,3 @@
-use std::io::{self, Write};
 use std::time::Duration;
 
 use super::{delta, drift, poll, run_diagnose, state::LoopState, DiagnoseResult};
@@ -162,8 +161,6 @@ pub fn run(
         );
         print_delta(&d);
         println!();
-        output::stdout::print_direction_line(&d);
-        println!();
         output::stdout::print_diagnose_table(&new_result, false);
 
         let headroom = new_report.baseline.as_ref().and_then(|b| b.headroom_pct);
@@ -174,40 +171,7 @@ pub fn run(
             break;
         }
 
-        let applied_short_action = prev_report
-            .groups
-            .first()
-            .map(|g| g.primary.short_action.as_str());
-        let next_fix = new_report
-            .groups
-            .first()
-            .map(|g| g.primary.short_action.as_str());
-
-        if d.direction == delta::Direction::Worse {
-            let choice = read_worse_regression_choice(&stdin_rx, &mut io::stdout())?;
-            match choice {
-                WorseRegressionChoice::Continue => {
-                    for line in direction_followup_lines(delta::Direction::Worse, next_fix) {
-                        println!("{line}");
-                    }
-                    let _ = apply_worse_regression_choice(
-                        &mut state, new_result, new_report, rule_name, choice,
-                    );
-                }
-                WorseRegressionChoice::Revert => {
-                    if let Some(action) = applied_short_action {
-                        println!("Revert: undo {action}, then re-measure when ready.");
-                    } else {
-                        println!("Revert: undo the last change, then re-measure when ready.");
-                    }
-                }
-            }
-        } else {
-            for line in direction_followup_lines(d.direction, next_fix) {
-                println!("{line}");
-            }
-            state.push(new_result, new_report, Some(rule_name));
-        }
+        state.push(new_result, new_report, Some(rule_name));
     }
 
     Ok(())
@@ -300,85 +264,6 @@ fn healthy_exit_message(
     format!("{prefix}\n\n{limiter_block}")
 }
 
-fn direction_followup_lines(
-    direction: delta::Direction,
-    short_action: Option<&str>,
-) -> Vec<String> {
-    let mut lines = Vec::new();
-    match direction {
-        delta::Direction::Worse => {
-            if let Some(fix) = short_action {
-                lines.push("Override accepted. Keeping degraded configuration.".to_string());
-                lines.push(format!("Apply fix: {fix}, then re-measure."));
-            }
-        }
-        delta::Direction::Mixed => {
-            // Direction line carries the reason. Nothing to add.
-        }
-        delta::Direction::NoChange => {
-            if let Some(fix) = short_action {
-                lines.push("No significant change.".to_string());
-                lines.push(format!("Apply fix: {fix}, then re-measure."));
-            }
-        }
-        // Better: no followup needed. The table shows the improved state; the
-        // Direction line already carries the signal. Silence is the right output.
-        delta::Direction::Better => {}
-    }
-    lines
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WorseRegressionChoice {
-    Continue,
-    Revert,
-}
-
-pub(crate) fn parse_worse_regression_choice(line: &str) -> Option<WorseRegressionChoice> {
-    match line.trim() {
-        "c" | "C" => Some(WorseRegressionChoice::Continue),
-        "r" | "R" => Some(WorseRegressionChoice::Revert),
-        _ => None,
-    }
-}
-
-pub(crate) fn read_worse_regression_choice(
-    stdin_rx: &std::sync::mpsc::Receiver<String>,
-    prompt: &mut dyn Write,
-) -> io::Result<WorseRegressionChoice> {
-    writeln!(prompt, "  [r] revert   [c] continue")?;
-    loop {
-        write!(prompt, "> ")?;
-        prompt.flush()?;
-        let line = match stdin_rx.recv() {
-            Ok(l) => l,
-            // EOF (non-interactive shell, CI, piped input) — default to Revert.
-            // Keeps degraded config out and exits cleanly without a panic.
-            Err(_) => return Ok(WorseRegressionChoice::Revert),
-        };
-        if let Some(choice) = parse_worse_regression_choice(&line) {
-            return Ok(choice);
-        }
-        writeln!(prompt, " r = revert, c = continue")?;
-    }
-}
-
-pub(crate) fn apply_worse_regression_choice(
-    state: &mut LoopState,
-    new_result: DiagnoseResult,
-    new_report: engine::Report,
-    rule_name: &'static str,
-    choice: WorseRegressionChoice,
-) -> bool {
-    match choice {
-        WorseRegressionChoice::Continue => {
-            state.push(new_result, new_report, Some(rule_name));
-            true
-        }
-        WorseRegressionChoice::Revert => false,
-    }
-}
-
 fn format_efficiency_delta_line(delta_pp: Option<f64>) -> Option<String> {
     match delta_pp {
         Some(v) if v >= EFFICIENCY_DISPLAY_MIN_PP => Some(format!("  Efficiency  +{v:.1}pp ↑")),
@@ -387,9 +272,21 @@ fn format_efficiency_delta_line(delta_pp: Option<f64>) -> Option<String> {
     }
 }
 
+fn config_change_status_lines(config_drifted: bool) -> [&'static str; 2] {
+    if config_drifted {
+        ["  Config changed, baseline reset.", ""]
+    } else {
+        ["  No config changed.", ""]
+    }
+}
+
 fn print_delta(d: &delta::Delta) {
-    if d.config_drifted {
-        println!("  Config changed, baseline reset.");
+    for line in config_change_status_lines(d.config_drifted) {
+        if line.is_empty() {
+            println!();
+        } else {
+            println!("{line}");
+        }
     }
     if let (Some(before), Some(after)) = (d.throughput_before, d.throughput_after) {
         if before.is_finite() && after.is_finite() {
@@ -686,6 +583,16 @@ mod tests {
     }
 
     #[test]
+    fn config_change_status_lines_for_drifted_and_not_drifted() {
+        let drifted = config_change_status_lines(true);
+        assert_eq!(drifted[0], "  Config changed, baseline reset.");
+        assert_eq!(drifted[1], "");
+        let stable = config_change_status_lines(false);
+        assert_eq!(stable[0], "  No config changed.");
+        assert_eq!(stable[1], "");
+    }
+
+    #[test]
     fn efficiency_delta_near_zero_suppressed() {
         assert!(format_efficiency_delta_line(Some(-0.04)).is_none());
         assert!(format_efficiency_delta_line(Some(0.03)).is_none());
@@ -696,161 +603,6 @@ mod tests {
         let line = format_efficiency_delta_line(Some(-0.06)).expect("line");
         assert!(line.contains('↓'));
         assert!(line.contains("-0.1pp"));
-    }
-
-    #[test]
-    fn direction_followup_includes_short_action_on_no_change() {
-        let lines = direction_followup_lines(
-            delta::Direction::NoChange,
-            Some("raise --max-num-seqs above 32"),
-        );
-        assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0], "No significant change.");
-        assert_eq!(
-            lines[1],
-            "Apply fix: raise --max-num-seqs above 32, then re-measure."
-        );
-    }
-
-    #[test]
-    fn direction_followup_mixed_is_empty() {
-        let lines = direction_followup_lines(
-            delta::Direction::Mixed,
-            Some("raise --max-num-seqs above 32"),
-        );
-        assert!(lines.is_empty());
-    }
-
-    #[test]
-    fn direction_followup_worse_is_empty_without_short_action() {
-        let lines = direction_followup_lines(delta::Direction::Worse, None);
-        assert!(lines.is_empty());
-    }
-
-    #[test]
-    fn continue_after_worse_shows_override_message() {
-        let fix = "raise --max-num-seqs above 32";
-        let lines = direction_followup_lines(delta::Direction::Worse, Some(fix));
-        let text = lines.join("\n");
-        assert!(text.contains("Override accepted"));
-        assert!(text.contains(fix));
-        assert!(!text.contains("No significant change"));
-    }
-
-    #[test]
-    fn parse_worse_regression_choice_accepts_r_and_c() {
-        assert_eq!(
-            parse_worse_regression_choice("c\n"),
-            Some(WorseRegressionChoice::Continue)
-        );
-        assert_eq!(
-            parse_worse_regression_choice("R"),
-            Some(WorseRegressionChoice::Revert)
-        );
-        assert_eq!(parse_worse_regression_choice("x"), None);
-    }
-
-    #[test]
-    fn read_worse_regression_choice_reprompts_on_invalid_input() {
-        let (tx, rx) = std::sync::mpsc::channel();
-        tx.send("x\n".to_string()).unwrap();
-        tx.send("r\n".to_string()).unwrap();
-        let mut out = Vec::new();
-        let choice = read_worse_regression_choice(&rx, &mut out).unwrap();
-        assert_eq!(choice, WorseRegressionChoice::Revert);
-        let text = String::from_utf8(out).unwrap();
-        assert!(text.contains(" r = revert, c = continue"));
-    }
-
-    #[test]
-    fn worse_pauses_loop_before_next_recommendation() {
-        assert!(!apply_worse_regression_choice(
-            &mut LoopState::new(minimal_diagnose(), empty_report()),
-            minimal_diagnose(),
-            empty_report(),
-            "under_batching",
-            WorseRegressionChoice::Revert,
-        ));
-    }
-
-    #[test]
-    fn acknowledge_sets_prev_to_curr() {
-        let mut s = LoopState::new(minimal_diagnose(), empty_report());
-        let mut new = minimal_diagnose();
-        new.snapshot.vllm.generation_tokens_per_sec = Some(80.0);
-        assert!(apply_worse_regression_choice(
-            &mut s,
-            new,
-            empty_report(),
-            "under_batching",
-            WorseRegressionChoice::Continue,
-        ));
-        assert_eq!(
-            s.last()
-                .unwrap()
-                .result
-                .snapshot
-                .vllm
-                .generation_tokens_per_sec,
-            Some(80.0)
-        );
-    }
-
-    #[test]
-    fn revert_does_not_update_prev() {
-        let mut prev = minimal_diagnose();
-        prev.snapshot.vllm.generation_tokens_per_sec = Some(100.0);
-        let mut s = LoopState::new(prev, empty_report());
-        let mut degraded = minimal_diagnose();
-        degraded.snapshot.vllm.generation_tokens_per_sec = Some(80.0);
-        assert!(!apply_worse_regression_choice(
-            &mut s,
-            degraded,
-            empty_report(),
-            "under_batching",
-            WorseRegressionChoice::Revert,
-        ));
-        assert_eq!(
-            s.last()
-                .unwrap()
-                .result
-                .snapshot
-                .vllm
-                .generation_tokens_per_sec,
-            Some(100.0)
-        );
-    }
-
-    fn minimal_diagnose() -> DiagnoseResult {
-        DiagnoseResult {
-            snapshot: crate::collectors::RawSnapshot {
-                gpu_observed_at: std::time::SystemTime::UNIX_EPOCH,
-                vllm_observed_at: std::time::SystemTime::UNIX_EPOCH,
-                timestamp: std::time::SystemTime::UNIX_EPOCH,
-                vllm: crate::collectors::VllmRawMetrics::default(),
-                gpu: crate::collectors::GpuRawMetrics::default(),
-            },
-            windows: Vec::new(),
-            static_ctx: crate::context::StaticContext::default(),
-            duration: Duration::from_secs(2),
-            started_at: std::time::SystemTime::UNIX_EPOCH,
-            any_evaluable: true,
-            metrics_input: String::new(),
-        }
-    }
-
-    fn empty_report() -> engine::Report {
-        engine::Report {
-            baseline: None,
-            groups: Vec::new(),
-            r2_suppressed_by_r4: false,
-        }
-    }
-
-    #[test]
-    fn direction_followup_omits_fix_when_short_action_missing() {
-        let lines = direction_followup_lines(delta::Direction::NoChange, None);
-        assert!(lines.is_empty());
     }
 
     #[test]
@@ -909,13 +661,9 @@ mod tests {
             ttft_p95_after_ms: None,
             tpot_p95_before_ms: None,
             tpot_p95_after_ms: None,
-            direction: delta::Direction::NoChange,
-            direction_reason: None,
             ttft_p99_delta_pct: None,
             ttft_p95_delta_pct: None,
             tpot_p95_delta_pct: None,
-            tpot_floor_ms: None,
-            prefill_latency_floor_ms: None,
             config_drifted: false,
         };
         assert!(economics_section_active(&d));
@@ -947,13 +695,9 @@ mod tests {
             ttft_p95_after_ms: None,
             tpot_p95_before_ms: None,
             tpot_p95_after_ms: None,
-            direction: delta::Direction::Better,
-            direction_reason: None,
             ttft_p99_delta_pct: None,
             ttft_p95_delta_pct: None,
             tpot_p95_delta_pct: None,
-            tpot_floor_ms: None,
-            prefill_latency_floor_ms: None,
             config_drifted: false,
         };
         assert!(recoverable_waste_available(&d));

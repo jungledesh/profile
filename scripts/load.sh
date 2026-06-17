@@ -363,61 +363,16 @@ Task: ${instructions[$i_idx]}"
   wait
 }
 
-load_ramp() {
-  # Three-step ramp for the profile demo:
-  #   Step 1 (4 workers, LAMBDA=3):  ~40% utilisation — r1 under-batching fires
-  #   Step 2 (8 workers, LAMBDA=2):  ~65% utilisation — healthy, rules quiet
-  #   Step 3 (15 workers, LAMBDA=1): ~100% utilisation — r2 KV pressure fires
-  #
-  # Profile runs alongside and sees each transition; delta awareness shows
-  # the operator exactly what changed and which rule cleared or fired.
-  # STEP_SECS controls how long each step runs (default: 120s = 2 min).
-  local step_secs="${STEP_SECS:-120}"
-  local max_tokens="${MAX_TOKENS:-300}"
-  local steps=("4:3" "8:2" "15:1")
-  local labels=("under-batching (~40% util)" "healthy (~65% util)" "KV pressure (~100% util)")
-
-  for idx in 0 1 2; do
-    local pair="${steps[$idx]}"
-    local workers="${pair%%:*}"
-    local lam="${pair##*:}"
-    echo ""
-    echo "── Ramp step $((idx + 1))/3: ${labels[$idx]} — ${workers} workers, λ=${lam}s, ${step_secs}s ──"
-    local end=$((SECONDS + step_secs))
-    for ((i = 0; i < workers; i++)); do
-      (
-        while [ "$SECONDS" -lt "$end" ]; do
-          local d_idx i_idx prompt max_tok think
-          d_idx=$((RANDOM % ${#docs[@]}))
-          i_idx=$((RANDOM % ${#instructions[@]}))
-          prompt="${docs[$d_idx]}
-
-${instructions[$i_idx]}"
-          max_tok=$(python3 -c "import random; print(random.randint(80, $max_tokens))")
-          think=$(python3 -c "import random; mt=max(float('$lam'),0.01); print(f'{random.expovariate(1/mt):.2f}')")
-          post "$prompt" "$max_tok"
-          sleep "$think"
-        done
-      ) &
-    done
-    wait
-    kill %% 2>/dev/null || true
-  done
-  echo ""
-  echo "Ramp complete."
-}
-
 echo "load.sh — MODE=${MODE}  target=${VLLM_URL}"
 echo "Ctrl-C to stop."
 echo ""
 
 case "$MODE" in
-  ramp) load_ramp ;;
   demo) load_demo ;;
   rag)  load_rag ;;
   r1)   load_r1 ;;
   seq)  load_seq ;;
   r2)   load_r2 ;;
   r5)   load_r5 ;;
-  *)    echo "Unknown MODE=${MODE}. Use ramp, demo, rag, r1, seq, r2, or r5." >&2; exit 1 ;;
+  *)    echo "Unknown MODE=${MODE}. Use demo, rag, r1, seq, r2, or r5." >&2; exit 1 ;;
 esac

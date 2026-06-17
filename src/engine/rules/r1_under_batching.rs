@@ -108,6 +108,8 @@ pub fn rule1_under_batching(
 pub fn r1_recommendation(
     snapshot: &RawSnapshot,
     config_max_num_seqs: Option<u32>,
+    kv_max_seqs: Option<u32>,
+    max_model_len: Option<u32>,
 ) -> Option<Recommendation> {
     let Rule1Outcome::Fired(d) = rule1_under_batching(snapshot, config_max_num_seqs) else {
         return None;
@@ -117,9 +119,9 @@ pub fn r1_recommendation(
         impact: 4,
         confidence: 0.8,
         action: "Increase client concurrency".to_string(),
-        short_action: r1_short_action(&d),
+        short_action: r1_short_action(&d, kv_max_seqs, max_model_len),
         expected_impact: "Higher throughput, stable TPOT".to_string(),
-        display_lines: format_under_batching_fired(&d, 0.8),
+        display_lines: format_under_batching_fired(&d, 0.8, kv_max_seqs, max_model_len),
     })
 }
 
@@ -139,23 +141,47 @@ pub fn r1_verbose_miss_line(snapshot: &RawSnapshot, config_max_num_seqs: Option<
     }
 }
 
-pub(super) fn r1_short_action(d: &UnderBatchingDetail) -> String {
+pub(super) fn r1_short_action(
+    d: &UnderBatchingDetail,
+    kv_max_seqs: Option<u32>,
+    max_model_len: Option<u32>,
+) -> String {
+    if let Some(kv_ceiling) = kv_max_seqs {
+        let m = max_model_len
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        return format!(
+            "increase client concurrency (KV ceiling: {kv_ceiling} at max_model_len={m})"
+        );
+    }
     let max_n = d.max_num_seqs.unwrap_or(0);
     let idle_slots = f64::from(max_n) - d.running;
     format!("increase client concurrency ({idle_slots:.0} slots idle)")
 }
 
-pub(super) fn format_under_batching_fired(d: &UnderBatchingDetail, confidence: f64) -> Vec<String> {
+pub(super) fn format_under_batching_fired(
+    d: &UnderBatchingDetail,
+    confidence: f64,
+    kv_max_seqs: Option<u32>,
+    max_model_len: Option<u32>,
+) -> Vec<String> {
     let Some(max_n) = d.max_num_seqs else {
         // Structurally unreachable: r1 hard-aborts without max_num_seqs.
         return Vec::new();
     };
     let threshold = UNDER_BATCHING_OCCUPANCY_PCT * 100.0;
     let max_str = max_n.to_string();
-    let fix_line = format!(
-        "    • Batch more requests or increase client concurrency ({:.0} slots idle)",
-        f64::from(max_n) - d.running
-    );
+    let fix_line = if let Some(kv_ceiling) = kv_max_seqs {
+        let m = max_model_len
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        format!("    • Increase client concurrency (KV ceiling: {kv_ceiling} at max_model_len={m})")
+    } else {
+        format!(
+            "    • Increase client concurrency ({:.0} slots idle)",
+            f64::from(max_n) - d.running
+        )
+    };
     let confidence_str = if confidence >= 0.8 { "High" } else { "Medium" };
 
     vec![
@@ -186,8 +212,10 @@ pub(super) fn format_under_batching_window_issue(
     d: &UnderBatchingDetail,
     seen_pct: u32,
     confidence: f64,
+    kv_max_seqs: Option<u32>,
+    max_model_len: Option<u32>,
 ) -> Vec<String> {
-    let mut lines = format_under_batching_fired(d, confidence);
+    let mut lines = format_under_batching_fired(d, confidence, kv_max_seqs, max_model_len);
     lines.insert(1, format!("  Seen in {seen_pct}% of windows"));
     lines
 }
@@ -459,7 +487,7 @@ mod tests {
     #[test]
     fn r1_recommendation_fires_without_baseline() {
         let s = entry_fired_snap();
-        let r = r1_recommendation(&s, None).expect("fired");
+        let r = r1_recommendation(&s, None, None, None).expect("fired");
         assert_eq!(r.rule_name, "under_batching");
         assert!((r.confidence - 0.8).abs() < 1e-9);
     }
@@ -467,8 +495,25 @@ mod tests {
     #[test]
     fn short_action_includes_idle_slots() {
         let s = entry_fired_snap();
-        let r = r1_recommendation(&s, None).expect("fired");
+        let r = r1_recommendation(&s, None, None, None).expect("fired");
         assert!(r.short_action.contains("increase client concurrency"));
         assert!(r.short_action.contains("251 slots idle"));
+    }
+
+    #[test]
+    fn fix_line_uses_kv_ceiling_when_known() {
+        let s = entry_fired_snap();
+        let r = r1_recommendation(&s, None, Some(13), Some(8192)).expect("fired");
+        let text = r.display_lines.join("\n");
+        assert!(text.contains("KV ceiling: 13 at max_model_len=8192"));
+        assert!(!text.contains("slots idle"));
+    }
+
+    #[test]
+    fn fix_line_uses_idle_slots_when_ceiling_unknown() {
+        let s = entry_fired_snap();
+        let r = r1_recommendation(&s, None, None, None).expect("fired");
+        let text = r.display_lines.join("\n");
+        assert!(text.contains("slots idle"));
     }
 }

@@ -2,33 +2,6 @@ use crate::engine::Report;
 
 use super::DiagnoseResult;
 
-// Direction thresholds. Provisional: calibrate against real workloads before hardening.
-const THROUGHPUT_IMPROVED_PCT: f64 = 10.0;
-const THROUGHPUT_DEGRADED_PCT: f64 = -10.0;
-const TTFT_P95_IMPROVED_PCT: f64 = -15.0; // negative = lower latency = better
-const TTFT_P95_DEGRADED_PCT: f64 = 20.0;
-const TPOT_P95_IMPROVED_PCT: f64 = -10.0; // negative = lower latency = better
-const TPOT_P95_DEGRADED_PCT: f64 = 15.0;
-
-// Minimum 2ms regardless of floor — safety net when baseline is unavailable
-const TPOT_JITTER_FLOOR_MS: f64 = 2.0;
-// Minimum 10ms regardless of floor
-const TTFT_JITTER_FLOOR_MS: f64 = 10.0;
-
-/// Placeholder until NLP `Goal` is wired from `cli/goal/`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Goal;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Direction {
-    Better,
-    Worse,
-    /// Signals contradict each other; reason always set.
-    Mixed,
-    /// No meaningful change, or no measurable signal.
-    NoChange,
-}
-
 #[derive(Debug, Clone)]
 pub struct Delta {
     /// Relative % change in `generation_tokens_per_sec`.
@@ -61,21 +34,10 @@ pub struct Delta {
     pub ttft_p95_after_ms: Option<f64>,
     pub tpot_p95_before_ms: Option<f64>,
     pub tpot_p95_after_ms: Option<f64>,
-    pub direction: Direction,
-    pub direction_reason: Option<&'static str>,
     pub ttft_p99_delta_pct: Option<f64>,
     pub ttft_p95_delta_pct: Option<f64>,
     pub tpot_p95_delta_pct: Option<f64>,
-    pub tpot_floor_ms: Option<f64>,
-    pub prefill_latency_floor_ms: Option<f64>,
     pub config_drifted: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Signal {
-    Improved,
-    Flat,
-    Degraded,
 }
 
 fn pct_delta(before: Option<f64>, after: Option<f64>) -> Option<f64> {
@@ -85,194 +47,6 @@ fn pct_delta(before: Option<f64>, after: Option<f64>) -> Option<f64> {
         }
         _ => None,
     }
-}
-
-fn eval_throughput(pct: f64) -> Signal {
-    if pct >= THROUGHPUT_IMPROVED_PCT {
-        Signal::Improved
-    } else if pct <= THROUGHPUT_DEGRADED_PCT {
-        Signal::Degraded
-    } else {
-        Signal::Flat
-    }
-}
-
-fn eval_ttft_p95(pct: f64, delta_ms: f64, prefill_floor_ms: Option<f64>) -> Signal {
-    // Jitter margin: 1.5× the physics prefill floor.
-    // TTFT spikes by full prefill durations from queue timing alone —
-    // absorb at least one unlucky queue-wait before declaring regression.
-    let jitter = prefill_floor_ms
-        .map(|f| (f * 1.5).max(TTFT_JITTER_FLOOR_MS))
-        .unwrap_or(TTFT_JITTER_FLOOR_MS);
-    if delta_ms > 0.0 && delta_ms < jitter {
-        return Signal::Flat;
-    }
-    if pct <= TTFT_P95_IMPROVED_PCT {
-        Signal::Improved
-    } else if pct >= TTFT_P95_DEGRADED_PCT {
-        Signal::Degraded
-    } else {
-        Signal::Flat
-    }
-}
-
-fn eval_tpot_p95(pct: f64, delta_ms: f64, tpot_floor_ms: Option<f64>) -> Signal {
-    // Jitter margin: half the physics decode floor.
-    // At low latency, percentage swings are noisy — only flag degradation
-    // when the absolute increase exceeds hardware-level noise.
-    let jitter = tpot_floor_ms
-        .map(|f| (f * 0.5).max(TPOT_JITTER_FLOOR_MS))
-        .unwrap_or(TPOT_JITTER_FLOOR_MS);
-    if delta_ms > 0.0 && delta_ms < jitter {
-        return Signal::Flat;
-    }
-    if pct <= TPOT_P95_IMPROVED_PCT {
-        Signal::Improved
-    } else if pct >= TPOT_P95_DEGRADED_PCT {
-        Signal::Degraded
-    } else {
-        Signal::Flat
-    }
-}
-
-fn evaluate_direction(delta: &Delta) -> (Direction, Option<&'static str>) {
-    use Signal::*;
-
-    let tput = delta
-        .throughput_delta_pct
-        .filter(|v| v.is_finite())
-        .map(eval_throughput)
-        .unwrap_or(Flat);
-
-    let tpot_delta_ms = match (delta.tpot_p95_before_ms, delta.tpot_p95_after_ms) {
-        (Some(b), Some(a)) => a - b,
-        _ => 0.0,
-    };
-    let ttft_delta_ms = match (delta.ttft_p95_before_ms, delta.ttft_p95_after_ms) {
-        (Some(b), Some(a)) => a - b,
-        _ => 0.0,
-    };
-
-    let ttft = delta
-        .ttft_p95_delta_pct
-        .filter(|v| v.is_finite())
-        .map(|pct| eval_ttft_p95(pct, ttft_delta_ms, delta.prefill_latency_floor_ms))
-        .unwrap_or(Flat);
-
-    let tpot = delta
-        .tpot_p95_delta_pct
-        .filter(|v| v.is_finite())
-        .map(|pct| eval_tpot_p95(pct, tpot_delta_ms, delta.tpot_floor_ms))
-        .unwrap_or(Flat);
-
-    match (tput, ttft, tpot) {
-        (Improved, Improved, Improved) => (Direction::Better, None),
-        (Improved, Improved, Flat) => (Direction::Better, None),
-        (Improved, Improved, Degraded) => (
-            Direction::Mixed,
-            Some("throughput + TTFT improved; TPOT worse — check KV pressure under higher load"),
-        ),
-        (Improved, Flat, Improved) => (Direction::Better, None),
-        (Improved, Flat, Flat) => (Direction::Better, Some("throughput expanded")),
-        (Improved, Flat, Degraded) => (
-            Direction::Mixed,
-            Some("throughput up, TPOT degraded; KV cache pressure likely"),
-        ),
-        (Improved, Degraded, Improved) => (
-            Direction::Mixed,
-            Some("throughput + TPOT improved; TTFT spiked — check prefill saturation"),
-        ),
-        (Improved, Degraded, Flat) => (Direction::Mixed, Some("throughput up, TTFT spiked")),
-        (Improved, Degraded, Degraded) => (
-            Direction::Worse,
-            Some("latency broken; throughput gain at cost of SLA"),
-        ),
-        (Flat, Improved, Improved) => (Direction::Better, None),
-        (Flat, Improved, Flat) => (Direction::Better, Some("TTFT p95 improved")),
-        (Flat, Improved, Degraded) => (
-            Direction::Mixed,
-            Some("TTFT improved, TPOT worse; prefill vs decode trade-off"),
-        ),
-        (Flat, Flat, Improved) => (Direction::Better, Some("TPOT p95 improved")),
-        (Flat, Flat, Flat) => (Direction::NoChange, None),
-        (Flat, Flat, Degraded) => (Direction::Worse, Some("TPOT p95 degraded")),
-        (Flat, Degraded, Improved) => (
-            Direction::Mixed,
-            Some("TTFT spiked, TPOT improved; prefill contention"),
-        ),
-        (Flat, Degraded, Flat) => (Direction::Worse, Some("TTFT p95 spiked")),
-        (Flat, Degraded, Degraded) => (Direction::Worse, Some("latency degraded across board")),
-        (Degraded, Improved, Improved) => (
-            Direction::Mixed,
-            Some("throughput fell; latency improvement may be load artifact"),
-        ),
-        (Degraded, Improved, Flat) => (
-            Direction::Worse,
-            Some("throughput fell; TTFT gain is load artifact"),
-        ),
-        (Degraded, Improved, Degraded) => (
-            Direction::Worse,
-            Some("throughput fell, TPOT worse; TTFT gain is load artifact"),
-        ),
-        (Degraded, Flat, Improved) => (
-            Direction::Mixed,
-            Some("throughput fell, TPOT improved; load drop likely"),
-        ),
-        (Degraded, Flat, Flat) => (Direction::Worse, Some("throughput fell")),
-        (Degraded, Flat, Degraded) => (Direction::Worse, Some("throughput fell, TPOT degraded")),
-        (Degraded, Degraded, Improved) => (Direction::Worse, Some("throughput + TTFT degraded")),
-        (Degraded, Degraded, Flat) => (Direction::Worse, Some("throughput + TTFT degraded")),
-        (Degraded, Degraded, Degraded) => (
-            Direction::Worse,
-            Some("severe regression; all signals degraded"),
-        ),
-    }
-}
-
-fn rule_direction_reason(
-    prev_rule: Option<&'static str>,
-    new_rule: Option<&'static str>,
-    direction: Direction,
-) -> Option<&'static str> {
-    match (prev_rule, new_rule, direction) {
-        (Some("concurrency_saturation"), None, Direction::Better) => {
-            Some("scheduler bottleneck cleared")
-        }
-        (Some("concurrency_saturation"), Some("concurrency_saturation"), Direction::NoChange) => {
-            Some("scheduler still saturated")
-        }
-        (Some("kv_cache_pressure"), None, Direction::Better) => Some("KV pressure cleared"),
-        (Some("kv_cache_pressure"), Some("kv_cache_pressure"), Direction::NoChange) => {
-            Some("KV pressure persists")
-        }
-        (Some("kv_admission_backlog"), None, Direction::Better) => {
-            Some("KV admission backlog cleared")
-        }
-        (Some("kv_admission_backlog"), Some("kv_admission_backlog"), Direction::NoChange) => {
-            Some("KV admission backlog persists")
-        }
-        (Some("under_batching"), None, Direction::Better) => Some("batch utilization improved"),
-        (Some("under_batching"), Some("under_batching"), Direction::NoChange) => {
-            Some("batch still under-utilized")
-        }
-        (Some("low_prefix_reuse"), None, Direction::Better) => {
-            Some("prefix cache hit rate improved")
-        }
-        (Some("low_prefix_reuse"), Some("low_prefix_reuse"), Direction::NoChange) => {
-            Some("prefix cache miss persists")
-        }
-        _ => None,
-    }
-}
-
-/// v2: Default/Throughput path only.
-///
-/// `goal` is reserved; exhaustive match ensures future objectives fail to compile until handled.
-pub fn calculate_direction(
-    delta: &Delta,
-    _goal: Option<&Goal>,
-) -> (Direction, Option<&'static str>) {
-    evaluate_direction(delta)
 }
 
 pub fn compute(
@@ -340,13 +114,7 @@ pub fn compute(
         .and_then(|b| b.cost.as_ref())
         .and_then(|c| c.joules_per_token);
 
-    let tpot_floor_ms = curr_report.baseline.as_ref().map(|b| b.tpot_floor_ms);
-    let prefill_latency_floor_ms = curr_report
-        .baseline
-        .as_ref()
-        .and_then(|b| b.prefill_latency_floor_ms);
-
-    let mut delta = Delta {
+    Delta {
         throughput_delta_pct,
         throughput_before,
         throughput_after,
@@ -370,21 +138,11 @@ pub fn compute(
         ttft_p95_after_ms,
         tpot_p95_before_ms,
         tpot_p95_after_ms,
-        direction: Direction::NoChange,
-        direction_reason: None,
         ttft_p99_delta_pct,
         ttft_p95_delta_pct,
         tpot_p95_delta_pct,
-        tpot_floor_ms,
-        prefill_latency_floor_ms,
         config_drifted,
-    };
-    let (direction, reason) = calculate_direction(&delta, None);
-    let prev_rule = prev_report.groups.first().map(|g| g.primary.rule_name);
-    let new_rule = curr_report.groups.first().map(|g| g.primary.rule_name);
-    delta.direction = direction;
-    delta.direction_reason = rule_direction_reason(prev_rule, new_rule, direction).or(reason);
-    delta
+    }
 }
 
 #[cfg(test)]
@@ -462,201 +220,6 @@ mod tests {
         }
     }
 
-    fn mk_delta(
-        throughput_pct: Option<f64>,
-        ttft_p95_before: Option<f64>,
-        ttft_p95_after: Option<f64>,
-        tpot_p95_before: Option<f64>,
-        tpot_p95_after: Option<f64>,
-    ) -> Delta {
-        mk_delta_with_floors(
-            throughput_pct,
-            ttft_p95_before,
-            ttft_p95_after,
-            tpot_p95_before,
-            tpot_p95_after,
-            None,
-            None,
-        )
-    }
-
-    fn mk_delta_with_floors(
-        throughput_pct: Option<f64>,
-        ttft_p95_before: Option<f64>,
-        ttft_p95_after: Option<f64>,
-        tpot_p95_before: Option<f64>,
-        tpot_p95_after: Option<f64>,
-        tpot_floor_ms: Option<f64>,
-        prefill_latency_floor_ms: Option<f64>,
-    ) -> Delta {
-        Delta {
-            throughput_delta_pct: throughput_pct,
-            throughput_before: None,
-            throughput_after: None,
-            efficiency_delta_pp: None,
-            efficiency_pct_before: None,
-            efficiency_pct_after: None,
-            cost_per_million_before: None,
-            cost_per_million_after: None,
-            joules_per_token_before: None,
-            joules_per_token_after: None,
-            cost_source_after: None,
-            ttft_before_ms: None,
-            ttft_after_ms: None,
-            tpot_before_ms: None,
-            tpot_after_ms: None,
-            ttft_p99_before_ms: None,
-            ttft_p99_after_ms: None,
-            tpot_p99_before_ms: None,
-            tpot_p99_after_ms: None,
-            ttft_p95_before_ms: ttft_p95_before,
-            ttft_p95_after_ms: ttft_p95_after,
-            tpot_p95_before_ms: tpot_p95_before,
-            tpot_p95_after_ms: tpot_p95_after,
-            direction: Direction::NoChange,
-            direction_reason: None,
-            ttft_p99_delta_pct: None,
-            ttft_p95_delta_pct: pct_delta(ttft_p95_before, ttft_p95_after),
-            tpot_p95_delta_pct: pct_delta(tpot_p95_before, tpot_p95_after),
-            tpot_floor_ms,
-            prefill_latency_floor_ms,
-            config_drifted: false,
-        }
-    }
-
-    fn finalize_delta(mut d: Delta) -> Delta {
-        let (direction, reason) = calculate_direction(&d, None);
-        d.direction = direction;
-        d.direction_reason = reason;
-        d
-    }
-
-    fn eval_dir(d: &Delta) -> (Direction, Option<&'static str>) {
-        evaluate_direction(d)
-    }
-
-    #[test]
-    fn all_improved_is_better() {
-        let (dir, reason) = eval_dir(&mk_delta(
-            Some(15.0),
-            Some(100.0),
-            Some(80.0),
-            Some(50.0),
-            Some(40.0),
-        ));
-        assert_eq!(dir, Direction::Better);
-        assert!(reason.is_none());
-    }
-
-    #[test]
-    fn throughput_up_tpot_degraded_is_mixed() {
-        let d = finalize_delta(mk_delta(
-            Some(15.0),
-            Some(100.0),
-            Some(95.0),
-            Some(50.0),
-            Some(60.0),
-        ));
-        assert_eq!(d.direction, Direction::Mixed);
-        assert!(d
-            .direction_reason
-            .is_some_and(|r| r.contains("KV cache pressure")));
-    }
-
-    #[test]
-    fn throughput_up_ttft_degraded_tpot_degraded_is_worse() {
-        let d = finalize_delta(mk_delta(
-            Some(15.0),
-            Some(100.0),
-            Some(125.0),
-            Some(50.0),
-            Some(60.0),
-        ));
-        assert_eq!(d.direction, Direction::Worse);
-        assert!(d
-            .direction_reason
-            .is_some_and(|r| r.contains("latency broken")));
-    }
-
-    #[test]
-    fn throughput_down_latency_improved_is_mixed() {
-        let d = finalize_delta(mk_delta(
-            Some(-15.0),
-            Some(100.0),
-            Some(80.0),
-            Some(50.0),
-            Some(40.0),
-        ));
-        assert_eq!(d.direction, Direction::Mixed);
-        assert!(d
-            .direction_reason
-            .is_some_and(|r| r.contains("load artifact")));
-    }
-
-    #[test]
-    fn throughput_down_ttft_improved_tpot_flat_is_worse() {
-        let d = finalize_delta(mk_delta(
-            Some(-15.0),
-            Some(100.0),
-            Some(80.0),
-            Some(50.0),
-            Some(50.0),
-        ));
-        assert_eq!(d.direction, Direction::Worse);
-        assert!(d
-            .direction_reason
-            .is_some_and(|r| r.contains("load artifact")));
-    }
-
-    #[test]
-    fn flat_tpot_degraded_is_worse() {
-        let d = finalize_delta(mk_delta(
-            Some(5.0),
-            Some(100.0),
-            Some(100.0),
-            Some(50.0),
-            Some(60.0),
-        ));
-        assert_eq!(d.direction, Direction::Worse);
-        assert_eq!(d.direction_reason, Some("TPOT p95 degraded"));
-    }
-
-    #[test]
-    fn flat_ttft_degraded_tpot_improved_is_mixed() {
-        let d = finalize_delta(mk_delta(
-            Some(5.0),
-            Some(100.0),
-            Some(125.0),
-            Some(50.0),
-            Some(40.0),
-        ));
-        assert_eq!(d.direction, Direction::Mixed);
-        assert!(d
-            .direction_reason
-            .is_some_and(|r| r.contains("prefill contention")));
-    }
-
-    #[test]
-    fn no_signal_is_no_change() {
-        let d = finalize_delta(mk_delta(None, None, None, None, None));
-        assert_eq!(d.direction, Direction::NoChange);
-    }
-
-    #[test]
-    fn severe_regression_all_degraded() {
-        let d = finalize_delta(mk_delta(
-            Some(-15.0),
-            Some(100.0),
-            Some(125.0),
-            Some(50.0),
-            Some(60.0),
-        ));
-        assert_eq!(d.direction, Direction::Worse);
-        assert!(d
-            .direction_reason
-            .is_some_and(|r| r.contains("severe regression")));
-    }
-
     #[test]
     fn pct_delta_returns_none_when_before_zero() {
         assert!(pct_delta(Some(0.0), Some(50.0)).is_none());
@@ -668,7 +231,7 @@ mod tests {
     }
 
     #[test]
-    fn compute_direction_better_on_throughput_not_efficiency() {
+    fn compute_populates_efficiency_delta_pp() {
         let d = compute(
             &diagnose(Some(100.0)),
             &report_eff(Some(50.0), None, None),
@@ -676,32 +239,8 @@ mod tests {
             &report_eff(Some(55.0), None, None),
             false,
         );
-        assert_eq!(d.direction, Direction::Better);
         assert!((d.efficiency_delta_pp.unwrap() - 5.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn compute_direction_worse_on_throughput_drop() {
-        let d = compute(
-            &diagnose(Some(100.0)),
-            &report_eff(Some(50.0), None, None),
-            &diagnose(Some(89.0)),
-            &report_eff(Some(43.0), None, None),
-            false,
-        );
-        assert_eq!(d.direction, Direction::Worse);
-    }
-
-    #[test]
-    fn compute_direction_no_change_when_throughput_within_flat_band() {
-        let d = compute(
-            &diagnose(Some(100.0)),
-            &report_eff(Some(50.0), None, None),
-            &diagnose(Some(91.0)),
-            &report_eff(Some(50.0), None, None),
-            false,
-        );
-        assert_eq!(d.direction, Direction::NoChange);
+        assert!((d.throughput_delta_pct.unwrap() - 12.0).abs() < 1e-9);
     }
 
     #[test]
@@ -714,7 +253,6 @@ mod tests {
             false,
         );
         assert!(d.throughput_delta_pct.is_none());
-        assert_eq!(d.direction, Direction::NoChange);
     }
 
     #[test]
@@ -814,65 +352,5 @@ mod tests {
         assert_eq!(d.tpot_p95_after_ms, Some(63.0));
         assert!((d.ttft_p95_delta_pct.unwrap() - (-15.0)).abs() < 1e-9);
         assert!((d.tpot_p95_delta_pct.unwrap() - (-10.0)).abs() < 1e-9);
-    }
-
-    #[test]
-    fn tpot_jitter_suppresses_small_absolute_increase() {
-        let d = mk_delta_with_floors(
-            Some(0.0),
-            Some(100.0),
-            Some(100.0),
-            Some(10.0),
-            Some(12.0),
-            Some(8.0),
-            None,
-        );
-        assert_eq!(
-            eval_tpot_p95(d.tpot_p95_delta_pct.unwrap(), 2.0, d.tpot_floor_ms),
-            Signal::Flat
-        );
-    }
-
-    #[test]
-    fn tpot_jitter_does_not_suppress_large_absolute_increase() {
-        let d = mk_delta_with_floors(
-            Some(0.0),
-            Some(100.0),
-            Some(100.0),
-            Some(10.0),
-            Some(18.0),
-            Some(8.0),
-            None,
-        );
-        assert_eq!(
-            eval_tpot_p95(d.tpot_p95_delta_pct.unwrap(), 8.0, d.tpot_floor_ms),
-            Signal::Degraded
-        );
-    }
-
-    #[test]
-    fn ttft_jitter_absorbs_one_prefill_spike() {
-        let d = mk_delta_with_floors(
-            Some(0.0),
-            Some(50.0),
-            Some(110.0),
-            Some(50.0),
-            Some(50.0),
-            None,
-            Some(50.0),
-        );
-        assert_eq!(
-            eval_ttft_p95(
-                d.ttft_p95_delta_pct.unwrap(),
-                60.0,
-                d.prefill_latency_floor_ms
-            ),
-            Signal::Flat
-        );
-    }
-
-    #[test]
-    fn jitter_uses_minimum_floor_when_baseline_missing() {
-        assert_eq!(eval_tpot_p95(50.0, 1.0, None), Signal::Flat);
     }
 }

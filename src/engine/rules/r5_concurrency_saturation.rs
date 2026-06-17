@@ -158,9 +158,14 @@ pub(super) fn format_concurrency_saturation_issue(
                     "    • KV pool has room ({pct:.0}%), but --max-num-seqs is at the physics ceiling for {m}. Lower --max-model-len to safely raise concurrency, or add a replica."
                 ));
             } else {
-                lines.push(format!(
-                    "    • Raise --max-num-seqs above {max_str} (KV cache {pct:.0}% used, pool has room)"
-                ));
+                match kv_max_seqs {
+                    Some(_) => lines.push(format!(
+                        "    • Raise --max-num-seqs above {max_str} (KV cache {pct:.0}% used, pool has room)"
+                    )),
+                    None => lines.push(format!(
+                        "    • Raise --max-num-seqs above {max_str} if KV headroom confirmed (ceiling unknown)"
+                    )),
+                }
             }
         }
         Some(pct) => {
@@ -260,6 +265,7 @@ pub(super) fn r5_short_action(
 
 pub(super) fn aggregate_concurrency_saturation_detail(
     details: &[ConcurrencySaturationDetail],
+    session_kv_peak: Option<f64>,
 ) -> Option<ConcurrencySaturationDetail> {
     if details.is_empty() {
         return None;
@@ -281,12 +287,15 @@ pub(super) fn aggregate_concurrency_saturation_detail(
     let merged_ttft = crate::collectors::merge_p99_bucket_vecs(&ttft_p99_vecs);
     let ttft_p99_ms =
         crate::collectors::vllm::histogram_quantile(0.99, &merged_ttft).map(|s| s * 1000.0);
-    // Use session-wide peak, not last window — a spike early in the run must
-    // block a "safe to raise concurrency" signal even if KV drained by end.
-    let kv_cache_usage_perc = details
-        .iter()
-        .filter_map(|d| d.kv_cache_usage_perc)
-        .reduce(f64::max);
+    // session_kv_peak: global peak across all evaluable windows (kv_cache_peak_perc preferred).
+    // Supersedes the per-detail values which are bounded to r5-firing windows only.
+    // Falls back to the r5-window peak if caller has no session data (e.g. single-window path).
+    let kv_cache_usage_perc = session_kv_peak.or_else(|| {
+        details
+            .iter()
+            .filter_map(|d| d.kv_cache_usage_perc)
+            .reduce(f64::max)
+    });
     Some(ConcurrencySaturationDetail {
         requests_running: run,
         requests_waiting: wait,
@@ -399,8 +408,17 @@ mod tests {
     fn fix_raises_cap_when_kv_below_safe_threshold() {
         let text = format_concurrency_saturation_issue(&fired_detail(None, Some(70.0)), None, None)
             .join("\n");
-        assert!(text.contains("Raise --max-num-seqs above 32"));
-        assert!(text.contains("KV cache 70% used, pool has room"));
+        assert!(text.contains("ceiling unknown"));
+        assert!(!text.contains("pool has room"));
+    }
+
+    #[test]
+    fn fix_shows_physics_ceiling_when_kv_low_and_cap_at_ceiling() {
+        let mut d = fired_detail(None, Some(8.0));
+        d.max_num_seqs = Some(13);
+        let text = format_concurrency_saturation_issue(&d, Some(8192), Some(13)).join("\n");
+        assert!(text.contains("Lower --max-model-len"));
+        assert!(text.contains("max_model_len=8192"));
     }
 
     #[test]
@@ -485,8 +503,8 @@ mod tests {
 
     #[test]
     fn aggregate_max_num_seqs_is_option_not_zero_sentinel() {
-        let agg =
-            aggregate_concurrency_saturation_detail(&[fired_detail(None, None)]).expect("agg");
+        let agg = aggregate_concurrency_saturation_detail(&[fired_detail(None, None)], None)
+            .expect("agg");
         assert_eq!(agg.max_num_seqs, Some(32));
     }
 
@@ -526,7 +544,7 @@ mod tests {
                 count: 100.0,
             },
         ];
-        let agg = aggregate_concurrency_saturation_detail(&[d1, d2]).expect("agg");
+        let agg = aggregate_concurrency_saturation_detail(&[d1, d2], None).expect("agg");
         let p99 = agg.ttft_p99_ms.expect("merged p99");
         // Merged: 200 obs, p99 ≈ 198ms. Simple average of 99ms and 199ms would be 149ms.
         assert!((p99 - 198.0).abs() < 1.0);
@@ -534,11 +552,21 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_r5_kv_uses_session_peak() {
+    fn aggregate_r5_kv_falls_back_to_r5_detail_peak_without_session_context() {
+        // Peak (not average) — a spike must block a "safe to raise" recommendation
+        // even if KV drained by end of session.
         let d1 = fired_detail(None, Some(60.0));
         let d2 = fired_detail(None, Some(95.0));
         let d3 = fired_detail(None, Some(70.0));
-        let agg = aggregate_concurrency_saturation_detail(&[d1, d2, d3]).expect("agg");
+        let agg = aggregate_concurrency_saturation_detail(&[d1, d2, d3], None).expect("agg");
+        assert_eq!(agg.kv_cache_usage_perc, Some(95.0));
+    }
+
+    #[test]
+    fn aggregate_r5_kv_prefers_session_peak_over_detail_peaks() {
+        let d1 = fired_detail(None, Some(60.0));
+        let d2 = fired_detail(None, Some(70.0));
+        let agg = aggregate_concurrency_saturation_detail(&[d1, d2], Some(95.0)).expect("agg");
         assert_eq!(agg.kv_cache_usage_perc, Some(95.0));
     }
 

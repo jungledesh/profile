@@ -40,7 +40,17 @@ pub fn build_report(input: AnalysisInput<'_>) -> Report {
     ));
 
     let mut recs: Vec<Recommendation> = [
-        rules::r1_recommendation(snapshot, input.ctx.config.max_num_seqs),
+        rules::r1_recommendation(
+            snapshot,
+            input.ctx.config.max_num_seqs,
+            rules::compute_kv_max_seqs(
+                baseline.as_ref().and_then(|b| b.kv_headroom_gb),
+                input.ctx.config.max_model_len,
+                &input.ctx.model,
+                input.ctx.config.kv_cache_dtype.as_deref(),
+            ),
+            input.ctx.config.max_model_len,
+        ),
         rules::r2_recommendation(
             snapshot,
             input.ctx.config.max_model_len,
@@ -118,6 +128,10 @@ pub fn build_report(input: AnalysisInput<'_>) -> Report {
         groups,
         r2_suppressed_by_r4,
     }
+}
+
+pub fn aggregate_prefix_hit_rate_for_diagnose(windows: &[RuntimeWindow]) -> Option<f64> {
+    rules::aggregate_prefix_hit_rate_for_windows(windows)
 }
 
 #[cfg(test)]
