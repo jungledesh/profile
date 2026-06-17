@@ -226,10 +226,6 @@ fn healthy_exit_message(
     tpot_floor_ms: Option<f64>,
     chunked_prefill_enabled: Option<bool>,
 ) -> String {
-    let eff_str = efficiency
-        .map(|e| format!("Efficiency: {e:.1}%"))
-        .unwrap_or_else(|| "Efficiency: unavailable".to_string());
-
     let limiter = engine::limiter::identify(
         kv_cache_usage_perc,
         num_running,
@@ -238,6 +234,20 @@ fn healthy_exit_message(
         tpot_floor_ms,
         chunked_prefill_enabled,
     );
+
+    if limiter == Some(engine::limiter::PrimaryLimiter::Traffic) {
+        let eff = efficiency
+            .filter(|e| e.is_finite())
+            .map(|e| format!("Efficiency {e:.1}%"))
+            .unwrap_or_else(|| "Efficiency unavailable".to_string());
+        return format!(
+            "No issues. {eff} — gap is traffic, not config. Increase load to find real limits."
+        );
+    }
+
+    let eff_str = efficiency
+        .map(|e| format!("Efficiency: {e:.1}%"))
+        .unwrap_or_else(|| "Efficiency: unavailable".to_string());
 
     let limiter_block = match limiter {
         Some(engine::limiter::PrimaryLimiter::Capacity) => {
@@ -248,13 +258,6 @@ fn healthy_exit_message(
                 "Primary Limiter: KV Cache Capacity\n\
                  {eff_str} —{kv} concurrency is capped before bandwidth saturates.\n\
                  Levers: enable prefix caching, apply KV quantization (FP8), or add TP to split KV cache."
-            )
-        }
-        Some(engine::limiter::PrimaryLimiter::Traffic) => {
-            format!(
-                "Primary Limiter: Traffic Density\n\
-                 {eff_str} — gap is idle time, not misconfiguration.\n\
-                 Lever: increase incoming QPS or consolidate traffic from other nodes."
             )
         }
         Some(engine::limiter::PrimaryLimiter::Physics) => {
@@ -282,18 +285,16 @@ fn healthy_exit_message(
                  Levers: test --enforce-eager, verify CPU/PCIe bottlenecks, or evaluate SGLang for this workload."
             )
         }
+        Some(engine::limiter::PrimaryLimiter::Traffic) => {
+            unreachable!("traffic limiter returns before limiter_block")
+        }
         None => {
             format!("{eff_str} — insufficient data to identify primary limiter.")
         }
     };
 
     let prefix = match limiter {
-        Some(engine::limiter::PrimaryLimiter::Traffic) => {
-            "Rules clear. Server is under-utilized — not enough incoming traffic to stress the hardware."
-        }
-        Some(_) => {
-            "Rules clear. Server is optimally tuned for current constraints."
-        }
+        Some(_) => "Rules clear. Server is optimally tuned for current constraints.",
         None => "Rules clear.",
     };
     format!("{prefix}\n\n{limiter_block}")
@@ -606,10 +607,11 @@ mod tests {
             Some(5.0),
             Some(false),
         );
-        assert!(msg.contains("Traffic Density"));
-        assert!(msg.contains("Efficiency: 34.0%"));
-        assert!(msg.contains("under-utilized"));
-        assert!(!msg.contains("optimally tuned"));
+        assert_eq!(
+            msg,
+            "No issues. Efficiency 34.0% — gap is traffic, not config. Increase load to find real limits."
+        );
+        assert!(!msg.contains('\n'));
     }
 
     #[test]
@@ -623,8 +625,9 @@ mod tests {
             Some(5.0),
             Some(false),
         );
-        assert!(msg.contains("under-utilized"));
+        assert!(msg.contains("No issues."));
         assert!(!msg.contains("optimally tuned"));
+        assert!(!msg.contains("Rules clear"));
     }
 
     #[test]

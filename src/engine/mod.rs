@@ -81,6 +81,12 @@ pub fn build_report(input: AnalysisInput<'_>) -> Report {
                 .or(snapshot.vllm.kv_cache_usage_perc),
             input.ctx.config.max_num_seqs,
             input.ctx.config.max_model_len,
+            rules::compute_kv_max_seqs(
+                baseline.as_ref().and_then(|b| b.kv_headroom_gb),
+                input.ctx.config.max_model_len,
+                &input.ctx.model,
+                input.ctx.config.kv_cache_dtype.as_deref(),
+            ),
         ) {
             recs.push(r5);
         }

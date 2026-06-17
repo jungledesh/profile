@@ -217,17 +217,15 @@ pub fn r2_recommendation(
         0.5
     };
     let (action, short_action) = if d.preemptions_active {
-        let act = match kv_max_seqs {
-            Some(n) => format!("Lower --max-num-seqs to ≤{n}"),
-            None => "Lower --max-num-seqs to stop evictions".to_string(),
-        };
-        (act, r2_kv_pressure_short_action().to_string())
+        (
+            r2_action(true, kv_max_seqs, max_model_len),
+            r2_kv_pressure_short_action().to_string(),
+        )
     } else {
-        let act = match kv_max_seqs {
-            Some(n) => format!("Lower --max-num-seqs to ≤{n} or raise --gpu-memory-utilization"),
-            None => "Lower --max-num-seqs or raise --gpu-memory-utilization".to_string(),
-        };
-        (act, r2_backlog_short_action().to_string())
+        (
+            r2_action(false, kv_max_seqs, max_model_len),
+            r2_backlog_short_action().to_string(),
+        )
     };
     Some(Recommendation {
         rule_name: "kv_cache_pressure",
@@ -256,6 +254,32 @@ pub(super) fn r2_backlog_short_action() -> &'static str {
     "raise --gpu-memory-utilization"
 }
 
+fn r2_max_num_seqs_ceiling_phrase(
+    kv_max_seqs: Option<u32>,
+    max_model_len: Option<u32>,
+) -> Option<String> {
+    kv_max_seqs.map(|n| match max_model_len {
+        Some(m) => format!("Lower --max-num-seqs to ≤{n} (physics ceiling for max_model_len={m})"),
+        None => format!("Lower --max-num-seqs to ≤{n}"),
+    })
+}
+
+pub(super) fn r2_action(
+    preemptions_active: bool,
+    kv_max_seqs: Option<u32>,
+    max_model_len: Option<u32>,
+) -> String {
+    if preemptions_active {
+        r2_max_num_seqs_ceiling_phrase(kv_max_seqs, max_model_len)
+            .unwrap_or_else(|| "Lower --max-num-seqs to stop evictions".to_string())
+    } else {
+        match r2_max_num_seqs_ceiling_phrase(kv_max_seqs, max_model_len) {
+            Some(base) => format!("{base} or raise --gpu-memory-utilization"),
+            None => "Lower --max-num-seqs or raise --gpu-memory-utilization".to_string(),
+        }
+    }
+}
+
 pub(super) fn kv_pressure_confidence(windows_fired: usize, total_evaluable: usize) -> f64 {
     if total_evaluable == 0 {
         return 0.0;
@@ -280,11 +304,13 @@ fn max_num_seqs_bullet(
 ) -> String {
     match kv_max_seqs {
         Some(n) => {
-            let ctx = match max_model_len {
-                Some(len) => format!(" (~{n} seqs fit in KV at {len} tokens)"),
-                None => " (KV physics ceiling)".to_string(),
+            let base = match max_model_len {
+                Some(m) => {
+                    format!("Lower --max-num-seqs to ≤{n} (physics ceiling for max_model_len={m})")
+                }
+                None => format!("Lower --max-num-seqs to ≤{n}"),
             };
-            format!("    • Lower --max-num-seqs to ≤{n}{ctx}")
+            format!("    • {base}")
         }
         None => {
             if evictions {
@@ -763,6 +789,26 @@ mod tests {
     }
 
     #[test]
+    fn r2_action_backlog_includes_ceiling_and_max_model_len() {
+        let action = r2_action(false, Some(14), Some(8192));
+        assert!(action.contains("≤14"));
+        assert!(action.contains("max_model_len=8192"));
+    }
+
+    #[test]
+    fn action_string_includes_max_model_len_when_ceiling_known() {
+        let v = VllmRawMetrics {
+            kv_cache_usage_perc: Some(90.0),
+            num_preemptions_per_sec: Some(0.05),
+            generation_tokens_per_sec: Some(100.0),
+            ..Default::default()
+        };
+        let r = r2_recommendation(&snap(v), Some(8192), None, Some(15), 1, 4).expect("fired");
+        assert!(r.action.contains("max_model_len=8192"));
+        assert!(r.action.contains("≤15"));
+    }
+
+    #[test]
     fn action_string_includes_ceiling_when_kv_max_seqs_known() {
         let v = VllmRawMetrics {
             kv_cache_usage_perc: Some(90.0),
@@ -807,7 +853,7 @@ mod tests {
     }
 
     #[test]
-    fn model_len_not_in_evictions_path() {
+    fn model_len_not_in_evictions_path_when_ceiling_unknown() {
         let v = VllmRawMetrics {
             kv_cache_usage_perc: Some(90.0),
             num_preemptions_per_sec: Some(0.05),
@@ -824,6 +870,33 @@ mod tests {
         )
         .join("\n");
         assert!(!text.contains("--max-model-len"));
+    }
+
+    #[test]
+    fn model_len_in_evictions_path_when_ceiling_known() {
+        let v = VllmRawMetrics {
+            kv_cache_usage_perc: Some(90.0),
+            num_preemptions_per_sec: Some(0.05),
+            ..Default::default()
+        };
+        let text = format_kv_cache_pressure_fired(
+            &detail(90.0, true),
+            &snap(v),
+            3,
+            4,
+            Some(4096),
+            None,
+            Some(16),
+        )
+        .join("\n");
+        assert!(
+            text.contains("max_model_len=4096"),
+            "evictions path should include max_model_len when ceiling is known"
+        );
+        assert!(
+            text.contains("≤16"),
+            "evictions path should include the ceiling value"
+        );
     }
 
     fn sample_backlog_detail() -> KvAdmissionBacklogDetail {

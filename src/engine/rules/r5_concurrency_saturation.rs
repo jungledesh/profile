@@ -68,9 +68,47 @@ pub fn rule5_concurrency_saturation(
     })
 }
 
+pub(super) fn r5_action(
+    d: &ConcurrencySaturationDetail,
+    kv_max_seqs: Option<u32>,
+    max_model_len: Option<u32>,
+) -> String {
+    let max_label = d
+        .max_num_seqs
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "?".to_string());
+
+    if d.kv_cache_usage_perc
+        .is_some_and(|p| p >= KV_CACHE_SAFE_TO_SCALE_PCT)
+    {
+        return "Add a replica to scale out.".to_string();
+    }
+
+    if let (Some(ceiling), Some(current)) = (kv_max_seqs, d.max_num_seqs) {
+        if current >= ceiling {
+            let m = max_model_len
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            let kv_note = match d.kv_cache_usage_perc {
+                Some(pct) => format!("KV pool has room ({pct:.0}%), but"),
+                None => "KV unknown, but".to_string(),
+            };
+            return format!(
+                "{kv_note} --max-num-seqs is at the physics ceiling for max_model_len={m}. Lower --max-model-len to safely raise concurrency, or add a replica."
+            );
+        }
+    }
+
+    format!(
+        "Raise --max-num-seqs above {max_label} (scheduler at cap, {:.0}% of requests waiting)",
+        d.queue_ratio * 100.0
+    )
+}
+
 pub(super) fn format_concurrency_saturation_issue(
     d: &ConcurrencySaturationDetail,
     max_model_len: Option<u32>,
+    kv_max_seqs: Option<u32>,
 ) -> Vec<String> {
     let max_str = d
         .max_num_seqs
@@ -110,9 +148,20 @@ pub(super) fn format_concurrency_saturation_issue(
     lines.push("  Fix:".to_string());
     match d.kv_cache_usage_perc {
         Some(pct) if pct < KV_CACHE_SAFE_TO_SCALE_PCT => {
-            lines.push(format!(
-                "    • Raise --max-num-seqs above {max_str} (KV cache {pct:.0}% used, pool has room)"
-            ));
+            if kv_max_seqs
+                .is_some_and(|ceiling| d.max_num_seqs.is_some_and(|current| current >= ceiling))
+            {
+                let m = max_model_len
+                    .map(|n| format!("max_model_len={n}"))
+                    .unwrap_or_else(|| "max_model_len=unknown".to_string());
+                lines.push(format!(
+                    "    • KV pool has room ({pct:.0}%), but --max-num-seqs is at the physics ceiling for {m}. Lower --max-model-len to safely raise concurrency, or add a replica."
+                ));
+            } else {
+                lines.push(format!(
+                    "    • Raise --max-num-seqs above {max_str} (KV cache {pct:.0}% used, pool has room)"
+                ));
+            }
         }
         Some(pct) => {
             lines.push(format!(
@@ -125,9 +174,20 @@ pub(super) fn format_concurrency_saturation_issue(
             ));
         }
         None => {
-            lines.push(format!(
-                "    • Raise --max-num-seqs above {max_str} if KV cache has headroom"
-            ));
+            if kv_max_seqs
+                .is_some_and(|ceiling| d.max_num_seqs.is_some_and(|current| current >= ceiling))
+            {
+                let m = max_model_len
+                    .map(|n| format!("max_model_len={n}"))
+                    .unwrap_or_else(|| "max_model_len=unknown".to_string());
+                lines.push(format!(
+                    "    • KV unknown, but --max-num-seqs is at the physics ceiling for {m}. Lower --max-model-len to safely raise concurrency, or add a replica."
+                ));
+            } else {
+                lines.push(format!(
+                    "    • Raise --max-num-seqs above {max_str} if KV cache has headroom"
+                ));
+            }
         }
     }
     lines.push(String::new());
@@ -140,8 +200,9 @@ pub(super) fn format_concurrency_saturation_window_issue(
     d: &ConcurrencySaturationDetail,
     seen_pct: u32,
     max_model_len: Option<u32>,
+    kv_max_seqs: Option<u32>,
 ) -> Vec<String> {
-    let mut lines = format_concurrency_saturation_issue(d, max_model_len);
+    let mut lines = format_concurrency_saturation_issue(d, max_model_len, kv_max_seqs);
     lines.insert(1, format!("  Seen in {seen_pct}% of windows"));
     lines
 }
@@ -151,12 +212,9 @@ pub fn r5_recommendation(
     kv_cache_usage_perc: Option<f64>,
     config_max_num_seqs: Option<u32>,
     max_model_len: Option<u32>,
+    kv_max_seqs: Option<u32>,
 ) -> Option<Recommendation> {
     let d = rule5_concurrency_saturation(snapshot, kv_cache_usage_perc, config_max_num_seqs)?;
-    let max_label = d
-        .max_num_seqs
-        .map(|n| n.to_string())
-        .unwrap_or_else(|| "?".to_string());
     Some(Recommendation {
         rule_name: "concurrency_saturation",
         impact: 4,
@@ -164,37 +222,40 @@ pub fn r5_recommendation(
             (Some(_), Some(_)) => 0.9,
             _ => 0.6,
         },
-        action: if d
-            .kv_cache_usage_perc
-            .is_some_and(|p| p >= KV_CACHE_SAFE_TO_SCALE_PCT)
-        {
-            "Add a replica to scale out.".to_string()
-        } else {
-            format!(
-                "Raise --max-num-seqs above {} (scheduler at cap, {:.0}% of requests waiting)",
-                max_label,
-                d.queue_ratio * 100.0
-            )
-        },
-        short_action: r5_short_action(&d),
+        action: r5_action(&d, kv_max_seqs, max_model_len),
+        short_action: r5_short_action(&d, kv_max_seqs, max_model_len),
         expected_impact: "Queue drains, TTFT recovers.".to_string(),
-        display_lines: format_concurrency_saturation_issue(&d, max_model_len),
+        display_lines: format_concurrency_saturation_issue(&d, max_model_len, kv_max_seqs),
     })
 }
 
-pub(super) fn r5_short_action(d: &ConcurrencySaturationDetail) -> String {
-    let max_str = d
-        .max_num_seqs
-        .map(|n| n.to_string())
-        .unwrap_or_else(|| "?".to_string());
+pub(super) fn r5_short_action(
+    d: &ConcurrencySaturationDetail,
+    kv_max_seqs: Option<u32>,
+    max_model_len: Option<u32>,
+) -> String {
     let kv_safe = d
         .kv_cache_usage_perc
         .is_none_or(|pct| pct < KV_CACHE_SAFE_TO_SCALE_PCT);
-    if kv_safe {
-        format!("raise --max-num-seqs above {max_str}")
-    } else {
-        "add a replica to scale out".to_string()
+
+    if !kv_safe {
+        return "add a replica to scale out".to_string();
     }
+
+    if let (Some(ceiling), Some(current)) = (kv_max_seqs, d.max_num_seqs) {
+        if current >= ceiling {
+            let m = max_model_len
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            return format!("lower --max-model-len (at physics ceiling for max_model_len={m})");
+        }
+    }
+
+    let max_label = d
+        .max_num_seqs
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "current cap".to_string());
+    format!("raise --max-num-seqs above {max_label}")
 }
 
 pub(super) fn aggregate_concurrency_saturation_detail(
@@ -336,16 +397,16 @@ mod tests {
 
     #[test]
     fn fix_raises_cap_when_kv_below_safe_threshold() {
-        let text =
-            format_concurrency_saturation_issue(&fired_detail(None, Some(70.0)), None).join("\n");
+        let text = format_concurrency_saturation_issue(&fired_detail(None, Some(70.0)), None, None)
+            .join("\n");
         assert!(text.contains("Raise --max-num-seqs above 32"));
         assert!(text.contains("KV cache 70% used, pool has room"));
     }
 
     #[test]
     fn fix_scales_out_when_kv_at_or_above_safe_threshold() {
-        let text =
-            format_concurrency_saturation_issue(&fired_detail(None, Some(85.0)), None).join("\n");
+        let text = format_concurrency_saturation_issue(&fired_detail(None, Some(85.0)), None, None)
+            .join("\n");
         assert!(text.contains("KV at 85%"));
         assert!(text.contains("No config change helps"));
         assert!(text.contains("Add a replica to scale out"));
@@ -353,40 +414,48 @@ mod tests {
 
     #[test]
     fn fix_generic_when_kv_usage_unknown() {
-        let text = format_concurrency_saturation_issue(&fired_detail(None, None), None).join("\n");
+        let text =
+            format_concurrency_saturation_issue(&fired_detail(None, None), None, None).join("\n");
         assert!(text.contains("if KV cache has headroom"));
         assert!(!text.contains("Add a replica"));
     }
 
     #[test]
     fn confidence_high_when_ttft_and_kv_present() {
-        let text =
-            format_concurrency_saturation_issue(&fired_detail(Some(5000.0), Some(70.0)), None)
-                .join("\n");
+        let text = format_concurrency_saturation_issue(
+            &fired_detail(Some(5000.0), Some(70.0)),
+            None,
+            None,
+        )
+        .join("\n");
         assert!(text.contains("Confidence: High"));
     }
 
     #[test]
     fn confidence_medium_when_ttft_or_kv_missing() {
         let text =
-            format_concurrency_saturation_issue(&fired_detail(Some(5000.0), None), None).join("\n");
+            format_concurrency_saturation_issue(&fired_detail(Some(5000.0), None), None, None)
+                .join("\n");
         assert!(text.contains("Confidence: Medium"));
         let text2 =
-            format_concurrency_saturation_issue(&fired_detail(None, Some(70.0)), None).join("\n");
+            format_concurrency_saturation_issue(&fired_detail(None, Some(70.0)), None, None)
+                .join("\n");
         assert!(text2.contains("Confidence: Medium"));
     }
 
     #[test]
     fn fix_shows_max_model_len_when_kv_high() {
-        let text = format_concurrency_saturation_issue(&fired_detail(None, Some(85.0)), Some(8192))
-            .join("\n");
+        let text =
+            format_concurrency_saturation_issue(&fired_detail(None, Some(85.0)), Some(8192), None)
+                .join("\n");
         assert!(text.contains("--max-model-len (currently 8192)"));
     }
 
     #[test]
     fn cause_shows_ttft_when_available() {
         let text =
-            format_concurrency_saturation_issue(&fired_detail(Some(5000.0), None), None).join("\n");
+            format_concurrency_saturation_issue(&fired_detail(Some(5000.0), None), None, None)
+                .join("\n");
         assert!(text.contains("TTFT 5.0s"));
     }
 
@@ -394,7 +463,7 @@ mod tests {
     fn cause_shows_ttft_p99_primary_when_both_available() {
         let mut d = fired_detail(Some(5000.0), None);
         d.ttft_p99_ms = Some(12400.0);
-        let text = format_concurrency_saturation_issue(&d, None).join("\n");
+        let text = format_concurrency_saturation_issue(&d, None, None).join("\n");
         assert!(text.contains("TTFT 12.4s p99 (5.0s avg)"));
     }
 
@@ -402,14 +471,15 @@ mod tests {
     fn cause_shows_ttft_p99_only_when_mean_missing() {
         let mut d = fired_detail(None, None);
         d.ttft_p99_ms = Some(12400.0);
-        let text = format_concurrency_saturation_issue(&d, None).join("\n");
+        let text = format_concurrency_saturation_issue(&d, None, None).join("\n");
         assert!(text.contains("TTFT 12.4s p99"));
         assert!(!text.contains("avg"));
     }
 
     #[test]
     fn cause_omits_ttft_when_none() {
-        let text = format_concurrency_saturation_issue(&fired_detail(None, None), None).join("\n");
+        let text =
+            format_concurrency_saturation_issue(&fired_detail(None, None), None, None).join("\n");
         assert!(!text.contains("requests queued ahead"));
     }
 
@@ -474,17 +544,22 @@ mod tests {
 
     #[test]
     fn window_issue_inserts_seen_pct() {
-        let lines = format_concurrency_saturation_window_issue(&fired_detail(None, None), 40, None);
+        let lines =
+            format_concurrency_saturation_window_issue(&fired_detail(None, None), 40, None, None);
         assert_eq!(lines[1], "  Seen in 40% of windows");
     }
 
     #[test]
     fn short_action_raises_cap_when_kv_safe() {
         let d = fired_detail(None, Some(70.0));
-        assert_eq!(r5_short_action(&d), "raise --max-num-seqs above 32");
+        assert_eq!(
+            r5_short_action(&d, None, None),
+            "raise --max-num-seqs above 32"
+        );
         let r = r5_recommendation(
             &snap(sat_vllm(32.0, 15.0, Some(32))),
             Some(70.0),
+            None,
             None,
             None,
         )
@@ -495,15 +570,103 @@ mod tests {
     #[test]
     fn short_action_scales_out_when_kv_not_safe() {
         let d = fired_detail(None, Some(85.0));
-        assert_eq!(r5_short_action(&d), "add a replica to scale out");
+        assert_eq!(
+            r5_short_action(&d, None, None),
+            "add a replica to scale out"
+        );
         let r = r5_recommendation(
             &snap(sat_vllm(32.0, 15.0, Some(32))),
             Some(85.0),
+            None,
             None,
             None,
         )
         .expect("fired");
         assert_eq!(r.short_action, "add a replica to scale out");
         assert_eq!(r.action, "Add a replica to scale out.");
+    }
+
+    #[test]
+    fn action_at_physics_ceiling_when_kv_has_room_but_max_num_seqs_at_cap() {
+        let r = r5_recommendation(
+            &snap(sat_vllm(15.0, 10.0, Some(15))),
+            Some(50.0),
+            None,
+            Some(8192),
+            Some(15),
+        )
+        .expect("fired");
+        assert!(r.action.contains("physics ceiling for max_model_len"));
+    }
+
+    #[test]
+    fn action_raises_max_num_seqs_when_headroom_below_ceiling() {
+        let r = r5_recommendation(
+            &snap(sat_vllm(10.0, 10.0, Some(10))),
+            Some(50.0),
+            None,
+            None,
+            Some(15),
+        )
+        .expect("fired");
+        assert!(r.action.contains("Raise --max-num-seqs"));
+    }
+
+    #[test]
+    fn action_at_physics_ceiling_when_kv_unknown() {
+        let d = ConcurrencySaturationDetail {
+            requests_running: 15.0,
+            requests_waiting: 10.0,
+            max_num_seqs: Some(15),
+            queue_ratio: 10.0 / 25.0,
+            ttft_ms: None,
+            ttft_p99_ms: None,
+            ttft_p99_buckets: vec![],
+            kv_cache_usage_perc: None,
+        };
+        let action = r5_action(&d, Some(15), Some(8192));
+        assert!(action.contains("max_model_len=8192"));
+        assert!(!action.contains("Raise --max-num-seqs"));
+        let short = r5_short_action(&d, Some(15), Some(8192));
+        assert!(short.contains("max_model_len=8192"));
+    }
+
+    #[test]
+    fn short_action_at_physics_ceiling_recommends_lower_max_model_len() {
+        let d = ConcurrencySaturationDetail {
+            requests_running: 15.0,
+            requests_waiting: 10.0,
+            max_num_seqs: Some(15),
+            queue_ratio: 10.0 / 25.0,
+            ttft_ms: None,
+            ttft_p99_ms: None,
+            ttft_p99_buckets: vec![],
+            kv_cache_usage_perc: Some(50.0),
+        };
+        let action = r5_short_action(&d, Some(15), Some(8192));
+        assert!(
+            action.contains("max_model_len=8192"),
+            "short_action must not say 'raise --max-num-seqs' when at physics ceiling"
+        );
+        assert!(
+            !action.contains("raise --max-num-seqs"),
+            "contradicts r5_action physics ceiling message"
+        );
+    }
+
+    #[test]
+    fn short_action_raises_max_num_seqs_when_below_ceiling() {
+        let d = ConcurrencySaturationDetail {
+            requests_running: 10.0,
+            requests_waiting: 10.0,
+            max_num_seqs: Some(10),
+            queue_ratio: 0.5,
+            ttft_ms: None,
+            ttft_p99_ms: None,
+            ttft_p99_buckets: vec![],
+            kv_cache_usage_perc: Some(50.0),
+        };
+        let action = r5_short_action(&d, Some(15), Some(8192));
+        assert!(action.contains("raise --max-num-seqs above 10"));
     }
 }

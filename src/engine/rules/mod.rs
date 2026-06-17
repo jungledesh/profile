@@ -29,14 +29,14 @@ pub use r5_concurrency_saturation::{
 use r1_under_batching::{aggregate_r1_detail, format_under_batching_window_issue, r1_short_action};
 use r2_kv_cache_pressure::{
     aggregate_backlog_detail, aggregate_r2_detail, format_kv_admission_backlog_issue,
-    format_kv_cache_window_issue, kv_pressure_confidence, r2_backlog_short_action,
+    format_kv_cache_window_issue, kv_pressure_confidence, r2_action, r2_backlog_short_action,
     r2_kv_pressure_short_action, KvPressureFormatOpts,
 };
 #[cfg(test)]
 use r3_low_prefix_reuse::format_low_prefix_hit_rate_fired;
 use r3_low_prefix_reuse::{aggregate_r3_detail, format_low_prefix_window_issue};
 use r5_concurrency_saturation::{
-    aggregate_concurrency_saturation_detail, format_concurrency_saturation_window_issue,
+    aggregate_concurrency_saturation_detail, format_concurrency_saturation_window_issue, r5_action,
     r5_short_action,
 };
 
@@ -564,19 +564,7 @@ fn build_report_from_eval(eval: &WindowRuleEval, summary: AnalysisInput<'_>) -> 
             rule_name: "kv_cache_pressure",
             impact: 5,
             confidence: conf,
-            action: if r2_agg.preemptions_active {
-                match kv_max_seqs {
-                    Some(n) => format!("Lower --max-num-seqs to ≤{n}"),
-                    None => "Lower --max-num-seqs to stop evictions".to_string(),
-                }
-            } else {
-                match kv_max_seqs {
-                    Some(n) => {
-                        format!("Lower --max-num-seqs to ≤{n} or raise --gpu-memory-utilization")
-                    }
-                    None => "Lower --max-num-seqs or raise --gpu-memory-utilization".to_string(),
-                }
-            },
+            action: r2_action(r2_agg.preemptions_active, kv_max_seqs, max_model_len),
             short_action: if r2_agg.preemptions_active {
                 r2_kv_pressure_short_action().to_string()
             } else {
@@ -599,7 +587,7 @@ fn build_report_from_eval(eval: &WindowRuleEval, summary: AnalysisInput<'_>) -> 
             rule_name: "kv_admission_backlog",
             impact: 5,
             confidence: kv_pressure_confidence(eval.r2_backlog_fired, eval.n_eval),
-            action: "Raise --gpu-memory-utilization or reduce KV footprint".to_string(),
+            action: r2_action(false, kv_max_seqs, max_model_len),
             short_action: r2_backlog_short_action().to_string(),
             expected_impact: "Wait queue drains, TTFT recovers.".to_string(),
             display_lines,
@@ -608,14 +596,11 @@ fn build_report_from_eval(eval: &WindowRuleEval, summary: AnalysisInput<'_>) -> 
 
     if eval.r5_significant() && !r2_significant && !r2_backlog_significant {
         if let Some(agg) = aggregate_concurrency_saturation_detail(&eval.r5_details) {
-            let max_label = agg
-                .max_num_seqs
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "?".to_string());
             let display_lines = format_concurrency_saturation_window_issue(
                 &agg,
                 pct(eval.r5_fired, eval.n_eval),
                 max_model_len,
+                kv_max_seqs,
             );
             recs.push(Recommendation {
                 rule_name: "concurrency_saturation",
@@ -624,12 +609,8 @@ fn build_report_from_eval(eval: &WindowRuleEval, summary: AnalysisInput<'_>) -> 
                     (Some(_), Some(_)) => 0.9,
                     _ => 0.6,
                 },
-                action: format!(
-                    "Raise --max-num-seqs above {} (scheduler at cap, {:.0}% of requests waiting)",
-                    max_label,
-                    agg.queue_ratio * 100.0
-                ),
-                short_action: r5_short_action(&agg),
+                action: r5_action(&agg, kv_max_seqs, max_model_len),
+                short_action: r5_short_action(&agg, kv_max_seqs, max_model_len),
                 expected_impact: "Queue drains, TTFT recovers.".to_string(),
                 display_lines,
             });
@@ -866,6 +847,12 @@ pub fn format_diagnose_rules_for_windows(
         .collect();
 
     let mut warnings = Vec::new();
+    let kv_max_seqs = compute_kv_max_seqs(
+        summary_baseline.as_ref().and_then(|b| b.kv_headroom_gb),
+        summary.ctx.config.max_model_len,
+        &summary.ctx.model,
+        summary.ctx.config.kv_cache_dtype.as_deref(),
+    );
 
     if r1_significant {
         let block = format_under_batching_window_issue(
@@ -879,12 +866,6 @@ pub fn format_diagnose_rules_for_windows(
 
     if r2_significant && !r2_suppressed_by_r4_display {
         let r2_agg = aggregate_r2_detail(r2_details);
-        let r2_max_seqs = compute_kv_max_seqs(
-            summary_baseline.as_ref().and_then(|b| b.kv_headroom_gb),
-            summary.ctx.config.max_model_len,
-            &summary.ctx.model,
-            summary.ctx.config.kv_cache_dtype.as_deref(),
-        );
         let block = format_kv_cache_window_issue(
             &r2_agg,
             pct(r2_fired, n_eval),
@@ -894,7 +875,7 @@ pub fn format_diagnose_rules_for_windows(
             KvPressureFormatOpts {
                 max_model_len: summary.ctx.config.max_model_len,
                 kv_headroom_gb: summary_baseline.as_ref().and_then(|b| b.kv_headroom_gb),
-                kv_max_seqs: r2_max_seqs,
+                kv_max_seqs,
             },
         );
         warnings.extend(block);
@@ -919,6 +900,7 @@ pub fn format_diagnose_rules_for_windows(
                 &agg,
                 pct(r5_fired, n_eval),
                 summary.ctx.config.max_model_len,
+                kv_max_seqs,
             );
             warnings.extend(block);
             warnings.push(String::new());
