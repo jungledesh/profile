@@ -535,7 +535,7 @@ fn build_report_from_eval(eval: &WindowRuleEval, summary: AnalysisInput<'_>) -> 
             action: if r2_agg.preemptions_active {
                 "Lower --max-num-seqs to stop evictions".to_string()
             } else {
-                "Raise --gpu-memory-utilization if VRAM headroom exists".to_string()
+                "Lower --max-num-seqs or raise --gpu-memory-utilization".to_string()
             },
             short_action: if r2_agg.preemptions_active {
                 r2_kv_pressure_short_action().to_string()
@@ -1460,8 +1460,10 @@ mod tests {
         assert!(text.contains("Cause:"));
         assert!(text.contains("KV cache hit 89.0% peak (threshold: 88%)"));
         assert!(text.contains("Expected: TTFT and TPOT recover once evictions stop."));
-        assert!(text.contains("Lower --max-num-seqs now to stop evictions"));
-        assert!(text.contains("Switch to fp8 KV cache (--kv-cache-dtype fp8)"));
+        assert!(text.contains(
+            "Lower --max-num-seqs to stop evictions (target: below current running count)"
+        ));
+        assert!(text.contains("Switch --kv-cache-dtype fp8"));
     }
 
     #[test]

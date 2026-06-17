@@ -152,9 +152,6 @@ pub fn run(
         let new_report = engine::build_report_for_diagnose(&new_result.windows, summary);
 
         let drifted = drift::config_changed(&prev_result.static_ctx, &new_result.static_ctx);
-        if drifted {
-            println!("Config change detected, re-baselined.");
-        }
 
         let d = delta::compute(
             &prev_result,

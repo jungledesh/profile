@@ -20,8 +20,7 @@ const KV_ADMISSION_BACKLOG_QUEUE_RATIO_MIN: f64 = 0.30;
 /// weights and allocator overhead leave no safe room to expand the KV pool.
 const KV_HEADROOM_SAFE_MIN_GB: f64 = 2.0;
 const NVCC_PATH: &str = "/usr/local/cuda/bin/nvcc";
-const FP8_KV_CACHE_FIX: &str =
-    "    • Switch to fp8 KV cache (--kv-cache-dtype fp8) to halve KV memory footprint";
+const FP8_KV_CACHE_FIX: &str = "    • Switch --kv-cache-dtype fp8 to halve KV memory footprint";
 
 static NVCC_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
@@ -39,14 +38,15 @@ fn fp8_kv_cache_fix_bullet() -> String {
 
 fn kv_headroom_gpu_mem_bullet(kv_headroom_gb: Option<f64>) -> String {
     match kv_headroom_gb {
-        Some(h) if h >= KV_HEADROOM_SAFE_MIN_GB => format!(
-            "    • Raise --gpu-memory-utilization ({h:.0}GB VRAM available) to expand KV pool"
-        ),
+        Some(h) if h >= KV_HEADROOM_SAFE_MIN_GB => {
+            "    • Raise --gpu-memory-utilization (check vRAM header for avail mem) to expand KV pool"
+                .to_string()
+        }
         Some(_) => {
             "    • GPU at VRAM capacity: cannot raise --gpu-memory-utilization. Scale out or reduce max context length (--max-model-len)."
                 .to_string()
         }
-        None => "    • Raise --gpu-memory-utilization if VRAM headroom exists".to_string(),
+        None => "    • Raise --gpu-memory-utilization (check vRAM header for avail mem) to expand KV pool".to_string(),
     }
 }
 
@@ -222,7 +222,7 @@ pub fn r2_recommendation(
         )
     } else {
         (
-            "Raise --gpu-memory-utilization if VRAM headroom exists".to_string(),
+            "Lower --max-num-seqs or raise --gpu-memory-utilization".to_string(),
             r2_backlog_short_action().to_string(),
         )
     };
@@ -302,25 +302,27 @@ pub(super) fn format_kv_cache_pressure_fired(
     out.push(String::new());
     out.push("  Fix:".to_string());
     let model_len_bullet = format!(
-        "    • Lower --max-model-len{} if your workload allows shorter context",
+        "    • Lower --max-model-len{} to shrink per-sequence KV footprint",
         model_len_suffix(max_model_len)
     );
     if d.preemptions_active {
         out.push(
-            "    • Lower --max-num-seqs now to stop evictions, pick a value below current running count"
+            "    • Lower --max-num-seqs to stop evictions (target: below current running count)"
                 .to_string(),
         );
         out.push(model_len_bullet);
         if let Some(bullet) = prefix_caching_fix_bullet(snapshot) {
             out.push(bullet);
         }
-        if let Some(h) = kv_headroom_gb.filter(|h| *h >= KV_HEADROOM_SAFE_MIN_GB) {
-            out.push(format!(
-                "    • Once evictions stop, raise --gpu-memory-utilization ({h:.0}GB VRAM available) to expand KV pool"
-            ));
+        if kv_headroom_gb.is_some_and(|h| h >= KV_HEADROOM_SAFE_MIN_GB) {
+            out.push(
+                "    • Once stable, raise --gpu-memory-utilization (check vRAM header) to expand KV pool"
+                    .to_string(),
+            );
         }
         out.push(fp8_kv_cache_fix_bullet());
     } else {
+        out.push("    • Lower --max-num-seqs to free KV blocks".to_string());
         out.push(kv_headroom_gpu_mem_bullet(kv_headroom_gb));
         out.push(model_len_bullet);
         if let Some(bullet) = prefix_caching_fix_bullet(snapshot) {
@@ -757,7 +759,7 @@ mod tests {
         };
         let text = format_kv_cache_pressure_fired(&detail(50.0, true), &snap(v), 3, 4, None, None)
             .join("\n");
-        assert!(text.contains("--max-model-len if"));
+        assert!(text.contains("to shrink per-sequence KV footprint"));
         assert!(!text.contains("currently"));
     }
 
@@ -777,7 +779,7 @@ mod tests {
         let text =
             format_kv_admission_backlog_issue(&sample_backlog_detail(), 27, None, Some(30.0), 3, 4)
                 .join("\n");
-        assert!(text.contains("30GB VRAM available"));
+        assert!(text.contains("check vRAM header for avail mem"));
     }
 
     #[test]
@@ -793,7 +795,7 @@ mod tests {
         let text =
             format_kv_admission_backlog_issue(&sample_backlog_detail(), 27, None, None, 3, 4)
                 .join("\n");
-        assert!(text.contains("if VRAM headroom exists"));
+        assert!(text.contains("check vRAM header for avail mem"));
     }
 
     #[test]
@@ -824,6 +826,24 @@ mod tests {
     }
 
     #[test]
+    fn queue_backpressure_suggests_max_num_seqs_from_running_count() {
+        let d = KvCachePressureDetail {
+            kv_cache_usage_perc: 90.0,
+            kv_peak_pct: Some(90.0),
+            preemptions_active: false,
+            queue_backpressure: true,
+        };
+        let v = VllmRawMetrics {
+            kv_cache_usage_perc: Some(90.0),
+            num_requests_running: Some(93.0),
+            num_requests_waiting: Some(5.0),
+            ..Default::default()
+        };
+        let text = format_kv_cache_pressure_fired(&d, &snap(v), 1, 1, None, None).join("\n");
+        assert!(text.contains("Lower --max-num-seqs to free KV blocks"));
+    }
+
+    #[test]
     fn queue_backpressure_warns_when_vram_full() {
         let d = KvCachePressureDetail {
             kv_cache_usage_perc: 90.0,
@@ -842,7 +862,7 @@ mod tests {
     }
 
     #[test]
-    fn evictions_path_shows_sequenced_raise_when_headroom_safe() {
+    fn evictions_path_shows_raise_gpu_mem_bullet_when_headroom_safe() {
         let v = VllmRawMetrics {
             kv_cache_usage_perc: Some(90.0),
             num_preemptions_per_sec: Some(0.05),
@@ -851,8 +871,28 @@ mod tests {
         let text =
             format_kv_cache_pressure_fired(&detail(90.0, true), &snap(v), 1, 1, None, Some(30.0))
                 .join("\n");
-        assert!(text
-            .contains("Once evictions stop, raise --gpu-memory-utilization (30GB VRAM available)"));
+        assert!(text.contains(
+            "Once stable, raise --gpu-memory-utilization (check vRAM header) to expand KV pool"
+        ));
+    }
+
+    #[test]
+    fn queue_backpressure_shows_raise_gpu_mem_bullet_when_headroom_unknown() {
+        let d = KvCachePressureDetail {
+            kv_cache_usage_perc: 90.0,
+            kv_peak_pct: Some(90.0),
+            preemptions_active: false,
+            queue_backpressure: true,
+        };
+        let v = VllmRawMetrics {
+            kv_cache_usage_perc: Some(90.0),
+            num_requests_waiting: Some(5.0),
+            ..Default::default()
+        };
+        let text = format_kv_cache_pressure_fired(&d, &snap(v), 1, 1, None, None).join("\n");
+        assert!(text.contains(
+            "Raise --gpu-memory-utilization (check vRAM header for avail mem) to expand KV pool"
+        ));
     }
 
     #[test]
@@ -881,7 +921,7 @@ mod tests {
     #[test]
     fn fp8_kv_cache_bullet_reflects_nvcc_availability() {
         let bullet = fp8_kv_cache_fix_bullet();
-        assert!(bullet.contains("Switch to fp8 KV cache (--kv-cache-dtype fp8)"));
+        assert!(bullet.contains("Switch --kv-cache-dtype fp8"));
         if std::path::Path::new(NVCC_PATH).exists() {
             assert!(!bullet.contains("requires nvcc"));
         } else {
