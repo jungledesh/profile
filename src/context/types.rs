@@ -16,6 +16,16 @@ pub struct ModelArch {
     pub hidden_dim: Option<u32>,
     pub is_moe: bool,
     pub default_weight_dtype: Option<String>,
+    /// Number of KV heads (num_key_value_heads). None for special architectures
+    /// (MLA, interleaved attention, hybrid) where standard KV formula doesn't apply.
+    pub num_kv_heads: Option<u32>,
+    /// KV cache head dimension. Explicit field — may differ from hidden_dim/num_heads
+    /// (e.g. Gemma 2 9B uses head_dim=256). None when architecture is non-standard.
+    pub head_dim: Option<u32>,
+    /// KV-relevant layer count for hybrid architectures where only a subset of layers
+    /// use standard KV cache (e.g. Qwen3.6: 32 attention layers out of 64 total).
+    /// None → fall back to num_layers in KV math (correct for pure-attention models).
+    pub num_kv_layers: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -83,6 +93,9 @@ impl StaticContext {
                 hidden_dim: Some(e.hidden_dim),
                 is_moe: e.is_moe,
                 default_weight_dtype: Some(e.default_weight_dtype.to_string()),
+                num_kv_heads: e.num_kv_heads,
+                head_dim: e.head_dim,
+                num_kv_layers: e.num_kv_layers,
             },
             None => ModelArch {
                 name: model_name,

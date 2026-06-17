@@ -23,6 +23,60 @@ pub fn latency_floor_ms(ceiling_tps: f64) -> f64 {
     1000.0 / ceiling_tps
 }
 
+/// KV cache bytes per element from kv_cache_dtype.
+/// "fp8" → 1; bf16/fp16 → 2; "auto"/None → falls back to weight_bytes.
+/// vLLM does not support fp32 KV cache, so 2 is the correct non-fp8 default.
+pub fn kv_bytes_per_element(kv_cache_dtype: Option<&str>, weight_bytes: u8) -> u8 {
+    match kv_cache_dtype {
+        Some(d) if d.trim().to_ascii_lowercase().contains("fp8") => 1,
+        Some(d)
+            if {
+                let d = d.trim().to_ascii_lowercase();
+                d.contains("fp16") || d.contains("bf16") || d.contains("float16") || d == "half"
+            } =>
+        {
+            2
+        }
+        _ => weight_bytes,
+    }
+}
+
+/// Maximum concurrent sequences the KV budget supports at the given context length.
+///
+/// Formula: `kv_budget_bytes / (max_model_len × 2 × num_layers × num_kv_heads × head_dim × bytes_per_elem)`
+///
+/// Returns `None` if any input is zero or the budget is too small for even one sequence.
+/// This is an upper bound — vLLM block fragmentation may reduce it slightly in practice.
+pub fn kv_max_concurrent_seqs(
+    kv_headroom_gb: f64,
+    max_model_len: u32,
+    num_layers: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    bytes_per_elem: u8,
+) -> Option<u32> {
+    if max_model_len == 0
+        || num_layers == 0
+        || num_kv_heads == 0
+        || head_dim == 0
+        || bytes_per_elem == 0
+        || kv_headroom_gb <= 0.0
+    {
+        return None;
+    }
+    // 2× for K and V tensors separately
+    let bytes_per_token = 2u64
+        .checked_mul(num_layers as u64)?
+        .checked_mul(num_kv_heads as u64)?
+        .checked_mul(head_dim as u64)?
+        .checked_mul(bytes_per_elem as u64)?;
+    let kv_budget_bytes = (kv_headroom_gb * 1e9) as u64;
+    let max_seqs = kv_budget_bytes
+        .checked_div(bytes_per_token)?
+        .checked_div(max_model_len as u64)?;
+    u32::try_from(max_seqs).ok().filter(|&n| n > 0)
+}
+
 /// Batch size at which decode transitions from memory-BW-bound to compute-bound.
 /// Below this: throughput limited by peak_bw. At or above: limited by peak_flops.
 pub fn ridge_batch_size(peak_flops_tc_tflops: f64, peak_bw_gbps: f64, bits_per_param: u8) -> f64 {
@@ -107,6 +161,56 @@ mod tests {
         // (91.6e12 × 8) / (864e9 × 16) = 53.009
         let r = ridge_batch_size(91.6, 864.0, 8);
         assert!((r - 53.009).abs() < 0.1);
+    }
+
+    #[test]
+    fn kv_bytes_per_element_fp8() {
+        assert_eq!(kv_bytes_per_element(Some("fp8"), 2), 1);
+        assert_eq!(kv_bytes_per_element(Some("FP8"), 2), 1);
+    }
+
+    #[test]
+    fn kv_bytes_per_element_bf16() {
+        assert_eq!(kv_bytes_per_element(Some("bf16"), 2), 2);
+        assert_eq!(kv_bytes_per_element(Some("fp16"), 2), 2);
+        assert_eq!(kv_bytes_per_element(Some("half"), 2), 2);
+    }
+
+    #[test]
+    fn kv_bytes_per_element_auto_falls_back_to_weight_bytes() {
+        assert_eq!(kv_bytes_per_element(Some("auto"), 2), 2);
+        assert_eq!(kv_bytes_per_element(None, 2), 2);
+        // fp8 weights → fp8 KV fallback
+        assert_eq!(kv_bytes_per_element(None, 1), 1);
+    }
+
+    #[test]
+    fn kv_max_concurrent_seqs_a100_llama3_70b() {
+        // A100 80GB, Llama-3 70B BF16: ~18GB KV, 8192 tokens, 80 layers, 8 KV heads, head_dim=128
+        // bytes_per_token = 2×80×8×128×2 = 327680 = 320KB
+        // max_seqs = 18e9 / 320KB / 8192 ≈ 6.8 → 6
+        let result = kv_max_concurrent_seqs(18.0, 8192, 80, 8, 128, 2);
+        assert!(result.is_some());
+        let n = result.unwrap();
+        // Llama 70B at 8192 tokens fits only a handful of seqs — expect 5–8 range
+        assert!((5..=8).contains(&n), "expected 5–8, got {n}");
+    }
+
+    #[test]
+    fn kv_max_concurrent_seqs_fp8_doubles_capacity() {
+        let bf16 = kv_max_concurrent_seqs(20.0, 4096, 32, 8, 128, 2).unwrap();
+        let fp8 = kv_max_concurrent_seqs(20.0, 4096, 32, 8, 128, 1).unwrap();
+        assert_eq!(fp8, bf16 * 2);
+    }
+
+    #[test]
+    fn kv_max_concurrent_seqs_none_on_zero_inputs() {
+        assert!(kv_max_concurrent_seqs(0.0, 4096, 32, 8, 128, 2).is_none());
+        assert!(kv_max_concurrent_seqs(20.0, 0, 32, 8, 128, 2).is_none());
+        assert!(kv_max_concurrent_seqs(20.0, 4096, 0, 8, 128, 2).is_none());
+        assert!(kv_max_concurrent_seqs(20.0, 4096, 32, 0, 128, 2).is_none());
+        assert!(kv_max_concurrent_seqs(20.0, 4096, 32, 8, 0, 2).is_none());
+        assert!(kv_max_concurrent_seqs(20.0, 4096, 32, 8, 128, 0).is_none());
     }
 
     #[test]

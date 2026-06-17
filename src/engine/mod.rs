@@ -45,6 +45,12 @@ pub fn build_report(input: AnalysisInput<'_>) -> Report {
             snapshot,
             input.ctx.config.max_model_len,
             baseline.as_ref().and_then(|b| b.kv_headroom_gb),
+            rules::compute_kv_max_seqs(
+                baseline.as_ref().and_then(|b| b.kv_headroom_gb),
+                input.ctx.config.max_model_len,
+                &input.ctx.model,
+                input.ctx.config.kv_cache_dtype.as_deref(),
+            ),
             r2_fired,
             n_eval,
         ),

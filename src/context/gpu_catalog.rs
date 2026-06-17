@@ -237,4 +237,12 @@ mod tests {
     fn unknown_gpu_returns_none() {
         assert!(lookup_gpu("NVIDIA Tesla V100").is_none());
     }
+
+    #[test]
+    fn gb200_matches_b200_entry_via_substring() {
+        // GB200 is the superchip (B200 GPU + Grace CPU). Same physics specs as B200.
+        let e = lookup_gpu("NVIDIA GB200 NVL72").expect("no match");
+        assert_eq!(e.arch, "blackwell");
+        assert_eq!(e.peak_bw_gbps, 8000.0);
+    }
 }

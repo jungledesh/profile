@@ -316,6 +316,9 @@ mod tests {
                 hidden_dim: Some(1),
                 is_moe: active_params.is_some(),
                 default_weight_dtype: default_dtype.map(str::to_string),
+                num_kv_heads: None,
+                head_dim: None,
+                num_kv_layers: None,
             },
             gpu: crate::context::GPUModel {
                 name: Some("gpu".to_string()),

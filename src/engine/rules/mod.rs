@@ -30,7 +30,7 @@ use r1_under_batching::{aggregate_r1_detail, format_under_batching_window_issue,
 use r2_kv_cache_pressure::{
     aggregate_backlog_detail, aggregate_r2_detail, format_kv_admission_backlog_issue,
     format_kv_cache_window_issue, kv_pressure_confidence, r2_backlog_short_action,
-    r2_kv_pressure_short_action,
+    r2_kv_pressure_short_action, KvPressureFormatOpts,
 };
 #[cfg(test)]
 use r3_low_prefix_reuse::format_low_prefix_hit_rate_fired;
@@ -55,6 +55,29 @@ pub(super) fn model_len_suffix(max_model_len: Option<u32>) -> String {
         Some(v) => format!(" (currently {v})"),
         None => String::new(),
     }
+}
+
+pub(super) fn compute_kv_max_seqs(
+    kv_headroom_gb: Option<f64>,
+    max_model_len: Option<u32>,
+    model: &crate::context::ModelArch,
+    kv_cache_dtype: Option<&str>,
+) -> Option<u32> {
+    use crate::engine::baseline::{kv_bytes_per_element, kv_max_concurrent_seqs};
+    let headroom = kv_headroom_gb?;
+    let max_len = max_model_len?;
+    let num_layers = model.num_kv_layers.or(model.num_layers)?;
+    let num_kv_heads = model.num_kv_heads?;
+    let head_dim = model.head_dim?;
+    let kv_bpp = kv_bytes_per_element(kv_cache_dtype, 2);
+    kv_max_concurrent_seqs(
+        headroom,
+        max_len,
+        num_layers,
+        num_kv_heads,
+        head_dim,
+        kv_bpp,
+    )
 }
 
 /// True when a rule fired in enough evaluable windows to be statistically stable.
@@ -496,6 +519,12 @@ fn build_report_from_eval(eval: &WindowRuleEval, summary: AnalysisInput<'_>) -> 
     let summary_snap = &summary.window.snapshot;
     let max_model_len = summary.ctx.config.max_model_len;
     let kv_headroom_gb = baseline.as_ref().and_then(|b| b.kv_headroom_gb);
+    let kv_max_seqs: Option<u32> = compute_kv_max_seqs(
+        kv_headroom_gb,
+        max_model_len,
+        &summary.ctx.model,
+        summary.ctx.config.kv_cache_dtype.as_deref(),
+    );
     let r2_significant = eval.r2_significant();
     let r2_backlog_significant = eval.r2_backlog_significant();
 
@@ -525,17 +554,28 @@ fn build_report_from_eval(eval: &WindowRuleEval, summary: AnalysisInput<'_>) -> 
             summary_snap,
             eval.r2_fired,
             eval.n_eval,
-            max_model_len,
-            kv_headroom_gb,
+            KvPressureFormatOpts {
+                max_model_len,
+                kv_headroom_gb,
+                kv_max_seqs,
+            },
         );
         recs.push(Recommendation {
             rule_name: "kv_cache_pressure",
             impact: 5,
             confidence: conf,
             action: if r2_agg.preemptions_active {
-                "Lower --max-num-seqs to stop evictions".to_string()
+                match kv_max_seqs {
+                    Some(n) => format!("Lower --max-num-seqs to ≤{n}"),
+                    None => "Lower --max-num-seqs to stop evictions".to_string(),
+                }
             } else {
-                "Lower --max-num-seqs or raise --gpu-memory-utilization".to_string()
+                match kv_max_seqs {
+                    Some(n) => {
+                        format!("Lower --max-num-seqs to ≤{n} or raise --gpu-memory-utilization")
+                    }
+                    None => "Lower --max-num-seqs or raise --gpu-memory-utilization".to_string(),
+                }
             },
             short_action: if r2_agg.preemptions_active {
                 r2_kv_pressure_short_action().to_string()
@@ -839,14 +879,23 @@ pub fn format_diagnose_rules_for_windows(
 
     if r2_significant && !r2_suppressed_by_r4_display {
         let r2_agg = aggregate_r2_detail(r2_details);
+        let r2_max_seqs = compute_kv_max_seqs(
+            summary_baseline.as_ref().and_then(|b| b.kv_headroom_gb),
+            summary.ctx.config.max_model_len,
+            &summary.ctx.model,
+            summary.ctx.config.kv_cache_dtype.as_deref(),
+        );
         let block = format_kv_cache_window_issue(
             &r2_agg,
             pct(r2_fired, n_eval),
             summary_snap,
             r2_fired,
             n_eval,
-            summary.ctx.config.max_model_len,
-            summary_baseline.as_ref().and_then(|b| b.kv_headroom_gb),
+            KvPressureFormatOpts {
+                max_model_len: summary.ctx.config.max_model_len,
+                kv_headroom_gb: summary_baseline.as_ref().and_then(|b| b.kv_headroom_gb),
+                kv_max_seqs: r2_max_seqs,
+            },
         );
         warnings.extend(block);
         warnings.push(String::new());
@@ -1026,6 +1075,30 @@ mod tests {
 
     fn mk_ctx() -> StaticContext {
         StaticContext::default()
+    }
+
+    #[test]
+    fn compute_kv_max_seqs_uses_kv_layers_over_total_layers() {
+        let hybrid = crate::context::ModelArch {
+            num_kv_heads: Some(8),
+            head_dim: Some(128),
+            num_layers: Some(64),
+            num_kv_layers: Some(32), // hybrid: only half the layers use KV cache
+            ..Default::default()
+        };
+        // 2^34 byte budget → integer-clean seq counts at 4096 ctx (20 GB truncates to 37 vs 36)
+        let headroom_gb = (1u64 << 34) as f64 / 1e9;
+        let with_kv_layers = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &hybrid, None);
+
+        let dense = crate::context::ModelArch {
+            num_kv_layers: None, // pure-attention: all 64 layers count
+            ..hybrid
+        };
+        let without_kv_layers = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &dense, None);
+
+        assert!(with_kv_layers.is_some() && without_kv_layers.is_some());
+        // 32 KV layers → half the bytes per token → fits 2× as many seqs
+        assert_eq!(with_kv_layers.unwrap(), without_kv_layers.unwrap() * 2);
     }
 
     fn mk_win(s: RawSnapshot) -> RuntimeWindow {
@@ -1362,7 +1435,7 @@ mod tests {
         let mut v = vllm_high_kv();
         v.num_preemptions_per_sec = Some(0.05);
         let s = snap(t, t, v, gpu_low());
-        let r = r2_recommendation(&s, None, None, 1, 4).expect("fired");
+        let r = r2_recommendation(&s, None, None, None, 1, 4).expect("fired");
         assert_eq!(r.rule_name, "kv_cache_pressure");
         assert_eq!(r.impact, 5);
         assert!((r.confidence - 0.5).abs() < 1e-9);
@@ -1376,7 +1449,7 @@ mod tests {
         v.kv_cache_peak_perc = Some(99.4);
         v.num_preemptions_per_sec = Some(0.05);
         let s = snap(t, t, v, gpu_low());
-        let r = r2_recommendation(&s, None, None, 1, 1).expect("fired");
+        let r = r2_recommendation(&s, None, None, None, 1, 1).expect("fired");
         let text = r.display_lines.join("\n");
         assert!(text.contains("KV cache hit 99.4% peak (threshold: 88%)"));
     }
@@ -1446,7 +1519,7 @@ mod tests {
         let s_kv_only = snap(t, t, vllm_high_kv_stressed(), gpu_busy());
         let ctx2 = mk_ctx();
         let win_kv_only = mk_win(s_kv_only);
-        let r2_text = r2_recommendation(&win_kv_only.snapshot, None, None, 1, 1)
+        let r2_text = r2_recommendation(&win_kv_only.snapshot, None, None, None, 1, 1)
             .expect("r2 fired")
             .display_lines
             .join("\n");
@@ -1460,9 +1533,7 @@ mod tests {
         assert!(text.contains("Cause:"));
         assert!(text.contains("KV cache hit 89.0% peak (threshold: 88%)"));
         assert!(text.contains("Expected: TTFT and TPOT recover once evictions stop."));
-        assert!(text.contains(
-            "Lower --max-num-seqs to stop evictions (target: below current running count)"
-        ));
+        assert!(text.contains("Lower --max-num-seqs to stop evictions"));
         assert!(text.contains("Switch --kv-cache-dtype fp8"));
     }
 
