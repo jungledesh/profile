@@ -78,6 +78,10 @@ pub(super) fn push_model_len_shrink_suggestion(
             return;
         };
         let suggested = (pp as u32).saturating_add(gp as u32);
+        // Suppress if reduction is < 5% — not a meaningful change (avoids "5464 → 5465" no-ops)
+        if suggested >= m.saturating_sub(m / 20) {
+            return;
+        }
         lines.push(format!(
             "{indent}• Lower --max-model-len (current: {m}) to ~{suggested} \
              (prompt p99 {pp:.0} tok + output p99 {gp:.0} tok), to shrink KV footprint."
@@ -2624,5 +2628,19 @@ mod tests {
         let text = lines.join("\n");
         assert!(text.contains("to safely raise concurrency"));
         assert!(!text.contains("to ~"));
+    }
+
+    #[test]
+    fn model_len_suggestion_suppressed_when_delta_below_5pct() {
+        let mut lines = Vec::new();
+        push_model_len_shrink_suggestion(
+            &mut lines,
+            Some(5464),
+            Some(5400.0),
+            Some(65.0),
+            150.0,
+            "    ",
+        );
+        assert!(lines.is_empty());
     }
 }

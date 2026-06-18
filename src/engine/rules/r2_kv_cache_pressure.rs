@@ -24,16 +24,23 @@ const FP8_KV_CACHE_FIX: &str = "    • Switch --kv-cache-dtype fp8 to halve KV 
 
 static NVCC_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
-fn fp8_kv_cache_fix_bullet() -> String {
+fn fp8_kv_cache_fix_bullet(kv_cache_dtype: Option<&str>) -> Option<String> {
+    // Already fp8 — don't suggest what's already applied
+    if kv_cache_dtype.is_some_and(|d| {
+        let d = d.trim().to_ascii_lowercase();
+        d.contains("fp8") || d.contains("e4m3") || d.contains("e5m2")
+    }) {
+        return None;
+    }
     // --kv-cache-dtype fp8 stores KV activations in fp8 via software cast — works on all GPUs
     // including A100. This is distinct from --quantization fp8 (weight quantization) which
     // requires native FP8 hardware and crashes on A100/Qwen3.6.
     let nvcc_present = *NVCC_AVAILABLE.get_or_init(|| std::path::Path::new(NVCC_PATH).exists());
-    if nvcc_present {
+    Some(if nvcc_present {
         FP8_KV_CACHE_FIX.to_string()
     } else {
         format!("{FP8_KV_CACHE_FIX} (requires nvcc)")
-    }
+    })
 }
 
 fn kv_headroom_gpu_mem_bullet(kv_headroom_gb: Option<f64>) -> String {
@@ -343,6 +350,7 @@ pub(super) fn format_kv_cache_pressure_fired(
         kv_headroom_gb,
         kv_max_seqs,
     } = *ctx;
+    let kv_cache_dtype = snapshot.vllm.cache_config.cache_dtype.as_deref();
     let peak = snapshot
         .vllm
         .kv_cache_peak_perc
@@ -378,7 +386,9 @@ pub(super) fn format_kv_cache_pressure_fired(
                     .to_string(),
             );
         }
-        out.push(fp8_kv_cache_fix_bullet());
+        if let Some(bullet) = fp8_kv_cache_fix_bullet(kv_cache_dtype) {
+            out.push(bullet);
+        }
         let total_count = snapshot.vllm.generation_tokens_completed.unwrap_or(0.0);
         super::push_model_len_shrink_suggestion(
             &mut out,
@@ -394,7 +404,9 @@ pub(super) fn format_kv_cache_pressure_fired(
         if let Some(bullet) = prefix_caching_fix_bullet(snapshot) {
             out.push(bullet);
         }
-        out.push(fp8_kv_cache_fix_bullet());
+        if let Some(bullet) = fp8_kv_cache_fix_bullet(kv_cache_dtype) {
+            out.push(bullet);
+        }
         let total_count = snapshot.vllm.generation_tokens_completed.unwrap_or(0.0);
         super::push_model_len_shrink_suggestion(
             &mut out,
@@ -428,6 +440,7 @@ pub(super) fn format_kv_admission_backlog_issue(
     windows_fired: usize,
     total_evaluable: usize,
 ) -> Vec<String> {
+    let kv_cache_dtype = snapshot.vllm.cache_config.cache_dtype.as_deref();
     let gpu_mem_bullet = kv_headroom_gpu_mem_bullet(kv_headroom_gb);
     let mut out = vec![
         "[!] KV Cache Pressure: Admission Backlog".to_string(),
@@ -446,7 +459,9 @@ pub(super) fn format_kv_admission_backlog_issue(
         "  Fix:".to_string(),
         gpu_mem_bullet,
     ];
-    out.push(fp8_kv_cache_fix_bullet());
+    if let Some(bullet) = fp8_kv_cache_fix_bullet(kv_cache_dtype) {
+        out.push(bullet);
+    }
     let total_count = snapshot.vllm.generation_tokens_completed.unwrap_or(0.0);
     super::push_model_len_shrink_suggestion(
         &mut out,
@@ -882,7 +897,7 @@ mod tests {
             queue_backpressure: true,
         };
         let text =
-            format_kv_cache_pressure_fired(&d, &kv_ctx(&snap(v), Some(4096), None, None), 3, 4)
+            format_kv_cache_pressure_fired(&d, &kv_ctx(&snap(v), Some(8192), None, None), 3, 4)
                 .join("\n");
         assert!(text.contains("to ~6450"));
         assert!(text.contains("Truncation risk"));
@@ -1183,12 +1198,21 @@ mod tests {
 
     #[test]
     fn fp8_kv_cache_bullet_reflects_nvcc_availability() {
-        let bullet = fp8_kv_cache_fix_bullet();
+        let bullet = fp8_kv_cache_fix_bullet(None).expect("bf16/auto should suggest fp8");
         assert!(bullet.contains("Switch --kv-cache-dtype fp8"));
         if std::path::Path::new(NVCC_PATH).exists() {
             assert!(!bullet.contains("requires nvcc"));
         } else {
             assert!(bullet.contains("(requires nvcc)"));
         }
+    }
+
+    #[test]
+    fn fp8_kv_cache_bullet_suppressed_when_already_fp8() {
+        assert!(fp8_kv_cache_fix_bullet(Some("fp8")).is_none());
+        assert!(fp8_kv_cache_fix_bullet(Some("FP8")).is_none());
+        assert!(fp8_kv_cache_fix_bullet(Some("e4m3fnuz")).is_none());
+        assert!(fp8_kv_cache_fix_bullet(Some("e5m2")).is_none());
+        assert!(fp8_kv_cache_fix_bullet(Some("auto")).is_some());
     }
 }
