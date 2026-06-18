@@ -134,7 +134,6 @@ pub(super) fn format_concurrency_saturation_issue(
     d: &ConcurrencySaturationDetail,
     max_model_len: Option<u32>,
     kv_max_seqs: Option<u32>,
-    prompt_tokens_mean: Option<f64>,
     snapshot: &RawSnapshot,
 ) -> Vec<String> {
     let max_str = d
@@ -147,22 +146,12 @@ pub(super) fn format_concurrency_saturation_issue(
     };
 
     // Prefer snapshot for display; header reads the same source.
-    let display_run = snapshot
-        .vllm
-        .num_requests_running
-        .filter(|v| v.is_finite())
-        .unwrap_or(d.requests_running);
     let display_wait = snapshot
         .vllm
         .num_requests_waiting
         .filter(|v| v.is_finite())
         .unwrap_or(d.requests_waiting);
-    let display_total = display_run + display_wait;
-    let display_queue_pct = if display_total > 0.0 {
-        display_wait / display_total * 100.0
-    } else {
-        d.queue_ratio * 100.0
-    };
+    let display_queue_pct = d.queue_ratio * 100.0;
     let display_kv = snapshot
         .vllm
         .kv_cache_usage_perc
@@ -187,19 +176,23 @@ pub(super) fn format_concurrency_saturation_issue(
         "  Cause:".to_string(),
         format!("    • --max-num-seqs={max_str} hit: scheduler won't admit more sequences"),
         format!(
-            "    • {:.0}% of requests waiting ({:.0} of {:.0} active)",
-            display_queue_pct, display_wait, display_total
+            "    • {:.0}% of requests waiting ({:.0} of {} active)",
+            display_queue_pct, display_wait, max_str
         ),
     ];
     match (display_p_x, display_avg) {
         (Some((px, label)), Some(avg)) => lines.push(format!(
-            "    • TTFT {} {} ({} avg)",
-            fmt_seconds_from_ms(px),
+            "    • TTFT ({} {}) ({} avg)",
             label,
+            fmt_seconds_from_ms(px),
             fmt_seconds_from_ms(avg)
         )),
         (Some((px, label)), None) => {
-            lines.push(format!("    • TTFT {} {}", fmt_seconds_from_ms(px), label));
+            lines.push(format!(
+                "    • TTFT ({} {})",
+                label,
+                fmt_seconds_from_ms(px)
+            ));
         }
         (None, Some(avg)) => lines.push(format!("    • TTFT {}", fmt_seconds_from_ms(avg))),
         (None, None) => {}
@@ -220,7 +213,9 @@ pub(super) fn format_concurrency_saturation_issue(
                 super::push_model_len_shrink_suggestion(
                     &mut lines,
                     max_model_len,
-                    prompt_tokens_mean,
+                    snapshot.vllm.prompt_tokens_p99,
+                    snapshot.vllm.generation_tokens_p99,
+                    snapshot.vllm.generation_tokens_completed.unwrap_or(0.0),
                     "    ",
                 );
             } else {
@@ -253,7 +248,9 @@ pub(super) fn format_concurrency_saturation_issue(
                 super::push_model_len_shrink_suggestion(
                     &mut lines,
                     max_model_len,
-                    prompt_tokens_mean,
+                    snapshot.vllm.prompt_tokens_p99,
+                    snapshot.vllm.generation_tokens_p99,
+                    snapshot.vllm.generation_tokens_completed.unwrap_or(0.0),
                     "    ",
                 );
             } else {
@@ -274,16 +271,9 @@ pub(super) fn format_concurrency_saturation_window_issue(
     seen_pct: u32,
     max_model_len: Option<u32>,
     kv_max_seqs: Option<u32>,
-    prompt_tokens_mean: Option<f64>,
     snapshot: &RawSnapshot,
 ) -> Vec<String> {
-    let mut lines = format_concurrency_saturation_issue(
-        d,
-        max_model_len,
-        kv_max_seqs,
-        prompt_tokens_mean,
-        snapshot,
-    );
+    let mut lines = format_concurrency_saturation_issue(d, max_model_len, kv_max_seqs, snapshot);
     lines.insert(1, format!("  Seen in {seen_pct}% of windows"));
     lines
 }
@@ -311,7 +301,6 @@ pub fn r5_recommendation(
             &d,
             max_model_len,
             kv_max_seqs,
-            prompt_tokens_mean,
             snapshot,
         ),
     })
@@ -411,6 +400,15 @@ mod tests {
         snap(VllmRawMetrics::default())
     }
 
+    fn model_len_snap(pp: f64, gp: f64, completed: f64) -> RawSnapshot {
+        snap(VllmRawMetrics {
+            prompt_tokens_p99: Some(pp),
+            generation_tokens_p99: Some(gp),
+            generation_tokens_completed: Some(completed),
+            ..Default::default()
+        })
+    }
+
     fn sat_vllm(run: f64, wait: f64, max_num_seqs: Option<u32>) -> VllmRawMetrics {
         VllmRawMetrics {
             num_requests_running: Some(run),
@@ -497,7 +495,6 @@ mod tests {
             &fired_detail(None, Some(70.0)),
             None,
             None,
-            None,
             &blank_snap(),
         )
         .join("\n");
@@ -513,13 +510,12 @@ mod tests {
             &d,
             Some(8192),
             Some(13),
-            Some(6200.0),
-            &blank_snap(),
+            &model_len_snap(6000.0, 450.0, 150.0),
         )
         .join("\n");
         assert!(text.contains("physics ceiling for max_model_len=8192"));
         assert!(text.contains("to ~6450"));
-        assert!(text.contains("Warning: Truncation risk!"));
+        assert!(text.contains("Truncation risk"));
         assert!(!text.contains("free KV blocks"));
     }
 
@@ -529,7 +525,6 @@ mod tests {
             &fired_detail(None, Some(85.0)),
             Some(8192),
             None,
-            Some(6200.0),
             &blank_snap(),
         )
         .join("\n");
@@ -546,7 +541,6 @@ mod tests {
             &fired_detail(None, None),
             None,
             None,
-            None,
             &blank_snap(),
         )
         .join("\n");
@@ -558,7 +552,6 @@ mod tests {
     fn confidence_high_when_ttft_and_kv_present() {
         let text = format_concurrency_saturation_issue(
             &fired_detail(Some(5000.0), Some(70.0)),
-            None,
             None,
             None,
             &blank_snap(),
@@ -573,14 +566,12 @@ mod tests {
             &fired_detail(Some(5000.0), None),
             None,
             None,
-            None,
             &blank_snap(),
         )
         .join("\n");
         assert!(text.contains("Confidence: Medium"));
         let text2 = format_concurrency_saturation_issue(
             &fired_detail(None, Some(70.0)),
-            None,
             None,
             None,
             &blank_snap(),
@@ -595,7 +586,6 @@ mod tests {
             &fired_detail(None, Some(85.0)),
             Some(8192),
             None,
-            Some(6200.0),
             &blank_snap(),
         )
         .join("\n");
@@ -604,10 +594,27 @@ mod tests {
     }
 
     #[test]
+    fn cause_waiting_line_uses_max_num_seqs_not_run_plus_wait() {
+        let mut d = fired_detail(None, None);
+        d.max_num_seqs = Some(13);
+        d.requests_running = 13.0;
+        d.requests_waiting = 237.0;
+        d.queue_ratio = 237.0 / 250.0;
+        let s = snap(VllmRawMetrics {
+            num_requests_running: Some(13.0),
+            num_requests_waiting: Some(237.0),
+            max_num_seqs: Some(13),
+            ..Default::default()
+        });
+        let text = format_concurrency_saturation_issue(&d, None, None, &s).join("\n");
+        assert!(text.contains("of 13 active"));
+        assert!(!text.contains("of 250 active"));
+    }
+
+    #[test]
     fn cause_shows_ttft_when_available() {
         let text = format_concurrency_saturation_issue(
             &fired_detail(Some(5000.0), None),
-            None,
             None,
             None,
             &blank_snap(),
@@ -620,10 +627,9 @@ mod tests {
     fn cause_falls_back_to_ttft_p99_when_snapshot_has_no_p95() {
         let mut d = fired_detail(Some(5000.0), None);
         d.ttft_p99_ms = Some(12400.0);
-        let text =
-            format_concurrency_saturation_issue(&d, None, None, None, &blank_snap()).join("\n");
+        let text = format_concurrency_saturation_issue(&d, None, None, &blank_snap()).join("\n");
         // snapshot has no p95 → falls back to d.ttft_p99_ms
-        assert!(text.contains("TTFT 12.4s p99 (5.0s avg)"));
+        assert!(text.contains("TTFT (p99 12.4s) (5.0s avg)"));
     }
 
     #[test]
@@ -635,9 +641,9 @@ mod tests {
             ttft_ms: Some(5000.0),     // snapshot avg: 5.0s
             ..Default::default()
         });
-        let text = format_concurrency_saturation_issue(&d, None, None, None, &s).join("\n");
+        let text = format_concurrency_saturation_issue(&d, None, None, &s).join("\n");
         assert!(
-            text.contains("9.5s p95"),
+            text.contains("TTFT (p95 9.5s)"),
             "snapshot p95 must win over d.ttft_p99"
         );
         assert!(
@@ -655,7 +661,7 @@ mod tests {
             kv_cache_usage_perc: Some(70.0),
             ..Default::default()
         });
-        let text = format_concurrency_saturation_issue(&d, None, None, None, &s).join("\n");
+        let text = format_concurrency_saturation_issue(&d, None, None, &s).join("\n");
         assert!(
             text.contains("Raise --max-num-seqs"),
             "snapshot KV (70%) should flip fix to raise cap"
@@ -670,9 +676,8 @@ mod tests {
     fn cause_shows_ttft_p99_only_when_mean_missing() {
         let mut d = fired_detail(None, None);
         d.ttft_p99_ms = Some(12400.0);
-        let text =
-            format_concurrency_saturation_issue(&d, None, None, None, &blank_snap()).join("\n");
-        assert!(text.contains("TTFT 12.4s p99"));
+        let text = format_concurrency_saturation_issue(&d, None, None, &blank_snap()).join("\n");
+        assert!(text.contains("TTFT (p99 12.4s)"));
         assert!(!text.contains("avg"));
     }
 
@@ -680,7 +685,6 @@ mod tests {
     fn cause_omits_ttft_when_none() {
         let text = format_concurrency_saturation_issue(
             &fired_detail(None, None),
-            None,
             None,
             None,
             &blank_snap(),
@@ -763,7 +767,6 @@ mod tests {
         let lines = format_concurrency_saturation_window_issue(
             &fired_detail(None, None),
             40,
-            None,
             None,
             None,
             &blank_snap(),
@@ -900,13 +903,12 @@ mod tests {
             &d,
             Some(8192),
             Some(15),
-            Some(6200.0),
-            &blank_snap(),
+            &model_len_snap(6000.0, 450.0, 150.0),
         )
         .join("\n");
         assert!(text.contains("physics ceiling for max_model_len=8192"));
         assert!(text.contains("to ~6450"));
-        assert!(text.contains("Warning: Truncation risk!"));
+        assert!(text.contains("Truncation risk"));
     }
 
     #[test]
@@ -915,7 +917,6 @@ mod tests {
             &fired_detail(None, Some(85.0)),
             Some(4096),
             None,
-            Some(3900.0),
             &blank_snap(),
         )
         .join("\n");

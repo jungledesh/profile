@@ -52,24 +52,44 @@ pub(super) const ENGINE_MIN_WINDOW_PCT: f64 = 0.25;
 // TODO(r5): sampling cliff — sampling temperature is not in collected metrics; wire rule when available.
 
 /// Push a max_model_len shrink suggestion into `lines`.
-/// suggested = prompt_tokens_mean rounded up + 250-tok buffer.
-/// Shows "Warning: Truncation risk!" as a second line.
-/// No-op when max_model_len or prompt_tokens_mean is None.
+/// Hard number only when `total_count >= 100` and both p99s are present.
+/// No-op when `max_model_len` is None.
 pub(super) fn push_model_len_shrink_suggestion(
     lines: &mut Vec<String>,
     max_model_len: Option<u32>,
-    prompt_tokens_mean: Option<f64>,
+    prompt_p99: Option<f64>,
+    generation_p99: Option<f64>,
+    total_count: f64,
     indent: &str,
 ) {
-    let (Some(m), Some(p)) = (max_model_len, prompt_tokens_mean) else {
-        return;
-    };
-    let suggested = (p as u32).saturating_add(250);
-    lines.push(format!(
-        "{indent}• Lower --max-model-len (current: {m}) to ~{suggested}, \
-         avg prompts ~{p:.0} tok, to shrink KV footprint."
-    ));
-    lines.push(format!("{indent}  Warning: Truncation risk!"));
+    let Some(m) = max_model_len else { return };
+
+    if total_count >= 100.0 {
+        let Some(pp) = prompt_p99 else {
+            lines.push(format!(
+                "{indent}• Lower --max-model-len (current: {m}) to safely raise concurrency."
+            ));
+            return;
+        };
+        let Some(gp) = generation_p99 else {
+            lines.push(format!(
+                "{indent}• Lower --max-model-len (current: {m}) to safely raise concurrency."
+            ));
+            return;
+        };
+        let suggested = (pp as u32).saturating_add(gp as u32);
+        lines.push(format!(
+            "{indent}• Lower --max-model-len (current: {m}) to ~{suggested} \
+             (prompt p99 {pp:.0} tok + output p99 {gp:.0} tok), to shrink KV footprint."
+        ));
+        lines.push(format!(
+            "{indent}  Warning: max_model_len is total context (prompt + completion). Truncation risk!"
+        ));
+    } else {
+        lines.push(format!(
+            "{indent}• Lower --max-model-len (current: {m}) to safely raise concurrency."
+        ));
+    }
 }
 
 pub(super) fn compute_kv_max_seqs(
@@ -665,7 +685,7 @@ fn build_report_from_eval(
             pct(eval.r2_backlog_fired, eval.n_eval),
             max_model_len,
             kv_headroom_gb,
-            summary_snap.vllm.prompt_tokens_mean,
+            summary_snap,
             eval.r2_backlog_fired,
             eval.n_eval,
         );
@@ -689,7 +709,6 @@ fn build_report_from_eval(
                 pct(eval.r5_fired, eval.n_eval),
                 max_model_len,
                 kv_max_seqs,
-                prompt_tokens_mean,
                 summary_snap,
             );
             recs.push(Recommendation {
@@ -983,7 +1002,7 @@ pub fn format_diagnose_rules_for_windows(
             pct(r2_backlog_fired, n_eval),
             summary.ctx.config.max_model_len,
             summary_baseline.as_ref().and_then(|b| b.kv_headroom_gb),
-            summary_snap.vllm.prompt_tokens_mean,
+            summary_snap,
             r2_backlog_fired,
             n_eval,
         );
@@ -999,7 +1018,6 @@ pub fn format_diagnose_rules_for_windows(
                 pct(r5_fired, n_eval),
                 summary.ctx.config.max_model_len,
                 kv_max_seqs,
-                summary_snap.vllm.prompt_tokens_mean,
                 summary_snap,
             );
             warnings.extend(block);
@@ -2559,5 +2577,47 @@ mod tests {
             Some(10.0),
         );
         assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn model_len_suggestion_uses_p99_sum_when_count_sufficient() {
+        let mut lines = Vec::new();
+        push_model_len_shrink_suggestion(
+            &mut lines,
+            Some(8192),
+            Some(6000.0),
+            Some(450.0),
+            150.0,
+            "    ",
+        );
+        let text = lines.join("\n");
+        assert!(text.contains("to ~6450"));
+        assert!(text.contains("prompt p99 6000 tok + output p99 450 tok"));
+        assert!(text.contains("Truncation risk"));
+    }
+
+    #[test]
+    fn model_len_suggestion_no_op_when_count_below_threshold() {
+        let mut lines = Vec::new();
+        push_model_len_shrink_suggestion(
+            &mut lines,
+            Some(8192),
+            Some(6000.0),
+            Some(450.0),
+            50.0,
+            "    ",
+        );
+        let text = lines.join("\n");
+        assert!(text.contains("to safely raise concurrency"));
+        assert!(!text.contains("to ~"));
+    }
+
+    #[test]
+    fn model_len_suggestion_no_op_when_p99_missing() {
+        let mut lines = Vec::new();
+        push_model_len_shrink_suggestion(&mut lines, Some(8192), Some(6000.0), None, 150.0, "    ");
+        let text = lines.join("\n");
+        assert!(text.contains("to safely raise concurrency"));
+        assert!(!text.contains("to ~"));
     }
 }

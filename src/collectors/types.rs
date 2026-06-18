@@ -80,6 +80,17 @@ pub struct VllmRawMetrics {
     pub queue_delay_ms: Option<f64>,
     /// `request_prompt_tokens` histogram: mean tokens (Δ window or last-scrape fallback).
     pub prompt_tokens_mean: Option<f64>,
+    /// `request_prompt_tokens` histogram: p99 from first→last scrape bucket delta.
+    pub prompt_tokens_p99: Option<f64>,
+    /// Raw histogram delta buckets for prompt tokens (first→last scrape in window).
+    pub prompt_tokens_p99_buckets: Vec<HistogramCount>,
+    /// `request_generation_tokens` histogram: p99 from first→last scrape bucket delta.
+    pub generation_tokens_p99: Option<f64>,
+    /// Raw histogram delta buckets for generation tokens (first→last scrape in window).
+    pub generation_tokens_p99_buckets: Vec<HistogramCount>,
+    /// Total completed requests observed in this window (from generation tokens +Inf bucket delta).
+    /// Used to gate --max-model-len suggestions: only suggest a hard number when >= 100.
+    pub generation_tokens_completed: Option<f64>,
 
     /// Wall-clock seconds from first→last `/metrics` scrape in this collection window.
     pub window_duration_secs: Option<f64>,

@@ -234,6 +234,22 @@ fn aggregate_windows(
             collectors::vllm::histogram_quantile(0.99, &merged_tpot).map(|s| s * 1000.0);
         agg_v.tpot_p95_ms =
             collectors::vllm::histogram_quantile(0.95, &merged_tpot).map(|s| s * 1000.0);
+
+        let prompt_tok_vecs: Vec<&[collectors::HistogramCount]> = evaluable_pairs
+            .iter()
+            .map(|(w, _)| w.vllm.prompt_tokens_p99_buckets.as_slice())
+            .collect();
+        let merged_prompt_tok = collectors::merge_p99_bucket_vecs(&prompt_tok_vecs);
+        agg_v.prompt_tokens_p99 = collectors::vllm::histogram_quantile(0.99, &merged_prompt_tok);
+
+        let gen_tok_vecs: Vec<&[collectors::HistogramCount]> = evaluable_pairs
+            .iter()
+            .map(|(w, _)| w.vllm.generation_tokens_p99_buckets.as_slice())
+            .collect();
+        let merged_gen_tok = collectors::merge_p99_bucket_vecs(&gen_tok_vecs);
+        agg_v.generation_tokens_p99 = collectors::vllm::histogram_quantile(0.99, &merged_gen_tok);
+        agg_v.generation_tokens_completed =
+            merged_gen_tok.last().map(|b| b.count).filter(|c| *c > 0.0);
     }
     agg_v.prefill_latency_ms =
         aggregate_histogram_from_mass(&active_pairs, |v| v.prefill_window_mass, 1000.0)

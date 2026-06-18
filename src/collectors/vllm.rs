@@ -429,6 +429,14 @@ fn apply_histogram_window(first: &Scrape, last: &Scrape, m: &mut VllmRawMetrics)
         .or_else(|| histogram_mean_ms_from_scrape(last, "vllm_request_queue_time_seconds"));
     m.prompt_tokens_mean = histogram_window_mean(first, last, "vllm_request_prompt_tokens")
         .or_else(|| histogram_mean_from_scrape(last, "vllm_request_prompt_tokens"));
+    let prompt_delta = histogram_window_delta_buckets(first, last, "vllm_request_prompt_tokens");
+    m.prompt_tokens_p99 = histogram_quantile(0.99, &prompt_delta);
+    m.prompt_tokens_p99_buckets = prompt_delta;
+
+    let gen_delta = histogram_window_delta_buckets(first, last, "vllm_request_generation_tokens");
+    m.generation_tokens_p99 = histogram_quantile(0.99, &gen_delta);
+    m.generation_tokens_completed = gen_delta.last().map(|b| b.count).filter(|c| *c > 0.0);
+    m.generation_tokens_p99_buckets = gen_delta;
     m.ttft_p99_ms = histogram_window_p99_ms(first, last, "vllm_time_to_first_token_seconds");
     m.tpot_p99_ms =
         histogram_window_p99_ms(first, last, "vllm_request_time_per_output_token_seconds")
@@ -623,6 +631,11 @@ fn parse_vllm_metrics(scrape: &Scrape) -> Result<VllmRawMetrics> {
         prefill_latency_ms,
         queue_delay_ms,
         prompt_tokens_mean,
+        prompt_tokens_p99: None,
+        prompt_tokens_p99_buckets: vec![],
+        generation_tokens_p99: None,
+        generation_tokens_p99_buckets: vec![],
+        generation_tokens_completed: None,
         window_duration_secs: None,
         ttft_window_mass: None,
         tpot_window_mass: None,
