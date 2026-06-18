@@ -2,7 +2,9 @@
 
 Less Words. Less Noise. More Signal. More Value.
 
-A physics-grounded, cost-aware optimizer for vLLM inference servers.
+A physics-grounded, cost-aware optimization loop for vLLM inference servers.
+
+**[Website](https://jungledesh.github.io/profile/index.html)** | **[Docs](https://jungledesh.github.io/profile/docs.html)**
 
 ---
 
@@ -17,139 +19,108 @@ A physics-grounded, cost-aware optimizer for vLLM inference servers.
 | Closed loop: measures delta after fix  | ✓       | ✗           |
 | Cost per 1M tokens + recoverable waste | ✓       | ✗           |
 | Prescriptive fixes, not just alerts    | ✓       | ✗           |
-| GPU metrics                            | ✓       | ✓           |
-| Prometheus `/metrics`                  | ✓       | ✓           |
 
 
----
-
-## How it works
-
-Profile watches your vLLM server under load. Computes the roofline for your exact model and GPU, shows where you stand against that ceiling, and tells you what to fix. Apply a change, Profile re-measures, reports the exact delta. Every recommendation is accountable.
+Profile is the first of its kind in the market. We are not just another monitoring tool; we provide actionable intelligence grounded in physics.
 
 ---
 
-## Value in a minute
+## The Value
 
-### Download
+You are paying for hardware. Are you using it?
+Profile computes the theoretical physics ceiling for your exact model and GPU, measures your live traffic, and tells you precisely why you are leaving money on the table. Every recommendation is accountable. You apply the fix, Profile measures the delta.
+
+### Real World Impact: Qwen3.6-27B on A100-SXM4-80GB
+
+**Before Profile:**
+
+- Throughput: `31 tok/s`
+- Economics: `$13.26 / 1M tokens`
+
+**After Profile:**
+
+- Throughput: `470 tok/s`
+- Economics: `$0.89 / 1M tokens`
+
+**Result:** A **15x throughput increase** and a **93% cost reduction**. Profile tracked the live traffic, dynamically recommended concurrency and model length adjustments, and identified the exact moment the server became structurally saturated. Instead of blindly tweaking configs, Profile advised spinning up a replica to preserve latency.
+
+```text
++----------------------------------------------------------------------------------------------------+
+|PROFILE v2.1.3 [Qwen3.6-27B] [NVIDIA A100-SXM4-80GB] (1m from 2026-06-18 22:08:40 UTC)              |
+|                                                                                                    |
+|GPU =>     EFFICIENCY 8.1% | POWER 390W | 0.83 J/tok | $0.89/1M tok (est) | vRAM 77/80GB (peak 79GB)|
+|                                                                                                    |
+|vLLM:                                                                                               |
+|REQUESTS   run 100 (95.6%) | wait 149 | max 105                                                     |
+|LATENCY    ttft 52.9s (p95 129.2s) | tpot 199ms (p95 295ms)                                         |
+|CACHE      kv_cache 81.5% avg | pfix_cache 61.6%                                                    |
+|THROUGHPUT 470 tok/s                                                                                |
+|                                                                                                    |
+|ISSUES:                                                                                             |
+|                                                                                                    |
+|[!] Concurrency Saturation                                                                          |
+|  Seen in 50% of windows                                                                            |
+|                                                                                                    |
+|  Fix:                                                                                              |
+|    • KV at 81%: scheduler at cap, pool full. No config change helps.                               |
+|    • Add a replica to scale out.                                                                   |
+|                                                                                                    |
+|~$1.38/hr lost to scheduler queuing                                                                 |
++----------------------------------------------------------------------------------------------------+
+```
+
+---
+
+## Install & Run
 
 ```bash
+# Linux x86_64
 curl -L https://github.com/jungledesh/profile/releases/latest/download/profile -o profile
-chmod +x profile && mv profile /usr/local/bin/
+chmod +x profile && sudo mv profile /usr/local/bin/
+
+# Start profiling your vLLM server
+profile diagnose --url http://localhost:8000/metrics --duration 1m
 ```
 
-### Or build from source
-
-```bash
-cargo install --git https://github.com/jungledesh/profile
-```
-
-### Run
-
-```bash
-profile diagnose --url http://localhost:8000/metrics
-```
+*Or build from source: `cargo install --git https://github.com/jungledesh/profile`*
 
 ---
 
 ## Configuration
 
-```bash
-profile diagnose [flags]
-```
 
-**Requires:** vLLM instance exporting Prometheus metrics at `/metrics` and NVIDIA Linux runtime with NVML (`libnvidia-ml.so`) access.
-
-
-| Flag                     | Default                         | Description                                     |
-| ------------------------ | ------------------------------- | ----------------------------------------------- |
-| `-u, --url`              | `http://localhost:8000/metrics` | vLLM metrics endpoint                           |
-| `--duration`             | `30s`                           | Sampling window (`30s`, `1m`, `2m`, `3m`)             |
-| `-m, --max-num-seqs`     | prompted if absent              | Pass directly to skip prompt; auto-read from `/metrics` when available |
-| `--tensor-parallel-size` | env / unset                     | TP degree (overrides `TENSOR_PARALLEL_SIZE`)    |
-| `--cost-per-hour`        | catalog estimate                | GPU cost in USD/hr (overrides catalog estimate) |
-| `-v`                     | off                             | Show non-triggered rules and physics limits     |
+| Flag                     | Default                         | Description                                                           |
+| ------------------------ | ------------------------------- | --------------------------------------------------------------------- |
+| `-u, --url`              | `http://localhost:8000/metrics` | vLLM metrics endpoint                                                 |
+| `--duration`             | `30s`                           | Sampling window (`30s`, `1m`, `2m`, `3m`)                             |
+| `-m, --max-num-seqs`     | Prompted if absent              | Pass directly to skip prompt. Auto-read from `/metrics` if available. |
+| `--tensor-parallel-size` | Env or unset                    | TP degree (overrides `TENSOR_PARALLEL_SIZE`)                          |
+| `--cost-per-hour`        | Catalog estimate                | GPU cost in USD/hr (overrides catalog estimate)                       |
+| `-v`                     | Off                             | Show non-triggered rules and physics limits                           |
 
 
 ---
 
-## Sample output
+## What it detects
 
-```
-$ ./profile diagnose --duration 2m
-
-Profile needs max_num_seqs for accurate diagnosis.
-
-Find it in your vLLM start command: --max-num-seqs N (default: 256 if not set).
-Enter value: 32
-
-+--------------------------------------------------------------------------------------------------+
-|PROFILE v2.1.0 [meta-llama/Llama-3.1-8B-Instruct] [NVIDIA H100 80GB HBM3] (2m from 2026-06-03) |
-|                                                                                                  |
-|GPU =>      EFFICIENCY 36.2% | POWER 312W | 0.20 J/tok | $0.61/1M tok (est) | vRAM 62/80GB      |
-|                                                                                                  |
-|vLLM:                                                                                             |
-|REQUESTS   run 1 (3.1%) | wait 1 | max 32                                                         |
-|LATENCY    ttft 420ms | tpot 35ms                                                                 |
-|CACHE      kv_cache 71.2% avg | pfix_cache 52.4%                                                  |
-|THROUGHPUT 1580 tok/s                                                                             |
-|TRAFFIC    qps 12.4 | req_total 1488 | gen_total 189600 | preempt/s 0.00 | preempt_total 0        |
-|                                                                                                  |
-|ISSUES:                                                                                           |
-|                                                                                                  |
-|[!] Under-batching: Insufficient Concurrency                                                     |
-|  Seen in 60% of windows                                                                          |
-|                                                                                                  |
-|  Occupancy  3.1%  (threshold: < 25%)                                                             |
-|  Requests   1 running, 1 waiting  (max: 32)                                                      |
-|                                                                                                  |
-|  Cause:                                                                                          |
-|    Hardware capacity under-fed by client. Not enough requests arriving to keep the server busy.  |
-|                                                                                                  |
-|  Fix:                                                                                            |
-|    • Batch more requests or increase client concurrency (31 slots idle)                            |
-|                                                                                                  |
-|  Expected: Higher throughput, stable TPOT.                                                       |
-|  Confidence: High                                                                                |
-|                                                                                                  |
-|At current efficiency, ~64% of compute cost is wasted — ~$2.20/hr recoverable.                   |
-|                                                                                                  |
-+--------------------------------------------------------------------------------------------------+
-
-Apply your change to vLLM.
-Profile will detect when vLLM restarts automatically.
-Press Enter to skip and re-measure now.
-```
-
-After you apply a fix:
-
-```
-Waiting for vLLM to restart...
-Connection restored. Resuming in 5s...
-
-Measuring delta...
-  Throughput  1580 → 2990 tok/s ↑
-  TTFT        4823 → 1204ms ↓  (p99 9847 → 2156ms ↓)
-  Efficiency  +32.4pp ↑
-
-ECONOMICS:
-  Cost/1M tok   $0.61 → $0.32 ↓ (est)
-  Recoverable   $2.20 → $1.08/hr ↓
-
-Direction: Better
-
-No issues detected. Efficiency: 68.6% of hardware ceiling.
-```
+- **R1 Under-batching (Under-utilized compute)**: `GPU Efficiency < 60%`. Hardware under-fed; compute headroom wasted.
+- **R2 KV cache pressure**: `KV Usage ≥ 88%`. VRAM near capacity, preemption risk rising. Dynamically calculates exact sequence length reductions.
+- **R3 Low prefix reuse**: `Hit Rate < 35%` at `> 1000 tok/s`. Prefill compute wasted on identical prompts.
+- **R4 OOM risk**: Model weight footprint structurally exceeds available VRAM.
+- **R5 Concurrency saturation**: `max_num_seqs` cap hit. Requests queueing, TTFT degrading.
 
 ---
 
-## Bottlenecks detected
+## Documentation
 
-- **Under-batching**: hardware under-fed by client; compute headroom wasted
-- **KV cache pressure**: VRAM near capacity, preemption risk rising
-- **Low prefix reuse**: prefix cache hit rate too low; prefill compute wasted
-- **Concurrency saturation**: `max_num_seqs` cap hit; requests queueing, TTFT degrading
-- **OOM risk**: model weight footprint structurally exceeds available VRAM
+Comprehensive internals are available in our docs.
+
+- **[Data](https://jungledesh.github.io/profile/docs.html#data)**: How we aggregate 2s windows from parallel NVML and vLLM polls.
+- **[Catalog](https://jungledesh.github.io/profile/docs.html#catalog)**: Hardcoded GPU memory bandwidth, FLOPs, and market prices.
+- **[Math](https://jungledesh.github.io/profile/docs.html#math)**: The physics formulas powering the efficiency percentage.
+- **[Rules](https://jungledesh.github.io/profile/docs.html#rules)**: The precise mathematical conditions that trigger recommendations.
+- **[Limitations](https://jungledesh.github.io/profile/docs.html#limitations)**: Where the math is approximate and why.
+- **[Design](https://jungledesh.github.io/profile/docs.html#design)**: The philosophy behind the engine.
 
 ---
 
@@ -166,10 +137,6 @@ No issues detected. Efficiency: 68.6% of hardware ceiling.
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE).
-
-```
-Copyright 2026 Gagandeep Singh
-```
+Apache License 2.0. Copyright 2026 Gagandeep Singh.
 
 For production teams requiring cluster-wide aggregation, multi-engine support, or custom hardware cataloging: **[jungledesh@gmail.com](mailto:jungledesh@gmail.com)**

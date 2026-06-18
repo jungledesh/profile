@@ -151,7 +151,7 @@ pub fn r1_recommendation(
         action: "Batch more requests or increase client concurrency".to_string(),
         short_action: r1_short_action(d.running, d.max_num_seqs),
         expected_impact: "Higher throughput, stable TPOT".to_string(),
-        display_lines: format_under_batching_fired(&d, 0.8),
+        display_lines: format_under_batching_fired(&d, snapshot, 0.8),
     })
 }
 
@@ -181,15 +181,29 @@ pub(super) fn r1_short_action(running: f64, max_num_seqs: Option<u32>) -> String
             let idle = (f64::from(max_n) - running).max(0.0);
             format!("batch more requests or increase client concurrency ({idle:.0} slots idle)")
         }
-        None => "raise client concurrency".to_string(),
+        None => "batch more requests or increase client concurrency".to_string(),
     }
 }
 
-pub(super) fn format_under_batching_fired(d: &UnderBatchingDetail, confidence: f64) -> Vec<String> {
+pub(super) fn format_under_batching_fired(
+    d: &UnderBatchingDetail,
+    snapshot: &RawSnapshot,
+    confidence: f64,
+) -> Vec<String> {
     let Some(max_n) = d.max_num_seqs else {
         // Structurally unreachable: r1 hard-aborts without max_num_seqs.
         return Vec::new();
     };
+    let display_run = snapshot
+        .vllm
+        .num_requests_running
+        .filter(|v| v.is_finite())
+        .unwrap_or(d.running);
+    let display_wait = snapshot
+        .vllm
+        .num_requests_waiting
+        .filter(|v| v.is_finite())
+        .unwrap_or(d.waiting);
     let threshold = UNDER_BATCHING_OCCUPANCY_PCT * 100.0;
     let max_str = max_n.to_string();
     let metric_line = if let Some(eff) = d.efficiency_pct {
@@ -202,12 +216,12 @@ pub(super) fn format_under_batching_fired(d: &UnderBatchingDetail, confidence: f
     };
     let fix_line = match d.max_num_seqs {
         Some(max_n) => {
-            let idle = (f64::from(max_n) - d.running).max(0.0);
+            let idle = (f64::from(max_n) - display_run).max(0.0);
             format!(
                 "    • Batch more requests or increase client concurrency ({idle:.0} slots idle)"
             )
         }
-        None => "    • Increase client concurrency".to_string(),
+        None => "    • Batch more requests or increase client concurrency".to_string(),
     };
     let confidence_str = if confidence >= 0.8 { "High" } else { "Medium" };
 
@@ -217,7 +231,7 @@ pub(super) fn format_under_batching_fired(d: &UnderBatchingDetail, confidence: f
         metric_line,
         format!(
             "  Requests   {:.0} running, {:.0} waiting  (max: {max_str})",
-            d.running, d.waiting
+            display_run, display_wait
         ),
         String::new(),
         "  Cause:".to_string(),
@@ -235,9 +249,10 @@ pub(super) fn format_under_batching_fired(d: &UnderBatchingDetail, confidence: f
 pub(super) fn format_under_batching_window_issue(
     d: &UnderBatchingDetail,
     seen_pct: u32,
+    snapshot: &RawSnapshot,
     confidence: f64,
 ) -> Vec<String> {
-    let mut lines = format_under_batching_fired(d, confidence);
+    let mut lines = format_under_batching_fired(d, snapshot, confidence);
     lines.insert(1, format!("  Seen in {seen_pct}% of windows"));
     lines
 }
@@ -523,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn short_action_is_raise_client_concurrency() {
+    fn short_action_includes_batch_or_increase_concurrency() {
         let s = entry_fired_snap();
         let r = r1_recommendation(&s, None, None).expect("fired");
         assert_eq!(
@@ -549,7 +564,7 @@ mod tests {
         match rule1_under_batching_with_efficiency(&s, None, Some(25.0)) {
             Rule1Outcome::Fired(d) => {
                 assert_eq!(d.efficiency_pct, Some(25.0));
-                let text = format_under_batching_fired(&d, 0.8).join("\n");
+                let text = format_under_batching_fired(&d, &s, 0.8).join("\n");
                 assert!(text.contains("Efficiency  25.0%"));
                 assert!(text.contains("threshold: < 60%"));
                 assert!(!text.contains("Occupancy"));
@@ -564,7 +579,7 @@ mod tests {
         match rule1_under_batching_with_efficiency(&s, None, None) {
             Rule1Outcome::Fired(d) => {
                 assert!(d.efficiency_pct.is_none());
-                let text = format_under_batching_fired(&d, 0.8).join("\n");
+                let text = format_under_batching_fired(&d, &s, 0.8).join("\n");
                 assert!(text.contains("Occupancy"));
                 assert!(text.contains("threshold: < 25%"));
                 assert!(!text.contains("Efficiency"));

@@ -33,7 +33,7 @@ use r1_under_batching::{
 use r2_kv_cache_pressure::{
     aggregate_backlog_detail, aggregate_r2_detail, format_kv_admission_backlog_issue,
     format_kv_cache_window_issue, kv_pressure_confidence, r2_action, r2_backlog_short_action,
-    r2_kv_pressure_short_action, KvPressureFormatOpts,
+    r2_kv_pressure_short_action, KvFormatCtx,
 };
 #[cfg(test)]
 use r3_low_prefix_reuse::format_low_prefix_hit_rate_fired;
@@ -51,12 +51,48 @@ pub(super) const ENGINE_MIN_WINDOW_PCT: f64 = 0.25;
 
 // TODO(r5): sampling cliff — sampling temperature is not in collected metrics; wire rule when available.
 
-/// Returns ` (currently N)` when known, empty string when not.
-/// Used by rules that surface --max-model-len in Fix bullets.
-pub(super) fn model_len_suffix(max_model_len: Option<u32>) -> String {
-    match max_model_len {
-        Some(v) => format!(" (currently {v})"),
-        None => String::new(),
+/// Push a max_model_len shrink suggestion into `lines`.
+/// Hard number only when `total_count >= 100` and both p99s are present.
+/// No-op when `max_model_len` is None.
+pub(super) fn push_model_len_shrink_suggestion(
+    lines: &mut Vec<String>,
+    max_model_len: Option<u32>,
+    prompt_p99: Option<f64>,
+    generation_p99: Option<f64>,
+    total_count: f64,
+    indent: &str,
+) {
+    let Some(m) = max_model_len else { return };
+
+    if total_count >= 100.0 {
+        let Some(pp) = prompt_p99 else {
+            lines.push(format!(
+                "{indent}• Lower --max-model-len (current: {m}) to safely raise concurrency."
+            ));
+            return;
+        };
+        let Some(gp) = generation_p99 else {
+            lines.push(format!(
+                "{indent}• Lower --max-model-len (current: {m}) to safely raise concurrency."
+            ));
+            return;
+        };
+        let suggested = (pp as u32).saturating_add(gp as u32);
+        // Suppress if reduction is < 5% — not a meaningful change (avoids "5464 → 5465" no-ops)
+        if suggested >= m.saturating_sub(m / 20) {
+            return;
+        }
+        lines.push(format!(
+            "{indent}• Lower --max-model-len (current: {m}) to ~{suggested} \
+             (prompt p99 {pp:.0} tok + output p99 {gp:.0} tok), to shrink KV footprint."
+        ));
+        lines.push(format!(
+            "{indent}  Warning: max_model_len is total context (prompt + completion). Truncation risk!"
+        ));
+    } else {
+        lines.push(format!(
+            "{indent}• Lower --max-model-len (current: {m}) to safely raise concurrency."
+        ));
     }
 }
 
@@ -605,13 +641,17 @@ fn build_report_from_eval(
 
     if eval.r1_significant() {
         let d = aggregate_r1_detail(&eval.r1_details);
-        let display_lines =
-            format_under_batching_window_issue(&d, pct(eval.r1_fired, eval.n_eval), 0.8);
+        let display_lines = format_under_batching_window_issue(
+            &d,
+            pct(eval.r1_fired, eval.n_eval),
+            summary_snap,
+            0.8,
+        );
         recs.push(Recommendation {
             rule_name: "under_batching",
             impact: 4,
             confidence: 0.8,
-            action: "Increase client concurrency".to_string(),
+            action: "Batch more requests or increase client concurrency".to_string(),
             short_action: r1_short_action(d.running, d.max_num_seqs),
             expected_impact: "Higher throughput, stable TPOT".to_string(),
             display_lines,
@@ -624,14 +664,14 @@ fn build_report_from_eval(
         let display_lines = format_kv_cache_window_issue(
             &r2_agg,
             pct(eval.r2_fired, eval.n_eval),
-            summary_snap,
-            eval.r2_fired,
-            eval.n_eval,
-            KvPressureFormatOpts {
+            &KvFormatCtx {
+                snapshot: summary_snap,
                 max_model_len,
                 kv_headroom_gb,
                 kv_max_seqs,
             },
+            eval.r2_fired,
+            eval.n_eval,
         );
         recs.push(Recommendation {
             rule_name: "kv_cache_pressure",
@@ -653,6 +693,7 @@ fn build_report_from_eval(
             pct(eval.r2_backlog_fired, eval.n_eval),
             max_model_len,
             kv_headroom_gb,
+            summary_snap,
             eval.r2_backlog_fired,
             eval.n_eval,
         );
@@ -676,7 +717,7 @@ fn build_report_from_eval(
                 pct(eval.r5_fired, eval.n_eval),
                 max_model_len,
                 kv_max_seqs,
-                prompt_tokens_mean,
+                summary_snap,
             );
             recs.push(Recommendation {
                 rule_name: "concurrency_saturation",
@@ -940,6 +981,7 @@ pub fn format_diagnose_rules_for_windows(
         let block = format_under_batching_window_issue(
             &aggregate_r1_detail(r1_details),
             pct(r1_fired, n_eval),
+            summary_snap,
             0.8,
         );
         warnings.extend(block);
@@ -951,14 +993,14 @@ pub fn format_diagnose_rules_for_windows(
         let block = format_kv_cache_window_issue(
             &r2_agg,
             pct(r2_fired, n_eval),
-            summary_snap,
-            r2_fired,
-            n_eval,
-            KvPressureFormatOpts {
+            &KvFormatCtx {
+                snapshot: summary_snap,
                 max_model_len: summary.ctx.config.max_model_len,
                 kv_headroom_gb: summary_baseline.as_ref().and_then(|b| b.kv_headroom_gb),
                 kv_max_seqs,
             },
+            r2_fired,
+            n_eval,
         );
         warnings.extend(block);
         warnings.push(String::new());
@@ -969,6 +1011,7 @@ pub fn format_diagnose_rules_for_windows(
             pct(r2_backlog_fired, n_eval),
             summary.ctx.config.max_model_len,
             summary_baseline.as_ref().and_then(|b| b.kv_headroom_gb),
+            summary_snap,
             r2_backlog_fired,
             n_eval,
         );
@@ -984,7 +1027,7 @@ pub fn format_diagnose_rules_for_windows(
                 pct(r5_fired, n_eval),
                 summary.ctx.config.max_model_len,
                 kv_max_seqs,
-                summary_snap.vllm.prompt_tokens_mean,
+                summary_snap,
             );
             warnings.extend(block);
             warnings.push(String::new());
@@ -2117,7 +2160,7 @@ mod tests {
         assert!(text.contains("threshold: < 60%"));
         assert!(text.contains("  Cause:"));
         assert!(
-            text.contains("Batch more requests or increase client concurrency (214 slots idle)")
+            text.contains("Batch more requests or increase client concurrency (156 slots idle)")
         );
         assert!(!text.contains("KV cache pressure: not triggered"));
         assert!(!text.contains("Low prefix reuse: not triggered"));
@@ -2329,7 +2372,13 @@ mod tests {
             text.contains("[!] Concurrency Saturation"),
             "expected r5: {text}"
         );
-        assert!(text.contains("KV at 95%: scheduler at cap, pool full."));
+        // Fix line uses summary snapshot KV (50%) for branch selection — scale-out, not session peak.
+        assert!(
+            text.contains("Raise --max-num-seqs above 32"),
+            "expected raise-cap fix from summary KV: {text}"
+        );
+        assert!(!text.contains("KV at 95%: scheduler at cap, pool full."));
+        assert!(!text.contains("Add a replica"));
         assert!(!text.contains("KV pool has room (70%)"));
     }
 
@@ -2359,8 +2408,14 @@ mod tests {
             .find(|g| g.primary.rule_name == "concurrency_saturation")
             .expect("r5 group");
         let text = r5.primary.display_lines.join("\n");
-        assert!(text.contains("KV at 95%: scheduler at cap, pool full."));
+        assert!(
+            text.contains("Raise --max-num-seqs above 32"),
+            "display fix line must use summary snapshot KV branch: {text}"
+        );
+        assert!(!text.contains("KV at 95%: scheduler at cap, pool full."));
+        assert!(!text.contains("Add a replica"));
         assert!(!text.contains("KV pool has room (70%)"));
+        // action still uses aggregate session peak from eval.
         assert_eq!(r5.primary.action, "Add a replica to scale out.");
     }
 
@@ -2531,5 +2586,61 @@ mod tests {
             Some(10.0),
         );
         assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn model_len_suggestion_uses_p99_sum_when_count_sufficient() {
+        let mut lines = Vec::new();
+        push_model_len_shrink_suggestion(
+            &mut lines,
+            Some(8192),
+            Some(6000.0),
+            Some(450.0),
+            150.0,
+            "    ",
+        );
+        let text = lines.join("\n");
+        assert!(text.contains("to ~6450"));
+        assert!(text.contains("prompt p99 6000 tok + output p99 450 tok"));
+        assert!(text.contains("Truncation risk"));
+    }
+
+    #[test]
+    fn model_len_suggestion_no_op_when_count_below_threshold() {
+        let mut lines = Vec::new();
+        push_model_len_shrink_suggestion(
+            &mut lines,
+            Some(8192),
+            Some(6000.0),
+            Some(450.0),
+            50.0,
+            "    ",
+        );
+        let text = lines.join("\n");
+        assert!(text.contains("to safely raise concurrency"));
+        assert!(!text.contains("to ~"));
+    }
+
+    #[test]
+    fn model_len_suggestion_no_op_when_p99_missing() {
+        let mut lines = Vec::new();
+        push_model_len_shrink_suggestion(&mut lines, Some(8192), Some(6000.0), None, 150.0, "    ");
+        let text = lines.join("\n");
+        assert!(text.contains("to safely raise concurrency"));
+        assert!(!text.contains("to ~"));
+    }
+
+    #[test]
+    fn model_len_suggestion_suppressed_when_delta_below_5pct() {
+        let mut lines = Vec::new();
+        push_model_len_shrink_suggestion(
+            &mut lines,
+            Some(5464),
+            Some(5400.0),
+            Some(65.0),
+            150.0,
+            "    ",
+        );
+        assert!(lines.is_empty());
     }
 }

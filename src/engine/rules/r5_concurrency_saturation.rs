@@ -4,12 +4,12 @@ use crate::fmt::fmt_seconds_from_ms;
 use super::Recommendation;
 
 /// Minimum ratio of (waiting / total active) confirming the cap is structurally bottlenecking.
-/// No industry standard exists — 0.30 is a judgment call. At 30%, nearly 1 in 3 active
+/// No industry standard exists; 0.30 is a judgment call. At 30%, nearly 1 in 3 active
 /// requests is halted. Below this, queue depth is likely a transient micro-burst, not structural.
 const CONCURRENCY_SATURATION_QUEUE_RATIO_MIN: f64 = 0.30;
 
 /// KV cache usage below this means the pool has room to absorb new sequences safely.
-/// Buffered 8 points below r2's 88% warning threshold — raising --max-num-seqs at 80%
+/// Buffered 8 points below r2's 88% warning threshold; raising --max-num-seqs at 80%
 /// won't immediately trigger KV pressure. At or above: hardware is near capacity, scale out.
 const KV_CACHE_SAFE_TO_SCALE_PCT: f64 = 80.0;
 
@@ -20,7 +20,7 @@ fn max_model_len_fix_line(max_model_len: Option<u32>, prompt_tokens_mean: Option
     match (max_model_len, prompt_tokens_mean) {
         (Some(m), Some(p)) if p > f64::from(m) * PROMPT_TRUNCATION_RISK_RATIO => {
             format!(
-                "• Lower --max-model-len (currently {m}), prompts avg ~{p:.0} tok — truncation risk.\n  \
+                "• Lower --max-model-len (currently {m}), prompts avg ~{p:.0} tok, truncation risk.\n  \
                  Prefer adding a replica or enabling TP if needed."
             )
         }
@@ -28,19 +28,6 @@ fn max_model_len_fix_line(max_model_len: Option<u32>, prompt_tokens_mean: Option
             format!("• Lower --max-model-len (currently {m}) to free KV blocks.")
         }
         (None, _) => "• Lower --max-model-len to free KV blocks.".to_string(),
-    }
-}
-
-/// Push the fix line(s) from `max_model_len_fix_line` into `lines`, each prefixed with `indent`.
-/// Handles the multi-line truncation-risk path without embedding `\n` in a single Vec entry.
-fn push_max_model_len_fix_lines(
-    lines: &mut Vec<String>,
-    max_model_len: Option<u32>,
-    prompt_tokens_mean: Option<f64>,
-    indent: &str,
-) {
-    for raw in max_model_len_fix_line(max_model_len, prompt_tokens_mean).split('\n') {
-        lines.push(format!("{}{}", indent, raw.trim_start()));
     }
 }
 
@@ -71,7 +58,7 @@ pub fn rule5_concurrency_saturation(
         .or(config_max_num_seqs)
         .filter(|&n| n > 0)?;
     // Exact equality: scheduler cap is the bottleneck.
-    // run > max_seqs means chunked prefill is batching across steps — cap is not the constraint.
+    // run > max_seqs means chunked prefill is batching across steps; cap is not the constraint.
     if (run - f64::from(max_seqs)).abs() > 0.5 {
         return None;
     }
@@ -147,7 +134,7 @@ pub(super) fn format_concurrency_saturation_issue(
     d: &ConcurrencySaturationDetail,
     max_model_len: Option<u32>,
     kv_max_seqs: Option<u32>,
-    prompt_tokens_mean: Option<f64>,
+    snapshot: &RawSnapshot,
 ) -> Vec<String> {
     let max_str = d
         .max_num_seqs
@@ -158,34 +145,66 @@ pub(super) fn format_concurrency_saturation_issue(
         _ => "Medium",
     };
 
+    // Prefer snapshot for display; header reads the same source.
+    let display_run = snapshot
+        .vllm
+        .num_requests_running
+        .filter(|v| v.is_finite())
+        .unwrap_or(d.requests_running);
+    let display_wait = snapshot
+        .vllm
+        .num_requests_waiting
+        .filter(|v| v.is_finite())
+        .unwrap_or(d.requests_waiting);
+    let display_queue_pct = d.queue_ratio * 100.0;
+    let display_kv = snapshot
+        .vllm
+        .kv_cache_usage_perc
+        .filter(|v| v.is_finite())
+        .or(d.kv_cache_usage_perc);
+    // p95 from snapshot (matches header label); fall back to p99 from d if absent.
+    let display_p_x = snapshot
+        .vllm
+        .ttft_p95_ms
+        .filter(|t| t.is_finite())
+        .map(|v| (v, "p95"))
+        .or_else(|| d.ttft_p99_ms.filter(|t| t.is_finite()).map(|v| (v, "p99")));
+    let display_avg = snapshot
+        .vllm
+        .ttft_ms
+        .filter(|t| t.is_finite())
+        .or_else(|| d.ttft_ms.filter(|t| t.is_finite()));
+
     let mut lines = vec![
         "[!] Concurrency Saturation".to_string(),
         String::new(),
         "  Cause:".to_string(),
         format!("    • --max-num-seqs={max_str} hit: scheduler won't admit more sequences"),
         format!(
-            "    • {:.0}% of requests waiting ({:.0} of {:.0} active)",
-            d.queue_ratio * 100.0,
-            d.requests_waiting,
-            d.requests_waiting + d.requests_running
+            "    • {:.0}% of requests waiting ({:.0} waiting, {:.0} running)",
+            display_queue_pct, display_wait, display_run
         ),
     ];
-    match (
-        d.ttft_p99_ms.filter(|t| t.is_finite()),
-        d.ttft_ms.filter(|t| t.is_finite()),
-    ) {
-        (Some(p99), Some(avg)) => lines.push(format!(
-            "    • TTFT {} p99 ({} avg)",
-            fmt_seconds_from_ms(p99),
+    match (display_p_x, display_avg) {
+        (Some((px, label)), Some(avg)) => lines.push(format!(
+            "    • TTFT ({} {}) ({} avg)",
+            label,
+            fmt_seconds_from_ms(px),
             fmt_seconds_from_ms(avg)
         )),
-        (Some(p99), None) => lines.push(format!("    • TTFT {} p99", fmt_seconds_from_ms(p99))),
+        (Some((px, label)), None) => {
+            lines.push(format!(
+                "    • TTFT ({} {})",
+                label,
+                fmt_seconds_from_ms(px)
+            ));
+        }
         (None, Some(avg)) => lines.push(format!("    • TTFT {}", fmt_seconds_from_ms(avg))),
         (None, None) => {}
     }
     lines.push(String::new());
     lines.push("  Fix:".to_string());
-    match d.kv_cache_usage_perc {
+    match display_kv {
         Some(pct) if pct < KV_CACHE_SAFE_TO_SCALE_PCT => {
             if kv_max_seqs
                 .is_some_and(|ceiling| d.max_num_seqs.is_some_and(|current| current >= ceiling))
@@ -196,7 +215,14 @@ pub(super) fn format_concurrency_saturation_issue(
                 lines.push(format!(
                     "    • KV pool has room ({pct:.0}%), but --max-num-seqs is at the physics ceiling for {m}."
                 ));
-                push_max_model_len_fix_lines(&mut lines, max_model_len, prompt_tokens_mean, "    ");
+                super::push_model_len_shrink_suggestion(
+                    &mut lines,
+                    max_model_len,
+                    snapshot.vllm.prompt_tokens_p99,
+                    snapshot.vllm.generation_tokens_p99,
+                    snapshot.vllm.generation_tokens_completed.unwrap_or(0.0),
+                    "    ",
+                );
             } else {
                 match kv_max_seqs {
                     Some(_) => lines.push(format!(
@@ -213,7 +239,6 @@ pub(super) fn format_concurrency_saturation_issue(
                 "    • KV at {pct:.0}%: scheduler at cap, pool full. No config change helps."
             ));
             lines.push("    • Add a replica to scale out.".to_string());
-            push_max_model_len_fix_lines(&mut lines, max_model_len, prompt_tokens_mean, "    ");
         }
         None => {
             if kv_max_seqs
@@ -225,7 +250,14 @@ pub(super) fn format_concurrency_saturation_issue(
                 lines.push(format!(
                     "    • KV unknown, but --max-num-seqs is at the physics ceiling for {m}."
                 ));
-                push_max_model_len_fix_lines(&mut lines, max_model_len, prompt_tokens_mean, "    ");
+                super::push_model_len_shrink_suggestion(
+                    &mut lines,
+                    max_model_len,
+                    snapshot.vllm.prompt_tokens_p99,
+                    snapshot.vllm.generation_tokens_p99,
+                    snapshot.vllm.generation_tokens_completed.unwrap_or(0.0),
+                    "    ",
+                );
             } else {
                 lines.push(format!(
                     "    • Raise --max-num-seqs above {max_str} if KV cache has headroom"
@@ -244,10 +276,9 @@ pub(super) fn format_concurrency_saturation_window_issue(
     seen_pct: u32,
     max_model_len: Option<u32>,
     kv_max_seqs: Option<u32>,
-    prompt_tokens_mean: Option<f64>,
+    snapshot: &RawSnapshot,
 ) -> Vec<String> {
-    let mut lines =
-        format_concurrency_saturation_issue(d, max_model_len, kv_max_seqs, prompt_tokens_mean);
+    let mut lines = format_concurrency_saturation_issue(d, max_model_len, kv_max_seqs, snapshot);
     lines.insert(1, format!("  Seen in {seen_pct}% of windows"));
     lines
 }
@@ -275,7 +306,7 @@ pub fn r5_recommendation(
             &d,
             max_model_len,
             kv_max_seqs,
-            prompt_tokens_mean,
+            snapshot,
         ),
     })
 }
@@ -370,6 +401,19 @@ mod tests {
         }
     }
 
+    fn blank_snap() -> RawSnapshot {
+        snap(VllmRawMetrics::default())
+    }
+
+    fn model_len_snap(pp: f64, gp: f64, completed: f64) -> RawSnapshot {
+        snap(VllmRawMetrics {
+            prompt_tokens_p99: Some(pp),
+            generation_tokens_p99: Some(gp),
+            generation_tokens_completed: Some(completed),
+            ..Default::default()
+        })
+    }
+
     fn sat_vllm(run: f64, wait: f64, max_num_seqs: Option<u32>) -> VllmRawMetrics {
         VllmRawMetrics {
             num_requests_running: Some(run),
@@ -452,9 +496,13 @@ mod tests {
 
     #[test]
     fn fix_raises_cap_when_kv_below_safe_threshold() {
-        let text =
-            format_concurrency_saturation_issue(&fired_detail(None, Some(70.0)), None, None, None)
-                .join("\n");
+        let text = format_concurrency_saturation_issue(
+            &fired_detail(None, Some(70.0)),
+            None,
+            None,
+            &blank_snap(),
+        )
+        .join("\n");
         assert!(text.contains("ceiling unknown"));
         assert!(!text.contains("pool has room"));
     }
@@ -463,25 +511,44 @@ mod tests {
     fn fix_shows_physics_ceiling_when_kv_low_and_cap_at_ceiling() {
         let mut d = fired_detail(None, Some(8.0));
         d.max_num_seqs = Some(13);
-        let text = format_concurrency_saturation_issue(&d, Some(8192), Some(13), None).join("\n");
-        assert!(text.contains("Lower --max-model-len"));
-        assert!(text.contains("max_model_len=8192"));
+        let text = format_concurrency_saturation_issue(
+            &d,
+            Some(8192),
+            Some(13),
+            &model_len_snap(6000.0, 450.0, 150.0),
+        )
+        .join("\n");
+        assert!(text.contains("physics ceiling for max_model_len=8192"));
+        assert!(text.contains("to ~6450"));
+        assert!(text.contains("Truncation risk"));
+        assert!(!text.contains("free KV blocks"));
     }
 
     #[test]
     fn fix_scales_out_when_kv_at_or_above_safe_threshold() {
-        let text =
-            format_concurrency_saturation_issue(&fired_detail(None, Some(85.0)), None, None, None)
-                .join("\n");
+        let text = format_concurrency_saturation_issue(
+            &fired_detail(None, Some(85.0)),
+            Some(8192),
+            None,
+            &blank_snap(),
+        )
+        .join("\n");
         assert!(text.contains("KV at 85%"));
         assert!(text.contains("No config change helps"));
         assert!(text.contains("Add a replica to scale out"));
+        assert!(!text.contains("free KV blocks"));
+        assert!(!text.contains("Warning: Truncation risk!"));
     }
 
     #[test]
     fn fix_generic_when_kv_usage_unknown() {
-        let text = format_concurrency_saturation_issue(&fired_detail(None, None), None, None, None)
-            .join("\n");
+        let text = format_concurrency_saturation_issue(
+            &fired_detail(None, None),
+            None,
+            None,
+            &blank_snap(),
+        )
+        .join("\n");
         assert!(text.contains("if KV cache has headroom"));
         assert!(!text.contains("Add a replica"));
     }
@@ -492,7 +559,7 @@ mod tests {
             &fired_detail(Some(5000.0), Some(70.0)),
             None,
             None,
-            None,
+            &blank_snap(),
         )
         .join("\n");
         assert!(text.contains("Confidence: High"));
@@ -504,13 +571,17 @@ mod tests {
             &fired_detail(Some(5000.0), None),
             None,
             None,
-            None,
+            &blank_snap(),
         )
         .join("\n");
         assert!(text.contains("Confidence: Medium"));
-        let text2 =
-            format_concurrency_saturation_issue(&fired_detail(None, Some(70.0)), None, None, None)
-                .join("\n");
+        let text2 = format_concurrency_saturation_issue(
+            &fired_detail(None, Some(70.0)),
+            None,
+            None,
+            &blank_snap(),
+        )
+        .join("\n");
         assert!(text2.contains("Confidence: Medium"));
     }
 
@@ -520,10 +591,30 @@ mod tests {
             &fired_detail(None, Some(85.0)),
             Some(8192),
             None,
-            None,
+            &blank_snap(),
         )
         .join("\n");
-        assert!(text.contains("--max-model-len (currently 8192)"));
+        assert!(text.contains("Add a replica to scale out"));
+        assert!(!text.contains("--max-model-len"));
+    }
+
+    #[test]
+    fn cause_waiting_line_shows_wait_and_run_explicitly() {
+        let mut d = fired_detail(None, None);
+        d.max_num_seqs = Some(13);
+        d.requests_running = 13.0;
+        d.requests_waiting = 237.0;
+        d.queue_ratio = 237.0 / 250.0;
+        let s = snap(VllmRawMetrics {
+            num_requests_running: Some(13.0),
+            num_requests_waiting: Some(237.0),
+            max_num_seqs: Some(13),
+            ..Default::default()
+        });
+        let text = format_concurrency_saturation_issue(&d, None, None, &s).join("\n");
+        assert!(text.contains("237 waiting, 13 running"));
+        assert!(!text.contains("of 13 active"));
+        assert!(!text.contains("of 250 active"));
     }
 
     #[test]
@@ -532,33 +623,79 @@ mod tests {
             &fired_detail(Some(5000.0), None),
             None,
             None,
-            None,
+            &blank_snap(),
         )
         .join("\n");
         assert!(text.contains("TTFT 5.0s"));
     }
 
     #[test]
-    fn cause_shows_ttft_p99_primary_when_both_available() {
+    fn cause_falls_back_to_ttft_p99_when_snapshot_has_no_p95() {
         let mut d = fired_detail(Some(5000.0), None);
         d.ttft_p99_ms = Some(12400.0);
-        let text = format_concurrency_saturation_issue(&d, None, None, None).join("\n");
-        assert!(text.contains("TTFT 12.4s p99 (5.0s avg)"));
+        let text = format_concurrency_saturation_issue(&d, None, None, &blank_snap()).join("\n");
+        // snapshot has no p95 → falls back to d.ttft_p99_ms
+        assert!(text.contains("TTFT (p99 12.4s) (5.0s avg)"));
+    }
+
+    #[test]
+    fn cause_shows_snapshot_p95_over_d_ttft_p99() {
+        let mut d = fired_detail(None, None);
+        d.ttft_p99_ms = Some(12400.0); // aggregate: 12.4s p99
+        let s = snap(VllmRawMetrics {
+            ttft_p95_ms: Some(9500.0), // snapshot: 9.5s p95
+            ttft_ms: Some(5000.0),     // snapshot avg: 5.0s
+            ..Default::default()
+        });
+        let text = format_concurrency_saturation_issue(&d, None, None, &s).join("\n");
+        assert!(
+            text.contains("TTFT (p95 9.5s)"),
+            "snapshot p95 must win over d.ttft_p99"
+        );
+        assert!(
+            !text.contains("12.4s"),
+            "d.ttft_p99 must not appear when snapshot has p95"
+        );
+    }
+
+    #[test]
+    fn fix_uses_snapshot_kv_not_aggregate_peak() {
+        // d has KV 85% (>= safe threshold) → would say "Add a replica"
+        // snapshot has KV 70% (< safe threshold) → snapshot wins, should say "Raise --max-num-seqs"
+        let d = fired_detail(None, Some(85.0));
+        let s = snap(VllmRawMetrics {
+            kv_cache_usage_perc: Some(70.0),
+            ..Default::default()
+        });
+        let text = format_concurrency_saturation_issue(&d, None, None, &s).join("\n");
+        assert!(
+            text.contains("Raise --max-num-seqs"),
+            "snapshot KV (70%) should flip fix to raise cap"
+        );
+        assert!(
+            !text.contains("Add a replica"),
+            "aggregate KV (85%) must not override snapshot"
+        );
     }
 
     #[test]
     fn cause_shows_ttft_p99_only_when_mean_missing() {
         let mut d = fired_detail(None, None);
         d.ttft_p99_ms = Some(12400.0);
-        let text = format_concurrency_saturation_issue(&d, None, None, None).join("\n");
-        assert!(text.contains("TTFT 12.4s p99"));
+        let text = format_concurrency_saturation_issue(&d, None, None, &blank_snap()).join("\n");
+        assert!(text.contains("TTFT (p99 12.4s)"));
         assert!(!text.contains("avg"));
     }
 
     #[test]
     fn cause_omits_ttft_when_none() {
-        let text = format_concurrency_saturation_issue(&fired_detail(None, None), None, None, None)
-            .join("\n");
+        let text = format_concurrency_saturation_issue(
+            &fired_detail(None, None),
+            None,
+            None,
+            &blank_snap(),
+        )
+        .join("\n");
         assert!(!text.contains("requests queued ahead"));
     }
 
@@ -614,7 +751,7 @@ mod tests {
 
     #[test]
     fn aggregate_r5_kv_falls_back_to_r5_detail_peak_without_session_context() {
-        // Peak (not average) — a spike must block a "safe to raise" recommendation
+        // Peak (not average); a spike must block a "safe to raise" recommendation
         // even if KV drained by end of session.
         let d1 = fired_detail(None, Some(60.0));
         let d2 = fired_detail(None, Some(95.0));
@@ -638,7 +775,7 @@ mod tests {
             40,
             None,
             None,
-            None,
+            &blank_snap(),
         );
         assert_eq!(lines[1], "  Seen in 40% of windows");
     }
@@ -765,29 +902,32 @@ mod tests {
     }
 
     #[test]
-    fn max_model_len_fix_line_warns_truncation_when_prompts_fill_window() {
+    fn ceiling_path_shows_shrink_suggestion_with_truncation_warning() {
+        let mut d = fired_detail(None, Some(50.0));
+        d.max_num_seqs = Some(15);
         let text = format_concurrency_saturation_issue(
-            &fired_detail(None, Some(85.0)),
-            Some(4096),
-            None,
-            Some(3900.0),
+            &d,
+            Some(8192),
+            Some(15),
+            &model_len_snap(6000.0, 450.0, 150.0),
         )
         .join("\n");
-        assert!(text.contains("truncation risk"));
-        assert!(text.contains("prompts avg ~3900 tok"));
-        assert!(text.contains("Prefer adding a replica"));
+        assert!(text.contains("physics ceiling for max_model_len=8192"));
+        assert!(text.contains("to ~6450"));
+        assert!(text.contains("Truncation risk"));
     }
 
     #[test]
-    fn max_model_len_fix_line_suggests_free_kv_when_prompts_below_threshold() {
+    fn scale_out_path_omits_max_model_len_shrink() {
         let text = format_concurrency_saturation_issue(
             &fired_detail(None, Some(85.0)),
             Some(4096),
             None,
-            Some(2000.0),
+            &blank_snap(),
         )
         .join("\n");
-        assert!(text.contains("free KV blocks"));
+        assert!(text.contains("Add a replica to scale out"));
         assert!(!text.contains("truncation risk"));
+        assert!(!text.contains("free KV blocks"));
     }
 }

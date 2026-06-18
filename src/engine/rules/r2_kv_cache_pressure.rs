@@ -1,6 +1,6 @@
 use crate::collectors::RawSnapshot;
 
-use super::{model_len_suffix, skew_secs, Recommendation, MAX_OBSERVATION_SKEW_SECS};
+use super::{skew_secs, Recommendation, MAX_OBSERVATION_SKEW_SECS};
 
 /// 88% matches observed vLLM production eviction onset; 85% was too conservative.
 const KV_CACHE_PRESSURE_MIN_PERC: f64 = 88.0;
@@ -24,16 +24,23 @@ const FP8_KV_CACHE_FIX: &str = "    • Switch --kv-cache-dtype fp8 to halve KV 
 
 static NVCC_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
-fn fp8_kv_cache_fix_bullet() -> String {
+fn fp8_kv_cache_fix_bullet(kv_cache_dtype: Option<&str>) -> Option<String> {
+    // Already fp8 — don't suggest what's already applied
+    if kv_cache_dtype.is_some_and(|d| {
+        let d = d.trim().to_ascii_lowercase();
+        d.contains("fp8") || d.contains("e4m3") || d.contains("e5m2")
+    }) {
+        return None;
+    }
     // --kv-cache-dtype fp8 stores KV activations in fp8 via software cast — works on all GPUs
     // including A100. This is distinct from --quantization fp8 (weight quantization) which
     // requires native FP8 hardware and crashes on A100/Qwen3.6.
     let nvcc_present = *NVCC_AVAILABLE.get_or_init(|| std::path::Path::new(NVCC_PATH).exists());
-    if nvcc_present {
+    Some(if nvcc_present {
         FP8_KV_CACHE_FIX.to_string()
     } else {
         format!("{FP8_KV_CACHE_FIX} (requires nvcc)")
-    }
+    })
 }
 
 fn kv_headroom_gpu_mem_bullet(kv_headroom_gb: Option<f64>) -> String {
@@ -236,12 +243,14 @@ pub fn r2_recommendation(
         expected_impact: "Reduced KV evictions and lower latency variance".to_string(),
         display_lines: format_kv_cache_pressure_fired(
             &d,
-            snapshot,
+            &KvFormatCtx {
+                snapshot,
+                max_model_len,
+                kv_headroom_gb,
+                kv_max_seqs,
+            },
             windows_fired,
             total_evaluable,
-            max_model_len,
-            kv_headroom_gb,
-            kv_max_seqs,
         ),
     })
 }
@@ -322,15 +331,26 @@ fn max_num_seqs_bullet(
     }
 }
 
+pub(super) struct KvFormatCtx<'a> {
+    pub snapshot: &'a RawSnapshot,
+    pub max_model_len: Option<u32>,
+    pub kv_headroom_gb: Option<f64>,
+    pub kv_max_seqs: Option<u32>,
+}
+
 pub(super) fn format_kv_cache_pressure_fired(
     d: &KvCachePressureDetail,
-    snapshot: &RawSnapshot,
+    ctx: &KvFormatCtx<'_>,
     windows_fired: usize,
     total_evaluable: usize,
-    max_model_len: Option<u32>,
-    kv_headroom_gb: Option<f64>,
-    kv_max_seqs: Option<u32>,
 ) -> Vec<String> {
+    let KvFormatCtx {
+        snapshot,
+        max_model_len,
+        kv_headroom_gb,
+        kv_max_seqs,
+    } = *ctx;
+    let kv_cache_dtype = snapshot.vllm.cache_config.cache_dtype.as_deref();
     let peak = snapshot
         .vllm
         .kv_cache_peak_perc
@@ -355,10 +375,6 @@ pub(super) fn format_kv_cache_pressure_fired(
     }
     out.push(String::new());
     out.push("  Fix:".to_string());
-    let model_len_bullet = format!(
-        "    • Lower --max-model-len{} to shrink per-sequence KV footprint",
-        model_len_suffix(max_model_len)
-    );
     if d.preemptions_active {
         out.push(max_num_seqs_bullet(kv_max_seqs, max_model_len, true));
         if let Some(bullet) = prefix_caching_fix_bullet(snapshot) {
@@ -370,15 +386,36 @@ pub(super) fn format_kv_cache_pressure_fired(
                     .to_string(),
             );
         }
-        out.push(fp8_kv_cache_fix_bullet());
+        if let Some(bullet) = fp8_kv_cache_fix_bullet(kv_cache_dtype) {
+            out.push(bullet);
+        }
+        let total_count = snapshot.vllm.generation_tokens_completed.unwrap_or(0.0);
+        super::push_model_len_shrink_suggestion(
+            &mut out,
+            max_model_len,
+            snapshot.vllm.prompt_tokens_p99,
+            snapshot.vllm.generation_tokens_p99,
+            total_count,
+            "    ",
+        );
     } else {
         out.push(max_num_seqs_bullet(kv_max_seqs, max_model_len, false));
         out.push(kv_headroom_gpu_mem_bullet(kv_headroom_gb));
-        out.push(model_len_bullet);
         if let Some(bullet) = prefix_caching_fix_bullet(snapshot) {
             out.push(bullet);
         }
-        out.push(fp8_kv_cache_fix_bullet());
+        if let Some(bullet) = fp8_kv_cache_fix_bullet(kv_cache_dtype) {
+            out.push(bullet);
+        }
+        let total_count = snapshot.vllm.generation_tokens_completed.unwrap_or(0.0);
+        super::push_model_len_shrink_suggestion(
+            &mut out,
+            max_model_len,
+            snapshot.vllm.prompt_tokens_p99,
+            snapshot.vllm.generation_tokens_p99,
+            total_count,
+            "    ",
+        );
     }
     let expected = if d.preemptions_active {
         "  Expected: TTFT and TPOT recover once evictions stop."
@@ -399,13 +436,11 @@ pub(super) fn format_kv_admission_backlog_issue(
     seen_pct: u32,
     max_model_len: Option<u32>,
     kv_headroom_gb: Option<f64>,
+    snapshot: &RawSnapshot,
     windows_fired: usize,
     total_evaluable: usize,
 ) -> Vec<String> {
-    let model_len_bullet = format!(
-        "    • Lower --max-model-len{} if your workload allows shorter context",
-        model_len_suffix(max_model_len)
-    );
+    let kv_cache_dtype = snapshot.vllm.cache_config.cache_dtype.as_deref();
     let gpu_mem_bullet = kv_headroom_gpu_mem_bullet(kv_headroom_gb);
     let mut out = vec![
         "[!] KV Cache Pressure: Admission Backlog".to_string(),
@@ -424,8 +459,18 @@ pub(super) fn format_kv_admission_backlog_issue(
         "  Fix:".to_string(),
         gpu_mem_bullet,
     ];
-    out.push(fp8_kv_cache_fix_bullet());
-    out.push(model_len_bullet);
+    if let Some(bullet) = fp8_kv_cache_fix_bullet(kv_cache_dtype) {
+        out.push(bullet);
+    }
+    let total_count = snapshot.vllm.generation_tokens_completed.unwrap_or(0.0);
+    super::push_model_len_shrink_suggestion(
+        &mut out,
+        max_model_len,
+        snapshot.vllm.prompt_tokens_p99,
+        snapshot.vllm.generation_tokens_p99,
+        total_count,
+        "    ",
+    );
     out.push(String::new());
     out.push("  Expected: Wait queue drains, TTFT recovers.".to_string());
     if super::rule_is_significant(windows_fired, total_evaluable) {
@@ -459,29 +504,14 @@ pub(super) fn aggregate_backlog_detail(
     }
 }
 
-pub(super) struct KvPressureFormatOpts {
-    pub max_model_len: Option<u32>,
-    pub kv_headroom_gb: Option<f64>,
-    pub kv_max_seqs: Option<u32>,
-}
-
 pub(super) fn format_kv_cache_window_issue(
     d: &KvCachePressureDetail,
     seen_pct: u32,
-    snapshot: &RawSnapshot,
+    ctx: &KvFormatCtx<'_>,
     windows_fired: usize,
     total_evaluable: usize,
-    opts: KvPressureFormatOpts,
 ) -> Vec<String> {
-    let mut lines = format_kv_cache_pressure_fired(
-        d,
-        snapshot,
-        windows_fired,
-        total_evaluable,
-        opts.max_model_len,
-        opts.kv_headroom_gb,
-        opts.kv_max_seqs,
-    );
+    let mut lines = format_kv_cache_pressure_fired(d, ctx, windows_fired, total_evaluable);
     lines.insert(1, format!("  Seen in {seen_pct}% of windows"));
     lines
 }
@@ -522,6 +552,20 @@ mod tests {
             timestamp: SystemTime::UNIX_EPOCH,
             vllm,
             gpu: GpuRawMetrics::default(),
+        }
+    }
+
+    fn kv_ctx<'a>(
+        snapshot: &'a RawSnapshot,
+        max_model_len: Option<u32>,
+        kv_headroom_gb: Option<f64>,
+        kv_max_seqs: Option<u32>,
+    ) -> KvFormatCtx<'a> {
+        KvFormatCtx {
+            snapshot,
+            max_model_len,
+            kv_headroom_gb,
+            kv_max_seqs,
         }
     }
 
@@ -666,20 +710,22 @@ mod tests {
             kv_cache_usage_perc: Some(90.0),
             ..Default::default()
         };
+        let s = snap(v.clone());
         let single = format_kv_cache_pressure_fired(
             &detail(90.0, true),
-            &snap(v.clone()),
+            &kv_ctx(&s, None, None, None),
             1,
             1,
-            None,
-            None,
-            None,
         )
         .join("\n");
         assert!(!single.contains("Confidence:"));
-        let stable =
-            format_kv_cache_pressure_fired(&detail(90.0, true), &snap(v), 3, 4, None, None, None)
-                .join("\n");
+        let stable = format_kv_cache_pressure_fired(
+            &detail(90.0, true),
+            &kv_ctx(&snap(v), None, None, None),
+            3,
+            4,
+        )
+        .join("\n");
         assert!(stable.contains("Confidence: Medium-High"));
     }
 
@@ -839,6 +885,9 @@ mod tests {
         let v = VllmRawMetrics {
             kv_cache_usage_perc: Some(90.0),
             num_requests_waiting: Some(5.0),
+            prompt_tokens_p99: Some(6000.0),
+            generation_tokens_p99: Some(450.0),
+            generation_tokens_completed: Some(150.0),
             ..Default::default()
         };
         let d = KvCachePressureDetail {
@@ -848,8 +897,31 @@ mod tests {
             queue_backpressure: true,
         };
         let text =
-            format_kv_cache_pressure_fired(&d, &snap(v), 3, 4, Some(4096), None, None).join("\n");
-        assert!(text.contains("--max-model-len (currently 4096)"));
+            format_kv_cache_pressure_fired(&d, &kv_ctx(&snap(v), Some(8192), None, None), 3, 4)
+                .join("\n");
+        assert!(text.contains("to ~6450"));
+        assert!(text.contains("Truncation risk"));
+    }
+
+    #[test]
+    fn shrink_suggestion_uses_p99_sum_when_count_sufficient() {
+        let v = VllmRawMetrics {
+            kv_cache_usage_perc: Some(90.0),
+            num_preemptions_per_sec: Some(0.05),
+            prompt_tokens_p99: Some(6000.0),
+            generation_tokens_p99: Some(450.0),
+            generation_tokens_completed: Some(150.0),
+            ..Default::default()
+        };
+        let text = format_kv_cache_pressure_fired(
+            &detail(90.0, true),
+            &kv_ctx(&snap(v), Some(8192), None, None),
+            3,
+            4,
+        )
+        .join("\n");
+        assert!(text.contains("to ~6450"));
+        assert!(text.contains("Truncation risk"));
     }
 
     #[test]
@@ -861,12 +933,9 @@ mod tests {
         };
         let text = format_kv_cache_pressure_fired(
             &detail(90.0, true),
-            &snap(v),
+            &kv_ctx(&snap(v), None, None, None),
             3,
             4,
-            Some(4096),
-            None,
-            None,
         )
         .join("\n");
         assert!(!text.contains("--max-model-len"));
@@ -881,12 +950,9 @@ mod tests {
         };
         let text = format_kv_cache_pressure_fired(
             &detail(90.0, true),
-            &snap(v),
+            &kv_ctx(&snap(v), Some(4096), None, Some(16)),
             3,
             4,
-            Some(4096),
-            None,
-            Some(16),
         )
         .join("\n");
         assert!(
@@ -912,35 +978,96 @@ mod tests {
 
     #[test]
     fn backlog_shows_headroom_when_safe() {
-        let text =
-            format_kv_admission_backlog_issue(&sample_backlog_detail(), 27, None, Some(30.0), 3, 4)
-                .join("\n");
+        let text = format_kv_admission_backlog_issue(
+            &sample_backlog_detail(),
+            27,
+            None,
+            Some(30.0),
+            &snap(VllmRawMetrics::default()),
+            3,
+            4,
+        )
+        .join("\n");
         assert!(text.contains("check vRAM header for avail mem"));
     }
 
     #[test]
     fn backlog_warns_when_vram_full() {
-        let text =
-            format_kv_admission_backlog_issue(&sample_backlog_detail(), 27, None, Some(1.0), 3, 4)
-                .join("\n");
+        let text = format_kv_admission_backlog_issue(
+            &sample_backlog_detail(),
+            27,
+            None,
+            Some(1.0),
+            &snap(VllmRawMetrics::default()),
+            3,
+            4,
+        )
+        .join("\n");
         assert!(text.contains("GPU at VRAM capacity"));
     }
 
     #[test]
     fn backlog_generic_when_headroom_unknown() {
-        let text =
-            format_kv_admission_backlog_issue(&sample_backlog_detail(), 27, None, None, 3, 4)
-                .join("\n");
+        let text = format_kv_admission_backlog_issue(
+            &sample_backlog_detail(),
+            27,
+            None,
+            None,
+            &snap(VllmRawMetrics::default()),
+            3,
+            4,
+        )
+        .join("\n");
         assert!(text.contains("check vRAM header for avail mem"));
     }
 
     #[test]
     fn backlog_omits_confidence_until_significant() {
         let d = sample_backlog_detail();
-        let single = format_kv_admission_backlog_issue(&d, 27, None, Some(30.0), 1, 1).join("\n");
+        let single = format_kv_admission_backlog_issue(
+            &d,
+            27,
+            None,
+            Some(30.0),
+            &snap(VllmRawMetrics::default()),
+            1,
+            1,
+        )
+        .join("\n");
         assert!(!single.contains("Confidence:"));
-        let stable = format_kv_admission_backlog_issue(&d, 27, None, Some(30.0), 3, 4).join("\n");
+        let stable = format_kv_admission_backlog_issue(
+            &d,
+            27,
+            None,
+            Some(30.0),
+            &snap(VllmRawMetrics::default()),
+            3,
+            4,
+        )
+        .join("\n");
         assert!(stable.contains("Confidence: Medium-High"));
+    }
+
+    #[test]
+    fn admission_backlog_shows_shrink_suggestion_when_p99_known() {
+        let v = VllmRawMetrics {
+            prompt_tokens_p99: Some(6000.0),
+            generation_tokens_p99: Some(450.0),
+            generation_tokens_completed: Some(150.0),
+            ..Default::default()
+        };
+        let lines = format_kv_admission_backlog_issue(
+            &sample_backlog_detail(),
+            27,
+            Some(8192),
+            Some(30.0),
+            &snap(v),
+            3,
+            4,
+        )
+        .join("\n");
+        assert!(lines.contains("to ~6450"));
+        assert!(lines.contains("Truncation risk"));
     }
 
     #[test]
@@ -956,7 +1083,8 @@ mod tests {
             num_requests_waiting: Some(5.0),
             ..Default::default()
         };
-        let text = format_kv_cache_pressure_fired(&d, &snap(v), 1, 1, None, None, None).join("\n");
+        let text = format_kv_cache_pressure_fired(&d, &kv_ctx(&snap(v), None, None, None), 1, 1)
+            .join("\n");
         assert!(text.contains("Wait queue drains"));
         assert!(!text.contains("evictions stop"));
     }
@@ -975,7 +1103,8 @@ mod tests {
             num_requests_waiting: Some(5.0),
             ..Default::default()
         };
-        let text = format_kv_cache_pressure_fired(&d, &snap(v), 1, 1, None, None, None).join("\n");
+        let text = format_kv_cache_pressure_fired(&d, &kv_ctx(&snap(v), None, None, None), 1, 1)
+            .join("\n");
         assert!(text.contains("Lower --max-num-seqs to free KV blocks"));
     }
 
@@ -993,7 +1122,8 @@ mod tests {
             ..Default::default()
         };
         let text =
-            format_kv_cache_pressure_fired(&d, &snap(v), 1, 1, None, Some(1.0), None).join("\n");
+            format_kv_cache_pressure_fired(&d, &kv_ctx(&snap(v), None, Some(1.0), None), 1, 1)
+                .join("\n");
         assert!(text.contains("GPU at VRAM capacity"));
         assert!(!text.contains("30GB VRAM available"));
     }
@@ -1007,12 +1137,9 @@ mod tests {
         };
         let text = format_kv_cache_pressure_fired(
             &detail(90.0, true),
-            &snap(v),
+            &kv_ctx(&snap(v), None, Some(30.0), None),
             1,
             1,
-            None,
-            Some(30.0),
-            None,
         )
         .join("\n");
         assert!(text.contains(
@@ -1033,7 +1160,8 @@ mod tests {
             num_requests_waiting: Some(5.0),
             ..Default::default()
         };
-        let text = format_kv_cache_pressure_fired(&d, &snap(v), 1, 1, None, None, None).join("\n");
+        let text = format_kv_cache_pressure_fired(&d, &kv_ctx(&snap(v), None, None, None), 1, 1)
+            .join("\n");
         assert!(text.contains(
             "Raise --gpu-memory-utilization (check vRAM header for avail mem) to expand KV pool"
         ));
@@ -1052,25 +1180,39 @@ mod tests {
             },
             ..Default::default()
         };
-        let with_bullet =
-            format_kv_cache_pressure_fired(&d, &snap(v_long.clone()), 1, 1, None, None, None)
-                .join("\n");
+        let with_bullet = format_kv_cache_pressure_fired(
+            &d,
+            &kv_ctx(&snap(v_long.clone()), None, None, None),
+            1,
+            1,
+        )
+        .join("\n");
         assert!(with_bullet.contains("Enable --enable-prefix-caching"));
 
         v_long.prompt_tokens_mean = Some(150.0);
         let without_bullet =
-            format_kv_cache_pressure_fired(&d, &snap(v_long), 1, 1, None, None, None).join("\n");
+            format_kv_cache_pressure_fired(&d, &kv_ctx(&snap(v_long), None, None, None), 1, 1)
+                .join("\n");
         assert!(!without_bullet.contains("Enable --enable-prefix-caching"));
     }
 
     #[test]
     fn fp8_kv_cache_bullet_reflects_nvcc_availability() {
-        let bullet = fp8_kv_cache_fix_bullet();
+        let bullet = fp8_kv_cache_fix_bullet(None).expect("bf16/auto should suggest fp8");
         assert!(bullet.contains("Switch --kv-cache-dtype fp8"));
         if std::path::Path::new(NVCC_PATH).exists() {
             assert!(!bullet.contains("requires nvcc"));
         } else {
             assert!(bullet.contains("(requires nvcc)"));
         }
+    }
+
+    #[test]
+    fn fp8_kv_cache_bullet_suppressed_when_already_fp8() {
+        assert!(fp8_kv_cache_fix_bullet(Some("fp8")).is_none());
+        assert!(fp8_kv_cache_fix_bullet(Some("FP8")).is_none());
+        assert!(fp8_kv_cache_fix_bullet(Some("e4m3fnuz")).is_none());
+        assert!(fp8_kv_cache_fix_bullet(Some("e5m2")).is_none());
+        assert!(fp8_kv_cache_fix_bullet(Some("auto")).is_some());
     }
 }
