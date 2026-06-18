@@ -1363,7 +1363,8 @@ mod tests {
         assert!(text.contains("threshold: < 25%"));
         assert!(text.contains("  Cause:"));
         assert!(text.contains("under-fed by client"));
-        assert!(text.contains("    • Increase client concurrency (251 slots idle)"));
+        assert!(text
+            .contains("    • Batch more requests or increase client concurrency (251 slots idle)"));
         assert!(text.contains("Expected: Higher throughput, stable TPOT."));
         assert!(
             text.contains("Confidence: High") || text.contains("Confidence: Medium"),
@@ -2115,7 +2116,9 @@ mod tests {
         assert!(text.contains("Efficiency"));
         assert!(text.contains("threshold: < 60%"));
         assert!(text.contains("  Cause:"));
-        assert!(text.contains("Increase client concurrency"));
+        assert!(
+            text.contains("Batch more requests or increase client concurrency (214 slots idle)")
+        );
         assert!(!text.contains("KV cache pressure: not triggered"));
         assert!(!text.contains("Low prefix reuse: not triggered"));
         assert!(!text.contains("Concurrency saturation: not triggered"));

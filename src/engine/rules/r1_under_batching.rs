@@ -203,7 +203,9 @@ pub(super) fn format_under_batching_fired(d: &UnderBatchingDetail, confidence: f
     let fix_line = match d.max_num_seqs {
         Some(max_n) => {
             let idle = (f64::from(max_n) - d.running).max(0.0);
-            format!("    • Batch more requests or increase client concurrency ({idle:.0} slots idle)")
+            format!(
+                "    • Batch more requests or increase client concurrency ({idle:.0} slots idle)"
+            )
         }
         None => "    • Increase client concurrency".to_string(),
     };
@@ -524,7 +526,10 @@ mod tests {
     fn short_action_is_raise_client_concurrency() {
         let s = entry_fired_snap();
         let r = r1_recommendation(&s, None, None).expect("fired");
-        assert_eq!(r.short_action, "batch more requests or increase client concurrency (251 slots idle)");
+        assert_eq!(
+            r.short_action,
+            "batch more requests or increase client concurrency (251 slots idle)"
+        );
     }
 
     #[test]
@@ -532,7 +537,8 @@ mod tests {
         let s = entry_fired_snap();
         let r = r1_recommendation(&s, None, None).expect("fired");
         let text = r.display_lines.join("\n");
-        assert!(text.contains("    • Batch more requests or increase client concurrency (251 slots idle)"));
+        assert!(text
+            .contains("    • Batch more requests or increase client concurrency (251 slots idle)"));
         assert!(!text.contains("hardware limit"));
         assert!(!text.contains("KV ceiling"));
     }
