@@ -7,7 +7,6 @@ use crate::collectors::{GpuRawMetrics, VllmConfig, VllmRawMetrics};
 use crate::context::AnalysisInput;
 use crate::engine;
 use crate::fmt::fmt_seconds_from_ms;
-use crate::profiler::delta::{Delta, Direction};
 use crate::profiler::DiagnoseResult;
 
 const VLLM_LABEL_W: usize = 10;
@@ -31,30 +30,6 @@ fn show_vram_peak_parenthetical(used_mb: u64, peak_mb: u64, total_mb: u64) -> bo
 #[inline]
 fn show_gpu_temp_peak_parenthetical(current_c: f64, peak_c: f64) -> bool {
     peak_c > current_c && peak_c >= GPU_TEMP_PEAK_SHOW_THRESHOLD_C
-}
-
-fn direction_label(direction: Direction) -> &'static str {
-    match direction {
-        Direction::Better => "Better",
-        Direction::Worse => "Worse",
-        Direction::Mixed => "Mixed",
-        Direction::NoChange => "No change",
-    }
-}
-
-/// Raw signal values and which path fired, for closed-loop delta output.
-pub fn format_direction_line(d: &Delta) -> String {
-    match d.direction {
-        Direction::Mixed => {
-            let reason = d.direction_reason.unwrap_or("mixed signals");
-            format!("Result: Mixed   {reason}")
-        }
-        other => format!("Result: {}", direction_label(other)),
-    }
-}
-
-pub fn print_direction_line(d: &Delta) {
-    println!("{}", format_direction_line(d));
 }
 
 pub fn print_diagnose_table(result: &DiagnoseResult, verbose_rules: bool) {
@@ -83,7 +58,9 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
     // Build AnalysisInput from the aggregate snapshot for baseline + single-window rule evaluation.
     let aggregate_win = crate::context::RuntimeWindow::from_snapshot(result.snapshot.clone());
     let summary_input = AnalysisInput::new(&result.static_ctx, &aggregate_win);
-    let report = engine::build_report(summary_input);
+    let aggregated_prefix_hit_rate =
+        engine::aggregate_prefix_hit_rate_for_diagnose(&result.windows);
+    let report = engine::build_report_for_diagnose(&result.windows, summary_input);
     if verbose_rules {
         lines.push(String::new());
         lines.extend(baseline_lines(
@@ -140,7 +117,7 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
     ));
     lines.push(vllm_label_row(
         "CACHE",
-        &vllm_prompt_value(v, verbose_rules),
+        &vllm_prompt_value(v, verbose_rules, aggregated_prefix_hit_rate),
     ));
     lines.push(vllm_label_row("THROUGHPUT", &vllm_throughput_value(v)));
     lines.push(vllm_label_row("TRAFFIC", &vllm_traffic_value(v)));
@@ -210,6 +187,19 @@ fn duration_short(duration: Duration) -> String {
     }
 }
 
+fn weight_dtype_display(source: engine::WeightDtypeSource, weight_gb: f64) -> String {
+    let suffix = match source {
+        engine::WeightDtypeSource::VllmInfoQuantization => "vLLM /info (quant)",
+        engine::WeightDtypeSource::EnvVarQuantization => "env (quant)",
+        engine::WeightDtypeSource::VllmConfig => "vLLM",
+        engine::WeightDtypeSource::VllmInfoEndpoint => "vLLM /info",
+        engine::WeightDtypeSource::EnvVar => "env",
+        engine::WeightDtypeSource::Catalog => "catalog",
+        engine::WeightDtypeSource::Fallback => "assumed bf16",
+    };
+    format!("weight {:.0}GB ({})", weight_gb, suffix)
+}
+
 fn baseline_lines(
     baseline: Option<engine::PhysicsBaseline>,
     num_requests_running: Option<f64>,
@@ -237,7 +227,7 @@ fn baseline_lines(
 
     // Line 2: memory budget + latency floors
     let mut seg2 = Vec::new();
-    seg2.push(format!("weight {:.0}GB", b.weight_gb));
+    seg2.push(weight_dtype_display(b.weight_dtype_source, b.weight_gb));
     if let Some(blocks) = num_gpu_blocks {
         seg2.push(format!("kv_blocks {blocks}"));
     } else if let Some(headroom) = b.kv_headroom_gb {
@@ -261,7 +251,10 @@ fn baseline_lines(
         format!("           {}", seg2.join(" | ")),
     ];
     if b.weight_dtype_source == engine::WeightDtypeSource::Fallback {
-        out.push("           weight dtype assumed bf16. Set DTYPE env var to confirm".to_string());
+        out.push(
+            "           weight dtype assumed bf16. Confirm via vLLM metrics or DTYPE env var"
+                .to_string(),
+        );
     }
     out
 }
@@ -414,16 +407,16 @@ fn vllm_latency_value(v: &VllmRawMetrics, verbose: bool) -> String {
         .tpot_ms
         .map(fmt_seconds_from_ms)
         .unwrap_or_else(|| "—".to_string());
-    let ttft_p99 = v
-        .ttft_p99_ms
-        .map(|p| format!(" (p99 {})", fmt_seconds_from_ms(p)))
+    let ttft_p95 = v
+        .ttft_p95_ms
+        .map(|p| format!(" (p95 {})", fmt_seconds_from_ms(p)))
         .unwrap_or_default();
-    let tpot_p99 = v
-        .tpot_p99_ms
-        .map(|p| format!(" (p99 {})", fmt_seconds_from_ms(p)))
+    let tpot_p95 = v
+        .tpot_p95_ms
+        .map(|p| format!(" (p95 {})", fmt_seconds_from_ms(p)))
         .unwrap_or_default();
     if !verbose {
-        return format!("ttft {ttft}{ttft_p99} | tpot {tpot}{tpot_p99}");
+        return format!("ttft {ttft}{ttft_p95} | tpot {tpot}{tpot_p95}");
     }
     let prefill = v
         .prefill_latency_ms
@@ -433,7 +426,7 @@ fn vllm_latency_value(v: &VllmRawMetrics, verbose: bool) -> String {
         .queue_delay_ms
         .map(fmt_seconds_from_ms)
         .unwrap_or_else(|| "—".to_string());
-    format!("ttft {ttft}{ttft_p99} | tpot {tpot}{tpot_p99} | prefill {prefill} | queue {queue}")
+    format!("ttft {ttft}{ttft_p95} | tpot {tpot}{tpot_p95} | prefill {prefill} | queue {queue}")
 }
 
 fn vllm_prompt_kv_fragment(v: &VllmRawMetrics) -> String {
@@ -451,9 +444,9 @@ fn vllm_prompt_kv_fragment(v: &VllmRawMetrics) -> String {
     }
 }
 
-fn vllm_prompt_value(v: &VllmRawMetrics, verbose: bool) -> String {
+fn vllm_prompt_value(v: &VllmRawMetrics, verbose: bool, prefix_hit_rate: Option<f64>) -> String {
     let kv = vllm_prompt_kv_fragment(v);
-    let cache = cache_use_fragment(v);
+    let cache = cache_use_fragment(prefix_hit_rate);
     if !verbose {
         return format!("{kv} | {cache}");
     }
@@ -478,8 +471,8 @@ fn vllm_throughput_value(v: &VllmRawMetrics) -> String {
         .unwrap_or_else(|| "— tok/s".to_string())
 }
 
-fn cache_use_fragment(v: &VllmRawMetrics) -> String {
-    match v.prefix_cache_hit_rate {
+fn cache_use_fragment(prefix_hit_rate: Option<f64>) -> String {
+    match prefix_hit_rate {
         Some(0.0) => "pfix_cache 0%".to_string(),
         Some(r) => format!("pfix_cache {:.1}%", r * 100.0),
         None => "pfix_cache —".to_string(),
@@ -641,7 +634,7 @@ fn config_kv_value(cfg: &VllmConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::collectors::{GpuRawMetrics, RawSnapshot, VllmRawMetrics};
+    use crate::collectors::{GpuRawMetrics, RawSnapshot, VllmConfig, VllmRawMetrics};
     use crate::context::{RuntimeWindow, StaticContext};
     use crate::profiler::DiagnoseResult;
     use std::time::{Duration, UNIX_EPOCH};
@@ -838,24 +831,9 @@ mod tests {
 
     #[test]
     fn cache_use_fragment_formats_hit_rate_only() {
-        assert_eq!(
-            cache_use_fragment(&VllmRawMetrics::default()),
-            "pfix_cache —"
-        );
-        assert_eq!(
-            cache_use_fragment(&VllmRawMetrics {
-                prefix_cache_hit_rate: Some(0.0),
-                ..Default::default()
-            }),
-            "pfix_cache 0%"
-        );
-        assert_eq!(
-            cache_use_fragment(&VllmRawMetrics {
-                prefix_cache_hit_rate: Some(0.728),
-                ..Default::default()
-            }),
-            "pfix_cache 72.8%"
-        );
+        assert_eq!(cache_use_fragment(None), "pfix_cache —");
+        assert_eq!(cache_use_fragment(Some(0.0)), "pfix_cache 0%");
+        assert_eq!(cache_use_fragment(Some(0.728)), "pfix_cache 72.8%");
     }
 
     fn baseline_efficiency(eff: f64) -> crate::engine::PhysicsBaseline {
@@ -1098,7 +1076,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            vllm_prompt_value(&v, false),
+            vllm_prompt_value(&v, false, v.prefix_cache_hit_rate),
             "kv_cache 45.2% avg | pfix_cache 50.0%"
         );
     }
@@ -1112,7 +1090,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            vllm_prompt_value(&v, true),
+            vllm_prompt_value(&v, true, v.prefix_cache_hit_rate),
             "18 tok | kv_cache 45.2% avg | pfix_cache 50.0%"
         );
         let v_peak = VllmRawMetrics {
@@ -1123,7 +1101,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            vllm_prompt_value(&v_peak, true),
+            vllm_prompt_value(&v_peak, true, v_peak.prefix_cache_hit_rate),
             "18 tok | kv_cache 40.0% avg (92.0% peak) | pfix_cache 50.0%"
         );
         let peak_ceiling = VllmRawMetrics {
@@ -1151,7 +1129,11 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            vllm_prompt_value(&peak_not_above_avg, true),
+            vllm_prompt_value(
+                &peak_not_above_avg,
+                true,
+                peak_not_above_avg.prefix_cache_hit_rate
+            ),
             "18 tok | kv_cache 92.0% avg | pfix_cache —"
         );
         let no_kv = VllmRawMetrics {
@@ -1159,7 +1141,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            vllm_prompt_value(&no_kv, true),
+            vllm_prompt_value(&no_kv, true, no_kv.prefix_cache_hit_rate),
             "512 tok | kv_cache — | pfix_cache —"
         );
     }
@@ -1181,17 +1163,17 @@ mod tests {
     }
 
     #[test]
-    fn vllm_latency_value_shows_p99_when_available() {
+    fn vllm_latency_value_shows_p95_when_available() {
         let v = VllmRawMetrics {
             ttft_ms: Some(120.0),
             tpot_ms: Some(50.0),
-            ttft_p99_ms: Some(892.0),
-            tpot_p99_ms: Some(180.0),
+            ttft_p95_ms: Some(892.0),
+            tpot_p95_ms: Some(180.0),
             ..Default::default()
         };
         assert_eq!(
             vllm_latency_value(&v, false),
-            "ttft 120ms (p99 892ms) | tpot 50ms (p99 180ms)"
+            "ttft 120ms (p95 892ms) | tpot 50ms (p95 180ms)"
         );
     }
 
@@ -1206,6 +1188,50 @@ mod tests {
         let c = vllm_label_row("CACHE", "kv_cache 67.0% avg | pfix_cache 72.8%");
         assert!(c.starts_with("CACHE"));
         assert!(c.contains("pfix_cache 72.8%"));
+    }
+
+    #[test]
+    fn header_and_r3_body_use_same_aggregated_prefix_hit_rate() {
+        let t = UNIX_EPOCH;
+        let mk_snapshot = || RawSnapshot {
+            gpu_observed_at: t,
+            vllm_observed_at: t,
+            timestamp: t,
+            vllm: VllmRawMetrics {
+                model_name: Some("meta-llama/Llama-3.1-8B-Instruct".to_string()),
+                num_requests_running: Some(5.0),
+                num_requests_waiting: Some(0.0),
+                max_num_seqs: Some(256),
+                prompt_tokens_mean: Some(64.0),
+                request_success_per_sec: Some(20.0),
+                prefix_cache_hit_rate: Some(0.276),
+                generation_tokens_per_sec: Some(200.0),
+                window_duration_secs: Some(2.0),
+                ..Default::default()
+            },
+            gpu: GpuRawMetrics {
+                gpu_name: Some("NVIDIA H100 80GB HBM3".to_string()),
+                gpu_util_pct: Some(70.0),
+                ..Default::default()
+            },
+        };
+        let w1 = RuntimeWindow::from_snapshot(mk_snapshot());
+        let w2 = RuntimeWindow::from_snapshot(mk_snapshot());
+        let w3 = RuntimeWindow::from_snapshot(mk_snapshot());
+        let snapshot = w3.snapshot.clone();
+        let static_ctx = StaticContext::from_snapshot(&snapshot, VllmConfig::default());
+        let result = DiagnoseResult {
+            snapshot,
+            windows: vec![w1, w2, w3],
+            static_ctx,
+            duration: Duration::from_secs(6),
+            started_at: UNIX_EPOCH,
+            any_evaluable: true,
+            metrics_input: "http://127.0.0.1:8000/metrics".to_string(),
+        };
+        let text = build_diagnose_lines(&result, false).join("\n");
+        assert!(text.contains("pfix_cache 27.6%"));
+        assert!(text.contains("Prefix hit rate 27.6%"));
     }
 
     #[test]

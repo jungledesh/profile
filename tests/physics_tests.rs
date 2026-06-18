@@ -216,7 +216,7 @@ fn efficiency_is_none_when_actual_tps_missing() {
 }
 
 #[test]
-fn efficiency_none_when_actual_above_decode_ceiling() {
+fn efficiency_clamped_at_100_when_above_hardware_ceiling() {
     let cfg = VllmConfig {
         dtype: Some("bf16".to_string()),
         max_model_len: Some(2048),
@@ -227,7 +227,7 @@ fn efficiency_none_when_actual_above_decode_ceiling() {
         "NVIDIA H100 80GB HBM3",
         cfg,
         Some(2048.0),
-        Some(1000.0),
+        Some(10_000.0),
         Some(1.0),
     );
     let input = AnalysisInput::new(&ctx, &win);
@@ -237,8 +237,14 @@ fn efficiency_none_when_actual_above_decode_ceiling() {
         Some(v) => v,
         None => panic!("baseline missing"),
     };
-    assert!(b.efficiency_pct.is_none());
-    assert!(b.headroom_pct.is_none());
+    let absolute_ceiling = b.decode.expected * b.ridge_batch_size;
+    assert!(
+        10_000.0 > absolute_ceiling,
+        "test setup: actual must exceed hardware ceiling"
+    );
+    let eff = b.efficiency_pct.expect("efficiency");
+    assert!((eff - 100.0).abs() < 1e-9);
+    assert!((b.headroom_pct.expect("headroom") - 0.0).abs() < 1e-9);
 }
 
 #[test]

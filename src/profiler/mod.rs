@@ -222,6 +222,8 @@ fn aggregate_windows(
         let merged_ttft = collectors::merge_p99_bucket_vecs(&ttft_vecs);
         agg_v.ttft_p99_ms =
             collectors::vllm::histogram_quantile(0.99, &merged_ttft).map(|s| s * 1000.0);
+        agg_v.ttft_p95_ms =
+            collectors::vllm::histogram_quantile(0.95, &merged_ttft).map(|s| s * 1000.0);
 
         let tpot_vecs: Vec<&[collectors::HistogramCount]> = active_pairs
             .iter()
@@ -230,6 +232,8 @@ fn aggregate_windows(
         let merged_tpot = collectors::merge_p99_bucket_vecs(&tpot_vecs);
         agg_v.tpot_p99_ms =
             collectors::vllm::histogram_quantile(0.99, &merged_tpot).map(|s| s * 1000.0);
+        agg_v.tpot_p95_ms =
+            collectors::vllm::histogram_quantile(0.95, &merged_tpot).map(|s| s * 1000.0);
     }
     agg_v.prefill_latency_ms =
         aggregate_histogram_from_mass(&active_pairs, |v| v.prefill_window_mass, 1000.0)
@@ -473,8 +477,8 @@ fn prefix_hit_rate_sum_of_window_deltas(windows: &[&collectors::RawSnapshot]) ->
 mod tests {
     use super::*;
     use crate::collectors::{
-        CacheConfigLabels, GpuRawMetrics, HistogramWindowMass, PrefixCacheScrapeSample,
-        RawSnapshot, VllmRawMetrics,
+        CacheConfigLabels, GpuRawMetrics, HistogramCount, HistogramWindowMass,
+        PrefixCacheScrapeSample, RawSnapshot, VllmRawMetrics,
     };
 
     fn mk_snap(
@@ -540,6 +544,50 @@ mod tests {
         );
         snap.vllm.kv_cache_usage_perc = Some(50.0);
         snap
+    }
+
+    #[test]
+    fn aggregate_windows_populates_p95_latencies() {
+        fn latency_buckets() -> Vec<HistogramCount> {
+            vec![
+                HistogramCount {
+                    less_than: 0.1,
+                    count: 50.0,
+                },
+                HistogramCount {
+                    less_than: 0.2,
+                    count: 100.0,
+                },
+                HistogramCount {
+                    less_than: f64::INFINITY,
+                    count: 100.0,
+                },
+            ]
+        }
+
+        let g = GpuRawMetrics {
+            gpu_util_pct: Some(50.0),
+            ..Default::default()
+        };
+        let mut w1 = mk_active_snap(Some(5.0), Some(100.0), None, None, None, g.clone(), None);
+        w1.vllm.ttft_p99_buckets = latency_buckets();
+        w1.vllm.tpot_p99_buckets = latency_buckets();
+        let mut w2 = mk_active_snap(Some(5.0), Some(200.0), None, None, None, g, None);
+        w2.vllm.ttft_p99_buckets = latency_buckets();
+        w2.vllm.tpot_p99_buckets = latency_buckets();
+
+        let agg = aggregate_windows(
+            &[w1, w2],
+            &[Duration::from_secs(2), Duration::from_secs(2)],
+            SystemTime::UNIX_EPOCH,
+        );
+
+        let ttft_p95 = agg.vllm.ttft_p95_ms.expect("ttft p95");
+        let ttft_p99 = agg.vllm.ttft_p99_ms.expect("ttft p99");
+        let tpot_p95 = agg.vllm.tpot_p95_ms.expect("tpot p95");
+        let tpot_p99 = agg.vllm.tpot_p99_ms.expect("tpot p99");
+        assert!(ttft_p95 <= ttft_p99);
+        assert!(tpot_p95 <= tpot_p99);
     }
 
     #[test]

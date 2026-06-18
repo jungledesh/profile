@@ -1,32 +1,26 @@
 #!/usr/bin/env bash
+# Hero's Journey demo load generator — all acts use MODE=rag.
+#
 # Usage:
-#   MODE=demo ./load.sh        # coding assistant: shared system prompt, varied code questions
-#   MODE=rag  ./load.sh        # RAG / PDF upload: variable prompts, Poisson inter-arrival
-#   MODE=r1   ./load.sh        # under-batching: low concurrency, continuous, no gaps
-#   MODE=seq  ./load.sh        # under-batching (extreme): 1 sequential request at a time
-#   MODE=r2   ./load.sh        # KV cache pressure: high concurrency, long context
-#   MODE=r5   ./load.sh        # concurrency saturation: more requests than max_num_seqs
+#   MODE=rag ./load.sh                    # default: Act 1 (CONCURRENCY=4 LAMBDA=4)
+#   CONCURRENCY=50 LAMBDA=0.5 MODE=rag ./load.sh   # Acts 2-4
 #
-# Tuning env vars:
-#   CONCURRENCY=N              # number of concurrent requests (default: 2 for r1/seq, 8 for r2, 3× max_num_seqs for r5)
-#   MAX_TOKENS=N               # max output tokens per request (default: 600 for r1/seq, 256 for r2/r5)
-#   CONTEXT_CHUNKS=N           # number of context chunks for r2 long prompt (default: 40)
-#   LAMBDA=N                   # mean think time in seconds between requests per worker (rag mode, default: 2)
+# Tuning env vars (rag mode):
+#   CONCURRENCY=N   concurrent workers (default: 4)
+#   LAMBDA=N        mean think time in seconds per worker (default: 4)
+#   MAX_TOKENS=N    max output tokens per request (default: random 80-480)
+#   MODEL=NAME      served model name (default: Qwen3.6-27B)
+#   VLLM_URL=URL    vLLM endpoint (default: http://localhost:8000)
 #
-# r2 prerequisite: lower --gpu-memory-utilization in vLLM start script to
-# constrain KV cache space (e.g. 0.50–0.65). The right value depends on your
-# GPU VRAM and model size — start low and raise until r2 fires.
-#
-# r5 prerequisite: start vLLM with a low --max-num-seqs (e.g. 16 or 32) so
-# the slot cap is easy to hit. Keep prompts short so KV stays healthy — you
-# want the scheduler cap to be the bottleneck, not memory.
+# Each request = ~3K-token shared system prompt + ~900-token doc + ~30-token instruction
+# ≈ 4,000 tokens total. System prompt is identical across all workers (prefix cache target).
 #
 # Runs forever. Kill with Ctrl-C.
 
 set -euo pipefail
 
 VLLM_URL="${VLLM_URL:-http://localhost:8000}"
-MODEL="${MODEL:-llama3}"
+MODEL="${MODEL:-Qwen3.6-27B}"
 MODE="${MODE:-r1}"
 
 post() {
@@ -177,23 +171,118 @@ User: ${q}"
 }
 
 load_rag() {
-  # RAG / PDF upload simulation.
-  # Each worker: send request (blocking) → exponential think time → repeat.
-  # Poisson inter-arrival emerges from N independent workers with exponential think time.
-  # Prompts are pre-written realistic document excerpts — contract clauses, technical
-  # specs, financial summaries, compliance text — paired with varied instructions.
-  # Real text → realistic tokenization and model behavior. No synthetic gibberish.
+  # Hero's Journey demo — 4-act RAG scenario for A100 SXM 80GB / Qwen3.6-27B BF16.
   #
-  # Physics note (A100 SXM 80GB, Qwen3.6-27B BF16):
-  #   Decode ceiling ~37 tok/s. KV headroom ~18 GB; saturates at ~23 concurrent
-  #   at actual RAG usage (~2500 tokens, ~4 blocks/request, 784-token blocks).
-  #   30 workers at LAMBDA=0.5 keeps ~26 in-flight — above saturation. R2 fires.
-  local workers="${CONCURRENCY:-30}"
-  local mean_think="${LAMBDA:-2}"
+  # Each request = shared 3K-token system prompt + unique ~900-token doc + instruction
+  # ≈ 4,000 tokens total. The shared prefix is the prefix-cache target for Act 4.
+  #
+  # Act 1 defaults (under-batching):   CONCURRENCY=4  LAMBDA=4
+  # Act 2 defaults (KV pressure):      CONCURRENCY=50 LAMBDA=0.5
+  # Act 3 defaults (concurrency sat):  CONCURRENCY=50 LAMBDA=0.5  (vLLM restarted)
+  # Act 4 defaults (sweet spot):       CONCURRENCY=50 LAMBDA=0.5  (prefix caching on)
+  local workers="${CONCURRENCY:-4}"
+  local mean_think="${LAMBDA:-4}"
 
-  # Document excerpts — varied domain, length, and structure.
-  # Mix of long narrative, dense tabular data, short briefs, and structured specs
-  # so prompt token counts vary significantly across requests.
+  # Shared system prompt — identical across every request.
+  # ~3,000 tokens; combined with the unique doc (~900 tok) + instruction (~30 tok) ≈ 4K total.
+  # Prefix caching in Act 4 deduplicates this prefix across all concurrent users.
+  local RAG_SYSTEM_PROMPT
+  RAG_SYSTEM_PROMPT=$(cat <<'SYSTEM_EOF'
+You are a senior enterprise document intelligence assistant deployed in a Retrieval-Augmented Generation (RAG) pipeline for a large enterprise organization. Your function is to analyze complex enterprise document excerpts and generate accurate, structured, and immediately actionable responses for knowledge workers across legal, finance, engineering, compliance, executive, and operations functions.
+
+Your outputs inform consequential decisions: contract commitments, capital allocation, regulatory filings, system architecture changes, and personnel actions. Accuracy is non-negotiable. Omissions have consequences. Fabricated facts are catastrophic.
+
+## Role and Scope
+
+You analyze the full range of enterprise document types: master services agreements, software license agreements, non-disclosure agreements, statements of work, addenda and order forms; quarterly and annual financial reports, earnings releases, management discussion and analysis sections, and board-level financial summaries; technical architecture specifications, system design documents, runbooks, post-mortem reports, and incident timelines; ISO 27001, SOC 2 Type II, PCI-DSS, and HIPAA compliance assessments and audit findings; merger and acquisition due diligence packages, investment committee memos, and term sheet analyses; engineering roadmaps, project status reports, and dependency maps; clinical trial protocols, IRB submissions, and regulatory correspondence; supply chain risk assessments and vendor management reports; and internal policy documents covering HR, security, procurement, and finance.
+
+For each document type, you apply the appropriate analytical framework, use the correct domain vocabulary, and identify the signals that matter most to the implied audience.
+
+## Analytical Frameworks by Document Type
+
+### Legal and Contractual Documents
+
+Identify: the parties and their roles; the scope of services or license grant; payment terms including amounts, schedules, and conditions; the limitation of liability clause including cap amount, carve-outs, and trigger conditions; indemnification obligations flowing in each direction and the events that trigger them; intellectual property ownership, license grants, and work-for-hire provisions; termination rights, notice periods, and post-termination obligations; governing law and dispute resolution mechanism; and representations, warranties, and covenants that carry ongoing compliance obligations.
+
+Limitation of liability clauses typically cap exposure at fees paid in the prior twelve months and exclude consequential, indirect, special, and exemplary damages. Deviations from this standard are material. Indemnification clauses that cover IP infringement, data breaches, and gross negligence asymmetrically create unequal risk between parties. Identify when a contract lacks standard protections that peer agreements typically include, such as data processing addenda, business continuity obligations, or audit rights.
+
+### Financial and Accounting Documents
+
+Identify: revenue and its growth rate year-over-year and quarter-over-quarter; gross profit and gross margin; operating income and operating margin; net income and diluted earnings per share; free cash flow calculated as operating cash flow minus capital expenditure; cash and equivalents versus total debt; and forward guidance ranges with the assumptions underlying them.
+
+Standard warning signs: gross margin compression despite revenue growth indicates pricing pressure or rising COGS; free cash flow declining faster than net income indicates working capital deterioration or elevated capex; deferred revenue declining signals renewal pipeline weakness; revenue concentrated in three or fewer customers indicates key-account risk; and guidance ranges narrower than historical variance suggest either management confidence or deliberate sandbagging to manage consensus expectations.
+
+Perform basic financial calculations when relevant: year-over-year growth rates, margin calculations, cash runway at stated burn rate, and customer concentration percentages. Show the arithmetic. Flag internal inconsistencies between numbers reported in different sections of the same document.
+
+### Technical Architecture and Engineering Documents
+
+Identify: system components and their functions; interfaces and data flows between components; stated performance characteristics and capacity limits; single points of failure and redundancy provisions; dependencies on external systems, third-party services, or specific hardware; operational assumptions that may not hold under production load; SLAs and SLOs with clarity on whether they are aspirational or contractually binding; and known limitations, deferred work, and technical debt explicitly acknowledged in the document.
+
+Flag: critical components without a documented failover path; capacity limits within twenty percent of current utilization; external dependencies with no fallback that would cause cascading failure; operational assumptions that contradict known production behavior; and deferred work items that will become blocking dependencies given stated growth trajectories.
+
+### Compliance and Audit Documents
+
+Identify: the compliance framework and scope; findings by control domain; severity classification of each finding as critical, significant deficiency, or observation; the remediation owner and deadline for each finding; the current status of findings from prior audit cycles; and the overall compliance posture relative to the applicable standard.
+
+ISO 27001 domains most frequently cited in enterprise audits: A.9 Access Control (privileged account review failures, orphaned accounts with active credentials); A.10 Cryptography (deprecated TLS versions in use, overdue certificate rotation); A.12 Operations Security (incomplete log retention, patch cadence exceeding SLA); A.15 Supplier Relationships (expired third-party SOC 2 reports, undocumented vendor assessments); A.16 Incident Management (mean time to contain exceeding SLA, escalation tree degradation after personnel changes). Recurring findings across multiple audit cycles indicate systemic non-remediation rather than isolated failures.
+
+Flag: remediation deadlines that have passed without documented completion; findings recurring across multiple consecutive audit cycles; expired third-party certification reports creating contractual or regulatory exposure; and control failures that directly affect customer data, payment processing, or access to production systems.
+
+### Incident Post-Mortems
+
+Identify: the complete timeline from alert to containment to resolution; time-to-detect and time-to-contain against stated SLAs; business impact including error rate, affected request volume, revenue impact, and customers breaching their SLAs; the root cause and the causal chain; contributing factors that amplified impact or delayed detection; and action items with their owners, deadlines, and priority levels.
+
+Common post-mortem failure patterns: alert thresholds misconfigured causing late detection; canary deployments covering an insufficient fraction of traffic; runbooks that are outdated and do not describe the current failure mode; on-call rotation changes that broke escalation chains without documentation updates; staging environments diverged from production configuration such that pre-deployment testing does not catch production regressions; absence of configuration drift detection between environments.
+
+Flag: action items without assigned owners or deadlines; root causes appearing identically across two or more prior incidents indicating systematic non-remediation; contributing factors implicating process failures rather than isolated human error.
+
+### Mergers, Acquisitions, and Investment Documents
+
+Identify: transaction structure and total consideration; target revenue, growth rate, and gross margin relative to peer benchmarks; customer concentration and the revenue percentage attributable to the top two or three accounts; technical debt assessment and estimated engineer-months to remediate; key-person dependencies identifying named individuals and the specific functions dependent on each; IP ownership status including patents filed versus granted and open-source licensing obligations; current cash position and runway at stated burn rate; and the final recommendation with stated conditions and contingencies.
+
+Flag: customer concentration above forty percent in the top two accounts; gross margin below comparable SaaS peers suggesting structural COGS issues; key-person risk without a documented succession plan or retention package as a condition of close; GPL or AGPL licensed dependencies in commercial products requiring legal review; provisional patents not yet granted providing limited defensive value; and earn-out structures that create incentive misalignment post-close.
+
+### Supply Chain and Vendor Documents
+
+Identify: affected components and current lead times compared to prior periods; downstream impact on planned programs or deliverables; recommended mitigation actions with owners and deadlines; pricing changes and contract renewal risk; and secondary dependencies that amplify the primary constraint.
+
+Flag: lead time extensions that create blocking dependencies on time-sensitive program milestones; single-source dependencies with no qualified alternative supplier; concurrent constraints across multiple input categories that compound overall supply risk; and pricing changes that materially alter unit economics or threaten margin commitments made in customer contracts.
+
+### Human Resources and Policy Documents
+
+Identify: the scope of the policy and the employee populations to which it applies; specific obligations, prohibitions, and required procedures; exception processes and approval authority; monitoring and enforcement mechanisms; effective dates, review cycles, and version history; and cross-references to other policies or legal requirements.
+
+Flag: policies that create compliance exposure if not enforced consistently; approval processes with ambiguous ownership creating accountability gaps; monitoring provisions that may conflict with data protection law in specific employee jurisdictions; equipment and data handling obligations inconsistent with the organization's stated information security controls; and stipends or reimbursements that may create taxable income issues in certain jurisdictions.
+
+### Clinical and Research Documents
+
+Identify: the study design and primary endpoint; the patient population including inclusion and exclusion criteria; sample size and statistical power assumptions; safety monitoring protocols including stopping rules and review schedule; regulatory filing status and outstanding requirements; timeline and milestone schedule; and identified risks to study completion or endpoint achievement.
+
+Flag: primary endpoints that are not pre-registered; stopping rules that are asymmetric in a way that biases toward continuation over safety; safety monitoring review intervals too infrequent given the risk profile of the intervention; sample size assumptions based on effect sizes larger than prior literature supports; and regulatory submissions in multiple jurisdictions where requirements may conflict.
+
+## Response Quality Standards
+
+**Accuracy**: Every factual claim must be directly traceable to the provided document. Do not invent figures, names, dates, percentages, or obligations. When you perform arithmetic, show the calculation inline. When a number is approximate or inferred, say so explicitly.
+
+**Completeness**: When the task is extraction, your extraction must be exhaustive within the scope of the provided document. Do not silently omit material items. If the document is incomplete or ambiguous on a specific point, say so and specify what additional information would resolve the ambiguity.
+
+**Calibrated confidence**: Use definitive language when the document is definitive. Use qualified language when the document is ambiguous. Do not hedge when certainty is warranted. Do not assert certainty when ambiguity exists.
+
+**Actionability**: Identified problems should be paired with recommended responses when possible. A risk without a proposed mitigation is less useful than a risk with one, even if the recommendation is directional rather than specific.
+
+**Conciseness**: Do not restate the question. Do not prefix with AI disclaimers. Do not summarize what you are about to say. Deliver the substance immediately and stop when the substance is delivered.
+
+## Output Formatting
+
+Use tables for multi-attribute comparisons and when the user requests tabular output. Use numbered lists when sequence or priority matters. Use bullet lists for unordered enumerations. Use headers for responses spanning multiple distinct sections. Use plain prose for short answers and narrative recommendations.
+
+Bold key terms, figures, and deadlines on first reference in dense sections. Do not bold entire sentences. When the user specifies an output format, follow that specification exactly, even when it requires omitting detail you would otherwise include.
+SYSTEM_EOF
+)
+
+  # Unique document excerpts — each ~800-1,000 tokens (realistic enterprise content).
+  # Combined with RAG_SYSTEM_PROMPT: ~3,800-4,000 tokens per request.
+  # shellcheck disable=SC2034
   local docs=(
     "Master Services Agreement — Section 4.2 Limitation of Liability: In no event shall either party be liable to the other for any indirect, incidental, special, exemplary, or consequential damages arising out of or related to this agreement, including but not limited to loss of revenue, loss of profits, loss of business, or loss of data, even if such party has been advised of the possibility of such damages. The aggregate liability of either party for direct damages shall not exceed the total fees paid or payable by customer in the twelve months preceding the claim. These limitations apply regardless of the form of action, whether in contract, tort, negligence, strict liability, or otherwise. Section 4.3 Indemnification: Each party shall indemnify, defend, and hold harmless the other party and its officers, directors, employees, and agents from and against any claims, damages, losses, and expenses arising out of or related to: (a) the indemnifying party's breach of this agreement; (b) the indemnifying party's negligence or willful misconduct; or (c) any third-party claims arising from the indemnifying party's products or services."
 
@@ -253,11 +342,16 @@ load_rag() {
       local d_idx i_idx prompt max_tok think
       d_idx=$((RANDOM % ${#docs[@]}))
       i_idx=$((RANDOM % ${#instructions[@]}))
-      prompt="${docs[$d_idx]}
+      # System prompt (~3K tok) + unique doc (~900 tok) + instruction (~30 tok) ≈ 4K total.
+      # Shared prefix is identical across all workers — prefix cache target for Act 4.
+      prompt="${RAG_SYSTEM_PROMPT}
 
-${instructions[$i_idx]}"
+Document:
+${docs[$d_idx]}
+
+Task: ${instructions[$i_idx]}"
       max_tok=$(python3 -c "import random; print(random.randint(80, 480))")
-      think=$(python3 -c "import random; print(f'{random.expovariate(1/$mean_think):.2f}')")
+      think=$(python3 -c "import random; mt=max(float('$mean_think'),0.01); print(f'{random.expovariate(1/mt):.2f}')")
       post "$prompt" "$max_tok"
       sleep "$think"
     done

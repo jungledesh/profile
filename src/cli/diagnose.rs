@@ -83,8 +83,12 @@ pub(crate) fn prompt_for_updated_max_num_seqs(
     current: u32,
     stdin_rx: &std::sync::mpsc::Receiver<String>,
 ) -> anyhow::Result<u32> {
-    let prompt = format!("New --max-num-seqs [{current}]: ");
+    let prompt = updated_max_num_seqs_prompt(current);
     prompt_u32_from_channel(stdin_rx, &mut io::stdout(), current, &prompt)
+}
+
+fn updated_max_num_seqs_prompt(current: u32) -> String {
+    format!("New --max-num-seqs [current: {current}]: ")
 }
 
 fn retry_u32_loop<F, W>(
@@ -205,5 +209,36 @@ mod tests {
     fn error_message_contains_recovery_hint() {
         let err = run(b"0\n0\n0\n0\n", 256).unwrap_err();
         assert!(err.to_string().contains("Pass -m <value>"));
+    }
+
+    #[test]
+    fn updated_max_num_seqs_prompt_labels_current_value() {
+        assert_eq!(
+            updated_max_num_seqs_prompt(128),
+            "New --max-num-seqs [current: 128]: "
+        );
+    }
+
+    #[test]
+    fn updated_max_num_seqs_empty_input_keeps_current() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(String::new()).unwrap();
+        let mut out = Vec::new();
+        let current = 512;
+        let prompt = updated_max_num_seqs_prompt(current);
+        let v = prompt_u32_from_channel(&rx, &mut out, current, &prompt).unwrap();
+        assert_eq!(v, 512);
+        let written = String::from_utf8(out).unwrap();
+        assert!(written.contains("New --max-num-seqs [current: 512]: "));
+    }
+
+    #[test]
+    fn updated_max_num_seqs_valid_input_returns_new_value() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send("64".to_string()).unwrap();
+        let mut out = Vec::new();
+        let prompt = updated_max_num_seqs_prompt(256);
+        let v = prompt_u32_from_channel(&rx, &mut out, 256, &prompt).unwrap();
+        assert_eq!(v, 64);
     }
 }

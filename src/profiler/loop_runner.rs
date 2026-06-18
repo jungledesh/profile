@@ -1,4 +1,3 @@
-use std::io::{self, Write};
 use std::time::Duration;
 
 use super::{delta, drift, poll, run_diagnose, state::LoopState, DiagnoseResult};
@@ -7,8 +6,9 @@ use crate::engine;
 use crate::output;
 
 const CEILING_HEADROOM_THRESHOLD_PCT: f64 = 10.0;
-const LOW_OCCUPANCY_THRESHOLD: f64 = 0.25;
 const EFFICIENCY_DISPLAY_MIN_PP: f64 = 0.05;
+const EFFICIENCY_PLATEAU_DELTA: f64 = 2.0;
+const PLATEAU_CONSECUTIVE_ITERS: u32 = 3;
 
 pub fn run(
     url: &str,
@@ -24,22 +24,42 @@ pub fn run(
     let mut current_max_num_seqs = max_num_seqs;
 
     loop {
-        let Some(rule_name) = state
-            .last()
-            .report
-            .groups
-            .first()
-            .map(|g| g.primary.rule_name)
-        else {
-            let baseline = state.last().report.baseline.as_ref();
-            let efficiency = baseline.and_then(|b| b.efficiency_pct);
-            let headroom = baseline.and_then(|b| b.headroom_pct);
-
-            let num_running = state.last().result.snapshot.vllm.num_requests_running;
-            let max_num_seqs = state.last().result.static_ctx.config.max_num_seqs;
-            let msg = healthy_exit_message(efficiency, headroom, num_running, max_num_seqs);
-            println!("\n{msg}");
-            break;
+        let (rule_name, prev_result, prev_report) = {
+            let Some(last_state) = state.last() else {
+                break;
+            };
+            let Some(rule_name) = last_state
+                .report
+                .groups
+                .first()
+                .map(|g| g.primary.rule_name)
+            else {
+                let baseline = last_state.report.baseline.as_ref();
+                let efficiency = baseline.and_then(|b| b.efficiency_pct);
+                let ridge_batch_size = baseline.map(|b| b.ridge_batch_size);
+                let tpot_floor_ms = baseline.map(|b| b.tpot_floor_ms);
+                let kv_cache_usage_perc = last_state.result.snapshot.vllm.kv_cache_usage_perc;
+                let num_running = last_state.result.snapshot.vllm.num_requests_running;
+                let tpot_ms = last_state.result.snapshot.vllm.tpot_ms;
+                let chunked_prefill_enabled =
+                    last_state.result.static_ctx.config.enable_chunked_prefill;
+                let msg = healthy_exit_message(
+                    efficiency,
+                    kv_cache_usage_perc,
+                    num_running,
+                    ridge_batch_size,
+                    tpot_ms,
+                    tpot_floor_ms,
+                    chunked_prefill_enabled,
+                );
+                println!("\n{msg}");
+                break;
+            };
+            (
+                rule_name,
+                last_state.result.clone(),
+                last_state.report.clone(),
+            )
         };
 
         if state.is_oscillating() {
@@ -114,13 +134,11 @@ pub fn run(
 
         let _outcome = poll::wait_for_restart_or_skip(url, &stdin_rx);
 
-        {
-            println!();
-            let current = current_max_num_seqs.unwrap_or(256);
-            current_max_num_seqs = Some(crate::cli::prompt_for_updated_max_num_seqs(
-                current, &stdin_rx,
-            )?);
-        }
+        println!();
+        let current = current_max_num_seqs.unwrap_or(256);
+        current_max_num_seqs = Some(crate::cli::prompt_for_updated_max_num_seqs(
+            current, &stdin_rx,
+        )?);
 
         println!("\nMeasuring delta...\n");
         let new_result = run_diagnose(
@@ -134,22 +152,18 @@ pub fn run(
         let summary = AnalysisInput::new(&new_result.static_ctx, &agg_win);
         let new_report = engine::build_report_for_diagnose(&new_result.windows, summary);
 
-        let drifted =
-            drift::config_changed(&state.last().result.static_ctx, &new_result.static_ctx);
-        if drifted {
-            println!("Config change detected, re-baselined.");
-        }
+        let drifted = drift::config_changed(&prev_result.static_ctx, &new_result.static_ctx);
 
         let d = delta::compute(
-            &state.last().result,
-            &state.last().report,
+            &prev_result,
+            &prev_report,
             &new_result,
             &new_report,
             drifted,
         );
+        let current_eff = new_report.baseline.as_ref().and_then(|b| b.efficiency_pct);
+        let plateau_count = state.update_efficiency_plateau(current_eff, EFFICIENCY_PLATEAU_DELTA);
         print_delta(&d);
-        println!();
-        output::stdout::print_direction_line(&d);
         println!();
         output::stdout::print_diagnose_table(&new_result, false);
 
@@ -160,43 +174,21 @@ pub fn run(
             );
             break;
         }
-
-        let applied_short_action = state
-            .last()
-            .report
-            .groups
-            .first()
-            .map(|g| g.primary.short_action.as_str());
-        let next_fix = new_report
-            .groups
-            .first()
-            .map(|g| g.primary.short_action.as_str());
-
-        if d.direction == delta::Direction::Worse {
-            let choice = read_worse_regression_choice(&stdin_rx, &mut io::stdout())?;
-            match choice {
-                WorseRegressionChoice::Continue => {
-                    for line in direction_followup_lines(delta::Direction::NoChange, next_fix) {
-                        println!("{line}");
-                    }
-                    let _ = apply_worse_regression_choice(
-                        &mut state, new_result, new_report, rule_name, choice,
-                    );
-                }
-                WorseRegressionChoice::Revert => {
-                    if let Some(action) = applied_short_action {
-                        println!("Revert: undo {action}, then re-measure when ready.");
-                    } else {
-                        println!("Revert: undo the last change, then re-measure when ready.");
-                    }
-                }
-            }
-        } else {
-            for line in direction_followup_lines(d.direction, next_fix) {
-                println!("{line}");
-            }
-            state.push(new_result, new_report, Some(rule_name));
+        if plateau_count >= PLATEAU_CONSECUTIVE_ITERS {
+            let eff_display = current_eff
+                .filter(|e| e.is_finite())
+                .map(|e| format!("{e:.1}%"))
+                .unwrap_or_else(|| "unknown".to_string());
+            println!(
+                "\nEfficiency plateaued at {eff_display} over {PLATEAU_CONSECUTIVE_ITERS} iterations."
+            );
+            println!("No further improvement from current config.");
+            println!("Either the workload has hit the hardware ceiling, or");
+            println!("a bottleneck exists that profile cannot yet identify.");
+            break;
         }
+
+        state.push(new_result, new_report, Some(rule_name));
     }
 
     Ok(())
@@ -208,100 +200,85 @@ fn at_hardware_ceiling(headroom_pct: Option<f64>) -> bool {
 
 fn healthy_exit_message(
     efficiency: Option<f64>,
-    headroom: Option<f64>,
+    kv_cache_usage_perc: Option<f64>,
     num_running: Option<f64>,
-    max_num_seqs: Option<u32>,
+    ridge_batch_size: Option<f64>,
+    tpot_ms: Option<f64>,
+    tpot_floor_ms: Option<f64>,
+    chunked_prefill_enabled: Option<bool>,
 ) -> String {
-    let load_is_low = match (num_running, max_num_seqs) {
-        (Some(r), Some(m)) if m > 0 => (r / f64::from(m)) < LOW_OCCUPANCY_THRESHOLD,
-        _ => false,
+    let limiter = engine::limiter::identify(
+        kv_cache_usage_perc,
+        num_running,
+        ridge_batch_size,
+        tpot_ms,
+        tpot_floor_ms,
+        chunked_prefill_enabled,
+    );
+
+    if limiter == Some(engine::limiter::PrimaryLimiter::Traffic) {
+        let eff = efficiency
+            .filter(|e| e.is_finite())
+            .map(|e| format!("Efficiency {e:.1}%"))
+            .unwrap_or_else(|| "Efficiency unavailable".to_string());
+        return format!(
+            "No issues. {eff} — gap is traffic, not config. Increase load to find real limits."
+        );
+    }
+
+    let eff_str = efficiency
+        .map(|e| format!("Efficiency: {e:.1}%"))
+        .unwrap_or_else(|| "Efficiency: unavailable".to_string());
+
+    let limiter_block = match limiter {
+        Some(engine::limiter::PrimaryLimiter::Capacity) => {
+            let kv = kv_cache_usage_perc
+                .map(|k| format!(" KV cache at {k:.0}%."))
+                .unwrap_or_default();
+            format!(
+                "Primary Limiter: KV Cache Capacity\n\
+                 {eff_str} —{kv} concurrency is capped before bandwidth saturates.\n\
+                 Levers: enable prefix caching, apply KV quantization (FP8), or add TP to split KV cache."
+            )
+        }
+        Some(engine::limiter::PrimaryLimiter::Physics) => {
+            let floor_str = tpot_floor_ms
+                .zip(tpot_ms)
+                .map(|(floor, actual)| format!(" TPOT {actual:.1}ms vs floor {floor:.1}ms."))
+                .unwrap_or_default();
+            format!(
+                "Primary Limiter: Physics (Hardware Ceiling)\n\
+                 {eff_str} —{floor_str} Hardware is at the limits of this model and dtype.\n\
+                 Levers: quantize further (FP16→FP8/AWQ), speculative decoding, or scale out with TP."
+            )
+        }
+        Some(engine::limiter::PrimaryLimiter::PrefillInterference) => {
+            format!(
+                "Primary Limiter: Prefill Interference\n\
+                 {eff_str} — chunked prefill is sharing decode memory bandwidth with prefill GEMMs.\n\
+                 Levers: disaggregate prefill/decode onto separate workers, or tune chunk size."
+            )
+        }
+        Some(engine::limiter::PrimaryLimiter::FrameworkOverhead) => {
+            format!(
+                "Primary Limiter: Framework Overhead\n\
+                 {eff_str} — batch healthy, VRAM available, but GPU is waiting on the system.\n\
+                 Levers: test --enforce-eager, verify CPU/PCIe bottlenecks, or evaluate SGLang for this workload."
+            )
+        }
+        Some(engine::limiter::PrimaryLimiter::Traffic) => {
+            unreachable!("traffic limiter returns before limiter_block")
+        }
+        None => {
+            format!("{eff_str} — insufficient data to identify primary limiter.")
+        }
     };
 
-    match (efficiency, headroom) {
-        (Some(e), _) if headroom.is_some_and(|h| h < CEILING_HEADROOM_THRESHOLD_PCT) => {
-            format!("No issues detected. Server is at hardware capacity: {e:.1}% of ceiling.")
-        }
-        (Some(e), _) if load_is_low => {
-            format!("No issues detected. Efficiency: {e:.1}% (hardware is under-fed, not misconfigured).")
-        }
-        (Some(e), _) => {
-            format!("No significant change. Efficiency: {e:.1}% of hardware ceiling.")
-        }
-        (None, _) => {
-            "No issues detected. Efficiency unavailable; GPU or model data missing.".to_string()
-        }
-    }
-}
-
-fn direction_followup_lines(
-    direction: delta::Direction,
-    short_action: Option<&str>,
-) -> Vec<String> {
-    let mut lines = Vec::new();
-    match direction {
-        delta::Direction::Worse => {}
-        delta::Direction::Mixed => {
-            // Direction line carries the reason. Nothing to add.
-        }
-        delta::Direction::NoChange => {
-            if let Some(fix) = short_action {
-                lines.push("No significant change.".to_string());
-                lines.push(format!("Apply fix: {fix}, then re-measure."));
-            }
-        }
-        // Better: no followup needed. The table shows the improved state; the
-        // Direction line already carries the signal. Silence is the right output.
-        delta::Direction::Better => {}
-    }
-    lines
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WorseRegressionChoice {
-    Continue,
-    Revert,
-}
-
-pub(crate) fn parse_worse_regression_choice(line: &str) -> Option<WorseRegressionChoice> {
-    match line.trim() {
-        "c" | "C" => Some(WorseRegressionChoice::Continue),
-        "r" | "R" => Some(WorseRegressionChoice::Revert),
-        _ => None,
-    }
-}
-
-pub(crate) fn read_worse_regression_choice(
-    stdin_rx: &std::sync::mpsc::Receiver<String>,
-    prompt: &mut dyn Write,
-) -> io::Result<WorseRegressionChoice> {
-    writeln!(prompt, "  [r] revert   [c] continue")?;
-    loop {
-        write!(prompt, "> ")?;
-        prompt.flush()?;
-        let line = stdin_rx
-            .recv()
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stdin closed"))?;
-        if let Some(choice) = parse_worse_regression_choice(&line) {
-            return Ok(choice);
-        }
-        writeln!(prompt, " r = revert, c = continue")?;
-    }
-}
-
-pub(crate) fn apply_worse_regression_choice(
-    state: &mut LoopState,
-    new_result: DiagnoseResult,
-    new_report: engine::Report,
-    rule_name: &'static str,
-    choice: WorseRegressionChoice,
-) -> bool {
-    match choice {
-        WorseRegressionChoice::Continue => {
-            state.push(new_result, new_report, Some(rule_name));
-            true
-        }
-        WorseRegressionChoice::Revert => false,
-    }
+    let prefix = match limiter {
+        Some(_) => "Rules clear. Server is optimally tuned for current constraints.",
+        None => "Rules clear.",
+    };
+    format!("{prefix}\n\n{limiter_block}")
 }
 
 fn format_efficiency_delta_line(delta_pp: Option<f64>) -> Option<String> {
@@ -312,9 +289,21 @@ fn format_efficiency_delta_line(delta_pp: Option<f64>) -> Option<String> {
     }
 }
 
+fn config_change_status_lines(config_drifted: bool) -> [&'static str; 2] {
+    if config_drifted {
+        ["  Config changed, baseline reset.", ""]
+    } else {
+        ["  No config changed.", ""]
+    }
+}
+
 fn print_delta(d: &delta::Delta) {
-    if d.config_drifted {
-        println!("  Config changed, baseline reset.");
+    for line in config_change_status_lines(d.config_drifted) {
+        if line.is_empty() {
+            println!();
+        } else {
+            println!("{line}");
+        }
     }
     if let (Some(before), Some(after)) = (d.throughput_before, d.throughput_after) {
         if before.is_finite() && after.is_finite() {
@@ -327,13 +316,13 @@ fn print_delta(d: &delta::Delta) {
             let delta = after - before;
             if delta.abs() > 5.0 {
                 let arrow = latency_arrow(delta);
-                let p99_suffix = match (d.ttft_p99_before_ms, d.ttft_p99_after_ms) {
+                let p95_suffix = match (d.ttft_p95_before_ms, d.ttft_p95_after_ms) {
                     (Some(pb), Some(pa)) if pb.is_finite() && pa.is_finite() => {
-                        format!("  (p99 {pb:.0} → {pa:.0}ms {})", latency_arrow(pa - pb))
+                        format!("  (p95 {pb:.0} → {pa:.0}ms {})", latency_arrow(pa - pb))
                     }
                     _ => String::new(),
                 };
-                println!("  TTFT        {before:.0} → {after:.0}ms {arrow}{p99_suffix}");
+                println!("  TTFT        {before:.0} → {after:.0}ms {arrow}{p95_suffix}");
             }
         }
     }
@@ -342,13 +331,13 @@ fn print_delta(d: &delta::Delta) {
             let delta = after - before;
             if delta.abs() > 0.5 {
                 let arrow = latency_arrow(delta);
-                let p99_suffix = match (d.tpot_p99_before_ms, d.tpot_p99_after_ms) {
+                let p95_suffix = match (d.tpot_p95_before_ms, d.tpot_p95_after_ms) {
                     (Some(pb), Some(pa)) if pb.is_finite() && pa.is_finite() => {
-                        format!("  (p99 {pb:.1} → {pa:.1}ms {})", latency_arrow(pa - pb))
+                        format!("  (p95 {pb:.1} → {pa:.1}ms {})", latency_arrow(pa - pb))
                     }
                     _ => String::new(),
                 };
-                println!("  TPOT        {before:.1} → {after:.1}ms {arrow}{p99_suffix}");
+                println!("  TPOT        {before:.1} → {after:.1}ms {arrow}{p95_suffix}");
             }
         }
     }
@@ -506,38 +495,118 @@ mod tests {
     }
 
     #[test]
-    fn healthy_exit_no_issues_shows_no_significant_change_with_efficiency() {
-        let msg = healthy_exit_message(Some(42.5), Some(57.5), None, None);
+    fn healthy_exit_capacity_limiter() {
+        let msg = healthy_exit_message(
+            Some(42.5),
+            Some(85.0),
+            Some(50.0),
+            Some(40.0),
+            Some(20.0),
+            Some(5.0),
+            Some(false),
+        );
+        assert!(msg.contains("KV Cache Capacity"));
+        assert!(msg.contains("Efficiency: 42.5%"));
+        assert!(msg.contains("KV cache at 85%"));
+    }
+
+    #[test]
+    fn healthy_exit_traffic_limiter() {
+        let msg = healthy_exit_message(
+            Some(34.0),
+            Some(50.0),
+            Some(5.0),
+            Some(100.0),
+            Some(20.0),
+            Some(5.0),
+            Some(false),
+        );
         assert_eq!(
             msg,
-            "No significant change. Efficiency: 42.5% of hardware ceiling."
+            "No issues. Efficiency 34.0% — gap is traffic, not config. Increase load to find real limits."
         );
+        assert!(!msg.contains('\n'));
     }
 
     #[test]
-    fn healthy_exit_at_capacity_when_headroom_low() {
-        let msg = healthy_exit_message(Some(91.0), Some(9.0), None, None);
-        assert!(msg.contains("at hardware capacity: 91.0% of ceiling."));
+    fn traffic_limiter_does_not_say_optimally_tuned() {
+        let msg = healthy_exit_message(
+            Some(34.0),
+            Some(50.0),
+            Some(5.0),
+            Some(100.0),
+            Some(20.0),
+            Some(5.0),
+            Some(false),
+        );
+        assert!(msg.contains("No issues."));
+        assert!(!msg.contains("optimally tuned"));
+        assert!(!msg.contains("Rules clear"));
     }
 
     #[test]
-    fn healthy_exit_unavailable_when_efficiency_missing() {
-        let msg = healthy_exit_message(None, Some(50.0), None, None);
-        assert!(msg.contains("Efficiency unavailable"));
+    fn healthy_exit_physics_limiter() {
+        let msg = healthy_exit_message(
+            Some(91.0),
+            Some(50.0),
+            Some(50.0),
+            Some(40.0),
+            Some(11.0),
+            Some(10.0),
+            Some(false),
+        );
+        assert!(msg.contains("Physics (Hardware Ceiling)"));
+        assert!(msg.contains("Efficiency: 91.0%"));
+        assert!(msg.contains("TPOT 11.0ms vs floor 10.0ms"));
     }
 
     #[test]
-    fn healthy_exit_under_fed_when_occupancy_low() {
-        let msg = healthy_exit_message(Some(34.0), Some(66.0), Some(2.0), Some(256));
-        assert!(msg.contains("under-fed, not misconfigured"));
-        assert!(msg.contains("34.0%"));
+    fn healthy_exit_prefill_interference_limiter() {
+        let msg = healthy_exit_message(
+            Some(55.0),
+            Some(50.0),
+            Some(50.0),
+            Some(40.0),
+            Some(50.0),
+            Some(10.0),
+            Some(true),
+        );
+        assert!(msg.contains("Prefill Interference"));
+        assert!(msg.contains("Efficiency: 55.0%"));
     }
 
     #[test]
-    fn healthy_exit_no_under_fed_label_when_occupancy_high() {
-        let msg = healthy_exit_message(Some(34.0), Some(66.0), Some(200.0), Some(256));
-        assert!(msg.contains("of hardware ceiling"));
-        assert!(!msg.contains("under-fed"));
+    fn healthy_exit_framework_overhead_limiter() {
+        let msg = healthy_exit_message(
+            Some(60.0),
+            Some(50.0),
+            Some(50.0),
+            Some(40.0),
+            Some(50.0),
+            Some(10.0),
+            Some(false),
+        );
+        assert!(msg.contains("Framework Overhead"));
+        assert!(msg.contains("Efficiency: 60.0%"));
+    }
+
+    #[test]
+    fn healthy_exit_insufficient_data_when_limiter_unknown() {
+        let msg = healthy_exit_message(None, None, None, None, None, None, None);
+        assert!(msg.contains("insufficient data to identify primary limiter"));
+        assert!(msg.contains("Efficiency: unavailable"));
+        assert!(!msg.contains("optimally tuned"));
+        assert_eq!(msg.matches("Rules clear.").count(), 1);
+    }
+
+    #[test]
+    fn config_change_status_lines_for_drifted_and_not_drifted() {
+        let drifted = config_change_status_lines(true);
+        assert_eq!(drifted[0], "  Config changed, baseline reset.");
+        assert_eq!(drifted[1], "");
+        let stable = config_change_status_lines(false);
+        assert_eq!(stable[0], "  No config changed.");
+        assert_eq!(stable[1], "");
     }
 
     #[test]
@@ -551,142 +620,6 @@ mod tests {
         let line = format_efficiency_delta_line(Some(-0.06)).expect("line");
         assert!(line.contains('↓'));
         assert!(line.contains("-0.1pp"));
-    }
-
-    #[test]
-    fn direction_followup_includes_short_action_on_no_change() {
-        let lines = direction_followup_lines(
-            delta::Direction::NoChange,
-            Some("raise --max-num-seqs above 32"),
-        );
-        assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0], "No significant change.");
-        assert_eq!(
-            lines[1],
-            "Apply fix: raise --max-num-seqs above 32, then re-measure."
-        );
-    }
-
-    #[test]
-    fn direction_followup_mixed_is_empty() {
-        let lines = direction_followup_lines(
-            delta::Direction::Mixed,
-            Some("raise --max-num-seqs above 32"),
-        );
-        assert!(lines.is_empty());
-    }
-
-    #[test]
-    fn direction_followup_worse_is_empty() {
-        let lines =
-            direction_followup_lines(delta::Direction::Worse, Some("increase client concurrency"));
-        assert!(lines.is_empty());
-    }
-
-    #[test]
-    fn parse_worse_regression_choice_accepts_r_and_c() {
-        assert_eq!(
-            parse_worse_regression_choice("c\n"),
-            Some(WorseRegressionChoice::Continue)
-        );
-        assert_eq!(
-            parse_worse_regression_choice("R"),
-            Some(WorseRegressionChoice::Revert)
-        );
-        assert_eq!(parse_worse_regression_choice("x"), None);
-    }
-
-    #[test]
-    fn read_worse_regression_choice_reprompts_on_invalid_input() {
-        let (tx, rx) = std::sync::mpsc::channel();
-        tx.send("x\n".to_string()).unwrap();
-        tx.send("r\n".to_string()).unwrap();
-        let mut out = Vec::new();
-        let choice = read_worse_regression_choice(&rx, &mut out).unwrap();
-        assert_eq!(choice, WorseRegressionChoice::Revert);
-        let text = String::from_utf8(out).unwrap();
-        assert!(text.contains(" r = revert, c = continue"));
-    }
-
-    #[test]
-    fn worse_pauses_loop_before_next_recommendation() {
-        assert!(!apply_worse_regression_choice(
-            &mut LoopState::new(minimal_diagnose(), empty_report()),
-            minimal_diagnose(),
-            empty_report(),
-            "under_batching",
-            WorseRegressionChoice::Revert,
-        ));
-    }
-
-    #[test]
-    fn acknowledge_sets_prev_to_curr() {
-        let mut s = LoopState::new(minimal_diagnose(), empty_report());
-        let mut new = minimal_diagnose();
-        new.snapshot.vllm.generation_tokens_per_sec = Some(80.0);
-        assert!(apply_worse_regression_choice(
-            &mut s,
-            new,
-            empty_report(),
-            "under_batching",
-            WorseRegressionChoice::Continue,
-        ));
-        assert_eq!(
-            s.last().result.snapshot.vllm.generation_tokens_per_sec,
-            Some(80.0)
-        );
-    }
-
-    #[test]
-    fn revert_does_not_update_prev() {
-        let mut prev = minimal_diagnose();
-        prev.snapshot.vllm.generation_tokens_per_sec = Some(100.0);
-        let mut s = LoopState::new(prev, empty_report());
-        let mut degraded = minimal_diagnose();
-        degraded.snapshot.vllm.generation_tokens_per_sec = Some(80.0);
-        assert!(!apply_worse_regression_choice(
-            &mut s,
-            degraded,
-            empty_report(),
-            "under_batching",
-            WorseRegressionChoice::Revert,
-        ));
-        assert_eq!(
-            s.last().result.snapshot.vllm.generation_tokens_per_sec,
-            Some(100.0)
-        );
-    }
-
-    fn minimal_diagnose() -> DiagnoseResult {
-        DiagnoseResult {
-            snapshot: crate::collectors::RawSnapshot {
-                gpu_observed_at: std::time::SystemTime::UNIX_EPOCH,
-                vllm_observed_at: std::time::SystemTime::UNIX_EPOCH,
-                timestamp: std::time::SystemTime::UNIX_EPOCH,
-                vllm: crate::collectors::VllmRawMetrics::default(),
-                gpu: crate::collectors::GpuRawMetrics::default(),
-            },
-            windows: Vec::new(),
-            static_ctx: crate::context::StaticContext::default(),
-            duration: Duration::from_secs(2),
-            started_at: std::time::SystemTime::UNIX_EPOCH,
-            any_evaluable: true,
-            metrics_input: String::new(),
-        }
-    }
-
-    fn empty_report() -> engine::Report {
-        engine::Report {
-            baseline: None,
-            groups: Vec::new(),
-            r2_suppressed_by_r4: false,
-        }
-    }
-
-    #[test]
-    fn direction_followup_omits_fix_when_short_action_missing() {
-        let lines = direction_followup_lines(delta::Direction::NoChange, None);
-        assert!(lines.is_empty());
     }
 
     #[test]
@@ -741,10 +674,13 @@ mod tests {
             ttft_p99_after_ms: None,
             tpot_p99_before_ms: None,
             tpot_p99_after_ms: None,
-            direction: delta::Direction::NoChange,
-            direction_reason: None,
+            ttft_p95_before_ms: None,
+            ttft_p95_after_ms: None,
+            tpot_p95_before_ms: None,
+            tpot_p95_after_ms: None,
             ttft_p99_delta_pct: None,
-            veto_fired: false,
+            ttft_p95_delta_pct: None,
+            tpot_p95_delta_pct: None,
             config_drifted: false,
         };
         assert!(economics_section_active(&d));
@@ -772,10 +708,13 @@ mod tests {
             ttft_p99_after_ms: None,
             tpot_p99_before_ms: None,
             tpot_p99_after_ms: None,
-            direction: delta::Direction::Better,
-            direction_reason: None,
+            ttft_p95_before_ms: None,
+            ttft_p95_after_ms: None,
+            tpot_p95_before_ms: None,
+            tpot_p95_after_ms: None,
             ttft_p99_delta_pct: None,
-            veto_fired: false,
+            ttft_p95_delta_pct: None,
+            tpot_p95_delta_pct: None,
             config_drifted: false,
         };
         assert!(recoverable_waste_available(&d));
