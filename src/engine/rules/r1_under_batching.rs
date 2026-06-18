@@ -148,8 +148,8 @@ pub fn r1_recommendation(
         rule_name: "under_batching",
         impact: 4,
         confidence: 0.8,
-        action: "Increase client concurrency".to_string(),
-        short_action: r1_short_action(),
+        action: "Batch more requests or increase client concurrency".to_string(),
+        short_action: r1_short_action(d.running, d.max_num_seqs),
         expected_impact: "Higher throughput, stable TPOT".to_string(),
         display_lines: format_under_batching_fired(&d, 0.8),
     })
@@ -175,8 +175,14 @@ pub fn r1_verbose_miss_line(
     }
 }
 
-pub(super) fn r1_short_action() -> String {
-    "raise client concurrency".to_string()
+pub(super) fn r1_short_action(running: f64, max_num_seqs: Option<u32>) -> String {
+    match max_num_seqs {
+        Some(max_n) => {
+            let idle = (f64::from(max_n) - running).max(0.0);
+            format!("batch more requests or increase client concurrency ({idle:.0} slots idle)")
+        }
+        None => "raise client concurrency".to_string(),
+    }
 }
 
 pub(super) fn format_under_batching_fired(d: &UnderBatchingDetail, confidence: f64) -> Vec<String> {
@@ -194,7 +200,13 @@ pub(super) fn format_under_batching_fired(d: &UnderBatchingDetail, confidence: f
             d.occupancy_pct
         )
     };
-    let fix_line = "    • Increase client concurrency".to_string();
+    let fix_line = match d.max_num_seqs {
+        Some(max_n) => {
+            let idle = (f64::from(max_n) - d.running).max(0.0);
+            format!("    • Batch more requests or increase client concurrency ({idle:.0} slots idle)")
+        }
+        None => "    • Increase client concurrency".to_string(),
+    };
     let confidence_str = if confidence >= 0.8 { "High" } else { "Medium" };
 
     vec![
@@ -512,7 +524,7 @@ mod tests {
     fn short_action_is_raise_client_concurrency() {
         let s = entry_fired_snap();
         let r = r1_recommendation(&s, None, None).expect("fired");
-        assert_eq!(r.short_action, "raise client concurrency");
+        assert_eq!(r.short_action, "batch more requests or increase client concurrency (251 slots idle)");
     }
 
     #[test]
@@ -520,9 +532,8 @@ mod tests {
         let s = entry_fired_snap();
         let r = r1_recommendation(&s, None, None).expect("fired");
         let text = r.display_lines.join("\n");
-        assert!(text.contains("    • Increase client concurrency"));
+        assert!(text.contains("    • Batch more requests or increase client concurrency (251 slots idle)"));
         assert!(!text.contains("hardware limit"));
-        assert!(!text.contains("slots idle"));
         assert!(!text.contains("KV ceiling"));
     }
 

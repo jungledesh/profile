@@ -612,7 +612,7 @@ fn build_report_from_eval(
             impact: 4,
             confidence: 0.8,
             action: "Increase client concurrency".to_string(),
-            short_action: r1_short_action(),
+            short_action: r1_short_action(d.running, d.max_num_seqs),
             expected_impact: "Higher throughput, stable TPOT".to_string(),
             display_lines,
         });
@@ -1363,8 +1363,7 @@ mod tests {
         assert!(text.contains("threshold: < 25%"));
         assert!(text.contains("  Cause:"));
         assert!(text.contains("under-fed by client"));
-        assert!(text.contains("    • Increase client concurrency"));
-        assert!(!text.contains("slots idle"));
+        assert!(text.contains("    • Increase client concurrency (251 slots idle)"));
         assert!(text.contains("Expected: Higher throughput, stable TPOT."));
         assert!(
             text.contains("Confidence: High") || text.contains("Confidence: Medium"),
