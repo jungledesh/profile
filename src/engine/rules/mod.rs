@@ -33,7 +33,7 @@ use r1_under_batching::{
 use r2_kv_cache_pressure::{
     aggregate_backlog_detail, aggregate_r2_detail, format_kv_admission_backlog_issue,
     format_kv_cache_window_issue, kv_pressure_confidence, r2_action, r2_backlog_short_action,
-    r2_kv_pressure_short_action, KvPressureFormatOpts,
+    r2_kv_pressure_short_action, KvFormatCtx,
 };
 #[cfg(test)]
 use r3_low_prefix_reuse::format_low_prefix_hit_rate_fired;
@@ -637,8 +637,12 @@ fn build_report_from_eval(
 
     if eval.r1_significant() {
         let d = aggregate_r1_detail(&eval.r1_details);
-        let display_lines =
-            format_under_batching_window_issue(&d, pct(eval.r1_fired, eval.n_eval), 0.8);
+        let display_lines = format_under_batching_window_issue(
+            &d,
+            pct(eval.r1_fired, eval.n_eval),
+            summary_snap,
+            0.8,
+        );
         recs.push(Recommendation {
             rule_name: "under_batching",
             impact: 4,
@@ -656,14 +660,14 @@ fn build_report_from_eval(
         let display_lines = format_kv_cache_window_issue(
             &r2_agg,
             pct(eval.r2_fired, eval.n_eval),
-            summary_snap,
-            eval.r2_fired,
-            eval.n_eval,
-            KvPressureFormatOpts {
+            &KvFormatCtx {
+                snapshot: summary_snap,
                 max_model_len,
                 kv_headroom_gb,
                 kv_max_seqs,
             },
+            eval.r2_fired,
+            eval.n_eval,
         );
         recs.push(Recommendation {
             rule_name: "kv_cache_pressure",
@@ -973,6 +977,7 @@ pub fn format_diagnose_rules_for_windows(
         let block = format_under_batching_window_issue(
             &aggregate_r1_detail(r1_details),
             pct(r1_fired, n_eval),
+            summary_snap,
             0.8,
         );
         warnings.extend(block);
@@ -984,14 +989,14 @@ pub fn format_diagnose_rules_for_windows(
         let block = format_kv_cache_window_issue(
             &r2_agg,
             pct(r2_fired, n_eval),
-            summary_snap,
-            r2_fired,
-            n_eval,
-            KvPressureFormatOpts {
+            &KvFormatCtx {
+                snapshot: summary_snap,
                 max_model_len: summary.ctx.config.max_model_len,
                 kv_headroom_gb: summary_baseline.as_ref().and_then(|b| b.kv_headroom_gb),
                 kv_max_seqs,
             },
+            r2_fired,
+            n_eval,
         );
         warnings.extend(block);
         warnings.push(String::new());
@@ -2151,7 +2156,7 @@ mod tests {
         assert!(text.contains("threshold: < 60%"));
         assert!(text.contains("  Cause:"));
         assert!(
-            text.contains("Batch more requests or increase client concurrency (214 slots idle)")
+            text.contains("Batch more requests or increase client concurrency (156 slots idle)")
         );
         assert!(!text.contains("KV cache pressure: not triggered"));
         assert!(!text.contains("Low prefix reuse: not triggered"));

@@ -236,12 +236,14 @@ pub fn r2_recommendation(
         expected_impact: "Reduced KV evictions and lower latency variance".to_string(),
         display_lines: format_kv_cache_pressure_fired(
             &d,
-            snapshot,
+            &KvFormatCtx {
+                snapshot,
+                max_model_len,
+                kv_headroom_gb,
+                kv_max_seqs,
+            },
             windows_fired,
             total_evaluable,
-            max_model_len,
-            kv_headroom_gb,
-            kv_max_seqs,
         ),
     })
 }
@@ -322,16 +324,25 @@ fn max_num_seqs_bullet(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+pub(super) struct KvFormatCtx<'a> {
+    pub snapshot: &'a RawSnapshot,
+    pub max_model_len: Option<u32>,
+    pub kv_headroom_gb: Option<f64>,
+    pub kv_max_seqs: Option<u32>,
+}
+
 pub(super) fn format_kv_cache_pressure_fired(
     d: &KvCachePressureDetail,
-    snapshot: &RawSnapshot,
+    ctx: &KvFormatCtx<'_>,
     windows_fired: usize,
     total_evaluable: usize,
-    max_model_len: Option<u32>,
-    kv_headroom_gb: Option<f64>,
-    kv_max_seqs: Option<u32>,
 ) -> Vec<String> {
+    let KvFormatCtx {
+        snapshot,
+        max_model_len,
+        kv_headroom_gb,
+        kv_max_seqs,
+    } = *ctx;
     let peak = snapshot
         .vllm
         .kv_cache_peak_perc
@@ -478,29 +489,14 @@ pub(super) fn aggregate_backlog_detail(
     }
 }
 
-pub(super) struct KvPressureFormatOpts {
-    pub max_model_len: Option<u32>,
-    pub kv_headroom_gb: Option<f64>,
-    pub kv_max_seqs: Option<u32>,
-}
-
 pub(super) fn format_kv_cache_window_issue(
     d: &KvCachePressureDetail,
     seen_pct: u32,
-    snapshot: &RawSnapshot,
+    ctx: &KvFormatCtx<'_>,
     windows_fired: usize,
     total_evaluable: usize,
-    opts: KvPressureFormatOpts,
 ) -> Vec<String> {
-    let mut lines = format_kv_cache_pressure_fired(
-        d,
-        snapshot,
-        windows_fired,
-        total_evaluable,
-        opts.max_model_len,
-        opts.kv_headroom_gb,
-        opts.kv_max_seqs,
-    );
+    let mut lines = format_kv_cache_pressure_fired(d, ctx, windows_fired, total_evaluable);
     lines.insert(1, format!("  Seen in {seen_pct}% of windows"));
     lines
 }
@@ -541,6 +537,20 @@ mod tests {
             timestamp: SystemTime::UNIX_EPOCH,
             vllm,
             gpu: GpuRawMetrics::default(),
+        }
+    }
+
+    fn kv_ctx<'a>(
+        snapshot: &'a RawSnapshot,
+        max_model_len: Option<u32>,
+        kv_headroom_gb: Option<f64>,
+        kv_max_seqs: Option<u32>,
+    ) -> KvFormatCtx<'a> {
+        KvFormatCtx {
+            snapshot,
+            max_model_len,
+            kv_headroom_gb,
+            kv_max_seqs,
         }
     }
 
@@ -685,20 +695,22 @@ mod tests {
             kv_cache_usage_perc: Some(90.0),
             ..Default::default()
         };
+        let s = snap(v.clone());
         let single = format_kv_cache_pressure_fired(
             &detail(90.0, true),
-            &snap(v.clone()),
+            &kv_ctx(&s, None, None, None),
             1,
             1,
-            None,
-            None,
-            None,
         )
         .join("\n");
         assert!(!single.contains("Confidence:"));
-        let stable =
-            format_kv_cache_pressure_fired(&detail(90.0, true), &snap(v), 3, 4, None, None, None)
-                .join("\n");
+        let stable = format_kv_cache_pressure_fired(
+            &detail(90.0, true),
+            &kv_ctx(&snap(v), None, None, None),
+            3,
+            4,
+        )
+        .join("\n");
         assert!(stable.contains("Confidence: Medium-High"));
     }
 
@@ -870,7 +882,8 @@ mod tests {
             queue_backpressure: true,
         };
         let text =
-            format_kv_cache_pressure_fired(&d, &snap(v), 3, 4, Some(4096), None, None).join("\n");
+            format_kv_cache_pressure_fired(&d, &kv_ctx(&snap(v), Some(4096), None, None), 3, 4)
+                .join("\n");
         assert!(text.contains("to ~6450"));
         assert!(text.contains("Truncation risk"));
     }
@@ -887,12 +900,9 @@ mod tests {
         };
         let text = format_kv_cache_pressure_fired(
             &detail(90.0, true),
-            &snap(v),
+            &kv_ctx(&snap(v), Some(8192), None, None),
             3,
             4,
-            Some(8192),
-            None,
-            None,
         )
         .join("\n");
         assert!(text.contains("to ~6450"));
@@ -906,9 +916,13 @@ mod tests {
             num_preemptions_per_sec: Some(0.05),
             ..Default::default()
         };
-        let text =
-            format_kv_cache_pressure_fired(&detail(90.0, true), &snap(v), 3, 4, None, None, None)
-                .join("\n");
+        let text = format_kv_cache_pressure_fired(
+            &detail(90.0, true),
+            &kv_ctx(&snap(v), None, None, None),
+            3,
+            4,
+        )
+        .join("\n");
         assert!(!text.contains("--max-model-len"));
     }
 
@@ -921,12 +935,9 @@ mod tests {
         };
         let text = format_kv_cache_pressure_fired(
             &detail(90.0, true),
-            &snap(v),
+            &kv_ctx(&snap(v), Some(4096), None, Some(16)),
             3,
             4,
-            Some(4096),
-            None,
-            Some(16),
         )
         .join("\n");
         assert!(
@@ -1057,7 +1068,8 @@ mod tests {
             num_requests_waiting: Some(5.0),
             ..Default::default()
         };
-        let text = format_kv_cache_pressure_fired(&d, &snap(v), 1, 1, None, None, None).join("\n");
+        let text = format_kv_cache_pressure_fired(&d, &kv_ctx(&snap(v), None, None, None), 1, 1)
+            .join("\n");
         assert!(text.contains("Wait queue drains"));
         assert!(!text.contains("evictions stop"));
     }
@@ -1076,7 +1088,8 @@ mod tests {
             num_requests_waiting: Some(5.0),
             ..Default::default()
         };
-        let text = format_kv_cache_pressure_fired(&d, &snap(v), 1, 1, None, None, None).join("\n");
+        let text = format_kv_cache_pressure_fired(&d, &kv_ctx(&snap(v), None, None, None), 1, 1)
+            .join("\n");
         assert!(text.contains("Lower --max-num-seqs to free KV blocks"));
     }
 
@@ -1094,7 +1107,8 @@ mod tests {
             ..Default::default()
         };
         let text =
-            format_kv_cache_pressure_fired(&d, &snap(v), 1, 1, None, Some(1.0), None).join("\n");
+            format_kv_cache_pressure_fired(&d, &kv_ctx(&snap(v), None, Some(1.0), None), 1, 1)
+                .join("\n");
         assert!(text.contains("GPU at VRAM capacity"));
         assert!(!text.contains("30GB VRAM available"));
     }
@@ -1108,12 +1122,9 @@ mod tests {
         };
         let text = format_kv_cache_pressure_fired(
             &detail(90.0, true),
-            &snap(v),
+            &kv_ctx(&snap(v), None, Some(30.0), None),
             1,
             1,
-            None,
-            Some(30.0),
-            None,
         )
         .join("\n");
         assert!(text.contains(
@@ -1134,7 +1145,8 @@ mod tests {
             num_requests_waiting: Some(5.0),
             ..Default::default()
         };
-        let text = format_kv_cache_pressure_fired(&d, &snap(v), 1, 1, None, None, None).join("\n");
+        let text = format_kv_cache_pressure_fired(&d, &kv_ctx(&snap(v), None, None, None), 1, 1)
+            .join("\n");
         assert!(text.contains(
             "Raise --gpu-memory-utilization (check vRAM header for avail mem) to expand KV pool"
         ));
@@ -1153,14 +1165,19 @@ mod tests {
             },
             ..Default::default()
         };
-        let with_bullet =
-            format_kv_cache_pressure_fired(&d, &snap(v_long.clone()), 1, 1, None, None, None)
-                .join("\n");
+        let with_bullet = format_kv_cache_pressure_fired(
+            &d,
+            &kv_ctx(&snap(v_long.clone()), None, None, None),
+            1,
+            1,
+        )
+        .join("\n");
         assert!(with_bullet.contains("Enable --enable-prefix-caching"));
 
         v_long.prompt_tokens_mean = Some(150.0);
         let without_bullet =
-            format_kv_cache_pressure_fired(&d, &snap(v_long), 1, 1, None, None, None).join("\n");
+            format_kv_cache_pressure_fired(&d, &kv_ctx(&snap(v_long), None, None, None), 1, 1)
+                .join("\n");
         assert!(!without_bullet.contains("Enable --enable-prefix-caching"));
     }
 

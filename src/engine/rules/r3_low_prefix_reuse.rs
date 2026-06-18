@@ -118,12 +118,15 @@ pub fn r3_recommendation(snapshot: &RawSnapshot) -> Option<Recommendation> {
 }
 
 fn prompt_throughput_cause_line(qps: f64, prompt_mean: Option<f64>) -> Option<String> {
-    prompt_mean.map(|pm| {
-        format!(
+    prompt_mean.and_then(|pm| {
+        let tp = qps * pm;
+        if tp < PREFIX_RULE_MIN_PROMPT_TPS {
+            return None;
+        }
+        Some(format!(
             "  - Prompt throughput: {:.0} tok/s (threshold: {:.0})",
-            qps * pm,
-            PREFIX_RULE_MIN_PROMPT_TPS
-        )
+            tp, PREFIX_RULE_MIN_PROMPT_TPS
+        ))
     })
 }
 
@@ -455,6 +458,18 @@ mod tests {
             queries_delta: None,
         };
         let text = format_low_prefix_hit_rate_fired(&d, Some(true), 10.0, None, None).join("\n");
+        assert!(!text.contains("Prompt throughput"));
+    }
+
+    #[test]
+    fn throughput_line_hidden_when_below_threshold() {
+        let d = LowPrefixReuseDetail {
+            hit_rate: Some(0.10),
+            prompt_tokens_mean: Some(64.0),
+            queries_delta: None,
+        };
+        let text =
+            format_low_prefix_hit_rate_fired(&d, Some(true), 10.0, Some(64.0), None).join("\n");
         assert!(!text.contains("Prompt throughput"));
     }
 

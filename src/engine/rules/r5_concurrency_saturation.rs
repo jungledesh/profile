@@ -146,6 +146,11 @@ pub(super) fn format_concurrency_saturation_issue(
     };
 
     // Prefer snapshot for display; header reads the same source.
+    let display_run = snapshot
+        .vllm
+        .num_requests_running
+        .filter(|v| v.is_finite())
+        .unwrap_or(d.requests_running);
     let display_wait = snapshot
         .vllm
         .num_requests_waiting
@@ -176,8 +181,8 @@ pub(super) fn format_concurrency_saturation_issue(
         "  Cause:".to_string(),
         format!("    • --max-num-seqs={max_str} hit: scheduler won't admit more sequences"),
         format!(
-            "    • {:.0}% of requests waiting ({:.0} of {} active)",
-            display_queue_pct, display_wait, max_str
+            "    • {:.0}% of requests waiting ({:.0} waiting, {:.0} running)",
+            display_queue_pct, display_wait, display_run
         ),
     ];
     match (display_p_x, display_avg) {
@@ -594,7 +599,7 @@ mod tests {
     }
 
     #[test]
-    fn cause_waiting_line_uses_max_num_seqs_not_run_plus_wait() {
+    fn cause_waiting_line_shows_wait_and_run_explicitly() {
         let mut d = fired_detail(None, None);
         d.max_num_seqs = Some(13);
         d.requests_running = 13.0;
@@ -607,7 +612,8 @@ mod tests {
             ..Default::default()
         });
         let text = format_concurrency_saturation_issue(&d, None, None, &s).join("\n");
-        assert!(text.contains("of 13 active"));
+        assert!(text.contains("237 waiting, 13 running"));
+        assert!(!text.contains("of 13 active"));
         assert!(!text.contains("of 250 active"));
     }
 

@@ -33,6 +33,7 @@ pub fn wait_for_restart_or_skip(
     metrics_url: &str,
     stdin_rx: &mpsc::Receiver<String>,
 ) -> WaitOutcome {
+    println!();
     println!("Apply your change. Press Enter when done.");
 
     let url = metrics_url.to_string();
