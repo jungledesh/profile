@@ -590,6 +590,7 @@ fn build_report_from_eval(
 
     let summary_snap = &summary.window.snapshot;
     let max_model_len = summary.ctx.config.max_model_len;
+    let prompt_tokens_mean = summary_snap.vllm.prompt_tokens_mean;
     let kv_headroom_gb = baseline.as_ref().and_then(|b| b.kv_headroom_gb);
     let kv_max_seqs: Option<u32> = compute_kv_max_seqs(
         kv_headroom_gb,
@@ -675,6 +676,7 @@ fn build_report_from_eval(
                 pct(eval.r5_fired, eval.n_eval),
                 max_model_len,
                 kv_max_seqs,
+                prompt_tokens_mean,
             );
             recs.push(Recommendation {
                 rule_name: "concurrency_saturation",
@@ -683,7 +685,7 @@ fn build_report_from_eval(
                     (Some(_), Some(_)) => 0.9,
                     _ => 0.6,
                 },
-                action: r5_action(&agg, kv_max_seqs, max_model_len),
+                action: r5_action(&agg, kv_max_seqs, max_model_len, prompt_tokens_mean),
                 short_action: r5_short_action(&agg, kv_max_seqs, max_model_len),
                 expected_impact: "Queue drains, TTFT recovers.".to_string(),
                 display_lines,
@@ -982,6 +984,7 @@ pub fn format_diagnose_rules_for_windows(
                 pct(r5_fired, n_eval),
                 summary.ctx.config.max_model_len,
                 kv_max_seqs,
+                summary_snap.vllm.prompt_tokens_mean,
             );
             warnings.extend(block);
             warnings.push(String::new());
