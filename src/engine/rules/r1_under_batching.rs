@@ -181,7 +181,7 @@ pub(super) fn r1_short_action(running: f64, max_num_seqs: Option<u32>) -> String
             let idle = (f64::from(max_n) - running).max(0.0);
             format!("batch more requests or increase client concurrency ({idle:.0} slots idle)")
         }
-        None => "raise client concurrency".to_string(),
+        None => "batch more requests or increase client concurrency".to_string(),
     }
 }
 
@@ -207,7 +207,7 @@ pub(super) fn format_under_batching_fired(d: &UnderBatchingDetail, confidence: f
                 "    • Batch more requests or increase client concurrency ({idle:.0} slots idle)"
             )
         }
-        None => "    • Increase client concurrency".to_string(),
+        None => "    • Batch more requests or increase client concurrency".to_string(),
     };
     let confidence_str = if confidence >= 0.8 { "High" } else { "Medium" };
 
@@ -523,7 +523,7 @@ mod tests {
     }
 
     #[test]
-    fn short_action_is_raise_client_concurrency() {
+    fn short_action_includes_batch_or_increase_concurrency() {
         let s = entry_fired_snap();
         let r = r1_recommendation(&s, None, None).expect("fired");
         assert_eq!(
