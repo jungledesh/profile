@@ -32,6 +32,8 @@ Profile computes the theoretical physics ceiling for your exact model and GPU, m
 
 ### Real World Impact: Qwen3.6-27B on A100-SXM4-80GB
 
+📺 **[Watch the 15x optimization demo](https://www.youtube.com/watch?v=XuPPKBteWH0)**
+
 **Before Profile:**
 
 - Throughput: `31 tok/s`
@@ -46,7 +48,7 @@ Profile computes the theoretical physics ceiling for your exact model and GPU, m
 
 ```text
 +----------------------------------------------------------------------------------------------------+
-|PROFILE v2.1.3 [Qwen3.6-27B] [NVIDIA A100-SXM4-80GB] (1m from 2026-06-18 22:08:40 UTC)              |
+|PROFILE v2.1.4 [Qwen3.6-27B] [NVIDIA A100-SXM4-80GB] (1m from 2026-06-18 22:08:40 UTC)              |
 |                                                                                                    |
 |GPU =>     EFFICIENCY 8.1% | POWER 390W | 0.83 J/tok | $0.89/1M tok (est) | vRAM 77/80GB (peak 79GB)|
 |                                                                                                    |
