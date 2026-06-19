@@ -77,8 +77,8 @@ Profile computes the theoretical physics ceiling for your exact model and GPU, m
 
 ```bash
 # Linux x86_64
-curl -L https://github.com/jungledesh/profile/releases/latest/download/profile-x86_64-unknown-linux-gnu.tar.xz | tar -xJ
-chmod +x profile && sudo mv profile /usr/local/bin/
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/jungledesh/profile/releases/latest/download/profile-installer.sh | sh
 
 # Start profiling your vLLM server
 profile diagnose --url http://localhost:8000/metrics --duration 1m
