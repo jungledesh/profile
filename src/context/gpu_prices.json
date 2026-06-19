@@ -7,7 +7,12 @@
       "on_demand_per_hr": 1.00,
       "spot_per_hr": 0.40
     },
-    "a100": {
+    "a100 40gb": {
+      "name": "NVIDIA A100 40GB",
+      "on_demand_per_hr": 1.50,
+      "spot_per_hr": 0.70
+    },
+    "a100 80gb": {
       "name": "NVIDIA A100 80GB",
       "on_demand_per_hr": 1.50,
       "spot_per_hr": 0.60
@@ -24,33 +29,58 @@
     },
     "h100 sxm": {
       "name": "NVIDIA H100 SXM",
-      "on_demand_per_hr": 3.45,
-      "spot_per_hr": 1.85
+      "on_demand_per_hr": 2.80,
+      "spot_per_hr": 1.75
     },
     "h100 hbm3": {
       "name": "NVIDIA H100 SXM (HBM3)",
-      "on_demand_per_hr": 3.45,
-      "spot_per_hr": 1.85
+      "on_demand_per_hr": 2.80,
+      "spot_per_hr": 1.75
     },
     "h200": {
       "name": "NVIDIA H200",
       "on_demand_per_hr": 3.50,
-      "spot_per_hr": 2.00
+      "spot_per_hr": 2.50
     },
     "b200": {
       "name": "NVIDIA B200",
-      "on_demand_per_hr": 6.00,
-      "spot_per_hr": 3.50
+      "on_demand_per_hr": 3.50,
+      "spot_per_hr": 2.00
     },
     "gb200": {
       "name": "NVIDIA GB200",
       "on_demand_per_hr": 8.50,
       "spot_per_hr": 4.00
     },
-    "gb10": {
-      "name": "NVIDIA DGX Spark (GB10)",
-      "on_demand_per_hr": 0.13,
+    "rtx 4090": {
+      "name": "NVIDIA RTX 4090",
+      "on_demand_per_hr": 0.44,
+      "spot_per_hr": 0.35
+    },
+    "rtx 5090": {
+      "name": "NVIDIA RTX 5090",
+      "on_demand_per_hr": 0.69,
+      "spot_per_hr": 0.40
+    },
+    "rtx 3090": {
+      "name": "NVIDIA RTX 3090",
+      "on_demand_per_hr": 0.20,
+      "spot_per_hr": 0.14
+    },
+    "rtx 3090 ti": {
+      "name": "NVIDIA RTX 3090 Ti",
+      "on_demand_per_hr": 0.22,
       "spot_per_hr": 0.13
+    },
+    "rtx a6000": {
+      "name": "NVIDIA RTX A6000",
+      "on_demand_per_hr": 0.65,
+      "spot_per_hr": 0.40
+    },
+    "rtx pro 6000 blackwell": {
+      "name": "NVIDIA RTX PRO 6000 Blackwell",
+      "on_demand_per_hr": 1.80,
+      "spot_per_hr": 0.90
     }
   }
 }

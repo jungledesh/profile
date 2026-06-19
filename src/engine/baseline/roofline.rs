@@ -1010,7 +1010,7 @@ mod tests {
         let cost = b.cost.expect("cost");
         assert_eq!(cost.cost_source, CostSource::Catalog);
         let cpm = cost.cost_per_million_tokens.expect("cpm");
-        let expected = 3.45 * 1_000_000.0 / (100.0 * 3600.0);
+        let expected = 2.80 * 1_000_000.0 / (100.0 * 3600.0);
         assert!((cpm - expected).abs() < 1e-6);
     }
 

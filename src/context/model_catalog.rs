@@ -187,7 +187,8 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_layers: None,
         },
     },
-    // ── Qwen 3.6 dense ───────────────────────────────────────────────────────
+    // ── Qwen 3.6 dense / hybrid ──────────────────────────────────────────────
+    // (Qwen3.6 35B entry removed: no official release)
     // Before generic qwen3 size entries — "7b" is a substring of "27b".
     // Released April 2026. Dense 27B; hybrid gated-DeltaNet + attention blocks.
     // Only attention layers use KV cache — standard num_layers formula overstates.
@@ -410,13 +411,13 @@ static CATALOG: &[ModelEntry] = &[
         },
     },
     // ── Mistral Large 3 ──────────────────────────────────────────────────────
-    // 675B MoE (52B active est.)
+    // 675B MoE (41B active est.)
     ModelEntry {
         tokens: &["mistral", "large", "675b"],
         entry: CatalogEntry {
             family: "mistral",
             param_count: 675 * B,
-            active_param_count: Some(52 * B),
+            active_param_count: Some(41 * B),
             num_layers: 88,
             hidden_dim: 8192,
             is_moe: true,
@@ -507,7 +508,59 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_layers: None,
         },
     },
-    // ── Gemma 2 / 3 ──────────────────────────────────────────────────────────
+    // ── Gemma 2 / 3 / 4 ──────────────────────────────────────────────────────
+    // Gemma 4 flagship: Google markets as "27B"; actual param count ~31B.
+    // Two token entries cover both HuggingFace name ("gemma-4-27b-it") and
+    // quantized GGUFs ("gemma-4-31b-it-bf16.gguf"). Both must appear before
+    // the Gemma 2 27B entry — otherwise "gemma-4-27b-it" falls through and
+    // matches Gemma 2 27B (wrong arch params).
+    // KV architecture non-standard (per-token head quantization): num_kv_heads = None.
+    ModelEntry {
+        tokens: &["gemma", "4", "27b"],
+        entry: CatalogEntry {
+            family: "gemma4",
+            param_count: 31 * B,
+            active_param_count: None,
+            num_layers: 60,
+            hidden_dim: 5376,
+            is_moe: false,
+            default_weight_dtype: "bf16",
+            num_kv_heads: None,
+            head_dim: None,
+            num_kv_layers: None,
+        },
+    },
+    ModelEntry {
+        tokens: &["gemma", "4", "31b"],
+        entry: CatalogEntry {
+            family: "gemma4",
+            param_count: 31 * B,
+            active_param_count: None,
+            num_layers: 60,
+            hidden_dim: 5376,
+            is_moe: false,
+            default_weight_dtype: "bf16",
+            num_kv_heads: None,
+            head_dim: None,
+            num_kv_layers: None,
+        },
+    },
+    // Gemma 4 26B-A4B MoE
+    ModelEntry {
+        tokens: &["gemma", "4", "26b"],
+        entry: CatalogEntry {
+            family: "gemma4",
+            param_count: 26 * B,
+            active_param_count: Some(4 * B),
+            num_layers: 30,   // Verified from HF config
+            hidden_dim: 2816, // Verified from HF config
+            is_moe: true,
+            default_weight_dtype: "bf16",
+            num_kv_heads: None,
+            head_dim: None,
+            num_kv_layers: None,
+        },
+    },
     // Gemma 2 27B: head_dim=128, 32 attn heads, 16 KV heads.
     ModelEntry {
         tokens: &["gemma", "27b"],
@@ -548,7 +601,7 @@ static CATALOG: &[ModelEntry] = &[
             family: "kimi",
             param_count: 1_000 * B,
             active_param_count: Some(32 * B),
-            num_layers: 96,
+            num_layers: 61,
             hidden_dim: 7168,
             is_moe: true,
             default_weight_dtype: "bf16",
@@ -591,22 +644,7 @@ static CATALOG: &[ModelEntry] = &[
         },
     },
     // ── Phi-4 ────────────────────────────────────────────────────────────────
-    // Phi-4 32B (reasoning): architecture uncertain; omit KV fields.
-    ModelEntry {
-        tokens: &["phi", "4", "32b"],
-        entry: CatalogEntry {
-            family: "phi4",
-            param_count: 32 * B,
-            active_param_count: None,
-            num_layers: 40,
-            hidden_dim: 5120,
-            is_moe: false,
-            default_weight_dtype: "bf16",
-            num_kv_heads: None,
-            head_dim: None,
-            num_kv_layers: None,
-        },
-    },
+    // (Phi-4 32B phantom entry removed — no official release at this size)
     // Phi-4 14B: 40 attn heads, 10 KV heads (GQA 4:1), head_dim=128.
     ModelEntry {
         tokens: &["phi", "4", "14b"],
@@ -794,6 +832,32 @@ mod tests {
         assert_eq!(e.num_kv_heads, Some(8));
         assert_eq!(e.head_dim, Some(128));
         assert_eq!(e.num_kv_layers, Some(32));
+    }
+
+    #[test]
+    fn gemma_4_27b_hf_name() {
+        // Google's HuggingFace name — must NOT fall through to Gemma 2 27B.
+        let e = lookup_model("google/gemma-4-pt-27b-it").expect("no match");
+        assert_eq!(e.family, "gemma4");
+        assert_eq!(e.param_count, 31 * B);
+        assert_eq!(e.num_layers, 60);
+    }
+
+    #[test]
+    fn gemma_4_31b() {
+        let e = lookup_model("gemma-4-31b-it-bf16.gguf").expect("no match");
+        assert_eq!(e.family, "gemma4");
+        assert_eq!(e.param_count, 31 * B);
+        assert!(!e.is_moe);
+    }
+
+    #[test]
+    fn gemma_4_26b() {
+        let e = lookup_model("gemma-4-26b-it-bf16.gguf").expect("no match");
+        assert_eq!(e.family, "gemma4");
+        assert_eq!(e.param_count, 26 * B);
+        assert_eq!(e.active_param_count, Some(4 * B));
+        assert!(e.is_moe);
     }
 
     #[test]

@@ -90,8 +90,8 @@ static CATALOG: &[GpuEntry] = &[
         tokens: &["rtx", "pro", "6000", "blackwell"],
         entry: GpuCatalogEntry {
             arch: "blackwell",
-            peak_flops_tc_tflops: 181.0,
-            peak_bw_gbps: 960.0,
+            peak_flops_tc_tflops: 250.0,
+            peak_bw_gbps: 1792.0,
         },
     },
     // ── L40S ─────────────────────────────────────────────────────────────────
@@ -99,7 +99,7 @@ static CATALOG: &[GpuEntry] = &[
         tokens: &["l40s"],
         entry: GpuCatalogEntry {
             arch: "ada",
-            peak_flops_tc_tflops: 366.0,
+            peak_flops_tc_tflops: 362.05,
             peak_bw_gbps: 864.0,
         },
     },
@@ -110,6 +110,51 @@ static CATALOG: &[GpuEntry] = &[
             arch: "ada",
             peak_flops_tc_tflops: 165.0,
             peak_bw_gbps: 1008.0,
+        },
+    },
+    // ── RTX A6000 (Ampere) ───────────────────────────────────────────────────
+    GpuEntry {
+        tokens: &["rtx", "a6000"],
+        entry: GpuCatalogEntry {
+            arch: "ampere",
+            peak_flops_tc_tflops: 77.4,
+            peak_bw_gbps: 768.0,
+        },
+    },
+    // ── RTX 3090 Ti ──────────────────────────────────────────────────────────
+    GpuEntry {
+        tokens: &["rtx", "3090", "ti"],
+        entry: GpuCatalogEntry {
+            arch: "ampere",
+            peak_flops_tc_tflops: 80.0,
+            peak_bw_gbps: 1008.0,
+        },
+    },
+    // ── RTX 3090 ─────────────────────────────────────────────────────────────
+    GpuEntry {
+        tokens: &["rtx", "3090"],
+        entry: GpuCatalogEntry {
+            arch: "ampere",
+            peak_flops_tc_tflops: 71.16,
+            peak_bw_gbps: 936.0,
+        },
+    },
+    // ── RTX 5090 ─────────────────────────────────────────────────────────────
+    GpuEntry {
+        tokens: &["rtx", "5090"],
+        entry: GpuCatalogEntry {
+            arch: "blackwell",
+            peak_flops_tc_tflops: 209.5,
+            peak_bw_gbps: 1792.0,
+        },
+    },
+    // ── A10G ─────────────────────────────────────────────────────────────────
+    GpuEntry {
+        tokens: &["a10g"],
+        entry: GpuCatalogEntry {
+            arch: "ampere",
+            peak_flops_tc_tflops: 126.0,
+            peak_bw_gbps: 600.0,
         },
     },
 ];
@@ -215,15 +260,15 @@ mod tests {
     fn rtx_pro_6000_blackwell() {
         let e = lookup_gpu("NVIDIA RTX PRO 6000 Blackwell").expect("no match");
         assert_eq!(e.arch, "blackwell");
-        assert_eq!(e.peak_bw_gbps, 960.0);
-        assert_eq!(e.peak_flops_tc_tflops, 181.0);
+        assert_eq!(e.peak_bw_gbps, 1792.0);
+        assert_eq!(e.peak_flops_tc_tflops, 250.0);
     }
 
     #[test]
     fn l40s() {
         let e = lookup_gpu("NVIDIA L40S").expect("no match");
         assert_eq!(e.arch, "ada");
-        assert_eq!(e.peak_flops_tc_tflops, 366.0);
+        assert_eq!(e.peak_flops_tc_tflops, 362.05);
     }
 
     #[test]
@@ -231,6 +276,46 @@ mod tests {
         let e = lookup_gpu("NVIDIA GeForce RTX 4090").expect("no match");
         assert_eq!(e.arch, "ada");
         assert_eq!(e.peak_flops_tc_tflops, 165.0);
+    }
+
+    #[test]
+    fn rtx_a6000() {
+        let e = lookup_gpu("NVIDIA RTX A6000").expect("no match");
+        assert_eq!(e.arch, "ampere");
+        assert_eq!(e.peak_flops_tc_tflops, 77.4);
+        assert_eq!(e.peak_bw_gbps, 768.0);
+    }
+
+    #[test]
+    fn rtx_3090_ti() {
+        let e = lookup_gpu("NVIDIA GeForce RTX 3090 Ti").expect("no match");
+        assert_eq!(e.arch, "ampere");
+        assert_eq!(e.peak_flops_tc_tflops, 80.0);
+        assert_eq!(e.peak_bw_gbps, 1008.0);
+    }
+
+    #[test]
+    fn rtx_3090() {
+        let e = lookup_gpu("NVIDIA GeForce RTX 3090").expect("no match");
+        assert_eq!(e.arch, "ampere");
+        assert_eq!(e.peak_flops_tc_tflops, 71.16);
+        assert_eq!(e.peak_bw_gbps, 936.0);
+    }
+
+    #[test]
+    fn rtx_5090() {
+        let e = lookup_gpu("NVIDIA GeForce RTX 5090").expect("no match");
+        assert_eq!(e.arch, "blackwell");
+        assert_eq!(e.peak_flops_tc_tflops, 209.5);
+        assert_eq!(e.peak_bw_gbps, 1792.0);
+    }
+
+    #[test]
+    fn a10g() {
+        let e = lookup_gpu("NVIDIA A10G").expect("no match");
+        assert_eq!(e.arch, "ampere");
+        assert_eq!(e.peak_flops_tc_tflops, 126.0);
+        assert_eq!(e.peak_bw_gbps, 600.0);
     }
 
     #[test]
