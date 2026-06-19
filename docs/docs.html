@@ -206,23 +206,26 @@ profile diagnose --url http://HOST:8000/metrics -m 256</code></pre>
     <h2>GPUs</h2>
     <p>FP32 TFLOPs and memory bandwidth feed the roofline math. Prices are market-average estimates as of 2026-06. Use <code>--cost-per-hour</code> for exact rates.</p>
     <table>
-      <thead><tr><th>GPU</th><th>Arch</th><th>FP32 TFLOPs</th><th>Mem BW GB/s</th><th>On-demand $/hr</th><th>Spot $/hr</th></tr></thead>
+      <thead><tr><th>GPU</th><th>Arch</th><th>BF16 TC Dense TFLOPs</th><th>Mem BW GB/s</th><th>On-demand $/hr</th><th>Spot $/hr</th></tr></thead>
       <tbody>
-        <tr><td>H100 PCIe</td><td>Hopper</td><td>60.0</td><td>2,000</td><td>$2.20</td><td>$0.90</td></tr>
-        <tr><td>H100 SXM</td><td>Hopper</td><td>67.0</td><td>3,350</td><td>$3.45</td><td>$1.85</td></tr>
-        <tr><td>H200</td><td>Hopper</td><td>67.0</td><td>4,800</td><td>$3.50</td><td>$2.00</td></tr>
-        <tr><td>A100 80GB</td><td>Ampere</td><td>19.5</td><td>2,039</td><td>$1.50</td><td>$0.60</td></tr>
-        <tr><td>A100 40GB</td><td>Ampere</td><td>19.5</td><td>1,555</td><td>$1.50</td><td>$0.60</td></tr>
-        <tr><td>A10G</td><td>Ampere</td><td>—</td><td>—</td><td>$1.00</td><td>$0.40</td></tr>
-        <tr><td>L40S</td><td>Ada</td><td>91.6</td><td>864</td><td>$1.80</td><td>$0.80</td></tr>
-        <tr><td>RTX 4090</td><td>Ada</td><td>82.6</td><td>1,008</td><td>—</td><td>—</td></tr>
-        <tr><td>RTX Pro 6000 Blackwell</td><td>Blackwell</td><td>125.0</td><td>960</td><td>—</td><td>—</td></tr>
-        <tr><td>B200</td><td>Blackwell</td><td>20.0</td><td>8,000</td><td>$6.00</td><td>$3.50</td></tr>
+        <tr><td>H100 PCIe</td><td>Hopper</td><td>756.0</td><td>2,000</td><td>$2.20</td><td>$0.90</td></tr>
+        <tr><td>H100 SXM</td><td>Hopper</td><td>989.0</td><td>3,350</td><td>$2.80</td><td>$1.75</td></tr>
+        <tr><td>H200</td><td>Hopper</td><td>989.0</td><td>4,800</td><td>$3.50</td><td>$2.50</td></tr>
+        <tr><td>A100 80GB</td><td>Ampere</td><td>312.0</td><td>2,039</td><td>$1.50</td><td>$0.60</td></tr>
+        <tr><td>A100 40GB</td><td>Ampere</td><td>312.0</td><td>1,555</td><td>$1.50</td><td>$0.70</td></tr>
+        <tr><td>A10G</td><td>Ampere</td><td>126.0</td><td>600</td><td>$1.00</td><td>$0.40</td></tr>
+        <tr><td>L40S</td><td>Ada</td><td>362.05</td><td>864</td><td>$1.80</td><td>$0.80</td></tr>
+        <tr><td>RTX 5090</td><td>Blackwell</td><td>209.5</td><td>1,792</td><td>$0.69</td><td>$0.40</td></tr>
+        <tr><td>RTX 4090</td><td>Ada</td><td>165.0</td><td>1,008</td><td>$0.44</td><td>$0.35</td></tr>
+        <tr><td>RTX 3090 Ti</td><td>Ampere</td><td>80.0</td><td>1,008</td><td>$0.22</td><td>$0.13</td></tr>
+        <tr><td>RTX 3090</td><td>Ampere</td><td>71.16</td><td>936</td><td>$0.20</td><td>$0.14</td></tr>
+        <tr><td>RTX A6000</td><td>Ampere</td><td>77.4</td><td>768</td><td>$0.65</td><td>$0.40</td></tr>
+        <tr><td>RTX PRO 6000 Blackwell</td><td>Blackwell</td><td>250.0</td><td>1,792</td><td>$1.80</td><td>$0.90</td></tr>
+        <tr><td>B200</td><td>Blackwell</td><td>2,250.0</td><td>8,000</td><td>$3.50</td><td>$2.00</td></tr>
         <tr><td>GB200</td><td>Blackwell</td><td>—</td><td>—</td><td>$8.50</td><td>$4.00</td></tr>
-        <tr><td>GB10 (DGX Spark)</td><td>Blackwell</td><td>20.0</td><td>273</td><td>—</td><td>—</td></tr>
       </tbody>
     </table>
-    <div class="callout">FP32 TFLOPs are non-tensor-core throughput; the conservative roofline input. All values labeled <code>(est)</code> in output. A10G and GB200 have price entries only; roofline is skipped for those GPUs. A plain "A100" without a size token (80GB or 40GB) in the NVML name will not match; Profile requires the size to disambiguate. Prices sampled across AWS, GCP, Azure, Lambda, Nebius, RunPod, CoreWeave, and GMI Cloud.</div>
+    <div class="callout">BF16 TC Dense TFLOPs are tensor-core throughput; the physics roofline input. All values labeled <code>(est)</code> in output. GB200 has a price entry only; roofline is skipped. A plain "A100" without a size token (80GB or 40GB) in the NVML name will not match; Profile requires the size to disambiguate. Prices sampled across AWS, GCP, Azure, Lambda, Nebius, RunPod, CoreWeave, and GMI Cloud.</div>
 
     <h2>Models</h2>
     <p>Matched by token against the model name vLLM reports at startup.</p>
@@ -236,6 +239,7 @@ profile diagnose --url http://HOST:8000/metrics -m 256</code></pre>
         <tr><td>Llama 3 8B</td><td>8B</td><td>—</td><td>No</td></tr>
         <tr><td>Nemotron 70B</td><td>70B</td><td>—</td><td>No</td></tr>
         <tr><td>Nemotron 8B</td><td>8B</td><td>—</td><td>No</td></tr>
+        <tr><td>Qwen3.6 27B</td><td>27B</td><td>—</td><td>No</td></tr>
         <tr><td>Qwen3 235B</td><td>235B</td><td>22B</td><td>Yes</td></tr>
         <tr><td>Qwen3 72B</td><td>72B</td><td>—</td><td>No</td></tr>
         <tr><td>Qwen3 32B</td><td>32B</td><td>—</td><td>No</td></tr>
@@ -249,17 +253,18 @@ profile diagnose --url http://HOST:8000/metrics -m 256</code></pre>
         <tr><td>DeepSeek 671B / R1 / V3</td><td>671B</td><td>37B</td><td>Yes</td></tr>
         <tr><td>DeepSeek 70B</td><td>70B</td><td>—</td><td>No</td></tr>
         <tr><td>DeepSeek 7B</td><td>7B</td><td>—</td><td>No</td></tr>
-        <tr><td>Mistral Large 675B</td><td>675B</td><td>52B</td><td>Yes</td></tr>
+        <tr><td>Mistral Large 3 (675B)</td><td>675B</td><td>41B</td><td>Yes</td></tr>
         <tr><td>Mistral Large 123B</td><td>123B</td><td>—</td><td>No</td></tr>
         <tr><td>Mixtral 8x22B</td><td>141B</td><td>39B</td><td>Yes</td></tr>
         <tr><td>Mixtral 8x7B</td><td>47B</td><td>13B</td><td>Yes</td></tr>
         <tr><td>Mistral 7B</td><td>7B</td><td>—</td><td>No</td></tr>
+        <tr><td>Gemma 4 31B/27B</td><td>31B</td><td>—</td><td>No</td></tr>
+        <tr><td>Gemma 4 26B</td><td>26B</td><td>4B</td><td>Yes</td></tr>
         <tr><td>Gemma 27B</td><td>27B</td><td>—</td><td>No</td></tr>
         <tr><td>Gemma 9B</td><td>9B</td><td>—</td><td>No</td></tr>
         <tr><td>Kimi K2</td><td>1,000B</td><td>32B</td><td>Yes</td></tr>
         <tr><td>GLM 744B</td><td>744B</td><td>56B</td><td>Yes</td></tr>
         <tr><td>GLM 32B</td><td>32B</td><td>—</td><td>No</td></tr>
-        <tr><td>Phi 4 32B</td><td>32B</td><td>—</td><td>No</td></tr>
         <tr><td>Phi 4 14B</td><td>14B</td><td>—</td><td>No</td></tr>
       </tbody>
     </table>
@@ -611,7 +616,7 @@ AND (kv_cache_pct > 30%  OR  gpu_util_pct > 20%)
     <table>
       <thead><tr><th>Field</th><th>Source</th><th>If absent</th></tr></thead>
       <tbody>
-        <tr><td><code>peak_flops_f32_tflops</code>, <code>peak_bw_gbps</code></td><td>GPU catalog. Non-tensor-core FP32, conservative roofline input.</td><td>Ceilings not computed</td></tr>
+        <tr><td><code>peak_flops_tc_tflops</code>, <code>peak_bw_gbps</code></td><td>GPU catalog. BF16 Tensor Core dense throughput, physics roofline input.</td><td>Ceilings not computed</td></tr>
         <tr><td><code>param_count</code>, <code>active_param_count</code></td><td>Model catalog. MoE: total for weight/OOM; active for roofline.</td><td>Roofline skipped</td></tr>
         <tr><td><code>bytes_per_param</code></td><td><code>DTYPE</code> / <code>VLLM_DTYPE</code> env → <code>kv_cache_dtype</code> → catalog default → bf16 (2 bytes)</td><td>bf16 fallback, labeled in output</td></tr>
       </tbody>
