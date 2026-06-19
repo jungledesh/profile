@@ -76,7 +76,7 @@ Profile computes the theoretical physics ceiling for your exact model and GPU, m
 ## Install & Run
 
 ```bash
-# Linux x86_64
+# Download
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/jungledesh/profile/releases/latest/download/profile-installer.sh | sh
 
