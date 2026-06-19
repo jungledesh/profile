@@ -163,19 +163,16 @@ footer {
     <p class="subtitle">Physics-aware optimization loop for vLLM inference servers.</p>
 
     <div class="tldr">
-      <p class="label">What it does</p>
-      <ul>
-        <li>Computes the hardware ceiling for your model + GPU. Shows how far below it you are.</li>
-        <li>Detects the bottleneck: batching gap, KV pressure, concurrency cap, prefix cache miss.</li>
-        <li>Measures before and after. Every recommendation is accountable.</li>
-      </ul>
+      <p class="label">Introduction</p>
+      <p><strong>The Problem:</strong> vLLM exposes numerous configuration flags (e.g., <code>--max-num-seqs</code>, <code>--enable-prefix-caching</code>). Tuning them via trial and error wastes time and hardware.</p>
+      <p><strong>The Solution:</strong> Profile establishes the theoretical physics ceiling for your exact model and GPU, measures live traffic, and maps the identified bottlenecks directly to the precise vLLM flags required to resolve them.</p>
     </div>
 
     <h2>Install</h2>
     <pre><code># Linux x86_64
 wget https://github.com/jungledesh/profile/releases/latest/download/profile
 chmod +x profile
-./profile diagnose --url http://localhost:8000/metrics
+./profile diagnose --url http://localhost:8000/metrics --duration 2m
 
 # Rust toolchain
 cargo install profile-vllm</code></pre>
@@ -185,17 +182,24 @@ cargo install profile-vllm</code></pre>
 profile diagnose --url http://HOST:8000/metrics --duration 2m
 profile diagnose --url http://HOST:8000/metrics -m 256</code></pre>
 
-    <h2>What profile detects</h2>
+    <h2>Optimization Workflow</h2>
+    <p>Profile maps hardware bottlenecks directly to vLLM startup arguments. Do not guess. Measure, adjust, and verify.</p>
+    <ol>
+      <li><strong>Establish Baseline:</strong> Start vLLM with default parameters. Apply production load.</li>
+      <li><strong>Diagnose:</strong> Execute <code>profile diagnose --url http://localhost:8000/metrics --duration 2m</code>.</li>
+      <li><strong>Map Output to vLLM Flags:</strong></li>
+    </ol>
     <table>
-      <thead><tr><th>Rule</th><th>Symptom</th><th>Fix</th></tr></thead>
+      <thead><tr><th>Diagnosis</th><th>Symptom</th><th>Action</th></tr></thead>
       <tbody>
-        <tr><td><strong>R1</strong> Under-batching</td><td>GPU efficiency &lt;60%</td><td>Raise concurrency or fix client</td></tr>
-        <tr><td><strong>R2</strong> KV cache pressure</td><td>KV usage ≥88% or preemptions active</td><td>Reduce max_num_seqs or add memory</td></tr>
-        <tr><td><strong>R3</strong> Low prefix reuse</td><td>Hit rate &lt;35%</td><td>Enable prefix caching</td></tr>
-        <tr><td><strong>R4</strong> OOM risk</td><td>Weights exceed VRAM</td><td>Add tensor parallelism</td></tr>
-        <tr><td><strong>R5</strong> Concurrency saturation</td><td>max_num_seqs hit, queue building</td><td>Raise --max-num-seqs</td></tr>
+        <tr><td><strong>R1</strong> Under-batching</td><td>GPU efficiency &lt;60%.</td><td>Hardware is starved. Increase client concurrency.</td></tr>
+        <tr><td><strong>R2</strong> KV cache pressure</td><td>KV usage ≥88%. Preemptions occur.</td><td>Lower <code>--max-num-seqs</code> to Profile's recommended value.</td></tr>
+        <tr><td><strong>R3</strong> Low prefix reuse</td><td>Hit rate &lt;35%.</td><td>Wasted prefill compute. Add <code>--enable-prefix-caching</code>.</td></tr>
+        <tr><td><strong>R4</strong> OOM risk</td><td>Weights exceed VRAM.</td><td>Add <code>--tensor-parallel-size</code> or quantize.</td></tr>
+        <tr><td><strong>R5</strong> Concurrency saturation</td><td>Queueing while GPU is idle.</td><td>Raise <code>--max-num-seqs</code> to ingest requests.</td></tr>
       </tbody>
     </table>
+    <p><strong>Verify:</strong> Apply the flag, restart vLLM, and re-run Profile to confirm the bottleneck is resolved.</p>
   </article>
 
   <!-- CATALOG -->
@@ -222,7 +226,7 @@ profile diagnose --url http://HOST:8000/metrics -m 256</code></pre>
         <tr><td>RTX A6000</td><td>Ampere</td><td>77.4</td><td>768</td><td>$0.65</td><td>$0.40</td></tr>
         <tr><td>RTX PRO 6000 Blackwell</td><td>Blackwell</td><td>250.0</td><td>1,792</td><td>$1.80</td><td>$0.90</td></tr>
         <tr><td>B200</td><td>Blackwell</td><td>2,250.0</td><td>8,000</td><td>$3.50</td><td>$2.00</td></tr>
-        <tr><td>GB200</td><td>Blackwell</td><td>—</td><td>—</td><td>$8.50</td><td>$4.00</td></tr>
+        <tr><td>GB200</td><td>Blackwell</td><td>-</td><td>-</td><td>$8.50</td><td>$4.00</td></tr>
       </tbody>
     </table>
     <div class="callout">BF16 TC Dense TFLOPs are tensor-core throughput; the physics roofline input. All values labeled <code>(est)</code> in output. GB200 has a price entry only; roofline is skipped. A plain "A100" without a size token (80GB or 40GB) in the NVML name will not match; Profile requires the size to disambiguate. Prices sampled across AWS, GCP, Azure, Lambda, Nebius, RunPod, CoreWeave, and GMI Cloud.</div>
@@ -234,38 +238,38 @@ profile diagnose --url http://HOST:8000/metrics -m 256</code></pre>
       <tbody>
         <tr><td>Llama 4 Maverick</td><td>400B</td><td>17B</td><td>Yes</td></tr>
         <tr><td>Llama 4 Scout</td><td>109B</td><td>17B</td><td>Yes</td></tr>
-        <tr><td>Llama 3 405B</td><td>405B</td><td>—</td><td>No</td></tr>
-        <tr><td>Llama 3 70B</td><td>70B</td><td>—</td><td>No</td></tr>
-        <tr><td>Llama 3 8B</td><td>8B</td><td>—</td><td>No</td></tr>
-        <tr><td>Nemotron 70B</td><td>70B</td><td>—</td><td>No</td></tr>
-        <tr><td>Nemotron 8B</td><td>8B</td><td>—</td><td>No</td></tr>
-        <tr><td>Qwen3.6 27B</td><td>27B</td><td>—</td><td>No</td></tr>
+        <tr><td>Llama 3 405B</td><td>405B</td><td>-</td><td>No</td></tr>
+        <tr><td>Llama 3 70B</td><td>70B</td><td>-</td><td>No</td></tr>
+        <tr><td>Llama 3 8B</td><td>8B</td><td>-</td><td>No</td></tr>
+        <tr><td>Nemotron 70B</td><td>70B</td><td>-</td><td>No</td></tr>
+        <tr><td>Nemotron 8B</td><td>8B</td><td>-</td><td>No</td></tr>
+        <tr><td>Qwen3.6 27B</td><td>27B</td><td>-</td><td>No</td></tr>
         <tr><td>Qwen3 235B</td><td>235B</td><td>22B</td><td>Yes</td></tr>
-        <tr><td>Qwen3 72B</td><td>72B</td><td>—</td><td>No</td></tr>
-        <tr><td>Qwen3 32B</td><td>32B</td><td>—</td><td>No</td></tr>
+        <tr><td>Qwen3 72B</td><td>72B</td><td>-</td><td>No</td></tr>
+        <tr><td>Qwen3 32B</td><td>32B</td><td>-</td><td>No</td></tr>
         <tr><td>Qwen3 30B</td><td>30B</td><td>3B</td><td>Yes</td></tr>
-        <tr><td>Qwen3 14B</td><td>14B</td><td>—</td><td>No</td></tr>
-        <tr><td>Qwen3 7B</td><td>7B</td><td>—</td><td>No</td></tr>
-        <tr><td>Qwen2.5 72B</td><td>72B</td><td>—</td><td>No</td></tr>
-        <tr><td>Qwen2.5 32B</td><td>32B</td><td>—</td><td>No</td></tr>
-        <tr><td>Qwen2.5 14B</td><td>14B</td><td>—</td><td>No</td></tr>
-        <tr><td>Qwen2.5 7B</td><td>7B</td><td>—</td><td>No</td></tr>
+        <tr><td>Qwen3 14B</td><td>14B</td><td>-</td><td>No</td></tr>
+        <tr><td>Qwen3 7B</td><td>7B</td><td>-</td><td>No</td></tr>
+        <tr><td>Qwen2.5 72B</td><td>72B</td><td>-</td><td>No</td></tr>
+        <tr><td>Qwen2.5 32B</td><td>32B</td><td>-</td><td>No</td></tr>
+        <tr><td>Qwen2.5 14B</td><td>14B</td><td>-</td><td>No</td></tr>
+        <tr><td>Qwen2.5 7B</td><td>7B</td><td>-</td><td>No</td></tr>
         <tr><td>DeepSeek 671B / R1 / V3</td><td>671B</td><td>37B</td><td>Yes</td></tr>
-        <tr><td>DeepSeek 70B</td><td>70B</td><td>—</td><td>No</td></tr>
-        <tr><td>DeepSeek 7B</td><td>7B</td><td>—</td><td>No</td></tr>
+        <tr><td>DeepSeek 70B</td><td>70B</td><td>-</td><td>No</td></tr>
+        <tr><td>DeepSeek 7B</td><td>7B</td><td>-</td><td>No</td></tr>
         <tr><td>Mistral Large 3 (675B)</td><td>675B</td><td>41B</td><td>Yes</td></tr>
-        <tr><td>Mistral Large 123B</td><td>123B</td><td>—</td><td>No</td></tr>
+        <tr><td>Mistral Large 123B</td><td>123B</td><td>-</td><td>No</td></tr>
         <tr><td>Mixtral 8x22B</td><td>141B</td><td>39B</td><td>Yes</td></tr>
         <tr><td>Mixtral 8x7B</td><td>47B</td><td>13B</td><td>Yes</td></tr>
-        <tr><td>Mistral 7B</td><td>7B</td><td>—</td><td>No</td></tr>
-        <tr><td>Gemma 4 31B/27B</td><td>31B</td><td>—</td><td>No</td></tr>
+        <tr><td>Mistral 7B</td><td>7B</td><td>-</td><td>No</td></tr>
+        <tr><td>Gemma 4 31B/27B</td><td>31B</td><td>-</td><td>No</td></tr>
         <tr><td>Gemma 4 26B</td><td>26B</td><td>4B</td><td>Yes</td></tr>
-        <tr><td>Gemma 27B</td><td>27B</td><td>—</td><td>No</td></tr>
-        <tr><td>Gemma 9B</td><td>9B</td><td>—</td><td>No</td></tr>
+        <tr><td>Gemma 27B</td><td>27B</td><td>-</td><td>No</td></tr>
+        <tr><td>Gemma 9B</td><td>9B</td><td>-</td><td>No</td></tr>
         <tr><td>Kimi K2</td><td>1,000B</td><td>32B</td><td>Yes</td></tr>
         <tr><td>GLM 744B</td><td>744B</td><td>56B</td><td>Yes</td></tr>
-        <tr><td>GLM 32B</td><td>32B</td><td>—</td><td>No</td></tr>
-        <tr><td>Phi 4 14B</td><td>14B</td><td>—</td><td>No</td></tr>
+        <tr><td>GLM 32B</td><td>32B</td><td>-</td><td>No</td></tr>
+        <tr><td>Phi 4 14B</td><td>14B</td><td>-</td><td>No</td></tr>
       </tbody>
     </table>
     <div class="callout">MoE models: <code>active_param_count</code> drives roofline ceilings; <code>param_count</code> (total) drives <code>weight_gb</code> and OOM headroom. Unrecognized models skip roofline entirely. To add a model or GPU, open an issue or submit a PR to the catalog files in <code>src/context/</code>.</div>
@@ -367,7 +371,7 @@ efficiency_delta_pp  = efficiency_pct_after − efficiency_pct_before</code></pr
       </tbody>
     </table>
     <p><strong>Latency veto:</strong> if efficiency says Better but <code>ttft_p99_delta_pct &gt; +20%</code>, direction is Plateau. Downgrades Better only; does not affect Plateau or Worse. Skipped on the throughput fallback path.</p>
-    <p><strong>On Worse:</strong> the degraded state seamlessly becomes the new baseline and is pushed to the history stack. The loop does not pause to ask for revert confirmations—since you are making the config changes manually, the tool simply measures the result, provides its next recommendation, and keeps profiling.</p>
+    <p><strong>On Worse:</strong> the degraded state seamlessly becomes the new baseline and is pushed to the history stack. The loop does not pause to ask for revert confirmations-since you are making the config changes manually, the tool simply measures the result, provides its next recommendation, and keeps profiling.</p>
     <p>All thresholds are provisional constants. Latency, cost, and p99 before/after are tracked alongside direction for display.</p>
 
     <h2>Per-window collection (~2s)</h2>
@@ -397,7 +401,7 @@ efficiency_delta_pp  = efficiency_pct_after − efficiency_pct_before</code></pr
         <tr><td>KV / VRAM / temp peaks</td><td>Evaluable</td><td><code>max(per-window peak, last evaluable landing value)</code> so aggregate peak ≥ displayed current.</td></tr>
         <tr><td>State gauges (VRAM used, temp, sm_clock)</td><td>Evaluable (last)</td><td>Last evaluable window's landing value.</td></tr>
         <tr><td>Cumulative counters (total tokens, total reqs)</td><td>All (chronological last)</td><td>Chronologically last collected window. Idle tail included. Preserves true Prometheus server totals.</td></tr>
-        <tr><td>All windows non-evaluable</td><td>—</td><td>Chronologically last raw window returned in full.</td></tr>
+        <tr><td>All windows non-evaluable</td><td>-</td><td>Chronologically last raw window returned in full.</td></tr>
       </tbody>
     </table>
   </article>
@@ -631,7 +635,7 @@ AND (kv_cache_pct > 30%  OR  gpu_util_pct > 20%)
         <tr><td><code>tensor_parallel_size</code></td><td><code>--tensor-parallel-size</code> CLI flag</td><td><code>TENSOR_PARALLEL_SIZE</code> / <code>VLLM_TENSOR_PARALLEL_SIZE</code> env var</td><td>Treated as 1; ceilings and kv_headroom unscaled</td></tr>
         <tr><td>TPOT histogram</td><td><code>request_time_per_output_token</code></td><td><code>time_per_output_token</code></td><td><code>None</code></td></tr>
         <tr><td><code>bytes_per_param</code></td><td><code>DTYPE</code> / <code>VLLM_DTYPE</code> env var</td><td><code>kv_cache_dtype</code> → catalog → bf16</td><td>bf16, labeled in output</td></tr>
-        <tr><td>All windows non-evaluable</td><td>—</td><td>Chronologically last raw window</td><td>Labeled as non-evaluable</td></tr>
+        <tr><td>All windows non-evaluable</td><td>-</td><td>Chronologically last raw window</td><td>Labeled as non-evaluable</td></tr>
       </tbody>
     </table>
   </article>
@@ -758,7 +762,7 @@ AND (kv_cache_pct > 30%  OR  gpu_util_pct > 20%)
     <p>Enterprises running production AI spend $50,000 to $500,000 per month on inference infrastructure. <a href="https://www.tensormesh.ai/blog-posts/ai-inference-costs-2025-energy-crisis">[2]</a> Inference costs have dropped 280× since 2022, from $20 to $0.07 per million tokens. That gap between what hardware can do and what most teams extract from it is your cost problem today.</p>
 
     <blockquote>
-      "The AI inferencing market will be much, much larger than the AI training market. People are running out of usable inference computing capacity." — Larry Ellison, Oracle earnings call <a href="https://www.benzinga.com/markets/earnings/25/09/47587481/larry-ellison-targets-multi-trillion-dollar-ai-inference-market-for-oracle-ai-will-change-everything">[3]</a>
+      "The AI inferencing market will be much, much larger than the AI training market. People are running out of usable inference computing capacity." - Larry Ellison, Oracle earnings call <a href="https://www.benzinga.com/markets/earnings/25/09/47587481/larry-ellison-targets-multi-trillion-dollar-ai-inference-market-for-oracle-ai-will-change-everything">[3]</a>
     </blockquote>
 
     <p>The shortage is not GPUs. It is efficient use of the GPUs already running in production, including yours.</p>

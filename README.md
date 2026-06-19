@@ -1,8 +1,9 @@
 # Profile
 
-Less Words. Less Noise. More Signal. More Value.
+A physics-grounded, cost-aware optimization loop for vLLM inference servers. 
 
-A physics-grounded, cost-aware optimization loop for vLLM inference servers.
+**The Problem:** vLLM exposes numerous configuration flags (e.g., `--max-num-seqs`, `--enable-prefix-caching`). Tuning them via trial and error wastes time and hardware.
+**The Solution:** Profile establishes the theoretical physics ceiling for your exact model and GPU, measures live traffic, and maps the identified bottlenecks directly to the precise vLLM flags required to resolve them.
 
 **[Website](https://jungledesh.github.io/profile/index.html)** | **[Docs](https://jungledesh.github.io/profile/docs.html)**
 
@@ -81,7 +82,7 @@ curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/jungledesh/profile/releases/latest/download/profile-installer.sh | sh
 
 # Start profiling your vLLM server
-profile diagnose --url http://localhost:8000/metrics --duration 1m
+profile diagnose --url http://localhost:8000/metrics --duration 2m
 ```
 
 *Or build from source: `cargo install --git https://github.com/jungledesh/profile`*
@@ -103,13 +104,23 @@ profile diagnose --url http://localhost:8000/metrics --duration 1m
 
 ---
 
-## What it detects
+## Optimization Workflow
 
-- **R1 Under-batching (Under-utilized compute)**: `GPU Efficiency < 60%`. Hardware under-fed; compute headroom wasted.
-- **R2 KV cache pressure**: `KV Usage ≥ 88%`. VRAM near capacity, preemption risk rising. Dynamically calculates exact sequence length reductions.
-- **R3 Low prefix reuse**: `Hit Rate < 35%` at `> 1000 tok/s`. Prefill compute wasted on identical prompts.
-- **R4 OOM risk**: Model weight footprint structurally exceeds available VRAM.
-- **R5 Concurrency saturation**: `max_num_seqs` cap hit. Requests queueing, TTFT degrading.
+Profile maps hardware bottlenecks directly to vLLM arguments. Do not guess. Measure, adjust, and verify.
+
+1. **Establish Baseline:** Start vLLM with default parameters. Apply production load.
+2. **Diagnose:** Execute `profile diagnose --url http://localhost:8000/metrics --duration 2m`.
+3. **Map Output to vLLM Flags:**
+
+| Diagnosis | Symptom | Action |
+| :--- | :--- | :--- |
+| **R1 Under-batching** | GPU efficiency <60%. | Hardware is starved. Increase client concurrency. |
+| **R2 KV cache pressure** | KV usage ≥88%. Preemptions occur. | Lower `--max-num-seqs` to Profile's recommended value. |
+| **R3 Low prefix reuse** | Hit rate <35%. | Wasted prefill compute. Add `--enable-prefix-caching`. |
+| **R4 OOM risk** | Weights exceed VRAM. | Add `--tensor-parallel-size` or quantize. |
+| **R5 Concurrency saturation** | Queueing while GPU is idle. | Raise `--max-num-seqs` to ingest requests. |
+
+4. **Verify:** Apply the flag, restart vLLM, and re-run Profile to confirm the bottleneck is resolved.
 
 ---
 
