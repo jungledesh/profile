@@ -143,6 +143,7 @@ footer {
   <div class="wrap">
     <a class="site-title" href="index.html">PROFILE</a>
     <nav>
+      <a href="#home" data-page="home">Workflow</a>
       <a href="#data" data-page="data">Data</a>
       <a href="#catalog" data-page="catalog">Catalog</a>
       <a href="#math" data-page="math">Math</a>
@@ -789,6 +790,7 @@ AND (kv_cache_pct > 30%  OR  gpu_util_pct > 20%)
 
 <script>
   const TITLES = {
+    home: 'Workflow | Profile',
     catalog: 'Catalog | Profile',
     math: 'Math | Profile',
     rules: 'Rules | Profile',
@@ -809,7 +811,7 @@ AND (kv_cache_pct > 30%  OR  gpu_util_pct > 20%)
   }
 
   window.addEventListener('hashchange', () => show(window.location.hash));
-  show(window.location.hash || '#data');
+  show(window.location.hash || '#home');
 </script>
 
 </body>
