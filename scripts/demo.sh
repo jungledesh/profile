@@ -67,6 +67,7 @@ else:
     print('routing.py not found — skipping patch.')
 "
 uv pip install "huggingface-hub==${HUGGINGFACE_HUB_VERSION}"
+uv pip install "transformers>=5.0.0"
 
 if [[ -n "${HF_TOKEN:-}" ]]; then
     export HF_TOKEN

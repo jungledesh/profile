@@ -371,9 +371,9 @@ efficiency_delta_pp  = efficiency_pct_after − efficiency_pct_before</code></pr
       <thead><tr><th>Metric type</th><th>Formula</th><th>On failure</th></tr></thead>
       <tbody>
         <tr><td>Histogram mean (TTFT, TPOT, prefill, queue, prompt tokens)</td><td><code>Δsum / Δcount</code> first→last scrape; ×1000 for seconds-based latencies</td><td>Last-scrape cumulative mean when <code>Δcount ≤ 0</code></td></tr>
-        <tr><td>Histogram p99</td><td>Delta buckets, then linear interpolation at q=0.99</td><td><code>None</code>. No cumulative fallback (stale p99 is worse than none)</td></tr>
+        <tr><td>Histogram p99</td><td>Delta buckets, then linear interpolation at q=0.99. If target falls in +Inf bucket, returns last finite bucket's upper bound.</td><td><code>None</code>. No cumulative fallback (stale p99 is worse than none)</td></tr>
         <tr><td>Counter rate (tok/s, req/s, preemptions/s)</td><td><code>(last − first) / window_duration_secs</code></td><td><code>None</code> on negative delta or zero duration. Zero delta is valid idle, not missing</td></tr>
-        <tr><td>Prefix cache hit rate</td><td><code>Δhits / Δqueries</code></td><td><code>None</code> when <code>Δqueries ≤ 0</code></td></tr>
+        <tr><td>Prefix cache hit rate</td><td><code>Δhits / Δqueries</code></td><td><code>None</code> when <code>Δqueries ≤ 0</code> (never divide by zero)</td></tr>
         <tr><td>GPU util, power</td><td>Mean across window polls</td><td>Poll skipped if NVML field absent</td></tr>
         <tr><td>VRAM, temp (current)</td><td>Last poll</td><td>Peaks (<code>vram_peak_mb</code>, <code>temperature_peak_c</code>, <code>kv_cache_peak_perc</code>): max across polls/scrapes</td></tr>
       </tbody>
@@ -387,7 +387,7 @@ efficiency_delta_pp  = efficiency_pct_after − efficiency_pct_before</code></pr
       <tbody>
         <tr><td>GPU util, power, running/waiting means, rates (tok/s, req/s)</td><td>Active</td><td>Time-weighted mean: <code>Σ(value × duration) / Σ(duration)</code></td></tr>
         <tr><td>Histogram means (TTFT, TPOT, prefill, queue latency)</td><td>Active</td><td><code>ΣΔsum / ΣΔcount</code> across active windows. Weighted by observation count, not time.</td></tr>
-        <tr><td>p99 (TTFT, TPOT, Prompt tokens, Generation tokens)</td><td>Active (Tokens: Evaluable)</td><td>Merge per-window delta bucket vectors (sum counts at matching boundaries), recompute q=0.99 via linear interpolation. Never average scalar p99 values.</td></tr>
+        <tr><td>p99 (TTFT, TPOT, Prompt tokens, Generation tokens)</td><td>Active (Tokens: Evaluable)</td><td>Merge per-window delta bucket vectors (sum counts at matching boundaries), recompute q=0.99 via linear interpolation. Length or boundary mismatches (e.g. version skew) skip the window gracefully instead of aborting. Never average scalar p99 values.</td></tr>
         <tr><td>KV cache avg, prefix cache hit rate, <code>prompt_tokens_mean</code></td><td>Evaluable</td><td>KV avg: time-weighted mean. Prefix hit rate: <code>Σ Δhits / Σ Δqueries</code> across all evaluable windows.</td></tr>
         <tr><td>KV / VRAM / temp peaks</td><td>Evaluable</td><td><code>max(per-window peak, last evaluable landing value)</code> so aggregate peak ≥ displayed current.</td></tr>
         <tr><td>State gauges (VRAM used, temp, sm_clock)</td><td>Evaluable (last)</td><td>Last evaluable window's landing value.</td></tr>
@@ -425,7 +425,7 @@ efficiency_delta_pp  = efficiency_pct_after − efficiency_pct_before</code></pr
       </tbody>
     </table>
     <p>VRAM ≥78% is shown in output as corroborating evidence when present, but is not a required condition. R2 fires on KV usage or preemptions alone.</p>
-    <p><strong>Fix:</strong> Reduce <code>--max-num-seqs</code> or <code>--max-model-len</code>. The <code>max-model-len</code> shrink uses mathematically sound <code>p99 prompt + p99 gen</code> sums, gated by &gt;100 completion samples and a &lt;5% reduction suppression to avoid useless noise.</p>
+    <p><strong>Fix:</strong> Reduce <code>--max-num-seqs</code> or <code>--max-model-len</code>. The <code>max-model-len</code> shrink uses mathematically sound <code>p99 prompt + p99 gen</code> sums, gated by &gt;100 completion samples and a &lt;5% reduction suppression to avoid useless noise. The KV absolute max sequence ceiling is calculated physically using: <code>kv_headroom_gb</code>, <code>max_model_len</code>, <code>num_layers</code>, <code>num_kv_heads</code>, <code>head_dim</code>, and <code>kv_bytes_per_element</code>.</p>
     <h3>Admission backlog path</h3>
     <table>
       <thead><tr><th>Condition</th><th>Threshold</th></tr></thead>
@@ -633,12 +633,14 @@ AND (kv_cache_pct > 30%  OR  gpu_util_pct > 20%)
 
   <!-- LIMITATIONS -->
   <article id="page-limitations" class="page">
-    <h1>Limitations <span style="font-size: 0.65rem; font-weight: 400; color: #aaa; letter-spacing: 0.05em;">(wip**)</span></h1>
+    <h1>Limitations</h1>
     <p class="subtitle">Where the math is approximate and why.</p>
 
     <table>
       <thead><tr><th>Gap</th><th>Affects</th><th>In practice</th></tr></thead>
       <tbody>
+        <tr><td>MoE active parameters assume uniform routing</td><td>R4, baseline</td><td>If traffic heavily skews to specific experts, actual VRAM usage may differ from the baseline <code>active_param_count</code> approximation.</td></tr>
+        <tr><td>Sampling cliff / Temperature absent</td><td>R5</td><td>Sampling temperature is not exposed in vLLM metrics, so R5 cannot factor token diversity into concurrency saturation logic.</td></tr>
         <tr><td>MoE weight uses catalog total <code>param_count</code></td><td>R4, baseline</td><td>Runtime VRAM may be lower if not all experts are loaded</td></tr>
         <tr><td>TP degree not reported by vLLM metrics; must be set via flag or env var</td><td>Baseline, R4</td><td>If <code>--tensor-parallel-size</code> / <code>TENSOR_PARALLEL_SIZE</code> absent, Profile assumes TP=1 and underestimates ceilings on multi-GPU deployments</td></tr>
         <tr><td>Efficiency % uses theoretical BW ceiling, not measured HBM</td><td>All rules</td><td>Can't distinguish BW bottleneck from scheduler under-feeding</td></tr>
@@ -653,7 +655,7 @@ AND (kv_cache_pct > 30%  OR  gpu_util_pct > 20%)
 
   <!-- DESIGN -->
   <article id="page-design" class="page">
-    <h1>Design <span style="font-size: 0.65rem; font-weight: 400; color: #aaa; letter-spacing: 0.05em;">(wip**)</span></h1>
+    <h1>Design</h1>
     <p class="subtitle">The non-obvious choices and the reasoning behind them.</p>
 
     <h2>Option&lt;T&gt; over sentinels</h2>
@@ -682,6 +684,9 @@ AND (kv_cache_pct > 30%  OR  gpu_util_pct > 20%)
 
     <h2>Zero allocation in the hot loop</h2>
     <p><code>AnalysisInput&lt;'a&gt;</code> borrows both contexts. No clones per 250ms window. A profiler that eats its target's resources is worse than no profiler.</p>
+
+    <h2>Graceful degradation over Panics</h2>
+    <p>When integrating parallel telemetry sources (vLLM and NVML), mismatches occur. Version skew can change bucket boundaries in histograms; instead of panicking, the engine skips the corrupted merge and degrades gracefully. One bad scrape window should never destroy the entire session's dataset.</p>
 
     <h2>Security</h2>
     <p>rustls only, no OpenSSL. Read-only NVML. No external API calls. No telemetry. <code>cargo audit</code> clean before every release tag.</p>
