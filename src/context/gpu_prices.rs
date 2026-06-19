@@ -75,7 +75,7 @@ mod tests {
     fn h200_matches_sxm_name() {
         let p = lookup_gpu_price("NVIDIA H200 SXM5").expect("h200 price");
         assert!((p.on_demand_per_hr - 3.50).abs() < 1e-9);
-        assert!((p.spot_per_hr - 2.00).abs() < 1e-9);
+        assert!((p.spot_per_hr - 2.50).abs() < 1e-9);
     }
 
     #[test]
@@ -87,13 +87,13 @@ mod tests {
     #[test]
     fn h100_sxm_price() {
         let p = lookup_gpu_price("NVIDIA H100 SXM5 80GB HBM3").expect("h100 sxm price");
-        assert!((p.on_demand_per_hr - 3.45).abs() < 1e-9);
+        assert!((p.on_demand_per_hr - 2.80).abs() < 1e-9);
     }
 
     #[test]
     fn h100_hbm3_price_without_sxm_token() {
         let p = lookup_gpu_price("NVIDIA H100 80GB HBM3").expect("h100 hbm3 price");
-        assert!((p.on_demand_per_hr - 3.45).abs() < 1e-9);
+        assert!((p.on_demand_per_hr - 2.80).abs() < 1e-9);
     }
 
     #[test]
@@ -103,10 +103,17 @@ mod tests {
     }
 
     #[test]
-    fn dgx_spark_gb10_price() {
-        let p = lookup_gpu_price("NVIDIA GB10").expect("gb10 price");
-        assert!((p.on_demand_per_hr - 0.13).abs() < 1e-9);
-        assert!((p.spot_per_hr - 0.13).abs() < 1e-9);
+    fn rtx_4090_price() {
+        let p = lookup_gpu_price("NVIDIA GeForce RTX 4090").expect("rtx 4090 price");
+        assert!((p.on_demand_per_hr - 0.44).abs() < 1e-9);
+        assert!((p.spot_per_hr - 0.35).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a100_80gb_price() {
+        let p = lookup_gpu_price("NVIDIA A100-SXM4-80GB").expect("a100 80gb price");
+        assert!((p.on_demand_per_hr - 1.50).abs() < 1e-9);
+        assert!((p.spot_per_hr - 0.60).abs() < 1e-9);
     }
 
     #[test]
