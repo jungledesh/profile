@@ -219,10 +219,10 @@ fn baseline_lines(
     if b.decode.expected >= 0.5 {
         seg1.push(format!("decode ~{:.0} tok/s (est)", b.decode.expected));
     }
-    if let Some(prefill) = b.prefill {
-        if prefill.expected >= 10.0 {
-            seg1.push(format!("prefill ~{:.0} tok/s (est)", prefill.expected));
-        }
+    if let Some(prefill) = b.prefill
+        && prefill.expected >= 10.0
+    {
+        seg1.push(format!("prefill ~{:.0} tok/s (est)", prefill.expected));
     }
 
     // Line 2: memory budget + latency floors
@@ -230,10 +230,10 @@ fn baseline_lines(
     seg2.push(weight_dtype_display(b.weight_dtype_source, b.weight_gb));
     if let Some(blocks) = num_gpu_blocks {
         seg2.push(format!("kv_blocks {blocks}"));
-    } else if let Some(headroom) = b.kv_headroom_gb {
-        if headroom < 0.0 {
-            seg2.push(format!("kv_headroom {:.0}GB (needs TP)", headroom));
-        }
+    } else if let Some(headroom) = b.kv_headroom_gb
+        && headroom < 0.0
+    {
+        seg2.push(format!("kv_headroom {:.0}GB (needs TP)", headroom));
     }
     seg2.push(format!("tpot_floor ~{:.1}ms", b.tpot_floor_ms));
     if let Some(pf) = b.prefill_latency_floor_ms {
@@ -308,10 +308,8 @@ fn gpu_gauges_line(
         if let Some(jtok) = cost.joules_per_token.filter(|v| v.is_finite() && *v > 0.0) {
             segments.push(format!("{:.2} J/tok", jtok));
         }
-        if verbose {
-            if let Some(tpw) = cost.tok_per_watt.filter(|v| v.is_finite() && *v > 0.0) {
-                segments.push(format!("{:.1} tok/W", tpw));
-            }
+        if verbose && let Some(tpw) = cost.tok_per_watt.filter(|v| v.is_finite() && *v > 0.0) {
+            segments.push(format!("{:.1} tok/W", tpw));
         }
         if let Some(cpm) = cost
             .cost_per_million_tokens
@@ -333,11 +331,11 @@ fn gpu_gauges_line(
             let u_gb = used as f64 / 1024.0;
             let t_gb = total as f64 / 1024.0;
             let mut s = format!("vRAM {:.0}/{:.0}GB", u_gb, t_gb);
-            if let Some(pk) = g.vram_peak_mb {
-                if show_vram_peak_parenthetical(used, pk, total) {
-                    let pk_gb = pk as f64 / 1024.0;
-                    s.push_str(&format!(" (peak {:.0}GB)", pk_gb));
-                }
+            if let Some(pk) = g.vram_peak_mb
+                && show_vram_peak_parenthetical(used, pk, total)
+            {
+                let pk_gb = pk as f64 / 1024.0;
+                s.push_str(&format!(" (peak {:.0}GB)", pk_gb));
             }
             s
         }
@@ -433,10 +431,10 @@ fn vllm_prompt_kv_fragment(v: &VllmRawMetrics) -> String {
     match v.kv_cache_usage_perc.filter(|x| x.is_finite()) {
         Some(avg) => {
             let mut s = format!("kv_cache {:.1}% avg", avg);
-            if let Some(pk) = v.kv_cache_peak_perc.filter(|x| x.is_finite()) {
-                if show_kv_cache_peak_parenthetical(avg, pk) {
-                    s.push_str(&format!(" ({:.1}% peak)", pk));
-                }
+            if let Some(pk) = v.kv_cache_peak_perc.filter(|x| x.is_finite())
+                && show_kv_cache_peak_parenthetical(avg, pk)
+            {
+                s.push_str(&format!(" ({:.1}% peak)", pk));
             }
             s
         }
@@ -487,10 +485,10 @@ fn gpu_detail_line(g: &GpuRawMetrics) -> String {
     let temp = match g.temperature_c.filter(|t| t.is_finite()) {
         Some(cur) => {
             let mut s = format!("temp {:.0}°C", cur);
-            if let Some(pk) = g.temperature_peak_c.filter(|t| t.is_finite()) {
-                if show_gpu_temp_peak_parenthetical(cur, pk) {
-                    s.push_str(&format!(" (peak {:.0}°C)", pk));
-                }
+            if let Some(pk) = g.temperature_peak_c.filter(|t| t.is_finite())
+                && show_gpu_temp_peak_parenthetical(cur, pk)
+            {
+                s.push_str(&format!(" (peak {:.0}°C)", pk));
             }
             s
         }

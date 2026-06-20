@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -15,13 +15,15 @@ pub enum WaitOutcome {
 /// each iteration so stdin is never double-owned.
 pub fn spawn_stdin_watcher() -> mpsc::Receiver<String> {
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || loop {
-        let mut buf = String::new();
-        if std::io::stdin().read_line(&mut buf).is_err() {
-            return;
-        }
-        if tx.send(buf).is_err() {
-            return;
+    std::thread::spawn(move || {
+        loop {
+            let mut buf = String::new();
+            if std::io::stdin().read_line(&mut buf).is_err() {
+                return;
+            }
+            if tx.send(buf).is_err() {
+                return;
+            }
         }
     });
     rx

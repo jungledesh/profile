@@ -1,6 +1,6 @@
 use std::time::SystemTime;
 
-use crate::collectors::{window_is_evaluable, RawSnapshot, VllmRawMetrics};
+use crate::collectors::{RawSnapshot, VllmRawMetrics, window_is_evaluable};
 use crate::context::{AnalysisInput, RuntimeWindow};
 use crate::engine::baseline::{self, CostSource, PhysicsBaseline, WeightDtypeSource};
 
@@ -11,19 +11,19 @@ mod r4_oom_risk;
 mod r5_concurrency_saturation;
 
 pub use r1_under_batching::{
-    r1_recommendation, r1_verbose_miss_line, rule1_under_batching, R1MissReport, Rule1Outcome,
-    UnderBatchingDetail,
+    R1MissReport, Rule1Outcome, UnderBatchingDetail, r1_recommendation, r1_verbose_miss_line,
+    rule1_under_batching,
 };
 pub use r2_kv_cache_pressure::{
-    r2_recommendation, rule2_kv_admission_backlog, rule2_kv_cache_pressure,
-    KvAdmissionBacklogDetail, KvCachePressureDetail, Rule2Outcome,
+    KvAdmissionBacklogDetail, KvCachePressureDetail, Rule2Outcome, r2_recommendation,
+    rule2_kv_admission_backlog, rule2_kv_cache_pressure,
 };
 pub use r3_low_prefix_reuse::{
-    r3_recommendation, rule3_low_prefix_reuse, LowPrefixReuseDetail, Rule3Outcome,
+    LowPrefixReuseDetail, Rule3Outcome, r3_recommendation, rule3_low_prefix_reuse,
 };
 pub use r4_oom_risk::{r4_advisory, r4_recommendation};
 pub use r5_concurrency_saturation::{
-    r5_recommendation, rule5_concurrency_saturation, ConcurrencySaturationDetail,
+    ConcurrencySaturationDetail, r5_recommendation, rule5_concurrency_saturation,
 };
 
 use r1_under_batching::{
@@ -31,9 +31,9 @@ use r1_under_batching::{
     rule1_under_batching_with_efficiency,
 };
 use r2_kv_cache_pressure::{
-    aggregate_backlog_detail, aggregate_r2_detail, format_kv_admission_backlog_issue,
+    KvFormatCtx, aggregate_backlog_detail, aggregate_r2_detail, format_kv_admission_backlog_issue,
     format_kv_cache_window_issue, kv_pressure_confidence, r2_action, r2_backlog_short_action,
-    r2_kv_pressure_short_action, KvFormatCtx,
+    r2_kv_pressure_short_action,
 };
 #[cfg(test)]
 use r3_low_prefix_reuse::format_low_prefix_hit_rate_fired;
@@ -708,30 +708,31 @@ fn build_report_from_eval(
         });
     }
 
-    if eval.r5_significant() && !r2_significant && !r2_backlog_significant {
-        if let Some(agg) =
+    if eval.r5_significant()
+        && !r2_significant
+        && !r2_backlog_significant
+        && let Some(agg) =
             aggregate_concurrency_saturation_detail(&eval.r5_details, eval.session_kv_peak)
-        {
-            let display_lines = format_concurrency_saturation_window_issue(
-                &agg,
-                pct(eval.r5_fired, eval.n_eval),
-                max_model_len,
-                kv_max_seqs,
-                summary_snap,
-            );
-            recs.push(Recommendation {
-                rule_name: "concurrency_saturation",
-                impact: 4,
-                confidence: match (agg.ttft_ms.or(agg.ttft_p99_ms), agg.kv_cache_usage_perc) {
-                    (Some(_), Some(_)) => 0.9,
-                    _ => 0.6,
-                },
-                action: r5_action(&agg, kv_max_seqs, max_model_len, prompt_tokens_mean),
-                short_action: r5_short_action(&agg, kv_max_seqs, max_model_len),
-                expected_impact: "Queue drains, TTFT recovers.".to_string(),
-                display_lines,
-            });
-        }
+    {
+        let display_lines = format_concurrency_saturation_window_issue(
+            &agg,
+            pct(eval.r5_fired, eval.n_eval),
+            max_model_len,
+            kv_max_seqs,
+            summary_snap,
+        );
+        recs.push(Recommendation {
+            rule_name: "concurrency_saturation",
+            impact: 4,
+            confidence: match (agg.ttft_ms.or(agg.ttft_p99_ms), agg.kv_cache_usage_perc) {
+                (Some(_), Some(_)) => 0.9,
+                _ => 0.6,
+            },
+            action: r5_action(&agg, kv_max_seqs, max_model_len, prompt_tokens_mean),
+            short_action: r5_short_action(&agg, kv_max_seqs, max_model_len),
+            expected_impact: "Queue drains, TTFT recovers.".to_string(),
+            display_lines,
+        });
     }
 
     if eval.r3_significant() {
@@ -1019,19 +1020,20 @@ pub fn format_diagnose_rules_for_windows(
         warnings.push(String::new());
     }
 
-    if r5_significant && !r2_significant && !r2_backlog_significant {
-        if let Some(agg) = aggregate_concurrency_saturation_detail(r5_details, eval.session_kv_peak)
-        {
-            let block = format_concurrency_saturation_window_issue(
-                &agg,
-                pct(r5_fired, n_eval),
-                summary.ctx.config.max_model_len,
-                kv_max_seqs,
-                summary_snap,
-            );
-            warnings.extend(block);
-            warnings.push(String::new());
-        }
+    if r5_significant
+        && !r2_significant
+        && !r2_backlog_significant
+        && let Some(agg) = aggregate_concurrency_saturation_detail(r5_details, eval.session_kv_peak)
+    {
+        let block = format_concurrency_saturation_window_issue(
+            &agg,
+            pct(r5_fired, n_eval),
+            summary.ctx.config.max_model_len,
+            kv_max_seqs,
+            summary_snap,
+        );
+        warnings.extend(block);
+        warnings.push(String::new());
     }
 
     if r3_significant {
@@ -1406,8 +1408,11 @@ mod tests {
         assert!(text.contains("threshold: < 25%"));
         assert!(text.contains("  Cause:"));
         assert!(text.contains("under-fed by client"));
-        assert!(text
-            .contains("    • Batch more requests or increase client concurrency (251 slots idle)"));
+        assert!(
+            text.contains(
+                "    • Batch more requests or increase client concurrency (251 slots idle)"
+            )
+        );
         assert!(text.contains("Expected: Higher throughput, stable TPOT."));
         assert!(
             text.contains("Confidence: High") || text.contains("Confidence: Medium"),
@@ -2237,9 +2242,11 @@ mod tests {
             no_evaluable_diagnose_lines(false, std::slice::from_ref(&win))
         );
         let vlines = format_diagnose_rules(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics");
-        assert!(vlines
-            .iter()
-            .any(|l| l.contains("1 of 1 collected windows")));
+        assert!(
+            vlines
+                .iter()
+                .any(|l| l.contains("1 of 1 collected windows"))
+        );
     }
 
     fn mk_evaluable_concurrency_saturation_window(
@@ -2443,9 +2450,11 @@ mod tests {
             true,
             "http://127.0.0.1:8000/metrics",
         );
-        assert!(vlines
-            .iter()
-            .any(|l| l.contains("2 of 2 collected windows")));
+        assert!(
+            vlines
+                .iter()
+                .any(|l| l.contains("2 of 2 collected windows"))
+        );
     }
 
     use crate::engine::baseline::{CeilingEstimate, CostEstimate, WeightDtypeSource};
@@ -2514,9 +2523,11 @@ mod tests {
         ];
         let mut lines = vec!["issue".to_string()];
         append_waste_line(&mut lines, &groups, Some(&b), Some(14.2));
-        assert!(lines
-            .iter()
-            .any(|l| l.contains("lost to compounding bottlenecks")));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("lost to compounding bottlenecks"))
+        );
     }
 
     #[test]

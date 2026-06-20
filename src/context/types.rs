@@ -1,6 +1,6 @@
 use std::time::SystemTime;
 
-use crate::collectors::{traffic_from_snapshot, RawSnapshot, TrafficState, VllmConfig};
+use crate::collectors::{RawSnapshot, TrafficState, VllmConfig, traffic_from_snapshot};
 
 use super::{gpu_catalog, model_catalog};
 

@@ -55,10 +55,10 @@ pub fn identify(
     }
 
     // 3. Physics — TPOT near theoretical floor; hardware is saturated.
-    if let (Some(tpot), Some(floor)) = (tpot_ms, tpot_floor_ms) {
-        if tpot <= floor * PHYSICS_LIMITER_FLOOR_MARGIN {
-            return Some(PrimaryLimiter::Physics);
-        }
+    if let (Some(tpot), Some(floor)) = (tpot_ms, tpot_floor_ms)
+        && tpot <= floor * PHYSICS_LIMITER_FLOOR_MARGIN
+    {
+        return Some(PrimaryLimiter::Physics);
     }
 
     // 4. Prefill interference — chunked prefill sharing decode bandwidth.

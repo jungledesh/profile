@@ -4,7 +4,7 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Context, Result};
 use prometheus_parse::{HistogramCount, Scrape, Value};
 
-use super::sampling::{sample_count_for, SAMPLE_INTERVAL};
+use super::sampling::{SAMPLE_INTERVAL, sample_count_for};
 use super::types::{
     CacheConfigLabels, HistogramWindowMass, PrefixCacheScrapeSample, VllmRawMetrics,
 };
@@ -966,12 +966,14 @@ vllm_prefix_cache_queries 20
             "vllm_time_to_first_token_seconds_sum 1\nvllm_time_to_first_token_seconds_count 4\n";
         let b =
             "vllm_time_to_first_token_seconds_sum 2\nvllm_time_to_first_token_seconds_count 4\n";
-        assert!(histogram_window_mean_ms(
-            &scrape_from_body(a).unwrap(),
-            &scrape_from_body(b).unwrap(),
-            "vllm_time_to_first_token_seconds",
-        )
-        .is_none());
+        assert!(
+            histogram_window_mean_ms(
+                &scrape_from_body(a).unwrap(),
+                &scrape_from_body(b).unwrap(),
+                "vllm_time_to_first_token_seconds",
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -980,12 +982,14 @@ vllm_prefix_cache_queries 20
             "vllm_time_to_first_token_seconds_sum 10\nvllm_time_to_first_token_seconds_count 4\n";
         let b =
             "vllm_time_to_first_token_seconds_sum 5\nvllm_time_to_first_token_seconds_count 8\n";
-        assert!(histogram_window_mean_ms(
-            &scrape_from_body(a).unwrap(),
-            &scrape_from_body(b).unwrap(),
-            "vllm_time_to_first_token_seconds",
-        )
-        .is_none());
+        assert!(
+            histogram_window_mean_ms(
+                &scrape_from_body(a).unwrap(),
+                &scrape_from_body(b).unwrap(),
+                "vllm_time_to_first_token_seconds",
+            )
+            .is_none()
+        );
     }
 
     #[test]

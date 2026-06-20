@@ -80,8 +80,8 @@ pub fn build_report(input: AnalysisInput<'_>) -> Report {
     .collect();
 
     let kv_pressure = recs.iter().any(|r| r.rule_name == "kv_cache_pressure");
-    if !kv_pressure {
-        if let Some(r5) = rules::r5_recommendation(
+    if !kv_pressure
+        && let Some(r5) = rules::r5_recommendation(
             snapshot,
             snapshot
                 .vllm
@@ -95,9 +95,9 @@ pub fn build_report(input: AnalysisInput<'_>) -> Report {
                 &input.ctx.model,
                 input.ctx.config.kv_cache_dtype.as_deref(),
             ),
-        ) {
-            recs.push(r5);
-        }
+        )
+    {
+        recs.push(r5);
     }
 
     let r2_present_before = recs.iter().any(|r| r.rule_name == "kv_cache_pressure");
@@ -239,14 +239,18 @@ mod build_report_tests {
                 w[1].primary.rule_name
             );
         }
-        assert!(report
-            .groups
-            .iter()
-            .any(|g| g.primary.rule_name == "under_batching"));
-        assert!(report
-            .groups
-            .iter()
-            .any(|g| g.primary.rule_name == "kv_cache_pressure"));
+        assert!(
+            report
+                .groups
+                .iter()
+                .any(|g| g.primary.rule_name == "under_batching")
+        );
+        assert!(
+            report
+                .groups
+                .iter()
+                .any(|g| g.primary.rule_name == "kv_cache_pressure")
+        );
         assert!(!report.r2_suppressed_by_r4);
     }
 
@@ -291,14 +295,18 @@ mod build_report_tests {
         let report = build_report(input);
 
         assert!(report.r2_suppressed_by_r4);
-        assert!(report
-            .groups
-            .iter()
-            .any(|g| g.primary.rule_name == "oom_risk"));
-        assert!(!report
-            .groups
-            .iter()
-            .any(|g| g.primary.rule_name == "kv_cache_pressure"));
+        assert!(
+            report
+                .groups
+                .iter()
+                .any(|g| g.primary.rule_name == "oom_risk")
+        );
+        assert!(
+            !report
+                .groups
+                .iter()
+                .any(|g| g.primary.rule_name == "kv_cache_pressure")
+        );
     }
 
     fn starved_no_rules_fixture() -> (StaticContext, RuntimeWindow) {

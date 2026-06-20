@@ -1,6 +1,6 @@
 use crate::collectors::config::DEFAULT_GPU_MEMORY_UTILIZATION;
-use crate::engine::baseline::ACTIVATION_KV_BUFFER_GB;
 use crate::engine::WeightDtypeSource;
+use crate::engine::baseline::ACTIVATION_KV_BUFFER_GB;
 
 use super::Recommendation;
 
@@ -25,11 +25,7 @@ fn confidence_for_source(weight_dtype_source: WeightDtypeSource) -> f64 {
 }
 
 fn confidence_label(confidence: f64) -> &'static str {
-    if confidence >= 0.9 {
-        "High"
-    } else {
-        "Medium"
-    }
+    if confidence >= 0.9 { "High" } else { "Medium" }
 }
 
 /// r4: weights exceed GPU VRAM budget (`kv_headroom_gb < 0`).
@@ -107,10 +103,7 @@ pub fn r4_recommendation(
             fix_line,
             String::new(),
             "  Expected: Model fits in VRAM; eliminates OOM risk.".to_string(),
-            format!(
-                "  Confidence: {}",
-                confidence_label(confidence)
-            ),
+            format!("  Confidence: {}", confidence_label(confidence)),
         ],
     })
 }
@@ -316,9 +309,10 @@ mod tests {
         assert!(text.contains("[!] OOM Risk"));
         assert!(text.contains("    • Model weights exceed GPU VRAM by ~12GB"));
         assert!(text.contains("weights overflow by ~12GB"));
-        assert!(r
-            .short_action
-            .contains("increase --tensor-parallel-size (weights overflow by ~12GB)"));
+        assert!(
+            r.short_action
+                .contains("increase --tensor-parallel-size (weights overflow by ~12GB)")
+        );
     }
 
     #[test]
@@ -352,14 +346,16 @@ mod tests {
         assert!(
             r4_recommendation(None, None, None, None, None, WeightDtypeSource::EnvVar,).is_none()
         );
-        assert!(r4_recommendation(
-            Some(f64::NAN),
-            None,
-            None,
-            None,
-            None,
-            WeightDtypeSource::EnvVar,
-        )
-        .is_none());
+        assert!(
+            r4_recommendation(
+                Some(f64::NAN),
+                None,
+                None,
+                None,
+                None,
+                WeightDtypeSource::EnvVar,
+            )
+            .is_none()
+        );
     }
 }

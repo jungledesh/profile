@@ -9,11 +9,11 @@ pub mod traffic;
 pub mod types;
 pub mod vllm;
 
-pub use config::{build_config, VllmConfig};
-pub use traffic::{traffic_from_snapshot, TrafficSource, TrafficState};
+pub use config::{VllmConfig, build_config};
+pub use traffic::{TrafficSource, TrafficState, traffic_from_snapshot};
 pub use types::{
-    window_is_active, window_is_evaluable, CacheConfigLabels, GpuRawMetrics, HistogramCount,
-    HistogramWindowMass, PrefixCacheScrapeSample, RawSnapshot, VllmRawMetrics,
+    CacheConfigLabels, GpuRawMetrics, HistogramCount, HistogramWindowMass, PrefixCacheScrapeSample,
+    RawSnapshot, VllmRawMetrics, window_is_active, window_is_evaluable,
 };
 pub(crate) use vllm::merge_p99_bucket_vecs;
 
