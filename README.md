@@ -1,52 +1,105 @@
 # Profile
 
-A physics-grounded, cost-aware optimization loop for vLLM inference servers. 
+A physics-grounded, cost-aware optimization loop for vLLM inference servers.
 
-**The Problem:** vLLM exposes numerous configuration flags (e.g., `--max-num-seqs`, `--enable-prefix-caching`). Tuning them via trial and error wastes time and hardware.
-**The Solution:** Profile establishes the theoretical physics ceiling for your exact model and GPU, measures live traffic, and maps the identified bottlenecks directly to the precise vLLM flags required to resolve them.
+**The Problem:** Inference servers run below hardware capacity. Operators cannot see why.
+
+**The Solution:** Profile computes the hardware ceiling for your model and GPU, measures live throughput against it, and identifies the vLLM startup flags to change.
 
 **[Website](https://jungledesh.github.io/profile/index.html)** | **[Docs](https://jungledesh.github.io/profile/docs.html)**
 
 ---
 
-## Profile vs other tools
+## How to use Profile
 
+Profile is not a passive dashboard. It is an interactive optimization loop. It analyzes your vLLM `/metrics`, pinpoints the primary bottleneck, and prescribes specific vLLM startup flags to fix it.
 
-|                                        | Profile | Other tools |
-| -------------------------------------- | ------- | ----------- |
-| Physics ceiling (roofline math)        | ✓       | ✗           |
-| Filters idle, only analyzes under load | ✓       | ✗           |
-| Bottleneck detection                   | ✓       | ✓           |
-| Closed loop: measures delta after fix  | ✓       | ✗           |
-| Cost per 1M tokens + recoverable waste | ✓       | ✗           |
-| Prescriptive fixes, not just alerts    | ✓       | ✗           |
+### Prerequisites
+- NVIDIA GPU with NVML (for hardware metrics).
+- vLLM running with `/metrics` reachable (default `http://localhost:8000/metrics`).
+- Active production-like load during the `--duration` window. Idle servers produce no signal.
 
+### Install & Run
+```bash
+# Download
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/jungledesh/profile/releases/latest/download/profile-installer.sh | sh
 
-Profile is the first of its kind in the market. We are not just another monitoring tool; we provide actionable intelligence grounded in physics.
+# Start profiling your vLLM server
+profile diagnose --url http://localhost:8000/metrics --duration 2m
+```
 
----
+*Or build from source: `cargo install --git https://github.com/jungledesh/profile`*
 
-## The Value
+### The Optimization Loop
+When sampling ends, Profile prints a summary block. Look at `ISSUES`. The `Fix:` tells you what to change in your vLLM startup command.
 
-You are paying for hardware. Are you using it?
-Profile computes the theoretical physics ceiling for your exact model and GPU, measures your live traffic, and tells you precisely why you are leaving money on the table. Every recommendation is accountable. You apply the fix, Profile measures the delta.
+*Read*
+Profile prints a performance snapshot followed by an `ISSUES` block. Here is an example issue. Do exactly what the `Fix:` section recommends.
+```text
++----------------------------------------------------------------------------------------------------+
+|PROFILE v2.1.4 [Qwen3.6-27B] [NVIDIA A100-SXM4-80GB] (1m from 2026-06-18 21:57:54 UTC)              |
+|                                                                                                    |
+|GPU =>     EFFICIENCY 4.9% | POWER 391W | 1.37 J/tok | $1.46/1M tok (est) | vRAM 71/80GB            |
+|                                                                                                    |
+|vLLM:                                                                                               |
+|REQUESTS   run 53 (20.8%) | wait 196 | max 256                                                      |
+|LATENCY    ttft 50.0s (p95 96.0s) | tpot 193ms (p95 292ms)                                          |
+|CACHE      kv_cache 98.0% avg (99.7% peak) | pfix_cache -                                           |
+|THROUGHPUT 285 tok/s                                                                                |
+|TRAFFIC    qps 0.7 | req_total 80 | gen_total 28429 | preempt/s 0.00 | preempt_total 0              |
+|                                                                                                    |
+|ISSUES:                                                                                             |
+|                                                                                                    |
+|[!] KV Cache Pressure                                                                               |
+|  Seen in 83% of windows                                                                            |
+|  Cause:                                                                                            |
+|  - KV cache hit 99.7% peak (threshold: 88%)                                                        |
+|  - Queue backpressure: 196 requests waiting on KV admission                                        |
+|                                                                                                    |
+|  Fix:                                                                                              |
+|    • Lower --max-num-seqs to ≤13 (physics ceiling for max_model_len=8192)                          |
+|    • Raise --gpu-memory-utilization (check VRAM header for avail mem) to expand KV pool            |
+|    • Enable --enable-prefix-caching to share KV blocks across identical prompt prefixes            |
+|    • Switch --kv-cache-dtype fp8 to halve KV memory footprint                                      |
+|    • Lower --max-model-len (current: 8192) to safely raise concurrency.                            |
+|                                                                                                    |
+|  Expected: Wait queue drains, TTFT recovers once KV pool has capacity.                             |
+|  Confidence: High                                                                                  |
++----------------------------------------------------------------------------------------------------+
+```
 
-### Real World Impact: Qwen3.6-27B on A100-SXM4-80GB
+> *Note: `[!] KV Cache Pressure` corresponds directly to rule **R2** in the Flag Recommendations Map below.*
 
-📺 **[Watch the 15x optimization demo](https://www.youtube.com/watch?v=XuPPKBteWH0)**
+*Restart & Measure*
+Apply primary and secondary fixes together in one restart. One flag per restart wastes time. Restart vLLM. Profile resumes on vLLM re-start and measures the new baseline. Repeat this process until the bottleneck clears or you reach hardware saturation.
 
-**Before Profile:**
+```text
+Apply your change. Press Enter when done.
+Connection restored. Resuming in 5s...
 
-- Throughput: `31 tok/s`
-- Economics: `$13.26 / 1M tokens`
+New --max-num-seqs [current: 256]: 13
 
-**After Profile:**
+Measuring delta...
 
-- Throughput: `470 tok/s`
-- Economics: `$0.89 / 1M tokens`
+  Config changed, baseline reset.
 
-**Result:** A **15x throughput increase** and a **93% cost reduction**. Profile tracked the live traffic, dynamically recommended concurrency and model length adjustments, and identified the exact moment the server became structurally saturated. Instead of blindly tweaking configs, Profile advised spinning up a replica to preserve latency.
+  Throughput   285 -> 133 tok/s ↓
+  TTFT         50046 -> 57230ms ↑  (p95 96000 -> 78000ms ↓)
+  TPOT         193.2 -> 75.6ms ↓   (p95 292.3 -> 97.5ms ↓)
+  Efficiency   -2.6pp ↓
 
+ECONOMICS:
+  J/tok        1.37 -> 2.14 ↑
+  Cost/1M tok  $1.46 -> $3.14 ↑ (est)
+  Waste        $1.43 -> $1.47/hr
+```
+
+*Iterate*
+Notice the throughput dropped? Profile reports regressions honestly. Fixing one bottleneck often exposes the next. Keep iterating, results improve over multiple restarts.
+
+*Scale Out*
+Eventually, no config change will help. You have hit hardware saturation. Time to scale out.
 ```text
 +----------------------------------------------------------------------------------------------------+
 |PROFILE v2.1.4 [Qwen3.6-27B] [NVIDIA A100-SXM4-80GB] (1m from 2026-06-18 22:08:40 UTC)              |
@@ -72,79 +125,79 @@ Profile computes the theoretical physics ceiling for your exact model and GPU, m
 +----------------------------------------------------------------------------------------------------+
 ```
 
----
+### vLLM Flag Recommendations Map
+Profile detects these bottlenecks and recommends the following vLLM flag changes:
 
-## Install & Run
+| Diagnosis                     | When it fires                                      | vLLM flags to change                                                                                                              |
+| ----------------------------- | -------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| **R1 Under-batching**         | GPU efficiency <60%, no queue                      | Increase client concurrency (not a vLLM flag)                                                                                     |
+| **R2 KV cache pressure**      | KV ≥88%, preemptions, or admission backlog         | Lower `--max-num-seqs` or `--max-model-len`; or raise `--gpu-memory-utilization`, switch to fp8 KV cache                          |
+| **R3 Low prefix reuse**       | Prefix hit rate <35%                               | Add `--enable-prefix-caching`; restructure prompts if already enabled                                                             |
+| **R4 OOM risk**               | Weights exceed VRAM                                | Set `--tensor-parallel-size` (Profile computes the value)                                                                         |
+| **R5 Concurrency saturation** | Queueing, running at `--max-num-seqs` cap            | Raise `--max-num-seqs` if KV <80%; otherwise add a replica or lower `--max-model-len`                                             |
 
-```bash
-# Download
-curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/jungledesh/profile/releases/latest/download/profile-installer.sh | sh
+> *Note: Profile may list several fixes in one Fix: block. Apply them together when relevant. See [Rules](https://jungledesh.github.io/profile/docs.html#rules) for thresholds and edge cases.*
 
-# Start profiling your vLLM server
-profile diagnose --url http://localhost:8000/metrics --duration 2m
-```
+### Profile CLI Configuration
+These are flags for the `profile` CLI itself, *not* vLLM.
 
-*Or build from source: `cargo install --git https://github.com/jungledesh/profile`*
-
----
-
-## Configuration
-
-
-| Flag                     | Default                         | Description                                                           |
-| ------------------------ | ------------------------------- | --------------------------------------------------------------------- |
-| `-u, --url`              | `http://localhost:8000/metrics` | vLLM metrics endpoint                                                 |
-| `--duration`             | `30s`                           | Sampling window (`30s`, `1m`, `2m`, `3m`)                             |
-| `-m, --max-num-seqs`     | Prompted if absent              | Pass directly to skip prompt. Auto-read from `/metrics` if available. |
-| `--tensor-parallel-size` | Env or unset                    | TP degree (overrides `TENSOR_PARALLEL_SIZE`)                          |
-| `--cost-per-hour`        | Catalog estimate                | GPU cost in USD/hr (overrides catalog estimate)                       |
-| `-v`                     | Off                             | Show non-triggered rules and physics limits                           |
-
+| Flag                     | Default                         | Description                                                  |
+| ------------------------ | ------------------------------- | ------------------------------------------------------------ |
+| `-u, --url`              | `http://localhost:8000/metrics` | vLLM metrics endpoint                                        |
+| `--duration`             | `30s`                           | Sampling window (`30s`, `1m`, `2m`, `3m`)                    |
+| `-m, --max-num-seqs`     | Prompted if absent              | Pass to skip prompt. Auto-read from `/metrics` if available. |
+| `--tensor-parallel-size` | Env or unset                    | TP degree (overrides `TENSOR_PARALLEL_SIZE`)                 |
+| `--cost-per-hour`        | Catalog estimate                | GPU cost in USD/hr (overrides catalog estimate)              |
+| `-v`                     | Off                             | Show non-triggered rules and physics limits                  |
 
 ---
 
-## Optimization Workflow
+## Proof: Qwen3.6-27B on A100-SXM4-80GB
 
-Profile maps hardware bottlenecks directly to vLLM arguments. Do not guess. Measure, adjust, and verify.
+📺 **[Watch the 15x optimization demo](https://www.youtube.com/watch?v=XuPPKBteWH0)**
 
-1. **Establish Baseline:** Start vLLM with default parameters. Apply production load.
-2. **Diagnose:** Execute `profile diagnose --url http://localhost:8000/metrics --duration 2m`.
-3. **Map Output to vLLM Flags:**
+**Before Profile:** `31 tok/s` | `$13.26 / 1M tokens`  
+**After Profile:** `470 tok/s` | `$0.89 / 1M tokens`
 
-| Diagnosis | Symptom | Action |
-| :--- | :--- | :--- |
-| **R1 Under-batching** | GPU efficiency <60%. | Hardware is starved. Increase client concurrency. |
-| **R2 KV cache pressure** | KV usage ≥88%. Preemptions occur. | Lower `--max-num-seqs` to Profile's recommended value. |
-| **R3 Low prefix reuse** | Hit rate <35%. | Wasted prefill compute. Add `--enable-prefix-caching`. |
-| **R4 OOM risk** | Weights exceed VRAM. | Add `--tensor-parallel-size` or quantize. |
-| **R5 Concurrency saturation** | Queueing while GPU is idle. | Raise `--max-num-seqs` to ingest requests. |
+**Result:** 15x throughput. 93% cost cut. Profile tracked live traffic and guided specific vLLM config changes (`--max-num-seqs`, prefix caching, FP8 KV cache, `--gpu-memory-utilization`) until hardware saturation was reached.
 
-4. **Verify:** Apply the flag, restart vLLM, and re-run Profile to confirm the bottleneck is resolved.
+---
+
+## Why Profile?
+
+Profile provides actionable intelligence grounded in hardware physics to maximize compute utilization, replacing passive metric alerts.
+
+| Feature                                | Profile | Others |
+| -------------------------------------- | ------- | ------ |
+| Physics ceiling (roofline math)        | ✓       | ✗      |
+| Filters idle, only analyzes under load | ✓       | ✗      |
+| Bottleneck detection                   | ✓       | ✓      |
+| Closed loop: measures delta after fix  | ✓       | ✗      |
+| Cost per 1M tokens + recoverable waste | ✓       | ✗      |
+| Prescriptive fixes, not just alerts    | ✓       | ✗      |
 
 ---
 
 ## Documentation
 
-Comprehensive internals are available in our docs.
+Start with the Workflow, then Rules. The rest is reference material.
 
-- **[Data](https://jungledesh.github.io/profile/docs.html#data)**: How we aggregate 2s windows from parallel NVML and vLLM polls.
-- **[Catalog](https://jungledesh.github.io/profile/docs.html#catalog)**: Hardcoded GPU memory bandwidth, FLOPs, and market prices.
-- **[Math](https://jungledesh.github.io/profile/docs.html#math)**: The physics formulas powering the efficiency percentage.
-- **[Rules](https://jungledesh.github.io/profile/docs.html#rules)**: The precise mathematical conditions that trigger recommendations.
-- **[Limitations](https://jungledesh.github.io/profile/docs.html#limitations)**: Where the math is approximate and why.
-- **[Design](https://jungledesh.github.io/profile/docs.html#design)**: The philosophy behind the engine.
+- **[Workflow](https://jungledesh.github.io/profile/docs.html#home)**: Usage, output walkthrough, flag mapping.
+- **[Rules](https://jungledesh.github.io/profile/docs.html#rules)**: Thresholds, confidence, and edge cases.
+- **[Data](https://jungledesh.github.io/profile/docs.html#data)**: Metric sources.
+- **[Math](https://jungledesh.github.io/profile/docs.html#math)**: Physics behind efficiency %.
+- **[Catalog](https://jungledesh.github.io/profile/docs.html#catalog)**: GPU bandwidth, FLOPs, and prices.
+- **[Limitations](https://jungledesh.github.io/profile/docs.html#limitations)**: Where the math is approximate.
+- **[Design](https://jungledesh.github.io/profile/docs.html#design)**: Engine design philosophy.
 
 ---
 
-## Crafted, not just engineered.
+## Engineering Principles
 
-- Every element in the UI earns its place. If it does not help the user, it is not there.
-- Plain language. No jargon, where a plain word works. The goal is to help, not impress.
-- Idle windows are ignored. Profile only measures behavior under active load. That is where waste lives.
-- Hardware and model agnostic. Roofline math derives limits fresh each run: peak memory bandwidth for decode, peak FLOPs for prefill. No calibration files, no pre-baked assumptions.
-- Honest under uncertainty. If a metric is unavailable, it shows `-` and moves on. No fabricated values.
-- Prescriptive. Profile tells you what to change and how. Waits while you apply it. Re-measures and reports the exact delta.
+- Actionable UI: Elements without direct utility are excluded.
+- Plain Language: Documentation avoids unnecessary jargon.
+- Hardware Agnostic: Roofline limits are computed dynamically per run without calibration files.
+- Honest. Unavailable metrics show `-`. No fabricated values.
 
 ---
 
@@ -152,4 +205,4 @@ Comprehensive internals are available in our docs.
 
 Apache License 2.0. Copyright 2026 Gagandeep Singh.
 
-For production teams requiring cluster-wide aggregation, multi-engine support, or custom hardware cataloging: **[jungledesh@gmail.com](mailto:jungledesh@gmail.com)**
+Need cluster aggregation, multi-engine, custom hardware catalog, or more support? [Open an issue](https://github.com/jungledesh/profile/issues) or email **[jungledesh@gmail.com](mailto:jungledesh@gmail.com)**
