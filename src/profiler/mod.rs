@@ -3,7 +3,7 @@
 //! Multi-window aggregation rules: **`docs/collection-policy.md`**.
 
 use crate::collectors::{
-    self, build_config, window_is_active, window_is_evaluable, HistogramWindowMass,
+    self, HistogramWindowMass, build_config, window_is_active, window_is_evaluable,
 };
 use crate::context::{RuntimeWindow, StaticContext};
 use std::time::{Duration, SystemTime};

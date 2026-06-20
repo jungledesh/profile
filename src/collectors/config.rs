@@ -105,11 +105,11 @@ pub fn build_config(
         cfg.model_root = api.model_root.or(cfg.model_root);
         cfg.max_model_len = api.max_model_len.or(cfg.max_model_len);
         let info = fetch_info(&client, &base);
-        if cfg.vllm_reported_dtype.as_deref() == Some("auto") || cfg.vllm_reported_dtype.is_none() {
-            if let Some(resolved) = info.dtype {
-                cfg.vllm_reported_dtype = Some(resolved);
-                cfg.vllm_reported_dtype_resolved = true;
-            }
+        if (cfg.vllm_reported_dtype.as_deref() == Some("auto") || cfg.vllm_reported_dtype.is_none())
+            && let Some(resolved) = info.dtype
+        {
+            cfg.vllm_reported_dtype = Some(resolved);
+            cfg.vllm_reported_dtype_resolved = true;
         }
         cfg.vllm_reported_quantization = info.quantization;
     }

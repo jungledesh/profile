@@ -379,14 +379,18 @@ mod tests {
         };
         let disabled = format_low_prefix_hit_rate_fired(&d, Some(false), 10.0, Some(64.0), None);
         let enabled = format_low_prefix_hit_rate_fired(&d, Some(true), 10.0, Some(64.0), None);
-        assert!(disabled
-            .iter()
-            .any(|l| l.contains("--enable-prefix-caching")));
+        assert!(
+            disabled
+                .iter()
+                .any(|l| l.contains("--enable-prefix-caching"))
+        );
         assert!(!disabled.iter().any(|l| l.contains("Avoid unique tokens")));
         assert!(enabled.iter().any(|l| l.contains("Avoid unique tokens")));
-        assert!(!enabled
-            .iter()
-            .any(|l| l.contains("--enable-prefix-caching")));
+        assert!(
+            !enabled
+                .iter()
+                .any(|l| l.contains("--enable-prefix-caching"))
+        );
     }
 
     #[test]

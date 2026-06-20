@@ -109,15 +109,15 @@ pub(super) fn rule1_under_batching_with_efficiency(
     // Known limitation: Prometheus histograms only record on request completion.
     // A chunked prefill spanning the full window duration will read sum_delta=0
     // and bypass this gate until the request completes. Accepted — documented limitation.
-    if let Some(mass) = snapshot.vllm.prefill_window_mass {
-        if mass.count_delta > 0.0 {
-            let mean_prefill_secs = mass.sum_delta / mass.count_delta;
-            let ratio = mean_prefill_secs / window_secs;
-            if ratio > UNDER_BATCHING_PREFILL_SATURATION_MAX {
-                return Rule1Outcome::NotFired(R1MissReport {
-                    prefill_saturation_ratio: Some(ratio),
-                });
-            }
+    if let Some(mass) = snapshot.vllm.prefill_window_mass
+        && mass.count_delta > 0.0
+    {
+        let mean_prefill_secs = mass.sum_delta / mass.count_delta;
+        let ratio = mean_prefill_secs / window_secs;
+        if ratio > UNDER_BATCHING_PREFILL_SATURATION_MAX {
+            return Rule1Outcome::NotFired(R1MissReport {
+                prefill_saturation_ratio: Some(ratio),
+            });
         }
     }
 
@@ -552,8 +552,11 @@ mod tests {
         let s = entry_fired_snap();
         let r = r1_recommendation(&s, None, None).expect("fired");
         let text = r.display_lines.join("\n");
-        assert!(text
-            .contains("    • Batch more requests or increase client concurrency (251 slots idle)"));
+        assert!(
+            text.contains(
+                "    • Batch more requests or increase client concurrency (251 slots idle)"
+            )
+        );
         assert!(!text.contains("hardware limit"));
         assert!(!text.contains("KV ceiling"));
     }

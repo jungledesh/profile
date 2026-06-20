@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use profile::{run, Cli};
+use profile::{Cli, run};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();

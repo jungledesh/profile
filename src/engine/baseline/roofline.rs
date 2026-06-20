@@ -1,5 +1,5 @@
 use crate::collectors::config::DEFAULT_GPU_MEMORY_UTILIZATION;
-use crate::context::{gpu_prices, AnalysisInput};
+use crate::context::{AnalysisInput, gpu_prices};
 
 use super::math;
 

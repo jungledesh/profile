@@ -103,25 +103,25 @@ pub(super) fn r5_action(
         return "Add a replica to scale out.".to_string();
     }
 
-    if let (Some(ceiling), Some(current)) = (kv_max_seqs, d.max_num_seqs) {
-        if current >= ceiling {
-            let m = max_model_len
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "?".to_string());
-            let kv_note = match d.kv_cache_usage_perc {
-                Some(pct) => format!("KV pool has room ({pct:.0}%), but"),
-                None => "KV unknown, but".to_string(),
-            };
-            let fix = max_model_len_fix_line(max_model_len, prompt_tokens_mean);
-            let first = fix
-                .split('\n')
-                .next()
-                .unwrap_or("")
-                .trim_start_matches("• ");
-            return format!(
-                "{kv_note} --max-num-seqs is at the physics ceiling for max_model_len={m}. {first}"
-            );
-        }
+    if let (Some(ceiling), Some(current)) = (kv_max_seqs, d.max_num_seqs)
+        && current >= ceiling
+    {
+        let m = max_model_len
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        let kv_note = match d.kv_cache_usage_perc {
+            Some(pct) => format!("KV pool has room ({pct:.0}%), but"),
+            None => "KV unknown, but".to_string(),
+        };
+        let fix = max_model_len_fix_line(max_model_len, prompt_tokens_mean);
+        let first = fix
+            .split('\n')
+            .next()
+            .unwrap_or("")
+            .trim_start_matches("• ");
+        return format!(
+            "{kv_note} --max-num-seqs is at the physics ceiling for max_model_len={m}. {first}"
+        );
     }
 
     format!(
@@ -324,13 +324,13 @@ pub(super) fn r5_short_action(
         return "add a replica to scale out".to_string();
     }
 
-    if let (Some(ceiling), Some(current)) = (kv_max_seqs, d.max_num_seqs) {
-        if current >= ceiling {
-            let m = max_model_len
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "?".to_string());
-            return format!("lower --max-model-len (at physics ceiling for max_model_len={m})");
-        }
+    if let (Some(ceiling), Some(current)) = (kv_max_seqs, d.max_num_seqs)
+        && current >= ceiling
+    {
+        let m = max_model_len
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        return format!("lower --max-model-len (at physics ceiling for max_model_len={m})");
     }
 
     let max_label = d

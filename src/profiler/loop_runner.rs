@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use super::{delta, drift, poll, run_diagnose, state::LoopState, DiagnoseResult};
+use super::{DiagnoseResult, delta, drift, poll, run_diagnose, state::LoopState};
 use crate::context::{AnalysisInput, RuntimeWindow};
 use crate::engine;
 use crate::output;
@@ -305,40 +305,43 @@ fn print_delta(d: &delta::Delta) {
             println!("{line}");
         }
     }
-    if let (Some(before), Some(after)) = (d.throughput_before, d.throughput_after) {
-        if before.is_finite() && after.is_finite() {
-            let arrow = throughput_arrow(before, after);
-            println!("  Throughput  {before:.0} → {after:.0} tok/s {arrow}");
+    if let (Some(before), Some(after)) = (d.throughput_before, d.throughput_after)
+        && before.is_finite()
+        && after.is_finite()
+    {
+        let arrow = throughput_arrow(before, after);
+        println!("  Throughput  {before:.0} → {after:.0} tok/s {arrow}");
+    }
+    if let (Some(before), Some(after)) = (d.ttft_before_ms, d.ttft_after_ms)
+        && before.is_finite()
+        && after.is_finite()
+    {
+        let delta = after - before;
+        if delta.abs() > 5.0 {
+            let arrow = latency_arrow(delta);
+            let p95_suffix = match (d.ttft_p95_before_ms, d.ttft_p95_after_ms) {
+                (Some(pb), Some(pa)) if pb.is_finite() && pa.is_finite() => {
+                    format!("  (p95 {pb:.0} → {pa:.0}ms {})", latency_arrow(pa - pb))
+                }
+                _ => String::new(),
+            };
+            println!("  TTFT        {before:.0} → {after:.0}ms {arrow}{p95_suffix}");
         }
     }
-    if let (Some(before), Some(after)) = (d.ttft_before_ms, d.ttft_after_ms) {
-        if before.is_finite() && after.is_finite() {
-            let delta = after - before;
-            if delta.abs() > 5.0 {
-                let arrow = latency_arrow(delta);
-                let p95_suffix = match (d.ttft_p95_before_ms, d.ttft_p95_after_ms) {
-                    (Some(pb), Some(pa)) if pb.is_finite() && pa.is_finite() => {
-                        format!("  (p95 {pb:.0} → {pa:.0}ms {})", latency_arrow(pa - pb))
-                    }
-                    _ => String::new(),
-                };
-                println!("  TTFT        {before:.0} → {after:.0}ms {arrow}{p95_suffix}");
-            }
-        }
-    }
-    if let (Some(before), Some(after)) = (d.tpot_before_ms, d.tpot_after_ms) {
-        if before.is_finite() && after.is_finite() {
-            let delta = after - before;
-            if delta.abs() > 0.5 {
-                let arrow = latency_arrow(delta);
-                let p95_suffix = match (d.tpot_p95_before_ms, d.tpot_p95_after_ms) {
-                    (Some(pb), Some(pa)) if pb.is_finite() && pa.is_finite() => {
-                        format!("  (p95 {pb:.1} → {pa:.1}ms {})", latency_arrow(pa - pb))
-                    }
-                    _ => String::new(),
-                };
-                println!("  TPOT        {before:.1} → {after:.1}ms {arrow}{p95_suffix}");
-            }
+    if let (Some(before), Some(after)) = (d.tpot_before_ms, d.tpot_after_ms)
+        && before.is_finite()
+        && after.is_finite()
+    {
+        let delta = after - before;
+        if delta.abs() > 0.5 {
+            let arrow = latency_arrow(delta);
+            let p95_suffix = match (d.tpot_p95_before_ms, d.tpot_p95_after_ms) {
+                (Some(pb), Some(pa)) if pb.is_finite() && pa.is_finite() => {
+                    format!("  (p95 {pb:.1} → {pa:.1}ms {})", latency_arrow(pa - pb))
+                }
+                _ => String::new(),
+            };
+            println!("  TPOT        {before:.1} → {after:.1}ms {arrow}{p95_suffix}");
         }
     }
     if let Some(line) = format_efficiency_delta_line(d.efficiency_delta_pp) {
@@ -374,14 +377,16 @@ fn print_delta(d: &delta::Delta) {
         d.throughput_after,
         d.efficiency_pct_before,
         d.efficiency_pct_after,
-    ) {
-        if cpm_b.is_finite() && cpm_a.is_finite() && tps_b > 0.0 && tps_a > 0.0 {
-            let waste_b = (cpm_b * tps_b * 3600.0 / 1_000_000.0) * (1.0 - eff_b / 100.0).max(0.0);
-            let waste_a = (cpm_a * tps_a * 3600.0 / 1_000_000.0) * (1.0 - eff_a / 100.0).max(0.0);
-            if waste_b.is_finite() && waste_a.is_finite() {
-                let arrow = recoverable_waste_arrow(waste_b, waste_a);
-                println!("  Waste         ${waste_b:.2} → ${waste_a:.2}/hr {arrow}");
-            }
+    ) && cpm_b.is_finite()
+        && cpm_a.is_finite()
+        && tps_b > 0.0
+        && tps_a > 0.0
+    {
+        let waste_b = (cpm_b * tps_b * 3600.0 / 1_000_000.0) * (1.0 - eff_b / 100.0).max(0.0);
+        let waste_a = (cpm_a * tps_a * 3600.0 / 1_000_000.0) * (1.0 - eff_a / 100.0).max(0.0);
+        if waste_b.is_finite() && waste_a.is_finite() {
+            let arrow = recoverable_waste_arrow(waste_b, waste_a);
+            println!("  Waste         ${waste_b:.2} → ${waste_a:.2}/hr {arrow}");
         }
     }
 }

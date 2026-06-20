@@ -1,6 +1,6 @@
 use crate::collectors::RawSnapshot;
 
-use super::{skew_secs, Recommendation, MAX_OBSERVATION_SKEW_SECS};
+use super::{MAX_OBSERVATION_SKEW_SECS, Recommendation, skew_secs};
 
 /// 88% matches observed vLLM production eviction onset; 85% was too conservative.
 const KV_CACHE_PRESSURE_MIN_PERC: f64 = 88.0;
@@ -366,12 +366,12 @@ pub(super) fn format_kv_cache_pressure_fired(
             "  - Active preemptions: scheduler evicting sequences to free KV blocks".to_string(),
         );
     }
-    if d.queue_backpressure {
-        if let Some(wait) = snapshot.vllm.num_requests_waiting.filter(|v| v.is_finite()) {
-            out.push(format!(
-                "  - Queue backpressure: {wait:.0} requests waiting on KV admission"
-            ));
-        }
+    if d.queue_backpressure
+        && let Some(wait) = snapshot.vllm.num_requests_waiting.filter(|v| v.is_finite())
+    {
+        out.push(format!(
+            "  - Queue backpressure: {wait:.0} requests waiting on KV admission"
+        ));
     }
     out.push(String::new());
     out.push("  Fix:".to_string());
@@ -615,46 +615,40 @@ mod tests {
     #[test]
     fn backlog_silent_when_free_at_least_demand() {
         // 10% KV used → 90% free pool; demand is small
-        assert!(rule2_kv_admission_backlog(&snap(backlog_vllm(
-            10.0,
-            5.0,
-            5.0,
-            100.0,
-            Some(1000),
-            Some(16),
-        )))
-        .is_none());
+        assert!(
+            rule2_kv_admission_backlog(&snap(backlog_vllm(
+                10.0,
+                5.0,
+                5.0,
+                100.0,
+                Some(1000),
+                Some(16),
+            )))
+            .is_none()
+        );
     }
 
     #[test]
     fn backlog_silent_when_required_field_missing() {
-        assert!(rule2_kv_admission_backlog(&snap(backlog_vllm(
-            90.0,
-            10.0,
-            5.0,
-            20.0,
-            None,
-            Some(16)
-        )))
-        .is_none());
-        assert!(rule2_kv_admission_backlog(&snap(backlog_vllm(
-            90.0,
-            10.0,
-            5.0,
-            20.0,
-            Some(100),
-            None
-        )))
-        .is_none());
-        assert!(rule2_kv_admission_backlog(&snap(backlog_vllm(
-            90.0,
-            10.0,
-            5.0,
-            f64::NAN,
-            Some(100),
-            Some(16)
-        )))
-        .is_none());
+        assert!(
+            rule2_kv_admission_backlog(&snap(backlog_vllm(90.0, 10.0, 5.0, 20.0, None, Some(16))))
+                .is_none()
+        );
+        assert!(
+            rule2_kv_admission_backlog(&snap(backlog_vllm(90.0, 10.0, 5.0, 20.0, Some(100), None)))
+                .is_none()
+        );
+        assert!(
+            rule2_kv_admission_backlog(&snap(backlog_vllm(
+                90.0,
+                10.0,
+                5.0,
+                f64::NAN,
+                Some(100),
+                Some(16)
+            )))
+            .is_none()
+        );
         let mut v = backlog_vllm(90.0, 10.0, 5.0, 20.0, Some(100), Some(16));
         v.max_num_seqs = None;
         assert!(rule2_kv_admission_backlog(&snap(v)).is_none());
@@ -671,15 +665,17 @@ mod tests {
 
     #[test]
     fn backlog_silent_when_ratio_below_0_30() {
-        assert!(rule2_kv_admission_backlog(&snap(backlog_vllm(
-            90.0,
-            2.0,
-            8.0,
-            20.0,
-            Some(100),
-            Some(16),
-        )))
-        .is_none());
+        assert!(
+            rule2_kv_admission_backlog(&snap(backlog_vllm(
+                90.0,
+                2.0,
+                8.0,
+                20.0,
+                Some(100),
+                Some(16),
+            )))
+            .is_none()
+        );
     }
 
     fn detail(kv: f64, preemptions: bool) -> KvCachePressureDetail {

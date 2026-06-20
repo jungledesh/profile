@@ -2,13 +2,13 @@ use std::thread;
 use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
-use nvml_wrapper::enum_wrappers::device::{Clock, ClockId, TemperatureSensor};
 use nvml_wrapper::Nvml;
+use nvml_wrapper::enum_wrappers::device::{Clock, ClockId, TemperatureSensor};
 
+use super::GpuRawMetrics;
 #[cfg(test)]
 use super::sampling::SAMPLE_COUNT;
-use super::sampling::{sample_count_for, SAMPLE_INTERVAL};
-use super::GpuRawMetrics;
+use super::sampling::{SAMPLE_INTERVAL, sample_count_for};
 
 const MIB: u64 = 1024 * 1024;
 

@@ -10,4 +10,4 @@ pub mod fmt;
 pub mod output;
 pub mod profiler;
 
-pub use cli::{run, Cli};
+pub use cli::{Cli, run};
