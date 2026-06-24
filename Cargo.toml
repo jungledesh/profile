@@ -11,6 +11,8 @@ repository = "https://github.com/jungledesh/profile"
 name = "profile"
 path = "src/main.rs"
 
+# testing for socket.dev scan
+
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4.5", features = ["derive"] }
