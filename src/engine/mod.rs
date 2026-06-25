@@ -2,7 +2,7 @@ pub mod baseline;
 pub mod limiter;
 mod rules;
 
-use crate::collectors::window_is_evaluable;
+use crate::collectors::{effective_tensor_parallel, window_is_evaluable};
 use crate::context::{AnalysisInput, RuntimeWindow};
 
 pub use baseline::{CeilingEstimate, CostEstimate, CostSource, PhysicsBaseline, WeightDtypeSource};
@@ -65,7 +65,10 @@ pub fn build_report(input: AnalysisInput<'_>) -> Report {
         rules::r3_recommendation(snapshot),
         rules::r4_recommendation(
             baseline.as_ref().and_then(|b| b.kv_headroom_gb),
-            input.ctx.config.tensor_parallel_size,
+            effective_tensor_parallel(
+                input.ctx.config.tensor_parallel_size,
+                input.window.snapshot.collected_gpu_count(),
+            ),
             baseline.as_ref().map(|b| b.weight_gb),
             input.ctx.gpu.vram_gb,
             input.ctx.config.gpu_memory_utilization,
@@ -211,7 +214,9 @@ mod build_report_tests {
             vllm_observed_at: t,
             timestamp: t,
             vllm: v,
-            gpu: g,
+            gpus: vec![g],
+
+            nvml_host_gpu_count: None,
         };
         let cfg = VllmConfig {
             dtype: Some("bf16".to_string()),
@@ -282,7 +287,9 @@ mod build_report_tests {
             vllm_observed_at: t,
             timestamp: t,
             vllm: v,
-            gpu: g,
+            gpus: vec![g],
+
+            nvml_host_gpu_count: None,
         };
         let cfg = VllmConfig {
             dtype: Some("bf16".to_string()),
@@ -335,7 +342,9 @@ mod build_report_tests {
             vllm_observed_at: t,
             timestamp: t,
             vllm: v,
-            gpu: g,
+            gpus: vec![g],
+
+            nvml_host_gpu_count: None,
         };
         let cfg = VllmConfig {
             dtype: Some("bf16".to_string()),

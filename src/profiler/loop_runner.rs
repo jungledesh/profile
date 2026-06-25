@@ -10,15 +10,18 @@ const EFFICIENCY_DISPLAY_MIN_PP: f64 = 0.05;
 const EFFICIENCY_PLATEAU_DELTA: f64 = 2.0;
 const PLATEAU_CONSECUTIVE_ITERS: u32 = 3;
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     url: &str,
-    max_num_seqs: Option<u32>,
+    max_num_seqs: u32,
     cost_per_hour: Option<f64>,
-    tensor_parallel_size: Option<u32>,
+    tensor_parallel_size: u32,
+    gpu_indices: Vec<u32>,
     duration: Duration,
     initial_result: DiagnoseResult,
     initial_report: engine::Report,
 ) -> anyhow::Result<()> {
+    let mut last_fingerprint = initial_result.snapshot.fingerprint();
     let mut state = LoopState::new(initial_result, initial_report);
     let stdin_rx = poll::spawn_stdin_watcher();
     let mut current_max_num_seqs = max_num_seqs;
@@ -135,19 +138,19 @@ pub fn run(
         let _outcome = poll::wait_for_restart_or_skip(url, &stdin_rx);
 
         println!();
-        let current = current_max_num_seqs.unwrap_or(256);
-        current_max_num_seqs = Some(crate::cli::prompt_for_updated_max_num_seqs(
-            current, &stdin_rx,
-        )?);
+        current_max_num_seqs =
+            crate::cli::prompt_for_updated_max_num_seqs(current_max_num_seqs, &stdin_rx)?;
 
         println!("\nMeasuring delta...\n");
         let new_result = run_diagnose(
             url,
-            current_max_num_seqs,
+            Some(current_max_num_seqs),
             cost_per_hour,
             tensor_parallel_size,
+            gpu_indices.clone(),
             duration,
         )?;
+        last_fingerprint = verified_pass_fingerprint(&last_fingerprint, &new_result.snapshot)?;
         let agg_win = RuntimeWindow::from_snapshot(new_result.snapshot.clone());
         let summary = AnalysisInput::new(&new_result.static_ctx, &agg_win);
         let new_report = engine::build_report_for_diagnose(&new_result.windows, summary);
@@ -480,9 +483,20 @@ fn latency_arrow(delta_ms: f64) -> &'static str {
     }
 }
 
+/// Closed-loop pass gate: fingerprint must match the prior iteration.
+fn verified_pass_fingerprint(
+    last: &crate::collectors::GpuFingerprint,
+    snapshot: &crate::collectors::RawSnapshot,
+) -> anyhow::Result<crate::collectors::GpuFingerprint> {
+    let current = snapshot.fingerprint();
+    crate::collectors::types::check_topology_drift(last, &current)?;
+    Ok(current)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collectors::test_fixtures::snap_with_gpu_indices;
 
     #[test]
     fn at_hardware_ceiling_below_threshold() {
@@ -724,5 +738,23 @@ mod tests {
         };
         assert!(recoverable_waste_available(&d));
         assert!(economics_section_active(&d));
+    }
+
+    #[test]
+    fn verified_pass_fingerprint_allows_unchanged_topology() {
+        let last = snap_with_gpu_indices(&[0, 1]).fingerprint();
+        let next = snap_with_gpu_indices(&[0, 1]);
+        assert!(verified_pass_fingerprint(&last, &next).is_ok());
+    }
+
+    #[test]
+    fn verified_pass_fingerprint_errors_on_topology_drift() {
+        let last = snap_with_gpu_indices(&[0, 1]).fingerprint();
+        let drifted = snap_with_gpu_indices(&[0, 2]);
+        let err = verified_pass_fingerprint(&last, &drifted).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Topology drift detected"));
+        assert!(msg.contains("missing [GPU-1]"));
+        assert!(msg.contains("new [GPU-2]"));
     }
 }

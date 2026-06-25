@@ -314,7 +314,9 @@ mod tests {
                 window_duration_secs,
                 ..Default::default()
             },
-            gpu: Default::default(),
+            gpus: vec![],
+
+            nvml_host_gpu_count: None,
         }
     }
 

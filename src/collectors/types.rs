@@ -29,21 +29,8 @@ pub struct HistogramWindowMass {
     pub count_delta: f64,
 }
 
-/// vLLM Prometheus scrape.
-///
-/// How fields are combined across scrapes and diagnose windows: **`docs/collection-policy.md`**.
-///
-/// **`Option<f64>`:** `Some` values are defined; `None` means that quantity could not be computed
-/// (missing series, zero denominator, reset, or zero-length window). `Some(0.0)` is a real zero where
-/// applicable (e.g. 0% prefix hits in-window), not “missing data.”
-///
-/// - **Histogram means** (TTFT, TPOT, prefill, queue, prompt mean): `None` if no observations or
-///   **Δcount ≤ 0** in the window (unless last-scrape cumulative fallback applies).
-/// - **Multi-window diagnose:** combined mean = **ΣΔsum / ΣΔcount** over evaluable windows using
-///   [`HistogramWindowMass`]; falls back to duration-weighted blend of window means if no mass (`docs/collection-policy.md`).
-/// - **`generation_tokens_per_sec`:** `None` if missing counters, negative Δ, or zero time window.
-/// - **`request_success_per_sec` / `num_preemptions_per_sec`:** Δ counter / window duration (first→last scrape), same rules as generation tokens.
-/// - **`prefix_cache_hit_rate`:** Per window: `(Δhits)/(Δqueries)` over first→last scrape. Multi-window diagnose: **`(Σ Δhits)/(Σ Δqueries)`** over evaluable windows (`docs/collection-policy.md`). `None` if no valid query mass.
+/// vLLM Prometheus scrape. `Option<f64>`: `Some` = defined, `None` = missing/reset/zero-denom.
+/// Aggregation rules across scrapes and windows: `docs/collection-policy.md`.
 #[derive(Debug, Clone, Default)]
 pub struct VllmRawMetrics {
     pub model_name: Option<String>,
@@ -147,6 +134,7 @@ pub struct GpuRawMetrics {
     pub gpu_index: Option<u32>,
     /// Stable per-device identifier from the driver (e.g. `GPU-xxxxxxxx-xxxx-...`).
     pub gpu_uuid: Option<String>,
+    pub pcie_bus_id: Option<String>,
     pub gpu_util_pct: Option<f64>,
     pub mem_util_pct: Option<f64>,
     pub power_watts: Option<f64>,
@@ -161,6 +149,77 @@ pub struct GpuRawMetrics {
     pub sm_clock_mhz: Option<u32>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum GpuIdentity {
+    Uuid(String),
+    Pcie(String),
+    Index(u32),
+    Simple(String),
+    Unknown,
+}
+
+impl std::fmt::Display for GpuIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GpuIdentity::Uuid(u) => write!(f, "{u}"),
+            GpuIdentity::Pcie(p) => write!(f, "{p}"),
+            GpuIdentity::Index(i) => write!(f, "GPU-{i}"),
+            GpuIdentity::Simple(s) => write!(f, "{s}"),
+            GpuIdentity::Unknown => write!(f, "Unknown"),
+        }
+    }
+}
+
+pub type GpuFingerprint = Vec<GpuIdentity>;
+
+impl GpuRawMetrics {
+    pub fn identity(&self) -> GpuIdentity {
+        if let Some(uuid) = &self.gpu_uuid {
+            GpuIdentity::Uuid(uuid.clone())
+        } else if let Some(pcie) = &self.pcie_bus_id {
+            GpuIdentity::Pcie(pcie.clone())
+        } else if let Some(idx) = self.gpu_index {
+            GpuIdentity::Index(idx)
+        } else {
+            GpuIdentity::Unknown
+        }
+    }
+
+    /// True when fingerprint falls back to NVML device index (no UUID or PCIe bus ID, but has index).
+    pub fn uses_index_only(&self) -> bool {
+        self.gpu_uuid.is_none() && self.pcie_bus_id.is_none() && self.gpu_index.is_some()
+    }
+
+    pub fn display_id(&self) -> String {
+        if let Some(uuid) = &self.gpu_uuid {
+            let id = if uuid.starts_with("GPU-") || uuid.starts_with("MIG-") {
+                &uuid[4..uuid.len().min(12)]
+            } else {
+                &uuid[..uuid.len().min(8)]
+            };
+            return id.to_string();
+        }
+        if let Some(pcie) = &self.pcie_bus_id {
+            return pcie.clone();
+        }
+        self.gpu_index
+            .map(|i| i.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AggregateGpuMetrics {
+    pub gpu_util_pct: Option<f64>,
+    pub mem_util_pct: Option<f64>,
+    pub power_watts: Option<f64>,
+    pub vram_used_mb: Option<u64>,
+    pub vram_peak_mb: Option<u64>,
+    pub sum_vram_total_mb: Option<u64>,
+    pub temperature_peak_c: Option<f64>,
+    pub gpu_name: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct RawSnapshot {
     /// When the GPU collector finished its sampling window (last NVML poll).
@@ -170,7 +229,160 @@ pub struct RawSnapshot {
     /// When the snapshot was assembled after both collectors joined.
     pub timestamp: SystemTime,
     pub vllm: VllmRawMetrics,
-    pub gpu: GpuRawMetrics,
+    pub gpus: Vec<GpuRawMetrics>,
+    /// NVML-reported GPU count on this host. None when NVML is unavailable.
+    pub nvml_host_gpu_count: Option<u32>,
+}
+
+impl Default for RawSnapshot {
+    fn default() -> Self {
+        Self {
+            gpu_observed_at: SystemTime::UNIX_EPOCH,
+            vllm_observed_at: SystemTime::UNIX_EPOCH,
+            timestamp: SystemTime::UNIX_EPOCH,
+            vllm: VllmRawMetrics::default(),
+            gpus: Vec::new(),
+            nvml_host_gpu_count: None,
+        }
+    }
+}
+
+impl RawSnapshot {
+    /// GPUs profile actually observed this window.
+    pub fn collected_gpu_count(&self) -> usize {
+        self.gpus.len()
+    }
+
+    pub fn aggregate_gpu(&self) -> AggregateGpuMetrics {
+        // util/mem: mean across GPUs — max would overstate cluster saturation
+        let mut sum_util = 0.0_f64;
+        let mut n_util = 0_u32;
+        let mut sum_mem = 0.0_f64;
+        let mut n_mem = 0_u32;
+        let mut sum_power = 0.0;
+        let mut n_power = 0;
+        let mut sum_vram = 0_u64;
+        let mut n_vram = 0;
+        let mut max_vram_peak = None;
+        let mut sum_vram_total = None;
+        let mut max_temp: Option<f64> = None;
+        let mut gpu_name = None;
+
+        for g in &self.gpus {
+            if gpu_name.is_none() {
+                gpu_name = g.gpu_name.clone();
+            }
+            if let Some(u) = g.gpu_util_pct {
+                sum_util += u;
+                n_util += 1;
+            }
+            if let Some(m) = g.mem_util_pct {
+                sum_mem += m;
+                n_mem += 1;
+            }
+            if let Some(p) = g.power_watts {
+                sum_power += p;
+                n_power += 1;
+            }
+            if let Some(vu) = g.vram_used_mb {
+                sum_vram += vu;
+                n_vram += 1;
+            }
+            if let Some(vp) = g.vram_peak_mb {
+                max_vram_peak = Some(max_vram_peak.unwrap_or(0).max(vp));
+            }
+            if let Some(vt) = g.vram_total_mb {
+                sum_vram_total = Some(sum_vram_total.unwrap_or(0) + vt);
+            }
+            if let Some(t) = g.temperature_peak_c {
+                max_temp = Some(max_temp.map_or(t, |cur| cur.max(t)));
+            }
+        }
+
+        AggregateGpuMetrics {
+            gpu_util_pct: (n_util > 0).then_some(sum_util / f64::from(n_util)),
+            mem_util_pct: (n_mem > 0).then_some(sum_mem / f64::from(n_mem)),
+            power_watts: (n_power > 0).then_some(sum_power),
+            vram_used_mb: (n_vram > 0).then_some(sum_vram),
+            vram_peak_mb: max_vram_peak,
+            sum_vram_total_mb: sum_vram_total,
+            temperature_peak_c: max_temp,
+            gpu_name,
+        }
+    }
+
+    pub fn fingerprint(&self) -> GpuFingerprint {
+        let raw: Vec<_> = self.gpus.iter().map(|g| g.identity()).collect();
+        if snapshot_uses_display_names(&self.gpus) {
+            raw.iter()
+                .enumerate()
+                .map(|(i, _)| GpuIdentity::Simple(format!("Device-{i}")))
+                .collect()
+        } else {
+            raw
+        }
+    }
+}
+
+pub(crate) fn validate_gpu_identities(gpus: &[GpuRawMetrics]) -> anyhow::Result<()> {
+    let unknown = gpus
+        .iter()
+        .filter(|g| matches!(g.identity(), GpuIdentity::Unknown))
+        .count();
+    if unknown > 0 && unknown < gpus.len() {
+        anyhow::bail!(
+            "Mixed identifiers: {unknown} of {} GPUs are Unknown.",
+            gpus.len()
+        );
+    }
+
+    let mut has_uuid = false;
+    let mut has_pcie = false;
+    let mut has_index = false;
+
+    for g in gpus {
+        match g.identity() {
+            GpuIdentity::Uuid(_) => has_uuid = true,
+            GpuIdentity::Pcie(_) => has_pcie = true,
+            GpuIdentity::Index(_) => has_index = true,
+            _ => {}
+        }
+    }
+
+    let types_count = has_uuid as u8 + has_pcie as u8 + has_index as u8;
+    if types_count > 1 {
+        anyhow::bail!("Mixed identifiers (UUID/PCIe/Index). Cannot track safely.");
+    }
+
+    Ok(())
+}
+
+pub fn snapshot_uses_display_names(gpus: &[GpuRawMetrics]) -> bool {
+    !gpus.is_empty()
+        && gpus
+            .iter()
+            .all(|g| matches!(g.identity(), GpuIdentity::Unknown))
+}
+
+pub fn snapshot_uses_index_only(gpus: &[GpuRawMetrics]) -> bool {
+    !snapshot_uses_display_names(gpus)
+        && !gpus.is_empty()
+        && gpus.iter().any(GpuRawMetrics::uses_index_only)
+}
+
+/// Tensor-parallel degree for roofline, cost, and R4.
+/// Config/CLI wins when set; otherwise infer from collected GPU count.
+/// When config exceeds collected GPUs, clamp to collected — physics must not assume
+/// hardware we did not observe.
+pub fn effective_tensor_parallel(config_tp: Option<u32>, collected_gpus: usize) -> Option<u32> {
+    if collected_gpus == 0 {
+        return None;
+    }
+    let collected = collected_gpus as u32;
+    match config_tp {
+        Some(cfg) => Some(cfg.min(collected).max(1)),
+        None => Some(collected),
+    }
 }
 
 /// A window is structurally valid if core telemetry was collected successfully.
@@ -212,7 +424,11 @@ pub fn window_is_active(s: &RawSnapshot) -> bool {
     };
 
     let kv = s.vllm.kv_cache_usage_perc;
-    let gpu = s.gpu.gpu_util_pct;
+    let gpu = s
+        .gpus
+        .iter()
+        .filter_map(|g| g.gpu_util_pct)
+        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
     match (kv, gpu) {
         (None, None) => true,
@@ -239,7 +455,8 @@ mod window_evaluable_tests {
                 window_duration_secs: duration,
                 ..Default::default()
             },
-            gpu: Default::default(),
+            gpus: vec![],
+            nvml_host_gpu_count: None,
         }
     }
 
@@ -280,10 +497,11 @@ mod window_active_tests {
                 window_duration_secs: Some(2.0),
                 ..Default::default()
             },
-            gpu: GpuRawMetrics {
+            gpus: vec![GpuRawMetrics {
                 gpu_util_pct: gpu,
                 ..Default::default()
-            },
+            }],
+            nvml_host_gpu_count: None,
         }
     }
 
@@ -323,5 +541,220 @@ mod window_active_tests {
     fn true_when_both_present_either_above_threshold() {
         assert!(window_is_active(&snap(5.0, Some(10.0), Some(25.0))));
         assert!(window_is_active(&snap(5.0, Some(35.0), Some(10.0))));
+    }
+}
+
+#[cfg(test)]
+mod effective_tensor_parallel_tests {
+    use super::effective_tensor_parallel;
+
+    #[test]
+    fn config_tp_clamped_when_collected_fewer_than_config() {
+        assert_eq!(effective_tensor_parallel(Some(4), 2), Some(2));
+    }
+
+    #[test]
+    fn infers_from_collected_when_unset() {
+        assert_eq!(effective_tensor_parallel(None, 2), Some(2));
+    }
+
+    #[test]
+    fn none_when_no_gpus_collected() {
+        assert_eq!(effective_tensor_parallel(Some(4), 0), None);
+    }
+}
+
+#[cfg(test)]
+mod gpu_identity_tests {
+    use super::*;
+
+    #[test]
+    fn index_identity_when_uuid_and_pcie_missing() {
+        let g = GpuRawMetrics {
+            gpu_index: Some(0),
+            ..Default::default()
+        };
+        assert!(g.uses_index_only());
+        assert!(snapshot_uses_index_only(&[g]));
+    }
+
+    #[test]
+    fn fingerprint_substitutes_soul_names_when_all_unknown() {
+        let snap = RawSnapshot {
+            gpus: vec![GpuRawMetrics::default(), GpuRawMetrics::default()],
+            ..Default::default()
+        };
+        let fp = snap.fingerprint();
+        assert_eq!(fp.len(), 2);
+        assert!(matches!(fp[0], GpuIdentity::Simple(_)));
+        assert!(matches!(fp[1], GpuIdentity::Simple(_)));
+        assert!(snapshot_uses_display_names(&snap.gpus));
+    }
+
+    #[test]
+    fn validate_rejects_mixed_unknown_and_known() {
+        let gpus = vec![
+            GpuRawMetrics {
+                gpu_uuid: Some("GPU-abc".into()),
+                ..Default::default()
+            },
+            GpuRawMetrics::default(),
+        ];
+        let err = validate_gpu_identities(&gpus).unwrap_err();
+        assert!(err.to_string().contains("1 of 2 GPUs are Unknown"));
+    }
+}
+
+pub(crate) fn validate_tensor_parallel_scope(
+    collected_gpus: u32,
+    tp: Option<u32>,
+) -> anyhow::Result<()> {
+    if collected_gpus == 0 {
+        anyhow::bail!(
+            "0 GPUs collected — cannot profile without GPU telemetry. Check NVML/driver."
+        );
+    }
+    if let Some(tp_val) = tp {
+        if collected_gpus < tp_val {
+            anyhow::bail!(
+                "TP {tp_val} requires {tp_val} GPUs but only {collected_gpus} visible. Check your --tensor-parallel-size or GPU visibility."
+            );
+        }
+        if collected_gpus > tp_val {
+            anyhow::bail!(
+                "Profile sees {collected_gpus} GPUs but TP is {tp_val}. Set CUDA_VISIBLE_DEVICES to match vLLM's GPU scope."
+            );
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn check_topology_drift(
+    base: &GpuFingerprint,
+    fp: &GpuFingerprint,
+) -> anyhow::Result<()> {
+    if fp != base {
+        use std::collections::HashSet;
+        let base_set: HashSet<_> = base.iter().collect();
+        let fp_set: HashSet<_> = fp.iter().collect();
+        let missing: Vec<_> = base
+            .iter()
+            .filter(|g| !fp_set.contains(g))
+            .map(|g| g.to_string())
+            .collect();
+        let new: Vec<_> = fp
+            .iter()
+            .filter(|g| !base_set.contains(g))
+            .map(|g| g.to_string())
+            .collect();
+        let mut changes = Vec::new();
+        if !missing.is_empty() {
+            changes.push(format!("missing [{}]", missing.join(", ")));
+        }
+        if !new.is_empty() {
+            changes.push(format!("new [{}]", new.join(", ")));
+        }
+
+        if base
+            .iter()
+            .all(|g| matches!(g, GpuIdentity::Unknown | GpuIdentity::Simple(_)))
+        {
+            eprintln!(
+                "\n[i] Warning: Topology drift detected ({}), but GPU identities are unknown/simple. Continuing.",
+                changes.join(", ")
+            );
+            return Ok(());
+        }
+
+        anyhow::bail!(
+            "Topology drift detected: {}. Hardware unstable.",
+            changes.join(", ")
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod scope_and_drift_tests {
+    use super::*;
+
+    #[test]
+    fn validate_tensor_parallel_scope_bails_when_no_gpus_collected() {
+        assert!(validate_tensor_parallel_scope(0, Some(4)).is_err());
+    }
+
+    #[test]
+    fn test_validate_tensor_parallel_scope_blind_spot() {
+        let err = validate_tensor_parallel_scope(2, Some(4)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("TP 4 requires 4 GPUs but only 2 visible")
+        );
+    }
+
+    #[test]
+    fn test_validate_tensor_parallel_scope_dilution() {
+        let err = validate_tensor_parallel_scope(8, Some(4)).unwrap_err();
+        assert!(err.to_string().contains("Profile sees 8 GPUs but TP is 4"));
+        assert!(err.to_string().contains("CUDA_VISIBLE_DEVICES"));
+    }
+
+    #[test]
+    fn test_validate_tensor_parallel_scope_ok() {
+        assert!(validate_tensor_parallel_scope(4, Some(4)).is_ok());
+        assert!(validate_tensor_parallel_scope(2, None).is_ok());
+    }
+
+    #[test]
+    fn test_check_topology_drift_ok() {
+        let base = vec![GpuIdentity::Index(0), GpuIdentity::Index(1)];
+        let fp = vec![GpuIdentity::Index(0), GpuIdentity::Index(1)];
+        assert!(check_topology_drift(&base, &fp).is_ok());
+    }
+
+    #[test]
+    fn test_check_topology_drift_missing_and_new() {
+        let base = vec![GpuIdentity::Index(0), GpuIdentity::Index(1)];
+        let fp = vec![GpuIdentity::Index(0), GpuIdentity::Index(2)];
+        let err = check_topology_drift(&base, &fp).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Topology drift detected:"));
+        assert!(msg.contains("missing [GPU-1]"));
+        assert!(msg.contains("new [GPU-2]"));
+    }
+
+    #[test]
+    fn effective_tensor_parallel_infers_from_collected_when_config_unset() {
+        assert_eq!(effective_tensor_parallel(None, 8), Some(8));
+        assert_eq!(effective_tensor_parallel(None, 2), Some(2));
+        assert_eq!(effective_tensor_parallel(None, 0), None);
+    }
+
+    #[test]
+    fn effective_tensor_parallel_clamps_config_to_collected() {
+        assert_eq!(effective_tensor_parallel(Some(4), 2), Some(2));
+        assert_eq!(effective_tensor_parallel(Some(2), 4), Some(2));
+    }
+
+    #[test]
+    fn aggregate_gpu_temperature_peak_is_max_without_sentinel() {
+        let snap = RawSnapshot {
+            gpus: vec![
+                GpuRawMetrics {
+                    temperature_peak_c: Some(70.0),
+                    ..Default::default()
+                },
+                GpuRawMetrics {
+                    temperature_peak_c: Some(88.0),
+                    ..Default::default()
+                },
+                GpuRawMetrics {
+                    temperature_peak_c: None,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(snap.aggregate_gpu().temperature_peak_c, Some(88.0));
     }
 }

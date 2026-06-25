@@ -1,6 +1,7 @@
 use std::io::{self, BufRead, Write};
 use std::time::Duration;
 
+use crate::cli::gpu_assignment::resolve_gpu_assignment;
 use crate::{context, engine, output, profiler};
 
 /// Fast-fail before collection starts. Longer hang is user-visible at startup.
@@ -14,22 +15,26 @@ pub fn execute(
     verbose_rules: bool,
     duration: Duration,
 ) -> anyhow::Result<()> {
-    let resolved: Option<u32> = if max_num_seqs.is_some() {
-        max_num_seqs
+    let resolved: u32 = if let Some(v) = max_num_seqs {
+        v
     } else {
         match pre_flight_max_num_seqs(vllm_metrics_input) {
-            Some(v) => Some(v),
-            None => Some(prompt_for_max_num_seqs()?),
+            Some(v) => v,
+            None => prompt_for_max_num_seqs()?,
         }
     };
 
+    let assignment = resolve_gpu_assignment(tensor_parallel_size, vllm_metrics_input)?;
+
     let result = profiler::run_diagnose(
         vllm_metrics_input,
-        resolved,
+        Some(resolved),
         cost_per_hour,
-        tensor_parallel_size,
+        assignment.tp,
+        assignment.indices.clone(),
         duration,
     )?;
+
     output::stdout::print_diagnose_table(&result, verbose_rules);
 
     if !result.any_evaluable {
@@ -44,7 +49,8 @@ pub fn execute(
         vllm_metrics_input,
         resolved,
         cost_per_hour,
-        tensor_parallel_size,
+        assignment.tp,
+        assignment.indices,
         duration,
         result,
         report,
@@ -68,7 +74,10 @@ fn pre_flight_max_num_seqs(url: &str) -> Option<u32> {
 const MAX_NUM_SEQS_PROMPT: &str =
     "--max-num-seqs [Hint: check your vLLM start command] (default 256): ";
 
+pub(crate) const TP_ABORT_HINT: &str = "Pass --tensor-parallel-size <value> to skip the prompt.";
+
 fn prompt_for_max_num_seqs() -> anyhow::Result<u32> {
+    println!();
     let v = prompt_u32_with_default(
         &mut io::stdin().lock(),
         &mut io::stdout(),
@@ -93,7 +102,8 @@ fn updated_max_num_seqs_prompt(current: u32) -> String {
 
 fn retry_u32_loop<F, W>(
     writer: &mut W,
-    default: u32,
+    default: Option<u32>,
+    abort_hint: &str,
     prompt: &str,
     mut next_line: F,
 ) -> anyhow::Result<u32>
@@ -109,25 +119,29 @@ where
         let line = next_line()?;
         let trimmed = line.trim();
         if trimmed.is_empty() {
-            return Ok(default);
+            if let Some(v) = default {
+                return Ok(v);
+            }
+            attempts += 1;
+            if attempts >= MAX_ATTEMPTS {
+                return Err(anyhow::anyhow!("Too many invalid attempts. {abort_hint}"));
+            }
+            writeln!(writer, "enter a positive integer.")?;
+            continue;
         }
         match trimmed.parse::<u32>() {
             Ok(0) => {
                 attempts += 1;
                 if attempts >= MAX_ATTEMPTS {
-                    return Err(anyhow::anyhow!(
-                        "max_num_seqs: too many invalid attempts. Pass -m <value> to skip the prompt."
-                    ));
+                    return Err(anyhow::anyhow!("Too many invalid attempts. {abort_hint}"));
                 }
-                writeln!(writer, "max_num_seqs must be greater than zero.")?;
+                writeln!(writer, "value must be greater than zero.")?;
             }
             Ok(v) => return Ok(v),
             Err(_) => {
                 attempts += 1;
                 if attempts >= MAX_ATTEMPTS {
-                    return Err(anyhow::anyhow!(
-                        "max_num_seqs: too many invalid attempts. Pass -m <value> to skip the prompt."
-                    ));
+                    return Err(anyhow::anyhow!("Too many invalid attempts. {abort_hint}"));
                 }
                 writeln!(writer, "expected a positive integer, got {trimmed:?}")?;
             }
@@ -135,13 +149,33 @@ where
     }
 }
 
+const MAX_NUM_SEQS_ABORT_HINT: &str = "Pass -m <value> to skip the prompt.";
+
 fn prompt_u32_with_default<R: BufRead, W: Write>(
     reader: &mut R,
     writer: &mut W,
     default: u32,
     prompt: &str,
 ) -> anyhow::Result<u32> {
-    retry_u32_loop(writer, default, prompt, || {
+    retry_u32_loop(
+        writer,
+        Some(default),
+        MAX_NUM_SEQS_ABORT_HINT,
+        prompt,
+        || {
+            let mut l = String::new();
+            reader.read_line(&mut l)?;
+            Ok(l)
+        },
+    )
+}
+
+pub(crate) fn prompt_u32_required<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    prompt: &str,
+) -> anyhow::Result<u32> {
+    retry_u32_loop(writer, None, TP_ABORT_HINT, prompt, || {
         let mut l = String::new();
         reader.read_line(&mut l)?;
         Ok(l)
@@ -154,17 +188,22 @@ fn prompt_u32_from_channel<W: Write>(
     default: u32,
     prompt: &str,
 ) -> anyhow::Result<u32> {
-    retry_u32_loop(writer, default, prompt, || {
-        stdin_rx.recv().map_err(|_| anyhow::anyhow!("stdin closed"))
-    })
+    retry_u32_loop(
+        writer,
+        Some(default),
+        MAX_NUM_SEQS_ABORT_HINT,
+        prompt,
+        || stdin_rx.recv().map_err(|_| anyhow::anyhow!("stdin closed")),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::gpu_assignment::tensor_parallel_prompt;
     use std::io::Cursor;
 
-    fn run(input: &[u8], default: u32) -> anyhow::Result<u32> {
+    fn run_max_num_seqs(input: &[u8], default: u32) -> anyhow::Result<u32> {
         let mut out = Vec::new();
         prompt_u32_with_default(
             &mut Cursor::new(input),
@@ -174,41 +213,91 @@ mod tests {
         )
     }
 
+    fn run_tp(input: &[u8], host_gpus: u32) -> anyhow::Result<u32> {
+        let mut out = Vec::new();
+        prompt_u32_required(
+            &mut Cursor::new(input),
+            &mut out,
+            &tensor_parallel_prompt(host_gpus),
+        )
+    }
+
+    #[test]
+    fn tensor_parallel_prompt_format() {
+        assert_eq!(
+            tensor_parallel_prompt(8),
+            "--tensor-parallel-size (8 gpus detected): "
+        );
+    }
+
     #[test]
     fn empty_input_returns_default() {
-        assert_eq!(run(b"\n", 256).unwrap(), 256);
+        assert_eq!(run_max_num_seqs(b"\n", 256).unwrap(), 256);
     }
 
     #[test]
     fn valid_input_returns_value() {
-        assert_eq!(run(b"128\n", 256).unwrap(), 128);
+        assert_eq!(run_max_num_seqs(b"128\n", 256).unwrap(), 128);
     }
 
     #[test]
     fn three_bad_inputs_does_not_exit() {
-        // 3 bad + 1 valid — should succeed
-        assert_eq!(run(b"0\n0\n0\n64\n", 256).unwrap(), 64);
+        assert_eq!(run_max_num_seqs(b"0\n0\n0\n64\n", 256).unwrap(), 64);
     }
 
     #[test]
     fn four_bad_inputs_exits_with_error() {
-        assert!(run(b"0\n0\n0\n0\n", 256).is_err());
+        assert!(run_max_num_seqs(b"0\n0\n0\n0\n", 256).is_err());
     }
 
     #[test]
     fn four_non_numeric_inputs_exits_with_error() {
-        assert!(run(b"abc\nabc\nabc\nabc\n", 256).is_err());
+        assert!(run_max_num_seqs(b"abc\nabc\nabc\nabc\n", 256).is_err());
     }
 
     #[test]
     fn valid_input_after_one_bad_attempt_succeeds() {
-        assert_eq!(run(b"0\n64\n", 256).unwrap(), 64);
+        assert_eq!(run_max_num_seqs(b"0\n64\n", 256).unwrap(), 64);
     }
 
     #[test]
     fn error_message_contains_recovery_hint() {
-        let err = run(b"0\n0\n0\n0\n", 256).unwrap_err();
+        let err = run_max_num_seqs(b"0\n0\n0\n0\n", 256).unwrap_err();
         assert!(err.to_string().contains("Pass -m <value>"));
+    }
+
+    #[test]
+    fn tp_empty_input_reprompts_until_valid() {
+        assert_eq!(run_tp(b"\n\n2\n", 8).unwrap(), 2);
+    }
+
+    #[test]
+    fn tp_empty_input_aborts_after_four_attempts() {
+        let err = run_tp(b"\n\n\n\n", 8).unwrap_err();
+        assert!(err.to_string().contains("Pass --tensor-parallel-size"));
+    }
+
+    #[test]
+    fn tp_valid_input_returns_value() {
+        assert_eq!(run_tp(b"2\n", 8).unwrap(), 2);
+    }
+
+    #[test]
+    fn tp_zero_reprompts() {
+        assert_eq!(run_tp(b"0\n4\n", 8).unwrap(), 4);
+    }
+
+    #[test]
+    fn tp_non_numeric_reprompts() {
+        assert_eq!(run_tp(b"abc\n2\n", 8).unwrap(), 2);
+    }
+
+    #[test]
+    fn tp_four_bad_inputs_aborts_with_hint() {
+        let err = run_tp(b"0\n0\n0\n0\n", 8).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Too many invalid attempts"));
+        assert!(msg.contains("Pass --tensor-parallel-size"));
     }
 
     #[test]

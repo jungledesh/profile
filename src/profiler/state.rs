@@ -5,10 +5,7 @@ use crate::engine::{Recommendation, Report};
 use super::DiagnoseResult;
 
 const OSCILLATION_WINDOW: usize = 3;
-/// Closed-loop iterations stored in `LoopState`. Each entry is one full diagnose
-/// cycle (user applies a change, profile re-measures). In practice a single session
-/// rarely exceeds a handful of iterations; 20 is a generous upper bound that costs
-/// essentially nothing.
+/// Per-session diagnose iterations stored in `LoopState`; 20 is a generous bound that costs nothing.
 pub const MAX_LOOP_ITERATIONS: usize = 20;
 
 pub struct IterationRecord {
@@ -171,7 +168,9 @@ mod tests {
                 vllm_observed_at: SystemTime::UNIX_EPOCH,
                 timestamp: SystemTime::UNIX_EPOCH,
                 vllm: VllmRawMetrics::default(),
-                gpu: crate::collectors::GpuRawMetrics::default(),
+                gpus: vec![],
+
+                nvml_host_gpu_count: None,
             },
             windows: Vec::new(),
             static_ctx: StaticContext::default(),

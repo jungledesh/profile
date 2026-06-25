@@ -1,6 +1,8 @@
 use std::time::SystemTime;
 
-use crate::collectors::{RawSnapshot, VllmRawMetrics, window_is_evaluable};
+use crate::collectors::{
+    RawSnapshot, VllmRawMetrics, effective_tensor_parallel, window_is_evaluable,
+};
 use crate::context::{AnalysisInput, RuntimeWindow};
 use crate::engine::baseline::{self, CostSource, PhysicsBaseline, WeightDtypeSource};
 
@@ -48,8 +50,6 @@ pub(super) const MAX_OBSERVATION_SKEW_SECS: f64 = 1.0;
 pub(super) const ENGINE_MIN_PERSISTENT_WINDOWS: usize = 3;
 /// Enforces >= 25% density floor across evaluable windows.
 pub(super) const ENGINE_MIN_WINDOW_PCT: f64 = 0.25;
-
-// TODO(r5): sampling cliff — sampling temperature is not in collected metrics; wire rule when available.
 
 /// Push a max_model_len shrink suggestion into `lines`.
 /// Hard number only when `total_count >= 100` and both p99s are present.
@@ -774,7 +774,10 @@ fn build_report_from_eval(
 
     if let Some(r4) = r4_recommendation(
         baseline.as_ref().and_then(|b| b.kv_headroom_gb),
-        summary.ctx.config.tensor_parallel_size,
+        effective_tensor_parallel(
+            summary.ctx.config.tensor_parallel_size,
+            summary.window.snapshot.collected_gpu_count(),
+        ),
         baseline.as_ref().map(|b| b.weight_gb),
         summary.ctx.gpu.vram_gb,
         summary.ctx.config.gpu_memory_utilization,
@@ -831,7 +834,8 @@ pub fn build_report_for_windows(
             r2_suppressed_by_r4: false,
         };
     };
-    build_report_from_eval(&eval, summary, None)
+    let session_hit_rate = aggregate_prefix_hit_rate_for_windows(windows);
+    build_report_from_eval(&eval, summary, session_hit_rate)
 }
 
 pub fn format_diagnose_rules_for_windows(
@@ -952,7 +956,10 @@ pub fn format_diagnose_rules_for_windows(
 
     let r4 = r4_recommendation(
         summary_baseline.as_ref().and_then(|b| b.kv_headroom_gb),
-        summary.ctx.config.tensor_parallel_size,
+        effective_tensor_parallel(
+            summary.ctx.config.tensor_parallel_size,
+            summary.window.snapshot.collected_gpu_count(),
+        ),
         summary_baseline.as_ref().map(|b| b.weight_gb),
         summary.ctx.gpu.vram_gb,
         summary.ctx.config.gpu_memory_utilization,
@@ -1188,7 +1195,8 @@ mod tests {
             vllm_observed_at: vllm_at,
             timestamp: gpu_at,
             vllm,
-            gpu,
+            gpus: vec![gpu],
+            nvml_host_gpu_count: None,
         }
     }
 
@@ -1246,12 +1254,14 @@ mod tests {
                 window_duration_secs: Some(2.0),
                 ..Default::default()
             },
-            gpu: GpuRawMetrics {
+            gpus: vec![GpuRawMetrics {
                 gpu_name: Some("NVIDIA H100 80GB HBM3".to_string()),
                 vram_total_mb: Some(80 * 1024),
                 gpu_util_pct: Some(58.0),
                 ..Default::default()
-            },
+            }],
+
+            nvml_host_gpu_count: None,
         };
         let cfg = VllmConfig {
             dtype: Some("bf16".to_string()),

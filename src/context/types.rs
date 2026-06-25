@@ -102,8 +102,14 @@ impl StaticContext {
                 ..Default::default()
             },
         };
-        let gpu_name = snapshot.gpu.gpu_name.clone();
-        let vram_gb = snapshot.gpu.vram_total_mb.map(|m| m as f64 / 1024.0);
+        let bottleneck_gpu = snapshot
+            .gpus
+            .iter()
+            .min_by_key(|g| g.vram_total_mb.unwrap_or(u64::MAX));
+        let gpu_name = bottleneck_gpu.and_then(|g| g.gpu_name.clone());
+        let vram_gb = bottleneck_gpu
+            .and_then(|g| g.vram_total_mb)
+            .map(|m| m as f64 / 1024.0);
         let gpu_entry = gpu_name.as_deref().and_then(gpu_catalog::lookup_gpu);
         let gpu = match gpu_entry {
             Some(e) => GPUModel {

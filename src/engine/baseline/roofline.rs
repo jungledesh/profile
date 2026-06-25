@@ -1,4 +1,5 @@
 use crate::collectors::config::DEFAULT_GPU_MEMORY_UTILIZATION;
+use crate::collectors::effective_tensor_parallel;
 use crate::context::{AnalysisInput, gpu_prices};
 
 use super::math;
@@ -67,7 +68,8 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
     let ctx = input.ctx;
     let peak_flops = ctx.gpu.peak_flops_tc_tflops?;
     let peak_bw = ctx.gpu.peak_bw_gbps?;
-    let tp = ctx.config.tensor_parallel_size.unwrap_or(1).max(1) as f64;
+    let collected = input.window.snapshot.collected_gpu_count();
+    let tp = effective_tensor_parallel(ctx.config.tensor_parallel_size, collected)? as f64;
 
     let roofline_params = ctx.model.active_param_count.or(ctx.model.param_count)?;
     let weight_params = ctx.model.param_count.or(ctx.model.active_param_count)?;
@@ -101,11 +103,9 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
 
     let ceiling = decode.expected;
 
-    // hw_efficiency_pct: fraction of absolute hardware ceiling being used.
-    // Denominator is fixed at ceiling × ridge_batch_size (the compute ceiling) —
-    // independent of current traffic. This is the ROI metric: an idle server
-    // with 1 request reads low, correctly.
-    let hw_efficiency_pct = input
+    // Fraction of the absolute hardware ceiling in use. Denominator is ceiling × ridge_batch_size
+    // (the compute ceiling), independent of current traffic. An idle server reads low, correctly.
+    let efficiency_pct = input
         .window
         .snapshot
         .vllm
@@ -117,8 +117,6 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
             pct.min(100.0) // clamp: actual cannot exceed compute ceiling in practice
         })
         .filter(|pct| pct.is_finite());
-
-    let efficiency_pct = hw_efficiency_pct; // feeds PhysicsBaseline; name kept for all downstream
 
     let headroom_pct = efficiency_pct.map(|raw| 100.0 - raw.min(100.0));
 
@@ -138,7 +136,8 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
         .vllm
         .generation_tokens_per_sec
         .filter(|v| v.is_finite() && *v > 0.0);
-    let power_watts = snap.gpu.power_watts.filter(|v| v.is_finite() && *v > 0.0);
+    let total_power: f64 = snap.gpus.iter().filter_map(|g| g.power_watts).sum();
+    let power_watts = (total_power > 0.0).then_some(total_power);
 
     let tok_per_watt = match (tps, power_watts) {
         (Some(t), Some(p)) => Some(t / p),
@@ -158,7 +157,7 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
         (Some(hr), CostSource::UserProvided)
     } else if let Some(gpu_name) = ctx.gpu.name.as_deref() {
         gpu_prices::lookup_gpu_price(gpu_name)
-            .map(|p| (Some(p.on_demand_per_hr), CostSource::Catalog))
+            .map(|p| (Some(p.on_demand_per_hr * tp), CostSource::Catalog))
             .unwrap_or((None, CostSource::None))
     } else {
         (None, CostSource::None)
@@ -306,6 +305,7 @@ mod tests {
         cfg: VllmConfig,
         snapshot: VllmRawMetrics,
     ) -> (StaticContext, RuntimeWindow) {
+        let n_gpus = cfg.tensor_parallel_size.unwrap_or(1).max(1) as usize;
         let ctx = StaticContext {
             model: crate::context::ModelArch {
                 name: Some("model".to_string()),
@@ -334,7 +334,9 @@ mod tests {
             vllm_observed_at: SystemTime::UNIX_EPOCH,
             timestamp: SystemTime::UNIX_EPOCH,
             vllm: snapshot,
-            gpu: GpuRawMetrics::default(),
+            gpus: vec![GpuRawMetrics::default(); n_gpus],
+
+            nvml_host_gpu_count: None,
         });
         (ctx, win)
     }
@@ -885,7 +887,7 @@ mod tests {
             snap,
         );
         ctx.gpu.name = Some("NVIDIA H100 80GB HBM3".to_string());
-        win.snapshot.gpu.power_watts = Some(50.0);
+        win.snapshot.gpus.first_mut().expect("gpu").power_watts = Some(50.0);
         let input = AnalysisInput::new(&ctx, &win);
         let b = compute(&input).expect("baseline");
         let cost = b.cost.expect("cost block");
@@ -916,7 +918,7 @@ mod tests {
             snap,
         );
         ctx.gpu.name = Some("NVIDIA H100 80GB HBM3".to_string());
-        win.snapshot.gpu.power_watts = None;
+        win.snapshot.gpus.first_mut().expect("gpu").power_watts = None;
         let cost = compute(&AnalysisInput::new(&ctx, &win))
             .expect("baseline")
             .cost
@@ -946,7 +948,7 @@ mod tests {
             snap,
         );
         ctx.gpu.name = Some("NVIDIA H100 80GB HBM3".to_string());
-        win.snapshot.gpu.power_watts = Some(50.0);
+        win.snapshot.gpus.first_mut().expect("gpu").power_watts = Some(50.0);
         let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
         assert!(b.cost.is_none_or(|c| c.joules_per_token.is_none()));
     }
@@ -973,7 +975,7 @@ mod tests {
             snap,
         );
         ctx.gpu.name = Some("NVIDIA H100 80GB HBM3".to_string());
-        win.snapshot.gpu.power_watts = Some(100.0);
+        win.snapshot.gpus.first_mut().expect("gpu").power_watts = Some(100.0);
         let cost = compute(&AnalysisInput::new(&ctx, &win))
             .expect("baseline")
             .cost
@@ -1160,7 +1162,7 @@ mod tests {
             },
         );
         ctx2.gpu.name = Some("NVIDIA H100 80GB HBM3".to_string());
-        win2.snapshot.gpu.power_watts = None;
+        win2.snapshot.gpus.first_mut().expect("gpu").power_watts = None;
         let cost = compute(&AnalysisInput::new(&ctx2, &win2))
             .expect("baseline")
             .cost

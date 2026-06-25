@@ -57,8 +57,7 @@ pub(crate) fn config_from_snapshot(
             .max_num_seqs
             .or(cli_max_num_seqs)
             .or_else(|| env_u32("MAX_NUM_SEQS")),
-        tensor_parallel_size: env_u32("TENSOR_PARALLEL_SIZE")
-            .or_else(|| env_u32("VLLM_TENSOR_PARALLEL_SIZE")),
+        tensor_parallel_size: None,
         pipeline_parallel_size: env_u32("PIPELINE_PARALLEL_SIZE")
             .or_else(|| env_u32("VLLM_PIPELINE_PARALLEL_SIZE")),
         dtype: env_str("DTYPE").or_else(|| env_str("VLLM_DTYPE")),
@@ -244,7 +243,7 @@ pub(crate) fn parse_bool(s: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::collectors::{GpuRawMetrics, RawSnapshot, VllmRawMetrics};
+    use crate::collectors::{RawSnapshot, VllmRawMetrics};
     use std::time::SystemTime;
 
     fn mk_snap(model: Option<&str>, max_seqs: Option<u32>) -> RawSnapshot {
@@ -257,7 +256,8 @@ mod tests {
                 max_num_seqs: max_seqs,
                 ..Default::default()
             },
-            gpu: GpuRawMetrics::default(),
+            gpus: vec![],
+            nvml_host_gpu_count: None,
         }
     }
 

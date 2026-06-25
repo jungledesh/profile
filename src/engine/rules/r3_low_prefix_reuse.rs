@@ -286,7 +286,9 @@ mod tests {
             vllm_observed_at: t,
             timestamp: t,
             vllm: v,
-            gpu: Default::default(),
+            gpus: vec![],
+
+            nvml_host_gpu_count: None,
         }
     }
 

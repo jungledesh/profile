@@ -34,7 +34,7 @@ pub fn traffic_from_snapshot(s: &RawSnapshot) -> TrafficState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::collectors::{GpuRawMetrics, RawSnapshot, VllmRawMetrics};
+    use crate::collectors::{RawSnapshot, VllmRawMetrics};
     use std::time::SystemTime;
 
     fn mk_snap(run: Option<f64>, tps: Option<f64>) -> RawSnapshot {
@@ -48,7 +48,8 @@ mod tests {
                 num_requests_waiting: Some(0.0),
                 ..Default::default()
             },
-            gpu: GpuRawMetrics::default(),
+            gpus: vec![],
+            nvml_host_gpu_count: None,
         }
     }
 
@@ -78,7 +79,8 @@ mod tests {
                 num_requests_waiting: Some(0.0),
                 ..Default::default()
             },
-            gpu: GpuRawMetrics::default(),
+            gpus: vec![],
+            nvml_host_gpu_count: None,
         };
         assert_eq!(traffic_from_snapshot(&mk(Some(12.5))).qps, Some(12.5));
         assert!(traffic_from_snapshot(&mk(None)).qps.is_none());

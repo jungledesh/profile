@@ -25,10 +25,12 @@ fn build_input(
             num_requests_running,
             ..Default::default()
         },
-        gpu: GpuRawMetrics {
+        gpus: vec![GpuRawMetrics {
             gpu_name: Some(gpu_name.to_string()),
             ..Default::default()
-        },
+        }],
+
+        nvml_host_gpu_count: None,
     };
     let ctx = StaticContext::from_snapshot(&snap, cfg);
     let win = RuntimeWindow::from_snapshot(snap);

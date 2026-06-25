@@ -4,6 +4,9 @@ use std::time::Duration;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const WARMUP_DELAY: Duration = Duration::from_secs(5);
+/// Per-request HTTP timeout for the restart poller. Prevents blocking indefinitely on a
+/// slow-but-alive vLLM instance while waiting for restart detection.
+const RESTART_POLL_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub enum WaitOutcome {
     RestartDetected,
@@ -44,12 +47,20 @@ pub fn wait_for_restart_or_skip(
 
     let cancelled_poller = Arc::clone(&cancelled);
     std::thread::spawn(move || {
+        // Build once; reuse across poll iterations.
+        let client = reqwest::blocking::Client::builder()
+            .use_rustls_tls()
+            .timeout(RESTART_POLL_REQUEST_TIMEOUT)
+            .build()
+            .ok();
         let mut was_down = false;
         loop {
             if cancelled_poller.load(Ordering::Relaxed) {
                 return;
             }
-            let reachable = reqwest::blocking::get(&url)
+            let reachable = client
+                .as_ref()
+                .and_then(|c| c.get(&url).send().ok())
                 .map(|r| r.status().is_success())
                 .unwrap_or(false);
             if !reachable && !was_down {
