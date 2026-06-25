@@ -469,10 +469,10 @@ fn ps_tiebreaker(
     let indices: Vec<u32> = gpu_indices.into_iter().collect();
     let tp = indices.len() as u32;
 
-    if let Some(expected) = known_tp {
-        if tp != expected {
-            return None;
-        }
+    if let Some(expected) = known_tp
+        && tp != expected
+    {
+        return None;
     }
 
     eprintln!("{}", term.step2_success(&indices, tp));
