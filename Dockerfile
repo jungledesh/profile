@@ -60,13 +60,14 @@ RUN mkdir -p "${APP_DIR}" "${MODELS_DIR}" /workspace && \
 WORKDIR ${APP_DIR}
 
 COPY --chown=appuser:appuser scripts/load.sh ./load.sh
+COPY --chown=appuser:appuser scripts/start.sh ./start.sh
 COPY --chown=appuser:appuser scripts/demo.sh ./demo.sh
 
 # Requires a pre-built binary: run `cargo build --release` before `docker build`
 COPY --chown=appuser:appuser target/release/profile ./profile
 
-RUN chmod 0755 ./load.sh ./demo.sh ./profile
+RUN chmod 0755 ./load.sh ./start.sh ./demo.sh ./profile
 
 USER appuser
 
-CMD ["bash", "-lc", "/home/appuser/app/demo.sh"]
+CMD ["bash", "-lc", "/home/appuser/app/start.sh"]
