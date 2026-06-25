@@ -254,9 +254,13 @@ fn run_pipeline(
         .map(|s| s.vram_total_mb as f64 / 1024.0)
         .collect();
 
-    if let Some(a) =
-        vram_heuristic_from_fracs_inner(host_count, &fracs, known_tp, model_weight_gb, &vram_total_gb)
-    {
+    if let Some(a) = vram_heuristic_from_fracs_inner(
+        host_count,
+        &fracs,
+        known_tp,
+        model_weight_gb,
+        &vram_total_gb,
+    ) {
         let active_set: HashSet<u32> = a.indices.iter().copied().collect();
         for row in &snapshots {
             let highlight = active_set.contains(&row.idx);
@@ -355,6 +359,7 @@ fn preflight_model_weight_gb(url: &str) -> Option<f64> {
     Some(crate::engine::baseline::weight_gb(entry.param_count, bits))
 }
 
+#[cfg(test)]
 pub(crate) fn vram_heuristic_from_fracs(
     host_count: u32,
     fracs: &[Option<f64>],
@@ -711,8 +716,6 @@ mod tests {
                 .unwrap_err();
         assert!(err.to_string().contains("No GPUs detected"));
     }
-
-
 
     #[test]
     fn plain_text_when_no_color() {

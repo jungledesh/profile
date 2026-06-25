@@ -489,7 +489,7 @@ fn format_efficiency_label(
     actual_tps: Option<f64>,
     decode_ceiling: Option<f64>,
 ) -> String {
-    let use_color = std::io::stdout().is_terminal();
+    let use_color = std::io::stdout().is_terminal() && !cfg!(test);
     if let Some(e) = efficiency_pct.filter(|e| e.is_finite()) {
         let pct_str = format!("{:.1}%", e);
         let colored = if use_color {
