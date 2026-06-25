@@ -77,6 +77,7 @@ const MAX_NUM_SEQS_PROMPT: &str =
 pub(crate) const TP_ABORT_HINT: &str = "Pass --tensor-parallel-size <value> to skip the prompt.";
 
 fn prompt_for_max_num_seqs() -> anyhow::Result<u32> {
+    println!();
     let v = prompt_u32_with_default(
         &mut io::stdin().lock(),
         &mut io::stdout(),

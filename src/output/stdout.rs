@@ -16,6 +16,8 @@ use crate::profiler::DiagnoseResult;
 use owo_colors::OwoColorize;
 
 const VLLM_LABEL_W: usize = 10;
+/// Width for GPU section labels: wide enough for `GPU [xxxxxxxx]` (14 chars) plus breathing room.
+const GPU_LABEL_W: usize = 20;
 const VLLM_LABEL_METRICS_GAP: &str = " ";
 /// Show the VRAM peak parenthetical only when it crosses 90% of total VRAM — suppresses noise
 /// from tiny fluctuations that are irrelevant to the operator.
@@ -134,8 +136,8 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
         lines.push(String::new());
     }
     lines.push(format!(
-        "{:<width$}{}{}",
-        blue_bold("GPU =>"),
+        "{}{}{}",
+        visual_pad(&blue_bold("GPU =>"), GPU_LABEL_W),
         VLLM_LABEL_METRICS_GAP,
         gpu_gauges_line(
             &cluster_gpu,
@@ -143,7 +145,6 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
             v.generation_tokens_per_sec,
             verbose_rules,
         ),
-        width = VLLM_LABEL_W
     ));
     if n_gpus <= 1 {
         let g = snapshot.gpus.first().unwrap_or(&cluster_gpu);
@@ -152,16 +153,17 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
             "",
             VLLM_LABEL_METRICS_GAP,
             gpu_detail_line(g, verbose_rules),
-            width = VLLM_LABEL_W
+            width = GPU_LABEL_W
         ));
     } else {
+        lines.push(String::new());
         for gpu in &snapshot.gpus {
             lines.push(format!(
                 "{:<width$}{}{}",
                 format!("GPU [{}]", gpu.display_id()),
                 VLLM_LABEL_METRICS_GAP,
                 gpu_detail_line(gpu, verbose_rules),
-                width = VLLM_LABEL_W
+                width = GPU_LABEL_W
             ));
         }
     }
@@ -206,7 +208,18 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
         lines.push(String::new());
         lines.push(red_bold("ISSUES:"));
         lines.push(String::new());
-        lines.extend(rule_lines);
+        // Color [!] issue headers red; indent lines stay plain.
+        let colored_rules: Vec<String> = rule_lines
+            .into_iter()
+            .map(|l| {
+                if use_color && l.starts_with("[!]") {
+                    l.red().bold().to_string()
+                } else {
+                    l
+                }
+            })
+            .collect();
+        lines.extend(colored_rules);
     }
 
     lines
@@ -348,20 +361,51 @@ fn baseline_lines(
 
 fn vllm_label_row(label: &str, value: &str) -> String {
     format!(
-        "{:<width$}{}{}",
-        label,
+        "{}{}{}",
+        visual_pad(label, VLLM_LABEL_W),
         VLLM_LABEL_METRICS_GAP,
         value,
-        width = VLLM_LABEL_W
     )
 }
 
+/// Returns the visible character width of a string, stripping ANSI escape sequences.
+/// `chars().count()` includes escape-code bytes, which breaks box alignment when colors are on.
+fn visual_len(s: &str) -> usize {
+    let mut len = 0;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if let Some('[') = chars.next() {
+                for next_c in chars.by_ref() {
+                    if next_c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+        } else {
+            len += 1;
+        }
+    }
+    len
+}
+
+/// Pad `s` to `width` visible characters. Rust's `{:<width$}` counts bytes, not visual width,
+/// so colored strings (which contain ANSI escape codes) receive no padding from the formatter.
+fn visual_pad(s: &str, width: usize) -> String {
+    let vlen = visual_len(s);
+    if vlen < width {
+        format!("{}{}", s, " ".repeat(width - vlen))
+    } else {
+        s.to_string()
+    }
+}
+
 fn print_boxed(lines: &[String]) {
-    let inner = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    let inner = lines.iter().map(|l| visual_len(l)).max().unwrap_or(0);
     let border = format!("+{}+", "-".repeat(inner));
     println!("{}", border);
     for line in lines {
-        let w = line.chars().count();
+        let w = visual_len(line);
         let padded = if w < inner {
             format!("{}{}", line, " ".repeat(inner - w))
         } else {
@@ -445,8 +489,21 @@ fn format_efficiency_label(
     actual_tps: Option<f64>,
     decode_ceiling: Option<f64>,
 ) -> String {
+    let use_color = std::io::stdout().is_terminal();
     if let Some(e) = efficiency_pct.filter(|e| e.is_finite()) {
-        return format!("EFFICIENCY {:.1}%", e);
+        let pct_str = format!("{:.1}%", e);
+        let colored = if use_color {
+            if e >= 60.0 {
+                pct_str.green().to_string()
+            } else if e >= 20.0 {
+                pct_str.yellow().to_string()
+            } else {
+                pct_str.red().to_string()
+            }
+        } else {
+            pct_str
+        };
+        return format!("EFFICIENCY {}", colored);
     }
     let actual = actual_tps.filter(|t| t.is_finite() && *t > 0.0);
     let ceiling = decode_ceiling.filter(|c| c.is_finite() && *c > 0.0);

@@ -7,7 +7,7 @@ use nvml_wrapper::Nvml;
 
 use crate::cli::diagnose::{TP_ABORT_HINT, prompt_u32_required};
 
-const VRAM_ACTIVE_THRESHOLD: f64 = 0.70;
+const VRAM_ACTIVE_THRESHOLD: f64 = 0.20;
 
 const DIM: &str = "\x1b[38;5;240m";
 const GREEN: &str = "\x1b[38;5;114m";
@@ -34,6 +34,7 @@ struct GpuSnapshot {
     idx: u32,
     name: String,
     vram_pct: f64,
+    vram_total_mb: u64,
     pids: Vec<u32>,
 }
 
@@ -57,7 +58,7 @@ impl Term {
     }
 
     fn scan_header(&self, n: u32) -> String {
-        self.wrap(DIM, &format!("scanning {n} gpus via nvml..."))
+        self.wrap(DIM, &format!("Scanning {n} GPUs via NVML..."))
     }
 
     fn format_gpu_row(&self, row: &GpuSnapshot, mode: RowColorMode, highlight: bool) -> String {
@@ -74,7 +75,7 @@ impl Term {
         };
 
         let bar = self.wrap(pct_color, &bar_body);
-        let pct = self.wrap(pct_color, &format!("{:>3.0}% vram", row.vram_pct.round()));
+        let pct = self.wrap(pct_color, &format!("{:>3.0}% vRAM", row.vram_pct.round()));
 
         let status = if row.vram_pct >= VRAM_ACTIVE_THRESHOLD * 100.0 {
             if !row.pids.is_empty() {
@@ -91,10 +92,10 @@ impl Term {
                     format!("{prefix} {pids_str}")
                 }
             } else {
-                self.wrap(DIM, "active")
+                self.wrap(DIM, "Active")
             }
         } else {
-            self.wrap(DIM, "idle")
+            self.wrap(DIM, "Idle")
         };
 
         let name = short_gpu_name(&row.name);
@@ -115,58 +116,20 @@ impl Term {
 
     fn step1_success(&self, indices: &[u32], tp: u32) -> String {
         format!(
-            "{} isolated workload on gpus {indices:?} — tp={tp} inferred",
+            "{} Isolated workload on GPUs {indices:?}: TP = {tp} inferred",
             self.wrap(GREEN, "✓")
         )
     }
 
     #[cfg(target_os = "linux")]
-    fn step2_progress(&self, port: u16) -> String {
-        self.wrap(
-            DIM,
-            &format!("vram ambiguous — tracing port {port} via /proc..."),
-        )
+    fn step2_progress(&self) -> String {
+        self.wrap(DIM, "vRAM Ambiguous, scanning GPU processes via ps...")
     }
 
     #[cfg(target_os = "linux")]
-    fn step2_port_line(
-        &self,
-        port: u16,
-        pid: u32,
-        indices: &[u32],
-        highlight: bool,
-        other_process: bool,
-    ) -> String {
-        let suffix = if other_process {
-            if self.color {
-                format!(" {DIM}(other process){RESET}")
-            } else {
-                " (other process)".to_string()
-            }
-        } else {
-            String::new()
-        };
-        if self.color {
-            if highlight {
-                format!(
-                    "{DIM}  port {port} →{RESET} {BLUE}pid {pid}{RESET} {DIM}→ gpus{RESET} {indices:?}{suffix}"
-                )
-            } else {
-                format!(
-                    "{DIM}  port {port} →{RESET} {DIM}pid {pid}{RESET}  {DIM}→ gpus {indices:?}{RESET}{suffix}"
-                )
-            }
-        } else if highlight {
-            format!("  port {port} → pid {pid} → gpus {indices:?}{suffix}")
-        } else {
-            format!("  port {port} → pid {pid}  → gpus {indices:?}{suffix}")
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn step2_success(&self, port: u16, indices: &[u32], tp: u32) -> String {
+    fn step2_success(&self, indices: &[u32], tp: u32) -> String {
         format!(
-            "{} port {port} maps to gpus {indices:?} — tp={tp} inferred",
+            "{} GPUs {indices:?}: TP = {tp} inferred",
             self.wrap(GREEN, "✓")
         )
     }
@@ -285,8 +248,15 @@ fn run_pipeline(
 
     let snapshots = collect_gpu_snapshots(&nvml, host_count);
     let fracs: Vec<Option<f64>> = snapshots.iter().map(|s| Some(s.vram_pct / 100.0)).collect();
+    let model_weight_gb = preflight_model_weight_gb(url);
+    let vram_total_gb: Vec<f64> = snapshots
+        .iter()
+        .map(|s| s.vram_total_mb as f64 / 1024.0)
+        .collect();
 
-    if let Some(a) = vram_heuristic_from_fracs(host_count, &fracs, known_tp) {
+    if let Some(a) =
+        vram_heuristic_from_fracs_inner(host_count, &fracs, known_tp, model_weight_gb, &vram_total_gb)
+    {
         let active_set: HashSet<u32> = a.indices.iter().copied().collect();
         for row in &snapshots {
             let highlight = active_set.contains(&row.idx);
@@ -295,6 +265,7 @@ fn run_pipeline(
                 term.format_gpu_row(row, RowColorMode::Step1, highlight)
             );
         }
+        eprintln!();
         eprintln!("{}", term.step1_success(&a.indices, a.tp));
         return Ok(a);
     }
@@ -305,15 +276,14 @@ fn run_pipeline(
             term.format_gpu_row(row, RowColorMode::Ambiguous, row.vram_pct >= 70.0)
         );
     }
+    eprintln!();
 
     #[cfg(target_os = "linux")]
-    if let Some(a) = proc_tiebreaker(&nvml, host_count, known_tp, url, &term, &snapshots) {
+    if let Some(a) = ps_tiebreaker(&snapshots, known_tp, &term) {
         return Ok(a);
     }
 
-    eprintln!(
-        "\n[i] Could not resolve GPU assignment automatically (port trace failed, ambiguous, or unsupported OS). Falling back to interactive prompt."
-    );
+    eprintln!("\n[i] Auto-resolve failed. Enter GPU assignment manually:");
 
     interactive_gpu_prompt(host_count, known_tp, &snapshots, &term)
 }
@@ -326,9 +296,9 @@ fn collect_gpu_snapshots(nvml: &Nvml, host_count: u32) -> Vec<GpuSnapshot> {
             .as_ref()
             .and_then(|d| d.name().ok())
             .unwrap_or_else(|| "GPU".to_string());
-        let vram_pct = device
+        let mem = device.as_ref().and_then(|d| d.memory_info().ok());
+        let vram_pct = mem
             .as_ref()
-            .and_then(|d| d.memory_info().ok())
             .map(|m| {
                 if m.total == 0 {
                     0.0
@@ -337,6 +307,7 @@ fn collect_gpu_snapshots(nvml: &Nvml, host_count: u32) -> Vec<GpuSnapshot> {
                 }
             })
             .unwrap_or(0.0);
+        let vram_total_mb = mem.map(|m| m.total / (1024 * 1024)).unwrap_or(0);
         let pids = device
             .as_ref()
             .and_then(|d| d.running_compute_processes().ok())
@@ -346,10 +317,42 @@ fn collect_gpu_snapshots(nvml: &Nvml, host_count: u32) -> Vec<GpuSnapshot> {
             idx,
             name,
             vram_pct,
+            vram_total_mb,
             pids,
         });
     }
     out
+}
+
+/// Fetch model weight in GB from the vLLM `/v1/models` endpoint + catalog.
+/// Returns None on any failure — callers fall back to VRAM_ACTIVE_THRESHOLD.
+fn preflight_model_weight_gb(url: &str) -> Option<f64> {
+    let base = {
+        let (scheme, rest) = url.split_once("://")?;
+        let host = rest.split('/').next()?;
+        format!("{scheme}://{host}")
+    };
+    let models_url = format!("{base}/v1/models");
+    let body = reqwest::blocking::Client::builder()
+        .use_rustls_tls()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .ok()?
+        .get(&models_url)
+        .send()
+        .ok()?
+        .text()
+        .ok()?;
+    let json: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let model_id = json["data"][0]["id"].as_str()?;
+    let entry = crate::context::model_catalog::lookup_model(model_id)?;
+    let bits: u8 = match entry.default_weight_dtype {
+        "fp8" | "e4m3" | "e5m2" => 8,
+        "fp16" | "bf16" => 16,
+        "fp32" => 32,
+        _ => 16,
+    };
+    Some(crate::engine::baseline::weight_gb(entry.param_count, bits))
 }
 
 pub(crate) fn vram_heuristic_from_fracs(
@@ -357,10 +360,33 @@ pub(crate) fn vram_heuristic_from_fracs(
     fracs: &[Option<f64>],
     known_tp: Option<u32>,
 ) -> Option<GpuAssignment> {
+    vram_heuristic_from_fracs_inner(host_count, fracs, known_tp, None, &[])
+}
+
+/// Internal implementation. `model_weight_gb` and `vram_total_gb_per_gpu` enable a
+/// physics-based active threshold; both fall back to VRAM_ACTIVE_THRESHOLD when absent.
+fn vram_heuristic_from_fracs_inner(
+    host_count: u32,
+    fracs: &[Option<f64>],
+    known_tp: Option<u32>,
+    model_weight_gb: Option<f64>,
+    vram_total_gb_per_gpu: &[f64],
+) -> Option<GpuAssignment> {
     let mut active = Vec::new();
     for idx in 0..host_count {
         let frac = fracs.get(idx as usize).copied().flatten()?;
-        if frac >= VRAM_ACTIVE_THRESHOLD {
+        // Physics-based threshold: weight_gb × 0.80 / host_count / gpu_vram_gb.
+        // Dividing by host_count is the worst-case (max TP) — ensures we catch
+        // any GPU holding even a fraction of model weights.
+        // Buffer of 0.80 covers catalog dtype/quantization uncertainty.
+        // Falls back to VRAM_ACTIVE_THRESHOLD when model or VRAM data unavailable.
+        let threshold = match (model_weight_gb, vram_total_gb_per_gpu.get(idx as usize)) {
+            (Some(w_gb), Some(&total_gb)) if total_gb > 0.0 => {
+                (w_gb * 0.80 / host_count as f64 / total_gb).min(VRAM_ACTIVE_THRESHOLD)
+            }
+            _ => VRAM_ACTIVE_THRESHOLD,
+        };
+        if frac >= threshold {
             active.push(idx);
         }
     }
@@ -380,218 +406,72 @@ pub(crate) fn vram_heuristic_from_fracs(
     })
 }
 
+/// Tiebreaker: run `ps -f -p <all GPU PIDs>`, find lines containing "vllm",
+/// map those PIDs back to GPU indices from the snapshots.
+/// More reliable than /proc socket walking — /proc/{pid}/cmdline is world-readable
+/// even when /proc/{pid}/fd/ is not.
 #[cfg(target_os = "linux")]
-fn proc_tiebreaker(
-    nvml: &Nvml,
-    host_count: u32,
+fn ps_tiebreaker(
+    snapshots: &[GpuSnapshot],
     known_tp: Option<u32>,
-    url: &str,
     term: &Term,
-    _snapshots: &[GpuSnapshot],
 ) -> Option<GpuAssignment> {
-    let port = port_from_metrics_url(url)?;
-    eprintln!("{}", term.step2_progress(port));
-
-    let inode = find_inode_for_port(port)?;
-    let vllm_pid = find_pid_for_socket_inode(inode)?;
-    let matching = gpu_indices_for_vllm_pid(nvml, host_count, vllm_pid)?;
-    if matching.is_empty() {
-        return None;
+    // Build pid → [gpu_indices] map from what NVML already gave us.
+    let mut pid_to_gpus: HashMap<u32, Vec<u32>> = HashMap::new();
+    for snap in snapshots {
+        for &pid in &snap.pids {
+            pid_to_gpus.entry(pid).or_default().push(snap.idx);
+        }
     }
-    if let Some(tp) = known_tp
-        && matching.len() != tp as usize
-    {
+    if pid_to_gpus.is_empty() {
         return None;
     }
 
-    eprintln!(
-        "{}",
-        term.step2_port_line(port, vllm_pid, &matching, true, false)
-    );
+    eprintln!("{}", term.step2_progress());
 
-    if let Some(other) = find_other_port_line(nvml, host_count, port) {
-        eprintln!(
-            "{}",
-            term.step2_port_line(other.port, other.pid, &other.indices, false, true)
-        );
-    }
+    let pid_list = pid_to_gpus
+        .keys()
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
 
-    let tp = matching.len() as u32;
-    eprintln!("{}", term.step2_success(port, &matching, tp));
-    Some(GpuAssignment {
-        tp,
-        indices: matching,
-    })
-}
+    let output = std::process::Command::new("ps")
+        .args(["-f", "-p", &pid_list])
+        .output()
+        .ok()?;
 
-#[cfg(target_os = "linux")]
-struct PortGpuLine {
-    port: u16,
-    pid: u32,
-    indices: Vec<u32>,
-}
+    let stdout = String::from_utf8_lossy(&output.stdout);
 
-#[cfg(target_os = "linux")]
-fn find_other_port_line(nvml: &Nvml, host_count: u32, skip_port: u16) -> Option<PortGpuLine> {
-    let skip_needle = format!(":{:04X}", skip_port);
-    let mut tcp_data = std::fs::read_to_string("/proc/net/tcp").unwrap_or_default();
-    if let Ok(tcp6) = std::fs::read_to_string("/proc/net/tcp6") {
-        tcp_data.push('\n');
-        if let Some((_, rest)) = tcp6.split_once('\n') {
-            tcp_data.push_str(rest);
-        } else {
-            tcp_data.push_str(&tcp6);
+    // ps -f columns: UID PID PPID C STIME TTY TIME CMD...
+    // Skip header; match lines where the full command contains "vllm".
+    let mut gpu_indices: BTreeSet<u32> = BTreeSet::new();
+    for line in stdout.lines().skip(1) {
+        if !line.contains("vllm") {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let _uid = fields.next();
+        let pid: u32 = fields.next().and_then(|s| s.parse().ok())?;
+        if let Some(gpus) = pid_to_gpus.get(&pid) {
+            gpu_indices.extend(gpus);
         }
     }
-    if tcp_data.is_empty() {
+
+    if gpu_indices.is_empty() {
         return None;
     }
-    for line in tcp_data.lines() {
-        let cols: Vec<&str> = line.split_whitespace().collect();
-        if cols.len() < 10 {
-            continue;
-        }
-        let local = cols[1];
-        if local.ends_with(&skip_needle) {
-            continue;
-        }
-        let Some(port_hex) = local.rsplit(':').next() else {
-            continue;
-        };
-        let Some(port) = u16::from_str_radix(port_hex, 16).ok() else {
-            continue;
-        };
-        if port == 0 {
-            continue;
-        }
-        let Some(inode) = cols[9].parse().ok() else {
-            continue;
-        };
-        let Some(pid) = find_pid_for_socket_inode(inode) else {
-            continue;
-        };
-        let Some(indices) = gpu_indices_for_vllm_pid(nvml, host_count, pid) else {
-            continue;
-        };
-        if indices.is_empty() {
-            continue;
-        }
-        return Some(PortGpuLine { port, pid, indices });
-    }
-    None
-}
 
-#[cfg(target_os = "linux")]
-fn gpu_indices_for_vllm_pid(nvml: &Nvml, host_count: u32, vllm_pid: u32) -> Option<Vec<u32>> {
-    let mut by_pid: HashMap<u32, Vec<u32>> = HashMap::new();
-    let mut by_ppid: HashMap<u32, Vec<u32>> = HashMap::new();
+    let indices: Vec<u32> = gpu_indices.into_iter().collect();
+    let tp = indices.len() as u32;
 
-    for gpu_idx in 0..host_count {
-        let Ok(device) = nvml.device_by_index(gpu_idx) else {
-            continue;
-        };
-        let Ok(procs) = device.running_compute_processes() else {
-            continue;
-        };
-        for proc in procs {
-            let pid = proc.pid;
-            by_pid.entry(pid).or_default().push(gpu_idx);
-            if let Some(ppid) = read_ppid(pid) {
-                by_ppid.entry(ppid).or_default().push(gpu_idx);
-            }
+    if let Some(expected) = known_tp {
+        if tp != expected {
+            return None;
         }
     }
 
-    let mut matching = by_pid
-        .get(&vllm_pid)
-        .cloned()
-        .or_else(|| by_ppid.get(&vllm_pid).cloned())?;
-    matching.sort_unstable();
-    matching.dedup();
-    if matching.is_empty() {
-        None
-    } else {
-        Some(matching)
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn read_ppid(pid: u32) -> Option<u32> {
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-    for line in status.lines() {
-        if let Some(rest) = line.strip_prefix("PPid:") {
-            return rest.trim().parse().ok();
-        }
-    }
-    None
-}
-
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn port_from_metrics_url(url: &str) -> Option<u16> {
-    let after_scheme = url.split("://").nth(1).unwrap_or(url);
-    let host_port = after_scheme.split('/').next().unwrap_or(after_scheme);
-    if let Some((_, port_str)) = host_port.rsplit_once(':') {
-        port_str.parse().ok()
-    } else {
-        None
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn find_inode_for_port(port: u16) -> Option<u64> {
-    let needle = format!(":{:04X}", port);
-    let mut tcp_data = std::fs::read_to_string("/proc/net/tcp").unwrap_or_default();
-    if let Ok(tcp6) = std::fs::read_to_string("/proc/net/tcp6") {
-        tcp_data.push('\n');
-        if let Some((_, rest)) = tcp6.split_once('\n') {
-            tcp_data.push_str(rest);
-        } else {
-            tcp_data.push_str(&tcp6);
-        }
-    }
-    if tcp_data.is_empty() {
-        return None;
-    }
-    for line in tcp_data.lines() {
-        let cols: Vec<&str> = line.split_whitespace().collect();
-        if cols.len() < 10 {
-            continue;
-        }
-        if cols[1].ends_with(&needle) {
-            return cols[9].parse().ok();
-        }
-    }
-    None
-}
-
-#[cfg(target_os = "linux")]
-fn find_pid_for_socket_inode(target_inode: u64) -> Option<u32> {
-    let proc = std::fs::read_dir("/proc").ok()?;
-    for entry in proc.flatten() {
-        let name = entry.file_name();
-        let pid: u32 = match name.to_string_lossy().parse() {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        let fd_dir = format!("/proc/{pid}/fd");
-        let fds = match std::fs::read_dir(&fd_dir) {
-            Ok(d) => d,
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => continue,
-            Err(_) => continue,
-        };
-        for fd in fds.flatten() {
-            let Ok(target) = std::fs::read_link(fd.path()) else {
-                continue;
-            };
-            let s = target.to_string_lossy();
-            if let Some(inode) = s.strip_prefix("socket:[").and_then(|x| x.strip_suffix(']'))
-                && inode.parse::<u64>().ok() == Some(target_inode)
-            {
-                return Some(pid);
-            }
-        }
-    }
-    None
+    eprintln!("{}", term.step2_success(&indices, tp));
+    Some(GpuAssignment { tp, indices })
 }
 
 fn interactive_gpu_prompt(
@@ -832,19 +712,7 @@ mod tests {
         assert!(err.to_string().contains("No GPUs detected"));
     }
 
-    #[test]
-    fn port_from_metrics_url_parses() {
-        assert_eq!(
-            port_from_metrics_url("http://localhost:8000/metrics"),
-            Some(8000)
-        );
-        assert_eq!(port_from_metrics_url("http://localhost:9000/"), Some(9000));
-        assert_eq!(port_from_metrics_url("http://localhost/metrics"), None);
-        assert_eq!(
-            port_from_metrics_url("http://localhost:invalid/metrics"),
-            None
-        );
-    }
+
 
     #[test]
     fn plain_text_when_no_color() {
@@ -853,11 +721,12 @@ mod tests {
             idx: 0,
             name: "NVIDIA A100".to_string(),
             vram_pct: 92.0,
+            vram_total_mb: 80 * 1024,
             pids: vec![40592],
         };
         let line = term.format_gpu_row(&row, RowColorMode::Step1, true);
         assert!(!line.contains('\x1b'));
         assert!(line.contains("[0]"));
-        assert!(line.contains("92% vram"));
+        assert!(line.contains("92% vRAM"));
     }
 }
