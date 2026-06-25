@@ -1,16 +1,20 @@
-# Build profile binary (musl = static, no GLIBC dependency)
-FROM rust:slim-bookworm AS profile-builder
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    musl-tools \
+# Build profile binary on Ubuntu 22.04 — matches runtime GLIBC and can load libnvidia-ml.so
+FROM ubuntu:22.04 AS profile-builder
+RUN export DEBIAN_FRONTEND=noninteractive \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    curl \
     ca-certificates \
+    build-essential \
+    pkg-config \
     && rm -rf /var/lib/apt/lists/*
-RUN rustup target add x86_64-unknown-linux-musl
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+ENV PATH="/root/.cargo/bin:${PATH}"
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p src && echo "fn main() {}" > src/main.rs
-RUN cargo build --release --target x86_64-unknown-linux-musl
+RUN cargo build --release
 COPY src ./src
-RUN touch src/main.rs && cargo build --release --target x86_64-unknown-linux-musl
+RUN touch src/main.rs && cargo build --release
 
 # Re-pin with: docker buildx imagetools inspect nvidia/cuda:12.4.1-devel-ubuntu22.04 --format '{{json .Manifest.Digest}}'
 FROM nvidia/cuda:12.4.1-devel-ubuntu22.04
@@ -77,7 +81,7 @@ COPY --chown=appuser:appuser scripts/load.sh ./load.sh
 COPY --chown=appuser:appuser scripts/start.sh ./start.sh
 COPY --chown=appuser:appuser scripts/demo.sh ./demo.sh
 
-COPY --from=profile-builder --chown=appuser:appuser /build/target/x86_64-unknown-linux-musl/release/profile ./profile
+COPY --from=profile-builder --chown=appuser:appuser /build/target/release/profile ./profile
 
 RUN chmod 0755 ./load.sh ./start.sh ./demo.sh ./profile
 
