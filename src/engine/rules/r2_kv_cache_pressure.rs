@@ -542,7 +542,7 @@ pub(super) fn aggregate_r2_detail(details: &[KvCachePressureDetail]) -> KvCacheP
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::collectors::{CacheConfigLabels, GpuRawMetrics, VllmRawMetrics};
+    use crate::collectors::{CacheConfigLabels, VllmRawMetrics};
     use std::time::SystemTime;
 
     fn snap(vllm: VllmRawMetrics) -> RawSnapshot {
@@ -551,7 +551,9 @@ mod tests {
             vllm_observed_at: SystemTime::UNIX_EPOCH,
             timestamp: SystemTime::UNIX_EPOCH,
             vllm,
-            gpu: GpuRawMetrics::default(),
+            gpus: vec![],
+
+            nvml_host_gpu_count: None,
         }
     }
 

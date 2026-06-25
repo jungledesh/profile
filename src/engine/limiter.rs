@@ -1,8 +1,5 @@
-//! Constraint analysis for the no-issue exit path.
-//!
-//! When rules r1–r5 fire nothing, this module identifies the primary physical
-//! boundary capping efficiency. The cascade is mutually exclusive by construction:
-//! each stage is only reached if all harder limits above it are clear.
+//! No-issue exit path: identifies the primary physical boundary capping efficiency.
+//! Cascade is mutually exclusive — each stage is only reached if harder limits above it are clear.
 
 /// The physical or systemic boundary capping efficiency when no rules fire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

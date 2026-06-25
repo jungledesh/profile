@@ -1,13 +1,12 @@
 //! Profiler: orchestrate collectors for `diagnose`.
 //!
-//! Multi-window aggregation rules: **`docs/collection-policy.md`**.
+//! Multi-window aggregation rules: `docs/collection-policy.md`.
 
-use crate::collectors::{
-    self, HistogramWindowMass, build_config, window_is_active, window_is_evaluable,
-};
+use crate::collectors::{self, build_config, window_is_evaluable};
 use crate::context::{RuntimeWindow, StaticContext};
 use std::time::{Duration, SystemTime};
 
+mod aggregate;
 pub mod delta;
 pub mod drift;
 pub mod loop_runner;
@@ -31,30 +30,33 @@ pub fn run_diagnose(
     vllm_metrics_input: &str,
     max_num_seqs: Option<u32>,
     cost_per_hour: Option<f64>,
-    tensor_parallel_size: Option<u32>,
+    tensor_parallel_size: u32,
+    gpu_indices: Vec<u32>,
     duration: Duration,
 ) -> anyhow::Result<DiagnoseResult> {
     let started_at = SystemTime::now();
     let metrics_input = vllm_metrics_input.to_string();
     let window = logical_window_size(duration);
     let window_durations = build_window_durations(duration, window);
-    let raw_windows = collect_windows(vllm_metrics_input, &window_durations)?;
+    let raw_windows = collect_windows(
+        vllm_metrics_input,
+        &window_durations,
+        tensor_parallel_size,
+        &gpu_indices,
+    )?;
     let any_evaluable = raw_windows.iter().any(window_is_evaluable);
     let snapshot = if raw_windows.is_empty() {
         empty_snapshot(started_at)
     } else if any_evaluable {
-        aggregate_windows(&raw_windows, &window_durations, started_at)
+        aggregate::aggregate_windows(&raw_windows, &window_durations, started_at)
+    } else if let Some(last) = raw_windows.last() {
+        context_only_diagnose_snapshot(last, started_at)
     } else {
-        context_only_diagnose_snapshot(
-            raw_windows
-                .last()
-                .expect("raw_windows non-empty when not is_empty: checked above"),
-            started_at,
-        )
+        empty_snapshot(started_at)
     };
     let mut config = build_config(vllm_metrics_input, &snapshot, max_num_seqs);
     config.cost_per_hour = cost_per_hour;
-    config.tensor_parallel_size = tensor_parallel_size.or(config.tensor_parallel_size);
+    config.tensor_parallel_size = Some(tensor_parallel_size);
     let static_ctx = StaticContext::from_snapshot(&snapshot, config);
     let windows: Vec<RuntimeWindow> = raw_windows
         .into_iter()
@@ -94,13 +96,37 @@ fn build_window_durations(duration: Duration, logical_window: Duration) -> Vec<D
     out
 }
 
+fn track_window_topology(
+    baseline: &mut Option<collectors::GpuFingerprint>,
+    snap: &collectors::RawSnapshot,
+) -> anyhow::Result<()> {
+    let fp = snap.fingerprint();
+    if let Some(base) = baseline.as_ref() {
+        collectors::types::check_topology_drift(base, &fp)?;
+    } else {
+        *baseline = Some(fp);
+    }
+    Ok(())
+}
+
 fn collect_windows(
     vllm_metrics_input: &str,
     window_durations: &[Duration],
+    tensor_parallel_size: u32,
+    gpu_indices: &[u32],
 ) -> anyhow::Result<Vec<collectors::RawSnapshot>> {
     let mut out = Vec::new();
+    let mut baseline_fingerprint: Option<collectors::GpuFingerprint> = None;
+
     for &this_window in window_durations {
-        let snap = collectors::collect_snapshot_for_window(vllm_metrics_input, this_window)?;
+        let snap = collectors::collect_snapshot_for_window(
+            vllm_metrics_input,
+            this_window,
+            tensor_parallel_size,
+            gpu_indices,
+        )?;
+        track_window_topology(&mut baseline_fingerprint, &snap)?;
+
         out.push(snap);
     }
     Ok(out)
@@ -112,7 +138,8 @@ fn empty_snapshot(at: SystemTime) -> collectors::RawSnapshot {
         vllm_observed_at: at,
         timestamp: at,
         vllm: collectors::VllmRawMetrics::default(),
-        gpu: collectors::GpuRawMetrics::default(),
+        gpus: vec![],
+        nvml_host_gpu_count: None,
     }
 }
 
@@ -131,480 +158,28 @@ fn context_only_diagnose_snapshot(
             cache_config: source.vllm.cache_config.clone(),
             ..Default::default()
         },
-        gpu: collectors::GpuRawMetrics {
-            gpu_name: source.gpu.gpu_name.clone(),
-            gpu_index: source.gpu.gpu_index,
-            gpu_uuid: source.gpu.gpu_uuid.clone(),
-            power_limit_watts: source.gpu.power_limit_watts,
-            vram_total_mb: source.gpu.vram_total_mb,
-            ..Default::default()
-        },
-    }
-}
-
-fn aggregate_windows(
-    windows: &[collectors::RawSnapshot],
-    window_durations: &[Duration],
-    started_at: SystemTime,
-) -> collectors::RawSnapshot {
-    if windows.is_empty() {
-        return empty_snapshot(started_at);
-    }
-
-    let evaluable_pairs: Vec<(&collectors::RawSnapshot, Duration)> = windows
-        .iter()
-        .enumerate()
-        .filter_map(|(i, w)| {
-            if !window_is_evaluable(w) {
-                return None;
-            }
-            let d = w
-                .vllm
-                .window_duration_secs
-                .filter(|s| s.is_finite() && *s > f64::EPSILON)
-                .map(Duration::from_secs_f64)
-                .or_else(|| window_durations.get(i).copied())?;
-            Some((w, d))
-        })
-        .collect();
-
-    let active_pairs: Vec<(&collectors::RawSnapshot, Duration)> = evaluable_pairs
-        .iter()
-        .copied()
-        .filter(|(w, _)| window_is_active(w))
-        .collect();
-
-    // Cumulative Prometheus counters: chronologically last collection (idle tail included).
-    let chronological_last = windows.last().expect("windows non-empty: checked above");
-
-    if evaluable_pairs.is_empty() {
-        return chronological_last.clone();
-    }
-
-    // Last *evaluable* window — state, static, prefix rate, GPU state gauges.
-    let (last, _) = evaluable_pairs.last().expect("evaluable_pairs non-empty");
-    let last = *last;
-    let mut agg_v = collectors::VllmRawMetrics {
-        model_name: last.vllm.model_name.clone(),
-        max_num_seqs: last.vllm.max_num_seqs,
-        ..Default::default()
-    };
-    let mut agg_g = collectors::GpuRawMetrics {
-        gpu_name: last.gpu.gpu_name.clone(),
-        gpu_index: last.gpu.gpu_index,
-        gpu_uuid: last.gpu.gpu_uuid.clone(),
-        power_limit_watts: last.gpu.power_limit_watts,
-        ..Default::default()
-    };
-
-    // Running / waiting: duration-weighted mean over active windows. None if no active windows.
-    agg_v.num_requests_running =
-        weighted_metric_pairs(&active_pairs, |w| w.vllm.num_requests_running);
-    agg_v.num_requests_waiting =
-        weighted_metric_pairs(&active_pairs, |w| w.vllm.num_requests_waiting);
-    let kv_avg = aggregate_kv_cache_avg_perc(&evaluable_pairs);
-    agg_v.kv_cache_usage_perc = kv_avg;
-    agg_v.kv_cache_avg_perc = kv_avg;
-    agg_v.kv_cache_peak_perc = aggregate_kv_cache_peak_perc(&evaluable_pairs, last);
-    agg_v.num_requests_swapped = last.vllm.num_requests_swapped;
-    agg_v.cpu_cache_usage_perc = last.vllm.cpu_cache_usage_perc;
-    agg_v.ttft_ms = aggregate_histogram_from_mass(&active_pairs, |v| v.ttft_window_mass, 1000.0)
-        .or_else(|| weighted_metric_pairs(&active_pairs, |w| w.vllm.ttft_ms));
-    agg_v.tpot_ms = aggregate_histogram_from_mass(&active_pairs, |v| v.tpot_window_mass, 1000.0)
-        .or_else(|| weighted_metric_pairs(&active_pairs, |w| w.vllm.tpot_ms));
-    // p99: merge per-window delta bucket vectors, recompute quantile from merged result.
-    // This is mathematically correct — averaging quantiles across windows is not.
-    {
-        let ttft_vecs: Vec<&[collectors::HistogramCount]> = active_pairs
+        gpus: source
+            .gpus
             .iter()
-            .map(|(w, _)| w.vllm.ttft_p99_buckets.as_slice())
-            .collect();
-        let merged_ttft = collectors::merge_p99_bucket_vecs(&ttft_vecs);
-        agg_v.ttft_p99_ms =
-            collectors::vllm::histogram_quantile(0.99, &merged_ttft).map(|s| s * 1000.0);
-        agg_v.ttft_p95_ms =
-            collectors::vllm::histogram_quantile(0.95, &merged_ttft).map(|s| s * 1000.0);
-
-        let tpot_vecs: Vec<&[collectors::HistogramCount]> = active_pairs
-            .iter()
-            .map(|(w, _)| w.vllm.tpot_p99_buckets.as_slice())
-            .collect();
-        let merged_tpot = collectors::merge_p99_bucket_vecs(&tpot_vecs);
-        agg_v.tpot_p99_ms =
-            collectors::vllm::histogram_quantile(0.99, &merged_tpot).map(|s| s * 1000.0);
-        agg_v.tpot_p95_ms =
-            collectors::vllm::histogram_quantile(0.95, &merged_tpot).map(|s| s * 1000.0);
-
-        let prompt_tok_vecs: Vec<&[collectors::HistogramCount]> = evaluable_pairs
-            .iter()
-            .map(|(w, _)| w.vllm.prompt_tokens_p99_buckets.as_slice())
-            .collect();
-        let merged_prompt_tok = collectors::merge_p99_bucket_vecs(&prompt_tok_vecs);
-        agg_v.prompt_tokens_p99 = collectors::vllm::histogram_quantile(0.99, &merged_prompt_tok);
-
-        let gen_tok_vecs: Vec<&[collectors::HistogramCount]> = evaluable_pairs
-            .iter()
-            .map(|(w, _)| w.vllm.generation_tokens_p99_buckets.as_slice())
-            .collect();
-        let merged_gen_tok = collectors::merge_p99_bucket_vecs(&gen_tok_vecs);
-        agg_v.generation_tokens_p99 = collectors::vllm::histogram_quantile(0.99, &merged_gen_tok);
-        agg_v.generation_tokens_completed =
-            merged_gen_tok.last().map(|b| b.count).filter(|c| *c > 0.0);
-    }
-    agg_v.prefill_latency_ms =
-        aggregate_histogram_from_mass(&active_pairs, |v| v.prefill_window_mass, 1000.0)
-            .or_else(|| weighted_metric_pairs(&active_pairs, |w| w.vllm.prefill_latency_ms));
-    agg_v.queue_delay_ms =
-        aggregate_histogram_from_mass(&active_pairs, |v| v.queue_window_mass, 1000.0)
-            .or_else(|| weighted_metric_pairs(&active_pairs, |w| w.vllm.queue_delay_ms));
-    agg_v.prompt_tokens_mean =
-        aggregate_histogram_from_mass(&evaluable_pairs, |v| v.prompt_tokens_window_mass, 1.0)
-            .or_else(|| weighted_metric_pairs(&evaluable_pairs, |w| w.vllm.prompt_tokens_mean));
-    let total_window_secs: f64 = evaluable_pairs.iter().map(|(_, d)| d.as_secs_f64()).sum();
-    if total_window_secs.is_finite() && total_window_secs > f64::EPSILON {
-        agg_v.window_duration_secs = Some(total_window_secs);
-    }
-    agg_v.prefill_window_mass =
-        aggregate_histogram_window_mass(&active_pairs, |v| v.prefill_window_mass);
-    agg_v.ttft_window_mass = aggregate_histogram_window_mass(&active_pairs, |v| v.ttft_window_mass);
-    agg_v.tpot_window_mass = aggregate_histogram_window_mass(&active_pairs, |v| v.tpot_window_mass);
-    agg_v.queue_window_mass =
-        aggregate_histogram_window_mass(&active_pairs, |v| v.queue_window_mass);
-    agg_v.prompt_tokens_window_mass =
-        aggregate_histogram_window_mass(&evaluable_pairs, |v| v.prompt_tokens_window_mass);
-    agg_v.generation_tokens_per_sec =
-        weighted_metric_pairs(&active_pairs, |w| w.vllm.generation_tokens_per_sec);
-    agg_v.request_success_per_sec =
-        weighted_metric_pairs(&active_pairs, |w| w.vllm.request_success_per_sec);
-    agg_v.num_preemptions_per_sec =
-        weighted_metric_pairs(&active_pairs, |w| w.vllm.num_preemptions_per_sec);
-    let eval_refs: Vec<&collectors::RawSnapshot> =
-        evaluable_pairs.iter().map(|(w, _)| *w).collect();
-    agg_v.prefix_cache_hit_rate = prefix_hit_rate_sum_of_window_deltas(&eval_refs);
-    agg_v.generation_tokens_total = chronological_last.vllm.generation_tokens_total;
-    agg_v.request_success_total = chronological_last.vllm.request_success_total;
-    agg_v.num_preemptions_total = chronological_last.vllm.num_preemptions_total;
-    agg_v.prefix_cache_scrape_samples = last.vllm.prefix_cache_scrape_samples.clone();
-    // Static config labels don't change across windows — carry from last.
-    agg_v.cache_config = last.vllm.cache_config.clone();
-
-    agg_g.gpu_util_pct = weighted_metric_pairs(&active_pairs, |w| w.gpu.gpu_util_pct);
-    agg_g.mem_util_pct = weighted_metric_pairs(&active_pairs, |w| w.gpu.mem_util_pct);
-    agg_g.power_watts = weighted_metric_pairs(&active_pairs, |w| w.gpu.power_watts);
-    agg_g.temperature_c = last.gpu.temperature_c;
-    agg_g.temperature_peak_c = aggregate_temperature_peak_c(&evaluable_pairs, last);
-    agg_g.sm_clock_mhz = last.gpu.sm_clock_mhz;
-    agg_g.vram_used_mb = last.gpu.vram_used_mb;
-    agg_g.vram_peak_mb = aggregate_vram_peak_mb(&evaluable_pairs, last);
-    agg_g.vram_total_mb = last.gpu.vram_total_mb;
-
-    collectors::RawSnapshot {
-        gpu_observed_at: last.gpu_observed_at,
-        vllm_observed_at: last.vllm_observed_at,
-        timestamp: last.timestamp,
-        vllm: agg_v,
-        gpu: agg_g,
-    }
-}
-
-fn aggregate_kv_cache_avg_perc(pairs: &[(&collectors::RawSnapshot, Duration)]) -> Option<f64> {
-    weighted_metric_pairs(pairs, |w| w.vllm.kv_cache_usage_perc)
-}
-
-/// `max(max per-window peaks, last evaluable window's landing KV %)` so aggregate peak ≥ displayed usage.
-fn aggregate_kv_cache_peak_perc(
-    pairs: &[(&collectors::RawSnapshot, Duration)],
-    last: &collectors::RawSnapshot,
-) -> Option<f64> {
-    let from_windows = pairs
-        .iter()
-        .filter_map(|(w, _)| w.vllm.kv_cache_peak_perc)
-        .reduce(|a, b| a.max(b));
-    let landing = last.vllm.kv_cache_usage_perc.filter(|x| x.is_finite());
-    match (from_windows, landing) {
-        (Some(pw), Some(u)) => Some(pw.max(u)),
-        (Some(pw), None) => Some(pw),
-        (None, Some(u)) => Some(u),
-        (None, None) => None,
-    }
-}
-
-/// `max(max per-window VRAM peaks, last evaluable window's used MiB)` so aggregate peak ≥ displayed used.
-fn aggregate_vram_peak_mb(
-    pairs: &[(&collectors::RawSnapshot, Duration)],
-    last: &collectors::RawSnapshot,
-) -> Option<u64> {
-    let from_windows = pairs.iter().filter_map(|(w, _)| w.gpu.vram_peak_mb).max();
-    let landing = last.gpu.vram_used_mb;
-    match (from_windows, landing) {
-        (Some(pw), Some(u)) => Some(pw.max(u)),
-        (Some(pw), None) => Some(pw),
-        (None, Some(u)) => Some(u),
-        (None, None) => None,
-    }
-}
-
-/// `max(max per-window temp peaks, last evaluable landing °C)` so aggregate peak ≥ displayed current.
-fn aggregate_temperature_peak_c(
-    pairs: &[(&collectors::RawSnapshot, Duration)],
-    last: &collectors::RawSnapshot,
-) -> Option<f64> {
-    let from_windows = pairs
-        .iter()
-        .filter_map(|(w, _)| w.gpu.temperature_peak_c)
-        .filter(|t| t.is_finite())
-        .reduce(|a, b| a.max(b));
-    let landing = last.gpu.temperature_c.filter(|t| t.is_finite());
-    match (from_windows, landing) {
-        (Some(pw), Some(u)) => Some(pw.max(u)),
-        (Some(pw), None) => Some(pw),
-        (None, Some(u)) => Some(u),
-        (None, None) => None,
-    }
-}
-
-/// Sum histogram Δmass across windows — shared accumulation for mean and mass helpers.
-fn accumulate_histogram_mass<M>(
-    pairs: &[(&collectors::RawSnapshot, Duration)],
-    get_mass: M,
-) -> Option<HistogramWindowMass>
-where
-    M: Fn(&collectors::VllmRawMetrics) -> Option<HistogramWindowMass>,
-{
-    let mut sum = 0.0_f64;
-    let mut count = 0.0_f64;
-    for (w, _) in pairs {
-        let Some(m) = get_mass(&w.vllm) else {
-            continue;
-        };
-        if m.count_delta <= 0.0 || m.sum_delta < 0.0 {
-            continue;
-        }
-        if !(m.sum_delta.is_finite() && m.count_delta.is_finite()) {
-            continue;
-        }
-        sum += m.sum_delta;
-        count += m.count_delta;
-    }
-    if count > 0.0 && sum.is_finite() {
-        Some(HistogramWindowMass {
-            sum_delta: sum,
-            count_delta: count,
-        })
-    } else {
-        None
-    }
-}
-
-/// Sum histogram Δmass across evaluable windows (for saturation gates on aggregated snapshots).
-fn aggregate_histogram_window_mass<M>(
-    pairs: &[(&collectors::RawSnapshot, Duration)],
-    mass: M,
-) -> Option<HistogramWindowMass>
-where
-    M: Fn(&collectors::VllmRawMetrics) -> Option<HistogramWindowMass>,
-{
-    accumulate_histogram_mass(pairs, mass)
-}
-
-/// Multi-window mean for Prometheus histograms: **ΣΔsum / ΣΔcount** over evaluable windows.
-/// `scale` converts Prometheus units to display units (1000 for latency seconds→ms, 1 for prompt tokens).
-fn aggregate_histogram_from_mass<M>(
-    pairs: &[(&collectors::RawSnapshot, Duration)],
-    mass: M,
-    scale: f64,
-) -> Option<f64>
-where
-    M: Fn(&collectors::VllmRawMetrics) -> Option<HistogramWindowMass>,
-{
-    accumulate_histogram_mass(pairs, mass).and_then(|m| {
-        let mean = (m.sum_delta / m.count_delta) * scale;
-        mean.is_finite().then_some(mean)
-    })
-}
-
-fn weighted_metric_pairs<F>(
-    pairs: &[(&collectors::RawSnapshot, Duration)],
-    metric: F,
-) -> Option<f64>
-where
-    F: Fn(&collectors::RawSnapshot) -> Option<f64>,
-{
-    let mut weighted_sum = 0.0;
-    let mut total_weight_secs = 0.0;
-    for (w, dur) in pairs {
-        let Some(value) = metric(w) else {
-            continue;
-        };
-        if !value.is_finite() {
-            continue;
-        }
-        let weight_secs = dur.as_secs_f64();
-        if weight_secs <= f64::EPSILON {
-            continue;
-        }
-        weighted_sum += value * weight_secs;
-        total_weight_secs += weight_secs;
-    }
-    (total_weight_secs > 0.0).then_some(weighted_sum / total_weight_secs)
-}
-
-/// `Σ Δhits / Σ Δqueries` across evaluable windows — each window uses first vs last
-/// `prefix_cache_scrape_samples` (same endpoints as `collectors::vllm::prefix_window_hit_rate`).
-/// Skips windows with invalid deltas; `None` if no valid query mass.
-fn prefix_hit_rate_sum_of_window_deltas(windows: &[&collectors::RawSnapshot]) -> Option<f64> {
-    let mut sum_dh = 0.0_f64;
-    let mut sum_dq = 0.0_f64;
-    for w in windows {
-        let samples = &w.vllm.prefix_cache_scrape_samples;
-        if samples.len() < 2 {
-            continue;
-        }
-        let first = &samples[0];
-        let last = &samples[samples.len() - 1];
-        let (Some(h0), Some(h1), Some(q0), Some(q1)) =
-            (first.hits, last.hits, first.queries, last.queries)
-        else {
-            continue;
-        };
-        if !(h0.is_finite() && h1.is_finite() && q0.is_finite() && q1.is_finite()) {
-            continue;
-        }
-        let dq = q1 - q0;
-        if dq <= 0.0 {
-            continue;
-        }
-        let dh = h1 - h0;
-        if dh < 0.0 || !dh.is_finite() {
-            continue;
-        }
-        sum_dh += dh;
-        sum_dq += dq;
-    }
-    if sum_dq > 0.0 {
-        let r = sum_dh / sum_dq;
-        r.is_finite().then_some(r)
-    } else {
-        None
+            .map(|g| collectors::GpuRawMetrics {
+                gpu_name: g.gpu_name.clone(),
+                gpu_index: g.gpu_index,
+                gpu_uuid: g.gpu_uuid.clone(),
+                pcie_bus_id: g.pcie_bus_id.clone(),
+                power_limit_watts: g.power_limit_watts,
+                vram_total_mb: g.vram_total_mb,
+                ..Default::default()
+            })
+            .collect(),
+        nvml_host_gpu_count: source.nvml_host_gpu_count,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::collectors::{
-        CacheConfigLabels, GpuRawMetrics, HistogramCount, HistogramWindowMass,
-        PrefixCacheScrapeSample, RawSnapshot, VllmRawMetrics,
-    };
-
-    fn mk_snap(
-        run: Option<f64>,
-        tps: Option<f64>,
-        hits: Option<(f64, f64)>,
-        q: Option<(f64, f64)>,
-        prefix_hit_rate: Option<f64>,
-        gpu: GpuRawMetrics,
-        generation_tokens_total: Option<f64>,
-    ) -> RawSnapshot {
-        let samples = match (hits, q) {
-            (Some((h0, h1)), Some((q0, q1))) => vec![
-                PrefixCacheScrapeSample {
-                    hits: Some(h0),
-                    queries: Some(q0),
-                },
-                PrefixCacheScrapeSample {
-                    hits: Some(h1),
-                    queries: Some(q1),
-                },
-            ],
-            _ => vec![],
-        };
-        // kv_cache_usage_perc and gpu_util_pct intentionally None.
-        // window_is_active falls back to running > 0 alone.
-        // Tests needing specific active/inactive behavior must set these fields explicitly.
-        RawSnapshot {
-            gpu_observed_at: SystemTime::UNIX_EPOCH,
-            vllm_observed_at: SystemTime::UNIX_EPOCH,
-            timestamp: SystemTime::UNIX_EPOCH,
-            vllm: VllmRawMetrics {
-                num_requests_running: run,
-                kv_cache_usage_perc: None,
-                generation_tokens_per_sec: tps,
-                prefix_cache_hit_rate: prefix_hit_rate,
-                prefix_cache_scrape_samples: samples,
-                generation_tokens_total,
-                window_duration_secs: Some(2.0),
-                ..Default::default()
-            },
-            gpu,
-        }
-    }
-
-    fn mk_active_snap(
-        run: Option<f64>,
-        tps: Option<f64>,
-        hits: Option<(f64, f64)>,
-        q: Option<(f64, f64)>,
-        prefix_hit_rate: Option<f64>,
-        gpu: GpuRawMetrics,
-        generation_tokens_total: Option<f64>,
-    ) -> RawSnapshot {
-        let mut snap = mk_snap(
-            run,
-            tps,
-            hits,
-            q,
-            prefix_hit_rate,
-            gpu,
-            generation_tokens_total,
-        );
-        snap.vllm.kv_cache_usage_perc = Some(50.0);
-        snap
-    }
-
-    #[test]
-    fn aggregate_windows_populates_p95_latencies() {
-        fn latency_buckets() -> Vec<HistogramCount> {
-            vec![
-                HistogramCount {
-                    less_than: 0.1,
-                    count: 50.0,
-                },
-                HistogramCount {
-                    less_than: 0.2,
-                    count: 100.0,
-                },
-                HistogramCount {
-                    less_than: f64::INFINITY,
-                    count: 100.0,
-                },
-            ]
-        }
-
-        let g = GpuRawMetrics {
-            gpu_util_pct: Some(50.0),
-            ..Default::default()
-        };
-        let mut w1 = mk_active_snap(Some(5.0), Some(100.0), None, None, None, g.clone(), None);
-        w1.vllm.ttft_p99_buckets = latency_buckets();
-        w1.vllm.tpot_p99_buckets = latency_buckets();
-        let mut w2 = mk_active_snap(Some(5.0), Some(200.0), None, None, None, g, None);
-        w2.vllm.ttft_p99_buckets = latency_buckets();
-        w2.vllm.tpot_p99_buckets = latency_buckets();
-
-        let agg = aggregate_windows(
-            &[w1, w2],
-            &[Duration::from_secs(2), Duration::from_secs(2)],
-            SystemTime::UNIX_EPOCH,
-        );
-
-        let ttft_p95 = agg.vllm.ttft_p95_ms.expect("ttft p95");
-        let ttft_p99 = agg.vllm.ttft_p99_ms.expect("ttft p99");
-        let tpot_p95 = agg.vllm.tpot_p95_ms.expect("tpot p95");
-        let tpot_p99 = agg.vllm.tpot_p99_ms.expect("tpot p99");
-        assert!(ttft_p95 <= ttft_p99);
-        assert!(tpot_p95 <= tpot_p99);
-    }
+    use crate::collectors::test_fixtures::snap_with_gpu_indices;
+    use crate::collectors::{CacheConfigLabels, GpuRawMetrics, RawSnapshot, VllmRawMetrics};
 
     #[test]
     fn build_window_durations_includes_partial_tail() {
@@ -618,134 +193,6 @@ mod tests {
                 Duration::from_secs(2),
             ]
         );
-    }
-
-    #[test]
-    fn aggregate_windows_time_weights_rates_latencies_running_waiting_and_state_from_last() {
-        let g1 = GpuRawMetrics {
-            gpu_util_pct: Some(10.0),
-            vram_used_mb: Some(1000),
-            temperature_c: Some(40.0),
-            sm_clock_mhz: Some(1000),
-            ..Default::default()
-        };
-        let g2 = GpuRawMetrics {
-            gpu_util_pct: Some(50.0),
-            vram_used_mb: Some(2000),
-            temperature_c: Some(60.0),
-            sm_clock_mhz: Some(2000),
-            ..Default::default()
-        };
-        let windows = vec![
-            mk_snap(
-                Some(2.0),
-                Some(100.0),
-                Some((10.0, 20.0)),
-                Some((50.0, 130.0)),
-                None,
-                g1,
-                None,
-            ),
-            mk_active_snap(
-                Some(10.0),
-                Some(500.0),
-                Some((0.0, 10.0)),
-                Some((10.0, 20.0)),
-                None,
-                g2,
-                None,
-            ),
-        ];
-        let durations = vec![Duration::from_secs(2), Duration::from_secs(10)];
-        let agg = aggregate_windows(&windows, &durations, SystemTime::UNIX_EPOCH);
-        // Window 1 inactive (gpu 10%); window 2 active (gpu 50%) — means use active only.
-        assert!((agg.vllm.num_requests_running.unwrap() - 10.0).abs() < 1e-9);
-        assert!((agg.vllm.generation_tokens_per_sec.unwrap() - 500.0).abs() < 1e-4);
-        // (10+10)/(80+10) = 20/90 — sum of Δhits / sum of Δqueries, not last window only.
-        assert!((agg.vllm.prefix_cache_hit_rate.unwrap() - 20.0 / 90.0).abs() < 1e-9);
-        assert!((agg.gpu.gpu_util_pct.unwrap() - 50.0).abs() < 1e-4);
-        assert_eq!(agg.gpu.vram_used_mb, Some(2000));
-        assert!((agg.gpu.temperature_c.unwrap() - 60.0).abs() < 1e-9);
-        assert_eq!(agg.gpu.sm_clock_mhz, Some(2000));
-    }
-
-    #[test]
-    fn actual_duration_used_over_planned_when_present() {
-        let g = GpuRawMetrics::default();
-        let mut w1 = mk_active_snap(Some(2.0), Some(100.0), None, None, None, g.clone(), None);
-        w1.vllm.window_duration_secs = Some(2.0);
-        let mut w2 = mk_active_snap(Some(2.0), Some(200.0), None, None, None, g, None);
-        w2.vllm.window_duration_secs = Some(6.0);
-        let planned = vec![Duration::from_secs(2), Duration::from_secs(2)];
-        let agg = aggregate_windows(&[w1, w2], &planned, SystemTime::UNIX_EPOCH);
-        // Planned-only weighting would yield (100×2 + 200×2) / 4 = 150.0.
-        assert!((agg.vllm.generation_tokens_per_sec.unwrap() - 175.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn aggregate_prefix_hit_rate_is_sum_of_deltas_over_evaluable_windows() {
-        // Window1: Δh=10, Δq=50 → alone 20%. Window2: Δh=10, Δq=10 → alone 100%.
-        // Last-window-only would report 100%; aggregate = 20/60 ≈ 33.3%.
-        let w1 = mk_snap(
-            Some(1.0),
-            Some(100.0),
-            Some((10.0, 20.0)),
-            Some((50.0, 100.0)),
-            None,
-            GpuRawMetrics::default(),
-            None,
-        );
-        let w2 = mk_snap(
-            Some(1.0),
-            Some(100.0),
-            Some((5.0, 15.0)),
-            Some((10.0, 20.0)),
-            None,
-            GpuRawMetrics::default(),
-            None,
-        );
-        let agg = aggregate_windows(
-            &[w1, w2],
-            &[Duration::from_secs(2), Duration::from_secs(2)],
-            SystemTime::UNIX_EPOCH,
-        );
-        assert!((agg.vllm.prefix_cache_hit_rate.unwrap() - (20.0 / 60.0)).abs() < 1e-9);
-    }
-
-    #[test]
-    fn aggregate_cumulative_tokens_from_chronological_last_not_last_evaluable() {
-        let g = GpuRawMetrics::default();
-        let w1 = mk_active_snap(
-            Some(2.0),
-            Some(100.0),
-            None,
-            None,
-            None,
-            g.clone(),
-            Some(1000.0),
-        );
-        let w2 = mk_snap(None, None, None, None, None, g, Some(9999.0));
-        let agg = aggregate_windows(
-            &[w1, w2],
-            &[Duration::from_secs(2), Duration::from_secs(2)],
-            SystemTime::UNIX_EPOCH,
-        );
-        assert_eq!(agg.vllm.generation_tokens_total, Some(9999.0));
-        assert!((agg.vllm.num_requests_running.unwrap() - 2.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn aggregate_all_non_evaluable_returns_chronological_last_snapshot() {
-        let g = GpuRawMetrics::default();
-        let w1 = mk_snap(None, None, None, None, None, g.clone(), Some(10.0));
-        let w2 = mk_snap(None, None, None, None, None, g, Some(20.0));
-        let agg = aggregate_windows(
-            &[w1, w2],
-            &[Duration::from_secs(2), Duration::from_secs(2)],
-            SystemTime::UNIX_EPOCH,
-        );
-        assert_eq!(agg.vllm.generation_tokens_total, Some(20.0));
-        assert!(agg.vllm.num_requests_running.is_none());
     }
 
     #[test]
@@ -769,370 +216,44 @@ mod tests {
             ..Default::default()
         };
         let src = RawSnapshot {
-            gpu_observed_at: SystemTime::UNIX_EPOCH,
-            vllm_observed_at: SystemTime::UNIX_EPOCH,
-            timestamp: SystemTime::UNIX_EPOCH,
+            gpu_observed_at: std::time::SystemTime::UNIX_EPOCH,
+            vllm_observed_at: std::time::SystemTime::UNIX_EPOCH,
+            timestamp: std::time::SystemTime::UNIX_EPOCH,
             vllm: v,
-            gpu: g,
+            gpus: vec![g],
+            nvml_host_gpu_count: None,
         };
-        let out = context_only_diagnose_snapshot(&src, SystemTime::UNIX_EPOCH);
+        let out = context_only_diagnose_snapshot(&src, std::time::SystemTime::UNIX_EPOCH);
         assert_eq!(out.vllm.model_name.as_deref(), Some("llama"));
         assert_eq!(out.vllm.max_num_seqs, Some(128));
         assert_eq!(out.vllm.cache_config.block_size, Some(16));
         assert!(out.vllm.num_requests_running.is_none());
         assert!(out.vllm.generation_tokens_total.is_none());
-        assert_eq!(out.gpu.gpu_name.as_deref(), Some("H100"));
-        assert_eq!(out.gpu.vram_total_mb, Some(80000));
-        assert!(out.gpu.vram_used_mb.is_none());
-    }
-
-    #[test]
-    fn aggregate_peak_kv_and_vram_max_over_evaluable_windows() {
-        let v1 = VllmRawMetrics {
-            num_requests_running: Some(2.0),
-            generation_tokens_per_sec: Some(100.0),
-            kv_cache_usage_perc: Some(40.0),
-            kv_cache_peak_perc: Some(92.0),
-            window_duration_secs: Some(2.0),
-            ..Default::default()
-        };
-        let g1 = GpuRawMetrics {
-            vram_used_mb: Some(60 * 1024),
-            vram_peak_mb: Some(78 * 1024),
-            vram_total_mb: Some(80 * 1024),
-            ..Default::default()
-        };
-        let v2 = VllmRawMetrics {
-            num_requests_running: Some(2.0),
-            generation_tokens_per_sec: Some(100.0),
-            kv_cache_usage_perc: Some(10.0),
-            kv_cache_peak_perc: Some(15.0),
-            window_duration_secs: Some(2.0),
-            ..Default::default()
-        };
-        let g2 = GpuRawMetrics {
-            vram_used_mb: Some(55 * 1024),
-            vram_peak_mb: Some(56 * 1024),
-            vram_total_mb: Some(80 * 1024),
-            ..Default::default()
-        };
-        let w1 = RawSnapshot {
-            gpu_observed_at: SystemTime::UNIX_EPOCH,
-            vllm_observed_at: SystemTime::UNIX_EPOCH,
-            timestamp: SystemTime::UNIX_EPOCH,
-            vllm: v1,
-            gpu: g1,
-        };
-        let w2 = RawSnapshot {
-            gpu_observed_at: SystemTime::UNIX_EPOCH,
-            vllm_observed_at: SystemTime::UNIX_EPOCH,
-            timestamp: SystemTime::UNIX_EPOCH,
-            vllm: v2,
-            gpu: g2,
-        };
-        let agg = aggregate_windows(
-            &[w1, w2],
-            &[Duration::from_secs(2), Duration::from_secs(2)],
-            SystemTime::UNIX_EPOCH,
-        );
-        assert!((agg.vllm.kv_cache_usage_perc.unwrap() - 25.0).abs() < 1e-9);
-        assert!((agg.vllm.kv_cache_avg_perc.unwrap() - 25.0).abs() < 1e-9);
-        assert!((agg.vllm.kv_cache_peak_perc.unwrap() - 92.0).abs() < 1e-9);
-        assert_eq!(agg.gpu.vram_used_mb, Some(55 * 1024));
-        assert_eq!(agg.gpu.vram_peak_mb, Some(78 * 1024));
-    }
-
-    #[test]
-    fn aggregate_peak_kv_and_vram_include_last_landing_when_higher_than_window_peaks() {
-        let v1 = VllmRawMetrics {
-            num_requests_running: Some(2.0),
-            generation_tokens_per_sec: Some(100.0),
-            kv_cache_usage_perc: Some(40.0),
-            kv_cache_peak_perc: Some(40.0),
-            window_duration_secs: Some(2.0),
-            ..Default::default()
-        };
-        let g1 = GpuRawMetrics {
-            vram_used_mb: Some(60 * 1024),
-            vram_peak_mb: Some(65 * 1024),
-            vram_total_mb: Some(80 * 1024),
-            ..Default::default()
-        };
-        let v2 = VllmRawMetrics {
-            num_requests_running: Some(2.0),
-            generation_tokens_per_sec: Some(100.0),
-            kv_cache_usage_perc: Some(95.0),
-            kv_cache_peak_perc: Some(50.0),
-            window_duration_secs: Some(2.0),
-            ..Default::default()
-        };
-        let g2 = GpuRawMetrics {
-            vram_used_mb: Some(72 * 1024),
-            vram_peak_mb: Some(56 * 1024),
-            vram_total_mb: Some(80 * 1024),
-            ..Default::default()
-        };
-        let w1 = RawSnapshot {
-            gpu_observed_at: SystemTime::UNIX_EPOCH,
-            vllm_observed_at: SystemTime::UNIX_EPOCH,
-            timestamp: SystemTime::UNIX_EPOCH,
-            vllm: v1,
-            gpu: g1,
-        };
-        let w2 = RawSnapshot {
-            gpu_observed_at: SystemTime::UNIX_EPOCH,
-            vllm_observed_at: SystemTime::UNIX_EPOCH,
-            timestamp: SystemTime::UNIX_EPOCH,
-            vllm: v2,
-            gpu: g2,
-        };
-        let agg = aggregate_windows(
-            &[w1, w2],
-            &[Duration::from_secs(2), Duration::from_secs(2)],
-            SystemTime::UNIX_EPOCH,
-        );
-        assert!((agg.vllm.kv_cache_usage_perc.unwrap() - 67.5).abs() < 1e-9);
-        assert!((agg.vllm.kv_cache_avg_perc.unwrap() - 67.5).abs() < 1e-9);
-        assert!((agg.vllm.kv_cache_peak_perc.unwrap() - 95.0).abs() < 1e-9);
-        assert_eq!(agg.gpu.vram_used_mb, Some(72 * 1024));
-        assert_eq!(agg.gpu.vram_peak_mb, Some(72 * 1024));
-    }
-
-    #[test]
-    fn aggregate_temperature_peak_folds_in_last_landing_when_higher_than_window_peaks() {
-        let v = VllmRawMetrics {
-            num_requests_running: Some(2.0),
-            generation_tokens_per_sec: Some(100.0),
-            window_duration_secs: Some(2.0),
-            ..Default::default()
-        };
-        let g1 = GpuRawMetrics {
-            temperature_c: Some(70.0),
-            temperature_peak_c: Some(70.0),
-            ..Default::default()
-        };
-        let g2 = GpuRawMetrics {
-            temperature_c: Some(88.0),
-            temperature_peak_c: Some(75.0),
-            ..Default::default()
-        };
-        let w1 = RawSnapshot {
-            gpu_observed_at: SystemTime::UNIX_EPOCH,
-            vllm_observed_at: SystemTime::UNIX_EPOCH,
-            timestamp: SystemTime::UNIX_EPOCH,
-            vllm: v.clone(),
-            gpu: g1,
-        };
-        let w2 = RawSnapshot {
-            gpu_observed_at: SystemTime::UNIX_EPOCH,
-            vllm_observed_at: SystemTime::UNIX_EPOCH,
-            timestamp: SystemTime::UNIX_EPOCH,
-            vllm: v,
-            gpu: g2,
-        };
-        let agg = aggregate_windows(
-            &[w1, w2],
-            &[Duration::from_secs(2), Duration::from_secs(2)],
-            SystemTime::UNIX_EPOCH,
-        );
-        assert!((agg.gpu.temperature_c.unwrap() - 88.0).abs() < 1e-9);
-        assert!((agg.gpu.temperature_peak_c.unwrap() - 88.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn aggregate_histogram_ttft_is_sum_delta_over_sum_count_not_duration_weighted() {
-        let g = GpuRawMetrics::default();
-        let v1 = VllmRawMetrics {
-            num_requests_running: Some(2.0),
-            kv_cache_usage_perc: Some(50.0),
-            generation_tokens_per_sec: Some(100.0),
-            window_duration_secs: Some(10.0),
-            ttft_ms: Some(5000.0),
-            ttft_window_mass: Some(HistogramWindowMass {
-                sum_delta: 5.0,
-                count_delta: 1.0,
-            }),
-            ..Default::default()
-        };
-        let v2 = VllmRawMetrics {
-            num_requests_running: Some(2.0),
-            kv_cache_usage_perc: Some(50.0),
-            generation_tokens_per_sec: Some(100.0),
-            window_duration_secs: Some(2.0),
-            ttft_ms: Some(50.0),
-            ttft_window_mass: Some(HistogramWindowMass {
-                sum_delta: 25.0,
-                count_delta: 500.0,
-            }),
-            ..Default::default()
-        };
-        let w1 = RawSnapshot {
-            gpu_observed_at: SystemTime::UNIX_EPOCH,
-            vllm_observed_at: SystemTime::UNIX_EPOCH,
-            timestamp: SystemTime::UNIX_EPOCH,
-            vllm: v1,
-            gpu: g.clone(),
-        };
-        let w2 = RawSnapshot {
-            gpu_observed_at: SystemTime::UNIX_EPOCH,
-            vllm_observed_at: SystemTime::UNIX_EPOCH,
-            timestamp: SystemTime::UNIX_EPOCH,
-            vllm: v2,
-            gpu: g,
-        };
-        let agg = aggregate_windows(
-            &[w1, w2],
-            &[Duration::from_secs(10), Duration::from_secs(2)],
-            SystemTime::UNIX_EPOCH,
-        );
-        let expected_ms = (30.0_f64 / 501.0_f64) * 1000.0;
-        assert!((agg.vllm.ttft_ms.unwrap() - expected_ms).abs() < 1e-6);
-        let duration_weighted_ms = (5000.0 * 10.0 + 50.0 * 2.0) / 12.0;
-        assert!((agg.vllm.ttft_ms.unwrap() - duration_weighted_ms).abs() > 100.0);
-    }
-
-    #[test]
-    fn aggregate_stores_mass_fields_on_aggregate() {
-        let g = GpuRawMetrics::default();
-        let v1 = VllmRawMetrics {
-            num_requests_running: Some(2.0),
-            kv_cache_usage_perc: Some(50.0),
-            window_duration_secs: Some(2.0),
-            ttft_window_mass: Some(HistogramWindowMass {
-                sum_delta: 2.0,
-                count_delta: 4.0,
-            }),
-            tpot_window_mass: Some(HistogramWindowMass {
-                sum_delta: 1.0,
-                count_delta: 10.0,
-            }),
-            queue_window_mass: Some(HistogramWindowMass {
-                sum_delta: 0.5,
-                count_delta: 5.0,
-            }),
-            prompt_tokens_window_mass: Some(HistogramWindowMass {
-                sum_delta: 100.0,
-                count_delta: 2.0,
-            }),
-            ..Default::default()
-        };
-        let v2 = VllmRawMetrics {
-            num_requests_running: Some(2.0),
-            kv_cache_usage_perc: Some(50.0),
-            window_duration_secs: Some(2.0),
-            ttft_window_mass: Some(HistogramWindowMass {
-                sum_delta: 3.0,
-                count_delta: 6.0,
-            }),
-            tpot_window_mass: Some(HistogramWindowMass {
-                sum_delta: 2.0,
-                count_delta: 20.0,
-            }),
-            queue_window_mass: Some(HistogramWindowMass {
-                sum_delta: 1.5,
-                count_delta: 15.0,
-            }),
-            prompt_tokens_window_mass: Some(HistogramWindowMass {
-                sum_delta: 200.0,
-                count_delta: 4.0,
-            }),
-            ..Default::default()
-        };
-        let w1 = RawSnapshot {
-            gpu_observed_at: SystemTime::UNIX_EPOCH,
-            vllm_observed_at: SystemTime::UNIX_EPOCH,
-            timestamp: SystemTime::UNIX_EPOCH,
-            vllm: v1,
-            gpu: g.clone(),
-        };
-        let w2 = RawSnapshot {
-            gpu_observed_at: SystemTime::UNIX_EPOCH,
-            vllm_observed_at: SystemTime::UNIX_EPOCH,
-            timestamp: SystemTime::UNIX_EPOCH,
-            vllm: v2,
-            gpu: g,
-        };
-        let agg = aggregate_windows(
-            &[w1, w2],
-            &[Duration::from_secs(2), Duration::from_secs(2)],
-            SystemTime::UNIX_EPOCH,
-        );
         assert_eq!(
-            agg.vllm.ttft_window_mass,
-            Some(HistogramWindowMass {
-                sum_delta: 5.0,
-                count_delta: 10.0,
-            })
+            out.gpus.first().and_then(|g| g.gpu_name.as_deref()),
+            Some("H100")
         );
-        assert_eq!(
-            agg.vllm.tpot_window_mass,
-            Some(HistogramWindowMass {
-                sum_delta: 3.0,
-                count_delta: 30.0,
-            })
-        );
-        assert_eq!(
-            agg.vllm.queue_window_mass,
-            Some(HistogramWindowMass {
-                sum_delta: 2.0,
-                count_delta: 20.0,
-            })
-        );
-        assert_eq!(
-            agg.vllm.prompt_tokens_window_mass,
-            Some(HistogramWindowMass {
-                sum_delta: 300.0,
-                count_delta: 6.0,
-            })
-        );
+        assert_eq!(out.gpus.first().and_then(|g| g.vram_total_mb), Some(80000));
+        assert!(out.gpus.first().and_then(|g| g.vram_used_mb).is_none());
     }
 
     #[test]
-    fn aggregate_means_use_active_windows_only() {
-        let idle_v = VllmRawMetrics {
-            num_requests_running: Some(8.0),
-            kv_cache_usage_perc: Some(10.0),
-            generation_tokens_per_sec: Some(10.0),
-            window_duration_secs: Some(2.0),
-            ..Default::default()
-        };
-        let idle_g = GpuRawMetrics {
-            gpu_util_pct: Some(5.0),
-            ..Default::default()
-        };
-        let active_v = VllmRawMetrics {
-            num_requests_running: Some(20.0),
-            kv_cache_usage_perc: Some(50.0),
-            generation_tokens_per_sec: Some(100.0),
-            window_duration_secs: Some(2.0),
-            ..Default::default()
-        };
-        let active_g = GpuRawMetrics {
-            gpu_util_pct: Some(60.0),
-            ..Default::default()
-        };
-        let mk = |v: VllmRawMetrics, g: GpuRawMetrics| RawSnapshot {
-            gpu_observed_at: SystemTime::UNIX_EPOCH,
-            vllm_observed_at: SystemTime::UNIX_EPOCH,
-            timestamp: SystemTime::UNIX_EPOCH,
-            vllm: v,
-            gpu: g,
-        };
-        let windows = vec![
-            mk(idle_v, idle_g),
-            mk(active_v.clone(), active_g.clone()),
-            mk(active_v, active_g),
-        ];
-        let durations = vec![
-            Duration::from_secs(2),
-            Duration::from_secs(2),
-            Duration::from_secs(2),
-        ];
-        let agg = aggregate_windows(&windows, &durations, SystemTime::UNIX_EPOCH);
-        assert!((agg.vllm.generation_tokens_per_sec.unwrap() - 100.0).abs() < 1e-9);
-        assert!((agg.vllm.num_requests_running.unwrap() - 20.0).abs() < 1e-9);
-        assert!((agg.gpu.gpu_util_pct.unwrap() - 60.0).abs() < 1e-9);
-        // Evaluable blend would be (10+100+100)/3 weighted by equal duration = 70 tok/s.
-        assert!((agg.vllm.generation_tokens_per_sec.unwrap() - 70.0).abs() > 10.0);
+    fn track_window_topology_sets_baseline_on_first_window() {
+        let mut baseline = None;
+        let snap = snap_with_gpu_indices(&[0, 1]);
+        track_window_topology(&mut baseline, &snap).unwrap();
+        assert_eq!(baseline, Some(snap.fingerprint()));
+    }
+
+    #[test]
+    fn track_window_topology_errors_when_gpu_set_changes_mid_pass() {
+        let mut baseline = None;
+        track_window_topology(&mut baseline, &snap_with_gpu_indices(&[0, 1])).unwrap();
+        let err =
+            track_window_topology(&mut baseline, &snap_with_gpu_indices(&[0, 2])).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Topology drift detected"));
+        assert!(msg.contains("missing [GPU-1]"));
+        assert!(msg.contains("new [GPU-2]"));
     }
 }

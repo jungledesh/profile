@@ -151,7 +151,7 @@ mod tests {
     use crate::engine::baseline::{CostEstimate, CostSource};
     use crate::engine::{CeilingEstimate, PhysicsBaseline, WeightDtypeSource};
     use crate::{
-        collectors::{GpuRawMetrics, RawSnapshot, VllmRawMetrics},
+        collectors::{RawSnapshot, VllmRawMetrics},
         context::{RuntimeWindow, StaticContext},
     };
     use std::time::{Duration, SystemTime};
@@ -165,7 +165,9 @@ mod tests {
                 generation_tokens_per_sec: tps,
                 ..Default::default()
             },
-            gpu: GpuRawMetrics::default(),
+            gpus: vec![],
+
+            nvml_host_gpu_count: None,
         }
     }
 

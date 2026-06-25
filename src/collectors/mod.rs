@@ -12,8 +12,10 @@ pub mod vllm;
 pub use config::{VllmConfig, build_config};
 pub use traffic::{TrafficSource, TrafficState, traffic_from_snapshot};
 pub use types::{
-    CacheConfigLabels, GpuRawMetrics, HistogramCount, HistogramWindowMass, PrefixCacheScrapeSample,
-    RawSnapshot, VllmRawMetrics, window_is_active, window_is_evaluable,
+    AggregateGpuMetrics, CacheConfigLabels, GpuFingerprint, GpuRawMetrics, HistogramCount,
+    HistogramWindowMass, PrefixCacheScrapeSample, RawSnapshot, VllmRawMetrics,
+    effective_tensor_parallel, snapshot_uses_display_names, snapshot_uses_index_only,
+    window_is_active, window_is_evaluable,
 };
 pub(crate) use vllm::merge_p99_bucket_vecs;
 
@@ -23,15 +25,28 @@ use std::time::Duration;
 pub fn collect_snapshot_for_window(
     vllm_metrics_input: &str,
     window: Duration,
+    tensor_parallel_size: u32,
+    gpu_indices: &[u32],
 ) -> anyhow::Result<RawSnapshot> {
     let url = vllm_metrics_input.to_string();
+    let indices = gpu_indices.to_vec();
 
-    let gpu_handle = thread::spawn(move || gpu::collect_gpu_metrics_for(window));
+    let gpu_handle = thread::spawn(move || gpu::collect_gpu_metrics_for(window, Some(&indices)));
     let vllm_handle = thread::spawn(move || vllm::collect_vllm_metrics_for(&url, window));
 
-    let (gpu, gpu_observed_at) = gpu_handle
+    let (mut gpus, gpu_observed_at, nvml_host_gpu_count) = gpu_handle
         .join()
         .map_err(|_| anyhow::anyhow!("GPU collector panicked"))??;
+
+    types::validate_tensor_parallel_scope(
+        u32::try_from(gpus.len()).unwrap_or(u32::MAX),
+        Some(tensor_parallel_size),
+    )?;
+
+    types::validate_gpu_identities(&gpus)?;
+
+    gpus.sort_by_key(|a| a.identity());
+
     let (vllm, vllm_observed_at) = vllm_handle
         .join()
         .map_err(|_| anyhow::anyhow!("vLLM collector panicked"))??;
@@ -41,6 +56,30 @@ pub fn collect_snapshot_for_window(
         vllm_observed_at,
         timestamp: std::time::SystemTime::now(),
         vllm,
-        gpu,
+        gpus,
+        nvml_host_gpu_count,
     })
+}
+
+#[cfg(test)]
+pub(crate) mod test_fixtures {
+    use super::types::{GpuRawMetrics, RawSnapshot};
+    use std::time::SystemTime;
+
+    pub fn snap_with_gpu_indices(indices: &[u32]) -> RawSnapshot {
+        RawSnapshot {
+            gpu_observed_at: SystemTime::UNIX_EPOCH,
+            vllm_observed_at: SystemTime::UNIX_EPOCH,
+            timestamp: SystemTime::UNIX_EPOCH,
+            vllm: Default::default(),
+            gpus: indices
+                .iter()
+                .map(|&gpu_index| GpuRawMetrics {
+                    gpu_index: Some(gpu_index),
+                    ..Default::default()
+                })
+                .collect(),
+            nvml_host_gpu_count: None,
+        }
+    }
 }

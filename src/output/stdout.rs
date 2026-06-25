@@ -1,19 +1,26 @@
+use std::io::IsTerminal as _;
 use std::time::Duration;
 use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
 
-use crate::collectors::{GpuRawMetrics, VllmConfig, VllmRawMetrics};
+use crate::collectors::{
+    GpuRawMetrics, RawSnapshot, VllmConfig, VllmRawMetrics, snapshot_uses_display_names,
+    snapshot_uses_index_only,
+};
 use crate::context::AnalysisInput;
 use crate::engine;
 use crate::fmt::fmt_seconds_from_ms;
 use crate::profiler::DiagnoseResult;
 
+use owo_colors::OwoColorize;
+
 const VLLM_LABEL_W: usize = 10;
 const VLLM_LABEL_METRICS_GAP: &str = " ";
-
-/// Peak VRAM / total must reach this fraction to show a spike parenthetical.
+/// Show the VRAM peak parenthetical only when it crosses 90% of total VRAM — suppresses noise
+/// from tiny fluctuations that are irrelevant to the operator.
 const VRAM_PEAK_SHOW_THRESHOLD_FRAC: f64 = 0.90;
+
 /// Global GPU temp parenthetical until per-arch throttle thresholds exist (Hopper ~83°C).
 const GPU_TEMP_PEAK_SHOW_THRESHOLD_C: f64 = 80.0;
 
@@ -40,20 +47,62 @@ pub fn print_diagnose_table(result: &DiagnoseResult, verbose_rules: bool) {
 fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<String> {
     let snapshot = &result.snapshot;
     let v = &snapshot.vllm;
-    let g = &snapshot.gpu;
+    let n_gpus = snapshot.gpus.len();
+    let agg = snapshot.aggregate_gpu();
+    let cluster_gpu = aggregate_to_display_gpu(&agg);
     let duration = result.duration;
     let started_at = result.started_at;
 
+    // Gate all ANSI color codes on stdout being a real terminal. Piped output, --json, and CI
+    // should receive plain text only.
+    let use_color = std::io::stdout().is_terminal();
+    let blue_bold = |s: &str| -> String {
+        if use_color {
+            s.blue().bold().to_string()
+        } else {
+            s.to_string()
+        }
+    };
+    let magenta_bold = |s: &str| -> String {
+        if use_color {
+            s.magenta().bold().to_string()
+        } else {
+            s.to_string()
+        }
+    };
+    let red_bold = |s: &str| -> String {
+        if use_color {
+            s.red().bold().to_string()
+        } else {
+            s.to_string()
+        }
+    };
+
     let model = v.model_name.as_deref().unwrap_or("(unknown model)");
-    let gpu_label = g.gpu_name.as_deref().unwrap_or("(no GPU)");
+    let gpu_label = if n_gpus > 1 {
+        agg.gpu_name
+            .as_deref()
+            .map(|n| format!("{n} x{n_gpus}"))
+            .unwrap_or_else(|| format!("{n_gpus} GPUs"))
+    } else {
+        snapshot
+            .gpus
+            .first()
+            .and_then(|g| g.gpu_name.as_deref())
+            .or(agg.gpu_name.as_deref())
+            .unwrap_or("(no GPU)")
+            .to_string()
+    };
     let ts = format_profile_timestamp(started_at);
     let mut lines = vec![profile_header_line(
         env!("CARGO_PKG_VERSION"),
         model,
-        gpu_label,
+        &gpu_label,
         &ts,
         duration,
     )];
+
+    push_gpu_advisories(&mut lines, snapshot);
 
     // Build AnalysisInput from the aggregate snapshot for baseline + single-window rule evaluation.
     let aggregate_win = crate::context::RuntimeWindow::from_snapshot(result.snapshot.clone());
@@ -72,7 +121,7 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
     }
 
     if !result.any_evaluable {
-        lines.push(vllm_label_row("Target:", &result.metrics_input));
+        lines.push(vllm_label_row(&blue_bold("Target:"), &result.metrics_input));
         lines.push(String::new());
         lines.extend(engine::no_evaluable_diagnose_lines(
             verbose_rules,
@@ -86,27 +135,38 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
     }
     lines.push(format!(
         "{:<width$}{}{}",
-        "GPU =>",
+        blue_bold("GPU =>"),
         VLLM_LABEL_METRICS_GAP,
         gpu_gauges_line(
-            g,
+            &cluster_gpu,
             report.baseline.as_ref(),
             v.generation_tokens_per_sec,
             verbose_rules,
         ),
         width = VLLM_LABEL_W
     ));
-    if verbose_rules {
+    if n_gpus <= 1 {
+        let g = snapshot.gpus.first().unwrap_or(&cluster_gpu);
         lines.push(format!(
             "{:<width$}{}{}",
             "",
             VLLM_LABEL_METRICS_GAP,
-            gpu_detail_line(g),
+            gpu_detail_line(g, verbose_rules),
             width = VLLM_LABEL_W
         ));
+    } else {
+        for gpu in &snapshot.gpus {
+            lines.push(format!(
+                "{:<width$}{}{}",
+                format!("GPU [{}]", gpu.display_id()),
+                VLLM_LABEL_METRICS_GAP,
+                gpu_detail_line(gpu, verbose_rules),
+                width = VLLM_LABEL_W
+            ));
+        }
     }
     lines.push(String::new());
-    lines.push(vllm_label_row("vLLM:", ""));
+    lines.push(vllm_label_row(&magenta_bold("vLLM:"), ""));
     lines.push(vllm_label_row(
         "REQUESTS",
         &vllm_requests_value(v, result.static_ctx.config.max_num_seqs),
@@ -144,12 +204,39 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
     };
     if !rule_lines.is_empty() {
         lines.push(String::new());
-        lines.push("ISSUES:".to_string());
+        lines.push(red_bold("ISSUES:"));
         lines.push(String::new());
         lines.extend(rule_lines);
     }
 
     lines
+}
+
+fn push_gpu_advisories(lines: &mut Vec<String>, snapshot: &RawSnapshot) {
+    if snapshot_uses_display_names(&snapshot.gpus) {
+        lines.push(
+            "[i] GPU identity unavailable. Assigning display names. Keep CUDA_VISIBLE_DEVICES stable."
+                .to_string(),
+        );
+    } else if snapshot_uses_index_only(&snapshot.gpus) {
+        lines.push(
+            "[i] GPU identity: device index only. Keep CUDA_VISIBLE_DEVICES stable.".to_string(),
+        );
+    }
+}
+
+fn aggregate_to_display_gpu(agg: &crate::collectors::AggregateGpuMetrics) -> GpuRawMetrics {
+    GpuRawMetrics {
+        gpu_name: agg.gpu_name.clone(),
+        gpu_util_pct: agg.gpu_util_pct,
+        mem_util_pct: agg.mem_util_pct,
+        power_watts: agg.power_watts,
+        vram_used_mb: agg.vram_used_mb,
+        vram_peak_mb: agg.vram_peak_mb,
+        vram_total_mb: agg.sum_vram_total_mb,
+        temperature_peak_c: agg.temperature_peak_c,
+        ..Default::default()
+    }
 }
 
 fn format_profile_timestamp(st: SystemTime) -> String {
@@ -285,6 +372,9 @@ fn print_boxed(lines: &[String]) {
     println!("{}", border);
 }
 
+// gpu_util_pct and mem_util_pct are intentionally absent here and from all top-level display.
+// NVML SM util reports "active" regardless of useful work (spin-locks, CUDA graphs, async polling
+// make 99% util compatible with near-zero MFU). Efficiency % is the honest saturation signal.
 fn gpu_gauges_line(
     g: &GpuRawMetrics,
     baseline: Option<&crate::engine::PhysicsBaseline>,
@@ -326,7 +416,14 @@ fn gpu_gauges_line(
         }
     }
 
-    let mem = match (g.vram_used_mb, g.vram_total_mb) {
+    let mem = format_vram(g);
+
+    segments.push(mem);
+    segments.join(" | ")
+}
+
+fn format_vram(g: &GpuRawMetrics) -> String {
+    match (g.vram_used_mb, g.vram_total_mb) {
         (Some(used), Some(total)) if total > 0 => {
             let u_gb = used as f64 / 1024.0;
             let t_gb = total as f64 / 1024.0;
@@ -340,10 +437,7 @@ fn gpu_gauges_line(
             s
         }
         _ => "vRAM —".to_string(),
-    };
-
-    segments.push(mem);
-    segments.join(" | ")
+    }
 }
 
 fn format_efficiency_label(
@@ -413,9 +507,11 @@ fn vllm_latency_value(v: &VllmRawMetrics, verbose: bool) -> String {
         .tpot_p95_ms
         .map(|p| format!(" (p95 {})", fmt_seconds_from_ms(p)))
         .unwrap_or_default();
+
     if !verbose {
         return format!("ttft {ttft}{ttft_p95} | tpot {tpot}{tpot_p95}");
     }
+
     let prefill = v
         .prefill_latency_ms
         .map(fmt_seconds_from_ms)
@@ -424,6 +520,7 @@ fn vllm_latency_value(v: &VllmRawMetrics, verbose: bool) -> String {
         .queue_delay_ms
         .map(fmt_seconds_from_ms)
         .unwrap_or_else(|| "—".to_string());
+
     format!("ttft {ttft}{ttft_p95} | tpot {tpot}{tpot_p95} | prefill {prefill} | queue {queue}")
 }
 
@@ -477,11 +574,24 @@ fn cache_use_fragment(prefix_hit_rate: Option<f64>) -> String {
     }
 }
 
-fn gpu_detail_line(g: &GpuRawMetrics) -> String {
+// gpu_util_pct is intentionally not rendered — see note above gpu_gauges_line.
+fn gpu_detail_line(g: &GpuRawMetrics, verbose: bool) -> String {
     let mem_util = g
         .mem_util_pct
-        .map(|u| format!("mem_util {:.1}%", u))
+        .map(|u| format!("mem_util {:.0}%", u))
         .unwrap_or_else(|| "mem_util —".to_string());
+
+    let power = g
+        .power_watts
+        .map(|draw| format!("power {:.0}W", draw))
+        .unwrap_or_else(|| "power —".to_string());
+
+    let vram = format_vram(g);
+
+    if !verbose {
+        return format!("{mem_util} | {power} | {vram}");
+    }
+
     let temp = match g.temperature_c.filter(|t| t.is_finite()) {
         Some(cur) => {
             let mut s = format!("temp {:.0}°C", cur);
@@ -502,7 +612,7 @@ fn gpu_detail_line(g: &GpuRawMetrics) -> String {
         .power_limit_watts
         .map(|l| format!("limit {:.0}W", l))
         .unwrap_or_else(|| "limit —".to_string());
-    format!("{mem_util} | {temp} | {sm} | {limit}")
+    format!("{mem_util} | {power} | {vram} | {temp} | {sm} | {limit}")
 }
 
 fn vllm_memory_value(v: &VllmRawMetrics) -> String {
@@ -965,6 +1075,7 @@ mod tests {
         };
         let s_peak = gpu_gauges_line(&g_peak, None, None, false);
         assert!(s_peak.contains("vRAM 60/80GB (peak 78GB)"));
+        // 70/80 = 87.5% < 90% threshold — peak should be suppressed (noise, not signal)
         let g_peak_below_frac = GpuRawMetrics {
             gpu_util_pct: Some(28.0),
             power_watts: Some(310.0),
@@ -973,7 +1084,7 @@ mod tests {
             vram_total_mb: Some(80 * 1024),
             ..Default::default()
         };
-        assert!(!gpu_gauges_line(&g_peak_below_frac, None, None, false).contains("peak"));
+        assert!(!gpu_gauges_line(&g_peak_below_frac, None, None, false).contains("peak 70GB"));
         let g_no_recovery = GpuRawMetrics {
             gpu_util_pct: Some(28.0),
             power_watts: Some(310.0),
@@ -1004,7 +1115,7 @@ mod tests {
             power_limit_watts: Some(700.0),
             ..Default::default()
         };
-        let line = gpu_detail_line(&g);
+        let line = gpu_detail_line(&g, true);
         assert!(line.contains("temp 72°C (peak 86°C)"));
     }
 
@@ -1016,14 +1127,14 @@ mod tests {
             temperature_peak_c: Some(70.0),
             ..Default::default()
         };
-        assert!(!gpu_detail_line(&below_80).contains("peak"));
+        assert!(!gpu_detail_line(&below_80, true).contains("peak"));
         let not_recovered = GpuRawMetrics {
             mem_util_pct: Some(50.0),
             temperature_c: Some(86.0),
             temperature_peak_c: Some(86.0),
             ..Default::default()
         };
-        assert!(!gpu_detail_line(&not_recovered).contains("peak"));
+        assert!(!gpu_detail_line(&not_recovered, true).contains("peak"));
     }
 
     #[test]
@@ -1151,12 +1262,17 @@ mod tests {
             tpot_ms: Some(50.0),
             prefill_latency_ms: Some(200.0),
             queue_delay_ms: Some(10.0),
+            ttft_p95_ms: Some(150.0),
+            tpot_p95_ms: Some(60.0),
             ..Default::default()
         };
-        assert_eq!(vllm_latency_value(&v, false), "ttft 120ms | tpot 50ms");
+        assert_eq!(
+            vllm_latency_value(&v, false),
+            "ttft 120ms (p95 150ms) | tpot 50ms (p95 60ms)"
+        );
         assert_eq!(
             vllm_latency_value(&v, true),
-            "ttft 120ms | tpot 50ms | prefill 200ms | queue 10ms"
+            "ttft 120ms (p95 150ms) | tpot 50ms (p95 60ms) | prefill 200ms | queue 10ms"
         );
     }
 
@@ -1207,11 +1323,13 @@ mod tests {
                 window_duration_secs: Some(2.0),
                 ..Default::default()
             },
-            gpu: GpuRawMetrics {
+            gpus: vec![GpuRawMetrics {
                 gpu_name: Some("NVIDIA H100 80GB HBM3".to_string()),
                 gpu_util_pct: Some(70.0),
                 ..Default::default()
-            },
+            }],
+
+            nvml_host_gpu_count: None,
         };
         let w1 = RuntimeWindow::from_snapshot(mk_snapshot());
         let w2 = RuntimeWindow::from_snapshot(mk_snapshot());
@@ -1244,10 +1362,12 @@ mod tests {
                 model_name: Some("test-model".into()),
                 ..Default::default()
             },
-            gpu: GpuRawMetrics {
+            gpus: vec![GpuRawMetrics {
                 gpu_name: Some("Test GPU".into()),
                 ..Default::default()
-            },
+            }],
+
+            nvml_host_gpu_count: None,
         };
         let result = DiagnoseResult {
             snapshot: idle_snap.clone(),
@@ -1263,5 +1383,73 @@ mod tests {
         assert!(text.contains("Target:") && text.contains("127.0.0.1"));
         assert!(text.contains("No qualifying load"));
         assert!(!text.contains("GPU =>"));
+    }
+
+    #[test]
+    fn advisory_index_only_identity() {
+        let mut lines = Vec::new();
+        let snap = RawSnapshot {
+            gpus: vec![GpuRawMetrics {
+                gpu_index: Some(0),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        push_gpu_advisories(&mut lines, &snap);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("device index only"));
+    }
+
+    #[test]
+    fn multi_gpu_diagnose_shows_cluster_header_and_per_gpu_rows() {
+        let t = UNIX_EPOCH;
+        let snapshot = RawSnapshot {
+            gpu_observed_at: t,
+            vllm_observed_at: t,
+            timestamp: t,
+            vllm: VllmRawMetrics {
+                model_name: Some("test-model".into()),
+                num_requests_running: Some(8.0),
+                generation_tokens_per_sec: Some(200.0),
+                window_duration_secs: Some(2.0),
+                ..Default::default()
+            },
+            gpus: vec![
+                GpuRawMetrics {
+                    gpu_index: Some(0),
+                    gpu_name: Some("NVIDIA H100 80GB HBM3".into()),
+                    mem_util_pct: Some(40.0),
+                    power_watts: Some(300.0),
+                    vram_used_mb: Some(40 * 1024),
+                    vram_total_mb: Some(80 * 1024),
+                    ..Default::default()
+                },
+                GpuRawMetrics {
+                    gpu_index: Some(1),
+                    gpu_name: Some("NVIDIA H100 80GB HBM3".into()),
+                    mem_util_pct: Some(42.0),
+                    power_watts: Some(310.0),
+                    vram_used_mb: Some(41 * 1024),
+                    vram_total_mb: Some(80 * 1024),
+                    ..Default::default()
+                },
+            ],
+            nvml_host_gpu_count: Some(2),
+        };
+        let static_ctx = StaticContext::from_snapshot(&snapshot, VllmConfig::default());
+        let result = DiagnoseResult {
+            snapshot: snapshot.clone(),
+            windows: vec![RuntimeWindow::from_snapshot(snapshot)],
+            static_ctx,
+            duration: Duration::from_secs(2),
+            started_at: UNIX_EPOCH,
+            any_evaluable: true,
+            metrics_input: "http://127.0.0.1:8000/metrics".into(),
+        };
+        let text = build_diagnose_lines(&result, false).join("\n");
+        assert!(text.contains(" x2"));
+        assert!(text.contains("GPU [0]"));
+        assert!(text.contains("GPU [1]"));
+        assert!(text.contains("POWER 610W"));
     }
 }

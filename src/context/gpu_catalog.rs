@@ -148,6 +148,20 @@ static CATALOG: &[GpuEntry] = &[
             peak_bw_gbps: 1792.0,
         },
     },
+    // ── GB10 (DGX Spark) ─────────────────────────────────────────────────────
+    // Grace-Blackwell Superchip: 128 GB unified LPDDR5X. BW is system-level (~273 GB/s);
+    // decode ceiling is fundamentally different from HBM parts — treat as approximate.
+    // NVML reports device name "NVIDIA GB10" — token "gb10" matches.
+    // BF16 Dense TC: 212.9 TFLOPS measured (mma_bf16bf16f32 via mmapeak on real hardware).
+    // The marketed "1000 TOPS" figure is FP4 2:4 sparse — not BF16 dense.
+    GpuEntry {
+        tokens: &["gb10"],
+        entry: GpuCatalogEntry {
+            arch: "blackwell",
+            peak_flops_tc_tflops: 212.9, // BF16 Dense TC — measured on production hardware
+            peak_bw_gbps: 273.0,         // LPDDR5X system BW — confirmed
+        },
+    },
     // ── A10G ─────────────────────────────────────────────────────────────────
     GpuEntry {
         tokens: &["a10g"],
@@ -316,6 +330,15 @@ mod tests {
         assert_eq!(e.arch, "ampere");
         assert_eq!(e.peak_flops_tc_tflops, 126.0);
         assert_eq!(e.peak_bw_gbps, 600.0);
+    }
+
+    #[test]
+    fn gb10_dgx_spark() {
+        // NVML reports "NVIDIA GB10" on production DGX Spark hardware.
+        let e = lookup_gpu("NVIDIA GB10").expect("no match");
+        assert_eq!(e.arch, "blackwell");
+        assert_eq!(e.peak_flops_tc_tflops, 212.9);
+        assert_eq!(e.peak_bw_gbps, 273.0);
     }
 
     #[test]

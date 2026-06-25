@@ -1,6 +1,7 @@
 //! CLI: parse commands, print results.
 
 mod diagnose;
+mod gpu_assignment;
 
 pub(crate) use diagnose::prompt_for_updated_max_num_seqs;
 
@@ -49,7 +50,7 @@ pub struct Cli {
     #[arg(
         long = "tensor-parallel-size",
         global = true,
-        help = "Tensor parallel degree (overrides TENSOR_PARALLEL_SIZE env var)",
+        help = "Tensor parallel degree for this vLLM instance",
         display_order = 2
     )]
     pub tensor_parallel_size: Option<u32>,
