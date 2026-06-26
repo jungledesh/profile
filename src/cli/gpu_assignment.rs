@@ -395,8 +395,15 @@ fn vram_heuristic_from_fracs_inner(
             active.push(idx);
         }
     }
-    if active.is_empty() || active.len() >= host_count as usize {
+    if active.is_empty() {
         return None;
+    }
+    // All GPUs active: unambiguous — only one workload can own all of them.
+    if active.len() == host_count as usize {
+        return Some(GpuAssignment {
+            tp: active.len() as u32,
+            indices: active,
+        });
     }
     match known_tp {
         Some(tp) if active.len() != tp as usize => return None,
@@ -604,9 +611,11 @@ mod tests {
     }
 
     #[test]
-    fn vram_heuristic_all_active_returns_none() {
+    fn vram_heuristic_all_active_returns_assignment() {
         let fracs = [Some(0.92), Some(0.91)];
-        assert!(vram_heuristic_from_fracs(2, &fracs, None).is_none());
+        let a = vram_heuristic_from_fracs(2, &fracs, None).expect("all active = unambiguous");
+        assert_eq!(a.tp, 2);
+        assert_eq!(a.indices, vec![0, 1]);
     }
 
     #[test]

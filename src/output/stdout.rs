@@ -1,4 +1,3 @@
-use std::io::IsTerminal as _;
 use std::time::Duration;
 use std::time::SystemTime;
 
@@ -12,8 +11,6 @@ use crate::context::AnalysisInput;
 use crate::engine;
 use crate::fmt::fmt_seconds_from_ms;
 use crate::profiler::DiagnoseResult;
-
-use owo_colors::OwoColorize;
 
 const VLLM_LABEL_W: usize = 10;
 /// Width for GPU section labels: wide enough for `GPU [xxxxxxxx]` (14 chars) plus breathing room.
@@ -54,31 +51,6 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
     let cluster_gpu = aggregate_to_display_gpu(&agg);
     let duration = result.duration;
     let started_at = result.started_at;
-
-    // Gate all ANSI color codes on stdout being a real terminal. Piped output, --json, and CI
-    // should receive plain text only.
-    let use_color = std::io::stdout().is_terminal();
-    let blue_bold = |s: &str| -> String {
-        if use_color {
-            s.blue().bold().to_string()
-        } else {
-            s.to_string()
-        }
-    };
-    let magenta_bold = |s: &str| -> String {
-        if use_color {
-            s.magenta().bold().to_string()
-        } else {
-            s.to_string()
-        }
-    };
-    let red_bold = |s: &str| -> String {
-        if use_color {
-            s.red().bold().to_string()
-        } else {
-            s.to_string()
-        }
-    };
 
     let model = v.model_name.as_deref().unwrap_or("(unknown model)");
     let gpu_label = if n_gpus > 1 {
@@ -123,7 +95,7 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
     }
 
     if !result.any_evaluable {
-        lines.push(vllm_label_row(&blue_bold("Target:"), &result.metrics_input));
+        lines.push(vllm_label_row("Target:", &result.metrics_input));
         lines.push(String::new());
         lines.extend(engine::no_evaluable_diagnose_lines(
             verbose_rules,
@@ -136,8 +108,8 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
         lines.push(String::new());
     }
     lines.push(format!(
-        "{}{}{}",
-        visual_pad(&blue_bold("GPU =>"), GPU_LABEL_W),
+        "{:<width$}{}{}",
+        "GPU =>",
         VLLM_LABEL_METRICS_GAP,
         gpu_gauges_line(
             &cluster_gpu,
@@ -145,6 +117,7 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
             v.generation_tokens_per_sec,
             verbose_rules,
         ),
+        width = GPU_LABEL_W
     ));
     if n_gpus <= 1 {
         let g = snapshot.gpus.first().unwrap_or(&cluster_gpu);
@@ -168,7 +141,7 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
         }
     }
     lines.push(String::new());
-    lines.push(vllm_label_row(&magenta_bold("vLLM:"), ""));
+    lines.push(vllm_label_row("vLLM:", ""));
     lines.push(vllm_label_row(
         "REQUESTS",
         &vllm_requests_value(v, result.static_ctx.config.max_num_seqs),
@@ -206,20 +179,9 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
     };
     if !rule_lines.is_empty() {
         lines.push(String::new());
-        lines.push(red_bold("ISSUES:"));
+        lines.push("ISSUES:".to_string());
         lines.push(String::new());
-        // Color [!] issue headers red; indent lines stay plain.
-        let colored_rules: Vec<String> = rule_lines
-            .into_iter()
-            .map(|l| {
-                if use_color && l.starts_with("[!]") {
-                    l.red().bold().to_string()
-                } else {
-                    l
-                }
-            })
-            .collect();
-        lines.extend(colored_rules);
+        lines.extend(rule_lines);
     }
 
     lines
@@ -361,51 +323,20 @@ fn baseline_lines(
 
 fn vllm_label_row(label: &str, value: &str) -> String {
     format!(
-        "{}{}{}",
-        visual_pad(label, VLLM_LABEL_W),
+        "{:<width$}{}{}",
+        label,
         VLLM_LABEL_METRICS_GAP,
         value,
+        width = VLLM_LABEL_W
     )
 }
 
-/// Returns the visible character width of a string, stripping ANSI escape sequences.
-/// `chars().count()` includes escape-code bytes, which breaks box alignment when colors are on.
-fn visual_len(s: &str) -> usize {
-    let mut len = 0;
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            if let Some('[') = chars.next() {
-                for next_c in chars.by_ref() {
-                    if next_c.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-            }
-        } else {
-            len += 1;
-        }
-    }
-    len
-}
-
-/// Pad `s` to `width` visible characters. Rust's `{:<width$}` counts bytes, not visual width,
-/// so colored strings (which contain ANSI escape codes) receive no padding from the formatter.
-fn visual_pad(s: &str, width: usize) -> String {
-    let vlen = visual_len(s);
-    if vlen < width {
-        format!("{}{}", s, " ".repeat(width - vlen))
-    } else {
-        s.to_string()
-    }
-}
-
 fn print_boxed(lines: &[String]) {
-    let inner = lines.iter().map(|l| visual_len(l)).max().unwrap_or(0);
+    let inner = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
     let border = format!("+{}+", "-".repeat(inner));
     println!("{}", border);
     for line in lines {
-        let w = visual_len(line);
+        let w = line.chars().count();
         let padded = if w < inner {
             format!("{}{}", line, " ".repeat(inner - w))
         } else {
@@ -452,7 +383,6 @@ fn gpu_gauges_line(
             let label = match cost.cost_source {
                 engine::CostSource::Catalog => format!("${:.2}/1M tok (est)", cpm),
                 engine::CostSource::UserProvided => format!("${:.2}/1M tok", cpm),
-                engine::CostSource::None => String::new(),
             };
             if !label.is_empty() {
                 segments.push(label);
@@ -489,21 +419,8 @@ fn format_efficiency_label(
     actual_tps: Option<f64>,
     decode_ceiling: Option<f64>,
 ) -> String {
-    let use_color = std::io::stdout().is_terminal() && !cfg!(test);
     if let Some(e) = efficiency_pct.filter(|e| e.is_finite()) {
-        let pct_str = format!("{:.1}%", e);
-        let colored = if use_color {
-            if e >= 60.0 {
-                pct_str.green().to_string()
-            } else if e >= 20.0 {
-                pct_str.yellow().to_string()
-            } else {
-                pct_str.red().to_string()
-            }
-        } else {
-            pct_str
-        };
-        return format!("EFFICIENCY {}", colored);
+        return format!("EFFICIENCY {:.1}%", e);
     }
     let actual = actual_tps.filter(|t| t.is_finite() && *t > 0.0);
     let ceiling = decode_ceiling.filter(|c| c.is_finite() && *c > 0.0);
@@ -1370,8 +1287,8 @@ mod tests {
             timestamp: t,
             vllm: VllmRawMetrics {
                 model_name: Some("meta-llama/Llama-3.1-8B-Instruct".to_string()),
-                num_requests_running: Some(5.0),
-                num_requests_waiting: Some(0.0),
+                num_requests_running: Some(70.0),
+                num_requests_waiting: Some(2.0),
                 max_num_seqs: Some(256),
                 prompt_tokens_mean: Some(64.0),
                 request_success_per_sec: Some(20.0),

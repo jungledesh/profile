@@ -3,6 +3,7 @@ use crate::engine::WeightDtypeSource;
 use crate::engine::baseline::ACTIVATION_KV_BUFFER_GB;
 
 use super::Recommendation;
+use super::rule_names;
 
 fn min_tp(weight_gb: f64, vram_gb: f64, gpu_memory_utilization: f64) -> Option<u32> {
     let usable = (vram_gb * gpu_memory_utilization) - ACTIVATION_KV_BUFFER_GB;
@@ -85,7 +86,8 @@ pub fn r4_recommendation(
     };
 
     Some(Recommendation {
-        rule_name: "oom_risk",
+        rule_name: rule_names::OOM_RISK,
+        layer: 2,
         impact: 5,
         confidence,
         action: format!(
@@ -302,7 +304,7 @@ mod tests {
             WeightDtypeSource::EnvVar,
         )
         .expect("fired");
-        assert_eq!(r.rule_name, "oom_risk");
+        assert_eq!(r.rule_name, rule_names::OOM_RISK);
         assert_eq!(r.impact, 5);
         assert!((r.confidence - 0.95).abs() < 1e-9);
         let text = r.display_lines.join("\n");

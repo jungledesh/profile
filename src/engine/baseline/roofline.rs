@@ -22,8 +22,6 @@ pub enum CostSource {
     UserProvided,
     /// From gpu_prices.json catalog. Always labeled (est).
     Catalog,
-    /// No cost data available.
-    None,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -63,6 +61,10 @@ pub struct PhysicsBaseline {
     pub ridge_batch_size: f64,
     pub cost: Option<CostEstimate>,
 }
+
+/// Lower/upper band around roofline ceiling `expected` (conservative / optimistic).
+const CEILING_LOWER_BAND: f64 = 0.85;
+const CEILING_UPPER_BAND: f64 = 1.05;
 
 pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
     let ctx = input.ctx;
@@ -149,37 +151,27 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
         _ => None,
     };
 
-    let (cost_per_hr, cost_source) = if let Some(hr) = ctx
+    let cost = if let Some(hr) = ctx
         .config
         .cost_per_hour
         .filter(|v| v.is_finite() && *v > 0.0)
     {
-        (Some(hr), CostSource::UserProvided)
-    } else if let Some(gpu_name) = ctx.gpu.name.as_deref() {
-        gpu_prices::lookup_gpu_price(gpu_name)
-            .map(|p| (Some(p.on_demand_per_hr * tp), CostSource::Catalog))
-            .unwrap_or((None, CostSource::None))
-    } else {
-        (None, CostSource::None)
-    };
-
-    let cost_per_million_tokens = match (cost_per_hr, tps, cost_source) {
-        (Some(hr), Some(t), CostSource::UserProvided | CostSource::Catalog) if t > 0.0 => {
-            let cpm = hr * 1_000_000.0 / (t * 3600.0);
-            cpm.is_finite().then_some(cpm)
-        }
-        _ => None,
-    };
-
-    let cost = if tok_per_watt.is_some()
-        || joules_per_token.is_some()
-        || cost_per_million_tokens.is_some()
-    {
-        Some(CostEstimate {
+        build_cost_estimate(
             tok_per_watt,
             joules_per_token,
-            cost_per_million_tokens,
-            cost_source,
+            hr,
+            tps,
+            CostSource::UserProvided,
+        )
+    } else if let Some(gpu_name) = ctx.gpu.name.as_deref() {
+        gpu_prices::lookup_gpu_price(gpu_name).and_then(|p| {
+            build_cost_estimate(
+                tok_per_watt,
+                joules_per_token,
+                p.on_demand_per_hr * tp,
+                tps,
+                CostSource::Catalog,
+            )
         })
     } else {
         None
@@ -200,12 +192,34 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
     })
 }
 
+fn build_cost_estimate(
+    tok_per_watt: Option<f64>,
+    joules_per_token: Option<f64>,
+    cost_per_hr: f64,
+    tps: Option<f64>,
+    cost_source: CostSource,
+) -> Option<CostEstimate> {
+    let cost_per_million_tokens = tps.filter(|t| *t > 0.0).and_then(|t| {
+        let cpm = cost_per_hr * 1_000_000.0 / (t * 3600.0);
+        cpm.is_finite().then_some(cpm)
+    });
+    if tok_per_watt.is_none() && joules_per_token.is_none() && cost_per_million_tokens.is_none() {
+        return None;
+    }
+    Some(CostEstimate {
+        tok_per_watt,
+        joules_per_token,
+        cost_per_million_tokens,
+        cost_source,
+    })
+}
+
 fn make_estimate(expected: f64) -> Option<CeilingEstimate> {
     if !expected.is_finite() {
         return None;
     }
-    let lower = expected * 0.85;
-    let upper = expected * 1.05;
+    let lower = expected * CEILING_LOWER_BAND;
+    let upper = expected * CEILING_UPPER_BAND;
     if !(lower.is_finite() && upper.is_finite()) {
         return None;
     }
@@ -328,6 +342,7 @@ mod tests {
                 peak_bw_gbps: peak_bw,
             },
             config: cfg,
+            nvcc_available: false,
         };
         let win = RuntimeWindow::from_snapshot(RawSnapshot {
             gpu_observed_at: SystemTime::UNIX_EPOCH,
@@ -381,10 +396,7 @@ mod tests {
         let input = AnalysisInput::new(&ctx, &win);
         let out = compute(&input);
         assert!(out.is_some());
-        let b = match out {
-            Some(v) => v,
-            None => panic!("expected baseline"),
-        };
+        let b = out.expect("expected baseline");
         assert_eq!(b.weight_dtype_source, WeightDtypeSource::EnvVar);
         let expected_decode = math::decode_ceiling_tps(3350.0, 10_000_000_000, 32);
         assert!((b.decode.expected - expected_decode).abs() < 1e-9);
@@ -525,10 +537,7 @@ mod tests {
         let input = AnalysisInput::new(&ctx, &win);
         let out = compute(&input);
         assert!(out.is_some());
-        let b = match out {
-            Some(v) => v,
-            None => panic!("expected baseline"),
-        };
+        let b = out.expect("expected baseline");
         assert!(b.prefill.is_none());
     }
 
@@ -635,10 +644,7 @@ mod tests {
         let input = AnalysisInput::new(&ctx, &win);
         let out = compute(&input);
         assert!(out.is_some());
-        let b = match out {
-            Some(v) => v,
-            None => panic!("expected baseline"),
-        };
+        let b = out.expect("expected baseline");
         assert_eq!(b.weight_dtype_source, WeightDtypeSource::Fallback);
     }
 
@@ -739,7 +745,7 @@ mod tests {
         let input = AnalysisInput::new(&ctx, &win);
         let out = compute(&input);
         assert!(out.is_some());
-        let b = out.unwrap();
+        let b = out.expect("expected baseline");
         assert_eq!(b.weight_dtype_source, WeightDtypeSource::Fallback);
     }
 

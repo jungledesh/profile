@@ -22,6 +22,7 @@ mod tests {
             model: ModelArch::default(),
             gpu: GPUModel::default(),
             config: cfg,
+            nvcc_available: false,
         }
     }
 

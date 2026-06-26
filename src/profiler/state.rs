@@ -142,7 +142,8 @@ mod tests {
         Report {
             baseline: None,
             groups: Vec::new(),
-            r2_suppressed_by_r4: false,
+            suppressed_rules: Vec::new(),
+            kv_max_seqs: None,
         }
     }
 
@@ -150,6 +151,7 @@ mod tests {
         IssueGroup {
             primary: Recommendation {
                 rule_name: rule,
+                layer: 4,
                 impact: 1,
                 confidence: 1.0,
                 action: String::new(),
@@ -187,7 +189,8 @@ mod tests {
         let rep = Report {
             baseline: None,
             groups: vec![group("under_batching")],
-            r2_suppressed_by_r4: false,
+            suppressed_rules: Vec::new(),
+            kv_max_seqs: None,
         };
         let mut s = LoopState::new(r, rep);
         s.record_recommendation("under_batching");
@@ -202,7 +205,8 @@ mod tests {
         let rep = Report {
             baseline: None,
             groups: vec![group("a")],
-            r2_suppressed_by_r4: false,
+            suppressed_rules: Vec::new(),
+            kv_max_seqs: None,
         };
         let mut s = LoopState::new(r, rep);
         s.record_recommendation("under_batching");

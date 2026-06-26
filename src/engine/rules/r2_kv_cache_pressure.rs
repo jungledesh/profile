@@ -1,6 +1,6 @@
 use crate::collectors::RawSnapshot;
 
-use super::{MAX_OBSERVATION_SKEW_SECS, Recommendation, skew_secs};
+use super::{MAX_OBSERVATION_SKEW_SECS, Recommendation, rule_names, skew_secs};
 
 /// 88% matches observed vLLM production eviction onset; 85% was too conservative.
 const KV_CACHE_PRESSURE_MIN_PERC: f64 = 88.0;
@@ -19,12 +19,11 @@ const KV_ADMISSION_BACKLOG_QUEUE_RATIO_MIN: f64 = 0.30;
 /// Minimum KV headroom (GB) before recommending --gpu-memory-utilization; below this,
 /// weights and allocator overhead leave no safe room to expand the KV pool.
 const KV_HEADROOM_SAFE_MIN_GB: f64 = 2.0;
-const NVCC_PATH: &str = "/usr/local/cuda/bin/nvcc";
 const FP8_KV_CACHE_FIX: &str = "    • Switch --kv-cache-dtype fp8 to halve KV memory footprint";
+/// Suggest prefix caching when mean prompt length exceeds this (tokens).
+const PREFIX_CACHING_LONG_PROMPT_MIN_TOKENS: f64 = 200.0;
 
-static NVCC_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-
-fn fp8_kv_cache_fix_bullet(kv_cache_dtype: Option<&str>) -> Option<String> {
+fn fp8_kv_cache_fix_bullet(kv_cache_dtype: Option<&str>, nvcc_available: bool) -> Option<String> {
     // Already fp8 — don't suggest what's already applied
     if kv_cache_dtype.is_some_and(|d| {
         let d = d.trim().to_ascii_lowercase();
@@ -35,7 +34,7 @@ fn fp8_kv_cache_fix_bullet(kv_cache_dtype: Option<&str>) -> Option<String> {
     // --kv-cache-dtype fp8 stores KV activations in fp8 via software cast — works on all GPUs
     // including A100. This is distinct from --quantization fp8 (weight quantization) which
     // requires native FP8 hardware and crashes on A100/Qwen3.6.
-    let nvcc_present = *NVCC_AVAILABLE.get_or_init(|| std::path::Path::new(NVCC_PATH).exists());
+    let nvcc_present = nvcc_available;
     Some(if nvcc_present {
         FP8_KV_CACHE_FIX.to_string()
     } else {
@@ -59,7 +58,10 @@ fn kv_headroom_gpu_mem_bullet(kv_headroom_gb: Option<f64>) -> String {
 
 fn prefix_caching_fix_bullet(snapshot: &RawSnapshot) -> Option<String> {
     if snapshot.vllm.cache_config.enable_prefix_caching != Some(true)
-        && snapshot.vllm.prompt_tokens_mean.is_some_and(|t| t >= 200.0)
+        && snapshot
+            .vllm
+            .prompt_tokens_mean
+            .is_some_and(|t| t >= PREFIX_CACHING_LONG_PROMPT_MIN_TOKENS)
     {
         Some(
             "    • Enable --enable-prefix-caching to share KV blocks across identical prompt prefixes"
@@ -214,6 +216,7 @@ pub fn r2_recommendation(
     kv_max_seqs: Option<u32>,
     windows_fired: usize,
     total_evaluable: usize,
+    nvcc_available: bool,
 ) -> Option<Recommendation> {
     let Rule2Outcome::Fired(d) = rule2_kv_cache_pressure(snapshot) else {
         return None;
@@ -235,7 +238,8 @@ pub fn r2_recommendation(
         )
     };
     Some(Recommendation {
-        rule_name: "kv_cache_pressure",
+        rule_name: rule_names::KV_CACHE_PRESSURE,
+        layer: 2,
         impact: 5,
         confidence,
         action,
@@ -248,6 +252,7 @@ pub fn r2_recommendation(
                 max_model_len,
                 kv_headroom_gb,
                 kv_max_seqs,
+                nvcc_available,
             },
             windows_fired,
             total_evaluable,
@@ -336,6 +341,7 @@ pub(super) struct KvFormatCtx<'a> {
     pub max_model_len: Option<u32>,
     pub kv_headroom_gb: Option<f64>,
     pub kv_max_seqs: Option<u32>,
+    pub nvcc_available: bool,
 }
 
 pub(super) fn format_kv_cache_pressure_fired(
@@ -349,6 +355,7 @@ pub(super) fn format_kv_cache_pressure_fired(
         max_model_len,
         kv_headroom_gb,
         kv_max_seqs,
+        nvcc_available,
     } = *ctx;
     let kv_cache_dtype = snapshot.vllm.cache_config.cache_dtype.as_deref();
     let peak = snapshot
@@ -386,7 +393,7 @@ pub(super) fn format_kv_cache_pressure_fired(
                     .to_string(),
             );
         }
-        if let Some(bullet) = fp8_kv_cache_fix_bullet(kv_cache_dtype) {
+        if let Some(bullet) = fp8_kv_cache_fix_bullet(kv_cache_dtype, nvcc_available) {
             out.push(bullet);
         }
         let total_count = snapshot.vllm.generation_tokens_completed.unwrap_or(0.0);
@@ -404,7 +411,7 @@ pub(super) fn format_kv_cache_pressure_fired(
         if let Some(bullet) = prefix_caching_fix_bullet(snapshot) {
             out.push(bullet);
         }
-        if let Some(bullet) = fp8_kv_cache_fix_bullet(kv_cache_dtype) {
+        if let Some(bullet) = fp8_kv_cache_fix_bullet(kv_cache_dtype, nvcc_available) {
             out.push(bullet);
         }
         let total_count = snapshot.vllm.generation_tokens_completed.unwrap_or(0.0);
@@ -434,17 +441,14 @@ pub(super) fn format_kv_cache_pressure_fired(
 pub(super) fn format_kv_admission_backlog_issue(
     d: &KvAdmissionBacklogDetail,
     seen_pct: u32,
-    max_model_len: Option<u32>,
-    kv_headroom_gb: Option<f64>,
-    snapshot: &RawSnapshot,
+    ctx: &KvFormatCtx<'_>,
     windows_fired: usize,
     total_evaluable: usize,
 ) -> Vec<String> {
-    let kv_cache_dtype = snapshot.vllm.cache_config.cache_dtype.as_deref();
-    let gpu_mem_bullet = kv_headroom_gpu_mem_bullet(kv_headroom_gb);
+    let kv_cache_dtype = ctx.snapshot.vllm.cache_config.cache_dtype.as_deref();
+    let gpu_mem_bullet = kv_headroom_gpu_mem_bullet(ctx.kv_headroom_gb);
     let mut out = vec![
         "[!] KV Cache Pressure: Admission Backlog".to_string(),
-        format!("  Seen in {seen_pct}% of windows"),
         "  Cause:".to_string(),
         format!(
             "  - Scheduler holding {:.0} requests in queue ({:.0}% of active requests waiting) to protect KV memory",
@@ -459,15 +463,15 @@ pub(super) fn format_kv_admission_backlog_issue(
         "  Fix:".to_string(),
         gpu_mem_bullet,
     ];
-    if let Some(bullet) = fp8_kv_cache_fix_bullet(kv_cache_dtype) {
+    if let Some(bullet) = fp8_kv_cache_fix_bullet(kv_cache_dtype, ctx.nvcc_available) {
         out.push(bullet);
     }
-    let total_count = snapshot.vllm.generation_tokens_completed.unwrap_or(0.0);
+    let total_count = ctx.snapshot.vllm.generation_tokens_completed.unwrap_or(0.0);
     super::push_model_len_shrink_suggestion(
         &mut out,
-        max_model_len,
-        snapshot.vllm.prompt_tokens_p99,
-        snapshot.vllm.generation_tokens_p99,
+        ctx.max_model_len,
+        ctx.snapshot.vllm.prompt_tokens_p99,
+        ctx.snapshot.vllm.generation_tokens_p99,
         total_count,
         "    ",
     );
@@ -477,7 +481,7 @@ pub(super) fn format_kv_admission_backlog_issue(
         let confidence = kv_pressure_confidence(windows_fired, total_evaluable);
         out.push(format!("  {}", kv_pressure_confidence_label(confidence)));
     }
-    out
+    super::with_seen_pct(out, seen_pct)
 }
 
 pub(super) fn aggregate_backlog_detail(
@@ -511,9 +515,10 @@ pub(super) fn format_kv_cache_window_issue(
     windows_fired: usize,
     total_evaluable: usize,
 ) -> Vec<String> {
-    let mut lines = format_kv_cache_pressure_fired(d, ctx, windows_fired, total_evaluable);
-    lines.insert(1, format!("  Seen in {seen_pct}% of windows"));
-    lines
+    super::with_seen_pct(
+        format_kv_cache_pressure_fired(d, ctx, windows_fired, total_evaluable),
+        seen_pct,
+    )
 }
 
 pub(super) fn aggregate_r2_detail(details: &[KvCachePressureDetail]) -> KvCachePressureDetail {
@@ -568,6 +573,7 @@ mod tests {
             max_model_len,
             kv_headroom_gb,
             kv_max_seqs,
+            nvcc_available: false,
         }
     }
 
@@ -822,7 +828,7 @@ mod tests {
             generation_tokens_per_sec: Some(100.0),
             ..Default::default()
         };
-        let r = r2_recommendation(&snap(v.clone()), None, None, None, 1, 1).expect("fired");
+        let r = r2_recommendation(&snap(v.clone()), None, None, None, 1, 1, false).expect("fired");
         assert!(!r.display_lines.join("\n").contains("evictions stop"));
         assert_eq!(r.short_action, "raise --gpu-memory-utilization");
         assert!(r.action.contains("gpu-memory-utilization"));
@@ -847,7 +853,8 @@ mod tests {
             generation_tokens_per_sec: Some(100.0),
             ..Default::default()
         };
-        let r = r2_recommendation(&snap(v), Some(8192), None, Some(15), 1, 4).expect("fired");
+        let r =
+            r2_recommendation(&snap(v), Some(8192), None, Some(15), 1, 4, false).expect("fired");
         assert!(r.action.contains("max_model_len=8192"));
         assert!(r.action.contains("≤15"));
     }
@@ -860,7 +867,7 @@ mod tests {
             generation_tokens_per_sec: Some(100.0),
             ..Default::default()
         };
-        let r = r2_recommendation(&snap(v), None, None, Some(18), 1, 4).expect("fired");
+        let r = r2_recommendation(&snap(v), None, None, Some(18), 1, 4, false).expect("fired");
         assert_eq!(r.action, "Lower --max-num-seqs to ≤18");
     }
 
@@ -872,7 +879,7 @@ mod tests {
             generation_tokens_per_sec: Some(100.0),
             ..Default::default()
         };
-        let r = r2_recommendation(&snap(v), None, None, None, 1, 4).expect("fired");
+        let r = r2_recommendation(&snap(v), None, None, None, 1, 4, false).expect("fired");
         assert_eq!(r.short_action, "lower --max-num-seqs");
         assert_eq!(r.action, "Lower --max-num-seqs to stop evictions");
         assert!((r.confidence - 0.5).abs() < 1e-9);
@@ -979,9 +986,7 @@ mod tests {
         let text = format_kv_admission_backlog_issue(
             &sample_backlog_detail(),
             27,
-            None,
-            Some(30.0),
-            &snap(VllmRawMetrics::default()),
+            &kv_ctx(&snap(VllmRawMetrics::default()), None, Some(30.0), None),
             3,
             4,
         )
@@ -994,9 +999,7 @@ mod tests {
         let text = format_kv_admission_backlog_issue(
             &sample_backlog_detail(),
             27,
-            None,
-            Some(1.0),
-            &snap(VllmRawMetrics::default()),
+            &kv_ctx(&snap(VllmRawMetrics::default()), None, Some(1.0), None),
             3,
             4,
         )
@@ -1009,9 +1012,7 @@ mod tests {
         let text = format_kv_admission_backlog_issue(
             &sample_backlog_detail(),
             27,
-            None,
-            None,
-            &snap(VllmRawMetrics::default()),
+            &kv_ctx(&snap(VllmRawMetrics::default()), None, None, None),
             3,
             4,
         )
@@ -1022,27 +1023,11 @@ mod tests {
     #[test]
     fn backlog_omits_confidence_until_significant() {
         let d = sample_backlog_detail();
-        let single = format_kv_admission_backlog_issue(
-            &d,
-            27,
-            None,
-            Some(30.0),
-            &snap(VllmRawMetrics::default()),
-            1,
-            1,
-        )
-        .join("\n");
+        let snap = snap(VllmRawMetrics::default());
+        let ctx = kv_ctx(&snap, None, Some(30.0), None);
+        let single = format_kv_admission_backlog_issue(&d, 27, &ctx, 1, 1).join("\n");
         assert!(!single.contains("Confidence:"));
-        let stable = format_kv_admission_backlog_issue(
-            &d,
-            27,
-            None,
-            Some(30.0),
-            &snap(VllmRawMetrics::default()),
-            3,
-            4,
-        )
-        .join("\n");
+        let stable = format_kv_admission_backlog_issue(&d, 27, &ctx, 3, 4).join("\n");
         assert!(stable.contains("Confidence: Medium-High"));
     }
 
@@ -1057,9 +1042,7 @@ mod tests {
         let lines = format_kv_admission_backlog_issue(
             &sample_backlog_detail(),
             27,
-            Some(8192),
-            Some(30.0),
-            &snap(v),
+            &kv_ctx(&snap(v), Some(8192), Some(30.0), None),
             3,
             4,
         )
@@ -1196,21 +1179,20 @@ mod tests {
 
     #[test]
     fn fp8_kv_cache_bullet_reflects_nvcc_availability() {
-        let bullet = fp8_kv_cache_fix_bullet(None).expect("bf16/auto should suggest fp8");
-        assert!(bullet.contains("Switch --kv-cache-dtype fp8"));
-        if std::path::Path::new(NVCC_PATH).exists() {
-            assert!(!bullet.contains("requires nvcc"));
-        } else {
-            assert!(bullet.contains("(requires nvcc)"));
-        }
+        let with_nvcc = fp8_kv_cache_fix_bullet(None, true).expect("bf16/auto should suggest fp8");
+        assert!(with_nvcc.contains("Switch --kv-cache-dtype fp8"));
+        assert!(!with_nvcc.contains("requires nvcc"));
+        let without_nvcc =
+            fp8_kv_cache_fix_bullet(None, false).expect("bf16/auto should suggest fp8");
+        assert!(without_nvcc.contains("(requires nvcc)"));
     }
 
     #[test]
     fn fp8_kv_cache_bullet_suppressed_when_already_fp8() {
-        assert!(fp8_kv_cache_fix_bullet(Some("fp8")).is_none());
-        assert!(fp8_kv_cache_fix_bullet(Some("FP8")).is_none());
-        assert!(fp8_kv_cache_fix_bullet(Some("e4m3fnuz")).is_none());
-        assert!(fp8_kv_cache_fix_bullet(Some("e5m2")).is_none());
-        assert!(fp8_kv_cache_fix_bullet(Some("auto")).is_some());
+        assert!(fp8_kv_cache_fix_bullet(Some("fp8"), true).is_none());
+        assert!(fp8_kv_cache_fix_bullet(Some("FP8"), true).is_none());
+        assert!(fp8_kv_cache_fix_bullet(Some("e4m3fnuz"), true).is_none());
+        assert!(fp8_kv_cache_fix_bullet(Some("e5m2"), true).is_none());
+        assert!(fp8_kv_cache_fix_bullet(Some("auto"), true).is_some());
     }
 }
