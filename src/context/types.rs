@@ -44,6 +44,8 @@ pub struct StaticContext {
     pub model: ModelArch,
     pub gpu: GPUModel,
     pub config: VllmConfig,
+    /// Resolved once at startup — whether `/usr/local/cuda/bin/nvcc` exists on this host.
+    pub nvcc_available: bool,
 }
 
 /// Last non-empty `/`-delimited segment; `None` if `s` is empty or whitespace only.
@@ -127,7 +129,12 @@ impl StaticContext {
                 peak_bw_gbps: None,
             },
         };
-        StaticContext { model, gpu, config }
+        StaticContext {
+            model,
+            gpu,
+            config,
+            nvcc_available: std::path::Path::new("/usr/local/cuda/bin/nvcc").exists(),
+        }
     }
 }
 

@@ -1,6 +1,7 @@
 use crate::collectors::RawSnapshot;
 
 use super::Recommendation;
+use super::rule_names;
 
 const PREFIX_HIT_RATE_LT: f64 = 0.35;
 const PREFIX_RULE_PROMPT_TOKENS_GTE: f64 = 20.0;
@@ -106,7 +107,8 @@ pub fn r3_recommendation(snapshot: &RawSnapshot) -> Option<Recommendation> {
         )
     };
     Some(Recommendation {
-        rule_name: "low_prefix_reuse",
+        rule_name: rule_names::LOW_PREFIX_REUSE,
+        layer: 5,
         impact: if d.hit_rate.is_none() { 3 } else { 2 },
         confidence,
         action,
@@ -206,15 +208,16 @@ pub(super) fn format_low_prefix_window_issue(
     prompt_mean: Option<f64>,
     session_hit_rate: Option<f64>,
 ) -> Vec<String> {
-    let mut lines = format_low_prefix_hit_rate_fired(
-        d,
-        enable_prefix_caching,
-        qps,
-        prompt_mean,
-        session_hit_rate,
-    );
-    lines.insert(1, format!("  Seen in {seen_pct}% of windows"));
-    lines
+    super::with_seen_pct(
+        format_low_prefix_hit_rate_fired(
+            d,
+            enable_prefix_caching,
+            qps,
+            prompt_mean,
+            session_hit_rate,
+        ),
+        seen_pct,
+    )
 }
 
 pub(super) fn aggregate_r3_detail(

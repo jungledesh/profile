@@ -2,6 +2,7 @@ use crate::collectors::RawSnapshot;
 use crate::fmt::fmt_seconds_from_ms;
 
 use super::Recommendation;
+use super::rule_names;
 
 /// Minimum ratio of (waiting / total active) confirming the cap is structurally bottlenecking.
 /// No industry standard exists; 0.30 is a judgment call. At 30%, nearly 1 in 3 active
@@ -43,6 +44,9 @@ pub struct ConcurrencySaturationDetail {
     pub kv_cache_usage_perc: Option<f64>,
 }
 
+/// Chunked prefill can batch `running` above `max_num_seqs` across steps; cap is not the constraint.
+const CHUNKED_PREFILL_TOLERANCE: f64 = 0.5;
+
 pub fn rule5_concurrency_saturation(
     snapshot: &RawSnapshot,
     kv_cache_usage_perc: Option<f64>,
@@ -59,7 +63,7 @@ pub fn rule5_concurrency_saturation(
         .filter(|&n| n > 0)?;
     // Exact equality: scheduler cap is the bottleneck.
     // run > max_seqs means chunked prefill is batching across steps; cap is not the constraint.
-    if (run - f64::from(max_seqs)).abs() > 0.5 {
+    if (run - f64::from(max_seqs)).abs() > CHUNKED_PREFILL_TOLERANCE {
         return None;
     }
     let wait = snapshot
@@ -278,9 +282,10 @@ pub(super) fn format_concurrency_saturation_window_issue(
     kv_max_seqs: Option<u32>,
     snapshot: &RawSnapshot,
 ) -> Vec<String> {
-    let mut lines = format_concurrency_saturation_issue(d, max_model_len, kv_max_seqs, snapshot);
-    lines.insert(1, format!("  Seen in {seen_pct}% of windows"));
-    lines
+    super::with_seen_pct(
+        format_concurrency_saturation_issue(d, max_model_len, kv_max_seqs, snapshot),
+        seen_pct,
+    )
 }
 
 pub fn r5_recommendation(
@@ -293,7 +298,8 @@ pub fn r5_recommendation(
     let d = rule5_concurrency_saturation(snapshot, kv_cache_usage_perc, config_max_num_seqs)?;
     let prompt_tokens_mean = snapshot.vllm.prompt_tokens_mean;
     Some(Recommendation {
-        rule_name: "concurrency_saturation",
+        rule_name: rule_names::CONCURRENCY_SATURATION,
+        layer: 3,
         impact: 4,
         confidence: match (d.ttft_ms.or(d.ttft_p99_ms), d.kv_cache_usage_perc) {
             (Some(_), Some(_)) => 0.9,

@@ -218,7 +218,8 @@ mod tests {
                 cost,
             }),
             groups: Vec::new(),
-            r2_suppressed_by_r4: false,
+            suppressed_rules: Vec::new(),
+            kv_max_seqs: None,
         }
     }
 

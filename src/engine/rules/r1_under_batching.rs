@@ -1,6 +1,7 @@
 use crate::collectors::RawSnapshot;
 
 use super::Recommendation;
+use super::rule_names;
 
 /// Occupancy fraction below which the server is considered under-loaded.
 const UNDER_BATCHING_OCCUPANCY_PCT: f64 = 0.25;
@@ -145,7 +146,8 @@ pub fn r1_recommendation(
         return None;
     };
     Some(Recommendation {
-        rule_name: "under_batching",
+        rule_name: rule_names::UNDER_BATCHING,
+        layer: 4,
         impact: 4,
         confidence: 0.8,
         action: "Batch more requests or increase client concurrency".to_string(),
@@ -252,9 +254,10 @@ pub(super) fn format_under_batching_window_issue(
     snapshot: &RawSnapshot,
     confidence: f64,
 ) -> Vec<String> {
-    let mut lines = format_under_batching_fired(d, snapshot, confidence);
-    lines.insert(1, format!("  Seen in {seen_pct}% of windows"));
-    lines
+    super::with_seen_pct(
+        format_under_batching_fired(d, snapshot, confidence),
+        seen_pct,
+    )
 }
 
 pub(super) fn aggregate_r1_detail(details: &[UnderBatchingDetail]) -> UnderBatchingDetail {
@@ -535,7 +538,7 @@ mod tests {
     fn r1_recommendation_fires_without_baseline() {
         let s = entry_fired_snap();
         let r = r1_recommendation(&s, None, None).expect("fired");
-        assert_eq!(r.rule_name, "under_batching");
+        assert_eq!(r.rule_name, rule_names::UNDER_BATCHING);
         assert!((r.confidence - 0.8).abs() < 1e-9);
     }
 
