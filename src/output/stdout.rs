@@ -41,6 +41,10 @@ fn show_gpu_temp_peak_parenthetical(current_c: f64, peak_c: f64) -> bool {
 pub fn print_diagnose_table(result: &DiagnoseResult, verbose_rules: bool) {
     let lines = build_diagnose_lines(result, verbose_rules);
     print_boxed(&lines);
+    if let Some(j) = journey_line(result) {
+        println!();
+        println!("{j}");
+    }
 }
 
 fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<String> {
@@ -185,6 +189,23 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
     }
 
     lines
+}
+
+/// Journey line: printed below the box, not inside it.
+/// Returns None when no issues fired (clean run or not evaluable).
+fn journey_line(result: &DiagnoseResult) -> Option<String> {
+    if !result.any_evaluable {
+        return None;
+    }
+    let aggregate_win = crate::context::RuntimeWindow::from_snapshot(result.snapshot.clone());
+    let summary_input = AnalysisInput::new(&result.static_ctx, &aggregate_win);
+    let report = engine::build_report_for_diagnose(&result.windows, summary_input);
+    let group = report.groups.first()?;
+    let name = engine::rule_names::display_name(group.primary.rule_name);
+    Some(format!(
+        "▶  Bottleneck: {}. Apply given fixes. Profile re-measures after change.",
+        name,
+    ))
 }
 
 fn push_gpu_advisories(lines: &mut Vec<String>, snapshot: &RawSnapshot) {

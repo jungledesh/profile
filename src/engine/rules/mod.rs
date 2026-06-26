@@ -188,6 +188,20 @@ pub mod rule_names {
     pub const CONCURRENCY_SATURATION: &str = "concurrency_saturation";
     pub const LOW_PREFIX_REUSE: &str = "low_prefix_reuse";
     pub const MASSIVE_UNDERUTILIZATION: &str = "massive_underutilization";
+
+    /// Human-readable label for a rule name — used in journey UI output.
+    pub fn display_name(rule_name: &str) -> &str {
+        match rule_name {
+            UNDER_BATCHING => "Under-batching",
+            KV_CACHE_PRESSURE => "KV Cache Pressure",
+            KV_ADMISSION_BACKLOG => "KV Admission Backlog",
+            OOM_RISK => "OOM Risk",
+            CONCURRENCY_SATURATION => "Concurrency Saturation",
+            LOW_PREFIX_REUSE => "Low Prefix Reuse",
+            MASSIVE_UNDERUTILIZATION => "Massive Under-utilization",
+            _ => rule_name,
+        }
+    }
 }
 
 const SUPPRESSION_TABLE: &[(&str, &str)] = &[
