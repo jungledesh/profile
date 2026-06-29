@@ -200,7 +200,6 @@ fn prompt_u32_from_channel<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::gpu_assignment::tensor_parallel_prompt;
     use std::io::Cursor;
 
     fn run_max_num_seqs(input: &[u8], default: u32) -> anyhow::Result<u32> {
@@ -218,16 +217,8 @@ mod tests {
         prompt_u32_required(
             &mut Cursor::new(input),
             &mut out,
-            &tensor_parallel_prompt(host_gpus),
+            &format!("Enter value for `--tensor-parallel-size ({host_gpus} gpus detected)` : "),
         )
-    }
-
-    #[test]
-    fn tensor_parallel_prompt_format() {
-        assert_eq!(
-            tensor_parallel_prompt(8),
-            "--tensor-parallel-size (8 gpus detected): "
-        );
     }
 
     #[test]

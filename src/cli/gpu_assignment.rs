@@ -9,25 +9,12 @@ use crate::cli::diagnose::{TP_ABORT_HINT, prompt_u32_required};
 
 const VRAM_ACTIVE_THRESHOLD: f64 = 0.20;
 
-const DIM: &str = "\x1b[38;5;240m";
-const GREEN: &str = "\x1b[38;5;114m";
-const YELLOW: &str = "\x1b[38;5;178m";
-const RED: &str = "\x1b[38;5;203m";
-const BLUE: &str = "\x1b[38;5;110m";
-const RESET: &str = "\x1b[0m";
-
 /// Resolved tensor-parallel degree and the exact GPU indices to collect from.
 /// `indices` is always non-empty after resolution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GpuAssignment {
     pub tp: u32,
     pub indices: Vec<u32>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RowColorMode {
-    Step1,
-    Ambiguous,
 }
 
 struct GpuSnapshot {
@@ -38,45 +25,22 @@ struct GpuSnapshot {
     pids: Vec<u32>,
 }
 
-struct Term {
-    color: bool,
-}
+struct Term;
 
 impl Term {
     fn new() -> Self {
-        Self {
-            color: color_enabled(),
-        }
-    }
-
-    fn wrap(&self, color: &str, text: &str) -> String {
-        if self.color {
-            format!("{color}{text}{RESET}")
-        } else {
-            text.to_string()
-        }
+        Self
     }
 
     fn scan_header(&self, n: u32) -> String {
-        self.wrap(DIM, &format!("Scanning {n} GPUs via NVML..."))
+        format!("Scanning {n} GPUs via NVML...")
     }
 
-    fn format_gpu_row(&self, row: &GpuSnapshot, mode: RowColorMode, highlight: bool) -> String {
+    fn format_gpu_row(&self, row: &GpuSnapshot) -> String {
         let filled = ((row.vram_pct / 10.0).round() as usize).min(10);
         let empty = 10usize.saturating_sub(filled);
-        let bar_body = format!("{}{}", "█".repeat(filled), "░".repeat(empty));
-
-        let pct_color = if mode == RowColorMode::Step1 && highlight && row.vram_pct >= 70.0 {
-            GREEN
-        } else if row.vram_pct >= 70.0 {
-            YELLOW
-        } else {
-            DIM
-        };
-
-        let bar = self.wrap(pct_color, &bar_body);
-        let pct = self.wrap(pct_color, &format!("{:>3.0}% vRAM", row.vram_pct.round()));
-
+        let bar = format!("{}{}", "█".repeat(filled), "░".repeat(empty));
+        let pct = format!("{:>3.0}% vRAM", row.vram_pct.round());
         let status = if row.vram_pct >= VRAM_ACTIVE_THRESHOLD * 100.0 {
             if !row.pids.is_empty() {
                 let pids_str = row
@@ -86,95 +50,64 @@ impl Term {
                     .collect::<Vec<_>>()
                     .join(", ");
                 let prefix = if row.pids.len() > 1 { "pids" } else { "pid" };
-                if self.color {
-                    format!("{DIM}{prefix} {RESET}{BLUE}{pids_str}{RESET}")
-                } else {
-                    format!("{prefix} {pids_str}")
-                }
+                format!("{prefix} {pids_str}")
             } else {
-                self.wrap(DIM, "Active")
+                "active".to_string()
             }
         } else {
-            self.wrap(DIM, "Idle")
+            "idle".to_string()
         };
-
-        let name = short_gpu_name(&row.name);
-        if self.color {
-            format!(
-                "{DIM}  [{idx}] {name:<12}{RESET}  {bar}  {pct}  {status}",
-                idx = row.idx,
-                name = name,
-            )
-        } else {
-            format!(
-                "  [{idx}] {name:<12}  {bar}  {pct}  {status}",
-                idx = row.idx,
-                name = name,
-            )
-        }
+        format!(
+            "  [{}] {:<12}  {}  {}  {}",
+            row.idx,
+            short_gpu_name(&row.name),
+            bar,
+            pct,
+            status
+        )
     }
 
     fn step1_success(&self, indices: &[u32], tp: u32) -> String {
-        format!(
-            "{} Isolated workload on GPUs {indices:?}: TP = {tp} inferred",
-            self.wrap(GREEN, "✓")
-        )
+        let idxs = indices
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("✓ Isolated workload on GPUs [{idxs}]: TP = {tp} inferred")
     }
 
     #[cfg(target_os = "linux")]
     fn step2_progress(&self) -> String {
-        self.wrap(DIM, "vRAM Ambiguous, scanning GPU processes via ps...")
+        "Scanning GPU processes via ps...".to_string()
     }
 
     #[cfg(target_os = "linux")]
     fn step2_success(&self, indices: &[u32], tp: u32) -> String {
-        format!(
-            "{} GPUs {indices:?}: TP = {tp} inferred",
-            self.wrap(GREEN, "✓")
-        )
+        let idxs = indices
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("✓ GPUs [{idxs}]: TP = {tp} inferred")
     }
 
     fn step3_header(&self, pid_list: &str) -> String {
         if pid_list.is_empty() {
-            format!(
-                "{} ambiguous — PIDs not visible. Try: {}",
-                self.wrap(RED, "[!]"),
-                self.wrap(BLUE, "ps aux | grep vllm")
-            )
+            "[!] No GPU processes detected. Enter TP and GPU indices manually.".to_string()
         } else {
             format!(
-                "{} ambiguous — run {} to trace your instance.",
-                self.wrap(RED, "[!]"),
-                self.wrap(BLUE, &format!("ps -f -p {pid_list}"))
+                "[!] Cannot find vLLM GPUs. Run: ps -f -p {pid_list}, match vLLM PID to GPUs above."
             )
         }
     }
 
     fn prompt_tp(&self, host_gpus: u32) -> String {
-        self.wrap(BLUE, &tensor_parallel_prompt(host_gpus))
+        format!("Enter value for --tensor-parallel-size ({host_gpus} gpus detected): ")
     }
 
     fn prompt_indices(&self) -> String {
-        self.wrap(BLUE, "--gpu-indices (e.g. 0,1): ")
+        "Enter value for --gpu-indices (e.g. 0,1): ".to_string()
     }
-
-    fn step3_success(&self, indices: &[u32], tp: u32) -> String {
-        format!(
-            "{} locked to gpus {indices:?} — tp={tp}",
-            self.wrap(GREEN, "✓")
-        )
-    }
-}
-
-pub(crate) fn tensor_parallel_prompt(host_gpus: u32) -> String {
-    format!("--tensor-parallel-size ({host_gpus} gpus detected): ")
-}
-
-fn color_enabled() -> bool {
-    if std::env::var_os("NO_COLOR").is_some() {
-        return false;
-    }
-    io::stderr().is_terminal()
 }
 
 fn short_gpu_name(name: &str) -> String {
@@ -261,13 +194,8 @@ fn run_pipeline(
         model_weight_gb,
         &vram_total_gb,
     ) {
-        let active_set: HashSet<u32> = a.indices.iter().copied().collect();
-        for row in &snapshots {
-            let highlight = active_set.contains(&row.idx);
-            eprintln!(
-                "{}",
-                term.format_gpu_row(row, RowColorMode::Step1, highlight)
-            );
+        for row in snapshots {
+            eprintln!("{}", term.format_gpu_row(&row));
         }
         eprintln!();
         eprintln!("{}", term.step1_success(&a.indices, a.tp));
@@ -275,10 +203,7 @@ fn run_pipeline(
     }
 
     for row in &snapshots {
-        eprintln!(
-            "{}",
-            term.format_gpu_row(row, RowColorMode::Ambiguous, row.vram_pct >= 70.0)
-        );
+        eprintln!("{}", term.format_gpu_row(row));
     }
     eprintln!();
 
@@ -286,8 +211,6 @@ fn run_pipeline(
     if let Some(a) = ps_tiebreaker(&snapshots, known_tp, &term) {
         return Ok(a);
     }
-
-    eprintln!("\n[i] Auto-resolve failed. Enter GPU assignment manually:");
 
     interactive_gpu_prompt(host_count, known_tp, &snapshots, &term)
 }
@@ -530,7 +453,13 @@ fn interactive_gpu_prompt(
         host_count,
         term,
     )?;
-    eprintln!("{}", term.step3_success(&indices, tp));
+    let idxs = indices
+        .iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    eprintln!("Locked to GPUs [{idxs}] and TP={tp}.");
+    eprintln!();
     Ok(GpuAssignment { tp, indices })
 }
 
@@ -727,8 +656,8 @@ mod tests {
     }
 
     #[test]
-    fn plain_text_when_no_color() {
-        let term = Term { color: false };
+    fn gpu_row_formats_correctly() {
+        let term = Term::new();
         let row = GpuSnapshot {
             idx: 0,
             name: "NVIDIA A100".to_string(),
@@ -736,7 +665,7 @@ mod tests {
             vram_total_mb: 80 * 1024,
             pids: vec![40592],
         };
-        let line = term.format_gpu_row(&row, RowColorMode::Step1, true);
+        let line = term.format_gpu_row(&row);
         assert!(!line.contains('\x1b'));
         assert!(line.contains("[0]"));
         assert!(line.contains("92% vRAM"));

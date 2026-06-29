@@ -17,6 +17,8 @@ pub struct Report {
     /// Rules that fired but were removed by layer filtering or the suppression table.
     pub suppressed_rules: Vec<&'static str>,
     pub kv_max_seqs: Option<u32>,
+    pub n_eval: usize,
+    pub skipped: usize,
 }
 
 /// Single-window aggregate report, or multi-window significance report when `windows.len() > 1`.
@@ -45,6 +47,8 @@ pub(crate) fn build_report(input: AnalysisInput<'_>) -> Report {
             groups: Vec::new(),
             suppressed_rules: Vec::new(),
             kv_max_seqs: None,
+            n_eval: 0,
+            skipped: 1,
         };
     }
 
@@ -111,7 +115,7 @@ pub(crate) fn build_report(input: AnalysisInput<'_>) -> Report {
         recs.push(r);
     }
 
-    rules::finalize_report_groups(recs, baseline, kv_max_seqs)
+    rules::finalize_report_groups(recs, baseline, kv_max_seqs, 1, 0)
 }
 
 fn maybe_add_massive_underutilization(

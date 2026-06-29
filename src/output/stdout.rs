@@ -7,12 +7,12 @@ use crate::collectors::{
     GpuRawMetrics, RawSnapshot, VllmConfig, VllmRawMetrics, snapshot_uses_display_names,
     snapshot_uses_index_only,
 };
-use crate::context::AnalysisInput;
+use crate::context::{AnalysisInput, RuntimeWindow};
 use crate::engine;
 use crate::fmt::fmt_seconds_from_ms;
 use crate::profiler::DiagnoseResult;
 
-const VLLM_LABEL_W: usize = 10;
+const VLLM_LABEL_W: usize = 20;
 /// Width for GPU section labels: wide enough for `GPU [xxxxxxxx]` (14 chars) plus breathing room.
 const GPU_LABEL_W: usize = 20;
 const VLLM_LABEL_METRICS_GAP: &str = " ";
@@ -39,15 +39,24 @@ fn show_gpu_temp_peak_parenthetical(current_c: f64, peak_c: f64) -> bool {
 }
 
 pub fn print_diagnose_table(result: &DiagnoseResult, verbose_rules: bool) {
-    let lines = build_diagnose_lines(result, verbose_rules);
+    let aggregate_win = RuntimeWindow::from_snapshot(result.snapshot.clone());
+    let summary_input = AnalysisInput::new(&result.static_ctx, &aggregate_win);
+    let report = engine::build_report_for_diagnose(&result.windows, summary_input);
+
+    let lines = build_diagnose_lines(result, &aggregate_win, &report, verbose_rules);
     print_boxed(&lines);
-    if let Some(j) = journey_line(result) {
+    if let Some(j) = journey_line(&report) {
         println!();
         println!("{j}");
     }
 }
 
-fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<String> {
+fn build_diagnose_lines(
+    result: &DiagnoseResult,
+    aggregate_win: &RuntimeWindow,
+    report: &engine::Report,
+    verbose_rules: bool,
+) -> Vec<String> {
     let snapshot = &result.snapshot;
     let v = &snapshot.vllm;
     let n_gpus = snapshot.gpus.len();
@@ -82,12 +91,8 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
 
     push_gpu_advisories(&mut lines, snapshot);
 
-    // Build AnalysisInput from the aggregate snapshot for baseline + single-window rule evaluation.
-    let aggregate_win = crate::context::RuntimeWindow::from_snapshot(result.snapshot.clone());
-    let summary_input = AnalysisInput::new(&result.static_ctx, &aggregate_win);
     let aggregated_prefix_hit_rate =
         engine::aggregate_prefix_hit_rate_for_diagnose(&result.windows);
-    let report = engine::build_report_for_diagnose(&result.windows, summary_input);
     if verbose_rules {
         lines.push(String::new());
         lines.extend(baseline_lines(
@@ -145,7 +150,7 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
         }
     }
     lines.push(String::new());
-    lines.push(vllm_label_row("vLLM:", ""));
+    lines.push(vllm_label_row("vLLM =>", ""));
     lines.push(vllm_label_row(
         "REQUESTS",
         &vllm_requests_value(v, result.static_ctx.config.max_num_seqs),
@@ -171,12 +176,14 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
         lines.push(vllm_label_row("KV", &config_kv_value(cfg)));
     }
 
+    let summary_input = AnalysisInput::new(&result.static_ctx, aggregate_win);
     let rule_lines = if result.windows.len() <= 1 {
-        engine::format_diagnose_rules(summary_input, verbose_rules, &result.metrics_input)
+        engine::format_diagnose_rules(summary_input, report, verbose_rules, &result.metrics_input)
     } else {
         engine::format_diagnose_rules_for_windows(
             &result.windows,
             summary_input,
+            report,
             verbose_rules,
             &result.metrics_input,
         )
@@ -193,18 +200,11 @@ fn build_diagnose_lines(result: &DiagnoseResult, verbose_rules: bool) -> Vec<Str
 
 /// Journey line: printed below the box, not inside it.
 /// Returns None when no issues fired (clean run or not evaluable).
-fn journey_line(result: &DiagnoseResult) -> Option<String> {
-    if !result.any_evaluable {
-        return None;
-    }
-    let aggregate_win = crate::context::RuntimeWindow::from_snapshot(result.snapshot.clone());
-    let summary_input = AnalysisInput::new(&result.static_ctx, &aggregate_win);
-    let report = engine::build_report_for_diagnose(&result.windows, summary_input);
+fn journey_line(report: &engine::Report) -> Option<String> {
     let group = report.groups.first()?;
     let name = engine::rule_names::display_name(group.primary.rule_name);
     Some(format!(
-        "▶  Bottleneck: {}. Apply given fixes. Profile re-measures after change.",
-        name,
+        "▶  Bottleneck: {name}. Apply the fix above. Profile re-measures after your change.",
     ))
 }
 
@@ -738,9 +738,16 @@ fn config_kv_value(cfg: &VllmConfig) -> String {
 mod tests {
     use super::*;
     use crate::collectors::{GpuRawMetrics, RawSnapshot, VllmConfig, VllmRawMetrics};
-    use crate::context::{RuntimeWindow, StaticContext};
+    use crate::context::{AnalysisInput, RuntimeWindow, StaticContext};
     use crate::profiler::DiagnoseResult;
     use std::time::{Duration, UNIX_EPOCH};
+
+    fn diagnose_lines_for(result: &DiagnoseResult, verbose_rules: bool) -> Vec<String> {
+        let aggregate_win = RuntimeWindow::from_snapshot(result.snapshot.clone());
+        let summary_input = AnalysisInput::new(&result.static_ctx, &aggregate_win);
+        let report = engine::build_report_for_diagnose(&result.windows, summary_input);
+        build_diagnose_lines(result, &aggregate_win, &report, verbose_rules)
+    }
 
     #[test]
     fn format_profile_timestamp_unix_epoch_utc() {
@@ -1340,7 +1347,7 @@ mod tests {
             any_evaluable: true,
             metrics_input: "http://127.0.0.1:8000/metrics".to_string(),
         };
-        let text = build_diagnose_lines(&result, false).join("\n");
+        let text = diagnose_lines_for(&result, false).join("\n");
         assert!(text.contains("pfix_cache 27.6%"));
         assert!(text.contains("Prefix hit rate 27.6%"));
     }
@@ -1373,7 +1380,7 @@ mod tests {
             any_evaluable: false,
             metrics_input: "http://127.0.0.1:8000/metrics".into(),
         };
-        let lines = build_diagnose_lines(&result, false);
+        let lines = diagnose_lines_for(&result, false);
         let text = lines.join("\n");
         assert!(text.contains("Target:") && text.contains("127.0.0.1"));
         assert!(text.contains("No qualifying load"));
@@ -1441,7 +1448,7 @@ mod tests {
             any_evaluable: true,
             metrics_input: "http://127.0.0.1:8000/metrics".into(),
         };
-        let text = build_diagnose_lines(&result, false).join("\n");
+        let text = diagnose_lines_for(&result, false).join("\n");
         assert!(text.contains(" x2"));
         assert!(text.contains("GPU [0]"));
         assert!(text.contains("GPU [1]"));

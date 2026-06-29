@@ -144,6 +144,8 @@ mod tests {
             groups: Vec::new(),
             suppressed_rules: Vec::new(),
             kv_max_seqs: None,
+            n_eval: 0,
+            skipped: 0,
         }
     }
 
@@ -191,6 +193,8 @@ mod tests {
             groups: vec![group("under_batching")],
             suppressed_rules: Vec::new(),
             kv_max_seqs: None,
+            n_eval: 1,
+            skipped: 0,
         };
         let mut s = LoopState::new(r, rep);
         s.record_recommendation("under_batching");
@@ -207,6 +211,8 @@ mod tests {
             groups: vec![group("a")],
             suppressed_rules: Vec::new(),
             kv_max_seqs: None,
+            n_eval: 1,
+            skipped: 0,
         };
         let mut s = LoopState::new(r, rep);
         s.record_recommendation("under_batching");
