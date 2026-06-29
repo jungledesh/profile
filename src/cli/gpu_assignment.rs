@@ -73,7 +73,7 @@ impl Term {
             .map(|i| i.to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        format!("✓ Isolated workload on GPUs [{idxs}]: TP = {tp} inferred")
+        format!("Detected vLLM on GPUs [{idxs}]: TP = {tp} inferred")
     }
 
     #[cfg(target_os = "linux")]
@@ -88,7 +88,7 @@ impl Term {
             .map(|i| i.to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        format!("✓ GPUs [{idxs}]: TP = {tp} inferred")
+        format!("Detected vLLM on GPUs [{idxs}]: TP = {tp} inferred")
     }
 
     fn step3_header(&self, pid_list: &str) -> String {
@@ -199,6 +199,7 @@ fn run_pipeline(
         }
         eprintln!();
         eprintln!("{}", term.step1_success(&a.indices, a.tp));
+        eprintln!();
         return Ok(a);
     }
 
@@ -406,6 +407,7 @@ fn ps_tiebreaker(
     }
 
     eprintln!("{}", term.step2_success(&indices, tp));
+    eprintln!();
     Some(GpuAssignment { tp, indices })
 }
 
@@ -458,7 +460,7 @@ fn interactive_gpu_prompt(
         .map(|i| i.to_string())
         .collect::<Vec<_>>()
         .join(", ");
-    eprintln!("Locked to GPUs [{idxs}] and TP={tp}.");
+    eprintln!("Locked to GPUs [{idxs}]: TP = {tp}");
     eprintln!();
     Ok(GpuAssignment { tp, indices })
 }
