@@ -188,6 +188,20 @@ pub mod rule_names {
     pub const CONCURRENCY_SATURATION: &str = "concurrency_saturation";
     pub const LOW_PREFIX_REUSE: &str = "low_prefix_reuse";
     pub const MASSIVE_UNDERUTILIZATION: &str = "massive_underutilization";
+
+    /// Human-readable label for a rule name — used in journey UI output.
+    pub fn display_name(rule_name: &str) -> &str {
+        match rule_name {
+            UNDER_BATCHING => "Under-batching",
+            KV_CACHE_PRESSURE => "KV Cache Pressure",
+            KV_ADMISSION_BACKLOG => "KV Admission Backlog",
+            OOM_RISK => "OOM Risk",
+            CONCURRENCY_SATURATION => "Concurrency Saturation",
+            LOW_PREFIX_REUSE => "Low Prefix Reuse",
+            MASSIVE_UNDERUTILIZATION => "Massive Under-utilization",
+            _ => rule_name,
+        }
+    }
 }
 
 const SUPPRESSION_TABLE: &[(&str, &str)] = &[
@@ -454,6 +468,7 @@ fn not_triggered_from_fired_names(
 
 pub fn format_diagnose_rules(
     input: AnalysisInput<'_>,
+    report: &super::Report,
     verbose_rules: bool,
     metrics_url: &str,
 ) -> Vec<String> {
@@ -462,8 +477,6 @@ pub fn format_diagnose_rules(
         return no_evaluable_diagnose_lines(verbose_rules, std::slice::from_ref(input.window));
     }
 
-    let report = super::build_report(input);
-    let kv_max_seqs = report.kv_max_seqs;
     let any_issue = !report.groups.is_empty();
     let baseline_ref = report.baseline.as_ref();
     let tps = snapshot.vllm.generation_tokens_per_sec;
@@ -517,7 +530,7 @@ pub fn format_diagnose_rules(
     if !any_issue && !any_advisory && !verbose_rules {
         out.push(NO_ISSUES_LINE.to_string());
     }
-    if let Some(line) = kv_ceiling_unknown_verbose_line(kv_max_seqs, verbose_rules) {
+    if let Some(line) = kv_ceiling_unknown_verbose_line(report.kv_max_seqs, verbose_rules) {
         append_display_block(&mut out, vec![line]);
     }
 
@@ -526,7 +539,6 @@ pub fn format_diagnose_rules(
 }
 
 struct WindowRuleEval {
-    total: usize,
     skipped: usize,
     n_eval: usize,
     r1_fired: usize,
@@ -543,10 +555,6 @@ struct WindowRuleEval {
 }
 
 impl WindowRuleEval {
-    fn no_fires(&self) -> bool {
-        self.r1_fired + self.r2_fired + self.r2_backlog_fired + self.r3_fired + self.r5_fired == 0
-    }
-
     fn r1_significant(&self) -> bool {
         rule_is_significant(self.r1_fired, self.n_eval)
     }
@@ -605,10 +613,8 @@ fn eval_window_rules(
         return None;
     }
 
-    let total = windows.len();
     let mut skipped = 0usize;
     let mut eval = WindowRuleEval {
-        total,
         skipped: 0,
         n_eval: 0,
         r1_fired: 0,
@@ -707,6 +713,8 @@ fn build_report_from_eval(
             groups: Vec::new(),
             suppressed_rules: Vec::new(),
             kv_max_seqs,
+            n_eval: 0,
+            skipped: 0,
         };
     }
 
@@ -884,13 +892,15 @@ fn build_report_from_eval(
         recs.push(r4);
     }
 
-    finalize_report_groups(recs, baseline, kv_max_seqs)
+    finalize_report_groups(recs, baseline, kv_max_seqs, eval.n_eval, eval.skipped)
 }
 
 pub(crate) fn finalize_report_groups(
     recs: Vec<Recommendation>,
     baseline: Option<baseline::PhysicsBaseline>,
     kv_max_seqs: Option<u32>,
+    n_eval: usize,
+    skipped: usize,
 ) -> super::Report {
     let mut suppressed_rules = Vec::new();
     let Some(min_layer) = recs.iter().map(|r| r.layer).min() else {
@@ -899,6 +909,8 @@ pub(crate) fn finalize_report_groups(
             groups: Vec::new(),
             suppressed_rules,
             kv_max_seqs,
+            n_eval,
+            skipped,
         };
     };
 
@@ -947,6 +959,8 @@ pub(crate) fn finalize_report_groups(
         groups,
         suppressed_rules,
         kv_max_seqs,
+        n_eval,
+        skipped,
     }
 }
 
@@ -963,6 +977,8 @@ pub fn build_report_for_windows(
             groups: Vec::new(),
             suppressed_rules: Vec::new(),
             kv_max_seqs: None,
+            n_eval: 0,
+            skipped: windows.len(),
         };
     };
     let session_hit_rate = aggregate_prefix_hit_rate_for_windows(windows);
@@ -972,21 +988,15 @@ pub fn build_report_for_windows(
 pub fn format_diagnose_rules_for_windows(
     windows: &[RuntimeWindow],
     summary: AnalysisInput<'_>,
+    report: &super::Report,
     verbose_rules: bool,
     metrics_url: &str,
 ) -> Vec<String> {
-    let mut summary_baseline = baseline::compute(&summary);
-    let summary_efficiency_pct = summary_baseline.as_ref().and_then(|b| b.efficiency_pct);
-    let Some(eval) = eval_window_rules(windows, &summary, summary_efficiency_pct) else {
-        return no_evaluable_diagnose_lines(verbose_rules, &[]);
-    };
-    let session_hit_rate = aggregate_prefix_hit_rate_for_windows(windows);
-
-    if eval.n_eval == 0 {
+    if report.n_eval == 0 {
         return no_evaluable_diagnose_lines(verbose_rules, windows);
     }
 
-    if eval.n_eval < ENGINE_MIN_PERSISTENT_WINDOWS {
+    if report.n_eval < ENGINE_MIN_PERSISTENT_WINDOWS {
         let mut out = vec![
             "[!] Insufficient Sustained Load".to_string(),
             String::new(),
@@ -994,9 +1004,9 @@ pub fn format_diagnose_rules_for_windows(
                 "  Traffic detected but too brief for reliable diagnosis. \
                  Required: {} evaluable windows. Captured: {}{}.",
                 ENGINE_MIN_PERSISTENT_WINDOWS,
-                eval.n_eval,
-                if eval.skipped > 0 {
-                    format!(" ({} windows dropped)", eval.skipped)
+                report.n_eval,
+                if report.skipped > 0 {
+                    format!(" ({} windows dropped)", report.skipped)
                 } else {
                     String::new()
                 }
@@ -1009,28 +1019,22 @@ pub fn format_diagnose_rules_for_windows(
         return out;
     }
 
-    let report = build_report_from_eval(&eval, summary, session_hit_rate, summary_baseline);
-    let groups = report.groups;
-    let suppressed_rules = report.suppressed_rules;
-    let kv_max_seqs = report.kv_max_seqs;
-    summary_baseline = report.baseline;
-
-    let total = eval.total;
-    let skipped = eval.skipped;
+    let total = report.n_eval + report.skipped;
+    let skipped = report.skipped;
 
     let summary_snap = &summary.window.snapshot;
-    let baseline_ref = summary_baseline.as_ref();
+    let baseline_ref = report.baseline.as_ref();
     let tps = summary_snap.vllm.generation_tokens_per_sec;
 
-    if eval.no_fires() {
+    if report.groups.is_empty() {
         let mut out = Vec::new();
         let advisories = collect_advisories(
             &std::collections::HashSet::new(),
             summary_snap,
             metrics_url,
-            summary_baseline.as_ref().and_then(|b| b.kv_headroom_gb),
+            report.baseline.as_ref().and_then(|b| b.kv_headroom_gb),
             summary.ctx.gpu.vram_gb,
-            summary_baseline.as_ref().map(|b| b.weight_gb),
+            report.baseline.as_ref().map(|b| b.weight_gb),
         );
         let any_advisory = advisories.any();
         append_display_block(&mut out, advisories.lines);
@@ -1048,7 +1052,7 @@ pub fn format_diagnose_rules_for_windows(
                 Some((
                     summary_snap,
                     summary.ctx.config.max_num_seqs,
-                    summary_baseline.as_ref().and_then(|b| b.efficiency_pct),
+                    report.baseline.as_ref().and_then(|b| b.efficiency_pct),
                 )),
             );
         }
@@ -1064,7 +1068,8 @@ pub fn format_diagnose_rules_for_windows(
         return out;
     }
 
-    let fired_names: std::collections::HashSet<&'static str> = groups
+    let fired_names: std::collections::HashSet<&'static str> = report
+        .groups
         .iter()
         .flat_map(|g| {
             std::iter::once(g.primary.rule_name).chain(g.secondary.iter().map(|r| r.rule_name))
@@ -1072,7 +1077,7 @@ pub fn format_diagnose_rules_for_windows(
         .collect();
 
     let mut warnings: Vec<String> = Vec::new();
-    for g in &groups {
+    for g in &report.groups {
         if !warnings.is_empty() && !warnings.last().is_some_and(|l| l.is_empty()) {
             warnings.push(String::new());
         }
@@ -1080,31 +1085,31 @@ pub fn format_diagnose_rules_for_windows(
         warnings.push(String::new());
     }
 
-    append_waste_line(&mut warnings, &groups, baseline_ref, tps);
+    append_waste_line(&mut warnings, &report.groups, baseline_ref, tps);
 
     let advisories = collect_advisories(
         &fired_names,
         summary_snap,
         metrics_url,
-        summary_baseline.as_ref().and_then(|b| b.kv_headroom_gb),
+        report.baseline.as_ref().and_then(|b| b.kv_headroom_gb),
         summary.ctx.gpu.vram_gb,
-        summary_baseline.as_ref().map(|b| b.weight_gb),
+        report.baseline.as_ref().map(|b| b.weight_gb),
     );
     let any_advisory = advisories.any();
     let mut out = warnings;
     append_display_block(&mut out, advisories.lines);
 
-    if let Some(line) = kv_ceiling_unknown_verbose_line(kv_max_seqs, verbose_rules) {
+    if let Some(line) = kv_ceiling_unknown_verbose_line(report.kv_max_seqs, verbose_rules) {
         append_display_block(&mut out, vec![line]);
     }
 
     let not_fired = not_triggered_from_fired_names(
         &fired_names,
-        &suppressed_rules,
+        &report.suppressed_rules,
         advisories.r2_present,
         advisories.r4_present,
     );
-    let any_warning = !groups.is_empty();
+    let any_warning = !report.groups.is_empty();
     if verbose_rules {
         append_not_triggered_lines(
             &mut out,
@@ -1113,7 +1118,7 @@ pub fn format_diagnose_rules_for_windows(
             Some((
                 summary_snap,
                 summary.ctx.config.max_num_seqs,
-                summary_baseline.as_ref().and_then(|b| b.efficiency_pct),
+                report.baseline.as_ref().and_then(|b| b.efficiency_pct),
             )),
         );
     }
@@ -1161,6 +1166,25 @@ fn trim_trailing_blank_lines(lines: &mut Vec<String>) {
 
 #[cfg(test)]
 mod tests {
+    fn format_diagnose_rules_test(
+        input: AnalysisInput<'_>,
+        verbose: bool,
+        metrics_url: &str,
+    ) -> Vec<String> {
+        let report = super::super::build_report(input);
+        super::format_diagnose_rules(input, &report, verbose, metrics_url)
+    }
+
+    fn format_diagnose_rules_for_windows_test(
+        windows: &[RuntimeWindow],
+        summary: AnalysisInput<'_>,
+        verbose: bool,
+        metrics_url: &str,
+    ) -> Vec<String> {
+        let report = super::super::build_report_for_windows(windows, summary);
+        super::format_diagnose_rules_for_windows(windows, summary, &report, verbose, metrics_url)
+    }
+
     use super::*;
     use crate::collectors::{GpuRawMetrics, RawSnapshot, VllmConfig, VllmRawMetrics};
     use crate::context::{AnalysisInput, RuntimeWindow, StaticContext};
@@ -1393,7 +1417,8 @@ mod tests {
         };
         let ctx = StaticContext::from_snapshot(&s, cfg);
         let win = mk_win(s);
-        let lines = format_diagnose_rules(ai(&ctx, &win), false, "http://127.0.0.1:8000/metrics");
+        let lines =
+            format_diagnose_rules_test(ai(&ctx, &win), false, "http://127.0.0.1:8000/metrics");
         let text = lines.join("\n");
         assert!(text.contains("[!] Under-batching: Insufficient Concurrency"));
         assert!(text.contains("Occupancy"));
@@ -1423,7 +1448,7 @@ mod tests {
         }
         let summary_win = windows.last().expect("windows");
         let summary = ai(&ctx, summary_win);
-        let report = build_report_for_windows(&windows, summary);
+        let report = super::build_report_for_windows(&windows, summary);
         assert_eq!(report.groups[0].primary.rule_name, rule_names::OOM_RISK);
         assert!(
             !report
@@ -1450,7 +1475,8 @@ mod tests {
                 .any(|g| g.primary.rule_name == rule_names::KV_CACHE_PRESSURE)
         );
         let text =
-            format_diagnose_rules(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics").join("\n");
+            format_diagnose_rules_test(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics")
+                .join("\n");
         assert!(!text.contains("KV cache pressure: not triggered"));
     }
 
@@ -1483,7 +1509,8 @@ mod tests {
         let ctx = mk_ctx();
         let win = mk_win(s);
         let text =
-            format_diagnose_rules(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics").join("\n");
+            format_diagnose_rules_test(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics")
+                .join("\n");
         assert!(text.contains("Under-batching: not triggered (prefill saturated at 80%)"));
     }
 
@@ -1498,7 +1525,8 @@ mod tests {
         let ctx = mk_ctx();
         let win = mk_win(s);
         let text =
-            format_diagnose_rules(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics").join("\n");
+            format_diagnose_rules_test(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics")
+                .join("\n");
         assert!(text.contains("Under-batching: not triggered"));
         assert!(text.contains("KV cache pressure: not triggered"));
         assert!(text.contains("Low prefix reuse: not triggered"));
@@ -1557,7 +1585,12 @@ mod tests {
     fn r2_issue_lines(windows: Vec<RuntimeWindow>) -> Vec<String> {
         let ctx = mk_ctx();
         let summary = ai(&ctx, windows.last().expect("windows"));
-        format_diagnose_rules_for_windows(&windows, summary, false, "http://127.0.0.1:8000/metrics")
+        format_diagnose_rules_for_windows_test(
+            &windows,
+            summary,
+            false,
+            "http://127.0.0.1:8000/metrics",
+        )
     }
 
     #[test]
@@ -1628,7 +1661,8 @@ mod tests {
         let ctx = mk_ctx();
         let win = mk_win(s);
         let text =
-            format_diagnose_rules(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics").join("\n");
+            format_diagnose_rules_test(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics")
+                .join("\n");
         assert!(text.contains("Under-batching: not triggered"));
         assert!(text.contains("KV cache pressure: not triggered"));
         assert!(text.contains("Low prefix reuse: not triggered"));
@@ -1655,7 +1689,7 @@ mod tests {
             .display_lines
             .join("\n");
         assert!(!r2_text.contains("Confidence:"));
-        let text = format_diagnose_rules(
+        let text = format_diagnose_rules_test(
             ai(&ctx2, &win_kv_only),
             false,
             "http://127.0.0.1:8000/metrics",
@@ -1678,7 +1712,8 @@ mod tests {
         let ctx = mk_ctx();
         let win = mk_win(s);
         let text =
-            format_diagnose_rules(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics").join("\n");
+            format_diagnose_rules_test(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics")
+                .join("\n");
         assert!(text.contains("Under-batching: not triggered"));
         assert!(text.contains("[i] KV Cache Pressure: core metric unavailable"));
         assert!(!text.contains("KV cache pressure: not triggered"));
@@ -1753,7 +1788,8 @@ mod tests {
         let ctx = mk_ctx();
         let win = mk_win(s);
         let text =
-            format_diagnose_rules(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics").join("\n");
+            format_diagnose_rules_test(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics")
+                .join("\n");
         assert!(text.contains("Low prefix reuse: not triggered"));
     }
 
@@ -1767,7 +1803,8 @@ mod tests {
         let ctx = mk_ctx();
         let win = mk_win(s);
         let text =
-            format_diagnose_rules(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics").join("\n");
+            format_diagnose_rules_test(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics")
+                .join("\n");
         assert!(text.contains("Low prefix reuse: not triggered"));
         assert!(!text.contains("working effectively"));
     }
@@ -1790,7 +1827,8 @@ mod tests {
         };
         let ctx = StaticContext::from_snapshot(&s, cfg);
         let win = mk_win(s);
-        let lines = format_diagnose_rules(ai(&ctx, &win), false, "http://127.0.0.1:8000/metrics");
+        let lines =
+            format_diagnose_rules_test(ai(&ctx, &win), false, "http://127.0.0.1:8000/metrics");
         assert_eq!(
             lines,
             vec!["No issues detected in this snapshot.".to_string()]
@@ -1818,7 +1856,8 @@ mod tests {
             let win = mk_win(snap);
             (ctx, win)
         };
-        let lines = format_diagnose_rules(ai(&ctx, &win), false, "http://127.0.0.1:8000/metrics");
+        let lines =
+            format_diagnose_rules_test(ai(&ctx, &win), false, "http://127.0.0.1:8000/metrics");
         let idx_kv = lines
             .iter()
             .position(|l| l.contains("[!] KV Cache Pressure"))
@@ -1977,7 +2016,7 @@ mod tests {
             .find(|g| g.primary.rule_name == rule_names::KV_CACHE_PRESSURE)
             .expect("r2 group");
         assert!((r2.primary.confidence - (4.0 / 15.0)).abs() < 1e-9);
-        let text = format_diagnose_rules_for_windows(
+        let text = format_diagnose_rules_for_windows_test(
             &windows,
             summary,
             false,
@@ -2006,7 +2045,7 @@ mod tests {
         summary_win.snapshot.vllm.kv_cache_usage_perc = Some(92.0);
         summary_win.snapshot.vllm.kv_cache_peak_perc = Some(95.0);
         let summary = ai(&ctx, &summary_win);
-        let text = format_diagnose_rules_for_windows(
+        let text = format_diagnose_rules_for_windows_test(
             &windows,
             summary,
             false,
@@ -2037,7 +2076,7 @@ mod tests {
         summary_win.snapshot.vllm.num_preemptions_per_sec = Some(0.05);
         summary_win.snapshot.vllm.num_requests_waiting = Some(5.0);
         let summary = ai(&ctx, &summary_win);
-        let text = format_diagnose_rules_for_windows(
+        let text = format_diagnose_rules_for_windows_test(
             &windows,
             summary,
             false,
@@ -2167,7 +2206,7 @@ mod tests {
         }
         let ctx = StaticContext::from_snapshot(&windows[0].snapshot, cfg);
         let summary = ai(&ctx, windows.last().expect("summary source"));
-        let lines = format_diagnose_rules_for_windows(
+        let lines = format_diagnose_rules_for_windows_test(
             &windows,
             summary,
             false,
@@ -2195,7 +2234,7 @@ mod tests {
         ];
         let ctx = mk_ctx();
         let summary = ai(&ctx, windows.last().expect("windows"));
-        let text = format_diagnose_rules_for_windows(
+        let text = format_diagnose_rules_for_windows_test(
             &windows,
             summary,
             false,
@@ -2231,7 +2270,7 @@ mod tests {
         let win = mk_win(snap);
         let windows = vec![win.clone(), win.clone(), win];
         let summary = ai(&ctx, windows.last().expect("windows"));
-        let lines = format_diagnose_rules_for_windows(
+        let lines = format_diagnose_rules_for_windows_test(
             &windows,
             summary,
             false,
@@ -2251,12 +2290,14 @@ mod tests {
         let s = snap(t, t, v, gpu_busy());
         let ctx = mk_ctx();
         let win = mk_win(s);
-        let lines = format_diagnose_rules(ai(&ctx, &win), false, "http://127.0.0.1:8000/metrics");
+        let lines =
+            format_diagnose_rules_test(ai(&ctx, &win), false, "http://127.0.0.1:8000/metrics");
         assert_eq!(
             lines,
             no_evaluable_diagnose_lines(false, std::slice::from_ref(&win))
         );
-        let vlines = format_diagnose_rules(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics");
+        let vlines =
+            format_diagnose_rules_test(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics");
         assert!(
             vlines
                 .iter()
@@ -2288,7 +2329,7 @@ mod tests {
         }
         let ctx = mk_ctx();
         let summary = ai(&ctx, windows.last().expect("windows"));
-        let text = format_diagnose_rules_for_windows(
+        let text = format_diagnose_rules_for_windows_test(
             &windows,
             summary,
             false,
@@ -2386,7 +2427,7 @@ mod tests {
 
         let ctx = mk_ctx();
         let summary = ai(&ctx, windows.last().expect("windows"));
-        let text = format_diagnose_rules_for_windows(
+        let text = format_diagnose_rules_for_windows_test(
             &windows,
             summary,
             false,
@@ -2455,7 +2496,7 @@ mod tests {
         let w2 = mk_win(snap(t, t, v, gpu_busy()));
         let windows = vec![w1, w2];
         let summary = ai(&ctx, &windows[0]);
-        let lines = format_diagnose_rules_for_windows(
+        let lines = format_diagnose_rules_for_windows_test(
             &windows,
             summary,
             false,
@@ -2463,7 +2504,7 @@ mod tests {
         );
         assert_eq!(lines, no_evaluable_diagnose_lines(false, &windows));
         let summary2 = ai(&ctx, &windows[0]);
-        let vlines = format_diagnose_rules_for_windows(
+        let vlines = format_diagnose_rules_for_windows_test(
             &windows,
             summary2,
             true,

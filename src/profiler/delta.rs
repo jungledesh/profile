@@ -220,6 +220,8 @@ mod tests {
             groups: Vec::new(),
             suppressed_rules: Vec::new(),
             kv_max_seqs: None,
+            n_eval: 0,
+            skipped: 0,
         }
     }
 
