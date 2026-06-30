@@ -134,7 +134,7 @@ fn build_diagnose_lines(
             "{:<width$}{}{}",
             "",
             VLLM_LABEL_METRICS_GAP,
-            gpu_detail_line(g, verbose_rules),
+            gpu_detail_line(g, verbose_rules, false),
             width = GPU_LABEL_W
         ));
     } else {
@@ -144,7 +144,7 @@ fn build_diagnose_lines(
                 "{:<width$}{}{}",
                 format!("GPU [{}]", gpu.display_id()),
                 VLLM_LABEL_METRICS_GAP,
-                gpu_detail_line(gpu, verbose_rules),
+                gpu_detail_line(gpu, verbose_rules, true),
                 width = GPU_LABEL_W
             ));
         }
@@ -482,14 +482,14 @@ fn format_efficiency_label(
     decode_ceiling: Option<f64>,
 ) -> String {
     if let Some(e) = efficiency_pct.filter(|e| e.is_finite()) {
-        return format!("efficiency {:.1}%", e);
+        return format!("decode_eff {:.1}%", e);
     }
     let actual = actual_tps.filter(|t| t.is_finite() && *t > 0.0);
     let ceiling = decode_ceiling.filter(|c| c.is_finite() && *c > 0.0);
     if actual.is_some() && ceiling.is_some() {
-        "efficiency ?".to_string()
+        "decode_eff ?".to_string()
     } else {
-        "efficiency -".to_string()
+        "decode_eff -".to_string()
     }
 }
 
@@ -610,15 +610,27 @@ fn cache_use_fragment(prefix_hit_rate: Option<f64>) -> String {
     }
 }
 
-// gpu_util_pct is intentionally not rendered - see note above gpu_gauges_line.
-fn gpu_detail_line(g: &GpuRawMetrics, verbose: bool) -> String {
+fn gpu_detail_line(g: &GpuRawMetrics, verbose: bool, is_multi_gpu: bool) -> String {
+    let mut base = String::new();
+
+    if is_multi_gpu {
+        let vram = format_vram(g);
+        let power = g
+            .power_watts
+            .map(|w| format!("power {:.0}W", w))
+            .unwrap_or_else(|| "power -".to_string());
+        base.push_str(&format!("{vram} | {power} | "));
+    }
+
     let mem_util = g
         .mem_util_pct
         .map(|u| format!("mem_util {:.0}%", u))
         .unwrap_or_else(|| "mem_util -".to_string());
 
+    base.push_str(&mem_util);
+
     if !verbose {
-        return mem_util;
+        return base;
     }
 
     let temp = match g.temperature_c.filter(|t| t.is_finite()) {
@@ -641,7 +653,8 @@ fn gpu_detail_line(g: &GpuRawMetrics, verbose: bool) -> String {
         .power_limit_watts
         .map(|l| format!("limit {:.0}W", l))
         .unwrap_or_else(|| "limit -".to_string());
-    format!("{mem_util} | {temp} | {sm} | {limit}")
+
+    format!("{base} | {temp} | {sm} | {limit}")
 }
 
 fn vllm_memory_value(v: &VllmRawMetrics) -> String {
@@ -1067,7 +1080,7 @@ mod tests {
             Some(0.31),
         );
         let s = gpu_gauges_line(&g, Some(&b), Some(5978.2), false);
-        assert!(s.contains("efficiency 31.7%"));
+        assert!(s.contains("decode_eff 31.7%"));
         assert!(s.contains("power 421W"));
         assert!(s.contains("0.31 J/tok"));
         assert!(!s.contains("tok/W"));
@@ -1116,7 +1129,7 @@ mod tests {
             ..Default::default()
         };
         let s = gpu_gauges_line(&g, Some(&baseline_efficiency(28.0)), None, false);
-        assert!(s.contains("efficiency 28.0%"));
+        assert!(s.contains("decode_eff 28.0%"));
         assert!(s.contains("power 310W"));
         assert!(s.contains("vRAM 72/80GB"));
         let g_peak = GpuRawMetrics {
@@ -1156,7 +1169,7 @@ mod tests {
         let mut b = baseline_efficiency(50.0);
         b.efficiency_pct = None;
         let s = gpu_gauges_line(&g, Some(&b), Some(200.0), false);
-        assert!(s.contains("efficiency ?"));
+        assert!(s.contains("decode_eff ?"));
     }
 
     #[test]
@@ -1169,7 +1182,7 @@ mod tests {
             power_limit_watts: Some(700.0),
             ..Default::default()
         };
-        let line = gpu_detail_line(&g, true);
+        let line = gpu_detail_line(&g, true, false);
         assert!(line.contains("temp 72°C (peak 86°C)"));
     }
 
@@ -1181,14 +1194,57 @@ mod tests {
             temperature_peak_c: Some(70.0),
             ..Default::default()
         };
-        assert!(!gpu_detail_line(&below_80, true).contains("peak"));
+        assert!(!gpu_detail_line(&below_80, true, false).contains("peak"));
         let not_recovered = GpuRawMetrics {
             mem_util_pct: Some(50.0),
             temperature_c: Some(86.0),
             temperature_peak_c: Some(86.0),
             ..Default::default()
         };
-        assert!(!gpu_detail_line(&not_recovered, true).contains("peak"));
+        assert!(!gpu_detail_line(&not_recovered, true, false).contains("peak"));
+    }
+
+    #[test]
+    fn gpu_detail_line_multi_gpu_includes_vram_and_power() {
+        let g = GpuRawMetrics {
+            mem_util_pct: Some(13.0),
+            power_watts: Some(171.0),
+            vram_used_mb: Some(49 * 1024),
+            vram_total_mb: Some(80 * 1024),
+            ..Default::default()
+        };
+        let default = gpu_detail_line(&g, false, true);
+        assert!(default.contains("vRAM 49/80GB"));
+        assert!(default.contains("power 171W"));
+        assert!(default.contains("mem_util 13%"));
+
+        let verbose = gpu_detail_line(&g, true, true);
+        assert!(verbose.contains("vRAM 49/80GB"));
+        assert!(verbose.contains("power 171W"));
+        assert!(verbose.contains("mem_util 13%"));
+        assert!(verbose.contains("temp -"));
+        assert!(verbose.contains("sm -"));
+        assert!(verbose.contains("limit -"));
+    }
+
+    #[test]
+    fn gpu_detail_line_single_gpu_omits_vram_and_power() {
+        let g = GpuRawMetrics {
+            mem_util_pct: Some(55.0),
+            power_watts: Some(244.0),
+            vram_used_mb: Some(40 * 1024),
+            vram_total_mb: Some(80 * 1024),
+            ..Default::default()
+        };
+        let default = gpu_detail_line(&g, false, false);
+        assert!(!default.contains("vRAM"));
+        assert!(!default.contains("power"));
+        assert!(default.contains("mem_util 55%"));
+
+        let verbose = gpu_detail_line(&g, true, false);
+        assert!(!verbose.contains("vRAM"));
+        assert!(!verbose.contains("power"));
+        assert!(verbose.contains("mem_util 55%"));
     }
 
     #[test]
