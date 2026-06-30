@@ -289,9 +289,13 @@ fn baseline_lines(
     num_gpu_blocks: Option<u32>,
 ) -> Vec<String> {
     let Some(b) = baseline else {
-        return vec![
-            "HW LIMITS  unavailable (model not recognized). Add model to catalog".to_string(),
-        ];
+        return vec![format!(
+            "{:<width$}{}{}",
+            "HW LIMITS",
+            VLLM_LABEL_METRICS_GAP,
+            "unavailable (model not recognized). Add model to catalog",
+            width = GPU_LABEL_W
+        )];
     };
 
     // Line 1: efficiency + throughput ceilings
@@ -300,7 +304,7 @@ fn baseline_lines(
         Some(e) => format!("{e:.1}%"),
         None => "-".to_string(),
     };
-    seg1.push(format!("Efficiency  {eff}"));
+    seg1.push(format!("decode_eff {eff}"));
     if b.decode.expected >= 0.5 {
         seg1.push(format!("decode ~{:.0} tok/s (est)", b.decode.expected));
     }
@@ -332,24 +336,48 @@ fn baseline_lines(
     }
 
     let mut out = vec![
-        format!("HW LIMITS  {}", seg1.join(" | ")),
-        format!("           {}", seg2.join(" | ")),
+        format!(
+            "{:<width$}{}{}",
+            "HW LIMITS",
+            VLLM_LABEL_METRICS_GAP,
+            seg1.join(" | "),
+            width = GPU_LABEL_W
+        ),
+        format!(
+            "{:<width$}{}{}",
+            "",
+            VLLM_LABEL_METRICS_GAP,
+            seg2.join(" | "),
+            width = GPU_LABEL_W
+        ),
     ];
     if b.weight_dtype_source == engine::WeightDtypeSource::Fallback {
-        out.push(
-            "           weight dtype assumed bf16. Confirm via vLLM metrics or DTYPE env var"
-                .to_string(),
-        );
+        out.push(format!(
+            "{:<width$}{}{}",
+            "",
+            VLLM_LABEL_METRICS_GAP,
+            "weight dtype assumed bf16. Confirm via vLLM metrics or DTYPE env var",
+            width = GPU_LABEL_W
+        ));
     }
     if let Some(pe) = b.prefill_efficiency_pct {
+        let content = format!("prefill_eff {pe:.1}%  of compute ceiling");
         out.push(format!(
-            "           Prefill efficiency  {pe:.1}%  of compute ceiling"
+            "{:<width$}{}{}",
+            "",
+            VLLM_LABEL_METRICS_GAP,
+            content,
+            width = GPU_LABEL_W
         ));
     }
     if let Some(pt) = b.prefill_time_fraction {
+        let content = format!("prefill_time ~{:.0}%   estimated GPU time", pt * 100.0);
         out.push(format!(
-            "           Prefill time        ~{:.0}%   estimated GPU time",
-            pt * 100.0
+            "{:<width$}{}{}",
+            "",
+            VLLM_LABEL_METRICS_GAP,
+            content,
+            width = GPU_LABEL_W
         ));
     }
     out
@@ -398,8 +426,8 @@ fn gpu_gauges_line(
 
     let power = g
         .power_watts
-        .map(|draw| format!("POWER {:.0}W", draw))
-        .unwrap_or_else(|| "POWER -".to_string());
+        .map(|draw| format!("power {:.0}W", draw))
+        .unwrap_or_else(|| "power -".to_string());
 
     let mut segments = vec![efficiency, power];
 
@@ -454,14 +482,14 @@ fn format_efficiency_label(
     decode_ceiling: Option<f64>,
 ) -> String {
     if let Some(e) = efficiency_pct.filter(|e| e.is_finite()) {
-        return format!("EFFICIENCY {:.1}%", e);
+        return format!("efficiency {:.1}%", e);
     }
     let actual = actual_tps.filter(|t| t.is_finite() && *t > 0.0);
     let ceiling = decode_ceiling.filter(|c| c.is_finite() && *c > 0.0);
     if actual.is_some() && ceiling.is_some() {
-        "EFFICIENCY ?".to_string()
+        "efficiency ?".to_string()
     } else {
-        "EFFICIENCY -".to_string()
+        "efficiency -".to_string()
     }
 }
 
@@ -589,15 +617,8 @@ fn gpu_detail_line(g: &GpuRawMetrics, verbose: bool) -> String {
         .map(|u| format!("mem_util {:.0}%", u))
         .unwrap_or_else(|| "mem_util -".to_string());
 
-    let power = g
-        .power_watts
-        .map(|draw| format!("power {:.0}W", draw))
-        .unwrap_or_else(|| "power -".to_string());
-
-    let vram = format_vram(g);
-
     if !verbose {
-        return format!("{mem_util} | {power} | {vram}");
+        return mem_util;
     }
 
     let temp = match g.temperature_c.filter(|t| t.is_finite()) {
@@ -620,7 +641,7 @@ fn gpu_detail_line(g: &GpuRawMetrics, verbose: bool) -> String {
         .power_limit_watts
         .map(|l| format!("limit {:.0}W", l))
         .unwrap_or_else(|| "limit -".to_string());
-    format!("{mem_util} | {power} | {vram} | {temp} | {sm} | {limit}")
+    format!("{mem_util} | {temp} | {sm} | {limit}")
 }
 
 fn vllm_memory_value(v: &VllmRawMetrics) -> String {
@@ -836,7 +857,13 @@ mod tests {
         let lines = baseline_lines(Some(b), None, None);
         assert_eq!(
             lines[0],
-            "HW LIMITS  Efficiency  - | decode ~100 tok/s (est) | prefill ~50 tok/s (est)"
+            format!(
+                "{:<width$}{}{}",
+                "HW LIMITS",
+                VLLM_LABEL_METRICS_GAP,
+                "decode_eff - | decode ~100 tok/s (est) | prefill ~50 tok/s (est)",
+                width = GPU_LABEL_W
+            )
         );
         assert!(
             lines[1].contains("prefill_floor ~20ms"),
@@ -1040,8 +1067,8 @@ mod tests {
             Some(0.31),
         );
         let s = gpu_gauges_line(&g, Some(&b), Some(5978.2), false);
-        assert!(s.contains("EFFICIENCY 31.7%"));
-        assert!(s.contains("POWER 421W"));
+        assert!(s.contains("efficiency 31.7%"));
+        assert!(s.contains("power 421W"));
         assert!(s.contains("0.31 J/tok"));
         assert!(!s.contains("tok/W"));
         assert!(s.contains("$1.84/1M tok (est)"));
@@ -1089,8 +1116,8 @@ mod tests {
             ..Default::default()
         };
         let s = gpu_gauges_line(&g, Some(&baseline_efficiency(28.0)), None, false);
-        assert!(s.contains("EFFICIENCY 28.0%"));
-        assert!(s.contains("POWER 310W"));
+        assert!(s.contains("efficiency 28.0%"));
+        assert!(s.contains("power 310W"));
         assert!(s.contains("vRAM 72/80GB"));
         let g_peak = GpuRawMetrics {
             gpu_util_pct: Some(28.0),
@@ -1129,7 +1156,7 @@ mod tests {
         let mut b = baseline_efficiency(50.0);
         b.efficiency_pct = None;
         let s = gpu_gauges_line(&g, Some(&b), Some(200.0), false);
-        assert!(s.contains("EFFICIENCY ?"));
+        assert!(s.contains("efficiency ?"));
     }
 
     #[test]
@@ -1477,6 +1504,6 @@ mod tests {
         assert!(text.contains(" x2"));
         assert!(text.contains("GPU [0]"));
         assert!(text.contains("GPU [1]"));
-        assert!(text.contains("POWER 610W"));
+        assert!(text.contains("power 610W"));
     }
 }

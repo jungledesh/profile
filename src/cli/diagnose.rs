@@ -54,6 +54,7 @@ pub fn execute(
         duration,
         result,
         report,
+        verbose_rules,
     )?;
 
     Ok(())

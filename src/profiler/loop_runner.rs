@@ -20,6 +20,7 @@ pub fn run(
     duration: Duration,
     initial_result: DiagnoseResult,
     initial_report: engine::Report,
+    verbose_rules: bool,
 ) -> anyhow::Result<()> {
     let mut last_fingerprint = initial_result.snapshot.fingerprint();
     let mut state = LoopState::new(initial_result, initial_report);
@@ -168,7 +169,7 @@ pub fn run(
         let plateau_count = state.update_efficiency_plateau(current_eff, EFFICIENCY_PLATEAU_DELTA);
         print_delta(&d);
         println!();
-        output::stdout::print_diagnose_table(&new_result, false);
+        output::stdout::print_diagnose_table(&new_result, verbose_rules);
 
         let headroom = new_report.baseline.as_ref().and_then(|b| b.headroom_pct);
         if at_hardware_ceiling(headroom) {
