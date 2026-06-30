@@ -19,13 +19,16 @@ pub struct ModelArch {
     /// Number of KV heads (num_key_value_heads). None for special architectures
     /// (MLA, interleaved attention, hybrid) where standard KV formula doesn't apply.
     pub num_kv_heads: Option<u32>,
-    /// KV cache head dimension. Explicit field — may differ from hidden_dim/num_heads
+    /// KV cache head dimension. Explicit field - may differ from hidden_dim/num_heads
     /// (e.g. Gemma 2 9B uses head_dim=256). None when architecture is non-standard.
     pub head_dim: Option<u32>,
     /// KV-relevant layer count for hybrid architectures where only a subset of layers
     /// use standard KV cache (e.g. Qwen3.6: 32 attention layers out of 64 total).
     /// None → fall back to num_layers in KV math (correct for pure-attention models).
     pub num_kv_layers: Option<u32>,
+    /// Per-layer attention FLOPs coefficient for prefill ceiling (seq_len² term).
+    /// None → standard MHA/GQA uses 2 × hidden_dim.
+    pub attn_flops_coeff: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -44,7 +47,7 @@ pub struct StaticContext {
     pub model: ModelArch,
     pub gpu: GPUModel,
     pub config: VllmConfig,
-    /// Resolved once at startup — whether `/usr/local/cuda/bin/nvcc` exists on this host.
+    /// Resolved once at startup - whether `/usr/local/cuda/bin/nvcc` exists on this host.
     pub nvcc_available: bool,
 }
 
@@ -98,6 +101,7 @@ impl StaticContext {
                 num_kv_heads: e.num_kv_heads,
                 head_dim: e.head_dim,
                 num_kv_layers: e.num_kv_layers,
+                attn_flops_coeff: e.attn_flops_coeff,
             },
             None => ModelArch {
                 name: model_name,

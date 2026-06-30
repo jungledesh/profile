@@ -1,10 +1,6 @@
 target/
 **/*.rs.bk
 .DS_Store
-docs/v2-plan.md
-docs/v2-user-research.md
-docs/v2-architecture.md
-RULES.md
-v2-launch.md
+ROADMAP.md
 CLAUDE.md
-.agents/
+.agents/ 

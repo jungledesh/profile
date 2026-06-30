@@ -156,7 +156,7 @@ fn prefix_scrape_sample(scrape: &Scrape) -> PrefixCacheScrapeSample {
 ///
 /// Returns `None` when:
 /// - either scrape lacks hits/queries totals,
-/// - **`Δqueries <= 0`** (zero-query window, flat counters, or non-monotonic queries) — **never divide by zero**,
+/// - **`Δqueries <= 0`** (zero-query window, flat counters, or non-monotonic queries) - **never divide by zero**,
 /// - `Δhits < 0` (counter reset),
 /// - non-finite values.
 ///
@@ -319,7 +319,7 @@ pub(crate) fn histogram_quantile(q: f64, buckets: &[HistogramCount]) -> Option<f
         prev_upper = b.less_than;
         prev_count = b.count;
     }
-    // All observations in +Inf bucket — return last finite bound
+    // All observations in +Inf bucket - return last finite bound
     buckets
         .iter()
         .rfind(|b| b.less_than.is_finite())
@@ -328,7 +328,7 @@ pub(crate) fn histogram_quantile(q: f64, buckets: &[HistogramCount]) -> Option<f
 
 /// p99 of requests completed in this window (delta buckets between first and last scrape).
 /// Returns None on counter reset (any bucket delta < 0), bucket count mismatch, or zero traffic.
-/// No fallback to cumulative — stale historical p99 is worse than no value.
+/// No fallback to cumulative - stale historical p99 is worse than no value.
 fn histogram_window_p99_ms(first: &Scrape, last: &Scrape, base: &str) -> Option<f64> {
     let delta = histogram_window_delta_buckets(first, last, base);
     histogram_quantile(0.99, &delta).map(|s| s * 1000.0)
@@ -380,12 +380,12 @@ pub(crate) fn merge_p99_bucket_vecs(vecs: &[&[HistogramCount]]) -> Vec<Histogram
     let mut merged: Vec<f64> = vecs[0].iter().map(|b| b.count).collect();
     for v in &vecs[1..] {
         // Length mismatch: bucket schema changed (vLLM version skew or malformed scrape).
-        // Skip this window rather than aborting — one bad window should not destroy
+        // Skip this window rather than aborting - one bad window should not destroy
         // all accumulated data from the rest of the session.
         if v.len() != bounds.len() {
             continue;
         }
-        // Boundary mismatch: same bucket count but different `le` values — bins are
+        // Boundary mismatch: same bucket count but different `le` values - bins are
         // incompatible and cannot be summed. Skip rather than produce a corrupt merge.
         if v.iter()
             .zip(bounds.iter())

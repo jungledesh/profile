@@ -20,6 +20,7 @@ pub fn run(
     duration: Duration,
     initial_result: DiagnoseResult,
     initial_report: engine::Report,
+    verbose_rules: bool,
 ) -> anyhow::Result<()> {
     let mut last_fingerprint = initial_result.snapshot.fingerprint();
     let mut state = LoopState::new(initial_result, initial_report);
@@ -168,7 +169,7 @@ pub fn run(
         let plateau_count = state.update_efficiency_plateau(current_eff, EFFICIENCY_PLATEAU_DELTA);
         print_delta(&d);
         println!();
-        output::stdout::print_diagnose_table(&new_result, false);
+        output::stdout::print_diagnose_table(&new_result, verbose_rules);
 
         let headroom = new_report.baseline.as_ref().and_then(|b| b.headroom_pct);
         if at_hardware_ceiling(headroom) {
@@ -225,7 +226,7 @@ fn healthy_exit_message(
             .map(|e| format!("Efficiency {e:.1}%"))
             .unwrap_or_else(|| "Efficiency unavailable".to_string());
         return format!(
-            "No issues. {eff} — gap is traffic, not config. Increase load to find real limits."
+            "No issues. {eff} - gap is traffic, not config. Increase load to find real limits."
         );
     }
 
@@ -240,7 +241,7 @@ fn healthy_exit_message(
                 .unwrap_or_default();
             format!(
                 "Primary Limiter: KV Cache Capacity\n\
-                 {eff_str} —{kv} concurrency is capped before bandwidth saturates.\n\
+                 {eff_str} -{kv} concurrency is capped before bandwidth saturates.\n\
                  Levers: enable prefix caching, apply KV quantization (FP8), or add TP to split KV cache."
             )
         }
@@ -251,21 +252,21 @@ fn healthy_exit_message(
                 .unwrap_or_default();
             format!(
                 "Primary Limiter: Physics (Hardware Ceiling)\n\
-                 {eff_str} —{floor_str} Hardware is at the limits of this model and dtype.\n\
+                 {eff_str} -{floor_str} Hardware is at the limits of this model and dtype.\n\
                  Levers: quantize further (FP16→FP8/AWQ), speculative decoding, or scale out with TP."
             )
         }
         Some(engine::limiter::PrimaryLimiter::PrefillInterference) => {
             format!(
                 "Primary Limiter: Prefill Interference\n\
-                 {eff_str} — chunked prefill is sharing decode memory bandwidth with prefill GEMMs.\n\
+                 {eff_str} - chunked prefill is sharing decode memory bandwidth with prefill GEMMs.\n\
                  Levers: disaggregate prefill/decode onto separate workers, or tune chunk size."
             )
         }
         Some(engine::limiter::PrimaryLimiter::FrameworkOverhead) => {
             format!(
                 "Primary Limiter: Framework Overhead\n\
-                 {eff_str} — batch healthy, VRAM available, but GPU is waiting on the system.\n\
+                 {eff_str} - batch healthy, VRAM available, but GPU is waiting on the system.\n\
                  Levers: test --enforce-eager, verify CPU/PCIe bottlenecks, or evaluate SGLang for this workload."
             )
         }
@@ -273,7 +274,7 @@ fn healthy_exit_message(
             unreachable!("traffic limiter returns before limiter_block")
         }
         None => {
-            format!("{eff_str} — insufficient data to identify primary limiter.")
+            format!("{eff_str} - insufficient data to identify primary limiter.")
         }
     };
 
@@ -349,6 +350,36 @@ fn print_delta(d: &delta::Delta) {
     }
     if let Some(line) = format_efficiency_delta_line(d.efficiency_delta_pp) {
         println!("{line}");
+    }
+    if let (Some(before), Some(after)) = (
+        d.prefill_time_fraction_before,
+        d.prefill_time_fraction_after,
+    ) && before.is_finite()
+        && after.is_finite()
+    {
+        let delta_pp = (after - before) * 100.0;
+        if delta_pp.abs() > 1.0 {
+            let arrow = if delta_pp < 0.0 { "↓" } else { "↑" };
+            println!(
+                "  Prefill time    {:.0}% → {:.0}%    {:+.0} pp {arrow}",
+                before * 100.0,
+                after * 100.0,
+                delta_pp
+            );
+        }
+    }
+    if let (Some(before), Some(after)) = (d.prefill_efficiency_before, d.prefill_efficiency_after)
+        && before.is_finite()
+        && after.is_finite()
+    {
+        let delta_pp = after - before;
+        if delta_pp.abs() > 0.5 {
+            let arrow = if delta_pp < 0.0 { "↓" } else { "↑" };
+            println!(
+                "  Prefill eff.   {before:.1}% → {after:.1}%  {:+.1} pp {arrow}",
+                delta_pp
+            );
+        }
     }
     let has_cost = economics_section_active(d);
     if has_cost {
@@ -542,7 +573,7 @@ mod tests {
         );
         assert_eq!(
             msg,
-            "No issues. Efficiency 34.0% — gap is traffic, not config. Increase load to find real limits."
+            "No issues. Efficiency 34.0% - gap is traffic, not config. Increase load to find real limits."
         );
         assert!(!msg.contains('\n'));
     }
@@ -701,6 +732,10 @@ mod tests {
             ttft_p95_delta_pct: None,
             tpot_p95_delta_pct: None,
             config_drifted: false,
+            prefill_time_fraction_before: None,
+            prefill_time_fraction_after: None,
+            prefill_efficiency_before: None,
+            prefill_efficiency_after: None,
         };
         assert!(economics_section_active(&d));
     }
@@ -735,6 +770,10 @@ mod tests {
             ttft_p95_delta_pct: None,
             tpot_p95_delta_pct: None,
             config_drifted: false,
+            prefill_time_fraction_before: None,
+            prefill_time_fraction_after: None,
+            prefill_efficiency_before: None,
+            prefill_efficiency_after: None,
         };
         assert!(recoverable_waste_available(&d));
         assert!(economics_section_active(&d));

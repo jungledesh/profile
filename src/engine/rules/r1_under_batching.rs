@@ -51,7 +51,7 @@ pub(super) fn rule1_under_batching_with_efficiency(
 ) -> Rule1Outcome {
     let running = snapshot.vllm.num_requests_running;
 
-    // 1. Hard abort — window duration required
+    // 1. Hard abort - window duration required
     let window_secs = match snapshot.vllm.window_duration_secs {
         Some(w) if w.is_finite() && w > f64::EPSILON => w,
         _ => {
@@ -61,7 +61,7 @@ pub(super) fn rule1_under_batching_with_efficiency(
         }
     };
 
-    // 2. Hard abort — max_num_seqs required (scrape or config)
+    // 2. Hard abort - max_num_seqs required (scrape or config)
     let Some(max_n) = snapshot
         .vllm
         .max_num_seqs
@@ -73,7 +73,7 @@ pub(super) fn rule1_under_batching_with_efficiency(
         });
     };
 
-    // 3. Hard abort — running required and > 0
+    // 3. Hard abort - running required and > 0
     let Some(run) = running.filter(|v| v.is_finite() && *v > 0.0) else {
         return Rule1Outcome::NotFired(R1MissReport {
             prefill_saturation_ratio: None,
@@ -106,10 +106,10 @@ pub(super) fn rule1_under_batching_with_efficiency(
         });
     }
 
-    // 5. Gate 1 — prefill saturation
+    // 5. Gate 1 - prefill saturation
     // Known limitation: Prometheus histograms only record on request completion.
     // A chunked prefill spanning the full window duration will read sum_delta=0
-    // and bypass this gate until the request completes. Accepted — documented limitation.
+    // and bypass this gate until the request completes. Accepted - documented limitation.
     if let Some(mass) = snapshot.vllm.prefill_window_mass
         && mass.count_delta > 0.0
     {

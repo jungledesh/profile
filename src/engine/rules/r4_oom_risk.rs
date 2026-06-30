@@ -75,7 +75,7 @@ pub fn r4_recommendation(
     };
 
     let short_action = if unrunnable {
-        "model unrunnable — GPU has insufficient VRAM for activation memory".to_string()
+        "model unrunnable - GPU has insufficient VRAM for activation memory".to_string()
     } else {
         match computed_min_tp {
             Some(n) => format!("set --tensor-parallel-size to at least {n}"),
@@ -111,7 +111,7 @@ pub fn r4_recommendation(
 }
 
 /// Fires when R4 cannot evaluate due to missing VRAM or model params.
-/// No traffic gate — OOM risk exists regardless of current load.
+/// No traffic gate - OOM risk exists regardless of current load.
 pub fn r4_advisory(
     kv_headroom_gb: Option<f64>,
     vram_gb: Option<f64>,
@@ -127,7 +127,7 @@ pub fn r4_advisory(
     }
     if weight_gb.is_none() {
         return Some(vec![
-            "[i] OOM Risk: Model parameters unknown. Cannot verify model fits in memory. Add model to catalog or pass --model-params.".to_string(),
+            "[i] OOM Risk: Model parameters unknown. Cannot verify model fits in memory. Add model to catalog.".to_string(),
         ]);
     }
     None

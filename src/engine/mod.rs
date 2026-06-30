@@ -62,6 +62,10 @@ pub(crate) fn build_report(input: AnalysisInput<'_>) -> Report {
         input.ctx.config.max_model_len,
         &input.ctx.model,
         input.ctx.config.kv_cache_dtype.as_deref(),
+        effective_tensor_parallel(
+            input.ctx.config.tensor_parallel_size,
+            input.window.snapshot.collected_gpu_count(),
+        ),
     );
 
     let mut recs: Vec<Recommendation> = Vec::new();
@@ -114,6 +118,15 @@ pub(crate) fn build_report(input: AnalysisInput<'_>) -> Report {
     if let Some(r) = rules::r3_recommendation(snapshot) {
         recs.push(r);
     }
+    if let Some(r) = rules::r6_recommendation(
+        baseline.as_ref().and_then(|b| b.prefill_time_fraction),
+        baseline.as_ref().and_then(|b| b.efficiency_pct),
+        baseline.as_ref().and_then(|b| b.prefill_efficiency_pct),
+        snapshot,
+        input.ctx.config.enable_chunked_prefill,
+    ) {
+        recs.push(r);
+    }
 
     rules::finalize_report_groups(recs, baseline, kv_max_seqs, 1, 0)
 }
@@ -148,7 +161,7 @@ fn maybe_add_massive_underutilization(
                 "  Wait queue  0  (server not saturated)".to_string(),
                 String::new(),
                 "  Cause:".to_string(),
-                "    GPU is idle. No config rule explains this — client traffic is too low."
+                "    GPU is idle. No config rule explains this - client traffic is too low."
                     .to_string(),
                 String::new(),
                 "  Fix:".to_string(),

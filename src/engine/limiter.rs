@@ -1,5 +1,5 @@
 //! No-issue exit path: identifies the primary physical boundary capping efficiency.
-//! Cascade is mutually exclusive — each stage is only reached if harder limits above it are clear.
+//! Cascade is mutually exclusive - each stage is only reached if harder limits above it are clear.
 
 /// The physical or systemic boundary capping efficiency when no rules fire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8,15 +8,15 @@ pub enum PrimaryLimiter {
     Capacity,
     /// Insufficient concurrent requests to amortize kernel launch and scheduler overhead.
     Traffic,
-    /// TPOT is within 20% of the theoretical floor — hardware is saturated.
+    /// TPOT is within 20% of the theoretical floor - hardware is saturated.
     Physics,
     /// Chunked prefill is sharing decode memory bandwidth with prefill GEMMs.
     PrefillInterference,
-    /// Batch sizes healthy, VRAM available — GPU is waiting on framework/system.
+    /// Batch sizes healthy, VRAM available - GPU is waiting on framework/system.
     FrameworkOverhead,
 }
 
-// All thresholds provisional — calibrate against real workloads before hardening.
+// All thresholds provisional - calibrate against real workloads before hardening.
 const KV_CAPACITY_LIMITER_PERC: f64 = 80.0; // below r2's crisis threshold of 88.0
 const TRAFFIC_LIMITER_RIDGE_FRACTION: f64 = 0.25;
 const TRAFFIC_LIMITER_MIN_RUNNING: f64 = 8.0;
@@ -37,12 +37,12 @@ pub fn identify(
     tpot_floor_ms: Option<f64>,
     chunked_prefill_enabled: Option<bool>,
 ) -> Option<PrimaryLimiter> {
-    // 1. Capacity — KV cache full enough to cap concurrency growth.
+    // 1. Capacity - KV cache full enough to cap concurrency growth.
     if kv_cache_usage_perc.is_some_and(|kv| kv >= KV_CAPACITY_LIMITER_PERC) {
         return Some(PrimaryLimiter::Capacity);
     }
 
-    // 2. Traffic — VRAM available but not enough concurrent requests to
+    // 2. Traffic - VRAM available but not enough concurrent requests to
     //    amortize overhead and saturate memory bandwidth.
     if let (Some(running), Some(ridge)) = (num_running, ridge_batch_size) {
         let threshold = (ridge * TRAFFIC_LIMITER_RIDGE_FRACTION).max(TRAFFIC_LIMITER_MIN_RUNNING);
@@ -51,19 +51,19 @@ pub fn identify(
         }
     }
 
-    // 3. Physics — TPOT near theoretical floor; hardware is saturated.
+    // 3. Physics - TPOT near theoretical floor; hardware is saturated.
     if let (Some(tpot), Some(floor)) = (tpot_ms, tpot_floor_ms)
         && tpot <= floor * PHYSICS_LIMITER_FLOOR_MARGIN
     {
         return Some(PrimaryLimiter::Physics);
     }
 
-    // 4. Prefill interference — chunked prefill sharing decode bandwidth.
+    // 4. Prefill interference - chunked prefill sharing decode bandwidth.
     if chunked_prefill_enabled == Some(true) {
         return Some(PrimaryLimiter::PrefillInterference);
     }
 
-    // 5. Framework overhead — batch healthy, VRAM free, not at physics ceiling.
+    // 5. Framework overhead - batch healthy, VRAM free, not at physics ceiling.
     //    Only fire if we have enough signal to rule out data absence.
     if num_running.is_some() && tpot_ms.is_some() {
         return Some(PrimaryLimiter::FrameworkOverhead);

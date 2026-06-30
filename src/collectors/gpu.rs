@@ -242,7 +242,7 @@ pub fn collect_gpu_metrics_for(
 }
 
 /// NVML device indices to poll. Scope vs TP is validated after collection in
-/// `validate_tensor_parallel_scope` — this only resolves CVD vs full host.
+/// `validate_tensor_parallel_scope` - this only resolves CVD vs full host.
 pub(crate) fn resolve_device_indices(cvd_indices: Vec<u32>, host_device_count: u32) -> Vec<u32> {
     if cvd_indices.is_empty() {
         (0..host_device_count).collect()

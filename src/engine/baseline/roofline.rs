@@ -59,6 +59,14 @@ pub struct PhysicsBaseline {
     pub prefill_latency_floor_ms: Option<f64>,
     /// Concurrent batch size at which decode crosses from BW-bound to compute-bound (roofline ridge).
     pub ridge_batch_size: f64,
+    /// Prefill efficiency: fraction of compute ceiling used during prefill.
+    /// (1 / mean_prefill_secs) / prefill_ceiling_prompts_per_sec × 100.
+    /// None when prefill ceiling or histogram data unavailable.
+    pub prefill_efficiency_pct: Option<f64>,
+    /// Fraction of window wall-clock time spent in prefill (0.0-1.0).
+    /// Derived from vllm_request_prefill_time_seconds histogram.
+    /// None when histogram data unavailable.
+    pub prefill_time_fraction: Option<f64>,
     pub cost: Option<CostEstimate>,
 }
 
@@ -98,8 +106,20 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
     // Note: Prefill ceiling assumes standard BF16 GEMM throughput. Fused dequantization
     // kernels (e.g., Marlin/AWQ) introduce instruction overhead that typically lowers
     // achievable compute utilization.
+    let attn_coeff = ctx
+        .model
+        .attn_flops_coeff
+        .unwrap_or_else(|| ctx.model.hidden_dim.map(|h| 2 * h as u64).unwrap_or(0));
+    let num_layers = ctx.model.num_layers.unwrap_or(0);
+
     let prefill = seq_len.and_then(|len| {
-        let expected = math::prefill_ceiling_tps(peak_flops * tp, roofline_params, len);
+        let expected = math::prefill_ops_per_sec(
+            peak_flops * tp,
+            roofline_params,
+            len,
+            num_layers,
+            attn_coeff,
+        );
         make_estimate(expected)
     });
 
@@ -132,6 +152,36 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
     });
     let tpot_floor_ms = math::latency_floor_ms(decode.expected);
     let prefill_latency_floor_ms = prefill.map(|p| math::latency_floor_ms(p.expected));
+
+    let prefill_time_fraction = (|| {
+        let mass = input.window.snapshot.vllm.prefill_window_mass?;
+        let window_secs = input
+            .window
+            .snapshot
+            .vllm
+            .window_duration_secs
+            .filter(|w| w.is_finite() && *w > f64::EPSILON)?;
+        if mass.count_delta <= 0.0 {
+            return None;
+        }
+        let mean_prefill_secs = mass.sum_delta / mass.count_delta;
+        let ratio = mean_prefill_secs / window_secs;
+        ratio.is_finite().then_some(ratio.clamp(0.0, 1.0))
+    })();
+
+    let prefill_efficiency_pct = prefill.and_then(|p| {
+        let mass = input.window.snapshot.vllm.prefill_window_mass?;
+        if mass.count_delta <= 0.0 {
+            return None;
+        }
+        let mean_prefill_secs = mass.sum_delta / mass.count_delta;
+        if !mean_prefill_secs.is_finite() || mean_prefill_secs <= 0.0 {
+            return None;
+        }
+        let actual_prompts_per_sec = 1.0 / mean_prefill_secs;
+        let pct = (actual_prompts_per_sec / p.expected) * 100.0;
+        pct.is_finite().then_some(pct.min(100.0))
+    });
 
     let snap = &input.window.snapshot;
     let tps = snap
@@ -188,6 +238,8 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
         tpot_floor_ms,
         prefill_latency_floor_ms,
         ridge_batch_size,
+        prefill_efficiency_pct,
+        prefill_time_fraction,
         cost,
     })
 }
@@ -333,6 +385,7 @@ mod tests {
                 num_kv_heads: None,
                 head_dim: None,
                 num_kv_layers: None,
+                attn_flops_coeff: None,
             },
             gpu: crate::context::GPUModel {
                 name: Some("gpu".to_string()),
@@ -719,7 +772,7 @@ mod tests {
         let input = AnalysisInput::new(&ctx, &win);
         let b = compute(&input);
         assert!(b.is_some());
-        let expected = math::prefill_ceiling_tps(67.0, 8_000_000_000, 1024);
+        let expected = math::prefill_ops_per_sec(67.0, 8_000_000_000, 1024, 1, 2);
         let got = b.and_then(|x| x.prefill).expect("prefill").expected;
         assert!((got - expected).abs() < 1e-6);
     }
@@ -1292,5 +1345,266 @@ mod tests {
         );
         let expected_decode = math::decode_ceiling_tps(3350.0, 8_000_000_000, 4);
         assert!((b.decode.expected - expected_decode).abs() < 1e-9);
+    }
+
+    fn baseline_input_llama8b(
+        snapshot: VllmRawMetrics,
+        cfg: VllmConfig,
+    ) -> (StaticContext, RuntimeWindow) {
+        let ctx = StaticContext {
+            model: crate::context::ModelArch {
+                name: Some("meta-llama/Llama-3.1-8B-Instruct".to_string()),
+                family: Some("llama3".to_string()),
+                param_count: Some(8_000_000_000),
+                active_param_count: None,
+                num_layers: Some(32),
+                hidden_dim: Some(4096),
+                is_moe: false,
+                default_weight_dtype: Some("bf16".to_string()),
+                num_kv_heads: Some(8),
+                head_dim: Some(128),
+                num_kv_layers: None,
+                attn_flops_coeff: None,
+            },
+            gpu: crate::context::GPUModel {
+                name: Some("NVIDIA H100 80GB HBM3".to_string()),
+                arch: Some("hopper".to_string()),
+                vram_gb: Some(80.0),
+                peak_flops_tc_tflops: Some(67.0),
+                peak_bw_gbps: Some(3350.0),
+            },
+            config: cfg,
+            nvcc_available: false,
+        };
+        let win = RuntimeWindow::from_snapshot(RawSnapshot {
+            gpu_observed_at: SystemTime::UNIX_EPOCH,
+            vllm_observed_at: SystemTime::UNIX_EPOCH,
+            timestamp: SystemTime::UNIX_EPOCH,
+            vllm: snapshot,
+            gpus: vec![GpuRawMetrics::default()],
+            nvml_host_gpu_count: None,
+        });
+        (ctx, win)
+    }
+
+    #[test]
+    fn prefill_ceiling_uses_attention_correction_when_hidden_dim_known() {
+        let cfg = VllmConfig {
+            dtype: Some("bf16".to_string()),
+            max_model_len: Some(8192),
+            ..Default::default()
+        };
+        let snap = VllmRawMetrics {
+            prompt_tokens_mean: Some(2048.0),
+            generation_tokens_per_sec: Some(10.0),
+            ..Default::default()
+        };
+        let (ctx, win) = baseline_input_llama8b(snap, cfg);
+        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+        let p = b.prefill.expect("prefill");
+        let linear_only = math::prefill_ops_per_sec(67.0, 8_000_000_000, 2048, 0, 0);
+        assert!(p.expected < linear_only);
+    }
+
+    #[test]
+    fn prefill_ceiling_uses_explicit_attn_coeff_for_mla() {
+        let cfg = VllmConfig {
+            dtype: Some("bf16".to_string()),
+            max_model_len: Some(4096),
+            ..Default::default()
+        };
+        let mut ctx = baseline_input_llama8b(VllmRawMetrics::default(), cfg.clone()).0;
+        ctx.model.attn_flops_coeff = Some(139_264);
+        ctx.model.param_count = Some(37_000_000_000);
+        ctx.model.active_param_count = Some(37_000_000_000);
+        ctx.model.num_layers = Some(61);
+        let win = RuntimeWindow::from_snapshot(RawSnapshot {
+            gpu_observed_at: SystemTime::UNIX_EPOCH,
+            vllm_observed_at: SystemTime::UNIX_EPOCH,
+            timestamp: SystemTime::UNIX_EPOCH,
+            vllm: VllmRawMetrics {
+                prompt_tokens_mean: Some(4096.0),
+                generation_tokens_per_sec: Some(10.0),
+                ..Default::default()
+            },
+            gpus: vec![GpuRawMetrics::default()],
+            nvml_host_gpu_count: None,
+        });
+        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+        let expected = math::prefill_ops_per_sec(67.0, 37_000_000_000, 4096, 61, 139_264);
+        assert!((b.prefill.expect("prefill").expected - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn prefill_ceiling_falls_back_to_linear_when_hidden_dim_and_coeff_both_none() {
+        let cfg = VllmConfig {
+            max_model_len: Some(1024),
+            ..Default::default()
+        };
+        let snap = VllmRawMetrics {
+            generation_tokens_per_sec: Some(10.0),
+            ..Default::default()
+        };
+        let (ctx, win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            None,
+            Some(67.0),
+            Some(3350.0),
+            cfg,
+            snap,
+        );
+        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+        let expected = math::prefill_ops_per_sec(67.0, 8_000_000_000, 1024, 0, 0);
+        assert!((b.prefill.expect("prefill").expected - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn prefill_efficiency_some_when_prefill_mass_and_prompt_tokens_available() {
+        use crate::collectors::HistogramWindowMass;
+        let cfg = VllmConfig {
+            dtype: Some("bf16".to_string()),
+            max_model_len: Some(2048),
+            ..Default::default()
+        };
+        let snap = VllmRawMetrics {
+            prompt_tokens_mean: Some(512.0),
+            generation_tokens_per_sec: Some(10.0),
+            prefill_window_mass: Some(HistogramWindowMass {
+                sum_delta: 2.0,
+                count_delta: 4.0,
+            }),
+            window_duration_secs: Some(2.0),
+            ..Default::default()
+        };
+        let (ctx, win) = baseline_input_llama8b(snap, cfg);
+        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+        let eff = b.prefill_efficiency_pct.expect("prefill efficiency");
+        assert!((0.0..=100.0).contains(&eff));
+    }
+
+    #[test]
+    fn prefill_efficiency_none_when_prefill_mass_missing() {
+        let cfg = VllmConfig {
+            dtype: Some("bf16".to_string()),
+            max_model_len: Some(2048),
+            ..Default::default()
+        };
+        let snap = VllmRawMetrics {
+            prompt_tokens_mean: Some(512.0),
+            generation_tokens_per_sec: Some(10.0),
+            ..Default::default()
+        };
+        let (ctx, win) = baseline_input_llama8b(snap, cfg);
+        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+        assert!(b.prefill_efficiency_pct.is_none());
+    }
+
+    #[test]
+    fn prefill_efficiency_clamped_at_100() {
+        use crate::collectors::HistogramWindowMass;
+        let cfg = VllmConfig {
+            dtype: Some("bf16".to_string()),
+            max_model_len: Some(2048),
+            ..Default::default()
+        };
+        let snap = VllmRawMetrics {
+            prompt_tokens_mean: Some(100_000.0),
+            generation_tokens_per_sec: Some(10.0),
+            prefill_window_mass: Some(HistogramWindowMass {
+                sum_delta: 0.001,
+                count_delta: 1.0,
+            }),
+            window_duration_secs: Some(2.0),
+            ..Default::default()
+        };
+        let (ctx, win) = baseline_input_llama8b(snap, cfg);
+        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+        assert_eq!(b.prefill_efficiency_pct, Some(100.0));
+    }
+
+    #[test]
+    fn prefill_efficiency_matches_single_request_rate() {
+        use crate::collectors::HistogramWindowMass;
+        let cfg = VllmConfig {
+            dtype: Some("bf16".to_string()),
+            max_model_len: Some(2048),
+            ..Default::default()
+        };
+        // 4 requests, each taking 0.5s average prefill.
+        // actual rate = 1 / 0.5 = 2 prompts/sec.
+        let snap = VllmRawMetrics {
+            prompt_tokens_mean: Some(512.0),
+            generation_tokens_per_sec: Some(10.0),
+            prefill_window_mass: Some(HistogramWindowMass {
+                sum_delta: 2.0,
+                count_delta: 4.0,
+            }),
+            window_duration_secs: Some(2.0),
+            ..Default::default()
+        };
+        let (ctx, win) = baseline_input_llama8b(snap, cfg);
+        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+        let ceiling = b.prefill.expect("prefill ceiling").expected;
+        let eff = b.prefill_efficiency_pct.expect("prefill efficiency");
+        let expected_eff = (2.0 / ceiling) * 100.0;
+        assert!(
+            (eff - expected_eff).abs() < 0.1,
+            "expected {expected_eff:.2}%, got {eff:.2}%"
+        );
+    }
+
+    #[test]
+    fn prefill_time_fraction_computed_from_histogram() {
+        use crate::collectors::HistogramWindowMass;
+        let cfg = VllmConfig::default();
+        let snap = VllmRawMetrics {
+            prefill_window_mass: Some(HistogramWindowMass {
+                sum_delta: 1.0,
+                count_delta: 2.0,
+            }),
+            window_duration_secs: Some(2.5),
+            generation_tokens_per_sec: Some(10.0),
+            ..Default::default()
+        };
+        let (ctx, win) = baseline_input_llama8b(snap, cfg);
+        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+        let frac = b.prefill_time_fraction.expect("fraction");
+        assert!((frac - 0.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn prefill_time_fraction_clamped_0_to_1() {
+        use crate::collectors::HistogramWindowMass;
+        let cfg = VllmConfig::default();
+        let snap = VllmRawMetrics {
+            prefill_window_mass: Some(HistogramWindowMass {
+                sum_delta: 5.0,
+                count_delta: 1.0,
+            }),
+            window_duration_secs: Some(2.0),
+            generation_tokens_per_sec: Some(10.0),
+            ..Default::default()
+        };
+        let (ctx, win) = baseline_input_llama8b(snap, cfg);
+        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+        assert_eq!(b.prefill_time_fraction, Some(1.0));
+    }
+
+    #[test]
+    fn prefill_time_fraction_none_when_no_window_duration() {
+        use crate::collectors::HistogramWindowMass;
+        let cfg = VllmConfig::default();
+        let snap = VllmRawMetrics {
+            prefill_window_mass: Some(HistogramWindowMass {
+                sum_delta: 1.0,
+                count_delta: 2.0,
+            }),
+            generation_tokens_per_sec: Some(10.0),
+            ..Default::default()
+        };
+        let (ctx, win) = baseline_input_llama8b(snap, cfg);
+        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+        assert!(b.prefill_time_fraction.is_none());
     }
 }

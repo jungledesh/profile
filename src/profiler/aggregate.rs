@@ -1,6 +1,6 @@
 //! Window aggregation: collapse `&[RawSnapshot]` into a single summary snapshot.
 //!
-//! Engine-agnostic — operates on `RawSnapshot` only. Supporting a new inference
+//! Engine-agnostic - operates on `RawSnapshot` only. Supporting a new inference
 //! engine means writing a collector that produces `RawSnapshot`; nothing here changes.
 //! Hardware collector changes (ROCm, Gaudi) are similarly isolated to `collectors/gpu.rs`.
 
@@ -52,7 +52,7 @@ pub(super) fn aggregate_windows(
         return chronological_last.clone();
     }
 
-    // Last *evaluable* window — state, static, prefix rate, GPU state gauges.
+    // Last *evaluable* window - state, static, prefix rate, GPU state gauges.
     let (last, _) = match evaluable_pairs.last() {
         Some(p) => p,
         None => return chronological_last.clone(),
@@ -147,7 +147,7 @@ pub(super) fn aggregate_windows(
     agg_v.request_success_total = chronological_last.vllm.request_success_total;
     agg_v.num_preemptions_total = chronological_last.vllm.num_preemptions_total;
     agg_v.prefix_cache_scrape_samples = last.vllm.prefix_cache_scrape_samples.clone();
-    // Static config labels don't change across windows — carry from last.
+    // Static config labels don't change across windows - carry from last.
     agg_v.cache_config = last.vllm.cache_config.clone();
 
     // Slot index is stable across windows: collect sorts gpus by identity() before storing,
@@ -189,7 +189,7 @@ fn empty_aggregate(at: SystemTime) -> collectors::RawSnapshot {
     }
 }
 
-/// `max(a, b)` for `Option<f64>` — `None` treated as absent, not zero.
+/// `max(a, b)` for `Option<f64>` - `None` treated as absent, not zero.
 #[inline]
 fn max_option_f64(a: Option<f64>, b: Option<f64>) -> Option<f64> {
     match (a, b) {
@@ -198,7 +198,7 @@ fn max_option_f64(a: Option<f64>, b: Option<f64>) -> Option<f64> {
     }
 }
 
-/// `max(a, b)` for `Option<u64>` — `None` treated as absent, not zero.
+/// `max(a, b)` for `Option<u64>` - `None` treated as absent, not zero.
 #[inline]
 fn max_option_u64(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     match (a, b) {
@@ -207,7 +207,7 @@ fn max_option_u64(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     }
 }
 
-/// `max(per-window peaks, last-evaluable landing KV%)` — aggregate peak ≥ displayed usage.
+/// `max(per-window peaks, last-evaluable landing KV%)` - aggregate peak ≥ displayed usage.
 fn kv_cache_peak_perc(
     pairs: &[(&collectors::RawSnapshot, Duration)],
     last: &collectors::RawSnapshot,
@@ -220,7 +220,7 @@ fn kv_cache_peak_perc(
     max_option_f64(from_windows, landing)
 }
 
-/// `max(per-window VRAM peaks, last-evaluable used MiB)` — aggregate peak ≥ displayed used.
+/// `max(per-window VRAM peaks, last-evaluable used MiB)` - aggregate peak ≥ displayed used.
 fn vram_peak_mb_slot(
     pairs: &[(&collectors::RawSnapshot, Duration)],
     last: &collectors::RawSnapshot,
@@ -234,7 +234,7 @@ fn vram_peak_mb_slot(
     max_option_u64(from_windows, landing)
 }
 
-/// `max(per-window temp peaks, last-evaluable landing °C)` — aggregate peak ≥ displayed current.
+/// `max(per-window temp peaks, last-evaluable landing °C)` - aggregate peak ≥ displayed current.
 fn temperature_peak_c_slot(
     pairs: &[(&collectors::RawSnapshot, Duration)],
     last: &collectors::RawSnapshot,
@@ -253,7 +253,7 @@ fn temperature_peak_c_slot(
     max_option_f64(from_windows, landing)
 }
 
-/// Sum ΔHistogramWindowMass across windows — base for both `histogram_mean` and mass carry-forward.
+/// Sum ΔHistogramWindowMass across windows - base for both `histogram_mean` and mass carry-forward.
 fn accumulate_histogram_mass<M>(
     pairs: &[(&collectors::RawSnapshot, Duration)],
     get_mass: M,
@@ -325,7 +325,7 @@ where
     (total_weight_secs > 0.0).then_some(weighted_sum / total_weight_secs)
 }
 
-/// ΣΔhits / ΣΔqueries across evaluable windows — mathematically correct multi-window prefix hit rate.
+/// ΣΔhits / ΣΔqueries across evaluable windows - mathematically correct multi-window prefix hit rate.
 fn prefix_hit_rate_sum_of_deltas(windows: &[&collectors::RawSnapshot]) -> Option<f64> {
     let mut sum_dh = 0.0_f64;
     let mut sum_dq = 0.0_f64;
@@ -518,7 +518,7 @@ mod tests {
         let agg = aggregate_windows(&windows, &durations, SystemTime::UNIX_EPOCH);
         assert!((agg.vllm.num_requests_running.unwrap() - 10.0).abs() < 1e-9);
         assert!((agg.vllm.generation_tokens_per_sec.unwrap() - 500.0).abs() < 1e-4);
-        // (10+10)/(80+10) = 20/90 — sum of Δhits / sum of Δqueries, not last window only.
+        // (10+10)/(80+10) = 20/90 - sum of Δhits / sum of Δqueries, not last window only.
         assert!((agg.vllm.prefix_cache_hit_rate.unwrap() - 20.0 / 90.0).abs() < 1e-9);
         assert!((agg.gpus.first().and_then(|g| g.gpu_util_pct).unwrap() - 50.0).abs() < 1e-4);
         assert_eq!(agg.gpus.first().and_then(|g| g.vram_used_mb), Some(2000));

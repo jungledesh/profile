@@ -24,14 +24,14 @@ const FP8_KV_CACHE_FIX: &str = "    • Switch --kv-cache-dtype fp8 to halve KV 
 const PREFIX_CACHING_LONG_PROMPT_MIN_TOKENS: f64 = 200.0;
 
 fn fp8_kv_cache_fix_bullet(kv_cache_dtype: Option<&str>, nvcc_available: bool) -> Option<String> {
-    // Already fp8 — don't suggest what's already applied
+    // Already fp8 - don't suggest what's already applied
     if kv_cache_dtype.is_some_and(|d| {
         let d = d.trim().to_ascii_lowercase();
         d.contains("fp8") || d.contains("e4m3") || d.contains("e5m2")
     }) {
         return None;
     }
-    // --kv-cache-dtype fp8 stores KV activations in fp8 via software cast — works on all GPUs
+    // --kv-cache-dtype fp8 stores KV activations in fp8 via software cast - works on all GPUs
     // including A100. This is distinct from --quantization fp8 (weight quantization) which
     // requires native FP8 hardware and crashes on A100/Qwen3.6.
     let nvcc_present = nvcc_available;
@@ -151,12 +151,12 @@ pub fn rule2_kv_admission_backlog(snapshot: &RawSnapshot) -> Option<KvAdmissionB
 /// Returns true when there is evidence of active KV eviction pressure.
 /// Two distinct signals, either sufficient:
 ///
-/// 1. Rate (velocity): preemptions/s > 0.02 — scheduler is actively evicting right now.
-/// 2. Debt (static): num_requests_swapped ≥ 2 — sequences parked on CPU. This is a
+/// 1. Rate (velocity): preemptions/s > 0.02 - scheduler is actively evicting right now.
+/// 2. Debt (static): num_requests_swapped ≥ 2 - sequences parked on CPU. This is a
 ///    gauge, not a delta. A non-zero count means eviction has already occurred and
 ///    sequences haven't been rescheduled yet. Risk: stuck alarm if swapped count is
 ///    stale and GPU has stabilized. A delta guard (swapped growing vs prior window)
-///    would eliminate this — deferred until per-rule state is available at eval time.
+///    would eliminate this - deferred until per-rule state is available at eval time.
 fn eviction_signal_active(snapshot: &RawSnapshot) -> bool {
     snapshot
         .vllm
@@ -489,7 +489,7 @@ pub(super) fn aggregate_backlog_detail(
 ) -> KvAdmissionBacklogDetail {
     debug_assert!(
         !details.is_empty(),
-        "aggregate_backlog_detail called with no fired windows — caller should gate on r2_backlog_significant"
+        "aggregate_backlog_detail called with no fired windows - caller should gate on r2_backlog_significant"
     );
     let n = details.len() as f64;
     let kv = details.iter().map(|d| d.kv_cache_usage_perc).sum::<f64>() / n;
@@ -524,7 +524,7 @@ pub(super) fn format_kv_cache_window_issue(
 pub(super) fn aggregate_r2_detail(details: &[KvCachePressureDetail]) -> KvCachePressureDetail {
     debug_assert!(
         !details.is_empty(),
-        "aggregate_r2_detail called with no fired windows — caller should gate on r2_significant"
+        "aggregate_r2_detail called with no fired windows - caller should gate on r2_significant"
     );
     let kv = details.iter().map(|d| d.kv_cache_usage_perc).sum::<f64>() / details.len() as f64;
     let peak = details

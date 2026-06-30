@@ -3,7 +3,7 @@ use std::time::SystemTime;
 pub use prometheus_parse::HistogramCount;
 
 /// Config fields extracted from the `vllm:cache_config_info` labeled gauge.
-/// All `Option<T>` — absent when the metric isn't present in the scrape.
+/// All `Option<T>` - absent when the metric isn't present in the scrape.
 #[derive(Debug, Clone, Default)]
 pub struct CacheConfigLabels {
     pub block_size: Option<u32>,
@@ -55,7 +55,7 @@ pub struct VllmRawMetrics {
     /// p99 TPOT from histogram bucket delta (first→last scrape in window). None if no traffic or counter reset.
     pub tpot_p99_ms: Option<f64>,
     /// Raw histogram delta buckets for TTFT (first→last scrape in window). Empty if no traffic, reset, or histogram unavailable.
-    /// Used for mathematically correct multi-window p99 aggregation — merge vectors, then recompute quantile.
+    /// Used for mathematically correct multi-window p99 aggregation - merge vectors, then recompute quantile.
     pub ttft_p99_buckets: Vec<HistogramCount>,
     /// Raw histogram delta buckets for TPOT (first→last scrape in window). Empty if no traffic, reset, or histogram unavailable.
     pub tpot_p99_buckets: Vec<HistogramCount>,
@@ -94,7 +94,7 @@ pub struct VllmRawMetrics {
     pub generation_tokens_total: Option<f64>,
     /// Δ generation tokens / s over the first→last scrape window (output throughput).
     pub generation_tokens_per_sec: Option<f64>,
-    /// Prefix cache hit rate. Single window: `(Δhits)/(Δqueries)` first→last scrape. Multi-window aggregate: sum of valid window deltas — see `docs/collection-policy.md`.
+    /// Prefix cache hit rate. Single window: `(Δhits)/(Δqueries)` first→last scrape. Multi-window aggregate: sum of valid window deltas - see `docs/collection-policy.md`.
     pub prefix_cache_hit_rate: Option<f64>,
     /// Cumulative prefix counters per scrape (same order as collector: 9 × ~250ms).
     pub prefix_cache_scrape_samples: Vec<PrefixCacheScrapeSample>,
@@ -254,7 +254,7 @@ impl RawSnapshot {
     }
 
     pub fn aggregate_gpu(&self) -> AggregateGpuMetrics {
-        // util/mem: mean across GPUs — max would overstate cluster saturation
+        // util/mem: mean across GPUs - max would overstate cluster saturation
         let mut sum_util = 0.0_f64;
         let mut n_util = 0_u32;
         let mut sum_mem = 0.0_f64;
@@ -372,7 +372,7 @@ pub fn snapshot_uses_index_only(gpus: &[GpuRawMetrics]) -> bool {
 
 /// Tensor-parallel degree for roofline, cost, and R4.
 /// Config/CLI wins when set; otherwise infer from collected GPU count.
-/// When config exceeds collected GPUs, clamp to collected — physics must not assume
+/// When config exceeds collected GPUs, clamp to collected - physics must not assume
 /// hardware we did not observe.
 pub fn effective_tensor_parallel(config_tp: Option<u32>, collected_gpus: usize) -> Option<u32> {
     if collected_gpus == 0 {
@@ -386,17 +386,17 @@ pub fn effective_tensor_parallel(config_tp: Option<u32>, collected_gpus: usize) 
 }
 
 /// A window is structurally valid if core telemetry was collected successfully.
-/// Zero traffic is a valid observation — it proves the server is idle, not that
+/// Zero traffic is a valid observation - it proves the server is idle, not that
 /// collection failed. Only skip windows where timing or metrics are absent entirely.
 pub fn window_is_evaluable(s: &RawSnapshot) -> bool {
-    // Duration must be present and positive — needed for all rate calculations.
+    // Duration must be present and positive - needed for all rate calculations.
     let duration_ok = s
         .vllm
         .window_duration_secs
         .filter(|w| w.is_finite() && *w > f64::EPSILON)
         .is_some();
 
-    // vLLM metrics must have been collected — num_requests_running being Some
+    // vLLM metrics must have been collected - num_requests_running being Some
     // (even if 0) means the endpoint responded successfully.
     let vllm_ok = s.vllm.num_requests_running.is_some();
 
@@ -406,12 +406,12 @@ pub fn window_is_evaluable(s: &RawSnapshot) -> bool {
 pub const ACTIVE_KV_CACHE_PCT_THRESHOLD: f64 = 30.0;
 pub const ACTIVE_GPU_UTIL_PCT_THRESHOLD: f64 = 20.0;
 
-/// A window contributed real work — used to gate aggregated means.
+/// A window contributed real work - used to gate aggregated means.
 /// Separate from `window_is_evaluable`, which only checks structural validity.
 ///
 /// Requires `running_reqs > 0` plus at least one activity signal:
 ///   - kv_cache_pct > 30%  (decode + sustained load)
-///   - gpu_util_pct > 20%  (prefill bursts; secondary — NVML is coarse)
+///   - gpu_util_pct > 20%  (prefill bursts; secondary - NVML is coarse)
 ///
 /// If both signals are absent, `running_reqs > 0` alone is the fallback.
 pub fn window_is_active(s: &RawSnapshot) -> bool {
@@ -611,7 +611,7 @@ pub(crate) fn validate_tensor_parallel_scope(
 ) -> anyhow::Result<()> {
     if collected_gpus == 0 {
         anyhow::bail!(
-            "0 GPUs collected — cannot profile without GPU telemetry. Check NVML/driver."
+            "0 GPUs collected - cannot profile without GPU telemetry. Check NVML/driver."
         );
     }
     if let Some(tp_val) = tp {

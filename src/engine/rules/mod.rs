@@ -11,6 +11,7 @@ mod r2_kv_cache_pressure;
 mod r3_low_prefix_reuse;
 mod r4_oom_risk;
 mod r5_concurrency_saturation;
+mod r6_prefill_bound;
 
 pub use r1_under_batching::{
     R1MissReport, Rule1Outcome, UnderBatchingDetail, r1_recommendation, r1_verbose_miss_line,
@@ -26,6 +27,9 @@ pub use r3_low_prefix_reuse::{
 pub use r4_oom_risk::{r4_advisory, r4_recommendation};
 pub use r5_concurrency_saturation::{
     ConcurrencySaturationDetail, r5_recommendation, rule5_concurrency_saturation,
+};
+pub use r6_prefill_bound::{
+    PrefillBoundDetail, Rule6Outcome, r6_recommendation, r6_verbose_miss_line,
 };
 
 use r1_under_batching::{
@@ -43,6 +47,11 @@ use r3_low_prefix_reuse::{aggregate_r3_detail, format_low_prefix_window_issue};
 use r5_concurrency_saturation::{
     aggregate_concurrency_saturation_detail, format_concurrency_saturation_window_issue, r5_action,
     r5_short_action,
+};
+use r6_prefill_bound::{
+    aggregate_r6_detail, confidence as r6_confidence, evaluate as r6_evaluate,
+    format_prefill_bound_window_issue, impact as r6_impact,
+    prefill_fix_lines as r6_prefill_fix_lines, severity as r6_severity,
 };
 
 pub(super) const MAX_OBSERVATION_SKEW_SECS: f64 = 1.0;
@@ -78,7 +87,7 @@ pub(super) fn push_model_len_shrink_suggestion(
             return;
         };
         let suggested = (pp as u32).saturating_add(gp as u32);
-        // Suppress if reduction is < 5% — not a meaningful change (avoids "5464 → 5465" no-ops)
+        // Suppress if reduction is < 5% - not a meaningful change (avoids "5464 → 5465" no-ops)
         if suggested >= m.saturating_sub(m / 20) {
             return;
         }
@@ -101,6 +110,7 @@ pub(super) fn compute_kv_max_seqs(
     max_model_len: Option<u32>,
     model: &crate::context::ModelArch,
     kv_cache_dtype: Option<&str>,
+    tp: Option<u32>,
 ) -> Option<u32> {
     use crate::engine::baseline::{kv_bytes_per_element, kv_max_concurrent_seqs};
     let headroom = kv_headroom_gb?;
@@ -108,12 +118,15 @@ pub(super) fn compute_kv_max_seqs(
     let num_layers = model.num_kv_layers.or(model.num_layers)?;
     let num_kv_heads = model.num_kv_heads?;
     let head_dim = model.head_dim?;
+    let sharded_kv_heads = tp
+        .map(|t| num_kv_heads / num_kv_heads.min(t))
+        .unwrap_or(num_kv_heads);
     let kv_bpp = kv_bytes_per_element(kv_cache_dtype, 2);
     kv_max_concurrent_seqs(
         headroom,
         max_len,
         num_layers,
-        num_kv_heads,
+        sharded_kv_heads,
         head_dim,
         kv_bpp,
     )
@@ -179,7 +192,7 @@ impl IssueGroup {
 
 const NO_ISSUES_LINE: &str = "No issues detected in this snapshot.";
 
-/// Canonical `Recommendation.rule_name` values — single source of truth for DAG + output coupling.
+/// Canonical `Recommendation.rule_name` values - single source of truth for DAG + output coupling.
 pub mod rule_names {
     pub const UNDER_BATCHING: &str = "under_batching";
     pub const KV_CACHE_PRESSURE: &str = "kv_cache_pressure";
@@ -187,9 +200,10 @@ pub mod rule_names {
     pub const OOM_RISK: &str = "oom_risk";
     pub const CONCURRENCY_SATURATION: &str = "concurrency_saturation";
     pub const LOW_PREFIX_REUSE: &str = "low_prefix_reuse";
+    pub const PREFILL_BOUND: &str = "prefill_bound";
     pub const MASSIVE_UNDERUTILIZATION: &str = "massive_underutilization";
 
-    /// Human-readable label for a rule name — used in journey UI output.
+    /// Human-readable label for a rule name - used in journey UI output.
     pub fn display_name(rule_name: &str) -> &str {
         match rule_name {
             UNDER_BATCHING => "Under-batching",
@@ -198,6 +212,7 @@ pub mod rule_names {
             OOM_RISK => "OOM Risk",
             CONCURRENCY_SATURATION => "Concurrency Saturation",
             LOW_PREFIX_REUSE => "Low Prefix Reuse",
+            PREFILL_BOUND => "Prefill-Bound",
             MASSIVE_UNDERUTILIZATION => "Massive Under-utilization",
             _ => rule_name,
         }
@@ -207,6 +222,7 @@ pub mod rule_names {
 const SUPPRESSION_TABLE: &[(&str, &str)] = &[
     (rule_names::OOM_RISK, rule_names::KV_CACHE_PRESSURE),
     (rule_names::OOM_RISK, rule_names::KV_ADMISSION_BACKLOG),
+    (rule_names::UNDER_BATCHING, rule_names::PREFILL_BOUND),
 ];
 
 const KV_RULE_NAMES: &[&str] = &[
@@ -237,6 +253,10 @@ const NOT_TRIGGERED_SINGLES: &[NotTriggeredRule] = &[
     NotTriggeredRule {
         rule_name: rule_names::LOW_PREFIX_REUSE,
         label: "Low prefix reuse",
+    },
+    NotTriggeredRule {
+        rule_name: rule_names::PREFILL_BOUND,
+        label: "Prefill-bound",
     },
 ];
 
@@ -362,6 +382,7 @@ pub(super) fn waste_label_suffix(rule_names_list: &[&str]) -> Option<&'static st
             rule_names::UNDER_BATCHING => Some("wasted on idle compute"),
             rule_names::KV_CACHE_PRESSURE => Some("lost to memory thrashing"),
             rule_names::LOW_PREFIX_REUSE => Some("wasted on redundant prefill"),
+            rule_names::PREFILL_BOUND => Some("lost to prefill interference"),
             rule_names::CONCURRENCY_SATURATION => Some("lost to scheduler queuing"),
             _ => Some("unclassified overhead"),
         },
@@ -419,6 +440,7 @@ fn append_not_triggered_lines(
     rules: &[&NotTriggeredRule],
     verbose_rules: bool,
     r1_context: Option<(&RawSnapshot, Option<u32>, Option<f64>)>,
+    baseline: Option<&PhysicsBaseline>,
 ) {
     if rules.is_empty() {
         return;
@@ -434,6 +456,12 @@ fn append_not_triggered_lines(
                 }
                 None => format!("{}: not triggered", rule.label),
             }
+        } else if rule.rule_name == rule_names::PREFILL_BOUND && verbose_rules {
+            r6_verbose_miss_line(
+                baseline.and_then(|b| b.prefill_time_fraction),
+                baseline.and_then(|b| b.efficiency_pct),
+            )
+            .unwrap_or_else(|| format!("{}: not triggered", rule.label))
         } else {
             format!("{}: not triggered", rule.label)
         };
@@ -524,6 +552,7 @@ pub fn format_diagnose_rules(
                 input.ctx.config.max_num_seqs,
                 baseline_ref.and_then(|b| b.efficiency_pct),
             )),
+            baseline_ref,
         );
     }
 
@@ -551,6 +580,8 @@ struct WindowRuleEval {
     r3_details: Vec<LowPrefixReuseDetail>,
     r5_fired: usize,
     r5_details: Vec<ConcurrencySaturationDetail>,
+    r6_fired: usize,
+    r6_details: Vec<PrefillBoundDetail>,
     session_kv_peak: Option<f64>,
 }
 
@@ -574,6 +605,10 @@ impl WindowRuleEval {
     fn r5_significant(&self) -> bool {
         rule_is_significant(self.r5_fired, self.n_eval)
     }
+
+    fn r6_significant(&self) -> bool {
+        rule_is_significant(self.r6_fired, self.n_eval)
+    }
 }
 
 fn r3_display_args(snap: &VllmRawMetrics, d: &LowPrefixReuseDetail) -> (f64, Option<f64>) {
@@ -588,7 +623,7 @@ fn r3_display_args(snap: &VllmRawMetrics, d: &LowPrefixReuseDetail) -> (f64, Opt
 }
 
 pub(crate) fn aggregate_prefix_hit_rate_for_windows(windows: &[RuntimeWindow]) -> Option<f64> {
-    // Average hit rate across ALL evaluable windows — not just windows where r3
+    // Average hit rate across ALL evaluable windows - not just windows where r3
     // fired. Filtering by rule outcome biases the result low: high-performing
     // windows (hit_rate above threshold, r3 silent) would be excluded.
     let (sum, count) = windows
@@ -627,6 +662,8 @@ fn eval_window_rules(
         r3_details: Vec::new(),
         r5_fired: 0,
         r5_details: Vec::new(),
+        r6_fired: 0,
+        r6_details: Vec::new(),
         session_kv_peak: None,
     };
 
@@ -686,6 +723,22 @@ fn eval_window_rules(
             eval.r5_fired += 1;
             eval.r5_details.push(d);
         }
+
+        let win_input = AnalysisInput::new(summary.ctx, w);
+        let win_baseline = baseline::compute(&win_input);
+        match r6_evaluate(
+            win_baseline.as_ref().and_then(|b| b.prefill_time_fraction),
+            win_baseline.as_ref().and_then(|b| b.efficiency_pct),
+            win_baseline.as_ref().and_then(|b| b.prefill_efficiency_pct),
+            snap,
+            summary.ctx.config.enable_chunked_prefill,
+        ) {
+            Rule6Outcome::Fired(d) => {
+                eval.r6_fired += 1;
+                eval.r6_details.push(d);
+            }
+            Rule6Outcome::NotFired => {}
+        }
     }
 
     eval.skipped = skipped;
@@ -693,7 +746,7 @@ fn eval_window_rules(
 }
 
 // session_hit_rate: all-evaluable-windows average hit rate for display in r3 recommendation body.
-// Caller must compute this from the full window slice — not from r3-fired windows only.
+// Caller must compute this from the full window slice - not from r3-fired windows only.
 // Pass None on the single-window path (no session to average).
 fn build_report_from_eval(
     eval: &WindowRuleEval,
@@ -707,6 +760,10 @@ fn build_report_from_eval(
             summary.ctx.config.max_model_len,
             &summary.ctx.model,
             summary.ctx.config.kv_cache_dtype.as_deref(),
+            effective_tensor_parallel(
+                summary.ctx.config.tensor_parallel_size,
+                summary.window.snapshot.collected_gpu_count(),
+            ),
         );
         return super::Report {
             baseline,
@@ -728,6 +785,10 @@ fn build_report_from_eval(
         max_model_len,
         &summary.ctx.model,
         summary.ctx.config.kv_cache_dtype.as_deref(),
+        effective_tensor_parallel(
+            summary.ctx.config.tensor_parallel_size,
+            summary.window.snapshot.collected_gpu_count(),
+        ),
     );
     let r2_significant = eval.r2_significant();
     let r2_backlog_significant = eval.r2_backlog_significant();
@@ -875,6 +936,25 @@ fn build_report_from_eval(
         });
     }
 
+    if eval.r6_significant() {
+        let d = aggregate_r6_detail(&eval.r6_details);
+        let sev = r6_severity(d.prefill_time_fraction);
+        let conf = r6_confidence(sev);
+        let imp = r6_impact(sev);
+        let display_lines = format_prefill_bound_window_issue(&d, pct(eval.r6_fired, eval.n_eval));
+        let (_, action, short_action, expected_impact) = r6_prefill_fix_lines(&d, sev);
+        recs.push(Recommendation {
+            rule_name: rule_names::PREFILL_BOUND,
+            layer: 5,
+            impact: imp,
+            confidence: conf,
+            action,
+            short_action,
+            expected_impact,
+            display_lines,
+        });
+    }
+
     if let Some(r4) = r4_recommendation(
         baseline.as_ref().and_then(|b| b.kv_headroom_gb),
         effective_tensor_parallel(
@@ -964,7 +1044,7 @@ pub(crate) fn finalize_report_groups(
     }
 }
 
-/// Multi-window rule evaluation — same significance gates as `format_diagnose_rules_for_windows`.
+/// Multi-window rule evaluation - same significance gates as `format_diagnose_rules_for_windows`.
 pub fn build_report_for_windows(
     windows: &[RuntimeWindow],
     summary: AnalysisInput<'_>,
@@ -1054,6 +1134,7 @@ pub fn format_diagnose_rules_for_windows(
                     summary.ctx.config.max_num_seqs,
                     report.baseline.as_ref().and_then(|b| b.efficiency_pct),
                 )),
+                report.baseline.as_ref(),
             );
         }
         if !any_advisory && !verbose_rules {
@@ -1120,6 +1201,7 @@ pub fn format_diagnose_rules_for_windows(
                 summary.ctx.config.max_num_seqs,
                 report.baseline.as_ref().and_then(|b| b.efficiency_pct),
             )),
+            report.baseline.as_ref(),
         );
     }
     if !any_warning && !any_advisory && !verbose_rules {
@@ -1221,17 +1303,61 @@ mod tests {
         };
         // 2^34 byte budget → integer-clean seq counts at 4096 ctx (20 GB truncates to 37 vs 36)
         let headroom_gb = (1u64 << 34) as f64 / 1e9;
-        let with_kv_layers = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &hybrid, None);
+        let with_kv_layers =
+            compute_kv_max_seqs(Some(headroom_gb), Some(4096), &hybrid, None, None);
 
         let dense = crate::context::ModelArch {
             num_kv_layers: None, // pure-attention: all 64 layers count
             ..hybrid
         };
-        let without_kv_layers = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &dense, None);
+        let without_kv_layers =
+            compute_kv_max_seqs(Some(headroom_gb), Some(4096), &dense, None, None);
 
         assert!(with_kv_layers.is_some() && without_kv_layers.is_some());
         // 32 KV layers → half the bytes per token → fits 2× as many seqs
         assert_eq!(with_kv_layers.unwrap(), without_kv_layers.unwrap() * 2);
+    }
+
+    #[test]
+    fn compute_kv_max_seqs_tp2_doubles_capacity() {
+        let model = crate::context::ModelArch {
+            num_kv_heads: Some(8),
+            head_dim: Some(128),
+            num_layers: Some(32),
+            ..Default::default()
+        };
+        let headroom_gb = 20.0;
+        let tp1 = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &model, None, Some(1));
+        let tp2 = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &model, None, Some(2));
+        assert_eq!(tp2.unwrap(), tp1.unwrap() * 2);
+    }
+
+    #[test]
+    fn compute_kv_max_seqs_tp_greater_than_kv_heads_no_benefit() {
+        let model = crate::context::ModelArch {
+            num_kv_heads: Some(2),
+            head_dim: Some(128),
+            num_layers: Some(32),
+            ..Default::default()
+        };
+        let headroom_gb = 20.0;
+        let tp2 = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &model, None, Some(2));
+        let tp4 = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &model, None, Some(4));
+        assert_eq!(tp2, tp4);
+    }
+
+    #[test]
+    fn compute_kv_max_seqs_tp_none_uses_full_heads() {
+        let model = crate::context::ModelArch {
+            num_kv_heads: Some(8),
+            head_dim: Some(128),
+            num_layers: Some(32),
+            ..Default::default()
+        };
+        let headroom_gb = 20.0;
+        let none = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &model, None, None);
+        let one = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &model, None, Some(1));
+        assert_eq!(none, one);
     }
 
     fn mk_win(s: RawSnapshot) -> RuntimeWindow {
@@ -2439,7 +2565,7 @@ mod tests {
             text.contains("[!] Concurrency Saturation"),
             "expected r5: {text}"
         );
-        // Fix line uses summary snapshot KV (50%) for branch selection — scale-out, not session peak.
+        // Fix line uses summary snapshot KV (50%) for branch selection - scale-out, not session peak.
         assert!(
             text.contains("Raise --max-num-seqs above 32"),
             "expected raise-cap fix from summary KV: {text}"
@@ -2535,6 +2661,8 @@ mod tests {
             tpot_floor_ms: 10.0,
             prefill_latency_floor_ms: None,
             ridge_batch_size: 1.0,
+            prefill_efficiency_pct: None,
+            prefill_time_fraction: None,
             cost: Some(CostEstimate {
                 tok_per_watt: None,
                 joules_per_token: None,
@@ -2771,5 +2899,137 @@ mod tests {
             "    ",
         );
         assert!(lines.is_empty());
+    }
+
+    fn mk_llama8b_h100_ctx(s: &RawSnapshot) -> StaticContext {
+        let cfg = VllmConfig {
+            dtype: Some("bf16".to_string()),
+            max_model_len: Some(8192),
+            max_num_seqs: Some(256),
+            ..Default::default()
+        };
+        StaticContext::from_snapshot(s, cfg)
+    }
+
+    fn mk_r6_prefill_window(prefill_fraction: f64, tps: f64, running: f64) -> RuntimeWindow {
+        use crate::collectors::HistogramWindowMass;
+        let t = SystemTime::UNIX_EPOCH;
+        let mut v = vllm_base();
+        v.model_name = Some("meta-llama/Llama-3.1-8B-Instruct".to_string());
+        v.generation_tokens_per_sec = Some(tps);
+        v.num_requests_running = Some(running);
+        v.num_requests_waiting = Some(0.0);
+        let window_secs = 2.0;
+        let mean_prefill = prefill_fraction * window_secs;
+        v.prefill_window_mass = Some(HistogramWindowMass {
+            sum_delta: mean_prefill * 4.0,
+            count_delta: 4.0,
+        });
+        v.window_duration_secs = Some(window_secs);
+        v.prompt_tokens_mean = Some(2048.0);
+        v.cache_config.enable_prefix_caching = Some(false);
+        let mut g = gpu_busy();
+        g.gpu_name = Some("NVIDIA H100 80GB HBM3".to_string());
+        mk_win(snap(t, t, v, g))
+    }
+
+    #[test]
+    fn r6_suppressed_when_r1_fires() {
+        let windows: Vec<_> = (0..10)
+            .map(|_| mk_r6_prefill_window(0.35, 10.0, 5.0))
+            .collect();
+        let s = windows[0].snapshot.clone();
+        let ctx = mk_llama8b_h100_ctx(&s);
+        let summary = ai(&ctx, windows.last().expect("windows"));
+        let report = build_report_for_windows(&windows, summary);
+        assert!(
+            report
+                .groups
+                .iter()
+                .any(|g| g.primary.rule_name == rule_names::UNDER_BATCHING)
+        );
+        assert!(report.suppressed_rules.contains(&rule_names::PREFILL_BOUND));
+    }
+
+    #[test]
+    fn r6_fires_when_r1_prefill_gate_suppresses_r1() {
+        let windows: Vec<_> = (0..10)
+            .map(|_| mk_r6_prefill_window(0.55, 10.0, 5.0))
+            .collect();
+        let s = windows[0].snapshot.clone();
+        let ctx = mk_llama8b_h100_ctx(&s);
+        let summary = ai(&ctx, windows.last().expect("windows"));
+        let report = build_report_for_windows(&windows, summary);
+        assert!(
+            report
+                .groups
+                .iter()
+                .any(|g| g.primary.rule_name == rule_names::PREFILL_BOUND)
+        );
+    }
+
+    #[test]
+    fn r6_not_primary_when_r2_outscores() {
+        let mut windows: Vec<_> = (0..10)
+            .map(|_| mk_r6_prefill_window(0.55, 10.0, 50.0))
+            .collect();
+        for w in windows.iter_mut().take(4) {
+            *w = mk_evaluable_kv_window(89.0, true);
+        }
+        let s = windows[0].snapshot.clone();
+        let ctx = mk_llama8b_h100_ctx(&s);
+        let summary = ai(&ctx, windows.last().expect("windows"));
+        let report = build_report_for_windows(&windows, summary);
+        assert!(
+            report
+                .groups
+                .iter()
+                .any(|g| g.primary.rule_name == rule_names::KV_CACHE_PRESSURE)
+        );
+        assert!(
+            !report
+                .groups
+                .iter()
+                .any(|g| g.primary.rule_name == rule_names::PREFILL_BOUND)
+        );
+    }
+
+    #[test]
+    fn r6_fires_as_primary_when_no_other_rules() {
+        let windows: Vec<_> = (0..10)
+            .map(|_| mk_r6_prefill_window(0.55, 10.0, 50.0))
+            .collect();
+        let s = windows[0].snapshot.clone();
+        let ctx = mk_llama8b_h100_ctx(&s);
+        let summary = ai(&ctx, windows.last().expect("windows"));
+        let report = build_report_for_windows(&windows, summary);
+        assert_eq!(
+            report.groups[0].primary.rule_name,
+            rule_names::PREFILL_BOUND
+        );
+    }
+
+    #[test]
+    fn r6_verbose_miss_line_when_not_triggered() {
+        let t = SystemTime::UNIX_EPOCH;
+        let mut v = vllm_base();
+        v.model_name = Some("meta-llama/Llama-3.1-8B-Instruct".to_string());
+        v.num_requests_running = Some(50.0);
+        v.generation_tokens_per_sec = Some(10.0);
+        v.prefill_window_mass = Some(crate::collectors::HistogramWindowMass {
+            sum_delta: 0.44,
+            count_delta: 2.0,
+        });
+        v.window_duration_secs = Some(2.0);
+        let mut g = gpu_busy();
+        g.gpu_name = Some("NVIDIA H100 80GB HBM3".to_string());
+        let s = snap(t, t, v, g);
+        let ctx = mk_llama8b_h100_ctx(&s);
+        let win = mk_win(s);
+        let text =
+            format_diagnose_rules_test(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics")
+                .join("\n");
+        assert!(text.contains("Prefill-bound: not triggered"));
+        assert!(text.contains("below 30% threshold"));
     }
 }

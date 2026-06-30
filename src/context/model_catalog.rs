@@ -20,7 +20,7 @@ pub struct CatalogEntry {
     /// Number of KV heads (num_key_value_heads from config.json).
     /// None for MLA (DeepSeek V3/R1), interleaved attention (Llama 4), or any
     /// architecture where per-head KV semantics don't apply.
-    /// Hybrid models (Qwen3.6) set this field — use num_kv_layers to restrict to
+    /// Hybrid models (Qwen3.6) set this field. Use num_kv_layers to restrict to
     /// attention-only layers.
     pub num_kv_heads: Option<u32>,
     /// KV cache head dimension in elements. Separate from hidden_dim/num_heads
@@ -31,6 +31,11 @@ pub struct CatalogEntry {
     /// interleaved models) where only a subset of layers use KV cache.
     /// None → fall back to num_layers in KV math (correct for pure-attention models).
     pub num_kv_layers: Option<u32>,
+    /// Pre-computed per-layer attention FLOPs coefficient for the quadratic seq_len² term.
+    /// Total attention FLOPs = attn_flops_coeff × num_layers × seq_len².
+    /// None → standard MHA/GQA: use 2 × hidden_dim.
+    /// Some(0) → architecture has no quadratic attention term (skip correction).
+    pub attn_flops_coeff: Option<u64>,
 }
 
 struct ModelEntry {
@@ -44,6 +49,7 @@ const B: u64 = 1_000_000_000;
 static CATALOG: &[ModelEntry] = &[
     // ── Llama 4 ──────────────────────────────────────────────────────────────
     // Interleaved attention architecture: standard KV formula doesn't apply.
+    // TODO: Interleaved attention: layer-level breakdown needed for accurate prefill ceiling.
     // Maverick: 17B active / 400B total MoE
     ModelEntry {
         tokens: &["llama", "4", "maverick"],
@@ -58,6 +64,7 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_heads: None,
             head_dim: None,
             num_kv_layers: None,
+            attn_flops_coeff: Some(0),
         },
     },
     // Scout: 17B active / 109B total MoE
@@ -74,9 +81,10 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_heads: None,
             head_dim: None,
             num_kv_layers: None,
+            attn_flops_coeff: Some(0),
         },
     },
-    // ── Nemotron (before generic llama entries — names contain "llama" + size) ─
+    // ── Nemotron (before generic llama entries, names contain "llama" + size) ─
     ModelEntry {
         tokens: &["nemotron", "70b"],
         entry: CatalogEntry {
@@ -90,6 +98,7 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_heads: Some(8),
             head_dim: Some(128),
             num_kv_layers: None,
+            attn_flops_coeff: None,
         },
     },
     ModelEntry {
@@ -105,6 +114,7 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_heads: Some(8),
             head_dim: Some(128),
             num_kv_layers: None,
+            attn_flops_coeff: None,
         },
     },
     // ── Llama 3.x ────────────────────────────────────────────────────────────
@@ -123,6 +133,7 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_heads: Some(8),
             head_dim: Some(128),
             num_kv_layers: None,
+            attn_flops_coeff: None,
         },
     },
     ModelEntry {
@@ -138,6 +149,7 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_heads: Some(8),
             head_dim: Some(128),
             num_kv_layers: None,
+            attn_flops_coeff: None,
         },
     },
     ModelEntry {
@@ -153,6 +165,7 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_heads: Some(8),
             head_dim: Some(128),
             num_kv_layers: None,
+            attn_flops_coeff: None,
         },
     },
     // ── Qwen 3 MoE ───────────────────────────────────────────────────────────
@@ -169,9 +182,10 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_heads: Some(4),
             head_dim: Some(128),
             num_kv_layers: None,
+            attn_flops_coeff: None,
         },
     },
-    // Qwen3-30B-A3B: unusual hidden_dim=2048 for a 30B MoE — KV formula unreliable.
+    // Qwen3-30B-A3B: unusual hidden_dim=2048 for a 30B MoE. KV formula unreliable.
     ModelEntry {
         tokens: &["qwen3", "30b"],
         entry: CatalogEntry {
@@ -185,13 +199,14 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_heads: None,
             head_dim: None,
             num_kv_layers: None,
+            attn_flops_coeff: None,
         },
     },
     // ── Qwen 3.6 dense / hybrid ──────────────────────────────────────────────
     // (Qwen3.6 35B entry removed: no official release)
-    // Before generic qwen3 size entries — "7b" is a substring of "27b".
+    // Before generic qwen3 size entries, "7b" is a substring of "27b".
     // Released April 2026. Dense 27B; hybrid gated-DeltaNet + attention blocks.
-    // Only attention layers use KV cache — standard num_layers formula overstates.
+    // Only attention layers use KV cache. Standard num_layers formula overstates.
     ModelEntry {
         tokens: &["qwen3.6", "27b"],
         entry: CatalogEntry {
@@ -205,6 +220,7 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_heads: Some(8),
             head_dim: Some(128),
             num_kv_layers: Some(32), // 64 total layers, 50/50 DeltaNet/attention split
+            attn_flops_coeff: None,
         },
     },
     // ── Qwen 3 dense ─────────────────────────────────────────────────────────
@@ -221,6 +237,7 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_heads: Some(8),
             head_dim: Some(128),
             num_kv_layers: None,
+            attn_flops_coeff: None,
         },
     },
     ModelEntry {
@@ -236,6 +253,7 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_heads: Some(8),
             head_dim: Some(128),
             num_kv_layers: None,
+            attn_flops_coeff: None,
         },
     },
     ModelEntry {
@@ -251,6 +269,7 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_heads: Some(8),
             head_dim: Some(128),
             num_kv_layers: None,
+            attn_flops_coeff: None,
         },
     },
     ModelEntry {
@@ -266,6 +285,7 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_heads: Some(4),
             head_dim: Some(128),
             num_kv_layers: None,
+            attn_flops_coeff: None,
         },
     },
     // ── Qwen 2.5 dense ───────────────────────────────────────────────────────
@@ -282,6 +302,7 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_heads: Some(8),
             head_dim: Some(128),
             num_kv_layers: None,
+            attn_flops_coeff: None,
         },
     },
     ModelEntry {
@@ -297,6 +318,7 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_heads: Some(8),
             head_dim: Some(128),
             num_kv_layers: None,
+            attn_flops_coeff: None,
         },
     },
     ModelEntry {
@@ -312,6 +334,7 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_heads: Some(8),
             head_dim: Some(128),
             num_kv_layers: None,
+            attn_flops_coeff: None,
         },
     },
     ModelEntry {
@@ -327,6 +350,7 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_heads: Some(4),
             head_dim: Some(128),
             num_kv_layers: None,
+            attn_flops_coeff: None,
         },
     },
     // ── DeepSeek V3 / R1 ─────────────────────────────────────────────────────
@@ -346,6 +370,7 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_heads: None,
             head_dim: None,
             num_kv_layers: None,
+            attn_flops_coeff: Some(139_264),
         },
     },
     // R1 without size token defaults to 671B
@@ -362,6 +387,7 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_heads: None,
             head_dim: None,
             num_kv_layers: None,
+            attn_flops_coeff: Some(139_264),
         },
     },
     // V3 without size token defaults to 671B
@@ -378,6 +404,7 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_heads: None,
             head_dim: None,
             num_kv_layers: None,
+            attn_flops_coeff: Some(139_264),
         },
     },
     ModelEntry {
@@ -393,6 +420,7 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_heads: None,
             head_dim: None,
             num_kv_layers: None,
+            attn_flops_coeff: Some(69_632),
         },
     },
     ModelEntry {
@@ -408,6 +436,7 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_heads: None,
             head_dim: None,
             num_kv_layers: None,
+            attn_flops_coeff: Some(34_816),
         },
     },
     // ── Mistral Large 3 ──────────────────────────────────────────────────────
@@ -425,6 +454,7 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_heads: Some(8),
             head_dim: Some(128),
             num_kv_layers: None,
+            attn_flops_coeff: None,
         },
     },
     // 123B dense
@@ -441,9 +471,10 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_heads: Some(8),
             head_dim: Some(128),
             num_kv_layers: None,
+            attn_flops_coeff: None,
         },
     },
-    // Mistral Large without explicit size — 123B default
+    // Mistral Large without explicit size, 123B default
     ModelEntry {
         tokens: &["mistral", "large"],
         entry: CatalogEntry {
@@ -457,10 +488,11 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_heads: Some(8),
             head_dim: Some(128),
             num_kv_layers: None,
+            attn_flops_coeff: None,
         },
     },
     // ── Mixtral MoE ──────────────────────────────────────────────────────────
-    // 8x22B — 141B total, ~39B active
+    // 8x22B: 141B total, ~39B active
     ModelEntry {
         tokens: &["mixtral", "8x22b"],
         entry: CatalogEntry {
@@ -474,9 +506,10 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_heads: Some(8),
             head_dim: Some(128),
             num_kv_layers: None,
+            attn_flops_coeff: None,
         },
     },
-    // 8x7B — 47B total, ~13B active
+    // 8x7B: 47B total, ~13B active
     ModelEntry {
         tokens: &["mixtral", "8x7b"],
         entry: CatalogEntry {
@@ -490,6 +523,7 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_heads: Some(8),
             head_dim: Some(128),
             num_kv_layers: None,
+            attn_flops_coeff: None,
         },
     },
     // ── Mistral 7B dense ─────────────────────────────────────────────────────
@@ -506,13 +540,14 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_heads: Some(8),
             head_dim: Some(128),
             num_kv_layers: None,
+            attn_flops_coeff: None,
         },
     },
     // ── Gemma 2 / 3 / 4 ──────────────────────────────────────────────────────
     // Gemma 4 flagship: Google markets as "27B"; actual param count ~31B.
     // Two token entries cover both HuggingFace name ("gemma-4-27b-it") and
     // quantized GGUFs ("gemma-4-31b-it-bf16.gguf"). Both must appear before
-    // the Gemma 2 27B entry — otherwise "gemma-4-27b-it" falls through and
+    // the Gemma 2 27B entry, otherwise "gemma-4-27b-it" falls through and
     // matches Gemma 2 27B (wrong arch params).
     // KV architecture non-standard (per-token head quantization): num_kv_heads = None.
     ModelEntry {
@@ -528,6 +563,7 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_heads: None,
             head_dim: None,
             num_kv_layers: None,
+            attn_flops_coeff: None,
         },
     },
     ModelEntry {
@@ -543,6 +579,7 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_heads: None,
             head_dim: None,
             num_kv_layers: None,
+            attn_flops_coeff: None,
         },
     },
     // Gemma 4 26B-A4B MoE
@@ -559,6 +596,7 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_heads: None,
             head_dim: None,
             num_kv_layers: None,
+            attn_flops_coeff: None,
         },
     },
     // Gemma 2 27B: head_dim=128, 32 attn heads, 16 KV heads.
@@ -575,6 +613,7 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_heads: Some(16),
             head_dim: Some(128),
             num_kv_layers: None,
+            attn_flops_coeff: None,
         },
     },
     // Gemma 2 9B: head_dim=256 (larger than typical), 16 attn heads, 8 KV heads.
@@ -591,6 +630,7 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_heads: Some(8),
             head_dim: Some(256),
             num_kv_layers: None,
+            attn_flops_coeff: None,
         },
     },
     // ── Kimi K2.5 ────────────────────────────────────────────────────────────
@@ -608,6 +648,7 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_heads: None,
             head_dim: None,
             num_kv_layers: None,
+            attn_flops_coeff: None,
         },
     },
     // ── GLM-5 / 5.1 MoE ──────────────────────────────────────────────────────
@@ -625,6 +666,7 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_heads: None,
             head_dim: None,
             num_kv_layers: None,
+            attn_flops_coeff: None,
         },
     },
     // 32B dense variant; KV architecture unconfirmed.
@@ -641,10 +683,11 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_heads: None,
             head_dim: None,
             num_kv_layers: None,
+            attn_flops_coeff: None,
         },
     },
     // ── Phi-4 ────────────────────────────────────────────────────────────────
-    // (Phi-4 32B phantom entry removed — no official release at this size)
+    // (Phi-4 32B phantom entry removed, no official release at this size)
     // Phi-4 14B: 40 attn heads, 10 KV heads (GQA 4:1), head_dim=128.
     ModelEntry {
         tokens: &["phi", "4", "14b"],
@@ -659,9 +702,10 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_heads: Some(10),
             head_dim: Some(128),
             num_kv_layers: None,
+            attn_flops_coeff: None,
         },
     },
-    // Phi-4 without explicit size — 14B default
+    // Phi-4 without explicit size, 14B default
     ModelEntry {
         tokens: &["phi", "4"],
         entry: CatalogEntry {
@@ -675,6 +719,7 @@ static CATALOG: &[ModelEntry] = &[
             num_kv_heads: Some(10),
             head_dim: Some(128),
             num_kv_layers: None,
+            attn_flops_coeff: None,
         },
     },
 ];
@@ -836,7 +881,7 @@ mod tests {
 
     #[test]
     fn gemma_4_27b_hf_name() {
-        // Google's HuggingFace name — must NOT fall through to Gemma 2 27B.
+        // Google's HuggingFace name, must NOT fall through to Gemma 2 27B.
         let e = lookup_model("google/gemma-4-pt-27b-it").expect("no match");
         assert_eq!(e.family, "gemma4");
         assert_eq!(e.param_count, 31 * B);
@@ -877,5 +922,38 @@ mod tests {
         // A hypothetical "Llama-4-70B" (no Scout/Maverick) must NOT match as
         // llama3. Before the "3" token guard this would have returned llama3.
         assert!(lookup_model("meta-llama/Llama-4-70B-Instruct").is_none());
+    }
+
+    #[test]
+    fn standard_models_have_no_attn_flops_coeff() {
+        for name in [
+            "meta-llama/Llama-3-8B",
+            "Qwen/Qwen2.5-72B",
+            "mistralai/Mistral-7B",
+        ] {
+            let e = lookup_model(name).expect("catalog hit");
+            assert!(
+                e.attn_flops_coeff.is_none(),
+                "{name} should use standard hidden_dim path"
+            );
+        }
+    }
+
+    #[test]
+    fn deepseek_v3_has_mla_coeff() {
+        let e = lookup_model("deepseek-ai/DeepSeek-V3").expect("catalog hit");
+        assert_eq!(e.attn_flops_coeff, Some(139_264));
+    }
+
+    #[test]
+    fn deepseek_r1_has_mla_coeff() {
+        let e = lookup_model("deepseek-ai/DeepSeek-R1").expect("catalog hit");
+        assert_eq!(e.attn_flops_coeff, Some(139_264));
+    }
+
+    #[test]
+    fn llama4_has_zero_coeff() {
+        let e = lookup_model("meta-llama/Llama-4-Maverick-17B-128E-Instruct").expect("catalog hit");
+        assert_eq!(e.attn_flops_coeff, Some(0));
     }
 }
