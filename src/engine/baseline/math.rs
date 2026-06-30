@@ -1,8 +1,29 @@
 /// Conservative activation memory buffer vLLM reserves inside the allocated VRAM block.
 pub const ACTIVATION_KV_BUFFER_GB: f64 = 3.0;
 
-pub fn prefill_ceiling_tps(peak_flops_tc_tflops: f64, param_count: u64, seq_len: u32) -> f64 {
-    (peak_flops_tc_tflops * 1e12_f64) / (2.0 * param_count as f64 * seq_len as f64)
+/// Prefill operations per second at the compute ceiling.
+///
+/// Accounts for both linear layer FLOPs (2 × params × seq_len) and
+/// quadratic attention FLOPs (coeff × num_layers × seq_len²).
+///
+/// `attn_coeff`: per-layer attention FLOPs coefficient for the seq_len² term.
+///   Standard MHA/GQA: 2 × hidden_dim.
+///   Non-standard (MLA, interleaved): architecture-specific value from catalog.
+///   0 → skip attention correction (linear-only fallback).
+pub fn prefill_ops_per_sec(
+    peak_flops_tc_tflops: f64,
+    param_count: u64,
+    seq_len: u32,
+    num_layers: u32,
+    attn_coeff: u64,
+) -> f64 {
+    let linear = 2.0 * param_count as f64 * seq_len as f64;
+    let attention = attn_coeff as f64 * num_layers as f64 * (seq_len as f64).powi(2);
+    let total_flops = linear + attention;
+    if total_flops == 0.0 {
+        return f64::INFINITY;
+    }
+    (peak_flops_tc_tflops * 1e12) / total_flops
 }
 
 pub fn decode_ceiling_tps(peak_bw_gbps: f64, param_count: u64, bits_per_param: u8) -> f64 {
@@ -46,7 +67,7 @@ pub fn kv_bytes_per_element(kv_cache_dtype: Option<&str>, weight_bytes: u8) -> u
 /// Formula: `kv_budget_bytes / (max_model_len × 2 × num_layers × num_kv_heads × head_dim × bytes_per_elem)`
 ///
 /// Returns `None` if any input is zero or the budget is too small for even one sequence.
-/// This is an upper bound — vLLM block fragmentation may reduce it slightly in practice.
+/// This is an upper bound - vLLM block fragmentation may reduce it slightly in practice.
 pub fn kv_max_concurrent_seqs(
     kv_headroom_gb: f64,
     max_model_len: u32,
@@ -88,10 +109,61 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prefill_happy_path() {
-        let tps = prefill_ceiling_tps(67.0, 70_000_000_000, 2048);
-        assert!(tps.is_finite());
-        assert!((tps - 0.233_677_455_357_142_85).abs() < 1e-15);
+    fn prefill_with_attention_flops_short_context() {
+        // Llama 3 8B: 32 layers, hidden_dim=4096, attn_coeff = 2*4096 = 8192
+        let with = prefill_ops_per_sec(67.0, 8_000_000_000, 512, 32, 8192);
+        let without = prefill_ops_per_sec(67.0, 8_000_000_000, 512, 0, 0);
+        let diff_pct = ((without - with) / without) * 100.0;
+        assert!(
+            diff_pct < 1.0,
+            "at 512 tokens, attention correction should be <1%, got {diff_pct:.2}%"
+        );
+    }
+
+    #[test]
+    fn prefill_with_attention_flops_long_context() {
+        let with = prefill_ops_per_sec(67.0, 8_000_000_000, 131072, 32, 8192);
+        let without = prefill_ops_per_sec(67.0, 8_000_000_000, 131072, 0, 0);
+        assert!(
+            with < without * 0.6,
+            "at 128k, attention should reduce ceiling significantly"
+        );
+        assert!(
+            with > without * 0.2,
+            "sanity: shouldn't reduce by more than 5x"
+        );
+    }
+
+    #[test]
+    fn prefill_attn_coeff_zero_matches_linear_only() {
+        let linear = prefill_ops_per_sec(67.0, 8_000_000_000, 2048, 0, 0);
+        let zero_coeff = prefill_ops_per_sec(67.0, 8_000_000_000, 2048, 32, 0);
+        assert!((linear - zero_coeff).abs() < 1e-6);
+    }
+
+    #[test]
+    fn prefill_mla_coeff_produces_lower_ceiling_than_hidden_dim() {
+        let standard = prefill_ops_per_sec(67.0, 37_000_000_000, 4096, 61, 14336);
+        let mla = prefill_ops_per_sec(67.0, 37_000_000_000, 4096, 61, 139264);
+        assert!(mla < standard, "MLA coeff should produce lower ceiling");
+    }
+
+    #[test]
+    fn prefill_zero_param_count_returns_infinity() {
+        let tps = prefill_ops_per_sec(67.0, 0, 2048, 0, 0);
+        assert!(tps.is_infinite());
+    }
+
+    #[test]
+    fn prefill_zero_seq_len_returns_infinity() {
+        let tps = prefill_ops_per_sec(67.0, 8_000_000_000, 0, 32, 8192);
+        assert!(tps.is_infinite());
+    }
+
+    #[test]
+    fn prefill_zero_params_and_zero_coeff_returns_infinity() {
+        let tps = prefill_ops_per_sec(67.0, 0, 2048, 0, 0);
+        assert!(tps.is_infinite());
     }
 
     #[test]
@@ -104,18 +176,6 @@ mod tests {
     fn efficiency_happy_path() {
         let pct = efficiency_pct(10.0, 20.0);
         assert!((pct - 50.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn prefill_zero_param_count_returns_infinity() {
-        let tps = prefill_ceiling_tps(67.0, 0, 2048);
-        assert!(tps.is_infinite());
-    }
-
-    #[test]
-    fn prefill_zero_seq_len_returns_infinity() {
-        let tps = prefill_ceiling_tps(67.0, 70_000_000_000, 0);
-        assert!(tps.is_infinite());
     }
 
     #[test]
@@ -192,7 +252,7 @@ mod tests {
         let result = kv_max_concurrent_seqs(18.0, 8192, 80, 8, 128, 2);
         assert!(result.is_some());
         let n = result.unwrap();
-        // Llama 70B at 8192 tokens fits only a handful of seqs — expect 5–8 range
+        // Llama 70B at 8192 tokens fits only a handful of seqs - expect 5–8 range
         assert!((5..=8).contains(&n), "expected 5–8, got {n}");
     }
 
@@ -222,7 +282,7 @@ mod tests {
 
     #[test]
     fn non_finite_inputs_propagate() {
-        let nan_prefill = prefill_ceiling_tps(f64::NAN, 70_000_000_000, 2048);
+        let nan_prefill = prefill_ops_per_sec(f64::NAN, 70_000_000_000, 2048, 32, 8192);
         assert!(nan_prefill.is_nan());
 
         let inf_decode = decode_ceiling_tps(f64::INFINITY, 70_000_000_000, 16);

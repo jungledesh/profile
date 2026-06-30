@@ -253,7 +253,7 @@ fn collect_gpu_snapshots(nvml: &Nvml, host_count: u32) -> Vec<GpuSnapshot> {
 }
 
 /// Fetch model weight in GB from the vLLM `/v1/models` endpoint + catalog.
-/// Returns None on any failure — callers fall back to VRAM_ACTIVE_THRESHOLD.
+/// Returns None on any failure - callers fall back to VRAM_ACTIVE_THRESHOLD.
 fn preflight_model_weight_gb(url: &str) -> Option<f64> {
     let base = {
         let (scheme, rest) = url.split_once("://")?;
@@ -305,7 +305,7 @@ fn vram_heuristic_from_fracs_inner(
     for idx in 0..host_count {
         let frac = fracs.get(idx as usize).copied().flatten()?;
         // Physics-based threshold: weight_gb × 0.80 / host_count / gpu_vram_gb.
-        // Dividing by host_count is the worst-case (max TP) — ensures we catch
+        // Dividing by host_count is the worst-case (max TP) - ensures we catch
         // any GPU holding even a fraction of model weights.
         // Buffer of 0.80 covers catalog dtype/quantization uncertainty.
         // Falls back to VRAM_ACTIVE_THRESHOLD when model or VRAM data unavailable.
@@ -322,7 +322,7 @@ fn vram_heuristic_from_fracs_inner(
     if active.is_empty() {
         return None;
     }
-    // All GPUs active: unambiguous — only one workload can own all of them.
+    // All GPUs active: unambiguous - only one workload can own all of them.
     if active.len() == host_count as usize {
         return Some(GpuAssignment {
             tp: active.len() as u32,
@@ -332,7 +332,7 @@ fn vram_heuristic_from_fracs_inner(
     match known_tp {
         Some(tp) if active.len() != tp as usize => return None,
         // No --tp hint: auto-resolve only when exactly 1 GPU is active.
-        // Multiple active GPUs without a TP hint is ambiguous — fall through to Step 2.
+        // Multiple active GPUs without a TP hint is ambiguous - fall through to Step 2.
         None if active.len() != 1 => return None,
         _ => {}
     }
@@ -344,7 +344,7 @@ fn vram_heuristic_from_fracs_inner(
 
 /// Tiebreaker: run `ps -f -p <all GPU PIDs>`, find lines containing "vllm",
 /// map those PIDs back to GPU indices from the snapshots.
-/// More reliable than /proc socket walking — /proc/{pid}/cmdline is world-readable
+/// More reliable than /proc socket walking - /proc/{pid}/cmdline is world-readable
 /// even when /proc/{pid}/fd/ is not.
 #[cfg(target_os = "linux")]
 fn ps_tiebreaker(

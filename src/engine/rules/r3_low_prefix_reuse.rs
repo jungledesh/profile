@@ -9,7 +9,7 @@ const PREFIX_RULE_RUNNING_GT: f64 = 0.75;
 /// Minimum prompt token throughput (QPS × mean_prompt_tokens) to gate R3.
 /// Filters sparse cold-cache workloads where 0% hit rate is expected, not actionable.
 /// Covers all real use cases: chat (20 QPS × 500 tok), agents (5 QPS × 2k tok),
-/// RAG (0.5 QPS × 32k tok). Calibration constant — print live value in output for operator tuning.
+/// RAG (0.5 QPS × 32k tok). Calibration constant - print live value in output for operator tuning.
 const PREFIX_RULE_MIN_PROMPT_TPS: f64 = 1000.0;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -114,7 +114,7 @@ pub fn r3_recommendation(snapshot: &RawSnapshot) -> Option<Recommendation> {
         action,
         short_action,
         expected_impact: "Higher prefix cache hit rate and lower TTFT".to_string(),
-        // Single-window path has no session context — use hit rate from this window only.
+        // Single-window path has no session context - use hit rate from this window only.
         display_lines: format_low_prefix_hit_rate_fired(&d, enable_prefix, qps, prompt_mean, None),
     })
 }
@@ -400,7 +400,7 @@ mod tests {
 
     #[test]
     fn rag_low_qps_high_prompt_passes_gate() {
-        // 0.5 QPS × 32_000 tok = 16_000 tok/s — RAG workload passes gate
+        // 0.5 QPS × 32_000 tok = 16_000 tok/s - RAG workload passes gate
         let mut v = path_b_base_vllm();
         v.request_success_per_sec = Some(0.5);
         v.prompt_tokens_mean = Some(32_000.0);
@@ -413,7 +413,7 @@ mod tests {
 
     #[test]
     fn sparse_cold_cache_does_not_fire() {
-        // 0.003 QPS × 32_000 tok = 96 tok/s — sparse, gate stays closed
+        // 0.003 QPS × 32_000 tok = 96 tok/s - sparse, gate stays closed
         let mut v = path_b_base_vllm();
         v.request_success_per_sec = Some(0.003);
         v.prompt_tokens_mean = Some(32_000.0);

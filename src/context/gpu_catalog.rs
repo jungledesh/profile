@@ -18,7 +18,7 @@ struct GpuEntry {
 
 static CATALOG: &[GpuEntry] = &[
     // ── H100 ─────────────────────────────────────────────────────────────────
-    // PCIe before generic H100 — "pcie" is the discriminating token.
+    // PCIe before generic H100 - "pcie" is the discriminating token.
     GpuEntry {
         tokens: &["h100", "pcie"],
         entry: GpuCatalogEntry {
@@ -79,7 +79,7 @@ static CATALOG: &[GpuEntry] = &[
         tokens: &["b200"],
         entry: GpuCatalogEntry {
             arch: "blackwell",
-            peak_flops_tc_tflops: 2250.0, // BF16 Dense Tensor Core (unverified — no production B200 to test against)
+            peak_flops_tc_tflops: 2250.0, // BF16 Dense Tensor Core (unverified - no production B200 to test against)
             peak_bw_gbps: 8000.0,
         },
     },
@@ -150,16 +150,16 @@ static CATALOG: &[GpuEntry] = &[
     },
     // ── GB10 (DGX Spark) ─────────────────────────────────────────────────────
     // Grace-Blackwell Superchip: 128 GB unified LPDDR5X. BW is system-level (~273 GB/s);
-    // decode ceiling is fundamentally different from HBM parts — treat as approximate.
-    // NVML reports device name "NVIDIA GB10" — token "gb10" matches.
+    // decode ceiling is fundamentally different from HBM parts - treat as approximate.
+    // NVML reports device name "NVIDIA GB10" - token "gb10" matches.
     // BF16 Dense TC: 212.9 TFLOPS measured (mma_bf16bf16f32 via mmapeak on real hardware).
-    // The marketed "1000 TOPS" figure is FP4 2:4 sparse — not BF16 dense.
+    // The marketed "1000 TOPS" figure is FP4 2:4 sparse - not BF16 dense.
     GpuEntry {
         tokens: &["gb10"],
         entry: GpuCatalogEntry {
             arch: "blackwell",
-            peak_flops_tc_tflops: 212.9, // BF16 Dense TC — measured on production hardware
-            peak_bw_gbps: 273.0,         // LPDDR5X system BW — confirmed
+            peak_flops_tc_tflops: 212.9, // BF16 Dense TC - measured on production hardware
+            peak_bw_gbps: 273.0,         // LPDDR5X system BW - confirmed
         },
     },
     // ── A10G ─────────────────────────────────────────────────────────────────
@@ -258,7 +258,7 @@ mod tests {
 
     #[test]
     fn a100_ambiguous_returns_none() {
-        // "NVIDIA A100" with no size token — must not guess.
+        // "NVIDIA A100" with no size token - must not guess.
         assert!(lookup_gpu("NVIDIA A100").is_none());
     }
 

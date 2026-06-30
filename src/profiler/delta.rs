@@ -38,6 +38,10 @@ pub struct Delta {
     pub ttft_p95_delta_pct: Option<f64>,
     pub tpot_p95_delta_pct: Option<f64>,
     pub config_drifted: bool,
+    pub prefill_time_fraction_before: Option<f64>,
+    pub prefill_time_fraction_after: Option<f64>,
+    pub prefill_efficiency_before: Option<f64>,
+    pub prefill_efficiency_after: Option<f64>,
 }
 
 fn pct_delta(before: Option<f64>, after: Option<f64>) -> Option<f64> {
@@ -114,6 +118,23 @@ pub fn compute(
         .and_then(|b| b.cost.as_ref())
         .and_then(|c| c.joules_per_token);
 
+    let prefill_time_fraction_before = prev_report
+        .baseline
+        .as_ref()
+        .and_then(|b| b.prefill_time_fraction);
+    let prefill_time_fraction_after = curr_report
+        .baseline
+        .as_ref()
+        .and_then(|b| b.prefill_time_fraction);
+    let prefill_efficiency_before = prev_report
+        .baseline
+        .as_ref()
+        .and_then(|b| b.prefill_efficiency_pct);
+    let prefill_efficiency_after = curr_report
+        .baseline
+        .as_ref()
+        .and_then(|b| b.prefill_efficiency_pct);
+
     Delta {
         throughput_delta_pct,
         throughput_before,
@@ -142,6 +163,10 @@ pub fn compute(
         ttft_p95_delta_pct,
         tpot_p95_delta_pct,
         config_drifted,
+        prefill_time_fraction_before,
+        prefill_time_fraction_after,
+        prefill_efficiency_before,
+        prefill_efficiency_after,
     }
 }
 
@@ -215,6 +240,8 @@ mod tests {
                 tpot_floor_ms: 1.0,
                 prefill_latency_floor_ms: None,
                 ridge_batch_size: 1.0,
+                prefill_efficiency_pct: None,
+                prefill_time_fraction: None,
                 cost,
             }),
             groups: Vec::new(),

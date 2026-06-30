@@ -52,7 +52,7 @@ fn price_key_matches(norm: &str, key: &str) -> bool {
 }
 
 /// Looks up price entry by GPU name tokens (loose substring match on catalog keys).
-/// Returns None if GPU not in catalog — caller must handle gracefully.
+/// Returns None if GPU not in catalog - caller must handle gracefully.
 pub fn lookup_gpu_price(gpu_name: &str) -> Option<GpuPriceEntry> {
     let norm = gpu_catalog::normalize_gpu_name(gpu_name);
     let prices = load_prices();

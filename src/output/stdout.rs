@@ -16,7 +16,7 @@ const VLLM_LABEL_W: usize = 20;
 /// Width for GPU section labels: wide enough for `GPU [xxxxxxxx]` (14 chars) plus breathing room.
 const GPU_LABEL_W: usize = 20;
 const VLLM_LABEL_METRICS_GAP: &str = " ";
-/// Show the VRAM peak parenthetical only when it crosses 90% of total VRAM — suppresses noise
+/// Show the VRAM peak parenthetical only when it crosses 90% of total VRAM - suppresses noise
 /// from tiny fluctuations that are irrelevant to the operator.
 const VRAM_PEAK_SHOW_THRESHOLD_FRAC: f64 = 0.90;
 
@@ -289,14 +289,16 @@ fn baseline_lines(
     num_gpu_blocks: Option<u32>,
 ) -> Vec<String> {
     let Some(b) = baseline else {
-        return vec!["HW LIMITS  unavailable (model not recognized)".to_string()];
+        return vec![
+            "HW LIMITS  unavailable (model not recognized). Add model to catalog".to_string(),
+        ];
     };
 
     // Line 1: efficiency + throughput ceilings
     let mut seg1 = Vec::new();
     let eff = match b.efficiency_pct {
         Some(e) => format!("{e:.1}%"),
-        None => "—".to_string(),
+        None => "-".to_string(),
     };
     seg1.push(format!("Efficiency  {eff}"));
     if b.decode.expected >= 0.5 {
@@ -338,6 +340,17 @@ fn baseline_lines(
             "           weight dtype assumed bf16. Confirm via vLLM metrics or DTYPE env var"
                 .to_string(),
         );
+    }
+    if let Some(pe) = b.prefill_efficiency_pct {
+        out.push(format!(
+            "           Prefill efficiency  {pe:.1}%  of compute ceiling"
+        ));
+    }
+    if let Some(pt) = b.prefill_time_fraction {
+        out.push(format!(
+            "           Prefill time        ~{:.0}%   estimated GPU time",
+            pt * 100.0
+        ));
     }
     out
 }
@@ -386,7 +399,7 @@ fn gpu_gauges_line(
     let power = g
         .power_watts
         .map(|draw| format!("POWER {:.0}W", draw))
-        .unwrap_or_else(|| "POWER —".to_string());
+        .unwrap_or_else(|| "POWER -".to_string());
 
     let mut segments = vec![efficiency, power];
 
@@ -431,7 +444,7 @@ fn format_vram(g: &GpuRawMetrics) -> String {
             }
             s
         }
-        _ => "vRAM —".to_string(),
+        _ => "vRAM -".to_string(),
     }
 }
 
@@ -448,7 +461,7 @@ fn format_efficiency_label(
     if actual.is_some() && ceiling.is_some() {
         "EFFICIENCY ?".to_string()
     } else {
-        "EFFICIENCY —".to_string()
+        "EFFICIENCY -".to_string()
     }
 }
 
@@ -464,15 +477,15 @@ fn vllm_requests_value(v: &VllmRawMetrics, config_max_num_seqs: Option<u32>) -> 
                 format!("run {:.0}", rounded)
             }
         }
-        None => "run —".to_string(),
+        None => "run -".to_string(),
     };
     let wait = match v.num_requests_waiting.filter(|x| x.is_finite()) {
         Some(w) => format!("wait {:.0}", w.round()),
-        None => "wait —".to_string(),
+        None => "wait -".to_string(),
     };
     let max_seq = max_n
         .map(|n| format!("max {n}"))
-        .unwrap_or_else(|| "max —".to_string());
+        .unwrap_or_else(|| "max -".to_string());
 
     format!("{run} | {wait} | {max_seq}")
 }
@@ -489,11 +502,11 @@ fn vllm_latency_value(v: &VllmRawMetrics, verbose: bool) -> String {
     let ttft = v
         .ttft_ms
         .map(fmt_seconds_from_ms)
-        .unwrap_or_else(|| "—".to_string());
+        .unwrap_or_else(|| "-".to_string());
     let tpot = v
         .tpot_ms
         .map(fmt_seconds_from_ms)
-        .unwrap_or_else(|| "—".to_string());
+        .unwrap_or_else(|| "-".to_string());
     let ttft_p95 = v
         .ttft_p95_ms
         .map(|p| format!(" (p95 {})", fmt_seconds_from_ms(p)))
@@ -510,11 +523,11 @@ fn vllm_latency_value(v: &VllmRawMetrics, verbose: bool) -> String {
     let prefill = v
         .prefill_latency_ms
         .map(fmt_seconds_from_ms)
-        .unwrap_or_else(|| "—".to_string());
+        .unwrap_or_else(|| "-".to_string());
     let queue = v
         .queue_delay_ms
         .map(fmt_seconds_from_ms)
-        .unwrap_or_else(|| "—".to_string());
+        .unwrap_or_else(|| "-".to_string());
 
     format!("ttft {ttft}{ttft_p95} | tpot {tpot}{tpot_p95} | prefill {prefill} | queue {queue}")
 }
@@ -530,7 +543,7 @@ fn vllm_prompt_kv_fragment(v: &VllmRawMetrics) -> String {
             }
             s
         }
-        None => "kv_cache —".to_string(),
+        None => "kv_cache -".to_string(),
     }
 }
 
@@ -543,7 +556,7 @@ fn vllm_prompt_value(v: &VllmRawMetrics, verbose: bool, prefix_hit_rate: Option<
     let n = v
         .prompt_tokens_mean
         .map(fmt_tok)
-        .unwrap_or_else(|| "—".to_string());
+        .unwrap_or_else(|| "-".to_string());
     format!("{n} tok | {kv} | {cache}")
 }
 
@@ -558,28 +571,28 @@ fn fmt_tok(t: f64) -> String {
 fn vllm_throughput_value(v: &VllmRawMetrics) -> String {
     v.generation_tokens_per_sec
         .map(|t| format!("{:.0} tok/s", t))
-        .unwrap_or_else(|| "— tok/s".to_string())
+        .unwrap_or_else(|| "- tok/s".to_string())
 }
 
 fn cache_use_fragment(prefix_hit_rate: Option<f64>) -> String {
     match prefix_hit_rate {
         Some(0.0) => "pfix_cache 0%".to_string(),
         Some(r) => format!("pfix_cache {:.1}%", r * 100.0),
-        None => "pfix_cache —".to_string(),
+        None => "pfix_cache -".to_string(),
     }
 }
 
-// gpu_util_pct is intentionally not rendered — see note above gpu_gauges_line.
+// gpu_util_pct is intentionally not rendered - see note above gpu_gauges_line.
 fn gpu_detail_line(g: &GpuRawMetrics, verbose: bool) -> String {
     let mem_util = g
         .mem_util_pct
         .map(|u| format!("mem_util {:.0}%", u))
-        .unwrap_or_else(|| "mem_util —".to_string());
+        .unwrap_or_else(|| "mem_util -".to_string());
 
     let power = g
         .power_watts
         .map(|draw| format!("power {:.0}W", draw))
-        .unwrap_or_else(|| "power —".to_string());
+        .unwrap_or_else(|| "power -".to_string());
 
     let vram = format_vram(g);
 
@@ -597,16 +610,16 @@ fn gpu_detail_line(g: &GpuRawMetrics, verbose: bool) -> String {
             }
             s
         }
-        None => "temp —".to_string(),
+        None => "temp -".to_string(),
     };
     let sm = g
         .sm_clock_mhz
         .map(|c| format!("sm {}MHz", c))
-        .unwrap_or_else(|| "sm —".to_string());
+        .unwrap_or_else(|| "sm -".to_string());
     let limit = g
         .power_limit_watts
         .map(|l| format!("limit {:.0}W", l))
-        .unwrap_or_else(|| "limit —".to_string());
+        .unwrap_or_else(|| "limit -".to_string());
     format!("{mem_util} | {power} | {vram} | {temp} | {sm} | {limit}")
 }
 
@@ -615,10 +628,10 @@ fn vllm_memory_value(v: &VllmRawMetrics) -> String {
         .num_requests_swapped
         .map(fmt_gauge)
         .map(|s| format!("swapped {s}"))
-        .unwrap_or_else(|| "swapped —".to_string());
+        .unwrap_or_else(|| "swapped -".to_string());
     let cpu_cache = match v.cpu_cache_usage_perc.filter(|x| x.is_finite()) {
         Some(p) => format!("cpu_cache {:.1}%", p),
-        None => "cpu_cache —".to_string(),
+        None => "cpu_cache -".to_string(),
     };
     format!("{swapped} | {cpu_cache}")
 }
@@ -627,23 +640,23 @@ fn vllm_traffic_value(v: &VllmRawMetrics) -> String {
     let qps = v
         .request_success_per_sec
         .map(|q| format!("qps {:.1}", q))
-        .unwrap_or_else(|| "qps —".to_string());
+        .unwrap_or_else(|| "qps -".to_string());
     let req_total = v
         .request_success_total
         .map(|t| format!("req_total {:.0}", t))
-        .unwrap_or_else(|| "req_total —".to_string());
+        .unwrap_or_else(|| "req_total -".to_string());
     let gen_total = v
         .generation_tokens_total
         .map(|t| format!("gen_total {:.0}", t))
-        .unwrap_or_else(|| "gen_total —".to_string());
+        .unwrap_or_else(|| "gen_total -".to_string());
     let preempt_rate = v
         .num_preemptions_per_sec
         .map(|p| format!("preempt/s {:.2}", p))
-        .unwrap_or_else(|| "preempt/s —".to_string());
+        .unwrap_or_else(|| "preempt/s -".to_string());
     let preempt_total = v
         .num_preemptions_total
         .map(|t| format!("preempt_total {:.0}", t))
-        .unwrap_or_else(|| "preempt_total —".to_string());
+        .unwrap_or_else(|| "preempt_total -".to_string());
     format!("{qps} | {req_total} | {gen_total} | {preempt_rate} | {preempt_total}")
 }
 
@@ -652,8 +665,8 @@ fn vllm_cache_cfg_value(v: &VllmRawMetrics) -> String {
         .cache_config
         .block_size
         .map(|b| format!("block {b}"))
-        .unwrap_or_else(|| "block —".to_string());
-    let dtype = v.cache_config.cache_dtype.as_deref().unwrap_or("—");
+        .unwrap_or_else(|| "block -".to_string());
+    let dtype = v.cache_config.cache_dtype.as_deref().unwrap_or("-");
     let prefix = v
         .cache_config
         .enable_prefix_caching
@@ -683,11 +696,11 @@ fn config_parallel_value(cfg: &VllmConfig) -> String {
     let tp = cfg
         .tensor_parallel_size
         .map(|v| format!("tp {v}"))
-        .unwrap_or_else(|| "tp —".to_string());
+        .unwrap_or_else(|| "tp -".to_string());
     let pp = cfg
         .pipeline_parallel_size
         .map(|v| format!("pp {v}"))
-        .unwrap_or_else(|| "pp —".to_string());
+        .unwrap_or_else(|| "pp -".to_string());
     format!("{tp} | {pp}")
 }
 
@@ -695,22 +708,22 @@ fn config_model_value(cfg: &VllmConfig) -> String {
     let max_len = cfg
         .max_model_len
         .map(|v| format!("max_len {v}"))
-        .unwrap_or_else(|| "max_len —".to_string());
-    let dtype = cfg.dtype.as_deref().unwrap_or("—");
-    let quant = cfg.quantization.as_deref().unwrap_or("—");
+        .unwrap_or_else(|| "max_len -".to_string());
+    let dtype = cfg.dtype.as_deref().unwrap_or("-");
+    let quant = cfg.quantization.as_deref().unwrap_or("-");
     let gpu_mem = cfg
         .gpu_memory_utilization
         .map(|v| format!("gpu_mem_util {:.2}", v))
-        .unwrap_or_else(|| "gpu_mem_util —".to_string());
+        .unwrap_or_else(|| "gpu_mem_util -".to_string());
     format!("{max_len} | dtype {dtype} | quant {quant} | {gpu_mem}")
 }
 
 fn config_kv_value(cfg: &VllmConfig) -> String {
-    let kv_dtype = cfg.kv_cache_dtype.as_deref().unwrap_or("—");
+    let kv_dtype = cfg.kv_cache_dtype.as_deref().unwrap_or("-");
     let block = cfg
         .block_size
         .map(|b| format!("block {b}"))
-        .unwrap_or_else(|| "block —".to_string());
+        .unwrap_or_else(|| "block -".to_string());
     let prefix = cfg
         .enable_prefix_caching
         .map(|b| {
@@ -816,12 +829,14 @@ mod tests {
             tpot_floor_ms: 10.0,
             prefill_latency_floor_ms: Some(20.0),
             ridge_batch_size: 40.0,
+            prefill_efficiency_pct: None,
+            prefill_time_fraction: None,
             cost: None,
         };
         let lines = baseline_lines(Some(b), None, None);
         assert_eq!(
             lines[0],
-            "HW LIMITS  Efficiency  — | decode ~100 tok/s (est) | prefill ~50 tok/s (est)"
+            "HW LIMITS  Efficiency  - | decode ~100 tok/s (est) | prefill ~50 tok/s (est)"
         );
         assert!(
             lines[1].contains("prefill_floor ~20ms"),
@@ -851,6 +866,8 @@ mod tests {
             tpot_floor_ms: 10.0,
             prefill_latency_floor_ms: Some(42.0),
             ridge_batch_size: 40.0,
+            prefill_efficiency_pct: None,
+            prefill_time_fraction: None,
             cost: None,
         };
         let above = baseline_lines(Some(base()), Some(40.0), None);
@@ -888,6 +905,8 @@ mod tests {
             tpot_floor_ms: 10.0,
             prefill_latency_floor_ms: Some(200.0),
             ridge_batch_size: 40.0,
+            prefill_efficiency_pct: None,
+            prefill_time_fraction: None,
             cost: None,
         };
         let lines = baseline_lines(Some(b), Some(5.0), None);
@@ -924,6 +943,8 @@ mod tests {
             tpot_floor_ms: 10.0,
             prefill_latency_floor_ms: Some(20.0),
             ridge_batch_size: 40.0,
+            prefill_efficiency_pct: None,
+            prefill_time_fraction: None,
             cost: None,
         };
         let lines = baseline_lines(Some(b), Some(10.0), None);
@@ -941,7 +962,7 @@ mod tests {
 
     #[test]
     fn cache_use_fragment_formats_hit_rate_only() {
-        assert_eq!(cache_use_fragment(None), "pfix_cache —");
+        assert_eq!(cache_use_fragment(None), "pfix_cache -");
         assert_eq!(cache_use_fragment(Some(0.0)), "pfix_cache 0%");
         assert_eq!(cache_use_fragment(Some(0.728)), "pfix_cache 72.8%");
     }
@@ -963,6 +984,8 @@ mod tests {
             tpot_floor_ms: 10.0,
             prefill_latency_floor_ms: None,
             ridge_batch_size: 1.0,
+            prefill_efficiency_pct: None,
+            prefill_time_fraction: None,
             cost: None,
         }
     }
@@ -992,6 +1015,8 @@ mod tests {
             tpot_floor_ms: 10.0,
             prefill_latency_floor_ms: None,
             ridge_batch_size: 1.0,
+            prefill_efficiency_pct: None,
+            prefill_time_fraction: None,
             cost: Some(CostEstimate {
                 tok_per_watt,
                 joules_per_token,
@@ -1077,7 +1102,7 @@ mod tests {
         };
         let s_peak = gpu_gauges_line(&g_peak, None, None, false);
         assert!(s_peak.contains("vRAM 60/80GB (peak 78GB)"));
-        // 70/80 = 87.5% < 90% threshold — peak should be suppressed (noise, not signal)
+        // 70/80 = 87.5% < 90% threshold - peak should be suppressed (noise, not signal)
         let g_peak_below_frac = GpuRawMetrics {
             gpu_util_pct: Some(28.0),
             power_watts: Some(310.0),
@@ -1161,7 +1186,7 @@ mod tests {
             max_num_seqs: None,
             ..Default::default()
         };
-        assert_eq!(vllm_requests_value(&v, None), "run 4 | wait 0 | max —");
+        assert_eq!(vllm_requests_value(&v, None), "run 4 | wait 0 | max -");
         assert_eq!(
             vllm_requests_value(&v, Some(64)),
             "run 4 (6.2%) | wait 0 | max 64"
@@ -1245,7 +1270,7 @@ mod tests {
                 true,
                 peak_not_above_avg.prefix_cache_hit_rate
             ),
-            "18 tok | kv_cache 92.0% avg | pfix_cache —"
+            "18 tok | kv_cache 92.0% avg | pfix_cache -"
         );
         let no_kv = VllmRawMetrics {
             prompt_tokens_mean: Some(512.0),
@@ -1253,7 +1278,7 @@ mod tests {
         };
         assert_eq!(
             vllm_prompt_value(&no_kv, true, no_kv.prefix_cache_hit_rate),
-            "512 tok | kv_cache — | pfix_cache —"
+            "512 tok | kv_cache - | pfix_cache -"
         );
     }
 

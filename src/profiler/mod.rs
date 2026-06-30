@@ -20,7 +20,7 @@ pub struct DiagnoseResult {
     pub static_ctx: StaticContext,
     pub duration: Duration,
     pub started_at: SystemTime,
-    /// False when every collected window failed `window_is_evaluable` — not an under-load diagnosis.
+    /// False when every collected window failed `window_is_evaluable` - not an under-load diagnosis.
     pub any_evaluable: bool,
     /// Metrics URL passed to `diagnose` (for display when `any_evaluable` is false).
     pub metrics_input: String,
@@ -143,7 +143,7 @@ fn empty_snapshot(at: SystemTime) -> collectors::RawSnapshot {
     }
 }
 
-/// Identity fields only — no runtime gauges. Used when no window was evaluable so we do not imply an under-load diagnosis.
+/// Identity fields only - no runtime gauges. Used when no window was evaluable so we do not imply an under-load diagnosis.
 fn context_only_diagnose_snapshot(
     source: &collectors::RawSnapshot,
     at: SystemTime,
