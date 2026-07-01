@@ -34,6 +34,23 @@ pub fn efficiency_pct(actual_tps: f64, decode_ceiling: f64) -> f64 {
     (actual_tps / decode_ceiling) * 100.0
 }
 
+/// Efficiency relative to what max_num_seqs allows, not ridge.
+/// Below ridge: config_ceiling = decode_ceiling_tps * max_num_seqs.
+/// At/above ridge: config_ceiling = decode_ceiling_tps * ridge (physics cap).
+pub fn config_relative_efficiency_pct(
+    actual_tps: f64,
+    decode_ceiling_tps: f64,
+    max_num_seqs: u32,
+    ridge: f64,
+) -> f64 {
+    let effective_batch = f64::from(max_num_seqs).min(ridge);
+    let config_ceiling = decode_ceiling_tps * effective_batch;
+    if !config_ceiling.is_finite() || config_ceiling <= 0.0 {
+        return 0.0;
+    }
+    (actual_tps / config_ceiling) * 100.0
+}
+
 pub fn weight_gb(param_count: u64, bits_per_param: u8) -> f64 {
     (param_count as f64 * bits_per_param as f64) / (8.0 * 1e9)
 }
@@ -182,6 +199,24 @@ mod tests {
     fn decode_zero_param_count_returns_infinity() {
         let tps = decode_ceiling_tps(3350.0, 0, 16);
         assert!(tps.is_infinite());
+    }
+
+    #[test]
+    fn config_relative_efficiency_below_ridge() {
+        // max_num_seqs=32, ridge=153, decode_ceiling=127
+        // config_ceiling = 127 * 32 = 4064
+        // actual 386 / 4064 = 9.5%
+        let pct = config_relative_efficiency_pct(386.0, 127.0, 32, 153.0);
+        assert!((pct - 9.5).abs() < 0.1);
+    }
+
+    #[test]
+    fn config_relative_efficiency_above_ridge_caps_at_ridge() {
+        // max_num_seqs=256, ridge=153, decode_ceiling=127
+        // config_ceiling = 127 * 153 = 19431 (capped at ridge)
+        // actual 5000 / 19431 = 25.7%
+        let pct = config_relative_efficiency_pct(5000.0, 127.0, 256, 153.0);
+        assert!((pct - 25.7).abs() < 0.2);
     }
 
     #[test]

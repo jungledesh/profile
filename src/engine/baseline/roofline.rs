@@ -67,6 +67,8 @@ pub struct PhysicsBaseline {
     /// Derived from vllm_request_prefill_time_seconds histogram.
     /// None when histogram data unavailable.
     pub prefill_time_fraction: Option<f64>,
+    /// Efficiency relative to max_num_seqs config ceiling (not ridge). None when GPU unknown or inputs missing.
+    pub config_relative_efficiency_pct: Option<f64>,
     pub cost: Option<CostEstimate>,
 }
 
@@ -140,6 +142,21 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
         })
         .filter(|pct| pct.is_finite());
 
+    let config_relative_efficiency_pct = input
+        .window
+        .snapshot
+        .vllm
+        .generation_tokens_per_sec
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .and_then(|actual| {
+            let max_seqs = ctx.config.max_num_seqs?;
+            Some(
+                math::config_relative_efficiency_pct(actual, ceiling, max_seqs, ridge_batch_size)
+                    .min(100.0),
+            )
+        })
+        .filter(|pct| pct.is_finite());
+
     let headroom_pct = efficiency_pct.map(|raw| 100.0 - raw.min(100.0));
 
     let weight_gb = math::weight_gb(weight_params, bits_per_param);
@@ -153,6 +170,7 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
     let tpot_floor_ms = math::latency_floor_ms(decode.expected);
     let prefill_latency_floor_ms = prefill.map(|p| math::latency_floor_ms(p.expected));
 
+    // Proxy for prefill pressure: mean prefill latency / window duration. Not GPU compute fraction.
     let prefill_time_fraction = (|| {
         let mass = input.window.snapshot.vllm.prefill_window_mass?;
         let window_secs = input
@@ -240,6 +258,7 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
         ridge_batch_size,
         prefill_efficiency_pct,
         prefill_time_fraction,
+        config_relative_efficiency_pct,
         cost,
     })
 }

@@ -112,6 +112,10 @@ pub(crate) fn build_report(input: AnalysisInput<'_>) -> Report {
         snapshot,
         input.ctx.config.max_num_seqs,
         baseline.as_ref().and_then(|b| b.efficiency_pct),
+        baseline
+            .as_ref()
+            .and_then(|b| b.config_relative_efficiency_pct),
+        baseline.as_ref().and_then(|b| b.prefill_time_fraction),
     ) {
         recs.push(r);
     }

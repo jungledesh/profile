@@ -242,6 +242,7 @@ mod tests {
                 ridge_batch_size: 1.0,
                 prefill_efficiency_pct: None,
                 prefill_time_fraction: None,
+                config_relative_efficiency_pct: None,
                 cost,
             }),
             groups: Vec::new(),

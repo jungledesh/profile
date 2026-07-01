@@ -371,7 +371,7 @@ fn baseline_lines(
         ));
     }
     if let Some(pt) = b.prefill_time_fraction {
-        let content = format!("prefill_time ~{:.0}%   estimated GPU time", pt * 100.0);
+        let content = format!("prefill_time ~{:.0}%   session avg", pt * 100.0);
         out.push(format!(
             "{:<width$}{}{}",
             "",
@@ -865,6 +865,7 @@ mod tests {
             ridge_batch_size: 40.0,
             prefill_efficiency_pct: None,
             prefill_time_fraction: None,
+            config_relative_efficiency_pct: None,
             cost: None,
         };
         let lines = baseline_lines(Some(b), None, None);
@@ -908,6 +909,7 @@ mod tests {
             ridge_batch_size: 40.0,
             prefill_efficiency_pct: None,
             prefill_time_fraction: None,
+            config_relative_efficiency_pct: None,
             cost: None,
         };
         let above = baseline_lines(Some(base()), Some(40.0), None);
@@ -947,6 +949,7 @@ mod tests {
             ridge_batch_size: 40.0,
             prefill_efficiency_pct: None,
             prefill_time_fraction: None,
+            config_relative_efficiency_pct: None,
             cost: None,
         };
         let lines = baseline_lines(Some(b), Some(5.0), None);
@@ -985,6 +988,7 @@ mod tests {
             ridge_batch_size: 40.0,
             prefill_efficiency_pct: None,
             prefill_time_fraction: None,
+            config_relative_efficiency_pct: None,
             cost: None,
         };
         let lines = baseline_lines(Some(b), Some(10.0), None);
@@ -1026,6 +1030,7 @@ mod tests {
             ridge_batch_size: 1.0,
             prefill_efficiency_pct: None,
             prefill_time_fraction: None,
+            config_relative_efficiency_pct: None,
             cost: None,
         }
     }
@@ -1057,6 +1062,7 @@ mod tests {
             ridge_batch_size: 1.0,
             prefill_efficiency_pct: None,
             prefill_time_fraction: None,
+            config_relative_efficiency_pct: None,
             cost: Some(CostEstimate {
                 tok_per_watt,
                 joules_per_token,
