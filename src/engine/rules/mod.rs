@@ -12,10 +12,10 @@ mod r3_low_prefix_reuse;
 mod r4_oom_risk;
 mod r5_concurrency_saturation;
 mod r6_prefill_bound;
+mod r7_config_headroom;
 
 pub use r1_under_batching::{
     R1MissReport, Rule1Outcome, UnderBatchingDetail, r1_recommendation, r1_verbose_miss_line,
-    rule1_under_batching,
 };
 pub use r2_kv_cache_pressure::{
     KvAdmissionBacklogDetail, KvCachePressureDetail, Rule2Outcome, r2_recommendation,
@@ -31,6 +31,7 @@ pub use r5_concurrency_saturation::{
 pub use r6_prefill_bound::{
     PrefillBoundDetail, Rule6Outcome, r6_recommendation, r6_verbose_miss_line,
 };
+pub use r7_config_headroom::{ConfigHeadroomDetail, rule7_config_headroom};
 
 use r1_under_batching::{
     aggregate_r1_detail, format_under_batching_window_issue, r1_short_action,
@@ -53,6 +54,16 @@ use r6_prefill_bound::{
     format_prefill_bound_window_issue, impact as r6_impact,
     prefill_fix_lines as r6_prefill_fix_lines, severity as r6_severity,
 };
+use r7_config_headroom::{aggregate_r7_detail, format_config_headroom_window_issue};
+
+fn resolve_prefill_time_fraction(
+    baseline: Option<&PhysicsBaseline>,
+    snapshot: &RawSnapshot,
+) -> Option<f64> {
+    baseline
+        .and_then(|b| b.prefill_time_fraction)
+        .or_else(|| baseline::prefill_time_fraction_from_snapshot(snapshot))
+}
 
 pub(super) const MAX_OBSERVATION_SKEW_SECS: f64 = 1.0;
 /// Enforces >= 6s temporal substance (3 windows × 2s).
@@ -201,6 +212,7 @@ pub mod rule_names {
     pub const CONCURRENCY_SATURATION: &str = "concurrency_saturation";
     pub const LOW_PREFIX_REUSE: &str = "low_prefix_reuse";
     pub const PREFILL_BOUND: &str = "prefill_bound";
+    pub const CONFIG_HEADROOM: &str = "config_headroom";
     pub const MASSIVE_UNDERUTILIZATION: &str = "massive_underutilization";
 
     /// Human-readable label for a rule name - used in journey UI output.
@@ -213,6 +225,7 @@ pub mod rule_names {
             CONCURRENCY_SATURATION => "Concurrency Saturation",
             LOW_PREFIX_REUSE => "Low Prefix Reuse",
             PREFILL_BOUND => "Prefill-Bound",
+            CONFIG_HEADROOM => "Config Headroom",
             MASSIVE_UNDERUTILIZATION => "Massive Under-utilization",
             _ => rule_name,
         }
@@ -223,7 +236,7 @@ const SUPPRESSION_TABLE: &[(&str, &str)] = &[
     (rule_names::OOM_RISK, rule_names::KV_CACHE_PRESSURE),
     (rule_names::OOM_RISK, rule_names::KV_ADMISSION_BACKLOG),
     (rule_names::UNDER_BATCHING, rule_names::PREFILL_BOUND),
-    // TODO: Add (rule_names::CONFIG_HEADROOM, rule_names::UNDER_BATCHING) when R7 ships.
+    (rule_names::CONFIG_HEADROOM, rule_names::UNDER_BATCHING),
 ];
 
 const KV_RULE_NAMES: &[&str] = &[
@@ -250,6 +263,10 @@ const NOT_TRIGGERED_SINGLES: &[NotTriggeredRule] = &[
     NotTriggeredRule {
         rule_name: rule_names::CONCURRENCY_SATURATION,
         label: "Concurrency saturation",
+    },
+    NotTriggeredRule {
+        rule_name: rule_names::CONFIG_HEADROOM,
+        label: "Config headroom",
     },
     NotTriggeredRule {
         rule_name: rule_names::LOW_PREFIX_REUSE,
@@ -385,6 +402,7 @@ pub(super) fn waste_label_suffix(rule_names_list: &[&str]) -> Option<&'static st
             rule_names::LOW_PREFIX_REUSE => Some("wasted on redundant prefill"),
             rule_names::PREFILL_BOUND => Some("lost to prefill interference"),
             rule_names::CONCURRENCY_SATURATION => Some("lost to scheduler queuing"),
+            rule_names::CONFIG_HEADROOM => Some("wasted on config-limited batching"),
             _ => Some("unclassified overhead"),
         },
         _ => Some("lost to compounding bottlenecks"),
@@ -459,7 +477,7 @@ fn append_not_triggered_lines(
     }
     for rule in rules {
         let line = if rule.rule_name == rule_names::UNDER_BATCHING && verbose_rules {
-            match r1_context {
+            match r1_context.as_ref() {
                 Some(R1VerboseContext {
                     snapshot,
                     max_num_seqs,
@@ -468,16 +486,16 @@ fn append_not_triggered_lines(
                     prefill_time_fraction,
                 }) => r1_verbose_miss_line(
                     snapshot,
-                    max_num_seqs,
-                    efficiency_pct,
-                    config_relative_efficiency_pct,
-                    prefill_time_fraction,
+                    *max_num_seqs,
+                    *efficiency_pct,
+                    *config_relative_efficiency_pct,
+                    *prefill_time_fraction,
                 ),
                 None => format!("{}: not triggered", rule.label),
             }
         } else if rule.rule_name == rule_names::PREFILL_BOUND && verbose_rules {
             r6_verbose_miss_line(
-                baseline.and_then(|b| b.prefill_time_fraction),
+                r1_context.as_ref().and_then(|c| c.prefill_time_fraction),
                 baseline.and_then(|b| b.efficiency_pct),
             )
             .unwrap_or_else(|| format!("{}: not triggered", rule.label))
@@ -572,7 +590,7 @@ pub fn format_diagnose_rules(
                 efficiency_pct: baseline_ref.and_then(|b| b.efficiency_pct),
                 config_relative_efficiency_pct: baseline_ref
                     .and_then(|b| b.config_relative_efficiency_pct),
-                prefill_time_fraction: baseline_ref.and_then(|b| b.prefill_time_fraction),
+                prefill_time_fraction: resolve_prefill_time_fraction(baseline_ref, snapshot),
             }),
             baseline_ref,
         );
@@ -604,6 +622,8 @@ struct WindowRuleEval {
     r5_details: Vec<ConcurrencySaturationDetail>,
     r6_fired: usize,
     r6_details: Vec<PrefillBoundDetail>,
+    r7_fired: usize,
+    r7_details: Vec<ConfigHeadroomDetail>,
     session_kv_peak: Option<f64>,
 }
 
@@ -630,6 +650,10 @@ impl WindowRuleEval {
 
     fn r6_significant(&self) -> bool {
         rule_is_significant(self.r6_fired, self.n_eval)
+    }
+
+    fn r7_significant(&self) -> bool {
+        rule_is_significant(self.r7_fired, self.n_eval)
     }
 }
 
@@ -686,6 +710,8 @@ fn eval_window_rules(
         r5_details: Vec::new(),
         r6_fired: 0,
         r6_details: Vec::new(),
+        r7_fired: 0,
+        r7_details: Vec::new(),
         session_kv_peak: None,
     };
 
@@ -717,7 +743,7 @@ fn eval_window_rules(
             win_baseline
                 .as_ref()
                 .and_then(|b| b.config_relative_efficiency_pct),
-            win_baseline.as_ref().and_then(|b| b.prefill_time_fraction),
+            resolve_prefill_time_fraction(win_baseline.as_ref(), snap),
         ) {
             Rule1Outcome::Fired(d) => {
                 eval.r1_fired += 1;
@@ -755,7 +781,7 @@ fn eval_window_rules(
         }
 
         match r6_evaluate(
-            win_baseline.as_ref().and_then(|b| b.prefill_time_fraction),
+            resolve_prefill_time_fraction(win_baseline.as_ref(), snap),
             win_baseline.as_ref().and_then(|b| b.efficiency_pct),
             win_baseline.as_ref().and_then(|b| b.prefill_efficiency_pct),
             snap,
@@ -766,6 +792,24 @@ fn eval_window_rules(
                 eval.r6_details.push(d);
             }
             Rule6Outcome::NotFired => {}
+        }
+
+        let ridge = win_baseline.as_ref().map(|b| b.ridge_batch_size);
+        let win_kv_max = compute_kv_max_seqs(
+            win_baseline.as_ref().and_then(|b| b.kv_headroom_gb),
+            summary.ctx.config.max_model_len,
+            &summary.ctx.model,
+            summary.ctx.config.kv_cache_dtype.as_deref(),
+            effective_tensor_parallel(
+                summary.ctx.config.tensor_parallel_size,
+                w.snapshot.collected_gpu_count(),
+            ),
+        );
+        if let Some(d) =
+            rule7_config_headroom(snap, summary.ctx.config.max_num_seqs, ridge, win_kv_max)
+        {
+            eval.r7_fired += 1;
+            eval.r7_details.push(d);
         }
     }
 
@@ -923,6 +967,30 @@ fn build_report_from_eval(
             action: r5_action(&agg, kv_max_seqs, max_model_len, prompt_tokens_mean),
             short_action: r5_short_action(&agg, kv_max_seqs, max_model_len),
             expected_impact: "Queue drains, TTFT recovers.".to_string(),
+            display_lines,
+        });
+    }
+
+    if eval.r7_significant() {
+        let d = aggregate_r7_detail(&eval.r7_details);
+        let conf = if d.kv_affordable_seqs.is_some() {
+            0.8
+        } else {
+            0.6
+        };
+        let display_lines =
+            format_config_headroom_window_issue(&d, pct(eval.r7_fired, eval.n_eval));
+        recs.push(Recommendation {
+            rule_name: rule_names::CONFIG_HEADROOM,
+            layer: 3,
+            impact: 3,
+            confidence: conf,
+            action: format!(
+                "Raise --max-num-seqs from {} to {}",
+                d.max_num_seqs, d.recommended_seqs
+            ),
+            short_action: format!("raise max_num_seqs to {}", d.recommended_seqs),
+            expected_impact: "Higher concurrency ceiling, better hardware utilization.".to_string(),
             display_lines,
         });
     }
@@ -1166,10 +1234,10 @@ pub fn format_diagnose_rules_for_windows(
                         .baseline
                         .as_ref()
                         .and_then(|b| b.config_relative_efficiency_pct),
-                    prefill_time_fraction: report
-                        .baseline
-                        .as_ref()
-                        .and_then(|b| b.prefill_time_fraction),
+                    prefill_time_fraction: resolve_prefill_time_fraction(
+                        report.baseline.as_ref(),
+                        summary_snap,
+                    ),
                 }),
                 report.baseline.as_ref(),
             );
@@ -1241,10 +1309,10 @@ pub fn format_diagnose_rules_for_windows(
                     .baseline
                     .as_ref()
                     .and_then(|b| b.config_relative_efficiency_pct),
-                prefill_time_fraction: report
-                    .baseline
-                    .as_ref()
-                    .and_then(|b| b.prefill_time_fraction),
+                prefill_time_fraction: resolve_prefill_time_fraction(
+                    report.baseline.as_ref(),
+                    summary_snap,
+                ),
             }),
             report.baseline.as_ref(),
         );
@@ -1488,7 +1556,7 @@ mod tests {
         assert_eq!(r.rule_name, rule_names::UNDER_BATCHING);
         assert_eq!(r.impact, 4);
         assert!((r.confidence - 0.5).abs() < 1e-9);
-        match rule1_under_batching(&win.snapshot, None) {
+        match rule1_under_batching_with_efficiency(&win.snapshot, None, None, None, None) {
             Rule1Outcome::Fired(d) => {
                 assert!((d.running - 3.1).abs() < 1e-9);
                 assert_eq!(d.max_num_seqs, Some(256));
@@ -2952,6 +3020,103 @@ mod tests {
             ..Default::default()
         };
         StaticContext::from_snapshot(s, cfg)
+    }
+
+    fn mk_r7_headroom_window(
+        running: f64,
+        max_num_seqs: u32,
+        waiting: f64,
+        tps: f64,
+    ) -> RuntimeWindow {
+        let t = SystemTime::UNIX_EPOCH;
+        let mut v = vllm_base();
+        v.model_name = Some("meta-llama/Llama-3.1-8B-Instruct".to_string());
+        v.generation_tokens_per_sec = Some(tps);
+        v.num_requests_running = Some(running);
+        v.num_requests_waiting = Some(waiting);
+        v.max_num_seqs = Some(max_num_seqs);
+        v.window_duration_secs = Some(2.0);
+        let mut g = gpu_busy();
+        g.gpu_name = Some("NVIDIA H100 80GB HBM3".to_string());
+        mk_win(snap(t, t, v, g))
+    }
+
+    fn mk_r7_ctx(max_num_seqs: u32) -> StaticContext {
+        let snap = mk_r7_headroom_window(5.0, max_num_seqs, 0.0, 50.0).snapshot;
+        let cfg = VllmConfig {
+            dtype: Some("bf16".to_string()),
+            max_model_len: Some(8192),
+            max_num_seqs: Some(max_num_seqs),
+            ..Default::default()
+        };
+        StaticContext::from_snapshot(&snap, cfg)
+    }
+
+    #[test]
+    fn r7_suppresses_r1() {
+        let windows: Vec<_> = (0..10)
+            .map(|_| mk_r7_headroom_window(20.0, 32, 0.0, 10.0))
+            .collect();
+        let ctx = mk_r7_ctx(32);
+        let summary = ai(&ctx, windows.last().expect("windows"));
+        let report = build_report_for_windows(&windows, summary);
+        assert!(
+            report
+                .groups
+                .iter()
+                .any(|g| g.primary.rule_name == rule_names::CONFIG_HEADROOM)
+        );
+        assert!(
+            !report
+                .groups
+                .iter()
+                .any(|g| g.primary.rule_name == rule_names::UNDER_BATCHING)
+        );
+        assert!(
+            report
+                .suppressed_rules
+                .contains(&rule_names::UNDER_BATCHING)
+        );
+    }
+
+    #[test]
+    fn r7_silent_when_waiting_nonzero_r5_territory() {
+        let mut windows: Vec<_> = (0..15)
+            .map(|_| mk_evaluable_kv_window(50.0, false))
+            .collect();
+        for w in windows.iter_mut().take(6) {
+            *w = mk_evaluable_concurrency_saturation_window(32.0, 15.0, 32);
+        }
+        let ctx = mk_r7_ctx(32);
+        let summary = ai(&ctx, windows.last().expect("windows"));
+        let report = build_report_for_windows(&windows, summary);
+        assert!(
+            report
+                .groups
+                .iter()
+                .any(|g| g.primary.rule_name == rule_names::CONCURRENCY_SATURATION)
+        );
+        assert!(
+            !report
+                .groups
+                .iter()
+                .any(|g| g.primary.rule_name == rule_names::CONFIG_HEADROOM)
+        );
+    }
+
+    #[test]
+    fn r7_fires_as_primary_when_alone() {
+        let windows: Vec<_> = (0..10)
+            .map(|_| mk_r7_headroom_window(20.0, 32, 0.0, 50.0))
+            .collect();
+        let ctx = mk_r7_ctx(32);
+        let summary = ai(&ctx, windows.last().expect("windows"));
+        let report = build_report_for_windows(&windows, summary);
+        assert_eq!(report.groups.len(), 1);
+        assert_eq!(
+            report.groups[0].primary.rule_name,
+            rule_names::CONFIG_HEADROOM
+        );
     }
 
     fn mk_r6_prefill_window(prefill_fraction: f64, tps: f64, running: f64) -> RuntimeWindow {

@@ -19,10 +19,6 @@ const PREFILL_FRACTION_GATE: f64 = 0.30;
 /// Waiting requests below this means no backlog pressure.
 const UNDER_BATCHING_WAITING_LT: f64 = 2.0;
 
-/// Prefill saturation ratio above which the server is considered prefill-bound.
-/// 40% of wall-clock time in prefill compute = server is not starved for work.
-const PREFILL_SATURATION_WINDOW_MAX: f64 = 0.40;
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnderBatchingDetail {
     pub running: f64,
@@ -47,13 +43,6 @@ pub enum Rule1Outcome {
     NotFired(R1MissReport),
 }
 
-pub fn rule1_under_batching(
-    snapshot: &RawSnapshot,
-    config_max_num_seqs: Option<u32>,
-) -> Rule1Outcome {
-    rule1_under_batching_with_efficiency(snapshot, config_max_num_seqs, None, None, None)
-}
-
 pub(super) fn rule1_under_batching_with_efficiency(
     snapshot: &RawSnapshot,
     config_max_num_seqs: Option<u32>,
@@ -64,7 +53,7 @@ pub(super) fn rule1_under_batching_with_efficiency(
     let running = snapshot.vllm.num_requests_running;
 
     // 1. Hard abort - window duration required
-    let window_secs = match snapshot.vllm.window_duration_secs {
+    let _window_secs = match snapshot.vllm.window_duration_secs {
         Some(w) if w.is_finite() && w > f64::EPSILON => w,
         _ => {
             return Rule1Outcome::NotFired(R1MissReport {
@@ -140,22 +129,6 @@ pub(super) fn rule1_under_batching_with_efficiency(
         return Rule1Outcome::NotFired(R1MissReport {
             prefill_saturation_ratio: None,
         });
-    }
-
-    // 5. Gate 1 - prefill saturation
-    // Known limitation: Prometheus histograms only record on request completion.
-    // A chunked prefill spanning the full window duration will read sum_delta=0
-    // and bypass this gate until the request completes. Accepted - documented limitation.
-    if let Some(mass) = snapshot.vllm.prefill_window_mass
-        && mass.count_delta > 0.0
-    {
-        let mean_prefill_secs = mass.sum_delta / mass.count_delta;
-        let ratio = mean_prefill_secs / window_secs;
-        if ratio > PREFILL_SATURATION_WINDOW_MAX {
-            return Rule1Outcome::NotFired(R1MissReport {
-                prefill_saturation_ratio: Some(ratio),
-            });
-        }
     }
 
     Rule1Outcome::Fired(UnderBatchingDetail {
@@ -400,7 +373,7 @@ mod tests {
     #[test]
     fn fires_when_occupancy_low() {
         let s = snap(Some(5.0), Some(256), Some(0.0));
-        match rule1_under_batching(&s, None) {
+        match rule1_under_batching_with_efficiency(&s, None, None, None, None) {
             Rule1Outcome::Fired(d) => {
                 assert!((d.occupancy_pct - (5.0 / 256.0 * 100.0)).abs() < 0.1);
             }
@@ -411,7 +384,7 @@ mod tests {
     #[test]
     fn fires_at_occupancy_below_threshold() {
         let s = snap(Some(63.0), Some(256), Some(0.0));
-        match rule1_under_batching(&s, None) {
+        match rule1_under_batching_with_efficiency(&s, None, None, None, None) {
             Rule1Outcome::Fired(d) => {
                 assert!(d.occupancy_pct < 25.0);
             }
@@ -423,7 +396,7 @@ mod tests {
     fn mutes_at_occupancy_threshold() {
         let s = snap(Some(64.0), Some(256), Some(0.0));
         assert!(matches!(
-            rule1_under_batching(&s, None),
+            rule1_under_batching_with_efficiency(&s, None, None, None, None),
             Rule1Outcome::NotFired(_)
         ));
     }
@@ -432,7 +405,7 @@ mod tests {
     fn mutes_when_no_traffic() {
         let s = snap(Some(0.0), Some(256), Some(0.0));
         assert!(matches!(
-            rule1_under_batching(&s, None),
+            rule1_under_batching_with_efficiency(&s, None, None, None, None),
             Rule1Outcome::NotFired(_)
         ));
     }
@@ -441,7 +414,7 @@ mod tests {
     fn mutes_when_backpressure_at_two() {
         let s = snap(Some(5.0), Some(256), Some(2.0));
         assert!(matches!(
-            rule1_under_batching(&s, None),
+            rule1_under_batching_with_efficiency(&s, None, None, None, None),
             Rule1Outcome::NotFired(_)
         ));
     }
@@ -450,7 +423,7 @@ mod tests {
     fn fires_when_waiting_one_below_backpressure_gate() {
         let s = snap(Some(5.0), Some(256), Some(1.0));
         assert!(matches!(
-            rule1_under_batching(&s, None),
+            rule1_under_batching_with_efficiency(&s, None, None, None, None),
             Rule1Outcome::Fired(_)
         ));
     }
@@ -459,7 +432,7 @@ mod tests {
     fn mutes_when_max_num_seqs_missing() {
         let s = snap(Some(5.0), None, Some(0.0));
         assert!(matches!(
-            rule1_under_batching(&s, None),
+            rule1_under_batching_with_efficiency(&s, None, None, None, None),
             Rule1Outcome::NotFired(_)
         ));
     }
@@ -468,7 +441,7 @@ mod tests {
     fn mutes_when_max_num_seqs_is_zero() {
         let s = snap(Some(5.0), Some(0), Some(0.0));
         assert!(matches!(
-            rule1_under_batching(&s, None),
+            rule1_under_batching_with_efficiency(&s, None, None, None, None),
             Rule1Outcome::NotFired(_)
         ));
     }
@@ -476,7 +449,7 @@ mod tests {
     #[test]
     fn fires_when_config_max_provides_capacity_and_occupancy_low() {
         let s = snap(Some(4.0), None, Some(0.0));
-        match rule1_under_batching(&s, Some(64)) {
+        match rule1_under_batching_with_efficiency(&s, Some(64), None, None, None) {
             Rule1Outcome::Fired(d) => {
                 assert_eq!(d.max_num_seqs, Some(64));
                 assert!((d.occupancy_pct - (4.0 / 64.0 * 100.0)).abs() < 0.1);
@@ -489,7 +462,7 @@ mod tests {
     fn mutes_at_occupancy_threshold_with_config_max_only() {
         let s = snap(Some(64.0), None, Some(0.0));
         assert!(matches!(
-            rule1_under_batching(&s, Some(64)),
+            rule1_under_batching_with_efficiency(&s, Some(64), None, None, None),
             Rule1Outcome::NotFired(_)
         ));
     }
@@ -498,7 +471,7 @@ mod tests {
     fn mutes_when_running_missing() {
         let s = snap(None, Some(256), Some(0.0));
         assert!(matches!(
-            rule1_under_batching(&s, None),
+            rule1_under_batching_with_efficiency(&s, None, None, None, None),
             Rule1Outcome::NotFired(_)
         ));
     }
@@ -507,101 +480,9 @@ mod tests {
     fn mutes_when_window_duration_missing() {
         let s = snap_with_gates(Some(5.0), Some(256), Some(0.0), None, None);
         assert!(matches!(
-            rule1_under_batching(&s, None),
+            rule1_under_batching_with_efficiency(&s, None, None, None, None),
             Rule1Outcome::NotFired(_)
         ));
-    }
-
-    #[test]
-    fn prefill_gate_suppresses_when_ratio_above_threshold() {
-        let s = snap_with_gates(
-            Some(5.0),
-            Some(256),
-            Some(0.0),
-            Some(HistogramWindowMass {
-                sum_delta: 4.0,
-                count_delta: 2.0,
-            }),
-            Some(4.0),
-        );
-        assert!(matches!(
-            rule1_under_batching(&s, None),
-            Rule1Outcome::NotFired(_)
-        ));
-    }
-
-    #[test]
-    fn prefill_gate_does_not_suppress_when_concurrent_short_prefills_inflate_sum() {
-        // 10 requests × 0.2s prefill = sum_delta 2.0s, but mean = 0.2s in 1.0s window = 20%
-        let s = snap_with_gates(
-            Some(5.0),
-            Some(256),
-            Some(0.0),
-            Some(HistogramWindowMass {
-                sum_delta: 2.0,
-                count_delta: 10.0,
-            }),
-            Some(1.0),
-        );
-        assert!(matches!(
-            rule1_under_batching(&s, None),
-            Rule1Outcome::Fired(_)
-        ));
-    }
-
-    #[test]
-    fn fires_when_prefill_below_thresholds() {
-        let s = snap_with_gates(
-            Some(5.0),
-            Some(256),
-            Some(0.0),
-            Some(HistogramWindowMass {
-                sum_delta: 1.0,
-                count_delta: 2.0,
-            }),
-            Some(10.0),
-        );
-        assert!(matches!(
-            rule1_under_batching(&s, None),
-            Rule1Outcome::Fired(_)
-        ));
-    }
-
-    #[test]
-    fn prefill_gate_miss_report_carries_ratio() {
-        let s = snap_with_gates(
-            Some(5.0),
-            Some(256),
-            Some(0.0),
-            Some(HistogramWindowMass {
-                sum_delta: 1.6,
-                count_delta: 2.0,
-            }),
-            Some(1.0),
-        );
-        match rule1_under_batching(&s, None) {
-            Rule1Outcome::NotFired(m) => {
-                let ratio = m.prefill_saturation_ratio.expect("ratio present");
-                assert!((ratio - 0.80).abs() < 1e-9);
-            }
-            Rule1Outcome::Fired(_) => panic!("expected not fired"),
-        }
-    }
-
-    #[test]
-    fn r1_verbose_miss_line_shows_prefill_saturation_ratio() {
-        let s = snap_with_gates(
-            Some(5.0),
-            Some(256),
-            Some(0.0),
-            Some(HistogramWindowMass {
-                sum_delta: 1.6,
-                count_delta: 2.0,
-            }),
-            Some(1.0),
-        );
-        let line = r1_verbose_miss_line(&s, None, None, None, None);
-        assert!(line.contains("prefill saturated at 80%"));
     }
 
     #[test]

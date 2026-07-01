@@ -115,7 +115,10 @@ pub(crate) fn build_report(input: AnalysisInput<'_>) -> Report {
         baseline
             .as_ref()
             .and_then(|b| b.config_relative_efficiency_pct),
-        baseline.as_ref().and_then(|b| b.prefill_time_fraction),
+        baseline
+            .as_ref()
+            .and_then(|b| b.prefill_time_fraction)
+            .or_else(|| baseline::prefill_time_fraction_from_snapshot(snapshot)),
     ) {
         recs.push(r);
     }
@@ -123,7 +126,10 @@ pub(crate) fn build_report(input: AnalysisInput<'_>) -> Report {
         recs.push(r);
     }
     if let Some(r) = rules::r6_recommendation(
-        baseline.as_ref().and_then(|b| b.prefill_time_fraction),
+        baseline
+            .as_ref()
+            .and_then(|b| b.prefill_time_fraction)
+            .or_else(|| baseline::prefill_time_fraction_from_snapshot(snapshot)),
         baseline.as_ref().and_then(|b| b.efficiency_pct),
         baseline.as_ref().and_then(|b| b.prefill_efficiency_pct),
         snapshot,

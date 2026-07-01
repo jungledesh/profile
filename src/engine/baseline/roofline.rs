@@ -1,5 +1,5 @@
 use crate::collectors::config::DEFAULT_GPU_MEMORY_UTILIZATION;
-use crate::collectors::effective_tensor_parallel;
+use crate::collectors::{RawSnapshot, effective_tensor_parallel};
 use crate::context::{AnalysisInput, gpu_prices};
 
 use super::math;
@@ -75,6 +75,21 @@ pub struct PhysicsBaseline {
 /// Lower/upper band around roofline ceiling `expected` (conservative / optimistic).
 const CEILING_LOWER_BAND: f64 = 0.85;
 const CEILING_UPPER_BAND: f64 = 1.05;
+
+/// Proxy for prefill pressure: mean prefill latency / window duration. Not GPU compute fraction.
+pub fn prefill_time_fraction_from_snapshot(snapshot: &RawSnapshot) -> Option<f64> {
+    let mass = snapshot.vllm.prefill_window_mass?;
+    let window_secs = snapshot
+        .vllm
+        .window_duration_secs
+        .filter(|w| w.is_finite() && *w > f64::EPSILON)?;
+    if mass.count_delta <= 0.0 {
+        return None;
+    }
+    let mean_prefill_secs = mass.sum_delta / mass.count_delta;
+    let ratio = mean_prefill_secs / window_secs;
+    ratio.is_finite().then_some(ratio.clamp(0.0, 1.0))
+}
 
 pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
     let ctx = input.ctx;
@@ -171,21 +186,7 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
     let prefill_latency_floor_ms = prefill.map(|p| math::latency_floor_ms(p.expected));
 
     // Proxy for prefill pressure: mean prefill latency / window duration. Not GPU compute fraction.
-    let prefill_time_fraction = (|| {
-        let mass = input.window.snapshot.vllm.prefill_window_mass?;
-        let window_secs = input
-            .window
-            .snapshot
-            .vllm
-            .window_duration_secs
-            .filter(|w| w.is_finite() && *w > f64::EPSILON)?;
-        if mass.count_delta <= 0.0 {
-            return None;
-        }
-        let mean_prefill_secs = mass.sum_delta / mass.count_delta;
-        let ratio = mean_prefill_secs / window_secs;
-        ratio.is_finite().then_some(ratio.clamp(0.0, 1.0))
-    })();
+    let prefill_time_fraction = prefill_time_fraction_from_snapshot(&input.window.snapshot);
 
     let prefill_efficiency_pct = prefill.and_then(|p| {
         let mass = input.window.snapshot.vllm.prefill_window_mass?;
