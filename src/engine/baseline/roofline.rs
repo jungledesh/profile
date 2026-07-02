@@ -77,6 +77,20 @@ const CEILING_LOWER_BAND: f64 = 0.85;
 const CEILING_UPPER_BAND: f64 = 1.05;
 
 /// Proxy for prefill pressure: mean prefill latency / window duration. Not GPU compute fraction.
+///
+/// Known limitation: uses mean (sum_delta / count_delta), which ignores request count.
+/// 10 requests x 0.2s and 1 request x 0.2s both read as the same fraction.
+/// Under high concurrency with short prompts, this undercounts actual prefill load.
+///
+/// The correct formula is sum_delta / window_secs (total prefill seconds / window),
+/// but that changes metric semantics (can exceed 1.0, thresholds need recalibration).
+/// Deferred until RunPod calibration produces empirical thresholds for the new metric.
+/// Track both old and new formulas during calibration to validate the switch.
+///
+/// Additionally, vLLM's request_prefill_time_seconds histogram records wall-clock time
+/// from SCHEDULED to first NEW_TOKENS, not GPU compute time. With chunked prefill,
+/// this includes interleaved decode time for other requests. No vLLM Prometheus metric
+/// exposes the actual GPU compute split between prefill and decode.
 pub fn prefill_time_fraction_from_snapshot(snapshot: &RawSnapshot) -> Option<f64> {
     let mass = snapshot.vllm.prefill_window_mass?;
     let window_secs = snapshot
