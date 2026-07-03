@@ -38,10 +38,10 @@ pub struct Delta {
     pub ttft_p95_delta_pct: Option<f64>,
     pub tpot_p95_delta_pct: Option<f64>,
     pub config_drifted: bool,
+    /// Non-baseline config diffs for display (e.g. max_num_seqs).
+    pub config_changes: Vec<String>,
     pub prefill_time_fraction_before: Option<f64>,
     pub prefill_time_fraction_after: Option<f64>,
-    pub prefill_efficiency_before: Option<f64>,
-    pub prefill_efficiency_after: Option<f64>,
 }
 
 fn pct_delta(before: Option<f64>, after: Option<f64>) -> Option<f64> {
@@ -59,6 +59,7 @@ pub fn compute(
     curr_result: &DiagnoseResult,
     curr_report: &Report,
     config_drifted: bool,
+    config_changes: Vec<String>,
 ) -> Delta {
     let throughput_before = prev_result.snapshot.vllm.generation_tokens_per_sec;
     let throughput_after = curr_result.snapshot.vllm.generation_tokens_per_sec;
@@ -126,14 +127,6 @@ pub fn compute(
         .baseline
         .as_ref()
         .and_then(|b| b.prefill_time_fraction);
-    let prefill_efficiency_before = prev_report
-        .baseline
-        .as_ref()
-        .and_then(|b| b.prefill_efficiency_pct);
-    let prefill_efficiency_after = curr_report
-        .baseline
-        .as_ref()
-        .and_then(|b| b.prefill_efficiency_pct);
 
     Delta {
         throughput_delta_pct,
@@ -163,10 +156,9 @@ pub fn compute(
         ttft_p95_delta_pct,
         tpot_p95_delta_pct,
         config_drifted,
+        config_changes,
         prefill_time_fraction_before,
         prefill_time_fraction_after,
-        prefill_efficiency_before,
-        prefill_efficiency_after,
     }
 }
 
@@ -271,6 +263,7 @@ mod tests {
             &diagnose(Some(112.0)),
             &report_eff(Some(55.0), None, None),
             false,
+            Vec::new(),
         );
         assert!((d.efficiency_delta_pp.unwrap() - 5.0).abs() < 1e-9);
         assert!((d.throughput_delta_pct.unwrap() - 12.0).abs() < 1e-9);
@@ -284,6 +277,7 @@ mod tests {
             &diagnose(Some(50.0)),
             &report_eff(Some(10.0), None, None),
             false,
+            Vec::new(),
         );
         assert!(d.throughput_delta_pct.is_none());
     }
@@ -296,6 +290,7 @@ mod tests {
             &diagnose(Some(50.0)),
             &report_eff(None, None, None),
             false,
+            Vec::new(),
         );
         assert!(d.throughput_delta_pct.is_none());
     }
@@ -308,8 +303,24 @@ mod tests {
             &diagnose(Some(100.0)),
             &report_eff(Some(50.0), None, None),
             true,
+            vec!["  max_num_seqs  32 -> 98".to_string()],
         );
         assert!(d.config_drifted);
+        assert_eq!(d.config_changes.len(), 1);
+    }
+
+    #[test]
+    fn config_changes_passthrough() {
+        let changes = vec!["  max_num_seqs  32 -> 98".to_string()];
+        let d = compute(
+            &diagnose(Some(100.0)),
+            &report_eff(Some(50.0), None, None),
+            &diagnose(Some(100.0)),
+            &report_eff(Some(50.0), None, None),
+            false,
+            changes.clone(),
+        );
+        assert_eq!(d.config_changes, changes);
     }
 
     #[test]
@@ -320,6 +331,7 @@ mod tests {
             &diagnose(Some(120.0)),
             &report_eff(Some(55.0), Some(2.00), Some(0.28)),
             false,
+            Vec::new(),
         );
         assert_eq!(d.efficiency_pct_before, Some(40.0));
         assert_eq!(d.efficiency_pct_after, Some(55.0));
@@ -337,6 +349,7 @@ mod tests {
             &diagnose(Some(110.0)),
             &report_eff(Some(45.0), None, Some(0.28)),
             false,
+            Vec::new(),
         );
         assert_eq!(d.joules_per_token_before, Some(0.31));
         assert_eq!(d.joules_per_token_after, Some(0.28));
@@ -356,6 +369,7 @@ mod tests {
             &curr,
             &report_eff(Some(45.0), None, None),
             false,
+            Vec::new(),
         );
         assert_eq!(d.ttft_p99_before_ms, Some(500.0));
         assert_eq!(d.ttft_p99_after_ms, Some(450.0));
@@ -378,6 +392,7 @@ mod tests {
             &curr,
             &report_eff(Some(45.0), None, None),
             false,
+            Vec::new(),
         );
         assert_eq!(d.ttft_p95_before_ms, Some(400.0));
         assert_eq!(d.ttft_p95_after_ms, Some(340.0));

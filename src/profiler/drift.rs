@@ -11,6 +11,26 @@ pub fn config_changed(prev: &StaticContext, curr: &StaticContext) -> bool {
         || prev.config.vllm_reported_quantization != curr.config.vllm_reported_quantization
 }
 
+/// Config fields that changed but don't affect the physics baseline.
+/// Returns a list of human-readable change descriptions for display.
+pub fn non_baseline_changes(prev: &StaticContext, curr: &StaticContext) -> Vec<String> {
+    let mut changes = Vec::new();
+    if prev.config.max_num_seqs != curr.config.max_num_seqs {
+        let before = prev
+            .config
+            .max_num_seqs
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let after = curr
+            .config
+            .max_num_seqs
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        changes.push(format!("  max_num_seqs  {before} -> {after}"));
+    }
+    changes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,5 +119,28 @@ mod tests {
         let mut c2 = base_cfg();
         c2.vllm_reported_quantization = Some("awq".into());
         assert!(config_changed(&ctx(base_cfg()), &ctx(c2)));
+    }
+
+    #[test]
+    fn max_num_seqs_change_not_baseline_drift() {
+        let mut c2 = base_cfg();
+        c2.max_num_seqs = Some(98);
+        assert!(!config_changed(&ctx(base_cfg()), &ctx(c2)));
+    }
+
+    #[test]
+    fn non_baseline_changes_reports_max_num_seqs() {
+        let mut prev = base_cfg();
+        prev.max_num_seqs = Some(32);
+        let mut curr = base_cfg();
+        curr.max_num_seqs = Some(98);
+        let changes = non_baseline_changes(&ctx(prev), &ctx(curr));
+        assert_eq!(changes, vec!["  max_num_seqs  32 -> 98".to_string()]);
+    }
+
+    #[test]
+    fn non_baseline_changes_empty_when_unchanged() {
+        let c = base_cfg();
+        assert!(non_baseline_changes(&ctx(c.clone()), &ctx(c)).is_empty());
     }
 }

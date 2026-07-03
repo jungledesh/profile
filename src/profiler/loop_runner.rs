@@ -157,6 +157,8 @@ pub fn run(
         let new_report = engine::build_report_for_diagnose(&new_result.windows, summary);
 
         let drifted = drift::config_changed(&prev_result.static_ctx, &new_result.static_ctx);
+        let config_changes =
+            drift::non_baseline_changes(&prev_result.static_ctx, &new_result.static_ctx);
 
         let d = delta::compute(
             &prev_result,
@@ -164,6 +166,7 @@ pub fn run(
             &new_result,
             &new_report,
             drifted,
+            config_changes,
         );
         let current_eff = new_report.baseline.as_ref().and_then(|b| b.efficiency_pct);
         let plateau_count = state.update_efficiency_plateau(current_eff, EFFICIENCY_PLATEAU_DELTA);
@@ -287,27 +290,31 @@ fn healthy_exit_message(
 
 fn format_efficiency_delta_line(delta_pp: Option<f64>) -> Option<String> {
     match delta_pp {
-        Some(v) if v >= EFFICIENCY_DISPLAY_MIN_PP => Some(format!("  Efficiency  +{v:.1}pp ↑")),
-        Some(v) if v <= -EFFICIENCY_DISPLAY_MIN_PP => Some(format!("  Efficiency  {v:.1}pp ↓")),
+        Some(v) if v >= EFFICIENCY_DISPLAY_MIN_PP => Some(format!("  Decode eff. +{v:.1}pp ↑")),
+        Some(v) if v <= -EFFICIENCY_DISPLAY_MIN_PP => Some(format!("  Decode eff. {v:.1}pp ↓")),
         _ => None,
     }
 }
 
-fn config_change_status_lines(config_drifted: bool) -> [&'static str; 2] {
+fn config_status_lines(config_drifted: bool, config_changes: &[String]) -> Vec<String> {
     if config_drifted {
-        ["  Config changed, baseline reset.", ""]
+        vec![
+            "  Config changed, baseline reset.".to_string(),
+            String::new(),
+        ]
+    } else if !config_changes.is_empty() {
+        let mut lines = vec!["  Config changed:".to_string()];
+        lines.extend(config_changes.iter().cloned());
+        lines.push(String::new());
+        lines
     } else {
-        ["  No config changed.", ""]
+        vec!["  No config changed.".to_string(), String::new()]
     }
 }
 
 fn print_delta(d: &delta::Delta) {
-    for line in config_change_status_lines(d.config_drifted) {
-        if line.is_empty() {
-            println!();
-        } else {
-            println!("{line}");
-        }
+    for line in config_status_lines(d.config_drifted, &d.config_changes) {
+        println!("{line}");
     }
     if let (Some(before), Some(after)) = (d.throughput_before, d.throughput_after)
         && before.is_finite()
@@ -364,19 +371,6 @@ fn print_delta(d: &delta::Delta) {
                 "  Prefill time    {:.0}% → {:.0}%    {:+.0} pp {arrow}",
                 before * 100.0,
                 after * 100.0,
-                delta_pp
-            );
-        }
-    }
-    if let (Some(before), Some(after)) = (d.prefill_efficiency_before, d.prefill_efficiency_after)
-        && before.is_finite()
-        && after.is_finite()
-    {
-        let delta_pp = after - before;
-        if delta_pp.abs() > 0.5 {
-            let arrow = if delta_pp < 0.0 { "↓" } else { "↑" };
-            println!(
-                "  Prefill eff.   {before:.1}% → {after:.1}%  {:+.1} pp {arrow}",
                 delta_pp
             );
         }
@@ -650,13 +644,54 @@ mod tests {
     }
 
     #[test]
-    fn config_change_status_lines_for_drifted_and_not_drifted() {
-        let drifted = config_change_status_lines(true);
-        assert_eq!(drifted[0], "  Config changed, baseline reset.");
-        assert_eq!(drifted[1], "");
-        let stable = config_change_status_lines(false);
-        assert_eq!(stable[0], "  No config changed.");
-        assert_eq!(stable[1], "");
+    fn non_baseline_max_num_seqs_not_baseline_drift() {
+        use crate::collectors::VllmConfig;
+        use crate::context::StaticContext;
+        let prev_cfg = VllmConfig {
+            max_num_seqs: Some(32),
+            ..Default::default()
+        };
+        let curr_cfg = VllmConfig {
+            max_num_seqs: Some(98),
+            ..Default::default()
+        };
+        let prev = StaticContext {
+            config: prev_cfg,
+            ..StaticContext::default()
+        };
+        let curr = StaticContext {
+            config: curr_cfg,
+            ..StaticContext::default()
+        };
+        assert!(!drift::config_changed(&prev, &curr));
+        assert_eq!(
+            drift::non_baseline_changes(&prev, &curr),
+            vec!["  max_num_seqs  32 -> 98".to_string()]
+        );
+    }
+
+    #[test]
+    fn config_status_lines_drifted() {
+        let lines = config_status_lines(true, &[]);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("Config changed, baseline reset."))
+        );
+    }
+
+    #[test]
+    fn config_status_lines_non_baseline_changes() {
+        let changes = vec!["  max_num_seqs  32 -> 98".to_string()];
+        let lines = config_status_lines(false, &changes);
+        assert!(lines.iter().any(|l| l.contains("Config changed:")));
+        assert!(lines.iter().any(|l| l.contains("max_num_seqs  32 -> 98")));
+    }
+
+    #[test]
+    fn config_status_lines_no_changes() {
+        let lines = config_status_lines(false, &[]);
+        assert!(lines.iter().any(|l| l == "  No config changed."));
     }
 
     #[test]
@@ -732,10 +767,9 @@ mod tests {
             ttft_p95_delta_pct: None,
             tpot_p95_delta_pct: None,
             config_drifted: false,
+            config_changes: Vec::new(),
             prefill_time_fraction_before: None,
             prefill_time_fraction_after: None,
-            prefill_efficiency_before: None,
-            prefill_efficiency_after: None,
         };
         assert!(economics_section_active(&d));
     }
@@ -770,10 +804,9 @@ mod tests {
             ttft_p95_delta_pct: None,
             tpot_p95_delta_pct: None,
             config_drifted: false,
+            config_changes: Vec::new(),
             prefill_time_fraction_before: None,
             prefill_time_fraction_after: None,
-            prefill_efficiency_before: None,
-            prefill_efficiency_after: None,
         };
         assert!(recoverable_waste_available(&d));
         assert!(economics_section_active(&d));

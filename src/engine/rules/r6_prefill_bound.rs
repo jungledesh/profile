@@ -278,7 +278,6 @@ pub(super) fn format_prefill_bound_window_issue(
                 severity_subtitle(sev)
             }
         ),
-        format!("  Seen in {seen_pct}% of windows"),
         String::new(),
         format!(
             "  Prefill time    ~{:.0}%  estimated GPU time",
@@ -360,7 +359,7 @@ pub(super) fn format_prefill_bound_window_issue(
     lines.push(String::new());
     lines.push(format!("  Expected: {expected}"));
     lines.push(format!("  Confidence: {}", confidence_label(conf)));
-    lines
+    super::with_seen_pct(lines, seen_pct)
 }
 
 pub fn r6_recommendation(

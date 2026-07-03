@@ -53,14 +53,15 @@ pub(super) fn rule1_under_batching_with_efficiency(
     let running = snapshot.vllm.num_requests_running;
 
     // 1. Hard abort - window duration required
-    let _window_secs = match snapshot.vllm.window_duration_secs {
-        Some(w) if w.is_finite() && w > f64::EPSILON => w,
-        _ => {
-            return Rule1Outcome::NotFired(R1MissReport {
-                prefill_saturation_ratio: None,
-            });
-        }
-    };
+    if !snapshot
+        .vllm
+        .window_duration_secs
+        .is_some_and(|w| w.is_finite() && w > f64::EPSILON)
+    {
+        return Rule1Outcome::NotFired(R1MissReport {
+            prefill_saturation_ratio: None,
+        });
+    }
 
     // 2. Hard abort - max_num_seqs required (scrape or config)
     let Some(max_n) = snapshot
@@ -228,17 +229,6 @@ pub(super) fn format_under_batching_fired(
         .num_requests_waiting
         .filter(|v| v.is_finite())
         .unwrap_or(d.waiting);
-    let metric_line = if let Some(eff) = d.config_relative_efficiency_pct {
-        format!(
-            "  Config efficiency  {eff:.1}%  (threshold: < {CONFIG_EFFICIENCY_STARVATION_PCT:.0}%)"
-        )
-    } else {
-        format!(
-            "  Occupancy  {:.1}%  (threshold: < {:.0}%)",
-            d.occupancy_pct,
-            OCCUPANCY_FALLBACK_PCT * 100.0
-        )
-    };
     let max_str = max_n.to_string();
     let idle = (f64::from(max_n) - display_run).max(0.0);
     let fix_line =
@@ -254,7 +244,6 @@ pub(super) fn format_under_batching_fired(
     let mut lines = vec![
         "[!] Under-batching: Insufficient Concurrency".to_string(),
         String::new(),
-        metric_line,
         format!(
             "  Requests   {:.0} running, {:.0} waiting  (max: {max_str})",
             display_run, display_wait
@@ -518,30 +507,30 @@ mod tests {
     }
 
     #[test]
-    fn format_under_batching_fired_shows_config_efficiency_on_known_gpu_path() {
+    fn format_under_batching_fired_shows_requests_on_known_gpu_path() {
         let s = snap(Some(5.0), Some(256), Some(0.0));
         match rule1_under_batching_with_efficiency(&s, None, Some(25.0), Some(15.0), None) {
             Rule1Outcome::Fired(d) => {
                 assert!(d.known_gpu);
                 assert_eq!(d.config_relative_efficiency_pct, Some(15.0));
                 let text = format_under_batching_fired(&d, &s, 0.8).join("\n");
-                assert!(text.contains("Config efficiency  15.0%"));
-                assert!(text.contains("threshold: < 60%"));
-                assert!(!text.contains("Occupancy"));
+                assert!(text.contains("Requests"));
+                assert!(text.contains("running"));
+                assert!(text.contains("max: 256"));
+                assert!(!text.contains("Config efficiency"));
             }
             Rule1Outcome::NotFired(_) => panic!("expected fire via config efficiency path"),
         }
     }
 
     #[test]
-    fn format_under_batching_fired_shows_occupancy_on_unknown_gpu_path() {
+    fn format_under_batching_fired_shows_note_on_unknown_gpu_path() {
         let s = snap(Some(5.0), Some(256), Some(0.0));
         match rule1_under_batching_with_efficiency(&s, None, None, None, None) {
             Rule1Outcome::Fired(d) => {
                 assert!(!d.known_gpu);
                 let text = format_under_batching_fired(&d, &s, 0.5).join("\n");
-                assert!(text.contains("Occupancy"));
-                assert!(text.contains("threshold: < 25%"));
+                assert!(text.contains("Requests"));
                 assert!(text.contains("low confidence"));
                 assert!(!text.contains("Config efficiency"));
             }

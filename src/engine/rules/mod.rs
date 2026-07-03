@@ -225,7 +225,7 @@ pub mod rule_names {
             CONCURRENCY_SATURATION => "Concurrency Saturation",
             LOW_PREFIX_REUSE => "Low Prefix Reuse",
             PREFILL_BOUND => "Prefill-Bound",
-            CONFIG_HEADROOM => "Config Headroom",
+            CONFIG_HEADROOM => "Configured Batch Limit",
             MASSIVE_UNDERUTILIZATION => "Massive Under-utilization",
             _ => rule_name,
         }
@@ -266,7 +266,7 @@ const NOT_TRIGGERED_SINGLES: &[NotTriggeredRule] = &[
     },
     NotTriggeredRule {
         rule_name: rule_names::CONFIG_HEADROOM,
-        label: "Config headroom",
+        label: "Configured batch limit",
     },
     NotTriggeredRule {
         rule_name: rule_names::LOW_PREFIX_REUSE,
@@ -368,6 +368,11 @@ fn collect_advisories(
     }
 }
 
+/// Practical achievable efficiency ceiling. No production workload reaches 100% of the
+/// roofline due to framework overhead, scheduling, and memory contention. 80% represents
+/// a well-optimized production system. Waste is computed against this ceiling, not 100%.
+const ACHIEVABLE_EFFICIENCY_CEILING: f64 = 0.80;
+
 fn compute_waste_per_hr(baseline: Option<&PhysicsBaseline>, tps: Option<f64>) -> Option<f64> {
     let b = baseline?;
     let eff = b.efficiency_pct.filter(|e| e.is_finite())?;
@@ -384,7 +389,7 @@ fn compute_waste_per_hr(baseline: Option<&PhysicsBaseline>, tps: Option<f64>) ->
     if cost_per_hr <= 0.0 {
         return None;
     }
-    let waste_fraction = (1.0 - eff / 100.0).max(0.0);
+    let waste_fraction = (ACHIEVABLE_EFFICIENCY_CEILING - eff / 100.0).max(0.0);
     let waste = cost_per_hr * waste_fraction;
     if !waste.is_finite() || waste <= 0.0 {
         return None;
@@ -795,19 +800,7 @@ fn eval_window_rules(
         }
 
         let ridge = win_baseline.as_ref().map(|b| b.ridge_batch_size);
-        let win_kv_max = compute_kv_max_seqs(
-            win_baseline.as_ref().and_then(|b| b.kv_headroom_gb),
-            summary.ctx.config.max_model_len,
-            &summary.ctx.model,
-            summary.ctx.config.kv_cache_dtype.as_deref(),
-            effective_tensor_parallel(
-                summary.ctx.config.tensor_parallel_size,
-                w.snapshot.collected_gpu_count(),
-            ),
-        );
-        if let Some(d) =
-            rule7_config_headroom(snap, summary.ctx.config.max_num_seqs, ridge, win_kv_max)
-        {
+        if let Some(d) = rule7_config_headroom(snap, summary.ctx.config.max_num_seqs, ridge) {
             eval.r7_fired += 1;
             eval.r7_details.push(d);
         }
@@ -973,7 +966,9 @@ fn build_report_from_eval(
 
     if eval.r7_significant() {
         let d = aggregate_r7_detail(&eval.r7_details);
-        let conf = if d.kv_affordable_seqs.is_some() {
+        // ridge_batch_size is 0.0 when ridge was unavailable (unwrap_or default in ConfigHeadroomDetail).
+        // Both sources present = higher confidence in the recommendation.
+        let conf = if d.ridge_batch_size > 0.0 && d.empirical_kv_seqs.is_some() {
             0.8
         } else {
             0.6
@@ -1660,8 +1655,8 @@ mod tests {
             format_diagnose_rules_test(ai(&ctx, &win), false, "http://127.0.0.1:8000/metrics");
         let text = lines.join("\n");
         assert!(text.contains("[!] Under-batching: Insufficient Concurrency"));
-        assert!(text.contains("Occupancy"));
-        assert!(text.contains("threshold: < 25%"));
+        assert!(text.contains("Requests"));
+        assert!(text.contains("running"));
         assert!(text.contains("  Cause:"));
         assert!(text.contains("under-fed by client"));
         assert!(
@@ -2451,8 +2446,8 @@ mod tests {
         let text = lines.join("\n");
         assert!(text.contains("Under-batching: Insufficient Concurrency"));
         assert!(text.contains("Seen in 100% of windows"));
-        assert!(text.contains("Config efficiency"));
-        assert!(text.contains("threshold: < 60%"));
+        assert!(text.contains("Requests"));
+        assert!(text.contains("running"));
         assert!(text.contains("  Cause:"));
         assert!(
             text.contains("Batch more requests or increase client concurrency (253 slots idle)")
@@ -2784,6 +2779,47 @@ mod tests {
     }
 
     #[test]
+    fn waste_none_when_efficiency_above_ceiling() {
+        let b = baseline_for_waste(85.0, CostSource::Catalog, 1.84);
+        let groups = vec![issue_group(rule_names::UNDER_BATCHING)];
+        let mut lines = vec!["issue".to_string()];
+        append_waste_line(&mut lines, &groups, Some(&b), Some(14.2));
+        assert!(
+            !lines.iter().any(|l| l.contains("/hr ")),
+            "85% efficiency is above 80% ceiling; no recoverable waste"
+        );
+    }
+
+    #[test]
+    fn waste_computed_against_80_pct_ceiling() {
+        let cpm = 1.84;
+        let tps = 14.2_f64;
+        let cost_per_hr = cpm * tps * 3600.0 / 1_000_000.0;
+        let expected_waste = cost_per_hr * 0.30;
+        let not_full_gap_waste = cost_per_hr * 0.50;
+        assert!(
+            (expected_waste - not_full_gap_waste).abs() > 1e-9,
+            "test must distinguish 80% ceiling from 100% roofline"
+        );
+        let b = baseline_for_waste(50.0, CostSource::Catalog, cpm);
+        let groups = vec![issue_group(rule_names::UNDER_BATCHING)];
+        let mut lines = vec!["issue".to_string()];
+        append_waste_line(&mut lines, &groups, Some(&b), Some(tps));
+        let waste_line = lines
+            .iter()
+            .find(|l| l.contains("/hr "))
+            .expect("50% efficiency should produce waste line");
+        assert!(
+            waste_line.contains(&format!("~${expected_waste:.2}/hr")),
+            "expected ~${expected_waste:.2}/hr (30% gap to 80% ceiling), got {waste_line}"
+        );
+        assert!(
+            !waste_line.contains(&format!("~${not_full_gap_waste:.2}/hr")),
+            "must not use 100% roofline gap: {waste_line}"
+        );
+    }
+
+    #[test]
     fn waste_line_appended_for_r1_r2_r3_r5() {
         let b = baseline_for_waste(32.0, CostSource::Catalog, 1.84);
         let tps = Some(14.2_f64);
@@ -3035,6 +3071,7 @@ mod tests {
         v.num_requests_running = Some(running);
         v.num_requests_waiting = Some(waiting);
         v.max_num_seqs = Some(max_num_seqs);
+        v.kv_cache_usage_perc = Some(3.3);
         v.window_duration_secs = Some(2.0);
         let mut g = gpu_busy();
         g.gpu_name = Some("NVIDIA H100 80GB HBM3".to_string());
