@@ -7,7 +7,7 @@ trap 'echo "FAILED at line $LINENO"' ERR
 # Pinned Python stack (override via env if needed). PyTorch wheels use cu126; CUDA image is 12.4.1 (12.x compatible).
 PIP_VERSION="${PIP_VERSION:-26.0.1}"
 UV_VERSION="${UV_VERSION:-0.11.1}"
-VLLM_VERSION="${VLLM_VERSION:-0.18.0}"
+VLLM_VERSION="${VLLM_VERSION:-0.24.0}"
 HUGGINGFACE_HUB_VERSION="${HUGGINGFACE_HUB_VERSION:-0.36.2}"
 TORCH_BACKEND="${TORCH_BACKEND:-cu126}"
 
@@ -66,11 +66,11 @@ python -m vllm.entrypoints.openai.api_server \
   --host 0.0.0.0 \
   --port 8000 \
   --dtype auto \
-  --gpu-memory-utilization 0.50 \
+  --gpu-memory-utilization 0.80 \
   --tensor-parallel-size 1 \
   --enforce-eager \
   --max-model-len 4096 \
-  --max-num-seqs 32 \
+  --max-num-seqs 256 \
   --enable-prefix-caching \
   2>&1 | tee \"$LOG_FILE\"'"
 
