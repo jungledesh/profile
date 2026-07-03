@@ -34,6 +34,8 @@ pub struct VllmConfig {
     pub enable_chunked_prefill: Option<bool>,
     pub block_size: Option<u32>,
     pub enable_prefix_caching: Option<bool>,
+    /// True when vLLM runs with `--enforce-eager` (CUDA graphs disabled).
+    pub enforce_eager: Option<bool>,
     /// Operator-supplied GPU cost ($/hr). Overrides catalog estimate when set.
     pub cost_per_hour: Option<f64>,
 }
@@ -85,6 +87,7 @@ pub(crate) fn config_from_snapshot(
             .enable_prefix_caching
             .or_else(|| env_bool("ENABLE_PREFIX_CACHING"))
             .or_else(|| env_bool("VLLM_ENABLE_PREFIX_CACHING")),
+        enforce_eager: env_bool("ENFORCE_EAGER").or_else(|| env_bool("VLLM_ENFORCE_EAGER")),
         cost_per_hour: None,
     }
 }

@@ -371,7 +371,7 @@ fn collect_advisories(
 /// Practical achievable efficiency ceiling. No production workload reaches 100% of the
 /// roofline due to framework overhead, scheduling, and memory contention. 80% represents
 /// a well-optimized production system. Waste is computed against this ceiling, not 100%.
-const ACHIEVABLE_EFFICIENCY_CEILING: f64 = 0.80;
+pub const ACHIEVABLE_EFFICIENCY_CEILING: f64 = 0.80;
 
 fn compute_waste_per_hr(baseline: Option<&PhysicsBaseline>, tps: Option<f64>) -> Option<f64> {
     let b = baseline?;
