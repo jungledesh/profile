@@ -82,6 +82,10 @@ fn total_generation_tokens(scrape: &Scrape) -> Option<f64> {
         .or_else(|| sum_metric_samples(scrape, "vllm_iteration_tokens_total_sum"))
 }
 
+fn total_prompt_tokens(scrape: &Scrape) -> Option<f64> {
+    sum_metric_samples(scrape, "vllm_prompt_tokens_total")
+}
+
 fn total_preemptions(scrape: &Scrape) -> Option<f64> {
     sum_metric_samples(scrape, "vllm_num_preemptions_total")
         .or_else(|| sum_metric_samples(scrape, "vllm_num_preemptions"))
@@ -183,18 +187,29 @@ fn prefix_window_hit_rate(first: &Scrape, last: &Scrape) -> Option<f64> {
     rate.is_finite().then_some(rate)
 }
 
-fn compute_counter_rates(
-    first: &Scrape,
-    last: &Scrape,
-    window_secs: f64,
-) -> (Option<f64>, Option<f64>) {
-    let gen_per_sec = counter_delta_per_sec(
+struct CounterWindowRates {
+    generation_tokens_per_sec: Option<f64>,
+    prompt_tokens_per_sec: Option<f64>,
+    prefix_cache_hit_rate: Option<f64>,
+}
+
+fn compute_counter_rates(first: &Scrape, last: &Scrape, window_secs: f64) -> CounterWindowRates {
+    let generation_tokens_per_sec = counter_delta_per_sec(
         total_generation_tokens(first),
         total_generation_tokens(last),
         window_secs,
     );
-    let prefix = prefix_window_hit_rate(first, last);
-    (gen_per_sec, prefix)
+    let prompt_tokens_per_sec = counter_delta_per_sec(
+        total_prompt_tokens(first),
+        total_prompt_tokens(last),
+        window_secs,
+    );
+    let prefix_cache_hit_rate = prefix_window_hit_rate(first, last);
+    CounterWindowRates {
+        generation_tokens_per_sec,
+        prompt_tokens_per_sec,
+        prefix_cache_hit_rate,
+    }
 }
 
 /// Cumulative mean from a single scrape (`sum`/`count` across labeled series). **`count == 0` → `None`** (no divide-by-zero).
@@ -517,9 +532,10 @@ pub fn collect_vllm_metrics_for(
     let mut m = parse_vllm_metrics(&last_scrape)?;
     m.kv_cache_peak_perc = kv_cache_peak_perc;
 
-    let (gen_per_sec, prefix_hit) = compute_counter_rates(&first_scrape, &last_scrape, window_secs);
-    m.generation_tokens_per_sec = gen_per_sec;
-    m.prefix_cache_hit_rate = prefix_hit;
+    let rates = compute_counter_rates(&first_scrape, &last_scrape, window_secs);
+    m.generation_tokens_per_sec = rates.generation_tokens_per_sec;
+    m.prompt_tokens_per_sec = rates.prompt_tokens_per_sec;
+    m.prefix_cache_hit_rate = rates.prefix_cache_hit_rate;
     m.prefix_cache_scrape_samples = prefix_samples;
     m.request_success_per_sec = counter_delta_per_sec(
         total_request_success(&first_scrape),
@@ -644,6 +660,7 @@ fn parse_vllm_metrics(scrape: &Scrape) -> Result<VllmRawMetrics> {
         prompt_tokens_window_mass: None,
         generation_tokens_total,
         generation_tokens_per_sec: None,
+        prompt_tokens_per_sec: None,
         prefix_cache_hit_rate: None,
         prefix_cache_scrape_samples: vec![],
         max_num_seqs,
@@ -778,36 +795,36 @@ vllm_iteration_tokens_total_sum 999
     fn compute_counter_rates_generation_throughput() {
         let a = "vllm_generation_tokens_total 100\n";
         let b = "vllm_generation_tokens_total 250\n";
-        let (tps, prefix) = compute_counter_rates(
+        let rates = compute_counter_rates(
             &scrape_from_body(a).unwrap(),
             &scrape_from_body(b).unwrap(),
             1.5,
         );
-        assert!((tps.unwrap() - 100.0).abs() < 1e-9);
-        assert_eq!(prefix, None);
+        assert!((rates.generation_tokens_per_sec.unwrap() - 100.0).abs() < 1e-9);
+        assert_eq!(rates.prefix_cache_hit_rate, None);
     }
 
     #[test]
     fn compute_counter_rates_zero_gen_delta() {
         let a = "vllm_generation_tokens_total 50\n";
-        let (tps, _) = compute_counter_rates(
+        let rates = compute_counter_rates(
             &scrape_from_body(a).unwrap(),
             &scrape_from_body(a).unwrap(),
             2.0,
         );
-        assert_eq!(tps, Some(0.0));
+        assert_eq!(rates.generation_tokens_per_sec, Some(0.0));
     }
 
     #[test]
     fn compute_counter_rates_missing_gen_on_first_scrape() {
         let first = "vllm_num_requests_running 1\n";
         let last = "vllm_generation_tokens_total 10\n";
-        let (tps, _) = compute_counter_rates(
+        let rates = compute_counter_rates(
             &scrape_from_body(first).unwrap(),
             &scrape_from_body(last).unwrap(),
             1.0,
         );
-        assert!(tps.is_none());
+        assert!(rates.generation_tokens_per_sec.is_none());
     }
 
     #[test]
@@ -820,12 +837,12 @@ vllm_prefix_cache_queries 10
 vllm_prefix_cache_hits 3
 vllm_prefix_cache_queries 10
 "#;
-        let (_, hit_rate) = compute_counter_rates(
+        let rates = compute_counter_rates(
             &scrape_from_body(a).unwrap(),
             &scrape_from_body(b).unwrap(),
             1.0,
         );
-        assert_eq!(hit_rate, None);
+        assert_eq!(rates.prefix_cache_hit_rate, None);
     }
 
     #[test]
@@ -838,14 +855,14 @@ vllm_prefix_cache_queries_total{model_name="llama3"} 550
 vllm_prefix_cache_hits_total{model_name="llama3"} 448
 vllm_prefix_cache_queries_total{model_name="llama3"} 615
 "#;
-        let (_, hit_rate) = compute_counter_rates(
+        let rates = compute_counter_rates(
             &scrape_from_body(first).unwrap(),
             &scrape_from_body(last).unwrap(),
             1.0,
         );
         let dh = 448.0 - 400.0;
         let dq = 615.0 - 550.0;
-        assert!((hit_rate.unwrap() - dh / dq).abs() < 1e-9);
+        assert!((rates.prefix_cache_hit_rate.unwrap() - dh / dq).abs() < 1e-9);
     }
 
     #[test]
@@ -858,12 +875,12 @@ vllm_prefix_cache_queries 20
 vllm_prefix_cache_hits 2
 vllm_prefix_cache_queries 30
 "#;
-        let (_, hit_rate) = compute_counter_rates(
+        let rates = compute_counter_rates(
             &scrape_from_body(a).unwrap(),
             &scrape_from_body(b).unwrap(),
             1.0,
         );
-        assert_eq!(hit_rate, None);
+        assert_eq!(rates.prefix_cache_hit_rate, None);
     }
 
     #[test]
@@ -873,24 +890,24 @@ vllm_prefix_cache_queries 30
 vllm_prefix_cache_hits 5
 vllm_prefix_cache_queries 100
 "#;
-        let (_, hit_rate) = compute_counter_rates(
+        let rates = compute_counter_rates(
             &scrape_from_body(a).unwrap(),
             &scrape_from_body(b).unwrap(),
             1.0,
         );
-        assert_eq!(hit_rate, None);
+        assert_eq!(rates.prefix_cache_hit_rate, None);
     }
 
     #[test]
     fn compute_counter_rates_prefix_hits_only_returns_none() {
         let a = "vllm_prefix_cache_hits 1\n";
         let b = "vllm_prefix_cache_hits 2\n";
-        let (_, hit_rate) = compute_counter_rates(
+        let rates = compute_counter_rates(
             &scrape_from_body(a).unwrap(),
             &scrape_from_body(b).unwrap(),
             1.0,
         );
-        assert_eq!(hit_rate, None);
+        assert_eq!(rates.prefix_cache_hit_rate, None);
     }
 
     #[test]
@@ -903,36 +920,36 @@ vllm_prefix_cache_queries 10
 vllm_prefix_cache_hits 5
 vllm_prefix_cache_queries 20
 "#;
-        let (_, hit_rate) = compute_counter_rates(
+        let rates = compute_counter_rates(
             &scrape_from_body(a).unwrap(),
             &scrape_from_body(b).unwrap(),
             1.0,
         );
-        assert!((hit_rate.unwrap() - 0.3).abs() < 1e-9);
+        assert!((rates.prefix_cache_hit_rate.unwrap() - 0.3).abs() < 1e-9);
     }
 
     #[test]
     fn compute_counter_rates_iteration_fallback_both_scrapes() {
         let a = "vllm_iteration_tokens_total_sum 1000\n";
         let b = "vllm_iteration_tokens_total_sum 1060\n";
-        let (tps, _) = compute_counter_rates(
+        let rates = compute_counter_rates(
             &scrape_from_body(a).unwrap(),
             &scrape_from_body(b).unwrap(),
             2.0,
         );
-        assert!((tps.unwrap() - 30.0).abs() < 1e-9);
+        assert!((rates.generation_tokens_per_sec.unwrap() - 30.0).abs() < 1e-9);
     }
 
     #[test]
     fn compute_counter_rates_zero_window_yields_no_rates() {
         let a = "vllm_generation_tokens_total 1\n";
         let b = "vllm_generation_tokens_total 9\n";
-        let (tps, _) = compute_counter_rates(
+        let rates = compute_counter_rates(
             &scrape_from_body(a).unwrap(),
             &scrape_from_body(b).unwrap(),
             0.0,
         );
-        assert!(tps.is_none());
+        assert!(rates.generation_tokens_per_sec.is_none());
     }
 
     #[test]
@@ -1092,12 +1109,34 @@ vllm_external_prefix_cache_queries 10
 vllm_external_prefix_cache_hits 3
 vllm_external_prefix_cache_queries 14
 "#;
-        let (_, hit_rate) = compute_counter_rates(
+        let rates = compute_counter_rates(
             &scrape_from_body(a).unwrap(),
             &scrape_from_body(b).unwrap(),
             1.0,
         );
-        assert!((hit_rate.unwrap() - 0.5).abs() < 1e-9);
+        assert!((rates.prefix_cache_hit_rate.unwrap() - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn compute_counter_rates_prompt_throughput() {
+        let a = "vllm_prompt_tokens_total 1000\n";
+        let b = "vllm_prompt_tokens_total 2500\n";
+        let rates = compute_counter_rates(
+            &scrape_from_body(a).unwrap(),
+            &scrape_from_body(b).unwrap(),
+            2.0,
+        );
+        assert!((rates.prompt_tokens_per_sec.unwrap() - 750.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn total_prompt_tokens_sums_labeled_series() {
+        let body = r#"
+vllm_prompt_tokens_total{model_name="a"} 40
+vllm_prompt_tokens_total{model_name="b"} 60
+"#;
+        let s = scrape_from_body(body).unwrap();
+        assert_eq!(total_prompt_tokens(&s), Some(100.0));
     }
 
     #[test]

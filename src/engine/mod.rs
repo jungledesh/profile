@@ -9,6 +9,8 @@ pub use baseline::{CeilingEstimate, CostEstimate, CostSource, PhysicsBaseline, W
 pub use rules::*;
 
 const MASSIVE_UNDERUTIL_THRESHOLD_PCT: f64 = 60.0;
+/// Occupancy at or above this: server is config-capped, not traffic-starved. Skip traffic fallback.
+const MASSIVE_UNDERUTIL_OCCUPANCY_CEILING: f64 = 0.75;
 
 #[derive(Debug, Clone)]
 pub struct Report {
@@ -33,7 +35,12 @@ pub fn build_report_for_diagnose(windows: &[RuntimeWindow], input: AnalysisInput
     } else {
         rules::build_report_for_windows(windows, input)
     };
-    maybe_add_massive_underutilization(&mut report.groups, report.baseline.as_ref());
+    maybe_add_massive_underutilization(
+        &mut report.groups,
+        report.baseline.as_ref(),
+        &input.window.snapshot,
+        input.ctx.config.max_num_seqs,
+    );
     report
 }
 
@@ -108,23 +115,38 @@ pub(crate) fn build_report(input: AnalysisInput<'_>) -> Report {
     ) {
         recs.push(r);
     }
-    if let Some(r) = rules::r1_recommendation(
+    if let Some(r) = rules::r1_recommendation(rules::R1EvalInput {
         snapshot,
-        input.ctx.config.max_num_seqs,
-        baseline.as_ref().and_then(|b| b.efficiency_pct),
-    ) {
+        config_max_num_seqs: input.ctx.config.max_num_seqs,
+        efficiency_pct: baseline.as_ref().and_then(|b| b.efficiency_pct),
+        config_relative_efficiency_pct: baseline
+            .as_ref()
+            .and_then(|b| b.config_relative_efficiency_pct),
+        prompt_tokens_per_sec: snapshot.vllm.prompt_tokens_per_sec,
+        generation_tokens_per_sec: snapshot.vllm.generation_tokens_per_sec,
+        prefix_cache_hit_rate: snapshot.vllm.prefix_cache_hit_rate,
+        ridge_batch_size: baseline.as_ref().map(|b| b.ridge_batch_size),
+    }) {
         recs.push(r);
     }
     if let Some(r) = rules::r3_recommendation(snapshot) {
         recs.push(r);
     }
-    if let Some(r) = rules::r6_recommendation(
-        baseline.as_ref().and_then(|b| b.prefill_time_fraction),
-        baseline.as_ref().and_then(|b| b.efficiency_pct),
-        baseline.as_ref().and_then(|b| b.prefill_efficiency_pct),
+    if let Some(r) = rules::r6_recommendation(rules::PrefillBoundEvalInput {
+        prompt_tokens_per_sec: snapshot.vllm.prompt_tokens_per_sec,
+        generation_tokens_per_sec: snapshot.vllm.generation_tokens_per_sec,
+        decode_efficiency_pct: baseline.as_ref().and_then(|b| b.efficiency_pct),
+        tpot_ms: snapshot.vllm.tpot_ms,
+        tpot_floor_ms: baseline.as_ref().map(|b| b.tpot_floor_ms),
+        histogram_prefill_fraction: baseline
+            .as_ref()
+            .and_then(|b| b.prefill_time_fraction)
+            .or_else(|| baseline::prefill_time_fraction_from_snapshot(snapshot)),
+        prefill_efficiency_pct: baseline.as_ref().and_then(|b| b.prefill_efficiency_pct),
+        prefix_cache_hit_rate: snapshot.vllm.prefix_cache_hit_rate,
         snapshot,
-        input.ctx.config.enable_chunked_prefill,
-    ) {
+        chunked_prefill_enabled: input.ctx.config.enable_chunked_prefill,
+    }) {
         recs.push(r);
     }
 
@@ -134,6 +156,8 @@ pub(crate) fn build_report(input: AnalysisInput<'_>) -> Report {
 fn maybe_add_massive_underutilization(
     groups: &mut Vec<IssueGroup>,
     baseline: Option<&PhysicsBaseline>,
+    snapshot: &crate::collectors::RawSnapshot,
+    config_max_num_seqs: Option<u32>,
 ) {
     if !groups.is_empty() {
         return;
@@ -143,6 +167,22 @@ fn maybe_add_massive_underutilization(
     };
     if eff >= MASSIVE_UNDERUTIL_THRESHOLD_PCT {
         return;
+    }
+    if let (Some(run), Some(max_n)) = (
+        snapshot
+            .vllm
+            .num_requests_running
+            .filter(|v| v.is_finite() && *v > 0.0),
+        snapshot
+            .vllm
+            .max_num_seqs
+            .or(config_max_num_seqs)
+            .filter(|&n| n > 0),
+    ) {
+        let occupancy = run / f64::from(max_n);
+        if occupancy >= MASSIVE_UNDERUTIL_OCCUPANCY_CEILING {
+            return;
+        }
     }
     groups.push(IssueGroup {
         primary: Recommendation {
@@ -155,7 +195,7 @@ fn maybe_add_massive_underutilization(
                 "[!] Massive Under-utilization".to_string(),
                 String::new(),
                 format!(
-                    "  Efficiency  {eff:.1}%  (threshold: < {:.0}%)",
+                    "  Decode eff. {eff:.1}%  (threshold: < {:.0}%)",
                     MASSIVE_UNDERUTIL_THRESHOLD_PCT
                 ),
                 "  Wait queue  0  (server not saturated)".to_string(),
@@ -427,6 +467,31 @@ mod build_report_tests {
             massive_underutilization_count(&report),
             1,
             "diagnose path should inject safety net exactly once"
+        );
+    }
+
+    #[test]
+    fn massive_underutilization_suppressed_at_high_occupancy() {
+        let (mut ctx, mut win) = starved_no_rules_fixture();
+        win.snapshot.vllm.num_requests_running = Some(200.0);
+        win.snapshot.vllm.max_num_seqs = Some(256);
+        ctx.config.max_num_seqs = Some(256);
+        let windows = vec![win.clone()];
+        let input = AnalysisInput::new(&ctx, &win);
+        let report = build_report_for_diagnose(&windows, input);
+        assert_eq!(
+            massive_underutilization_count(&report),
+            0,
+            "high occupancy should not trigger traffic-starvation fallback"
+        );
+        let eff = report
+            .baseline
+            .as_ref()
+            .and_then(|b| b.efficiency_pct)
+            .expect("baseline efficiency");
+        assert!(
+            eff < MASSIVE_UNDERUTIL_THRESHOLD_PCT,
+            "fixture should still be under-utilized: {eff}%"
         );
     }
 }

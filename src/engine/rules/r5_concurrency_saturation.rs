@@ -9,6 +9,10 @@ use super::rule_names;
 /// requests is halted. Below this, queue depth is likely a transient micro-burst, not structural.
 const CONCURRENCY_SATURATION_QUEUE_RATIO_MIN: f64 = 0.30;
 
+/// Absolute floor on waiting requests. Below this, queue depth is gauge noise,
+/// not structural saturation. Matches R1 and R2's established floor of 2.0.
+const CONCURRENCY_SATURATION_WAITING_MIN: f64 = 2.0;
+
 /// KV cache usage below this means the pool has room to absorb new sequences safely.
 /// Buffered 8 points below r2's 88% warning threshold; raising --max-num-seqs at 80%
 /// won't immediately trigger KV pressure. At or above: hardware is near capacity, scale out.
@@ -70,6 +74,9 @@ pub fn rule5_concurrency_saturation(
         .vllm
         .num_requests_waiting
         .filter(|v| v.is_finite())?;
+    if wait < CONCURRENCY_SATURATION_WAITING_MIN {
+        return None;
+    }
     let total = wait + run;
     if total <= 0.0 {
         return None;
@@ -471,6 +478,23 @@ mod tests {
             rule5_concurrency_saturation(&snap(sat_vllm(32.0, 2.0, Some(32))), None, None)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn does_not_fire_when_waiting_below_2() {
+        assert!(
+            rule5_concurrency_saturation(&snap(sat_vllm(32.0, 1.5, Some(32))), Some(70.0), None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn fires_when_waiting_at_2() {
+        let d = rule5_concurrency_saturation(&snap(sat_vllm(4.0, 2.0, Some(4))), Some(70.0), None)
+            .expect("fired");
+        assert_eq!(d.max_num_seqs, Some(4));
+        assert!((d.queue_ratio - (2.0 / 6.0)).abs() < 1e-9);
+        assert_eq!(d.kv_cache_usage_perc, Some(70.0));
     }
 
     #[test]

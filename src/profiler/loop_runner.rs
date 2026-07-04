@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use super::{DiagnoseResult, delta, drift, poll, run_diagnose, state::LoopState};
 use crate::context::{AnalysisInput, RuntimeWindow};
-use crate::engine;
+use crate::engine::{self, ACHIEVABLE_EFFICIENCY_CEILING};
 use crate::output;
 
 const CEILING_HEADROOM_THRESHOLD_PCT: f64 = 10.0;
@@ -47,7 +47,11 @@ pub fn run(
                 let tpot_ms = last_state.result.snapshot.vllm.tpot_ms;
                 let chunked_prefill_enabled =
                     last_state.result.static_ctx.config.enable_chunked_prefill;
-                let msg = healthy_exit_message(
+                let enforce_eager = last_state.result.static_ctx.config.enforce_eager;
+                let enable_prefix_caching =
+                    last_state.result.static_ctx.config.enable_prefix_caching;
+                let quantization = last_state.result.static_ctx.config.quantization.clone();
+                let msg = healthy_exit_message(HealthyExitInput {
                     efficiency,
                     kv_cache_usage_perc,
                     num_running,
@@ -55,7 +59,10 @@ pub fn run(
                     tpot_ms,
                     tpot_floor_ms,
                     chunked_prefill_enabled,
-                );
+                    enforce_eager,
+                    enable_prefix_caching,
+                    quantization,
+                });
                 println!("\n{msg}");
                 break;
             };
@@ -157,6 +164,8 @@ pub fn run(
         let new_report = engine::build_report_for_diagnose(&new_result.windows, summary);
 
         let drifted = drift::config_changed(&prev_result.static_ctx, &new_result.static_ctx);
+        let config_changes =
+            drift::non_baseline_changes(&prev_result.static_ctx, &new_result.static_ctx);
 
         let d = delta::compute(
             &prev_result,
@@ -164,6 +173,7 @@ pub fn run(
             &new_result,
             &new_report,
             drifted,
+            config_changes,
         );
         let current_eff = new_report.baseline.as_ref().and_then(|b| b.efficiency_pct);
         let plateau_count = state.update_efficiency_plateau(current_eff, EFFICIENCY_PLATEAU_DELTA);
@@ -202,7 +212,37 @@ fn at_hardware_ceiling(headroom_pct: Option<f64>) -> bool {
     headroom_pct.is_some_and(|h| h < CEILING_HEADROOM_THRESHOLD_PCT)
 }
 
-fn healthy_exit_message(
+fn capacity_levers(enable_prefix_caching: Option<bool>) -> String {
+    let mut levers = Vec::new();
+    if enable_prefix_caching != Some(true) {
+        levers.push("enable prefix caching");
+    }
+    levers.push("apply KV quantization (FP8)");
+    levers.push("add TP to split KV cache");
+    format!("Levers: {}", levers.join(", "))
+}
+
+fn physics_levers(quantization: &Option<String>) -> String {
+    let mut levers = Vec::new();
+    if quantization.is_none() {
+        levers.push("quantize further (FP16→FP8/AWQ)");
+    }
+    levers.push("speculative decoding");
+    levers.push("scale out with TP");
+    format!("Levers: {}", levers.join(", "))
+}
+
+fn framework_overhead_levers(enforce_eager: Option<bool>) -> String {
+    let mut levers = Vec::new();
+    if enforce_eager != Some(true) {
+        levers.push("test --enforce-eager");
+    }
+    levers.push("verify CPU/PCIe bottlenecks");
+    levers.push("evaluate SGLang for this workload");
+    format!("Levers: {}", levers.join(", "))
+}
+
+struct HealthyExitInput {
     efficiency: Option<f64>,
     kv_cache_usage_perc: Option<f64>,
     num_running: Option<f64>,
@@ -210,7 +250,24 @@ fn healthy_exit_message(
     tpot_ms: Option<f64>,
     tpot_floor_ms: Option<f64>,
     chunked_prefill_enabled: Option<bool>,
-) -> String {
+    enforce_eager: Option<bool>,
+    enable_prefix_caching: Option<bool>,
+    quantization: Option<String>,
+}
+
+fn healthy_exit_message(input: HealthyExitInput) -> String {
+    let HealthyExitInput {
+        efficiency,
+        kv_cache_usage_perc,
+        num_running,
+        ridge_batch_size,
+        tpot_ms,
+        tpot_floor_ms,
+        chunked_prefill_enabled,
+        enforce_eager,
+        enable_prefix_caching,
+        quantization,
+    } = input;
     let limiter = engine::limiter::identify(
         kv_cache_usage_perc,
         num_running,
@@ -239,10 +296,11 @@ fn healthy_exit_message(
             let kv = kv_cache_usage_perc
                 .map(|k| format!(" KV cache at {k:.0}%."))
                 .unwrap_or_default();
+            let levers = capacity_levers(enable_prefix_caching);
             format!(
                 "Primary Limiter: KV Cache Capacity\n\
                  {eff_str} -{kv} concurrency is capped before bandwidth saturates.\n\
-                 Levers: enable prefix caching, apply KV quantization (FP8), or add TP to split KV cache."
+                 {levers}"
             )
         }
         Some(engine::limiter::PrimaryLimiter::Physics) => {
@@ -250,10 +308,11 @@ fn healthy_exit_message(
                 .zip(tpot_ms)
                 .map(|(floor, actual)| format!(" TPOT {actual:.1}ms vs floor {floor:.1}ms."))
                 .unwrap_or_default();
+            let levers = physics_levers(&quantization);
             format!(
                 "Primary Limiter: Physics (Hardware Ceiling)\n\
                  {eff_str} -{floor_str} Hardware is at the limits of this model and dtype.\n\
-                 Levers: quantize further (FP16→FP8/AWQ), speculative decoding, or scale out with TP."
+                 {levers}"
             )
         }
         Some(engine::limiter::PrimaryLimiter::PrefillInterference) => {
@@ -264,10 +323,11 @@ fn healthy_exit_message(
             )
         }
         Some(engine::limiter::PrimaryLimiter::FrameworkOverhead) => {
+            let levers = framework_overhead_levers(enforce_eager);
             format!(
                 "Primary Limiter: Framework Overhead\n\
                  {eff_str} - batch healthy, VRAM available, but GPU is waiting on the system.\n\
-                 Levers: test --enforce-eager, verify CPU/PCIe bottlenecks, or evaluate SGLang for this workload."
+                 {levers}"
             )
         }
         Some(engine::limiter::PrimaryLimiter::Traffic) => {
@@ -279,7 +339,7 @@ fn healthy_exit_message(
     };
 
     let prefix = match limiter {
-        Some(_) => "Rules clear. Server is optimally tuned for current constraints.",
+        Some(_) => "Rules clear. No actionable config fix identified.",
         None => "Rules clear.",
     };
     format!("{prefix}\n\n{limiter_block}")
@@ -287,27 +347,31 @@ fn healthy_exit_message(
 
 fn format_efficiency_delta_line(delta_pp: Option<f64>) -> Option<String> {
     match delta_pp {
-        Some(v) if v >= EFFICIENCY_DISPLAY_MIN_PP => Some(format!("  Efficiency  +{v:.1}pp ↑")),
-        Some(v) if v <= -EFFICIENCY_DISPLAY_MIN_PP => Some(format!("  Efficiency  {v:.1}pp ↓")),
+        Some(v) if v >= EFFICIENCY_DISPLAY_MIN_PP => Some(format!("  Decode eff. +{v:.1}pp ↑")),
+        Some(v) if v <= -EFFICIENCY_DISPLAY_MIN_PP => Some(format!("  Decode eff. {v:.1}pp ↓")),
         _ => None,
     }
 }
 
-fn config_change_status_lines(config_drifted: bool) -> [&'static str; 2] {
+fn config_status_lines(config_drifted: bool, config_changes: &[String]) -> Vec<String> {
     if config_drifted {
-        ["  Config changed, baseline reset.", ""]
+        vec![
+            "  Config changed, baseline reset.".to_string(),
+            String::new(),
+        ]
+    } else if !config_changes.is_empty() {
+        let mut lines = vec!["  Config changed:".to_string()];
+        lines.extend(config_changes.iter().cloned());
+        lines.push(String::new());
+        lines
     } else {
-        ["  No config changed.", ""]
+        vec!["  No config changed.".to_string(), String::new()]
     }
 }
 
 fn print_delta(d: &delta::Delta) {
-    for line in config_change_status_lines(d.config_drifted) {
-        if line.is_empty() {
-            println!();
-        } else {
-            println!("{line}");
-        }
+    for line in config_status_lines(d.config_drifted, &d.config_changes) {
+        println!("{line}");
     }
     if let (Some(before), Some(after)) = (d.throughput_before, d.throughput_after)
         && before.is_finite()
@@ -368,19 +432,6 @@ fn print_delta(d: &delta::Delta) {
             );
         }
     }
-    if let (Some(before), Some(after)) = (d.prefill_efficiency_before, d.prefill_efficiency_after)
-        && before.is_finite()
-        && after.is_finite()
-    {
-        let delta_pp = after - before;
-        if delta_pp.abs() > 0.5 {
-            let arrow = if delta_pp < 0.0 { "↓" } else { "↑" };
-            println!(
-                "  Prefill eff.   {before:.1}% → {after:.1}%  {:+.1} pp {arrow}",
-                delta_pp
-            );
-        }
-    }
     let has_cost = economics_section_active(d);
     if has_cost {
         println!();
@@ -416,8 +467,8 @@ fn print_delta(d: &delta::Delta) {
         && tps_b > 0.0
         && tps_a > 0.0
     {
-        let waste_b = (cpm_b * tps_b * 3600.0 / 1_000_000.0) * (1.0 - eff_b / 100.0).max(0.0);
-        let waste_a = (cpm_a * tps_a * 3600.0 / 1_000_000.0) * (1.0 - eff_a / 100.0).max(0.0);
+        let waste_b = recoverable_waste_per_hr(cpm_b, tps_b, eff_b);
+        let waste_a = recoverable_waste_per_hr(cpm_a, tps_a, eff_a);
         if waste_b.is_finite() && waste_a.is_finite() {
             let arrow = recoverable_waste_arrow(waste_b, waste_a);
             println!("  Waste         ${waste_b:.2} → ${waste_a:.2}/hr {arrow}");
@@ -428,6 +479,11 @@ fn print_delta(d: &delta::Delta) {
 const COST_ARROW_THRESHOLD_USD: f64 = 0.01;
 const RECOVERABLE_ARROW_THRESHOLD_USD_PER_HR: f64 = 0.05;
 const JTOK_ARROW_THRESHOLD: f64 = 0.02;
+
+fn recoverable_waste_per_hr(cpm: f64, tps: f64, efficiency_pct: f64) -> f64 {
+    let cost_per_hr = cpm * tps * 3600.0 / 1_000_000.0;
+    cost_per_hr * (ACHIEVABLE_EFFICIENCY_CEILING - efficiency_pct / 100.0).max(0.0)
+}
 
 fn recoverable_waste_available(d: &delta::Delta) -> bool {
     matches!(
@@ -544,33 +600,74 @@ mod tests {
         assert!(!at_hardware_ceiling(None));
     }
 
+    fn framework_overhead_input(enforce_eager: Option<bool>) -> HealthyExitInput {
+        HealthyExitInput {
+            efficiency: Some(60.0),
+            kv_cache_usage_perc: Some(50.0),
+            num_running: Some(50.0),
+            ridge_batch_size: Some(40.0),
+            tpot_ms: Some(50.0),
+            tpot_floor_ms: Some(10.0),
+            chunked_prefill_enabled: Some(false),
+            enforce_eager,
+            enable_prefix_caching: None,
+            quantization: None,
+        }
+    }
+
+    fn capacity_input(enable_prefix_caching: Option<bool>) -> HealthyExitInput {
+        HealthyExitInput {
+            efficiency: Some(42.5),
+            kv_cache_usage_perc: Some(85.0),
+            num_running: Some(50.0),
+            ridge_batch_size: Some(40.0),
+            tpot_ms: Some(20.0),
+            tpot_floor_ms: Some(5.0),
+            chunked_prefill_enabled: Some(false),
+            enforce_eager: None,
+            enable_prefix_caching,
+            quantization: None,
+        }
+    }
+
+    fn physics_input(quantization: Option<String>) -> HealthyExitInput {
+        HealthyExitInput {
+            efficiency: Some(91.0),
+            kv_cache_usage_perc: Some(50.0),
+            num_running: Some(50.0),
+            ridge_batch_size: Some(40.0),
+            tpot_ms: Some(11.0),
+            tpot_floor_ms: Some(10.0),
+            chunked_prefill_enabled: Some(false),
+            enforce_eager: None,
+            enable_prefix_caching: None,
+            quantization,
+        }
+    }
+
     #[test]
     fn healthy_exit_capacity_limiter() {
-        let msg = healthy_exit_message(
-            Some(42.5),
-            Some(85.0),
-            Some(50.0),
-            Some(40.0),
-            Some(20.0),
-            Some(5.0),
-            Some(false),
-        );
+        let msg = healthy_exit_message(capacity_input(None));
         assert!(msg.contains("KV Cache Capacity"));
         assert!(msg.contains("Efficiency: 42.5%"));
         assert!(msg.contains("KV cache at 85%"));
+        assert!(msg.contains("No actionable config fix identified."));
     }
 
     #[test]
     fn healthy_exit_traffic_limiter() {
-        let msg = healthy_exit_message(
-            Some(34.0),
-            Some(50.0),
-            Some(5.0),
-            Some(100.0),
-            Some(20.0),
-            Some(5.0),
-            Some(false),
-        );
+        let msg = healthy_exit_message(HealthyExitInput {
+            efficiency: Some(34.0),
+            kv_cache_usage_perc: Some(50.0),
+            num_running: Some(5.0),
+            ridge_batch_size: Some(100.0),
+            tpot_ms: Some(20.0),
+            tpot_floor_ms: Some(5.0),
+            chunked_prefill_enabled: Some(false),
+            enforce_eager: None,
+            enable_prefix_caching: None,
+            quantization: None,
+        });
         assert_eq!(
             msg,
             "No issues. Efficiency 34.0% - gap is traffic, not config. Increase load to find real limits."
@@ -580,31 +677,26 @@ mod tests {
 
     #[test]
     fn traffic_limiter_does_not_say_optimally_tuned() {
-        let msg = healthy_exit_message(
-            Some(34.0),
-            Some(50.0),
-            Some(5.0),
-            Some(100.0),
-            Some(20.0),
-            Some(5.0),
-            Some(false),
-        );
+        let msg = healthy_exit_message(HealthyExitInput {
+            efficiency: Some(34.0),
+            kv_cache_usage_perc: Some(50.0),
+            num_running: Some(5.0),
+            ridge_batch_size: Some(100.0),
+            tpot_ms: Some(20.0),
+            tpot_floor_ms: Some(5.0),
+            chunked_prefill_enabled: Some(false),
+            enforce_eager: None,
+            enable_prefix_caching: None,
+            quantization: None,
+        });
         assert!(msg.contains("No issues."));
-        assert!(!msg.contains("optimally tuned"));
+        assert!(!msg.contains("No actionable config fix identified."));
         assert!(!msg.contains("Rules clear"));
     }
 
     #[test]
     fn healthy_exit_physics_limiter() {
-        let msg = healthy_exit_message(
-            Some(91.0),
-            Some(50.0),
-            Some(50.0),
-            Some(40.0),
-            Some(11.0),
-            Some(10.0),
-            Some(false),
-        );
+        let msg = healthy_exit_message(physics_input(None));
         assert!(msg.contains("Physics (Hardware Ceiling)"));
         assert!(msg.contains("Efficiency: 91.0%"));
         assert!(msg.contains("TPOT 11.0ms vs floor 10.0ms"));
@@ -612,51 +704,148 @@ mod tests {
 
     #[test]
     fn healthy_exit_prefill_interference_limiter() {
-        let msg = healthy_exit_message(
-            Some(55.0),
-            Some(50.0),
-            Some(50.0),
-            Some(40.0),
-            Some(50.0),
-            Some(10.0),
-            Some(true),
-        );
+        let msg = healthy_exit_message(HealthyExitInput {
+            efficiency: Some(55.0),
+            kv_cache_usage_perc: Some(50.0),
+            num_running: Some(50.0),
+            ridge_batch_size: Some(40.0),
+            tpot_ms: Some(50.0),
+            tpot_floor_ms: Some(10.0),
+            chunked_prefill_enabled: Some(true),
+            enforce_eager: None,
+            enable_prefix_caching: None,
+            quantization: None,
+        });
         assert!(msg.contains("Prefill Interference"));
         assert!(msg.contains("Efficiency: 55.0%"));
     }
 
     #[test]
     fn healthy_exit_framework_overhead_limiter() {
-        let msg = healthy_exit_message(
-            Some(60.0),
-            Some(50.0),
-            Some(50.0),
-            Some(40.0),
-            Some(50.0),
-            Some(10.0),
-            Some(false),
-        );
+        let msg = healthy_exit_message(framework_overhead_input(None));
         assert!(msg.contains("Framework Overhead"));
         assert!(msg.contains("Efficiency: 60.0%"));
     }
 
     #[test]
+    fn framework_overhead_levers_hide_enforce_eager_when_on() {
+        let msg = healthy_exit_message(framework_overhead_input(Some(true)));
+        assert!(msg.contains("Framework Overhead"));
+        assert!(!msg.contains("--enforce-eager"));
+        assert!(msg.contains("verify CPU/PCIe bottlenecks"));
+        assert!(msg.contains("evaluate SGLang for this workload"));
+    }
+
+    #[test]
+    fn framework_overhead_levers_show_enforce_eager_when_off_or_unknown() {
+        for enforce_eager in [Some(false), None] {
+            let msg = healthy_exit_message(framework_overhead_input(enforce_eager));
+            assert!(
+                msg.contains("--enforce-eager"),
+                "expected enforce-eager lever for {enforce_eager:?}"
+            );
+        }
+    }
+
+    #[test]
     fn healthy_exit_insufficient_data_when_limiter_unknown() {
-        let msg = healthy_exit_message(None, None, None, None, None, None, None);
+        let msg = healthy_exit_message(HealthyExitInput {
+            efficiency: None,
+            kv_cache_usage_perc: None,
+            num_running: None,
+            ridge_batch_size: None,
+            tpot_ms: None,
+            tpot_floor_ms: None,
+            chunked_prefill_enabled: None,
+            enforce_eager: None,
+            enable_prefix_caching: None,
+            quantization: None,
+        });
         assert!(msg.contains("insufficient data to identify primary limiter"));
         assert!(msg.contains("Efficiency: unavailable"));
-        assert!(!msg.contains("optimally tuned"));
+        assert!(!msg.contains("No actionable config fix identified."));
         assert_eq!(msg.matches("Rules clear.").count(), 1);
     }
 
     #[test]
-    fn config_change_status_lines_for_drifted_and_not_drifted() {
-        let drifted = config_change_status_lines(true);
-        assert_eq!(drifted[0], "  Config changed, baseline reset.");
-        assert_eq!(drifted[1], "");
-        let stable = config_change_status_lines(false);
-        assert_eq!(stable[0], "  No config changed.");
-        assert_eq!(stable[1], "");
+    fn capacity_levers_hide_prefix_caching_when_on() {
+        let msg = healthy_exit_message(capacity_input(Some(true)));
+        assert!(msg.contains("KV Cache Capacity"));
+        assert!(!msg.contains("enable prefix caching"));
+        assert!(msg.contains("KV quantization"));
+        assert!(msg.contains("add TP"));
+    }
+
+    #[test]
+    fn capacity_levers_show_prefix_caching_when_off() {
+        let msg = healthy_exit_message(capacity_input(None));
+        assert!(msg.contains("enable prefix caching"));
+    }
+
+    #[test]
+    fn physics_levers_hide_quantize_when_already_quantized() {
+        let msg = healthy_exit_message(physics_input(Some("awq".to_string())));
+        assert!(msg.contains("Physics (Hardware Ceiling)"));
+        assert!(!msg.contains("quantize further"));
+        assert!(msg.contains("speculative decoding"));
+        assert!(msg.contains("scale out"));
+    }
+
+    #[test]
+    fn physics_levers_show_quantize_when_unquantized() {
+        let msg = healthy_exit_message(physics_input(None));
+        assert!(msg.contains("quantize further"));
+    }
+
+    #[test]
+    fn non_baseline_max_num_seqs_not_baseline_drift() {
+        use crate::collectors::VllmConfig;
+        use crate::context::StaticContext;
+        let prev_cfg = VllmConfig {
+            max_num_seqs: Some(32),
+            ..Default::default()
+        };
+        let curr_cfg = VllmConfig {
+            max_num_seqs: Some(98),
+            ..Default::default()
+        };
+        let prev = StaticContext {
+            config: prev_cfg,
+            ..StaticContext::default()
+        };
+        let curr = StaticContext {
+            config: curr_cfg,
+            ..StaticContext::default()
+        };
+        assert!(!drift::config_changed(&prev, &curr));
+        assert_eq!(
+            drift::non_baseline_changes(&prev, &curr),
+            vec!["  max_num_seqs  32 -> 98".to_string()]
+        );
+    }
+
+    #[test]
+    fn config_status_lines_drifted() {
+        let lines = config_status_lines(true, &[]);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("Config changed, baseline reset."))
+        );
+    }
+
+    #[test]
+    fn config_status_lines_non_baseline_changes() {
+        let changes = vec!["  max_num_seqs  32 -> 98".to_string()];
+        let lines = config_status_lines(false, &changes);
+        assert!(lines.iter().any(|l| l.contains("Config changed:")));
+        assert!(lines.iter().any(|l| l.contains("max_num_seqs  32 -> 98")));
+    }
+
+    #[test]
+    fn config_status_lines_no_changes() {
+        let lines = config_status_lines(false, &[]);
+        assert!(lines.iter().any(|l| l == "  No config changed."));
     }
 
     #[test]
@@ -732,10 +921,9 @@ mod tests {
             ttft_p95_delta_pct: None,
             tpot_p95_delta_pct: None,
             config_drifted: false,
+            config_changes: Vec::new(),
             prefill_time_fraction_before: None,
             prefill_time_fraction_after: None,
-            prefill_efficiency_before: None,
-            prefill_efficiency_after: None,
         };
         assert!(economics_section_active(&d));
     }
@@ -770,13 +958,70 @@ mod tests {
             ttft_p95_delta_pct: None,
             tpot_p95_delta_pct: None,
             config_drifted: false,
+            config_changes: Vec::new(),
             prefill_time_fraction_before: None,
             prefill_time_fraction_after: None,
-            prefill_efficiency_before: None,
-            prefill_efficiency_after: None,
         };
         assert!(recoverable_waste_available(&d));
         assert!(economics_section_active(&d));
+    }
+
+    #[test]
+    fn delta_waste_uses_80_pct_ceiling() {
+        let cpm = 0.34;
+        let tps = 1216.0;
+        let eff = 50.0;
+        let d = delta::Delta {
+            throughput_delta_pct: None,
+            throughput_before: Some(tps),
+            throughput_after: Some(tps),
+            efficiency_delta_pp: None,
+            efficiency_pct_before: Some(eff),
+            efficiency_pct_after: Some(eff),
+            cost_per_million_before: Some(cpm),
+            cost_per_million_after: Some(cpm),
+            joules_per_token_before: None,
+            joules_per_token_after: None,
+            cost_source_after: Some(engine::CostSource::Catalog),
+            ttft_before_ms: None,
+            ttft_after_ms: None,
+            tpot_before_ms: None,
+            tpot_after_ms: None,
+            ttft_p99_before_ms: None,
+            ttft_p99_after_ms: None,
+            tpot_p99_before_ms: None,
+            tpot_p99_after_ms: None,
+            ttft_p95_before_ms: None,
+            ttft_p95_after_ms: None,
+            tpot_p95_before_ms: None,
+            tpot_p95_after_ms: None,
+            ttft_p99_delta_pct: None,
+            ttft_p95_delta_pct: None,
+            tpot_p95_delta_pct: None,
+            config_drifted: false,
+            config_changes: Vec::new(),
+            prefill_time_fraction_before: None,
+            prefill_time_fraction_after: None,
+        };
+        assert!(recoverable_waste_available(&d));
+        let waste = recoverable_waste_per_hr(
+            d.cost_per_million_before.unwrap(),
+            d.throughput_before.unwrap(),
+            d.efficiency_pct_before.unwrap(),
+        );
+        let cost_per_hr = cpm * tps * 3600.0 / 1_000_000.0;
+        let expected = cost_per_hr * 0.30;
+        let full_roofline_gap = cost_per_hr * 0.50;
+        assert!(
+            (waste - expected).abs() < 1e-9,
+            "expected {expected}, got {waste}"
+        );
+        assert!(
+            (waste - full_roofline_gap).abs() > 1e-9,
+            "must not use 100% roofline gap"
+        );
+        let waste_at_85 = recoverable_waste_per_hr(cpm, tps, 85.0);
+        assert_eq!(waste_at_85, 0.0);
     }
 
     #[test]
