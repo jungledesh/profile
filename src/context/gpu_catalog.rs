@@ -201,6 +201,7 @@ pub fn lookup_gpu(name: &str) -> Option<&'static GpuCatalogEntry> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::float_cmp)]
     use super::*;
 
     #[test]

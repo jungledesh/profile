@@ -582,6 +582,7 @@ fn verified_pass_fingerprint(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::float_cmp)]
     use super::*;
     use crate::collectors::test_fixtures::snap_with_gpu_indices;
 
