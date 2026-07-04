@@ -42,6 +42,9 @@ pub fn r4_recommendation(
     if !h.is_finite() {
         return None;
     }
+    if weight_dtype_source == WeightDtypeSource::Fallback && h < 0.0 {
+        return None;
+    }
     if h >= 0.0 {
         return None;
     }
@@ -110,14 +113,34 @@ pub fn r4_recommendation(
     })
 }
 
-/// Fires when R4 cannot evaluate due to missing VRAM or model params.
-/// No traffic gate - OOM risk exists regardless of current load.
+/// Informational note when R4 cannot produce a confident recommendation.
+/// Covers: missing VRAM, missing model params, or negative headroom with uncertain dtype (Fallback).
+/// No traffic gate, no DAG participation.
 pub fn r4_advisory(
     kv_headroom_gb: Option<f64>,
     vram_gb: Option<f64>,
     weight_gb: Option<f64>,
+    weight_dtype_source: WeightDtypeSource,
+    tensor_parallel_size: Option<u32>,
 ) -> Option<Vec<String>> {
-    if kv_headroom_gb.is_some() {
+    if let Some(h) = kv_headroom_gb {
+        if h < 0.0 && weight_dtype_source == WeightDtypeSource::Fallback {
+            let w = weight_gb
+                .map(|g| format!("{g:.0}GB"))
+                .unwrap_or_else(|| "?".to_string());
+            let v = vram_gb
+                .map(|g| format!("{g:.0}GB"))
+                .unwrap_or_else(|| "?".to_string());
+            let tp = tensor_parallel_size
+                .map(|t| format!("TP={t}"))
+                .unwrap_or_else(|| "TP=?".to_string());
+            return Some(vec![
+                format!(
+                    "[i] OOM Risk: Negative headroom ({h:.1}GB) computed assuming bf16. Weights {w}, VRAM {v}, {tp}."
+                ),
+                "    If quantized, ignore this. Otherwise verify dtype or increase TP.".to_string(),
+            ]);
+        }
         return None;
     }
     if vram_gb.is_none() {
@@ -186,18 +209,18 @@ mod tests {
     }
 
     #[test]
-    fn confidence_low_when_dtype_fallback() {
-        let r = r4_recommendation(
-            Some(-12.5),
-            None,
-            Some(140.0),
+    fn advisory_fires_on_fallback_negative_headroom() {
+        let adv = r4_advisory(
+            Some(-5.0),
             Some(80.0),
-            Some(0.9),
+            Some(140.0),
             WeightDtypeSource::Fallback,
+            Some(2),
         )
-        .expect("fired");
-        assert!((r.confidence - 0.60).abs() < 1e-9);
-        assert!(r.display_lines.join("\n").contains("Confidence: Medium"));
+        .expect("advisory");
+        let text = adv.join("\n");
+        assert!(text.contains("assuming bf16"));
+        assert!(text.contains("Weights 140GB, VRAM 80GB, TP=2."));
     }
 
     #[test]
@@ -277,20 +300,38 @@ mod tests {
 
     #[test]
     fn advisory_fires_when_vram_gb_missing() {
-        let adv = r4_advisory(None, None, Some(70.0)).expect("advisory");
+        let adv =
+            r4_advisory(None, None, Some(70.0), WeightDtypeSource::EnvVar, None).expect("advisory");
         assert!(adv[0].contains("GPU VRAM unavailable"));
     }
 
     #[test]
     fn advisory_fires_when_weight_gb_missing() {
-        let adv = r4_advisory(None, Some(80.0), None).expect("advisory");
+        let adv =
+            r4_advisory(None, Some(80.0), None, WeightDtypeSource::EnvVar, None).expect("advisory");
         assert!(adv[0].contains("Model parameters unknown"));
     }
 
     #[test]
     fn advisory_absent_when_kv_headroom_computed() {
-        assert!(r4_advisory(Some(-5.0), None, None).is_none());
-        assert!(r4_advisory(Some(4.0), None, Some(70.0)).is_none());
+        assert!(r4_advisory(Some(-5.0), None, None, WeightDtypeSource::EnvVar, None).is_none());
+        assert!(
+            r4_advisory(Some(4.0), None, Some(70.0), WeightDtypeSource::EnvVar, None).is_none()
+        );
+    }
+
+    #[test]
+    fn advisory_absent_when_fallback_but_positive_headroom() {
+        assert!(
+            r4_advisory(
+                Some(4.0),
+                Some(80.0),
+                Some(140.0),
+                WeightDtypeSource::Fallback,
+                Some(2),
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -314,6 +355,36 @@ mod tests {
         assert!(
             r.short_action
                 .contains("increase --tensor-parallel-size (weights overflow by ~12GB)")
+        );
+    }
+
+    #[test]
+    fn r4_recommendation_none_when_fallback_negative() {
+        assert!(
+            r4_recommendation(
+                Some(-12.5),
+                None,
+                Some(140.0),
+                Some(80.0),
+                Some(0.9),
+                WeightDtypeSource::Fallback,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn r4_recommendation_fires_when_non_fallback_negative() {
+        assert!(
+            r4_recommendation(
+                Some(-12.5),
+                None,
+                Some(140.0),
+                Some(80.0),
+                Some(0.9),
+                WeightDtypeSource::EnvVar,
+            )
+            .is_some()
         );
     }
 

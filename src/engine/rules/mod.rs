@@ -337,20 +337,33 @@ impl CollectedAdvisories {
     }
 }
 
+#[derive(Clone, Copy)]
+struct R4AdvisoryInput {
+    kv_headroom_gb: Option<f64>,
+    gpu_vram_gb: Option<f64>,
+    weight_gb: Option<f64>,
+    weight_dtype_source: WeightDtypeSource,
+    tensor_parallel_size: Option<u32>,
+}
+
 fn collect_advisories(
     fired_names: &std::collections::HashSet<&'static str>,
     snapshot: &RawSnapshot,
     metrics_url: &str,
-    kv_headroom_gb: Option<f64>,
-    gpu_vram_gb: Option<f64>,
-    weight_gb: Option<f64>,
+    r4_input: R4AdvisoryInput,
 ) -> CollectedAdvisories {
     let r2_adv = if kv_rules_absent_from_fired(fired_names) {
         r2_kv_cache_advisory(snapshot, metrics_url)
     } else {
         None
     };
-    let r4_adv = r4_advisory(kv_headroom_gb, gpu_vram_gb, weight_gb);
+    let r4_adv = r4_advisory(
+        r4_input.kv_headroom_gb,
+        r4_input.gpu_vram_gb,
+        r4_input.weight_gb,
+        r4_input.weight_dtype_source,
+        r4_input.tensor_parallel_size,
+    );
     let r2_present = r2_adv.is_some();
     let r4_present = r4_adv.is_some();
     let mut lines = Vec::new();
@@ -566,9 +579,20 @@ pub fn format_diagnose_rules(
         &fired_names,
         snapshot,
         metrics_url,
-        report.baseline.as_ref().and_then(|b| b.kv_headroom_gb),
-        input.ctx.gpu.vram_gb,
-        report.baseline.as_ref().map(|b| b.weight_gb),
+        R4AdvisoryInput {
+            kv_headroom_gb: report.baseline.as_ref().and_then(|b| b.kv_headroom_gb),
+            gpu_vram_gb: input.ctx.gpu.vram_gb,
+            weight_gb: report.baseline.as_ref().map(|b| b.weight_gb),
+            weight_dtype_source: report
+                .baseline
+                .as_ref()
+                .map(|b| b.weight_dtype_source)
+                .unwrap_or(WeightDtypeSource::Fallback),
+            tensor_parallel_size: effective_tensor_parallel(
+                input.ctx.config.tensor_parallel_size,
+                input.window.snapshot.collected_gpu_count(),
+            ),
+        },
     );
     let any_advisory = advisories.any();
     append_display_block(&mut out, advisories.lines);
@@ -1212,9 +1236,20 @@ pub fn format_diagnose_rules_for_windows(
             &std::collections::HashSet::new(),
             summary_snap,
             metrics_url,
-            report.baseline.as_ref().and_then(|b| b.kv_headroom_gb),
-            summary.ctx.gpu.vram_gb,
-            report.baseline.as_ref().map(|b| b.weight_gb),
+            R4AdvisoryInput {
+                kv_headroom_gb: report.baseline.as_ref().and_then(|b| b.kv_headroom_gb),
+                gpu_vram_gb: summary.ctx.gpu.vram_gb,
+                weight_gb: report.baseline.as_ref().map(|b| b.weight_gb),
+                weight_dtype_source: report
+                    .baseline
+                    .as_ref()
+                    .map(|b| b.weight_dtype_source)
+                    .unwrap_or(WeightDtypeSource::Fallback),
+                tensor_parallel_size: effective_tensor_parallel(
+                    summary.ctx.config.tensor_parallel_size,
+                    summary.window.snapshot.collected_gpu_count(),
+                ),
+            },
         );
         let any_advisory = advisories.any();
         append_display_block(&mut out, advisories.lines);
@@ -1284,9 +1319,20 @@ pub fn format_diagnose_rules_for_windows(
         &fired_names,
         summary_snap,
         metrics_url,
-        report.baseline.as_ref().and_then(|b| b.kv_headroom_gb),
-        summary.ctx.gpu.vram_gb,
-        report.baseline.as_ref().map(|b| b.weight_gb),
+        R4AdvisoryInput {
+            kv_headroom_gb: report.baseline.as_ref().and_then(|b| b.kv_headroom_gb),
+            gpu_vram_gb: summary.ctx.gpu.vram_gb,
+            weight_gb: report.baseline.as_ref().map(|b| b.weight_gb),
+            weight_dtype_source: report
+                .baseline
+                .as_ref()
+                .map(|b| b.weight_dtype_source)
+                .unwrap_or(WeightDtypeSource::Fallback),
+            tensor_parallel_size: effective_tensor_parallel(
+                summary.ctx.config.tensor_parallel_size,
+                summary.window.snapshot.collected_gpu_count(),
+            ),
+        },
     );
     let any_advisory = advisories.any();
     let mut out = warnings;
