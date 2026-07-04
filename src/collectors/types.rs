@@ -94,6 +94,8 @@ pub struct VllmRawMetrics {
     pub generation_tokens_total: Option<f64>,
     /// Δ generation tokens / s over the first→last scrape window (output throughput).
     pub generation_tokens_per_sec: Option<f64>,
+    /// Δ prompt tokens / s over the first→last scrape window (input throughput).
+    pub prompt_tokens_per_sec: Option<f64>,
     /// Prefix cache hit rate. Single window: `(Δhits)/(Δqueries)` first→last scrape. Multi-window aggregate: sum of valid window deltas - see `docs/collection-policy.md`.
     pub prefix_cache_hit_rate: Option<f64>,
     /// Cumulative prefix counters per scrape (same order as collector: 9 × ~250ms).

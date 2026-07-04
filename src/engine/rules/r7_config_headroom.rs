@@ -6,8 +6,8 @@ const CONFIG_HEADROOM_RATIO: f64 = 0.90;
 /// Server must be working, not idle.
 const OCCUPANCY_FLOOR: f64 = 0.50;
 
-/// No backlog; R5 owns that signal.
-const WAITING_CEILING: f64 = 0.0;
+/// No backlog; R5 owns that signal. Below 1.0 is gauge noise, not a real queue.
+const WAITING_CEILING: f64 = 1.0;
 
 /// Safety margin on recommended max_num_seqs.
 const RECOMMENDED_SEQS_SAFETY_MARGIN: f64 = 0.80;
@@ -16,7 +16,7 @@ const RECOMMENDED_SEQS_SAFETY_MARGIN: f64 = 0.80;
 pub struct ConfigHeadroomDetail {
     pub max_num_seqs: u32,
     pub recommended_seqs: u32,
-    pub ridge_batch_size: f64,
+    pub ridge_batch_size: Option<f64>,
     pub empirical_kv_seqs: Option<u32>,
     pub occupancy_pct: f64,
     pub running: f64,
@@ -77,14 +77,10 @@ pub fn rule7_config_headroom(
         return None;
     }
 
-    let ridge = ridge_batch_size
-        .filter(|r| r.is_finite() && *r > 0.0)
-        .unwrap_or(0.0);
-
     Some(ConfigHeadroomDetail {
         max_num_seqs: max_n,
         recommended_seqs: recommended,
-        ridge_batch_size: ridge,
+        ridge_batch_size: ridge_batch_size.filter(|r| r.is_finite() && *r > 0.0),
         empirical_kv_seqs: emp_kv.and_then(|v| u32::try_from(v.floor() as u64).ok()),
         occupancy_pct: occupancy * 100.0,
         running: run,
@@ -138,16 +134,32 @@ pub(super) fn aggregate_r7_detail(details: &[ConfigHeadroomDetail]) -> ConfigHea
     }
 }
 
+fn confidence_label(conf: f64) -> &'static str {
+    if conf >= 0.8 {
+        "High"
+    } else if conf >= 0.6 {
+        "Moderate"
+    } else {
+        "Low"
+    }
+}
+
 pub(super) fn format_config_headroom_window_issue(
     d: &ConfigHeadroomDetail,
     seen_pct: u32,
+    confidence: f64,
 ) -> Vec<String> {
     let cap_pct = (f64::from(d.max_num_seqs) / f64::from(d.recommended_seqs)) * 100.0;
+    let ridge_str = d
+        .ridge_batch_size
+        .map(|r| format!("{r:.0}"))
+        .unwrap_or_else(|| "-".to_string());
     super::with_seen_pct(
         vec![
             "[!] Configured Batch Limit".to_string(),
             String::new(),
             format!("  Config max    {}", d.max_num_seqs),
+            format!("  Ridge batch   {ridge_str}"),
             format!("  Recommended   {}", d.recommended_seqs),
             String::new(),
             "  Cause:".to_string(),
@@ -164,7 +176,7 @@ pub(super) fn format_config_headroom_window_issue(
             ),
             String::new(),
             "  Expected: Higher decode throughput when traffic concurrency increases.".to_string(),
-            "  Confidence: High".to_string(),
+            format!("  Confidence: {}", confidence_label(confidence)),
         ],
         seen_pct,
     )
@@ -209,6 +221,7 @@ mod tests {
         let d = rule7_config_headroom(&s, None, Some(153.0)).expect("fired");
         assert_eq!(d.recommended_seqs, 122);
         assert_eq!(d.empirical_kv_seqs, Some(606));
+        assert_eq!(d.ridge_batch_size, Some(153.0));
     }
 
     #[test]
@@ -291,6 +304,35 @@ mod tests {
         let s = snap(50.0, 20, 0.0, Some(80.0));
         let d = rule7_config_headroom(&s, None, Some(200.0)).expect("fired");
         assert_eq!(d.recommended_seqs, 50);
+    }
+
+    #[test]
+    fn ridge_stored_as_none_when_only_kv_drives_recommendation() {
+        let s = snap(50.0, 20, 0.0, Some(80.0));
+        let d = rule7_config_headroom(&s, None, None).expect("fired on kv only");
+        assert!(d.ridge_batch_size.is_none());
+        assert_eq!(d.recommended_seqs, 50);
+    }
+
+    #[test]
+    fn fractional_waiting_below_ceiling_does_not_suppress() {
+        let s = snap(20.0, 32, 0.5, Some(3.3));
+        assert!(rule7_config_headroom(&s, None, Some(153.0)).is_some());
+    }
+
+    #[test]
+    fn format_shows_dash_when_ridge_unavailable() {
+        let d = ConfigHeadroomDetail {
+            max_num_seqs: 32,
+            recommended_seqs: 122,
+            ridge_batch_size: None,
+            empirical_kv_seqs: Some(606),
+            occupancy_pct: 62.5,
+            running: 20.0,
+        };
+        let text = format_config_headroom_window_issue(&d, 100, 0.6).join("\n");
+        assert!(text.contains("Ridge batch   -"));
+        assert!(text.contains("Confidence: Moderate"));
     }
 
     #[test]

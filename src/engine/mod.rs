@@ -115,33 +115,38 @@ pub(crate) fn build_report(input: AnalysisInput<'_>) -> Report {
     ) {
         recs.push(r);
     }
-    if let Some(r) = rules::r1_recommendation(
+    if let Some(r) = rules::r1_recommendation(rules::R1EvalInput {
         snapshot,
-        input.ctx.config.max_num_seqs,
-        baseline.as_ref().and_then(|b| b.efficiency_pct),
-        baseline
+        config_max_num_seqs: input.ctx.config.max_num_seqs,
+        efficiency_pct: baseline.as_ref().and_then(|b| b.efficiency_pct),
+        config_relative_efficiency_pct: baseline
             .as_ref()
             .and_then(|b| b.config_relative_efficiency_pct),
-        baseline
-            .as_ref()
-            .and_then(|b| b.prefill_time_fraction)
-            .or_else(|| baseline::prefill_time_fraction_from_snapshot(snapshot)),
-    ) {
+        prompt_tokens_per_sec: snapshot.vllm.prompt_tokens_per_sec,
+        generation_tokens_per_sec: snapshot.vllm.generation_tokens_per_sec,
+        prefix_cache_hit_rate: snapshot.vllm.prefix_cache_hit_rate,
+        ridge_batch_size: baseline.as_ref().map(|b| b.ridge_batch_size),
+    }) {
         recs.push(r);
     }
     if let Some(r) = rules::r3_recommendation(snapshot) {
         recs.push(r);
     }
-    if let Some(r) = rules::r6_recommendation(
-        baseline
+    if let Some(r) = rules::r6_recommendation(rules::PrefillBoundEvalInput {
+        prompt_tokens_per_sec: snapshot.vllm.prompt_tokens_per_sec,
+        generation_tokens_per_sec: snapshot.vllm.generation_tokens_per_sec,
+        decode_efficiency_pct: baseline.as_ref().and_then(|b| b.efficiency_pct),
+        tpot_ms: snapshot.vllm.tpot_ms,
+        tpot_floor_ms: baseline.as_ref().map(|b| b.tpot_floor_ms),
+        histogram_prefill_fraction: baseline
             .as_ref()
             .and_then(|b| b.prefill_time_fraction)
             .or_else(|| baseline::prefill_time_fraction_from_snapshot(snapshot)),
-        baseline.as_ref().and_then(|b| b.efficiency_pct),
-        baseline.as_ref().and_then(|b| b.prefill_efficiency_pct),
+        prefill_efficiency_pct: baseline.as_ref().and_then(|b| b.prefill_efficiency_pct),
+        prefix_cache_hit_rate: snapshot.vllm.prefix_cache_hit_rate,
         snapshot,
-        input.ctx.config.enable_chunked_prefill,
-    ) {
+        chunked_prefill_enabled: input.ctx.config.enable_chunked_prefill,
+    }) {
         recs.push(r);
     }
 

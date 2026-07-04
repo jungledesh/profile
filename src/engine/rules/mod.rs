@@ -1,8 +1,6 @@
 use std::time::SystemTime;
 
-use crate::collectors::{
-    RawSnapshot, VllmRawMetrics, effective_tensor_parallel, window_is_evaluable,
-};
+use crate::collectors::{RawSnapshot, effective_tensor_parallel, window_is_evaluable};
 use crate::context::{AnalysisInput, RuntimeWindow};
 use crate::engine::baseline::{self, CostSource, PhysicsBaseline, WeightDtypeSource};
 
@@ -15,7 +13,8 @@ mod r6_prefill_bound;
 mod r7_config_headroom;
 
 pub use r1_under_batching::{
-    R1MissReport, Rule1Outcome, UnderBatchingDetail, r1_recommendation, r1_verbose_miss_line,
+    R1EvalInput, R1MissReport, Rule1Outcome, UnderBatchingDetail, r1_recommendation,
+    r1_verbose_miss_line,
 };
 pub use r2_kv_cache_pressure::{
     KvAdmissionBacklogDetail, KvCachePressureDetail, Rule2Outcome, r2_recommendation,
@@ -29,13 +28,14 @@ pub use r5_concurrency_saturation::{
     ConcurrencySaturationDetail, r5_recommendation, rule5_concurrency_saturation,
 };
 pub use r6_prefill_bound::{
-    PrefillBoundDetail, Rule6Outcome, r6_recommendation, r6_verbose_miss_line,
+    PrefillBoundDetail, PrefillBoundEvalInput, R6GateInput, Rule6Outcome, r6_recommendation,
+    r6_verbose_miss_line,
 };
 pub use r7_config_headroom::{ConfigHeadroomDetail, rule7_config_headroom};
 
 use r1_under_batching::{
-    aggregate_r1_detail, format_under_batching_window_issue, r1_short_action,
-    rule1_under_batching_with_efficiency,
+    KV_MONITOR_WARNING_PCT, aggregate_r1_detail, format_under_batching_window_issue,
+    r1_short_action, rule1_under_batching_with_efficiency,
 };
 use r2_kv_cache_pressure::{
     KvFormatCtx, aggregate_backlog_detail, aggregate_r2_detail, format_kv_admission_backlog_issue,
@@ -56,7 +56,7 @@ use r6_prefill_bound::{
 };
 use r7_config_headroom::{aggregate_r7_detail, format_config_headroom_window_issue};
 
-fn resolve_prefill_time_fraction(
+fn histogram_prefill_fraction_for_confidence(
     baseline: Option<&PhysicsBaseline>,
     snapshot: &RawSnapshot,
 ) -> Option<f64> {
@@ -235,6 +235,8 @@ pub mod rule_names {
 const SUPPRESSION_TABLE: &[(&str, &str)] = &[
     (rule_names::OOM_RISK, rule_names::KV_CACHE_PRESSURE),
     (rule_names::OOM_RISK, rule_names::KV_ADMISSION_BACKLOG),
+    (rule_names::KV_CACHE_PRESSURE, rule_names::UNDER_BATCHING),
+    (rule_names::KV_ADMISSION_BACKLOG, rule_names::UNDER_BATCHING),
     (rule_names::UNDER_BATCHING, rule_names::PREFILL_BOUND),
     (rule_names::CONFIG_HEADROOM, rule_names::UNDER_BATCHING),
 ];
@@ -460,11 +462,9 @@ pub fn no_evaluable_diagnose_lines(verbose: bool, windows: &[RuntimeWindow]) -> 
 }
 
 struct R1VerboseContext<'a> {
-    snapshot: &'a RawSnapshot,
-    max_num_seqs: Option<u32>,
-    efficiency_pct: Option<f64>,
-    config_relative_efficiency_pct: Option<f64>,
-    prefill_time_fraction: Option<f64>,
+    eval: R1EvalInput<'a>,
+    tpot_ms: Option<f64>,
+    tpot_floor_ms: Option<f64>,
 }
 
 fn append_not_triggered_lines(
@@ -483,27 +483,22 @@ fn append_not_triggered_lines(
     for rule in rules {
         let line = if rule.rule_name == rule_names::UNDER_BATCHING && verbose_rules {
             match r1_context.as_ref() {
-                Some(R1VerboseContext {
-                    snapshot,
-                    max_num_seqs,
-                    efficiency_pct,
-                    config_relative_efficiency_pct,
-                    prefill_time_fraction,
-                }) => r1_verbose_miss_line(
-                    snapshot,
-                    *max_num_seqs,
-                    *efficiency_pct,
-                    *config_relative_efficiency_pct,
-                    *prefill_time_fraction,
-                ),
+                Some(ctx) => r1_verbose_miss_line(ctx.eval),
                 None => format!("{}: not triggered", rule.label),
             }
         } else if rule.rule_name == rule_names::PREFILL_BOUND && verbose_rules {
-            r6_verbose_miss_line(
-                r1_context.as_ref().and_then(|c| c.prefill_time_fraction),
-                baseline.and_then(|b| b.efficiency_pct),
-            )
-            .unwrap_or_else(|| format!("{}: not triggered", rule.label))
+            let gate = r1_context.as_ref().map(|ctx| R6GateInput {
+                prompt_tokens_per_sec: ctx.eval.prompt_tokens_per_sec,
+                generation_tokens_per_sec: ctx.eval.generation_tokens_per_sec,
+                decode_efficiency_pct: baseline.and_then(|b| b.efficiency_pct),
+                tpot_ms: ctx.tpot_ms,
+                tpot_floor_ms: ctx
+                    .tpot_floor_ms
+                    .or_else(|| baseline.map(|b| b.tpot_floor_ms)),
+                prefix_cache_hit_rate: ctx.eval.prefix_cache_hit_rate,
+            });
+            gate.and_then(r6_verbose_miss_line)
+                .unwrap_or_else(|| format!("{}: not triggered", rule.label))
         } else {
             format!("{}: not triggered", rule.label)
         };
@@ -590,12 +585,19 @@ pub fn format_diagnose_rules(
             &not_fired,
             verbose_rules,
             Some(R1VerboseContext {
-                snapshot,
-                max_num_seqs: input.ctx.config.max_num_seqs,
-                efficiency_pct: baseline_ref.and_then(|b| b.efficiency_pct),
-                config_relative_efficiency_pct: baseline_ref
-                    .and_then(|b| b.config_relative_efficiency_pct),
-                prefill_time_fraction: resolve_prefill_time_fraction(baseline_ref, snapshot),
+                eval: R1EvalInput {
+                    snapshot,
+                    config_max_num_seqs: input.ctx.config.max_num_seqs,
+                    efficiency_pct: baseline_ref.and_then(|b| b.efficiency_pct),
+                    config_relative_efficiency_pct: baseline_ref
+                        .and_then(|b| b.config_relative_efficiency_pct),
+                    prompt_tokens_per_sec: snapshot.vllm.prompt_tokens_per_sec,
+                    generation_tokens_per_sec: snapshot.vllm.generation_tokens_per_sec,
+                    prefix_cache_hit_rate: snapshot.vllm.prefix_cache_hit_rate,
+                    ridge_batch_size: baseline_ref.map(|b| b.ridge_batch_size),
+                },
+                tpot_ms: snapshot.vllm.tpot_ms,
+                tpot_floor_ms: baseline_ref.map(|b| b.tpot_floor_ms),
             }),
             baseline_ref,
         );
@@ -616,6 +618,7 @@ struct WindowRuleEval {
     skipped: usize,
     n_eval: usize,
     r1_fired: usize,
+    r1_kv_warning_count: usize,
     r1_details: Vec<UnderBatchingDetail>,
     r2_fired: usize,
     r2_details: Vec<KvCachePressureDetail>,
@@ -662,17 +665,6 @@ impl WindowRuleEval {
     }
 }
 
-fn r3_display_args(snap: &VllmRawMetrics, d: &LowPrefixReuseDetail) -> (f64, Option<f64>) {
-    let qps = snap
-        .request_success_per_sec
-        .filter(|x| x.is_finite())
-        .unwrap_or(0.0);
-    let prompt_mean = d
-        .prompt_tokens_mean
-        .or_else(|| snap.prompt_tokens_mean.filter(|x| x.is_finite()));
-    (qps, prompt_mean)
-}
-
 pub(crate) fn aggregate_prefix_hit_rate_for_windows(windows: &[RuntimeWindow]) -> Option<f64> {
     // Average hit rate across ALL evaluable windows - not just windows where r3
     // fired. Filtering by rule outcome biases the result low: high-performing
@@ -704,6 +696,7 @@ fn eval_window_rules(
         skipped: 0,
         n_eval: 0,
         r1_fired: 0,
+        r1_kv_warning_count: 0,
         r1_details: Vec::new(),
         r2_fired: 0,
         r2_details: Vec::new(),
@@ -741,17 +734,27 @@ fn eval_window_rules(
         let win_input = AnalysisInput::new(summary.ctx, w);
         let win_baseline = baseline::compute(&win_input);
 
-        match rule1_under_batching_with_efficiency(
-            snap,
-            summary.ctx.config.max_num_seqs,
-            summary_efficiency_pct,
-            win_baseline
+        match rule1_under_batching_with_efficiency(R1EvalInput {
+            snapshot: snap,
+            config_max_num_seqs: summary.ctx.config.max_num_seqs,
+            efficiency_pct: summary_efficiency_pct,
+            config_relative_efficiency_pct: win_baseline
                 .as_ref()
                 .and_then(|b| b.config_relative_efficiency_pct),
-            resolve_prefill_time_fraction(win_baseline.as_ref(), snap),
-        ) {
+            prompt_tokens_per_sec: snap.vllm.prompt_tokens_per_sec,
+            generation_tokens_per_sec: snap.vllm.generation_tokens_per_sec,
+            prefix_cache_hit_rate: snap.vllm.prefix_cache_hit_rate,
+            ridge_batch_size: win_baseline.as_ref().map(|b| b.ridge_batch_size),
+        }) {
             Rule1Outcome::Fired(d) => {
                 eval.r1_fired += 1;
+                if snap
+                    .vllm
+                    .kv_cache_usage_perc
+                    .is_some_and(|kv| kv.is_finite() && kv >= KV_MONITOR_WARNING_PCT)
+                {
+                    eval.r1_kv_warning_count += 1;
+                }
                 eval.r1_details.push(d);
             }
             Rule1Outcome::NotFired(_) => {}
@@ -785,13 +788,21 @@ fn eval_window_rules(
             eval.r5_details.push(d);
         }
 
-        match r6_evaluate(
-            resolve_prefill_time_fraction(win_baseline.as_ref(), snap),
-            win_baseline.as_ref().and_then(|b| b.efficiency_pct),
-            win_baseline.as_ref().and_then(|b| b.prefill_efficiency_pct),
-            snap,
-            summary.ctx.config.enable_chunked_prefill,
-        ) {
+        match r6_evaluate(PrefillBoundEvalInput {
+            prompt_tokens_per_sec: snap.vllm.prompt_tokens_per_sec,
+            generation_tokens_per_sec: snap.vllm.generation_tokens_per_sec,
+            decode_efficiency_pct: win_baseline.as_ref().and_then(|b| b.efficiency_pct),
+            tpot_ms: snap.vllm.tpot_ms,
+            tpot_floor_ms: win_baseline.as_ref().map(|b| b.tpot_floor_ms),
+            histogram_prefill_fraction: histogram_prefill_fraction_for_confidence(
+                win_baseline.as_ref(),
+                snap,
+            ),
+            prefill_efficiency_pct: win_baseline.as_ref().and_then(|b| b.prefill_efficiency_pct),
+            prefix_cache_hit_rate: snap.vllm.prefix_cache_hit_rate,
+            snapshot: snap,
+            chunked_prefill_enabled: summary.ctx.config.enable_chunked_prefill,
+        }) {
             Rule6Outcome::Fired(d) => {
                 eval.r6_fired += 1;
                 eval.r6_details.push(d);
@@ -863,11 +874,12 @@ fn build_report_from_eval(
     if eval.r1_significant() {
         let d = aggregate_r1_detail(&eval.r1_details);
         let confidence = if d.known_gpu { 0.8 } else { 0.5 };
+        let kv_warning = rule_is_significant(eval.r1_kv_warning_count, eval.r1_fired);
         let display_lines = format_under_batching_window_issue(
             &d,
             pct(eval.r1_fired, eval.n_eval),
-            summary_snap,
             confidence,
+            kv_warning,
         );
         recs.push(Recommendation {
             rule_name: rule_names::UNDER_BATCHING,
@@ -875,7 +887,7 @@ fn build_report_from_eval(
             impact: 4,
             confidence,
             action: "Batch more requests or increase client concurrency".to_string(),
-            short_action: r1_short_action(d.running, d.max_num_seqs),
+            short_action: r1_short_action(d.running, d.effective_max),
             expected_impact: "Higher throughput, stable TPOT".to_string(),
             display_lines,
         });
@@ -966,15 +978,14 @@ fn build_report_from_eval(
 
     if eval.r7_significant() {
         let d = aggregate_r7_detail(&eval.r7_details);
-        // ridge_batch_size is 0.0 when ridge was unavailable (unwrap_or default in ConfigHeadroomDetail).
-        // Both sources present = higher confidence in the recommendation.
-        let conf = if d.ridge_batch_size > 0.0 && d.empirical_kv_seqs.is_some() {
+        // Both ridge and empirical KV present = higher confidence in the recommendation.
+        let conf = if d.ridge_batch_size.is_some() && d.empirical_kv_seqs.is_some() {
             0.8
         } else {
             0.6
         };
         let display_lines =
-            format_config_headroom_window_issue(&d, pct(eval.r7_fired, eval.n_eval));
+            format_config_headroom_window_issue(&d, pct(eval.r7_fired, eval.n_eval), conf);
         recs.push(Recommendation {
             rule_name: rule_names::CONFIG_HEADROOM,
             layer: 3,
@@ -993,7 +1004,6 @@ fn build_report_from_eval(
     if eval.r3_significant() {
         let d = aggregate_r3_detail(&eval.r3_details, summary_snap);
         let enable_prefix = summary_snap.vllm.cache_config.enable_prefix_caching;
-        let (qps, prompt_mean) = r3_display_args(&summary_snap.vllm, &d);
         let (action, short_action, impact, confidence) = if d.hit_rate.is_none() {
             (
                 "Enable --enable-prefix-caching".to_string(),
@@ -1021,8 +1031,6 @@ fn build_report_from_eval(
                 &d,
                 pct(eval.r3_fired, eval.n_eval),
                 enable_prefix,
-                qps,
-                prompt_mean,
                 session_hit_rate,
             ),
         });
@@ -1030,8 +1038,8 @@ fn build_report_from_eval(
 
     if eval.r6_significant() {
         let d = aggregate_r6_detail(&eval.r6_details);
-        let sev = r6_severity(d.prefill_time_fraction);
-        let conf = r6_confidence(sev);
+        let sev = r6_severity(d.prompt_gen_ratio);
+        let conf = r6_confidence(sev, d.histogram_prefill_fraction);
         let imp = r6_impact(sev);
         let display_lines = format_prefill_bound_window_issue(&d, pct(eval.r6_fired, eval.n_eval));
         let (_, action, short_action, expected_impact) = r6_prefill_fix_lines(&d, sev);
@@ -1222,17 +1230,21 @@ pub fn format_diagnose_rules_for_windows(
                 &not_fired,
                 verbose_rules,
                 Some(R1VerboseContext {
-                    snapshot: summary_snap,
-                    max_num_seqs: summary.ctx.config.max_num_seqs,
-                    efficiency_pct: report.baseline.as_ref().and_then(|b| b.efficiency_pct),
-                    config_relative_efficiency_pct: report
-                        .baseline
-                        .as_ref()
-                        .and_then(|b| b.config_relative_efficiency_pct),
-                    prefill_time_fraction: resolve_prefill_time_fraction(
-                        report.baseline.as_ref(),
-                        summary_snap,
-                    ),
+                    eval: R1EvalInput {
+                        snapshot: summary_snap,
+                        config_max_num_seqs: summary.ctx.config.max_num_seqs,
+                        efficiency_pct: report.baseline.as_ref().and_then(|b| b.efficiency_pct),
+                        config_relative_efficiency_pct: report
+                            .baseline
+                            .as_ref()
+                            .and_then(|b| b.config_relative_efficiency_pct),
+                        prompt_tokens_per_sec: summary_snap.vllm.prompt_tokens_per_sec,
+                        generation_tokens_per_sec: summary_snap.vllm.generation_tokens_per_sec,
+                        prefix_cache_hit_rate: summary_snap.vllm.prefix_cache_hit_rate,
+                        ridge_batch_size: report.baseline.as_ref().map(|b| b.ridge_batch_size),
+                    },
+                    tpot_ms: summary_snap.vllm.tpot_ms,
+                    tpot_floor_ms: report.baseline.as_ref().map(|b| b.tpot_floor_ms),
                 }),
                 report.baseline.as_ref(),
             );
@@ -1297,17 +1309,21 @@ pub fn format_diagnose_rules_for_windows(
             &not_fired,
             verbose_rules,
             Some(R1VerboseContext {
-                snapshot: summary_snap,
-                max_num_seqs: summary.ctx.config.max_num_seqs,
-                efficiency_pct: report.baseline.as_ref().and_then(|b| b.efficiency_pct),
-                config_relative_efficiency_pct: report
-                    .baseline
-                    .as_ref()
-                    .and_then(|b| b.config_relative_efficiency_pct),
-                prefill_time_fraction: resolve_prefill_time_fraction(
-                    report.baseline.as_ref(),
-                    summary_snap,
-                ),
+                eval: R1EvalInput {
+                    snapshot: summary_snap,
+                    config_max_num_seqs: summary.ctx.config.max_num_seqs,
+                    efficiency_pct: report.baseline.as_ref().and_then(|b| b.efficiency_pct),
+                    config_relative_efficiency_pct: report
+                        .baseline
+                        .as_ref()
+                        .and_then(|b| b.config_relative_efficiency_pct),
+                    prompt_tokens_per_sec: summary_snap.vllm.prompt_tokens_per_sec,
+                    generation_tokens_per_sec: summary_snap.vllm.generation_tokens_per_sec,
+                    prefix_cache_hit_rate: summary_snap.vllm.prefix_cache_hit_rate,
+                    ridge_batch_size: report.baseline.as_ref().map(|b| b.ridge_batch_size),
+                },
+                tpot_ms: summary_snap.vllm.tpot_ms,
+                tpot_floor_ms: report.baseline.as_ref().map(|b| b.tpot_floor_ms),
             }),
             report.baseline.as_ref(),
         );
@@ -1540,6 +1556,26 @@ mod tests {
         }
     }
 
+    fn r1_test_input(snapshot: &RawSnapshot) -> R1EvalInput<'_> {
+        R1EvalInput {
+            snapshot,
+            config_max_num_seqs: None,
+            efficiency_pct: None,
+            config_relative_efficiency_pct: None,
+            prompt_tokens_per_sec: None,
+            generation_tokens_per_sec: None,
+            prefix_cache_hit_rate: None,
+            ridge_batch_size: None,
+        }
+    }
+
+    fn mk_r1_window_with_kv(kv_pct: f64) -> RuntimeWindow {
+        let t = SystemTime::UNIX_EPOCH;
+        let mut v = vllm_base();
+        v.kv_cache_usage_perc = Some(kv_pct);
+        mk_win(snap(t, t, v, gpu_low()))
+    }
+
     #[test]
     fn under_batching_fires_when_gates_pass() {
         let t = SystemTime::UNIX_EPOCH;
@@ -1547,11 +1583,11 @@ mod tests {
         v.tpot_ms = Some(35.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        let r = r1_recommendation(&win.snapshot, None, None, None, None).expect("r1 fired");
+        let r = r1_recommendation(r1_test_input(&win.snapshot)).expect("r1 fired");
         assert_eq!(r.rule_name, rule_names::UNDER_BATCHING);
         assert_eq!(r.impact, 4);
         assert!((r.confidence - 0.5).abs() < 1e-9);
-        match rule1_under_batching_with_efficiency(&win.snapshot, None, None, None, None) {
+        match rule1_under_batching_with_efficiency(r1_test_input(&win.snapshot)) {
             Rule1Outcome::Fired(d) => {
                 assert!((d.running - 3.1).abs() < 1e-9);
                 assert_eq!(d.max_num_seqs, Some(256));
@@ -1569,7 +1605,7 @@ mod tests {
         v.tpot_ms = Some(35.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot, None, None, None, None).is_none());
+        assert!(r1_recommendation(r1_test_input(&win.snapshot)).is_none());
     }
 
     #[test]
@@ -1580,7 +1616,7 @@ mod tests {
         v.tpot_ms = Some(35.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot, None, None, None, None).is_none());
+        assert!(r1_recommendation(r1_test_input(&win.snapshot)).is_none());
     }
 
     #[test]
@@ -1590,7 +1626,7 @@ mod tests {
         v.num_requests_running = Some(64.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot, None, None, None, None).is_none());
+        assert!(r1_recommendation(r1_test_input(&win.snapshot)).is_none());
     }
 
     #[test]
@@ -1601,7 +1637,7 @@ mod tests {
         v.tpot_ms = Some(35.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot, None, None, None, None).is_none());
+        assert!(r1_recommendation(r1_test_input(&win.snapshot)).is_none());
     }
 
     #[test]
@@ -1612,7 +1648,7 @@ mod tests {
         v.tpot_ms = Some(35.0);
         let s = snap(t, t, v, gpu_low());
         let win = mk_win(s);
-        assert!(r1_recommendation(&win.snapshot, None, None, None, None).is_none());
+        assert!(r1_recommendation(r1_test_input(&win.snapshot)).is_none());
     }
 
     #[test]
@@ -1655,7 +1691,7 @@ mod tests {
             format_diagnose_rules_test(ai(&ctx, &win), false, "http://127.0.0.1:8000/metrics");
         let text = lines.join("\n");
         assert!(text.contains("[!] Under-batching: Insufficient Concurrency"));
-        assert!(text.contains("Requests"));
+        assert!(text.contains("Requests (avg when starved)"));
         assert!(text.contains("running"));
         assert!(text.contains("  Cause:"));
         assert!(text.contains("under-fed by client"));
@@ -1730,23 +1766,21 @@ mod tests {
 
     #[test]
     fn format_diagnose_verbose_r1_shows_prefill_saturation_when_gate_suppresses() {
-        use crate::collectors::HistogramWindowMass;
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
         v.num_requests_running = Some(5.0);
         v.num_requests_waiting = Some(0.0);
-        v.prefill_window_mass = Some(HistogramWindowMass {
-            sum_delta: 1.6,
-            count_delta: 2.0,
-        });
-        v.window_duration_secs = Some(1.0);
+        v.prompt_tokens_per_sec = Some(600.0);
+        v.generation_tokens_per_sec = Some(100.0);
+        v.prefix_cache_hit_rate = None;
+        v.window_duration_secs = Some(2.0);
         let s = snap(t, t, v, gpu_busy());
         let ctx = mk_ctx();
         let win = mk_win(s);
         let text =
             format_diagnose_rules_test(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics")
                 .join("\n");
-        assert!(text.contains("Under-batching: not triggered (prefill saturated at 80%)"));
+        assert!(text.contains("Under-batching: not triggered (prompt/gen ratio 6.0x"));
     }
 
     #[test]
@@ -1999,13 +2033,11 @@ mod tests {
             prompt_tokens_mean: Some(128.0),
             queries_delta: None,
         };
-        let lines = format_low_prefix_hit_rate_fired(&d, Some(true), 10.0, Some(128.0), None);
+        let lines = format_low_prefix_hit_rate_fired(&d, Some(true), None);
         let text = lines.join("\n");
         assert!(text.contains("[!] Low Prefix Cache"));
         assert!(text.contains("  Cause:"));
         assert!(text.contains("  - Prefix hit rate 24.0% (threshold: 35%)"));
-        assert!(text.contains("  - Prompt throughput: 1280 tok/s (threshold: 1000)"));
-        assert!(text.contains("Restructure prompts to share common prefixes"));
         assert!(text.contains("  Fix:"));
         assert!(text.contains("Move shared instructions/system prompts to the very start"));
         assert!(text.contains("Standardize prompt templates across requests"));
@@ -3117,6 +3149,72 @@ mod tests {
     }
 
     #[test]
+    fn kv_warning_requires_significance() {
+        let mut windows: Vec<_> = (0..10).map(|_| mk_r1_window_with_kv(50.0)).collect();
+        windows[0] = mk_r1_window_with_kv(78.0);
+        let ctx = mk_ctx();
+        let summary = ai(&ctx, windows.last().expect("windows"));
+        let report = build_report_for_windows(&windows, summary);
+        assert_eq!(
+            report.groups[0].primary.rule_name,
+            rule_names::UNDER_BATCHING
+        );
+        let text = report.groups[0].primary.display_lines.join("\n");
+        assert!(!text.contains("Monitor KV cache when scaling up."));
+    }
+
+    #[test]
+    fn kv_warning_fires_when_significant() {
+        let mut windows: Vec<_> = (0..10).map(|_| mk_r1_window_with_kv(50.0)).collect();
+        for w in windows.iter_mut().take(4) {
+            *w = mk_r1_window_with_kv(78.0);
+        }
+        let ctx = mk_ctx();
+        let summary = ai(&ctx, windows.last().expect("windows"));
+        let report = build_report_for_windows(&windows, summary);
+        assert_eq!(
+            report.groups[0].primary.rule_name,
+            rule_names::UNDER_BATCHING
+        );
+        let text = report.groups[0].primary.display_lines.join("\n");
+        assert!(text.contains("Monitor KV cache when scaling up."));
+    }
+
+    #[test]
+    fn r2_suppresses_r1_in_table() {
+        let t = SystemTime::UNIX_EPOCH;
+        let windows: Vec<_> = (0..10)
+            .map(|_| {
+                let mut v = vllm_base();
+                v.kv_cache_usage_perc = Some(89.0);
+                v.num_preemptions_per_sec = Some(0.05);
+                let s = snap(t, t, v, gpu_busy());
+                mk_win(s)
+            })
+            .collect();
+        let ctx = mk_ctx();
+        let summary = ai(&ctx, windows.last().expect("windows"));
+        let report = build_report_for_windows(&windows, summary);
+        assert!(
+            report
+                .groups
+                .iter()
+                .any(|g| g.primary.rule_name == rule_names::KV_CACHE_PRESSURE)
+        );
+        assert!(
+            !report
+                .groups
+                .iter()
+                .any(|g| g.primary.rule_name == rule_names::UNDER_BATCHING)
+        );
+        assert!(
+            report
+                .suppressed_rules
+                .contains(&rule_names::UNDER_BATCHING)
+        );
+    }
+
+    #[test]
     fn r7_silent_when_waiting_nonzero_r5_territory() {
         let mut windows: Vec<_> = (0..15)
             .map(|_| mk_evaluable_kv_window(50.0, false))
@@ -3156,23 +3254,24 @@ mod tests {
         );
     }
 
-    fn mk_r6_prefill_window(prefill_fraction: f64, tps: f64, running: f64) -> RuntimeWindow {
-        use crate::collectors::HistogramWindowMass;
+    fn mk_r6_prefill_window(
+        prompt_gen_ratio: f64,
+        gen_tps: f64,
+        running: f64,
+        tpot_ms: Option<f64>,
+    ) -> RuntimeWindow {
         let t = SystemTime::UNIX_EPOCH;
         let mut v = vllm_base();
         v.model_name = Some("meta-llama/Llama-3.1-8B-Instruct".to_string());
-        v.generation_tokens_per_sec = Some(tps);
+        v.generation_tokens_per_sec = Some(gen_tps);
+        v.prompt_tokens_per_sec = Some(gen_tps * prompt_gen_ratio);
         v.num_requests_running = Some(running);
         v.num_requests_waiting = Some(0.0);
-        let window_secs = 2.0;
-        let mean_prefill = prefill_fraction * window_secs;
-        v.prefill_window_mass = Some(HistogramWindowMass {
-            sum_delta: mean_prefill * 4.0,
-            count_delta: 4.0,
-        });
-        v.window_duration_secs = Some(window_secs);
+        v.tpot_ms = tpot_ms.or(Some(50.0));
+        v.window_duration_secs = Some(2.0);
         v.prompt_tokens_mean = Some(2048.0);
-        v.cache_config.enable_prefix_caching = Some(false);
+        v.cache_config.enable_prefix_caching = Some(true);
+        v.prefix_cache_hit_rate = Some(0.5);
         let mut g = gpu_busy();
         g.gpu_name = Some("NVIDIA H100 80GB HBM3".to_string());
         mk_win(snap(t, t, v, g))
@@ -3180,9 +3279,9 @@ mod tests {
 
     #[test]
     fn r6_suppressed_when_r1_fires() {
-        // Prefill below R1 physics gate (0.30): R1 owns under-batching; R6 stays quiet.
+        // Low prompt/gen ratio: R1 owns under-batching; R6 stays quiet.
         let windows: Vec<_> = (0..10)
-            .map(|_| mk_r6_prefill_window(0.25, 10.0, 5.0))
+            .map(|_| mk_r6_prefill_window(2.5, 10.0, 5.0, Some(50.0)))
             .collect();
         let s = windows[0].snapshot.clone();
         let ctx = mk_llama8b_h100_ctx(&s);
@@ -3205,7 +3304,7 @@ mod tests {
     #[test]
     fn r6_fires_when_r1_prefill_gate_suppresses_r1() {
         let windows: Vec<_> = (0..10)
-            .map(|_| mk_r6_prefill_window(0.55, 10.0, 5.0))
+            .map(|_| mk_r6_prefill_window(12.0, 10.0, 5.0, Some(50.0)))
             .collect();
         let s = windows[0].snapshot.clone();
         let ctx = mk_llama8b_h100_ctx(&s);
@@ -3222,7 +3321,7 @@ mod tests {
     #[test]
     fn r6_not_primary_when_r2_outscores() {
         let mut windows: Vec<_> = (0..10)
-            .map(|_| mk_r6_prefill_window(0.55, 10.0, 50.0))
+            .map(|_| mk_r6_prefill_window(12.0, 10.0, 50.0, Some(50.0)))
             .collect();
         for w in windows.iter_mut().take(4) {
             *w = mk_evaluable_kv_window(89.0, true);
@@ -3248,7 +3347,7 @@ mod tests {
     #[test]
     fn r6_fires_as_primary_when_no_other_rules() {
         let windows: Vec<_> = (0..10)
-            .map(|_| mk_r6_prefill_window(0.55, 10.0, 50.0))
+            .map(|_| mk_r6_prefill_window(12.0, 10.0, 50.0, Some(50.0)))
             .collect();
         let s = windows[0].snapshot.clone();
         let ctx = mk_llama8b_h100_ctx(&s);
@@ -3267,10 +3366,7 @@ mod tests {
         v.model_name = Some("meta-llama/Llama-3.1-8B-Instruct".to_string());
         v.num_requests_running = Some(50.0);
         v.generation_tokens_per_sec = Some(10.0);
-        v.prefill_window_mass = Some(crate::collectors::HistogramWindowMass {
-            sum_delta: 0.44,
-            count_delta: 2.0,
-        });
+        v.prompt_tokens_per_sec = Some(20.0);
         v.window_duration_secs = Some(2.0);
         let mut g = gpu_busy();
         g.gpu_name = Some("NVIDIA H100 80GB HBM3".to_string());
@@ -3281,6 +3377,6 @@ mod tests {
             format_diagnose_rules_test(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics")
                 .join("\n");
         assert!(text.contains("Prefill-bound: not triggered"));
-        assert!(text.contains("below 30% threshold"));
+        assert!(text.contains("below 5.0x threshold"));
     }
 }
