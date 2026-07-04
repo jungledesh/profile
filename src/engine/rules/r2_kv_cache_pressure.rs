@@ -562,12 +562,12 @@ mod tests {
         }
     }
 
-    fn kv_ctx<'a>(
-        snapshot: &'a RawSnapshot,
+    fn kv_ctx(
+        snapshot: &RawSnapshot,
         max_model_len: Option<u32>,
         kv_headroom_gb: Option<f64>,
         kv_max_seqs: Option<u32>,
-    ) -> KvFormatCtx<'a> {
+    ) -> KvFormatCtx<'_> {
         KvFormatCtx {
             snapshot,
             max_model_len,
@@ -586,6 +586,7 @@ mod tests {
         block_size: Option<u32>,
     ) -> VllmRawMetrics {
         // max_num_seqs set well above run so concurrency cap doesn't suppress the rule.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let max_num_seqs = Some((run as u32) + 100);
         VllmRawMetrics {
             kv_cache_usage_perc: Some(kv),
@@ -595,8 +596,8 @@ mod tests {
             generation_tokens_per_sec: Some(100.0),
             max_num_seqs,
             cache_config: CacheConfigLabels {
-                num_gpu_blocks,
                 block_size,
+                num_gpu_blocks,
                 ..Default::default()
             },
             ..Default::default()

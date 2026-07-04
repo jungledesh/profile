@@ -243,10 +243,9 @@ mod tests {
         let s = snap(20.0, 32, 0.0, Some(3.3));
         let d = rule7_config_headroom(&s, None, Some(153.0)).expect("fired");
         let raw = 153.0_f64.min(20.0 / 0.033);
-        assert_eq!(
-            d.recommended_seqs,
-            (raw * RECOMMENDED_SEQS_SAFETY_MARGIN).floor() as u32
-        );
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let expected = (raw * RECOMMENDED_SEQS_SAFETY_MARGIN).floor() as u32;
+        assert_eq!(d.recommended_seqs, expected);
     }
 
     #[test]

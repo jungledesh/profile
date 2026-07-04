@@ -367,7 +367,7 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
+    #[derive(Default, Copy, Clone)]
     struct R1InputOpts {
         config_max_num_seqs: Option<u32>,
         efficiency_pct: Option<f64>,

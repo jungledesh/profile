@@ -599,6 +599,7 @@ mod tests {
         }
     }
 
+    #[derive(Copy, Clone)]
     struct EvalR6Params<'a> {
         prompt_tps: Option<f64>,
         gen_tps: Option<f64>,

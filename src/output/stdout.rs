@@ -1,3 +1,4 @@
+use std::fmt::Write;
 use std::time::Duration;
 use std::time::SystemTime;
 
@@ -198,14 +199,13 @@ fn build_diagnose_lines(
     lines
 }
 
-/// Journey line: printed below the box, not inside it.
+/// Action line: printed below the box, not inside it.
 /// Returns None when no issues fired (clean run or not evaluable).
-fn journey_line(report: &engine::Report) -> Option<String> {
-    let group = report.groups.first()?;
-    let name = engine::rule_names::display_name(group.primary.rule_name);
-    Some(format!(
-        "▶  Bottleneck: {name}. Apply the fix above. Profile re-measures after your change.",
-    ))
+fn journey_line(report: &engine::Report) -> Option<&'static str> {
+    if report.groups.is_empty() {
+        return None;
+    }
+    Some("▶  Apply the fix above. Profile re-measures after your change.")
 }
 
 fn push_gpu_advisories(lines: &mut Vec<String>, snapshot: &RawSnapshot) {
@@ -468,7 +468,7 @@ fn format_vram(g: &GpuRawMetrics) -> String {
                 && show_vram_peak_parenthetical(used, pk, total)
             {
                 let pk_gb = pk as f64 / 1024.0;
-                s.push_str(&format!(" (peak {:.0}GB)", pk_gb));
+                let _ = write!(s, " (peak {:.0}GB)", pk_gb);
             }
             s
         }
@@ -567,7 +567,7 @@ fn vllm_prompt_kv_fragment(v: &VllmRawMetrics) -> String {
             if let Some(pk) = v.kv_cache_peak_perc.filter(|x| x.is_finite())
                 && show_kv_cache_peak_parenthetical(avg, pk)
             {
-                s.push_str(&format!(" ({:.1}% peak)", pk));
+                let _ = write!(s, " ({:.1}% peak)", pk);
             }
             s
         }
@@ -619,7 +619,7 @@ fn gpu_detail_line(g: &GpuRawMetrics, verbose: bool, is_multi_gpu: bool) -> Stri
             .power_watts
             .map(|w| format!("power {:.0}W", w))
             .unwrap_or_else(|| "power -".to_string());
-        base.push_str(&format!("{vram} | {power} | "));
+        let _ = write!(base, "{vram} | {power} | ");
     }
 
     let mem_util = g
@@ -639,7 +639,7 @@ fn gpu_detail_line(g: &GpuRawMetrics, verbose: bool, is_multi_gpu: bool) -> Stri
             if let Some(pk) = g.temperature_peak_c.filter(|t| t.is_finite())
                 && show_gpu_temp_peak_parenthetical(cur, pk)
             {
-                s.push_str(&format!(" (peak {:.0}°C)", pk));
+                let _ = write!(s, " (peak {:.0}°C)", pk);
             }
             s
         }
