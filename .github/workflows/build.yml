@@ -66,6 +66,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      - name: Tests
+        run: cargo test
+
       - name: Docker tags and whether to push
         id: docker_meta
         run: |

@@ -24,10 +24,13 @@ prometheus-parse = "0.2"
 assert_cmd = "2.0"
 predicates = "3"
 
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"
-lto = "thin"
-codegen-units = 1 
-strip = true
-
