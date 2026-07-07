@@ -4,12 +4,11 @@
 set -Eeuo pipefail
 trap 'echo "FAILED at line $LINENO"' ERR
 
-# Pinned Python stack (override via env if needed). PyTorch wheels use cu126; CUDA image is 12.4.1 (12.x compatible).
+# Pinned Python stack (override via env if needed).
 PIP_VERSION="${PIP_VERSION:-26.0.1}"
 UV_VERSION="${UV_VERSION:-0.11.1}"
 VLLM_VERSION="${VLLM_VERSION:-0.24.0}"
 HUGGINGFACE_HUB_VERSION="${HUGGINGFACE_HUB_VERSION:-0.36.2}"
-TORCH_BACKEND="${TORCH_BACKEND:-cu129}"
 
 APP_DIR="${APP_DIR:-/home/appuser/app}"
 VENV_DIR="${VENV_DIR:-/home/appuser/vllm-env}"
@@ -30,7 +29,7 @@ source "$VENV_DIR/bin/activate"
 
 python -m pip install "pip==${PIP_VERSION}"
 python -m pip install "uv==${UV_VERSION}"
-uv pip install "vllm==${VLLM_VERSION}" --torch-backend="${TORCH_BACKEND}"
+uv pip install "vllm==${VLLM_VERSION}"
 uv pip install "huggingface-hub==${HUGGINGFACE_HUB_VERSION}"
 
 if [[ -n "${HF_TOKEN:-}" ]]; then
@@ -53,6 +52,14 @@ else
     echo "Model already present."
 fi
 
+# vLLM 0.24.0 ships nvidia-cuda-runtime 13.x as a pip package.
+# The dynamic linker needs the path to libcudart.so.13.
+CUDA13_LIB=$(find "$VENV_DIR" -path "*/nvidia/cu13/lib" -type d 2>/dev/null | head -1)
+if [[ -n "$CUDA13_LIB" ]]; then
+    export LD_LIBRARY_PATH="${CUDA13_LIB}:${LD_LIBRARY_PATH:-}"
+    echo "CUDA 13 libs: $CUDA13_LIB"
+fi
+
 if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
     echo "Killing existing tmux session: $TMUX_SESSION"
     tmux kill-session -t "$TMUX_SESSION"
@@ -60,6 +67,7 @@ fi
 
 tmux new-session -d -s "$TMUX_SESSION" \
 "bash -lc 'source \"$VENV_DIR/bin/activate\" && \
+export LD_LIBRARY_PATH=\"${CUDA13_LIB}:\${LD_LIBRARY_PATH:-}\" && \
 python -m vllm.entrypoints.openai.api_server \
   --model \"$MODEL_PATH\" \
   --served-model-name llama3 \
