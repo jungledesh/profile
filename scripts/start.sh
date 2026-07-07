@@ -8,7 +8,6 @@ trap 'echo "FAILED at line $LINENO"' ERR
 PIP_VERSION="${PIP_VERSION:-26.0.1}"
 UV_VERSION="${UV_VERSION:-0.11.1}"
 VLLM_VERSION="${VLLM_VERSION:-0.24.0}"
-HUGGINGFACE_HUB_VERSION="${HUGGINGFACE_HUB_VERSION:-0.36.2}"
 
 APP_DIR="${APP_DIR:-/home/appuser/app}"
 VENV_DIR="${VENV_DIR:-/home/appuser/vllm-env}"
@@ -30,7 +29,8 @@ source "$VENV_DIR/bin/activate"
 python -m pip install "pip==${PIP_VERSION}"
 python -m pip install "uv==${UV_VERSION}"
 uv pip install "vllm==${VLLM_VERSION}"
-uv pip install "huggingface-hub==${HUGGINGFACE_HUB_VERSION}"
+# vLLM 0.24.0 pins huggingface_hub<1.0 but its transformers dep needs >=1.0.
+pip install --upgrade huggingface_hub
 
 if [[ -n "${HF_TOKEN:-}" ]]; then
     export HF_TOKEN
