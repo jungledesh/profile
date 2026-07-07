@@ -36,18 +36,10 @@ if [[ -n "${HF_TOKEN:-}" ]]; then
     export HF_TOKEN
 fi
 
-HF_CLI="${VENV_DIR}/bin/huggingface-cli"
-
 if [[ ! -d "$MODEL_PATH" ]] || [[ -z "$(ls -A "$MODEL_PATH" 2>/dev/null)" ]]; then
     echo "Downloading model..."
     mkdir -p "$MODEL_PATH"
-    [[ -x "$HF_CLI" ]] || {
-        echo "missing $HF_CLI after hub install" >&2
-        exit 1
-    }
-    "$HF_CLI" download \
-        meta-llama/Meta-Llama-3-8B-Instruct \
-        --local-dir "$MODEL_PATH"
+    hf download meta-llama/Meta-Llama-3-8B-Instruct --local-dir "$MODEL_PATH"
 else
     echo "Model already present."
 fi
