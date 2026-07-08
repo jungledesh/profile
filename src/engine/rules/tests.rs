@@ -531,20 +531,22 @@ fn format_diagnose_rules_for_windows_r4_suppresses_r2_when_both_significant() {
     assert!(
         report
             .suppressed_rules
-            .contains(&rule_names::KV_CACHE_PRESSURE)
+            .iter()
+            .any(|(s, _)| *s == rule_names::KV_CACHE_PRESSURE)
     );
 }
 
 #[test]
-fn format_diagnose_verbose_omits_kv_pressure_when_r4_fires() {
+fn format_diagnose_verbose_shows_kv_pressure_suppressed_when_r4_fires() {
     let (ctx, win) = input_r4_suppresses_r2();
     let text = format_diagnose_rules_test(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics")
         .join("\n");
+    assert!(text.contains("KV Cache Pressure: suppressed by OOM Risk"));
     assert!(!text.contains("KV cache pressure: not triggered"));
 }
 
 #[test]
-fn format_diagnose_verbose_r1_shows_prefill_saturation_when_gate_suppresses() {
+fn not_triggered_shows_plain_label() {
     let t = SystemTime::UNIX_EPOCH;
     let mut v = vllm_base();
     v.prompt_tokens_per_sec = Some(600.0);
@@ -555,7 +557,64 @@ fn format_diagnose_verbose_r1_shows_prefill_saturation_when_gate_suppresses() {
     let win = mk_win(s);
     let text = format_diagnose_rules_test(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics")
         .join("\n");
-    assert!(text.contains("Under-batching: not triggered (prompt/gen ratio 6.0x"));
+    assert!(text.contains("Under-batching: not triggered"));
+    assert!(!text.contains("Under-batching: not triggered ("));
+}
+
+#[test]
+fn suppressed_rule_shows_suppressor_in_verbose() {
+    let mut windows: Vec<_> = (0..10)
+        .map(|_| mk_r6_prefill_window(2.5, 10.0, 5.0, Some(50.0)))
+        .collect();
+    for w in windows.iter_mut().skip(5) {
+        *w = mk_r6_prefill_window(12.0, 10.0, 5.0, Some(80.0));
+    }
+    let ctx = mk_llama8b_h100_ctx(&windows[0].snapshot);
+    let summary = ai(&ctx, windows.last().expect("windows"));
+    let text = format_diagnose_rules_for_windows_test(
+        &windows,
+        summary,
+        true,
+        "http://127.0.0.1:8000/metrics",
+    )
+    .join("\n");
+    assert!(text.contains("Prefill-bound: suppressed by Under-batching"));
+}
+
+#[test]
+fn suppression_table_shows_suppressor_in_verbose() {
+    let (ctx, _) = input_r4_suppresses_r2();
+    let mut windows: Vec<_> = (0..15)
+        .map(|_| mk_evaluable_kv_window(50.0, false))
+        .collect();
+    for w in windows.iter_mut().take(8) {
+        *w = mk_evaluable_kv_window(89.0, true);
+    }
+    let summary = ai(&ctx, windows.last().expect("windows"));
+    let text = format_diagnose_rules_for_windows_test(
+        &windows,
+        summary,
+        true,
+        "http://127.0.0.1:8000/metrics",
+    )
+    .join("\n");
+    assert!(text.contains("KV Cache Pressure: suppressed by OOM Risk"));
+}
+
+#[test]
+fn format_diagnose_verbose_r1_shows_plain_not_triggered_when_gate_suppresses() {
+    let t = SystemTime::UNIX_EPOCH;
+    let mut v = vllm_base();
+    v.prompt_tokens_per_sec = Some(600.0);
+    v.generation_tokens_per_sec = Some(100.0);
+    v.prefix_cache_hit_rate = None;
+    let s = snap(t, t, v, gpu_busy());
+    let ctx = mk_ctx();
+    let win = mk_win(s);
+    let text = format_diagnose_rules_test(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics")
+        .join("\n");
+    assert!(text.contains("Under-batching: not triggered"));
+    assert!(!text.contains("prompt/gen ratio"));
 }
 
 #[test]
@@ -1612,26 +1671,6 @@ fn r6_fires_as_primary_when_no_other_rules() {
         report.groups[0].primary.rule_name,
         rule_names::PREFILL_BOUND
     );
-}
-
-#[test]
-fn r6_verbose_miss_line_when_not_triggered() {
-    let t = SystemTime::UNIX_EPOCH;
-    let mut v = vllm_base();
-    v.model_name = Some("meta-llama/Llama-3.1-8B-Instruct".to_string());
-    v.num_requests_running = Some(50.0);
-    v.generation_tokens_per_sec = Some(10.0);
-    v.prompt_tokens_per_sec = Some(20.0);
-    v.window_duration_secs = Some(2.0);
-    let mut g = gpu_busy();
-    g.gpu_name = Some("NVIDIA H100 80GB HBM3".to_string());
-    let s = snap(t, t, v, g);
-    let ctx = mk_llama8b_h100_ctx(&s);
-    let win = mk_win(s);
-    let text = format_diagnose_rules_test(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics")
-        .join("\n");
-    assert!(text.contains("Prefill-bound: not triggered"));
-    assert!(text.contains("below 5.0x threshold"));
 }
 
 #[test]
