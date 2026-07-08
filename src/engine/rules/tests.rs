@@ -1093,7 +1093,7 @@ fn r2_recommendation_includes_peak_from_detail() {
     let s = snap(t, t, v, gpu_low());
     let r = r2_recommendation(&s, None, None, None, 1, 1, false).expect("fired");
     let text = r.display_lines.join("\n");
-    assert!(text.contains("KV cache hit 99.4% peak (threshold: 88%)"));
+    assert!(text.contains("KV cache 89% avg, 99% peak (threshold: 88%)."));
 }
 
 #[test]
@@ -1143,7 +1143,7 @@ fn kv_cache_pressure_preemption_displays_without_premature_confidence() {
     )
     .join("\n");
     assert!(text.contains("Cause:"));
-    assert!(text.contains("KV cache hit 89.0% peak (threshold: 88%)"));
+    assert!(text.contains("KV cache 89% avg, 89% peak (threshold: 88%)."));
     assert!(text.contains("Expected: TTFT and TPOT recover once evictions stop."));
     assert!(text.contains("Lower --max-num-seqs to stop evictions"));
     assert!(text.contains("Switch --kv-cache-dtype fp8"));
@@ -1246,8 +1246,8 @@ fn cause_line_peak_matches_summary_snapshot() {
         "http://127.0.0.1:8000/metrics",
     )
     .join("\n");
-    assert!(text.contains("KV cache hit 95.0% peak (threshold: 88%)"));
-    assert!(!text.contains("92.0% peak"));
+    assert!(text.contains("KV cache 95% avg, 95% peak (threshold: 88%)."));
+    assert!(!text.contains("92% avg"));
 }
 
 #[test]
@@ -1277,16 +1277,11 @@ fn cause_kv_line_precedes_preemptions_and_queue() {
         "http://127.0.0.1:8000/metrics",
     )
     .join("\n");
-    let pos_kv = text.find("KV cache hit").expect("KV peak line missing");
-    let pos_preempt = text
-        .find("Active preemptions")
-        .expect("preemptions line missing");
-    let pos_queue = text.find("Queue backpressure").expect("queue line missing");
-    assert!(
-        pos_kv < pos_preempt,
-        "KV line must precede preemptions line"
-    );
-    assert!(pos_kv < pos_queue, "KV line must precede queue line");
+    let pos_kv = text.find("KV cache").expect("KV peak line missing");
+    let pos_evidence = text
+        .find("Scheduler evicting")
+        .expect("evidence line missing");
+    assert!(pos_kv < pos_evidence, "KV line must precede evidence line");
 }
 
 #[test]
