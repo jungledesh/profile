@@ -542,7 +542,7 @@ fn format_diagnose_verbose_shows_kv_pressure_suppressed_when_r4_fires() {
     let text = format_diagnose_rules_test(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics")
         .join("\n");
     assert!(text.contains("KV Cache Pressure: suppressed by OOM Risk"));
-    assert!(!text.contains("KV cache pressure: not triggered"));
+    assert!(!text.contains("KV Cache Pressure: not triggered"));
 }
 
 #[test]
@@ -578,7 +578,7 @@ fn suppressed_rule_shows_suppressor_in_verbose() {
         "http://127.0.0.1:8000/metrics",
     )
     .join("\n");
-    assert!(text.contains("Prefill-bound: suppressed by Under-batching"));
+    assert!(text.contains("Prefill-Bound: suppressed by Under-batching"));
 }
 
 #[test]
@@ -630,8 +630,8 @@ fn format_diagnose_verbose_shows_not_indicated_when_no_issue() {
     let text = format_diagnose_rules_test(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics")
         .join("\n");
     assert!(text.contains("Under-batching: not triggered"));
-    assert!(text.contains("KV cache pressure: not triggered"));
-    assert!(text.contains("Low prefix reuse: not triggered"));
+    assert!(text.contains("KV Cache Pressure: not triggered"));
+    assert!(text.contains("Low Prefix Reuse: not triggered"));
 }
 
 #[test]
@@ -659,7 +659,7 @@ fn kv_cache_miss_unavailable_without_gauge_verbose() {
     let text = format_diagnose_rules_test(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics")
         .join("\n");
     assert!(text.contains("[i] KV Cache Pressure: core metric unavailable"));
-    assert!(!text.contains("KV cache pressure: not triggered"));
+    assert!(!text.contains("KV Cache Pressure: not triggered"));
 }
 
 #[test]
@@ -1264,8 +1264,8 @@ fn r2_does_not_fire_on_single_critical_kv_window_without_preemptions() {
     windows[0] = mk_evaluable_kv_window(96.0, false);
     let text = r2_issue_lines(&windows).join("\n");
     assert!(!text.contains("[!] KV Cache Pressure"));
-    assert!(!text.contains("KV cache pressure: not triggered"));
-    assert!(!text.contains("Low prefix reuse: not triggered"));
+    assert!(!text.contains("KV Cache Pressure: not triggered"));
+    assert!(!text.contains("Low Prefix Reuse: not triggered"));
     assert!(!text.contains("Seen in"));
 }
 
@@ -1411,7 +1411,7 @@ fn format_diagnose_rule3_verbose_working_effectively_when_rate_healthy() {
     let win = mk_win(s);
     let text = format_diagnose_rules_test(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics")
         .join("\n");
-    assert!(text.contains("Low prefix reuse: not triggered"));
+    assert!(text.contains("Low Prefix Reuse: not triggered"));
 }
 
 #[test]
@@ -1425,7 +1425,7 @@ fn format_diagnose_rule3_verbose_not_indicated_when_rate_low_but_prompt_below_fl
     let win = mk_win(s);
     let text = format_diagnose_rules_test(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics")
         .join("\n");
-    assert!(text.contains("Low prefix reuse: not triggered"));
+    assert!(text.contains("Low Prefix Reuse: not triggered"));
     assert!(!text.contains("working effectively"));
 }
 
@@ -1517,9 +1517,9 @@ fn format_diagnose_rules_for_windows_matches_requested_style_when_some_rules_fir
     assert!(text.contains("running"));
     assert!(text.contains("    Cause:"));
     assert!(text.contains("Batch more requests or increase client concurrency (253 slots idle)"));
-    assert!(!text.contains("KV cache pressure: not triggered"));
-    assert!(!text.contains("Low prefix reuse: not triggered"));
-    assert!(!text.contains("Concurrency saturation: not triggered"));
+    assert!(!text.contains("KV Cache Pressure: not triggered"));
+    assert!(!text.contains("Low Prefix Reuse: not triggered"));
+    assert!(!text.contains("Concurrency Saturation: not triggered"));
 }
 
 #[test]

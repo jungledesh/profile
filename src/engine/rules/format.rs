@@ -16,44 +16,15 @@ const KV_RULE_NAMES: &[&str] = &[
     rule_names::KV_ADMISSION_BACKLOG,
 ];
 
-const KV_NOT_TRIGGERED_LABEL: &str = "KV cache pressure";
-
-struct NotTriggeredRule {
-    rule_name: &'static str,
-    label: &'static str,
-}
-
-const NOT_TRIGGERED_SINGLES: &[NotTriggeredRule] = &[
-    NotTriggeredRule {
-        rule_name: rule_names::UNDER_BATCHING,
-        label: "Under-batching",
-    },
-    NotTriggeredRule {
-        rule_name: rule_names::OOM_RISK,
-        label: "OOM risk",
-    },
-    NotTriggeredRule {
-        rule_name: rule_names::CONCURRENCY_SATURATION,
-        label: "Concurrency saturation",
-    },
-    NotTriggeredRule {
-        rule_name: rule_names::CONFIG_HEADROOM,
-        label: "Configured batch limit",
-    },
-    NotTriggeredRule {
-        rule_name: rule_names::LOW_PREFIX_REUSE,
-        label: "Low prefix reuse",
-    },
-    NotTriggeredRule {
-        rule_name: rule_names::PREFILL_BOUND,
-        label: "Prefill-bound",
-    },
+const NOT_TRIGGERED_SINGLES: &[&str] = &[
+    rule_names::UNDER_BATCHING,
+    rule_names::OOM_RISK,
+    rule_names::CONCURRENCY_SATURATION,
+    rule_names::CONFIG_HEADROOM,
+    rule_names::LOW_PREFIX_REUSE,
+    rule_names::PREFILL_BOUND,
+    rule_names::MASSIVE_UNDERUTILIZATION,
 ];
-
-const NOT_TRIGGERED_KV: NotTriggeredRule = NotTriggeredRule {
-    rule_name: rule_names::KV_CACHE_PRESSURE,
-    label: KV_NOT_TRIGGERED_LABEL,
-};
 
 fn kv_rules_absent_from_fired(fired_names: &HashSet<&'static str>) -> bool {
     !KV_RULE_NAMES.iter().any(|name| fired_names.contains(name))
@@ -256,23 +227,9 @@ pub fn no_evaluable_diagnose_lines(verbose: bool, windows: &[RuntimeWindow]) -> 
     out
 }
 
-fn verbose_rule_label(rule_name: &str) -> &str {
-    if matches!(
-        rule_name,
-        rule_names::KV_CACHE_PRESSURE | rule_names::KV_ADMISSION_BACKLOG | rule_names::OOM_RISK
-    ) {
-        return rule_names::display_name(rule_name);
-    }
-    NOT_TRIGGERED_SINGLES
-        .iter()
-        .find(|e| e.rule_name == rule_name)
-        .map(|e| e.label)
-        .unwrap_or(rule_name)
-}
-
 fn append_not_triggered_lines(
     out: &mut Vec<String>,
-    rules: &[&NotTriggeredRule],
+    rules: &[&str],
     suppressed_rules: &[(&'static str, &'static str)],
 ) {
     if rules.is_empty() && suppressed_rules.is_empty() {
@@ -282,15 +239,11 @@ fn append_not_triggered_lines(
         out.push(String::new());
     }
     for rule in rules {
-        out.push(format!("{}: not triggered", rule.label));
+        out.push(format!("{}: not triggered", rule_names::display_name(rule)));
     }
     for &(suppressed_name, suppressor_name) in suppressed_rules {
-        let label = verbose_rule_label(suppressed_name);
-        let suppressor_label = if suppressor_name == "higher-priority rule" {
-            suppressor_name
-        } else {
-            verbose_rule_label(suppressor_name)
-        };
+        let label = rule_names::display_name(suppressed_name);
+        let suppressor_label = rule_names::display_name(suppressor_name);
         out.push(format!("{label}: suppressed by {suppressor_label}"));
     }
 }
@@ -300,14 +253,14 @@ fn not_triggered_from_fired_names(
     suppressed_rules: &[(&'static str, &'static str)],
     r2_adv_present: bool,
     r4_adv_present: bool,
-) -> Vec<&'static NotTriggeredRule> {
+) -> Vec<&'static str> {
     let suppressed = |name: &str| suppressed_rules.iter().any(|(s, _)| *s == name);
     let mut rules = Vec::new();
-    for entry in NOT_TRIGGERED_SINGLES {
-        if entry.rule_name == rule_names::OOM_RISK && r4_adv_present {
+    for &entry in NOT_TRIGGERED_SINGLES {
+        if entry == rule_names::OOM_RISK && r4_adv_present {
             continue;
         }
-        if !fired_names.contains(entry.rule_name) && !suppressed(entry.rule_name) {
+        if !fired_names.contains(entry) && !suppressed(entry) {
             rules.push(entry);
         }
     }
@@ -315,7 +268,7 @@ fn not_triggered_from_fired_names(
         && !KV_RULE_NAMES.iter().any(|n| suppressed(n))
         && !r2_adv_present
     {
-        rules.push(&NOT_TRIGGERED_KV);
+        rules.push(rule_names::KV_CACHE_PRESSURE);
     }
     rules
 }
