@@ -239,8 +239,13 @@ pub(super) fn format_under_batching_fired(
     };
     let max_str = max_n.to_string();
     let idle = (d.effective_max - d.running).max(0.0);
-    let fix_line =
-        format!("    • Batch more requests or increase client concurrency ({idle:.0} slots idle)");
+    let fix_line = if d.effective_max < max_n as f64 {
+        format!(
+            "      • Batch more requests or increase client concurrency ({idle:.0} slots idle before hardware degrades TPOT)"
+        )
+    } else {
+        format!("      • Batch more requests or increase client concurrency ({idle:.0} slots idle)")
+    };
     let confidence_str = if confidence >= 0.8 {
         "High"
     } else if confidence >= 0.6 {
@@ -253,26 +258,26 @@ pub(super) fn format_under_batching_fired(
         "[!] Under-batching: Insufficient Concurrency".to_string(),
         String::new(),
         format!(
-            "  Requests (avg when starved)   {:.0} running, {:.0} waiting  (max: {max_str})",
+            "    Requests (avg when starved)   {:.0} running, {:.0} waiting  (max: {max_str})",
             d.running, d.waiting
         ),
         String::new(),
-        "  Cause:".to_string(),
-        "    Hardware capacity under-fed by client. Not enough requests arriving to keep the server busy."
+        "    Cause:".to_string(),
+        "      Hardware capacity under-fed by client. Not enough requests arriving to keep the server busy."
             .to_string(),
         String::new(),
-        "  Fix:".to_string(),
+        "    Fix:".to_string(),
         fix_line,
     ];
     if kv_warning {
-        lines.push("    • Monitor KV cache when scaling up.".to_string());
+        lines.push("      • Monitor KV cache when scaling up.".to_string());
     }
     lines.push(String::new());
-    lines.push("  Expected: Higher throughput, stable TPOT.".to_string());
-    lines.push(format!("  Confidence: {confidence_str}"));
+    lines.push("    Expected: Higher throughput, stable TPOT.".to_string());
+    lines.push(format!("    Confidence: {confidence_str}"));
     if !d.known_gpu {
         lines.push(
-            "  Note: GPU not in catalog. Diagnosis based on occupancy only (low confidence)."
+            "    Note: GPU not in catalog. Diagnosis based on occupancy only (low confidence)."
                 .to_string(),
         );
     }
@@ -554,11 +559,9 @@ mod tests {
         let s = entry_fired_snap();
         let r = r1_recommendation(r1_input(&s, R1InputOpts::default())).expect("fired");
         let text = r.display_lines.join("\n");
-        assert!(
-            text.contains(
-                "    • Batch more requests or increase client concurrency (251 slots idle)"
-            )
-        );
+        assert!(text.contains(
+            "      • Batch more requests or increase client concurrency (251 slots idle)"
+        ));
         assert!(!text.contains("hardware limit"));
         assert!(!text.contains("KV ceiling"));
     }

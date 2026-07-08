@@ -120,15 +120,15 @@ pub(super) fn format_low_prefix_hit_rate_fired(
 ) -> Vec<String> {
     let cause_lines: Vec<String> = if d.hit_rate.is_none() {
         vec![
-            "  Cause:".to_string(),
-            "  - Prefix caching is disabled (enable_prefix_caching=False)".to_string(),
+            "    Cause:".to_string(),
+            "      Prefix caching is disabled (enable_prefix_caching=False).".to_string(),
         ]
     } else {
         let hit = session_hit_rate.or(d.hit_rate).unwrap_or(0.0) * 100.0;
         vec![
-            "  Cause:".to_string(),
+            "    Cause:".to_string(),
             format!(
-                "  - Prefix hit rate {hit:.1}% (threshold: {:.0}%)",
+                "      Prefix hit rate {hit:.1}% (threshold: {:.0}%).",
                 PREFIX_HIT_RATE_LT * 100.0
             ),
         ]
@@ -136,26 +136,26 @@ pub(super) fn format_low_prefix_hit_rate_fired(
 
     let fix_lines: Vec<String> = if enable_prefix_caching == Some(false) {
         vec![
-            "  • Enable prefix caching: --enable-prefix-caching".to_string(),
-            "  • Move shared instructions/system prompts to the very start".to_string(),
-            "  • Standardize prompt templates across requests".to_string(),
+            "      • Enable prefix caching: --enable-prefix-caching".to_string(),
+            "      • Move shared instructions/system prompts to the very start".to_string(),
+            "      • Standardize prompt templates across requests".to_string(),
         ]
     } else {
         vec![
-            "  • Move shared instructions/system prompts to the very start".to_string(),
-            "  • Standardize prompt templates across requests".to_string(),
-            "  • Avoid unique tokens (IDs, timestamps) at the beginning".to_string(),
+            "      • Move shared instructions/system prompts to the very start".to_string(),
+            "      • Standardize prompt templates across requests".to_string(),
+            "      • Avoid unique tokens (IDs, timestamps) at the beginning".to_string(),
         ]
     };
 
     let mut lines = vec!["[!] Low Prefix Cache".to_string(), String::new()];
     lines.extend(cause_lines);
     lines.push(String::new());
-    lines.push("  Fix:".to_string());
+    lines.push("    Fix:".to_string());
     lines.extend(fix_lines);
     lines.push(String::new());
-    lines.push("  Expected: Lower TTFT on repeated prefixes".to_string());
-    lines.push("  Confidence: High".to_string());
+    lines.push("    Expected: Lower TTFT on repeated prefixes".to_string());
+    lines.push("    Confidence: High".to_string());
     lines
 }
 

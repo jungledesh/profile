@@ -59,20 +59,20 @@ pub fn r4_recommendation(
         .and_then(|(w, v)| min_tp(w, v, gpu_util));
 
     let fix_line = if unrunnable {
-        "    • This GPU has insufficient VRAM for activation memory alone. This model cannot run on this hardware.".to_string()
+        "      • This GPU has insufficient VRAM for activation memory alone. This model cannot run on this hardware.".to_string()
     } else {
         match (tensor_parallel_size, computed_min_tp) {
             (Some(current), Some(needed)) if current < needed => format!(
-                "    • Increase --tensor-parallel-size to at least {needed} (currently {current})"
+                "      • Increase --tensor-parallel-size to at least {needed} (currently {current})"
             ),
             (Some(current), Some(needed)) if current >= needed => format!(
-                "    • TP={current} should fit weights, but KV cache or activation memory is exhausted. Reduce --max-model-len or lower --gpu-memory-utilization"
+                "      • TP={current} should fit weights, but KV cache or activation memory is exhausted. Reduce --max-model-len or lower --gpu-memory-utilization"
             ),
             (None, Some(needed)) => {
-                format!("    • Set --tensor-parallel-size to at least {needed}")
+                format!("      • Set --tensor-parallel-size to at least {needed}")
             }
             _ => format!(
-                "    • Increase --tensor-parallel-size (weights overflow by ~{overflow:.0}GB)"
+                "      • Increase --tensor-parallel-size (weights overflow by ~{overflow:.0}GB)"
             ),
         }
     };
@@ -101,14 +101,14 @@ pub fn r4_recommendation(
         display_lines: vec![
             "[!] OOM Risk".to_string(),
             String::new(),
-            "  Cause:".to_string(),
-            format!("    • Model weights exceed GPU VRAM by ~{overflow:.0}GB"),
+            "    Cause:".to_string(),
+            format!("      • Model weights exceed GPU VRAM by ~{overflow:.0}GB"),
             String::new(),
-            "  Fix:".to_string(),
+            "    Fix:".to_string(),
             fix_line,
             String::new(),
-            "  Expected: Model fits in VRAM; eliminates OOM risk.".to_string(),
-            format!("  Confidence: {}", confidence_label(confidence)),
+            "    Expected: Model fits in VRAM; eliminates OOM risk.".to_string(),
+            format!("    Confidence: {}", confidence_label(confidence)),
         ],
     })
 }
@@ -350,7 +350,7 @@ mod tests {
         assert!((r.confidence - 0.95).abs() < 1e-9);
         let text = r.display_lines.join("\n");
         assert!(text.contains("[!] OOM Risk"));
-        assert!(text.contains("    • Model weights exceed GPU VRAM by ~12GB"));
+        assert!(text.contains("      • Model weights exceed GPU VRAM by ~12GB"));
         assert!(text.contains("weights overflow by ~12GB"));
         assert!(
             r.short_action

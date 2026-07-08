@@ -230,7 +230,7 @@ pub(super) fn append_waste_line(
     if !lines.is_empty() && !lines.last().is_some_and(|l| l.is_empty()) {
         lines.push(String::new());
     }
-    lines.push(format!("~${waste_per_hr:.2}/hr {suffix}"));
+    lines.push(format!("    ~${waste_per_hr:.2}/hr {suffix}"));
 }
 
 /// User-facing lines when no window met `window_is_evaluable` (shared by stdout and rule formatters).
@@ -438,7 +438,7 @@ pub fn format_diagnose_rules_for_windows(
             "[!] Insufficient Sustained Load".to_string(),
             String::new(),
             format!(
-                "  Traffic detected but too brief for reliable diagnosis. \
+                "    Traffic detected but too brief for reliable diagnosis. \
                  Required: {} evaluable windows. Captured: {}{}.",
                 ENGINE_MIN_PERSISTENT_WINDOWS,
                 report.n_eval,
@@ -449,8 +449,8 @@ pub fn format_diagnose_rules_for_windows(
                 }
             ),
             String::new(),
-            "  Fix:".to_string(),
-            "    • Maintain steady traffic for the full diagnostic duration.".to_string(),
+            "    Fix:".to_string(),
+            "      • Maintain steady traffic for the full diagnostic duration.".to_string(),
         ];
         trim_trailing_blank_lines(&mut out);
         return out;

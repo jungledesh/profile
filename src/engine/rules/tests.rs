@@ -233,8 +233,6 @@ fn baseline_for_waste(eff: f64, source: CostSource, cpm: f64) -> PhysicsBaseline
         tpot_floor_ms: 10.0,
         prefill_latency_floor_ms: None,
         ridge_batch_size: 1.0,
-        prefill_efficiency_pct: None,
-        prefill_time_fraction: None,
         config_relative_efficiency_pct: None,
         cost: Some(CostEstimate {
             tok_per_watt: None,
@@ -414,7 +412,7 @@ fn model_len_suggestion_uses_p99_sum_when_count_sufficient() {
         Some(6000.0),
         Some(450.0),
         150.0,
-        "    ",
+        "      ",
     );
     let text = lines.join("\n");
     assert!(text.contains("to ~6450"));
@@ -431,7 +429,7 @@ fn model_len_suggestion_no_op_when_count_below_threshold() {
         Some(6000.0),
         Some(450.0),
         50.0,
-        "    ",
+        "      ",
     );
     let text = lines.join("\n");
     assert!(text.contains("to safely raise concurrency"));
@@ -441,7 +439,7 @@ fn model_len_suggestion_no_op_when_count_below_threshold() {
 #[test]
 fn model_len_suggestion_no_op_when_p99_missing() {
     let mut lines = Vec::new();
-    push_model_len_shrink_suggestion(&mut lines, Some(8192), Some(6000.0), None, 150.0, "    ");
+    push_model_len_shrink_suggestion(&mut lines, Some(8192), Some(6000.0), None, 150.0, "      ");
     let text = lines.join("\n");
     assert!(text.contains("to safely raise concurrency"));
     assert!(!text.contains("to ~"));
@@ -456,7 +454,7 @@ fn model_len_suggestion_suppressed_when_delta_below_5pct() {
         Some(5400.0),
         Some(65.0),
         150.0,
-        "    ",
+        "      ",
     );
     assert!(lines.is_empty());
 }
@@ -1463,7 +1461,7 @@ fn format_diagnose_rules_for_windows_matches_requested_style_when_some_rules_fir
     assert!(text.contains("Seen in 100% of windows"));
     assert!(text.contains("Requests"));
     assert!(text.contains("running"));
-    assert!(text.contains("  Cause:"));
+    assert!(text.contains("    Cause:"));
     assert!(text.contains("Batch more requests or increase client concurrency (253 slots idle)"));
     assert!(!text.contains("KV cache pressure: not triggered"));
     assert!(!text.contains("Low prefix reuse: not triggered"));

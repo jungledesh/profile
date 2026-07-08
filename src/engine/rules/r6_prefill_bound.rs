@@ -19,8 +19,32 @@ const TPOT_INFLATION_GATE: f64 = 4.0;
 const DECODE_EFFICIENCY_GATE: f64 = 40.0;
 const PROMPT_SKEW_RATIO: f64 = 5.0;
 
-/// Histogram prefill fraction thresholds for optional confidence boost only.
-const HISTOGRAM_PREFILL_FRACTION_BOOST: f64 = 0.30;
+/// Fixed label column width for R6 metric rows (longest label: "Prefill ratio").
+const R6_METRIC_LABEL_W: usize = 20;
+
+fn r6_metric_line(label: &str, value: &str) -> String {
+    format!("    {label:<R6_METRIC_LABEL_W$}{value}")
+}
+
+/// Fallback when prompt mean or running count unavailable for budget derivation.
+const DEFAULT_BATCH_TOKEN_BUDGET: u64 = 2048;
+
+/// Compute recommended --max-num-batched-tokens from workload.
+/// Target: chunk average prompt into ~2 steps after decode overhead.
+/// Round up to nearest 128 for readability.
+fn recommended_batch_token_budget(prompt_mean: f64, running: f64) -> u64 {
+    let raw = prompt_mean / 2.0 + running;
+    ((raw / 128.0).ceil() as u64) * 128
+}
+
+fn batch_token_budget(d: &PrefillBoundDetail) -> u64 {
+    match (d.prompt_tokens_mean, d.running_count) {
+        (Some(pm), Some(rc)) if pm.is_finite() && pm > 0.0 && rc.is_finite() && rc >= 0.0 => {
+            recommended_batch_token_budget(pm, rc)
+        }
+        _ => DEFAULT_BATCH_TOKEN_BUDGET,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PrefillBoundDetail {
@@ -28,13 +52,12 @@ pub struct PrefillBoundDetail {
     pub decode_efficiency_pct: f64,
     pub tpot_ms: Option<f64>,
     pub tpot_floor_ms: Option<f64>,
-    pub histogram_prefill_fraction: Option<f64>,
-    pub prefill_efficiency_pct: Option<f64>,
     pub prefix_caching_enabled: Option<bool>,
     pub chunked_prefill_enabled: Option<bool>,
     pub prompt_tokens_mean: Option<f64>,
     pub prompt_tokens_p99: Option<f64>,
     pub prompt_skew_ratio: Option<f64>,
+    pub running_count: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,8 +95,6 @@ pub struct PrefillBoundEvalInput<'a> {
     pub decode_efficiency_pct: Option<f64>,
     pub tpot_ms: Option<f64>,
     pub tpot_floor_ms: Option<f64>,
-    pub histogram_prefill_fraction: Option<f64>,
-    pub prefill_efficiency_pct: Option<f64>,
     pub prefix_cache_hit_rate: Option<f64>,
     pub snapshot: &'a RawSnapshot,
     pub chunked_prefill_enabled: Option<bool>,
@@ -97,16 +118,12 @@ pub fn impact(sev: Severity) -> u8 {
     }
 }
 
-pub fn confidence(sev: Severity, histogram_prefill_fraction: Option<f64>) -> f64 {
-    let base: f64 = match sev {
+pub fn confidence(sev: Severity) -> f64 {
+    match sev {
         Severity::Severe => 0.85,
         Severity::Moderate => 0.75,
         Severity::Mild => 0.65,
-    };
-    let boost = histogram_prefill_fraction
-        .filter(|f| *f >= HISTOGRAM_PREFILL_FRACTION_BOOST)
-        .map_or(0.0, |_| 0.05);
-    (base + boost).min(0.95_f64)
+    }
 }
 
 fn confidence_label(conf: f64) -> &'static str {
@@ -149,8 +166,6 @@ pub fn evaluate(input: PrefillBoundEvalInput<'_>) -> Rule6Outcome {
         decode_efficiency_pct,
         tpot_ms,
         tpot_floor_ms,
-        histogram_prefill_fraction,
-        prefill_efficiency_pct,
         prefix_cache_hit_rate,
         snapshot,
         chunked_prefill_enabled,
@@ -207,13 +222,12 @@ pub fn evaluate(input: PrefillBoundEvalInput<'_>) -> Rule6Outcome {
         decode_efficiency_pct: eff,
         tpot_ms,
         tpot_floor_ms,
-        histogram_prefill_fraction: histogram_prefill_fraction.filter(|f| f.is_finite()),
-        prefill_efficiency_pct,
         prefix_caching_enabled: snapshot.vllm.cache_config.enable_prefix_caching,
         chunked_prefill_enabled,
         prompt_tokens_mean: snapshot.vllm.prompt_tokens_mean,
         prompt_tokens_p99: snapshot.vllm.prompt_tokens_p99,
         prompt_skew_ratio,
+        running_count: snapshot.vllm.num_requests_running,
     })
 }
 
@@ -238,28 +252,6 @@ pub(super) fn aggregate_r6_detail(details: &[PrefillBoundDetail]) -> PrefillBoun
             .filter_map(|d| d.tpot_ms)
             .fold(None, |acc, v| Some(acc.map_or(v, |a: f64| a.max(v)))),
         tpot_floor_ms: details.last().and_then(|d| d.tpot_floor_ms),
-        histogram_prefill_fraction: {
-            let vals: Vec<f64> = details
-                .iter()
-                .filter_map(|d| d.histogram_prefill_fraction)
-                .collect();
-            if vals.is_empty() {
-                None
-            } else {
-                Some(vals.iter().sum::<f64>() / vals.len() as f64)
-            }
-        },
-        prefill_efficiency_pct: {
-            let vals: Vec<f64> = details
-                .iter()
-                .filter_map(|d| d.prefill_efficiency_pct)
-                .collect();
-            if vals.is_empty() {
-                None
-            } else {
-                Some(vals.iter().sum::<f64>() / vals.len() as f64)
-            }
-        },
         prefix_caching_enabled: details.last().and_then(|d| d.prefix_caching_enabled),
         chunked_prefill_enabled: details.last().and_then(|d| d.chunked_prefill_enabled),
         prompt_tokens_mean: {
@@ -281,6 +273,14 @@ pub(super) fn aggregate_r6_detail(details: &[PrefillBoundDetail]) -> PrefillBoun
             .iter()
             .filter_map(|d| d.prompt_skew_ratio)
             .fold(None, |acc, v| Some(acc.map_or(v, |a: f64| a.max(v)))),
+        running_count: {
+            let vals: Vec<f64> = details.iter().filter_map(|d| d.running_count).collect();
+            if vals.is_empty() {
+                None
+            } else {
+                Some(vals.iter().sum::<f64>() / vals.len() as f64)
+            }
+        },
     }
 }
 
@@ -290,23 +290,18 @@ fn skewed_mode(d: &PrefillBoundDetail) -> bool {
         .is_some_and(|r| r >= PROMPT_SKEW_RATIO)
 }
 
-fn prefill_gpu_time_pct(d: &PrefillBoundDetail) -> Option<f64> {
-    d.histogram_prefill_fraction
-        .filter(|f| f.is_finite())
-        .map(|f| f * 100.0)
-}
-
 fn cause_severity_line(sev: Severity, d: &PrefillBoundDetail) -> String {
     if sev == Severity::Severe
         && d.prefix_caching_enabled == Some(true)
         && d.chunked_prefill_enabled == Some(true)
     {
-        "    Prefix caching and chunked prefill are enabled but insufficient for this workload."
+        "      Prefix caching and chunked prefill are enabled but insufficient for this workload."
             .to_string()
     } else if sev == Severity::Severe {
-        "    The GPU is busy, but mostly doing prompt processing, not token generation.".to_string()
+        "      The GPU is busy, but mostly doing prompt processing, not token generation."
+            .to_string()
     } else {
-        "    The GPU is busy, but decode throughput is limited.".to_string()
+        "      The GPU is busy, but decode throughput is limited.".to_string()
     }
 }
 
@@ -323,12 +318,12 @@ pub(super) fn prefill_fix_lines(
         return (
             vec![
                 format!(
-                    "    • Route long-context requests (p99: {p99:.0} tok) to a dedicated vLLM instance."
+                    "      • Route long-context requests (p99: {p99:.0} tok) to a dedicated vLLM instance."
                 ),
                 format!(
                     "      Short requests ({mean:.0} tok mean) are blocked by outlier prefills."
                 ),
-                "    • Or cap --max-model-len to reject prompts above the p95 threshold, or truncate at the application layer.".to_string(),
+                "      • Or cap --max-model-len to reject prompts above the p95 threshold, or truncate at the application layer.".to_string(),
             ],
             format!(
                 "Route long-context requests (p99: {p99:.0} tok) to a dedicated instance, or cap --max-model-len above p95"
@@ -345,7 +340,7 @@ pub(super) fn prefill_fix_lines(
     if prefix_off {
         (
             vec![
-                "    • Enable automatic prefix caching (--enable-prefix-caching).".to_string(),
+                "      • Enable automatic prefix caching (--enable-prefix-caching).".to_string(),
                 "      Repeated prompt prefixes are re-computed every request.".to_string(),
             ],
             "Enable automatic prefix caching (--enable-prefix-caching) to avoid re-computing shared prompt prefixes".to_string(),
@@ -353,42 +348,48 @@ pub(super) fn prefill_fix_lines(
             "20-40% reduction in prefill time for workloads with shared prefixes.".to_string(),
         )
     } else if chunked_not_enabled {
+        let budget = batch_token_budget(d);
         (
             vec![
-                "    • Enable chunked prefill (--enable-chunked-prefill) with a --max-num-batched-tokens budget (start at 2048, tune up).".to_string(),
+                "      • Enable chunked prefill (--enable-chunked-prefill).".to_string(),
+                format!(
+                    "      • Set --max-num-batched-tokens to {budget}. Lower for smoother TPOT, raise for lower TTFT."
+                ),
             ],
-            "Enable chunked prefill (--enable-chunked-prefill) with --max-num-batched-tokens budget, start at 2048".to_string(),
+            format!(
+                "Enable chunked prefill (--enable-chunked-prefill) and set --max-num-batched-tokens to {budget}"
+            ),
             "Enable chunked prefill (--enable-chunked-prefill)".to_string(),
             "Decode batches interleave with prefill, reducing head-of-line blocking.".to_string(),
         )
     } else if sev == Severity::Severe && d.prefix_caching_enabled == Some(true) && chunked_on {
         (
             vec![
-                "    • Disaggregate prefill and decode onto separate workers (vLLM disaggregated serving, requires 2+ nodes).".to_string(),
+                "      • Disaggregate prefill and decode onto separate workers (vLLM disaggregated serving, requires 2+ nodes).".to_string(),
             ],
             "Disaggregate prefill and decode onto separate workers (vLLM disaggregated serving, requires 2+ nodes)".to_string(),
             "Disaggregate prefill and decode workers".to_string(),
             "Full separation of prefill and decode compute paths.".to_string(),
         )
     } else if chunked_on {
+        let budget = batch_token_budget(d);
         (
-            vec![
-                "    • Reduce --max-num-batched-tokens to shrink prefill chunk size.".to_string(),
-                "      Current chunks are too large, starving decode.".to_string(),
-            ],
-            "Reduce --max-num-batched-tokens to shrink prefill chunk size, current chunks are starving decode".to_string(),
+            vec![format!(
+                "      • Reduce --max-num-batched-tokens to {budget}. Lower for smoother TPOT, raise for lower TTFT."
+            )],
+            format!("Reduce --max-num-batched-tokens to {budget} to shrink prefill chunk size"),
             "Reduce --max-num-batched-tokens".to_string(),
             "Lower TTFT variance, steadier decode throughput.".to_string(),
         )
     } else {
         // Logically unreachable: branch 2 forces chunked_on=true, branch 4 catches it.
         // Safe fallback instead of panic in library code.
+        let budget = batch_token_budget(d);
         (
-            vec![
-                "    • Reduce --max-num-batched-tokens to shrink prefill chunk size.".to_string(),
-                "      Current chunks are too large, starving decode.".to_string(),
-            ],
-            "Reduce --max-num-batched-tokens to shrink prefill chunk size, current chunks are starving decode".to_string(),
+            vec![format!(
+                "      • Reduce --max-num-batched-tokens to {budget}. Lower for smoother TPOT, raise for lower TTFT."
+            )],
+            format!("Reduce --max-num-batched-tokens to {budget} to shrink prefill chunk size"),
             "Reduce --max-num-batched-tokens".to_string(),
             "Lower TTFT variance, steadier decode throughput.".to_string(),
         )
@@ -400,7 +401,7 @@ pub(super) fn format_prefill_bound_window_issue(
     seen_pct: u32,
 ) -> Vec<String> {
     let sev = severity(d.prompt_gen_ratio);
-    let conf = confidence(sev, d.histogram_prefill_fraction);
+    let conf = confidence(sev);
     let (fix_bullets, _, _, expected) = prefill_fix_lines(d, sev);
     let skewed = skewed_mode(d);
 
@@ -421,72 +422,72 @@ pub(super) fn format_prefill_bound_window_issue(
             }
         ),
         String::new(),
-        format!("  Prefill ratio     {ratio_display}  prompt tok/s vs gen tok/s"),
+        r6_metric_line(
+            "Prefill ratio",
+            &format!("{ratio_display}  prompt tok/s vs gen tok/s"),
+        ),
         format!(
-            "  Decode eff.      {:.1}%  of HW ceiling",
-            d.decode_efficiency_pct
+            "    {:<width$}(avg when prefill-bound)   {:.1}%  of HW ceiling",
+            "Decode eff.",
+            d.decode_efficiency_pct,
+            width = R6_METRIC_LABEL_W
         ),
     ];
 
-    if let Some(pe) = d.prefill_efficiency_pct {
-        lines.push(format!("  Prefill eff.    {pe:.1}%  of compute ceiling"));
-    }
     if skewed {
         if let Some(pm) = d.prompt_tokens_mean.filter(|v| v.is_finite() && *v > 0.0) {
-            lines.push(format!("  Prompt mean    {pm:.0} tok"));
+            lines.push(r6_metric_line("Prompt mean", &format!("{pm:.0} tok")));
         }
         if let Some(p99) = d.prompt_tokens_p99.filter(|v| v.is_finite() && *v > 0.0) {
             let ratio = d.prompt_skew_ratio.unwrap_or(0.0);
             if ratio > 0.0 && ratio.is_finite() {
-                lines.push(format!("  Prompt p99    {p99:.0} tok  ({ratio:.0}x mean)"));
+                lines.push(r6_metric_line(
+                    "Prompt p99",
+                    &format!("{p99:.0} tok  ({ratio:.0}x mean)"),
+                ));
             } else {
-                lines.push(format!("  Prompt p99    {p99:.0} tok"));
+                lines.push(r6_metric_line("Prompt p99", &format!("{p99:.0} tok")));
             }
         }
     } else if let Some(pm) = d.prompt_tokens_mean.filter(|v| v.is_finite() && *v > 0.0) {
-        lines.push(format!("  Avg prompt     {pm:.0} tok"));
+        lines.push(r6_metric_line("Avg prompt", &format!("{pm:.0} tok")));
     }
 
     lines.push(String::new());
-    lines.push("  Cause:".to_string());
+    lines.push("    Cause:".to_string());
     if skewed {
         if let (Some(pm), Some(p99)) = (
             d.prompt_tokens_mean.filter(|v| v.is_finite() && *v > 0.0),
             d.prompt_tokens_p99.filter(|v| v.is_finite() && *v > 0.0),
         ) {
             lines.push(format!(
-                "    Outlier prompts (p99: {p99:.0} tok) are monopolizing prefill compute."
+                "      Outlier prompts (p99: {p99:.0} tok) are monopolizing prefill compute."
             ));
             lines.push(format!(
-                "    Short requests ({pm:.0} tok mean) are blocked behind long-tail prefills."
+                "      Short requests ({pm:.0} tok mean) are blocked behind long-tail prefills."
             ));
         } else {
             lines.push(
-                "    Prompt length outliers are monopolizing prefill compute and blocking shorter requests."
+                "      Prompt length outliers are monopolizing prefill compute and blocking shorter requests."
                     .to_string(),
             );
         }
-    } else if let Some(pct) = prefill_gpu_time_pct(d) {
-        lines.push(format!(
-            "    Prefill is consuming {pct:.0}% of GPU time, starving decode throughput."
-        ));
-        lines.push(cause_severity_line(sev, d));
     } else {
         lines.push(format!(
-            "    Prompt input rate is {ratio_display} generation output rate, starving decode throughput."
+            "      Prompt input rate is {ratio_display} generation output rate, starving decode throughput."
         ));
         lines.push(cause_severity_line(sev, d));
     }
 
     lines.push(String::new());
-    lines.push("  Fix:".to_string());
+    lines.push("    Fix:".to_string());
     lines.extend(fix_bullets);
     if !skewed {
-        lines.push("    • Reduce prompt length where possible.".to_string());
+        lines.push("      • Reduce prompt length where possible.".to_string());
     }
     lines.push(String::new());
-    lines.push(format!("  Expected: {expected}"));
-    lines.push(format!("  Confidence: {}", confidence_label(conf)));
+    lines.push(format!("    Expected: {expected}"));
+    lines.push(format!("    Confidence: {}", confidence_label(conf)));
     super::with_seen_pct(lines, seen_pct)
 }
 
@@ -495,7 +496,7 @@ pub fn r6_recommendation(input: PrefillBoundEvalInput<'_>) -> Option<Recommendat
         return None;
     };
     let sev = severity(d.prompt_gen_ratio);
-    let conf = confidence(sev, d.histogram_prefill_fraction);
+    let conf = confidence(sev);
     let (_, action, short_action, expected) = prefill_fix_lines(&d, sev);
     Some(Recommendation {
         rule_name: rule_names::PREFILL_BOUND,
@@ -606,7 +607,6 @@ mod tests {
         eff: Option<f64>,
         tpot_ms: Option<f64>,
         tpot_floor_ms: Option<f64>,
-        histogram: Option<f64>,
         prefix_cache_hit_rate: Option<f64>,
         snapshot: &'a RawSnapshot,
     }
@@ -618,8 +618,6 @@ mod tests {
             decode_efficiency_pct: p.eff,
             tpot_ms: p.tpot_ms,
             tpot_floor_ms: p.tpot_floor_ms,
-            histogram_prefill_fraction: p.histogram,
-            prefill_efficiency_pct: None,
             prefix_cache_hit_rate: p.prefix_cache_hit_rate,
             snapshot: p.snapshot,
             chunked_prefill_enabled: None,
@@ -640,7 +638,6 @@ mod tests {
             eff,
             tpot_ms,
             tpot_floor_ms,
-            histogram: None,
             prefix_cache_hit_rate: None,
             snapshot,
         })
@@ -657,8 +654,6 @@ mod tests {
             decode_efficiency_pct: Some(10.0),
             tpot_ms: Some(66.0),
             tpot_floor_ms: Some(7.85),
-            histogram_prefill_fraction: None,
-            prefill_efficiency_pct: None,
             prefix_cache_hit_rate: Some(0.996),
             snapshot: &s,
             chunked_prefill_enabled: None,
@@ -851,8 +846,6 @@ mod tests {
             decode_efficiency_pct: Some(5.0),
             tpot_ms: Some(100.0),
             tpot_floor_ms: Some(7.85),
-            histogram_prefill_fraction: None,
-            prefill_efficiency_pct: None,
             prefix_cache_hit_rate: Some(1.0),
             snapshot: &s,
             chunked_prefill_enabled: None,
@@ -885,26 +878,18 @@ mod tests {
     }
 
     #[test]
-    fn confidence_boost_when_histogram_corroborates() {
-        let base = confidence(Severity::Mild, None);
-        let boosted = confidence(Severity::Mild, Some(0.35));
-        assert!((boosted - base - 0.05).abs() < 1e-9);
-    }
-
-    #[test]
     fn aggregate_filters_infinite_ratio() {
         let base = PrefillBoundDetail {
             prompt_gen_ratio: 6.0,
             decode_efficiency_pct: 10.0,
             tpot_ms: Some(50.0),
             tpot_floor_ms: Some(7.85),
-            histogram_prefill_fraction: None,
-            prefill_efficiency_pct: None,
             prefix_caching_enabled: Some(true),
             chunked_prefill_enabled: Some(true),
             prompt_tokens_mean: Some(2048.0),
             prompt_tokens_p99: Some(4096.0),
             prompt_skew_ratio: Some(2.0),
+            running_count: None,
         };
         let inf_window = PrefillBoundDetail {
             prompt_gen_ratio: f64::INFINITY,
@@ -926,13 +911,12 @@ mod tests {
             decode_efficiency_pct: 10.0,
             tpot_ms: None,
             tpot_floor_ms: None,
-            histogram_prefill_fraction: None,
-            prefill_efficiency_pct: None,
             prefix_caching_enabled: None,
             chunked_prefill_enabled: None,
             prompt_tokens_mean: None,
             prompt_tokens_p99: None,
             prompt_skew_ratio: None,
+            running_count: None,
         };
         let agg = aggregate_r6_detail(&[d.clone(), d]);
         assert!(agg.prompt_gen_ratio.is_infinite());
@@ -945,41 +929,18 @@ mod tests {
     }
 
     #[test]
-    fn prefill_efficiency_propagated_when_available() {
-        let s = test_snapshot();
-        match evaluate(PrefillBoundEvalInput {
-            prompt_tokens_per_sec: Some(600.0),
-            generation_tokens_per_sec: Some(100.0),
-            decode_efficiency_pct: Some(10.0),
-            tpot_ms: Some(50.0),
-            tpot_floor_ms: Some(7.85),
-            histogram_prefill_fraction: None,
-            prefill_efficiency_pct: Some(72.5),
-            prefix_cache_hit_rate: None,
-            snapshot: &s,
-            chunked_prefill_enabled: None,
-        }) {
-            Rule6Outcome::Fired(d) => {
-                assert_eq!(d.prefill_efficiency_pct, Some(72.5));
-            }
-            Rule6Outcome::NotFired => panic!("expected fired"),
-        }
-    }
-
-    #[test]
     fn fix_recommends_routing_when_skewed() {
         let d = PrefillBoundDetail {
             prompt_gen_ratio: 15.0,
             decode_efficiency_pct: 6.7,
             tpot_ms: Some(130.0),
             tpot_floor_ms: Some(7.85),
-            histogram_prefill_fraction: Some(0.62),
-            prefill_efficiency_pct: Some(68.4),
             prefix_caching_enabled: Some(true),
             chunked_prefill_enabled: Some(true),
             prompt_tokens_mean: Some(2048.0),
             prompt_tokens_p99: Some(51_200.0),
             prompt_skew_ratio: Some(25.0),
+            running_count: None,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
         assert!(text.contains("Route long-context requests"));
@@ -994,13 +955,12 @@ mod tests {
             decode_efficiency_pct: 8.2,
             tpot_ms: Some(80.0),
             tpot_floor_ms: Some(7.85),
-            histogram_prefill_fraction: Some(0.58),
-            prefill_efficiency_pct: Some(72.1),
             prefix_caching_enabled: Some(false),
             chunked_prefill_enabled: Some(true),
             prompt_tokens_mean: Some(4096.0),
             prompt_tokens_p99: Some(6000.0),
             prompt_skew_ratio: Some(1.46),
+            running_count: None,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
         assert!(text.contains("--enable-prefix-caching"));
@@ -1013,13 +973,12 @@ mod tests {
             decode_efficiency_pct: 8.0,
             tpot_ms: Some(80.0),
             tpot_floor_ms: Some(7.85),
-            histogram_prefill_fraction: Some(0.55),
-            prefill_efficiency_pct: Some(70.0),
             prefix_caching_enabled: Some(true),
             chunked_prefill_enabled: Some(false),
             prompt_tokens_mean: Some(4096.0),
             prompt_tokens_p99: Some(6000.0),
             prompt_skew_ratio: Some(1.46),
+            running_count: None,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
         assert!(text.contains("--enable-chunked-prefill"));
@@ -1033,16 +992,15 @@ mod tests {
             decode_efficiency_pct: 8.0,
             tpot_ms: Some(80.0),
             tpot_floor_ms: Some(7.85),
-            histogram_prefill_fraction: Some(0.55),
-            prefill_efficiency_pct: Some(70.0),
             prefix_caching_enabled: Some(true),
             chunked_prefill_enabled: Some(true),
             prompt_tokens_mean: Some(4096.0),
             prompt_tokens_p99: Some(6000.0),
             prompt_skew_ratio: Some(1.46),
+            running_count: None,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
-        assert!(text.contains("Reduce --max-num-batched-tokens to shrink prefill chunk size"));
+        assert!(text.contains("Reduce --max-num-batched-tokens to 2048"));
         assert!(!text.contains("Disaggregate prefill and decode"));
     }
 
@@ -1053,16 +1011,34 @@ mod tests {
             decode_efficiency_pct: 5.0,
             tpot_ms: Some(130.0),
             tpot_floor_ms: Some(7.85),
-            histogram_prefill_fraction: Some(0.62),
-            prefill_efficiency_pct: Some(68.0),
             prefix_caching_enabled: Some(true),
             chunked_prefill_enabled: Some(true),
             prompt_tokens_mean: Some(4096.0),
             prompt_tokens_p99: Some(6000.0),
             prompt_skew_ratio: Some(1.46),
+            running_count: None,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
         assert!(text.contains("Disaggregate prefill and decode"));
+    }
+
+    #[test]
+    fn decode_eff_shows_prefill_bound_qualifier() {
+        let d = PrefillBoundDetail {
+            prompt_gen_ratio: 12.0,
+            decode_efficiency_pct: 5.1,
+            tpot_ms: Some(80.0),
+            tpot_floor_ms: Some(7.85),
+            prefix_caching_enabled: Some(true),
+            chunked_prefill_enabled: Some(true),
+            prompt_tokens_mean: Some(4096.0),
+            prompt_tokens_p99: Some(6000.0),
+            prompt_skew_ratio: Some(1.46),
+            running_count: None,
+        };
+        let text = format_prefill_bound_window_issue(&d, 100).join("\n");
+        assert!(text.contains("avg when prefill-bound"));
+        assert!(text.contains("5.1%"));
     }
 
     #[test]
@@ -1072,13 +1048,12 @@ mod tests {
             decode_efficiency_pct: 8.0,
             tpot_ms: Some(80.0),
             tpot_floor_ms: Some(7.85),
-            histogram_prefill_fraction: Some(0.55),
-            prefill_efficiency_pct: Some(70.0),
             prefix_caching_enabled: Some(true),
             chunked_prefill_enabled: Some(true),
             prompt_tokens_mean: Some(4096.0),
             prompt_tokens_p99: Some(6000.0),
             prompt_skew_ratio: Some(1.46),
+            running_count: None,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
         assert!(text.contains("Reduce prompt length where possible"));
@@ -1091,16 +1066,93 @@ mod tests {
             decode_efficiency_pct: 6.7,
             tpot_ms: Some(130.0),
             tpot_floor_ms: Some(7.85),
-            histogram_prefill_fraction: Some(0.62),
-            prefill_efficiency_pct: Some(68.4),
             prefix_caching_enabled: Some(true),
             chunked_prefill_enabled: Some(true),
             prompt_tokens_mean: Some(2048.0),
             prompt_tokens_p99: Some(51_200.0),
             prompt_skew_ratio: Some(25.0),
+            running_count: None,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
         assert!(!text.contains("Reduce prompt length where possible"));
         assert!(text.contains("Route long-context requests"));
+    }
+
+    #[test]
+    fn metric_lines_use_consistent_label_padding() {
+        let skewed = PrefillBoundDetail {
+            prompt_gen_ratio: 15.0,
+            decode_efficiency_pct: 6.7,
+            tpot_ms: Some(130.0),
+            tpot_floor_ms: Some(7.85),
+            prefix_caching_enabled: Some(true),
+            chunked_prefill_enabled: Some(true),
+            prompt_tokens_mean: Some(2048.0),
+            prompt_tokens_p99: Some(51_200.0),
+            prompt_skew_ratio: Some(25.0),
+            running_count: None,
+        };
+        let skewed_lines = format_prefill_bound_window_issue(&skewed, 40);
+        assert_eq!(
+            skewed_lines[3],
+            "    Prefill ratio       15.0x  prompt tok/s vs gen tok/s"
+        );
+        assert_eq!(
+            skewed_lines[4],
+            "    Decode eff.         (avg when prefill-bound)   6.7%  of HW ceiling"
+        );
+        assert_eq!(skewed_lines[5], "    Prompt mean         2048 tok");
+        assert_eq!(
+            skewed_lines[6],
+            "    Prompt p99          51200 tok  (25x mean)"
+        );
+
+        let uniform = PrefillBoundDetail {
+            prompt_gen_ratio: 12.0,
+            decode_efficiency_pct: 5.1,
+            tpot_ms: Some(80.0),
+            tpot_floor_ms: Some(7.85),
+            prefix_caching_enabled: Some(true),
+            chunked_prefill_enabled: Some(true),
+            prompt_tokens_mean: Some(4096.0),
+            prompt_tokens_p99: Some(6000.0),
+            prompt_skew_ratio: Some(1.46),
+            running_count: None,
+        };
+        let uniform_lines = format_prefill_bound_window_issue(&uniform, 100);
+        assert_eq!(
+            uniform_lines[3],
+            "    Prefill ratio       12.0x  prompt tok/s vs gen tok/s"
+        );
+        assert_eq!(
+            uniform_lines[4],
+            "    Decode eff.         (avg when prefill-bound)   5.1%  of HW ceiling"
+        );
+        assert_eq!(uniform_lines[5], "    Avg prompt          4096 tok");
+    }
+
+    #[test]
+    fn dynamic_batch_budget_rounds_to_128() {
+        assert_eq!(recommended_batch_token_budget(1333.0, 161.0), 896);
+        assert_eq!(recommended_batch_token_budget(8000.0, 50.0), 4096);
+        assert_eq!(recommended_batch_token_budget(200.0, 10.0), 128);
+    }
+
+    #[test]
+    fn fix_uses_dynamic_batch_budget_when_running_count_available() {
+        let d = PrefillBoundDetail {
+            prompt_gen_ratio: 12.0,
+            decode_efficiency_pct: 8.0,
+            tpot_ms: Some(80.0),
+            tpot_floor_ms: Some(7.85),
+            prefix_caching_enabled: Some(true),
+            chunked_prefill_enabled: Some(true),
+            prompt_tokens_mean: Some(1333.0),
+            prompt_tokens_p99: Some(6000.0),
+            prompt_skew_ratio: Some(1.46),
+            running_count: Some(161.0),
+        };
+        let text = format_prefill_bound_window_issue(&d, 100).join("\n");
+        assert!(text.contains("Reduce --max-num-batched-tokens to 896"));
     }
 }

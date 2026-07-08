@@ -1,8 +1,5 @@
 use std::time::SystemTime;
 
-use crate::collectors::RawSnapshot;
-use crate::engine::baseline::{self, PhysicsBaseline};
-
 mod eval;
 mod format;
 mod r1_under_batching;
@@ -41,15 +38,6 @@ pub use r6_prefill_bound::{
     r6_verbose_miss_line,
 };
 pub use r7_config_headroom::{ConfigHeadroomDetail, rule7_config_headroom};
-
-fn histogram_prefill_fraction_for_confidence(
-    baseline: Option<&PhysicsBaseline>,
-    snapshot: &RawSnapshot,
-) -> Option<f64> {
-    baseline
-        .and_then(|b| b.prefill_time_fraction)
-        .or_else(|| baseline::prefill_time_fraction_from_snapshot(snapshot))
-}
 
 pub(super) const MAX_OBSERVATION_SKEW_SECS: f64 = 1.0;
 /// Enforces >= 6s temporal substance (3 windows × 2s).
@@ -140,7 +128,7 @@ pub fn rule_is_significant(fired: usize, total_evaluable: usize) -> bool {
 
 /// Inserts "Seen in N% of windows" after the rule title line in multi-window display blocks.
 pub(super) fn with_seen_pct(mut lines: Vec<String>, seen_pct: u32) -> Vec<String> {
-    lines.insert(1, format!("  Seen in {seen_pct}% of windows"));
+    lines.insert(1, format!("    Seen in {seen_pct}% of windows"));
     lines
 }
 

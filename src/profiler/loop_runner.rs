@@ -386,10 +386,10 @@ fn print_delta(d: &delta::Delta) {
     {
         let delta = after - before;
         if delta.abs() > 5.0 {
-            let arrow = latency_arrow(delta);
+            let arrow = latency_quality(delta);
             let p95_suffix = match (d.ttft_p95_before_ms, d.ttft_p95_after_ms) {
                 (Some(pb), Some(pa)) if pb.is_finite() && pa.is_finite() => {
-                    format!("  (p95 {pb:.0} → {pa:.0}ms {})", latency_arrow(pa - pb))
+                    format!("  (p95 {pb:.0} → {pa:.0}ms {})", latency_quality(pa - pb))
                 }
                 _ => String::new(),
             };
@@ -402,10 +402,10 @@ fn print_delta(d: &delta::Delta) {
     {
         let delta = after - before;
         if delta.abs() > 0.5 {
-            let arrow = latency_arrow(delta);
+            let arrow = latency_quality(delta);
             let p95_suffix = match (d.tpot_p95_before_ms, d.tpot_p95_after_ms) {
                 (Some(pb), Some(pa)) if pb.is_finite() && pa.is_finite() => {
-                    format!("  (p95 {pb:.1} → {pa:.1}ms {})", latency_arrow(pa - pb))
+                    format!("  (p95 {pb:.1} → {pa:.1}ms {})", latency_quality(pa - pb))
                 }
                 _ => String::new(),
             };
@@ -414,23 +414,6 @@ fn print_delta(d: &delta::Delta) {
     }
     if let Some(line) = format_efficiency_delta_line(d.efficiency_delta_pp) {
         println!("{line}");
-    }
-    if let (Some(before), Some(after)) = (
-        d.prefill_time_fraction_before,
-        d.prefill_time_fraction_after,
-    ) && before.is_finite()
-        && after.is_finite()
-    {
-        let delta_pp = (after - before) * 100.0;
-        if delta_pp.abs() > 1.0 {
-            let arrow = if delta_pp < 0.0 { "↓" } else { "↑" };
-            println!(
-                "  Prefill time    {:.0}% → {:.0}%    {:+.0} pp {arrow}",
-                before * 100.0,
-                after * 100.0,
-                delta_pp
-            );
-        }
     }
     let has_cost = economics_section_active(d);
     if has_cost {
@@ -520,9 +503,9 @@ fn economics_section_active(d: &delta::Delta) -> bool {
 fn jtok_change_arrow(before: f64, after: f64) -> &'static str {
     let diff = after - before;
     if diff < -JTOK_ARROW_THRESHOLD {
-        "↓"
+        "↓ (improved)"
     } else if diff > JTOK_ARROW_THRESHOLD {
-        "↑"
+        "↑ (regressed)"
     } else {
         ""
     }
@@ -531,9 +514,9 @@ fn jtok_change_arrow(before: f64, after: f64) -> &'static str {
 fn cost_change_arrow(before: f64, after: f64) -> &'static str {
     let diff = after - before;
     if diff < -COST_ARROW_THRESHOLD_USD {
-        "↓"
+        "↓ (improved)"
     } else if diff > COST_ARROW_THRESHOLD_USD {
-        "↑"
+        "↑ (regressed)"
     } else {
         ""
     }
@@ -542,9 +525,9 @@ fn cost_change_arrow(before: f64, after: f64) -> &'static str {
 fn recoverable_waste_arrow(waste_before: f64, waste_after: f64) -> &'static str {
     let waste_diff = waste_after - waste_before;
     if waste_diff < -RECOVERABLE_ARROW_THRESHOLD_USD_PER_HR {
-        "↓"
+        "↓ (improved)"
     } else if waste_diff > RECOVERABLE_ARROW_THRESHOLD_USD_PER_HR {
-        "↑"
+        "↑ (regressed)"
     } else {
         ""
     }
@@ -560,11 +543,11 @@ fn throughput_arrow(before: f64, after: f64) -> &'static str {
     }
 }
 
-fn latency_arrow(delta_ms: f64) -> &'static str {
+fn latency_quality(delta_ms: f64) -> &'static str {
     if delta_ms < 0.0 {
-        "↓"
+        "↓ (improved)"
     } else if delta_ms > 0.0 {
-        "↑"
+        "↑ (regressed)"
     } else {
         ""
     }
@@ -869,7 +852,7 @@ mod tests {
 
     #[test]
     fn cost_arrow_down_when_improvement_above_threshold() {
-        assert_eq!(cost_change_arrow(2.00, 1.98), "↓");
+        assert_eq!(cost_change_arrow(2.00, 1.98), "↓ (improved)");
     }
 
     #[test]
@@ -879,12 +862,12 @@ mod tests {
 
     #[test]
     fn recoverable_arrow_down_when_waste_reduced_above_threshold() {
-        assert_eq!(recoverable_waste_arrow(10.0, 9.94), "↓");
+        assert_eq!(recoverable_waste_arrow(10.0, 9.94), "↓ (improved)");
     }
 
     #[test]
     fn jtok_arrow_down_when_energy_improves() {
-        assert_eq!(jtok_change_arrow(0.31, 0.28), "↓");
+        assert_eq!(jtok_change_arrow(0.31, 0.28), "↓ (improved)");
     }
 
     #[test]
@@ -923,8 +906,6 @@ mod tests {
             tpot_p95_delta_pct: None,
             config_drifted: false,
             config_changes: Vec::new(),
-            prefill_time_fraction_before: None,
-            prefill_time_fraction_after: None,
         };
         assert!(economics_section_active(&d));
     }
@@ -960,8 +941,6 @@ mod tests {
             tpot_p95_delta_pct: None,
             config_drifted: false,
             config_changes: Vec::new(),
-            prefill_time_fraction_before: None,
-            prefill_time_fraction_after: None,
         };
         assert!(recoverable_waste_available(&d));
         assert!(economics_section_active(&d));
@@ -1001,8 +980,6 @@ mod tests {
             tpot_p95_delta_pct: None,
             config_drifted: false,
             config_changes: Vec::new(),
-            prefill_time_fraction_before: None,
-            prefill_time_fraction_after: None,
         };
         assert!(recoverable_waste_available(&d));
         let waste = recoverable_waste_per_hr(
