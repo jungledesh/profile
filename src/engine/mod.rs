@@ -138,11 +138,6 @@ pub(crate) fn build_report(input: AnalysisInput<'_>) -> Report {
         decode_efficiency_pct: baseline.as_ref().and_then(|b| b.efficiency_pct),
         tpot_ms: snapshot.vllm.tpot_ms,
         tpot_floor_ms: baseline.as_ref().map(|b| b.tpot_floor_ms),
-        histogram_prefill_fraction: baseline
-            .as_ref()
-            .and_then(|b| b.prefill_time_fraction)
-            .or_else(|| baseline::prefill_time_fraction_from_snapshot(snapshot)),
-        prefill_efficiency_pct: baseline.as_ref().and_then(|b| b.prefill_efficiency_pct),
         prefix_cache_hit_rate: snapshot.vllm.prefix_cache_hit_rate,
         snapshot,
         chunked_prefill_enabled: input.ctx.config.enable_chunked_prefill,

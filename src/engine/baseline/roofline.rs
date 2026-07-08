@@ -1,5 +1,5 @@
 use crate::collectors::config::DEFAULT_GPU_MEMORY_UTILIZATION;
-use crate::collectors::{RawSnapshot, effective_tensor_parallel};
+use crate::collectors::effective_tensor_parallel;
 use crate::context::{AnalysisInput, gpu_prices};
 
 use super::math;
@@ -59,14 +59,6 @@ pub struct PhysicsBaseline {
     pub prefill_latency_floor_ms: Option<f64>,
     /// Concurrent batch size at which decode crosses from BW-bound to compute-bound (roofline ridge).
     pub ridge_batch_size: f64,
-    /// Prefill efficiency: fraction of compute ceiling used during prefill.
-    /// (1 / mean_prefill_secs) / prefill_ceiling_prompts_per_sec × 100.
-    /// None when prefill ceiling or histogram data unavailable.
-    pub prefill_efficiency_pct: Option<f64>,
-    /// Fraction of window wall-clock time spent in prefill (0.0-1.0).
-    /// Derived from vllm_request_prefill_time_seconds histogram.
-    /// None when histogram data unavailable.
-    pub prefill_time_fraction: Option<f64>,
     /// Efficiency relative to max_num_seqs config ceiling (not ridge). None when GPU unknown or inputs missing.
     pub config_relative_efficiency_pct: Option<f64>,
     pub cost: Option<CostEstimate>,
@@ -75,35 +67,6 @@ pub struct PhysicsBaseline {
 /// Lower/upper band around roofline ceiling `expected` (conservative / optimistic).
 const CEILING_LOWER_BAND: f64 = 0.85;
 const CEILING_UPPER_BAND: f64 = 1.05;
-
-/// Proxy for prefill pressure: mean prefill latency / window duration. Not GPU compute fraction.
-///
-/// Known limitation: uses mean (sum_delta / count_delta), which ignores request count.
-/// 10 requests x 0.2s and 1 request x 0.2s both read as the same fraction.
-/// Under high concurrency with short prompts, this undercounts actual prefill load.
-///
-/// The correct formula is sum_delta / window_secs (total prefill seconds / window),
-/// but that changes metric semantics (can exceed 1.0, thresholds need recalibration).
-/// Deferred until RunPod calibration produces empirical thresholds for the new metric.
-/// Track both old and new formulas during calibration to validate the switch.
-///
-/// Additionally, vLLM's request_prefill_time_seconds histogram records wall-clock time
-/// from SCHEDULED to first NEW_TOKENS, not GPU compute time. With chunked prefill,
-/// this includes interleaved decode time for other requests. No vLLM Prometheus metric
-/// exposes the actual GPU compute split between prefill and decode.
-pub fn prefill_time_fraction_from_snapshot(snapshot: &RawSnapshot) -> Option<f64> {
-    let mass = snapshot.vllm.prefill_window_mass?;
-    let window_secs = snapshot
-        .vllm
-        .window_duration_secs
-        .filter(|w| w.is_finite() && *w > f64::EPSILON)?;
-    if mass.count_delta <= 0.0 {
-        return None;
-    }
-    let mean_prefill_secs = mass.sum_delta / mass.count_delta;
-    let ratio = mean_prefill_secs / window_secs;
-    ratio.is_finite().then_some(ratio.clamp(0.0, 1.0))
-}
 
 pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
     let ctx = input.ctx;
@@ -199,23 +162,6 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
     let tpot_floor_ms = math::latency_floor_ms(decode.expected);
     let prefill_latency_floor_ms = prefill.map(|p| math::latency_floor_ms(p.expected));
 
-    // Proxy for prefill pressure: mean prefill latency / window duration. Not GPU compute fraction.
-    let prefill_time_fraction = prefill_time_fraction_from_snapshot(&input.window.snapshot);
-
-    let prefill_efficiency_pct = prefill.and_then(|p| {
-        let mass = input.window.snapshot.vllm.prefill_window_mass?;
-        if mass.count_delta <= 0.0 {
-            return None;
-        }
-        let mean_prefill_secs = mass.sum_delta / mass.count_delta;
-        if !mean_prefill_secs.is_finite() || mean_prefill_secs <= 0.0 {
-            return None;
-        }
-        let actual_prompts_per_sec = 1.0 / mean_prefill_secs;
-        let pct = (actual_prompts_per_sec / p.expected) * 100.0;
-        pct.is_finite().then_some(pct.min(100.0))
-    });
-
     let snap = &input.window.snapshot;
     let tps = snap
         .vllm
@@ -271,8 +217,6 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
         tpot_floor_ms,
         prefill_latency_floor_ms,
         ridge_batch_size,
-        prefill_efficiency_pct,
-        prefill_time_fraction,
         config_relative_efficiency_pct,
         cost,
     })
@@ -1491,154 +1435,5 @@ mod tests {
         let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
         let expected = math::prefill_ops_per_sec(67.0, 8_000_000_000, 1024, 0, 0);
         assert!((b.prefill.expect("prefill").expected - expected).abs() < 1e-6);
-    }
-
-    #[test]
-    fn prefill_efficiency_some_when_prefill_mass_and_prompt_tokens_available() {
-        use crate::collectors::HistogramWindowMass;
-        let cfg = VllmConfig {
-            dtype: Some("bf16".to_string()),
-            max_model_len: Some(2048),
-            ..Default::default()
-        };
-        let snap = VllmRawMetrics {
-            prompt_tokens_mean: Some(512.0),
-            generation_tokens_per_sec: Some(10.0),
-            prefill_window_mass: Some(HistogramWindowMass {
-                sum_delta: 2.0,
-                count_delta: 4.0,
-            }),
-            window_duration_secs: Some(2.0),
-            ..Default::default()
-        };
-        let (ctx, win) = baseline_input_llama8b(snap, cfg);
-        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
-        let eff = b.prefill_efficiency_pct.expect("prefill efficiency");
-        assert!((0.0..=100.0).contains(&eff));
-    }
-
-    #[test]
-    fn prefill_efficiency_none_when_prefill_mass_missing() {
-        let cfg = VllmConfig {
-            dtype: Some("bf16".to_string()),
-            max_model_len: Some(2048),
-            ..Default::default()
-        };
-        let snap = VllmRawMetrics {
-            prompt_tokens_mean: Some(512.0),
-            generation_tokens_per_sec: Some(10.0),
-            ..Default::default()
-        };
-        let (ctx, win) = baseline_input_llama8b(snap, cfg);
-        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
-        assert!(b.prefill_efficiency_pct.is_none());
-    }
-
-    #[test]
-    fn prefill_efficiency_clamped_at_100() {
-        use crate::collectors::HistogramWindowMass;
-        let cfg = VllmConfig {
-            dtype: Some("bf16".to_string()),
-            max_model_len: Some(2048),
-            ..Default::default()
-        };
-        let snap = VllmRawMetrics {
-            prompt_tokens_mean: Some(100_000.0),
-            generation_tokens_per_sec: Some(10.0),
-            prefill_window_mass: Some(HistogramWindowMass {
-                sum_delta: 0.001,
-                count_delta: 1.0,
-            }),
-            window_duration_secs: Some(2.0),
-            ..Default::default()
-        };
-        let (ctx, win) = baseline_input_llama8b(snap, cfg);
-        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
-        assert_eq!(b.prefill_efficiency_pct, Some(100.0));
-    }
-
-    #[test]
-    fn prefill_efficiency_matches_single_request_rate() {
-        use crate::collectors::HistogramWindowMass;
-        let cfg = VllmConfig {
-            dtype: Some("bf16".to_string()),
-            max_model_len: Some(2048),
-            ..Default::default()
-        };
-        // 4 requests, each taking 0.5s average prefill.
-        // actual rate = 1 / 0.5 = 2 prompts/sec.
-        let snap = VllmRawMetrics {
-            prompt_tokens_mean: Some(512.0),
-            generation_tokens_per_sec: Some(10.0),
-            prefill_window_mass: Some(HistogramWindowMass {
-                sum_delta: 2.0,
-                count_delta: 4.0,
-            }),
-            window_duration_secs: Some(2.0),
-            ..Default::default()
-        };
-        let (ctx, win) = baseline_input_llama8b(snap, cfg);
-        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
-        let ceiling = b.prefill.expect("prefill ceiling").expected;
-        let eff = b.prefill_efficiency_pct.expect("prefill efficiency");
-        let expected_eff = (2.0 / ceiling) * 100.0;
-        assert!(
-            (eff - expected_eff).abs() < 0.1,
-            "expected {expected_eff:.2}%, got {eff:.2}%"
-        );
-    }
-
-    #[test]
-    fn prefill_time_fraction_computed_from_histogram() {
-        use crate::collectors::HistogramWindowMass;
-        let cfg = VllmConfig::default();
-        let snap = VllmRawMetrics {
-            prefill_window_mass: Some(HistogramWindowMass {
-                sum_delta: 1.0,
-                count_delta: 2.0,
-            }),
-            window_duration_secs: Some(2.5),
-            generation_tokens_per_sec: Some(10.0),
-            ..Default::default()
-        };
-        let (ctx, win) = baseline_input_llama8b(snap, cfg);
-        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
-        let frac = b.prefill_time_fraction.expect("fraction");
-        assert!((frac - 0.2).abs() < 1e-9);
-    }
-
-    #[test]
-    fn prefill_time_fraction_clamped_0_to_1() {
-        use crate::collectors::HistogramWindowMass;
-        let cfg = VllmConfig::default();
-        let snap = VllmRawMetrics {
-            prefill_window_mass: Some(HistogramWindowMass {
-                sum_delta: 5.0,
-                count_delta: 1.0,
-            }),
-            window_duration_secs: Some(2.0),
-            generation_tokens_per_sec: Some(10.0),
-            ..Default::default()
-        };
-        let (ctx, win) = baseline_input_llama8b(snap, cfg);
-        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
-        assert_eq!(b.prefill_time_fraction, Some(1.0));
-    }
-
-    #[test]
-    fn prefill_time_fraction_none_when_no_window_duration() {
-        use crate::collectors::HistogramWindowMass;
-        let cfg = VllmConfig::default();
-        let snap = VllmRawMetrics {
-            prefill_window_mass: Some(HistogramWindowMass {
-                sum_delta: 1.0,
-                count_delta: 2.0,
-            }),
-            generation_tokens_per_sec: Some(10.0),
-            ..Default::default()
-        };
-        let (ctx, win) = baseline_input_llama8b(snap, cfg);
-        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
-        assert!(b.prefill_time_fraction.is_none());
     }
 }

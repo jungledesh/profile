@@ -19,7 +19,7 @@ const KV_ADMISSION_BACKLOG_QUEUE_RATIO_MIN: f64 = 0.30;
 /// Minimum KV headroom (GB) before recommending --gpu-memory-utilization; below this,
 /// weights and allocator overhead leave no safe room to expand the KV pool.
 const KV_HEADROOM_SAFE_MIN_GB: f64 = 2.0;
-const FP8_KV_CACHE_FIX: &str = "    • Switch --kv-cache-dtype fp8 to halve KV memory footprint";
+const FP8_KV_CACHE_FIX: &str = "      • Switch --kv-cache-dtype fp8 to halve KV memory footprint";
 /// Suggest prefix caching when mean prompt length exceeds this (tokens).
 const PREFIX_CACHING_LONG_PROMPT_MIN_TOKENS: f64 = 200.0;
 
@@ -45,14 +45,14 @@ fn fp8_kv_cache_fix_bullet(kv_cache_dtype: Option<&str>, nvcc_available: bool) -
 fn kv_headroom_gpu_mem_bullet(kv_headroom_gb: Option<f64>) -> String {
     match kv_headroom_gb {
         Some(h) if h >= KV_HEADROOM_SAFE_MIN_GB => {
-            "    • Raise --gpu-memory-utilization (check vRAM header for avail mem) to expand KV pool"
+            "      • Raise --gpu-memory-utilization (check vRAM header for avail mem) to expand KV pool"
                 .to_string()
         }
         Some(_) => {
-            "    • GPU at VRAM capacity: cannot raise --gpu-memory-utilization. Scale out or reduce max context length (--max-model-len)."
+            "      • GPU at VRAM capacity: cannot raise --gpu-memory-utilization. Scale out or reduce max context length (--max-model-len)."
                 .to_string()
         }
-        None => "    • Raise --gpu-memory-utilization (check vRAM header for avail mem) to expand KV pool".to_string(),
+        None => "      • Raise --gpu-memory-utilization (check vRAM header for avail mem) to expand KV pool".to_string(),
     }
 }
 
@@ -64,7 +64,7 @@ fn prefix_caching_fix_bullet(snapshot: &RawSnapshot) -> Option<String> {
             .is_some_and(|t| t >= PREFIX_CACHING_LONG_PROMPT_MIN_TOKENS)
     {
         Some(
-            "    • Enable --enable-prefix-caching to share KV blocks across identical prompt prefixes"
+            "      • Enable --enable-prefix-caching to share KV blocks across identical prompt prefixes"
                 .to_string(),
         )
     } else {
@@ -324,13 +324,13 @@ fn max_num_seqs_bullet(
                 }
                 None => format!("Lower --max-num-seqs to ≤{n}"),
             };
-            format!("    • {base}")
+            format!("      • {base}")
         }
         None => {
             if evictions {
-                "    • Lower --max-num-seqs to stop evictions".to_string()
+                "      • Lower --max-num-seqs to stop evictions".to_string()
             } else {
-                "    • Lower --max-num-seqs to free KV blocks".to_string()
+                "      • Lower --max-num-seqs to free KV blocks".to_string()
             }
         }
     }
@@ -363,25 +363,29 @@ pub(super) fn format_kv_cache_pressure_fired(
         .kv_cache_peak_perc
         .filter(|v| v.is_finite())
         .unwrap_or(d.kv_cache_usage_perc);
-    let mut out = vec!["[!] KV Cache Pressure".to_string(), "  Cause:".to_string()];
+    let mut out = vec![
+        "[!] KV Cache Pressure".to_string(),
+        "    Cause:".to_string(),
+    ];
     out.push(format!(
-        "  - KV cache hit {peak:.1}% peak (threshold: {:.0}%)",
+        "      - KV cache hit {peak:.1}% peak (threshold: {:.0}%)",
         KV_CACHE_PRESSURE_MIN_PERC
     ));
     if d.preemptions_active {
         out.push(
-            "  - Active preemptions: scheduler evicting sequences to free KV blocks".to_string(),
+            "      - Active preemptions: scheduler evicting sequences to free KV blocks"
+                .to_string(),
         );
     }
     if d.queue_backpressure
         && let Some(wait) = snapshot.vllm.num_requests_waiting.filter(|v| v.is_finite())
     {
         out.push(format!(
-            "  - Queue backpressure: {wait:.0} requests waiting on KV admission"
+            "      - Queue backpressure: {wait:.0} requests waiting on KV admission"
         ));
     }
     out.push(String::new());
-    out.push("  Fix:".to_string());
+    out.push("    Fix:".to_string());
     if d.preemptions_active {
         out.push(max_num_seqs_bullet(kv_max_seqs, max_model_len, true));
         if let Some(bullet) = prefix_caching_fix_bullet(snapshot) {
@@ -389,7 +393,7 @@ pub(super) fn format_kv_cache_pressure_fired(
         }
         if kv_headroom_gb.is_some_and(|h| h >= KV_HEADROOM_SAFE_MIN_GB) {
             out.push(
-                "    • Once stable, raise --gpu-memory-utilization (check vRAM header) to expand KV pool"
+                "      • Once stable, raise --gpu-memory-utilization (check vRAM header) to expand KV pool"
                     .to_string(),
             );
         }
@@ -403,7 +407,7 @@ pub(super) fn format_kv_cache_pressure_fired(
             snapshot.vllm.prompt_tokens_p99,
             snapshot.vllm.generation_tokens_p99,
             total_count,
-            "    ",
+            "      ",
         );
     } else {
         out.push(max_num_seqs_bullet(kv_max_seqs, max_model_len, false));
@@ -421,19 +425,19 @@ pub(super) fn format_kv_cache_pressure_fired(
             snapshot.vllm.prompt_tokens_p99,
             snapshot.vllm.generation_tokens_p99,
             total_count,
-            "    ",
+            "      ",
         );
     }
     let expected = if d.preemptions_active {
-        "  Expected: TTFT and TPOT recover once evictions stop."
+        "    Expected: TTFT and TPOT recover once evictions stop."
     } else {
-        "  Expected: Wait queue drains, TTFT recovers once KV pool has capacity."
+        "    Expected: Wait queue drains, TTFT recovers once KV pool has capacity."
     };
     out.push(String::new());
     out.push(expected.to_string());
     if super::rule_is_significant(windows_fired, total_evaluable) {
         let confidence = kv_pressure_confidence(windows_fired, total_evaluable);
-        out.push(format!("  {}", kv_pressure_confidence_label(confidence)));
+        out.push(format!("    {}", kv_pressure_confidence_label(confidence)));
     }
     out
 }
@@ -449,18 +453,18 @@ pub(super) fn format_kv_admission_backlog_issue(
     let gpu_mem_bullet = kv_headroom_gpu_mem_bullet(ctx.kv_headroom_gb);
     let mut out = vec![
         "[!] KV Cache Pressure: Admission Backlog".to_string(),
-        "  Cause:".to_string(),
+        "    Cause:".to_string(),
         format!(
-            "  - Scheduler holding {:.0} requests in queue ({:.0}% of active requests waiting) to protect KV memory",
+            "      - Scheduler holding {:.0} requests in queue ({:.0}% of active requests waiting) to protect KV memory",
             d.requests_waiting,
             d.admission_ratio * 100.0
         ),
         format!(
-            "  - Free KV tokens: {:.0} available, {:.0} demanded",
+            "      - Free KV tokens: {:.0} available, {:.0} demanded",
             d.free_kv_tokens, d.demand_tokens
         ),
         String::new(),
-        "  Fix:".to_string(),
+        "    Fix:".to_string(),
         gpu_mem_bullet,
     ];
     if let Some(bullet) = fp8_kv_cache_fix_bullet(kv_cache_dtype, ctx.nvcc_available) {
@@ -473,13 +477,13 @@ pub(super) fn format_kv_admission_backlog_issue(
         ctx.snapshot.vllm.prompt_tokens_p99,
         ctx.snapshot.vllm.generation_tokens_p99,
         total_count,
-        "    ",
+        "      ",
     );
     out.push(String::new());
-    out.push("  Expected: Wait queue drains, TTFT recovers.".to_string());
+    out.push("    Expected: Wait queue drains, TTFT recovers.".to_string());
     if super::rule_is_significant(windows_fired, total_evaluable) {
         let confidence = kv_pressure_confidence(windows_fired, total_evaluable);
-        out.push(format!("  {}", kv_pressure_confidence_label(confidence)));
+        out.push(format!("    {}", kv_pressure_confidence_label(confidence)));
     }
     super::with_seen_pct(out, seen_pct)
 }

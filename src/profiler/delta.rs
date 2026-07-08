@@ -40,8 +40,6 @@ pub struct Delta {
     pub config_drifted: bool,
     /// Non-baseline config diffs for display (e.g. max_num_seqs).
     pub config_changes: Vec<String>,
-    pub prefill_time_fraction_before: Option<f64>,
-    pub prefill_time_fraction_after: Option<f64>,
 }
 
 fn pct_delta(before: Option<f64>, after: Option<f64>) -> Option<f64> {
@@ -119,15 +117,6 @@ pub fn compute(
         .and_then(|b| b.cost.as_ref())
         .and_then(|c| c.joules_per_token);
 
-    let prefill_time_fraction_before = prev_report
-        .baseline
-        .as_ref()
-        .and_then(|b| b.prefill_time_fraction);
-    let prefill_time_fraction_after = curr_report
-        .baseline
-        .as_ref()
-        .and_then(|b| b.prefill_time_fraction);
-
     Delta {
         throughput_delta_pct,
         throughput_before,
@@ -157,8 +146,6 @@ pub fn compute(
         tpot_p95_delta_pct,
         config_drifted,
         config_changes,
-        prefill_time_fraction_before,
-        prefill_time_fraction_after,
     }
 }
 
@@ -232,8 +219,6 @@ mod tests {
                 tpot_floor_ms: 1.0,
                 prefill_latency_floor_ms: None,
                 ridge_batch_size: 1.0,
-                prefill_efficiency_pct: None,
-                prefill_time_fraction: None,
                 config_relative_efficiency_pct: None,
                 cost,
             }),

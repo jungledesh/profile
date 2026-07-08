@@ -158,25 +158,26 @@ pub(super) fn format_config_headroom_window_issue(
         vec![
             "[!] Configured Batch Limit".to_string(),
             String::new(),
-            format!("  Config max    {}", d.max_num_seqs),
-            format!("  Ridge batch   {ridge_str}"),
-            format!("  Recommended   {}", d.recommended_seqs),
+            format!("    Config max    {}", d.max_num_seqs),
+            format!("    Ridge batch   {ridge_str}"),
+            format!("    Recommended   {}", d.recommended_seqs),
             String::new(),
-            "  Cause:".to_string(),
+            "    Cause:".to_string(),
             format!(
-                "    --max-num-seqs={} caps batch size at {:.0}% of hardware capacity.",
+                "      --max-num-seqs={} caps batch size at {:.0}% of hardware capacity.",
                 d.max_num_seqs, cap_pct
             ),
-            "    Compute and KV memory headroom available.".to_string(),
+            "      Compute and KV memory headroom available.".to_string(),
             String::new(),
-            "  Fix:".to_string(),
+            "    Fix:".to_string(),
             format!(
-                "    • Raise --max-num-seqs to at least {}.",
+                "      • Raise --max-num-seqs to at least {}.",
                 d.recommended_seqs
             ),
             String::new(),
-            "  Expected: Higher decode throughput when traffic concurrency increases.".to_string(),
-            format!("  Confidence: {}", confidence_label(confidence)),
+            "    Expected: Higher decode throughput when traffic concurrency increases."
+                .to_string(),
+            format!("    Confidence: {}", confidence_label(confidence)),
         ],
         seen_pct,
     )

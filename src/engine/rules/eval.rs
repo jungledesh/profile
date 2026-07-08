@@ -32,10 +32,7 @@ use super::r7_config_headroom::{
     ConfigHeadroomDetail, aggregate_r7_detail, format_config_headroom_window_issue,
     rule7_config_headroom,
 };
-use super::{
-    IssueGroup, Recommendation, compute_kv_max_seqs, histogram_prefill_fraction_for_confidence,
-    rule_is_significant, rule_names,
-};
+use super::{IssueGroup, Recommendation, compute_kv_max_seqs, rule_is_significant, rule_names};
 
 const SUPPRESSION_TABLE: &[(&str, &str)] = &[
     (rule_names::OOM_RISK, rule_names::KV_CACHE_PRESSURE),
@@ -222,11 +219,6 @@ fn eval_window_rules(
             decode_efficiency_pct: win_baseline.as_ref().and_then(|b| b.efficiency_pct),
             tpot_ms: snap.vllm.tpot_ms,
             tpot_floor_ms: win_baseline.as_ref().map(|b| b.tpot_floor_ms),
-            histogram_prefill_fraction: histogram_prefill_fraction_for_confidence(
-                win_baseline.as_ref(),
-                snap,
-            ),
-            prefill_efficiency_pct: win_baseline.as_ref().and_then(|b| b.prefill_efficiency_pct),
             prefix_cache_hit_rate: snap.vllm.prefix_cache_hit_rate,
             snapshot: snap,
             chunked_prefill_enabled: summary.ctx.config.enable_chunked_prefill,
@@ -467,7 +459,7 @@ fn build_report_from_eval(
     if eval.r6_significant() {
         let d = aggregate_r6_detail(&eval.r6_details);
         let sev = r6_severity(d.prompt_gen_ratio);
-        let conf = r6_confidence(sev, d.histogram_prefill_fraction);
+        let conf = r6_confidence(sev);
         let imp = r6_impact(sev);
         let display_lines = format_prefill_bound_window_issue(&d, pct(eval.r6_fired, eval.n_eval));
         let (_, action, short_action, expected_impact) = r6_prefill_fix_lines(&d, sev);

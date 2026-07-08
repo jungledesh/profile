@@ -360,26 +360,6 @@ fn baseline_lines(
             width = GPU_LABEL_W
         ));
     }
-    if let Some(pe) = b.prefill_efficiency_pct {
-        let content = format!("prefill_eff {pe:.1}%  of compute ceiling");
-        out.push(format!(
-            "{:<width$}{}{}",
-            "",
-            VLLM_LABEL_METRICS_GAP,
-            content,
-            width = GPU_LABEL_W
-        ));
-    }
-    if let Some(pt) = b.prefill_time_fraction {
-        let content = format!("prefill_time ~{:.0}%   session avg", pt * 100.0);
-        out.push(format!(
-            "{:<width$}{}{}",
-            "",
-            VLLM_LABEL_METRICS_GAP,
-            content,
-            width = GPU_LABEL_W
-        ));
-    }
     out
 }
 
@@ -863,8 +843,6 @@ mod tests {
             tpot_floor_ms: 10.0,
             prefill_latency_floor_ms: Some(20.0),
             ridge_batch_size: 40.0,
-            prefill_efficiency_pct: None,
-            prefill_time_fraction: None,
             config_relative_efficiency_pct: None,
             cost: None,
         };
@@ -907,8 +885,6 @@ mod tests {
             tpot_floor_ms: 10.0,
             prefill_latency_floor_ms: Some(42.0),
             ridge_batch_size: 40.0,
-            prefill_efficiency_pct: None,
-            prefill_time_fraction: None,
             config_relative_efficiency_pct: None,
             cost: None,
         };
@@ -947,8 +923,6 @@ mod tests {
             tpot_floor_ms: 10.0,
             prefill_latency_floor_ms: Some(200.0),
             ridge_batch_size: 40.0,
-            prefill_efficiency_pct: None,
-            prefill_time_fraction: None,
             config_relative_efficiency_pct: None,
             cost: None,
         };
@@ -986,8 +960,6 @@ mod tests {
             tpot_floor_ms: 10.0,
             prefill_latency_floor_ms: Some(20.0),
             ridge_batch_size: 40.0,
-            prefill_efficiency_pct: None,
-            prefill_time_fraction: None,
             config_relative_efficiency_pct: None,
             cost: None,
         };
@@ -1028,8 +1000,6 @@ mod tests {
             tpot_floor_ms: 10.0,
             prefill_latency_floor_ms: None,
             ridge_batch_size: 1.0,
-            prefill_efficiency_pct: None,
-            prefill_time_fraction: None,
             config_relative_efficiency_pct: None,
             cost: None,
         }
@@ -1060,8 +1030,6 @@ mod tests {
             tpot_floor_ms: 10.0,
             prefill_latency_floor_ms: None,
             ridge_batch_size: 1.0,
-            prefill_efficiency_pct: None,
-            prefill_time_fraction: None,
             config_relative_efficiency_pct: None,
             cost: Some(CostEstimate {
                 tok_per_watt,

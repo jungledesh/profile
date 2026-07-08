@@ -189,32 +189,32 @@ pub(super) fn format_concurrency_saturation_issue(
     let mut lines = vec![
         "[!] Concurrency Saturation".to_string(),
         String::new(),
-        "  Cause:".to_string(),
-        format!("    • --max-num-seqs={max_str} hit: scheduler won't admit more sequences"),
+        "    Cause:".to_string(),
+        format!("      • --max-num-seqs={max_str} hit: scheduler won't admit more sequences"),
         format!(
-            "    • {:.0}% of requests waiting ({:.0} waiting, {:.0} running)",
+            "      • {:.0}% of requests waiting ({:.0} waiting, {:.0} running)",
             display_queue_pct, display_wait, display_run
         ),
     ];
     match (display_p_x, display_avg) {
         (Some((px, label)), Some(avg)) => lines.push(format!(
-            "    • TTFT ({} {}) ({} avg)",
+            "      • TTFT ({} {}) ({} avg)",
             label,
             fmt_seconds_from_ms(px),
             fmt_seconds_from_ms(avg)
         )),
         (Some((px, label)), None) => {
             lines.push(format!(
-                "    • TTFT ({} {})",
+                "      • TTFT ({} {})",
                 label,
                 fmt_seconds_from_ms(px)
             ));
         }
-        (None, Some(avg)) => lines.push(format!("    • TTFT {}", fmt_seconds_from_ms(avg))),
+        (None, Some(avg)) => lines.push(format!("      • TTFT {}", fmt_seconds_from_ms(avg))),
         (None, None) => {}
     }
     lines.push(String::new());
-    lines.push("  Fix:".to_string());
+    lines.push("    Fix:".to_string());
     match display_kv {
         Some(pct) if pct < KV_CACHE_SAFE_TO_SCALE_PCT => {
             if kv_max_seqs
@@ -224,7 +224,7 @@ pub(super) fn format_concurrency_saturation_issue(
                     .map(|n| format!("max_model_len={n}"))
                     .unwrap_or_else(|| "max_model_len=unknown".to_string());
                 lines.push(format!(
-                    "    • KV pool has room ({pct:.0}%), but --max-num-seqs is at the physics ceiling for {m}."
+                    "      • KV pool has room ({pct:.0}%), but --max-num-seqs is at the physics ceiling for {m}."
                 ));
                 super::push_model_len_shrink_suggestion(
                     &mut lines,
@@ -232,24 +232,24 @@ pub(super) fn format_concurrency_saturation_issue(
                     snapshot.vllm.prompt_tokens_p99,
                     snapshot.vllm.generation_tokens_p99,
                     snapshot.vllm.generation_tokens_completed.unwrap_or(0.0),
-                    "    ",
+                    "      ",
                 );
             } else {
                 match kv_max_seqs {
                     Some(_) => lines.push(format!(
-                        "    • Raise --max-num-seqs above {max_str} (KV cache {pct:.0}% used, pool has room)"
+                        "      • Raise --max-num-seqs above {max_str} (KV cache {pct:.0}% used, pool has room)"
                     )),
                     None => lines.push(format!(
-                        "    • Raise --max-num-seqs above {max_str} if KV headroom confirmed (ceiling unknown)"
+                        "      • Raise --max-num-seqs above {max_str} if KV headroom confirmed (ceiling unknown)"
                     )),
                 }
             }
         }
         Some(pct) => {
             lines.push(format!(
-                "    • KV at {pct:.0}%: scheduler at cap, pool full. No config change helps."
+                "      • KV at {pct:.0}%: scheduler at cap, pool full. No config change helps."
             ));
-            lines.push("    • Add a replica to scale out.".to_string());
+            lines.push("      • Add a replica to scale out.".to_string());
         }
         None => {
             if kv_max_seqs
@@ -259,7 +259,7 @@ pub(super) fn format_concurrency_saturation_issue(
                     .map(|n| format!("max_model_len={n}"))
                     .unwrap_or_else(|| "max_model_len=unknown".to_string());
                 lines.push(format!(
-                    "    • KV unknown, but --max-num-seqs is at the physics ceiling for {m}."
+                    "      • KV unknown, but --max-num-seqs is at the physics ceiling for {m}."
                 ));
                 super::push_model_len_shrink_suggestion(
                     &mut lines,
@@ -267,18 +267,18 @@ pub(super) fn format_concurrency_saturation_issue(
                     snapshot.vllm.prompt_tokens_p99,
                     snapshot.vllm.generation_tokens_p99,
                     snapshot.vllm.generation_tokens_completed.unwrap_or(0.0),
-                    "    ",
+                    "      ",
                 );
             } else {
                 lines.push(format!(
-                    "    • Raise --max-num-seqs above {max_str} if KV cache has headroom"
+                    "      • Raise --max-num-seqs above {max_str} if KV cache has headroom"
                 ));
             }
         }
     }
     lines.push(String::new());
-    lines.push("  Expected: Queue drains, TTFT recovers.".to_string());
-    lines.push(format!("  Confidence: {confidence}"));
+    lines.push("    Expected: Queue drains, TTFT recovers.".to_string());
+    lines.push(format!("    Confidence: {confidence}"));
     lines
 }
 
@@ -809,7 +809,7 @@ mod tests {
             None,
             &blank_snap(),
         );
-        assert_eq!(lines[1], "  Seen in 40% of windows");
+        assert_eq!(lines[1], "    Seen in 40% of windows");
     }
 
     #[test]
