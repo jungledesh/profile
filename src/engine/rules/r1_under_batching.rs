@@ -203,26 +203,6 @@ pub fn r1_recommendation(input: R1EvalInput<'_>) -> Option<Recommendation> {
     })
 }
 
-pub fn r1_verbose_miss_line(input: R1EvalInput<'_>) -> String {
-    match rule1_under_batching_with_efficiency(input) {
-        Rule1Outcome::NotFired(m) => {
-            if let Some(ratio) = m.prefill_saturation_ratio {
-                let ratio_str = if ratio.is_finite() {
-                    format!("{ratio:.1}x")
-                } else {
-                    "inf".to_string()
-                };
-                format!(
-                    "Under-batching: not triggered (prompt/gen ratio {ratio_str}, R6 territory)"
-                )
-            } else {
-                "Under-batching: not triggered".to_string()
-            }
-        }
-        Rule1Outcome::Fired(_) => "Under-batching: not triggered".to_string(),
-    }
-}
-
 pub(super) fn r1_short_action(running: f64, effective_max: f64) -> String {
     let idle = (effective_max - running).max(0.0);
     format!("batch more requests or increase client concurrency ({idle:.0} slots idle)")

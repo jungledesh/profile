@@ -77,17 +77,6 @@ pub(crate) fn effective_prompt_tps(raw_prompt_tps: f64, prefix_hit_rate: Option<
     }
 }
 
-/// Gate inputs shared by evaluate() and verbose miss reporting.
-#[derive(Debug, Clone, Copy)]
-pub struct R6GateInput {
-    pub prompt_tokens_per_sec: Option<f64>,
-    pub generation_tokens_per_sec: Option<f64>,
-    pub decode_efficiency_pct: Option<f64>,
-    pub tpot_ms: Option<f64>,
-    pub tpot_floor_ms: Option<f64>,
-    pub prefix_cache_hit_rate: Option<f64>,
-}
-
 /// Inputs for per-window R6 evaluation.
 pub struct PrefillBoundEvalInput<'a> {
     pub prompt_tokens_per_sec: Option<f64>,
@@ -510,75 +499,6 @@ pub fn r6_recommendation(input: PrefillBoundEvalInput<'_>) -> Option<Recommendat
     })
 }
 
-pub fn r6_verbose_miss_line(input: R6GateInput) -> Option<String> {
-    let R6GateInput {
-        prompt_tokens_per_sec,
-        generation_tokens_per_sec,
-        decode_efficiency_pct,
-        tpot_ms,
-        tpot_floor_ms,
-        prefix_cache_hit_rate,
-    } = input;
-    let Some(raw_prompt_tps) = prompt_tokens_per_sec.filter(|v| v.is_finite() && *v > 0.0) else {
-        return Some("Prefill-bound: not triggered (prompt tok/s unavailable)".to_string());
-    };
-    let prompt_tps = effective_prompt_tps(raw_prompt_tps, prefix_cache_hit_rate);
-    if prompt_tps <= 0.0 {
-        return Some(
-            "Prefill-bound: not triggered (effective prompt tok/s zero after prefix cache adjustment)"
-                .to_string(),
-        );
-    }
-    let gen_tps = match generation_tokens_per_sec.filter(|v| v.is_finite()) {
-        Some(v) => v,
-        None => {
-            return Some("Prefill-bound: not triggered (gen tok/s unavailable)".to_string());
-        }
-    };
-    let ratio = if gen_tps > 0.0 {
-        prompt_tps / gen_tps
-    } else {
-        f64::INFINITY
-    };
-
-    if ratio < PROMPT_GEN_RATIO_MILD {
-        let ratio_str = if ratio.is_finite() {
-            format!("{ratio:.1}x")
-        } else {
-            "inf".to_string()
-        };
-        return Some(format!(
-            "Prefill-bound: not triggered (prompt/gen ratio {ratio_str}, below {:.1}x threshold)",
-            PROMPT_GEN_RATIO_MILD
-        ));
-    }
-
-    if let Some(eff) = decode_efficiency_pct.filter(|e| e.is_finite()) {
-        if eff >= DECODE_EFFICIENCY_GATE {
-            return Some(format!(
-                "Prefill-bound: not triggered (decode efficiency {eff:.1}%, above {:.0}% gate)",
-                DECODE_EFFICIENCY_GATE
-            ));
-        }
-    } else {
-        return Some("Prefill-bound: not triggered (decode efficiency unavailable)".to_string());
-    }
-
-    if let (Some(tpot), Some(floor)) = (
-        tpot_ms.filter(|v| v.is_finite() && *v > 0.0),
-        tpot_floor_ms.filter(|v| v.is_finite() && *v > 0.0),
-    ) && tpot < floor * TPOT_INFLATION_GATE
-    {
-        return Some(format!(
-            "Prefill-bound: not triggered (TPOT {tpot:.1}ms below {:.1}x floor {:.1}ms)",
-            TPOT_INFLATION_GATE,
-            floor * TPOT_INFLATION_GATE
-        ));
-    }
-
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -851,20 +771,6 @@ mod tests {
             chunked_prefill_enabled: None,
         });
         assert!(matches!(result, Rule6Outcome::NotFired));
-    }
-
-    #[test]
-    fn verbose_miss_when_efficiency_unavailable() {
-        let line = r6_verbose_miss_line(R6GateInput {
-            prompt_tokens_per_sec: Some(600.0),
-            generation_tokens_per_sec: Some(100.0),
-            decode_efficiency_pct: None,
-            tpot_ms: Some(50.0),
-            tpot_floor_ms: Some(7.85),
-            prefix_cache_hit_rate: None,
-        });
-        assert!(line.is_some());
-        assert!(line.expect("line").contains("unavailable"));
     }
 
     #[test]

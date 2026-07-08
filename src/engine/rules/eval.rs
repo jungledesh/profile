@@ -514,13 +514,24 @@ pub(crate) fn finalize_report_groups(
         };
     };
 
+    let primary_name = recs
+        .iter()
+        .filter(|r| r.layer == min_layer)
+        .max_by(|a, b| {
+            let sa = a.impact as f64 * a.confidence;
+            let sb = b.impact as f64 * b.confidence;
+            sa.total_cmp(&sb)
+        })
+        .map(|r| r.rule_name)
+        .unwrap_or("higher-priority rule");
+
     let mut recs: Vec<Recommendation> = recs
         .into_iter()
         .filter(|r| {
             if r.layer == min_layer {
                 true
             } else {
-                suppressed_rules.push(r.rule_name);
+                suppressed_rules.push((r.rule_name, primary_name));
                 false
             }
         })
@@ -532,7 +543,7 @@ pub(crate) fn finalize_report_groups(
             let before = recs.len();
             recs.retain(|r| r.rule_name != *suppressed);
             if recs.len() < before {
-                suppressed_rules.push(suppressed);
+                suppressed_rules.push((suppressed, suppressor));
             }
         }
     }

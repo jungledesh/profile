@@ -17,7 +17,7 @@ pub struct Report {
     pub baseline: Option<PhysicsBaseline>,
     pub groups: Vec<IssueGroup>,
     /// Rules that fired but were removed by layer filtering or the suppression table.
-    pub suppressed_rules: Vec<&'static str>,
+    pub suppressed_rules: Vec<(&'static str, &'static str)>,
     pub kv_max_seqs: Option<u32>,
     pub n_eval: usize,
     pub skipped: usize,

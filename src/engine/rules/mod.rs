@@ -20,7 +20,6 @@ pub use format::{
 };
 pub use r1_under_batching::{
     R1EvalInput, R1MissReport, Rule1Outcome, UnderBatchingDetail, r1_recommendation,
-    r1_verbose_miss_line,
 };
 pub use r2_kv_cache_pressure::{
     KvAdmissionBacklogDetail, KvCachePressureDetail, Rule2Outcome, r2_recommendation,
@@ -34,8 +33,7 @@ pub use r5_concurrency_saturation::{
     ConcurrencySaturationDetail, r5_recommendation, rule5_concurrency_saturation,
 };
 pub use r6_prefill_bound::{
-    PrefillBoundDetail, PrefillBoundEvalInput, R6GateInput, Rule6Outcome, r6_recommendation,
-    r6_verbose_miss_line,
+    PrefillBoundDetail, PrefillBoundEvalInput, Rule6Outcome, r6_recommendation,
 };
 pub use r7_config_headroom::{ConfigHeadroomDetail, rule7_config_headroom};
 

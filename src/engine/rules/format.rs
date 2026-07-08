@@ -5,9 +5,7 @@ use crate::context::{AnalysisInput, RuntimeWindow};
 use crate::engine::Report;
 use crate::engine::baseline::{CostSource, PhysicsBaseline, WeightDtypeSource};
 
-use super::r1_under_batching::{R1EvalInput, r1_verbose_miss_line};
 use super::r4_oom_risk::r4_advisory;
-use super::r6_prefill_bound::{R6GateInput, r6_verbose_miss_line};
 use super::{
     ACHIEVABLE_EFFICIENCY_CEILING, ENGINE_MIN_PERSISTENT_WINDOWS, IssueGroup, NO_ISSUES_LINE,
     rule_names,
@@ -18,44 +16,15 @@ const KV_RULE_NAMES: &[&str] = &[
     rule_names::KV_ADMISSION_BACKLOG,
 ];
 
-const KV_NOT_TRIGGERED_LABEL: &str = "KV cache pressure";
-
-struct NotTriggeredRule {
-    rule_name: &'static str,
-    label: &'static str,
-}
-
-const NOT_TRIGGERED_SINGLES: &[NotTriggeredRule] = &[
-    NotTriggeredRule {
-        rule_name: rule_names::UNDER_BATCHING,
-        label: "Under-batching",
-    },
-    NotTriggeredRule {
-        rule_name: rule_names::OOM_RISK,
-        label: "OOM risk",
-    },
-    NotTriggeredRule {
-        rule_name: rule_names::CONCURRENCY_SATURATION,
-        label: "Concurrency saturation",
-    },
-    NotTriggeredRule {
-        rule_name: rule_names::CONFIG_HEADROOM,
-        label: "Configured batch limit",
-    },
-    NotTriggeredRule {
-        rule_name: rule_names::LOW_PREFIX_REUSE,
-        label: "Low prefix reuse",
-    },
-    NotTriggeredRule {
-        rule_name: rule_names::PREFILL_BOUND,
-        label: "Prefill-bound",
-    },
+const NOT_TRIGGERED_SINGLES: &[&str] = &[
+    rule_names::UNDER_BATCHING,
+    rule_names::OOM_RISK,
+    rule_names::CONCURRENCY_SATURATION,
+    rule_names::CONFIG_HEADROOM,
+    rule_names::LOW_PREFIX_REUSE,
+    rule_names::PREFILL_BOUND,
+    rule_names::MASSIVE_UNDERUTILIZATION,
 ];
-
-const NOT_TRIGGERED_KV: NotTriggeredRule = NotTriggeredRule {
-    rule_name: rule_names::KV_CACHE_PRESSURE,
-    label: KV_NOT_TRIGGERED_LABEL,
-};
 
 fn kv_rules_absent_from_fired(fired_names: &HashSet<&'static str>) -> bool {
     !KV_RULE_NAMES.iter().any(|name| fired_names.contains(name))
@@ -258,64 +227,40 @@ pub fn no_evaluable_diagnose_lines(verbose: bool, windows: &[RuntimeWindow]) -> 
     out
 }
 
-struct R1VerboseContext<'a> {
-    eval: R1EvalInput<'a>,
-    tpot_ms: Option<f64>,
-    tpot_floor_ms: Option<f64>,
-}
-
 fn append_not_triggered_lines(
     out: &mut Vec<String>,
-    rules: &[&NotTriggeredRule],
-    verbose_rules: bool,
-    r1_context: Option<R1VerboseContext<'_>>,
-    baseline: Option<&PhysicsBaseline>,
+    rules: &[&str],
+    suppressed_rules: &[(&'static str, &'static str)],
 ) {
-    if rules.is_empty() {
+    if rules.is_empty() && suppressed_rules.is_empty() {
         return;
     }
     if !out.is_empty() && !out.last().is_some_and(|l| l.is_empty()) {
         out.push(String::new());
     }
     for rule in rules {
-        let line = if rule.rule_name == rule_names::UNDER_BATCHING && verbose_rules {
-            match r1_context.as_ref() {
-                Some(ctx) => r1_verbose_miss_line(ctx.eval),
-                None => format!("{}: not triggered", rule.label),
-            }
-        } else if rule.rule_name == rule_names::PREFILL_BOUND && verbose_rules {
-            let gate = r1_context.as_ref().map(|ctx| R6GateInput {
-                prompt_tokens_per_sec: ctx.eval.prompt_tokens_per_sec,
-                generation_tokens_per_sec: ctx.eval.generation_tokens_per_sec,
-                decode_efficiency_pct: baseline.and_then(|b| b.efficiency_pct),
-                tpot_ms: ctx.tpot_ms,
-                tpot_floor_ms: ctx
-                    .tpot_floor_ms
-                    .or_else(|| baseline.map(|b| b.tpot_floor_ms)),
-                prefix_cache_hit_rate: ctx.eval.prefix_cache_hit_rate,
-            });
-            gate.and_then(r6_verbose_miss_line)
-                .unwrap_or_else(|| format!("{}: not triggered", rule.label))
-        } else {
-            format!("{}: not triggered", rule.label)
-        };
-        out.push(line);
+        out.push(format!("{}: not triggered", rule_names::display_name(rule)));
+    }
+    for &(suppressed_name, suppressor_name) in suppressed_rules {
+        let label = rule_names::display_name(suppressed_name);
+        let suppressor_label = rule_names::display_name(suppressor_name);
+        out.push(format!("{label}: suppressed by {suppressor_label}"));
     }
 }
 
 fn not_triggered_from_fired_names(
     fired_names: &HashSet<&'static str>,
-    suppressed_rules: &[&'static str],
+    suppressed_rules: &[(&'static str, &'static str)],
     r2_adv_present: bool,
     r4_adv_present: bool,
-) -> Vec<&'static NotTriggeredRule> {
-    let suppressed = |name: &str| suppressed_rules.contains(&name);
+) -> Vec<&'static str> {
+    let suppressed = |name: &str| suppressed_rules.iter().any(|(s, _)| *s == name);
     let mut rules = Vec::new();
-    for entry in NOT_TRIGGERED_SINGLES {
-        if entry.rule_name == rule_names::OOM_RISK && r4_adv_present {
+    for &entry in NOT_TRIGGERED_SINGLES {
+        if entry == rule_names::OOM_RISK && r4_adv_present {
             continue;
         }
-        if !fired_names.contains(entry.rule_name) && !suppressed(entry.rule_name) {
+        if !fired_names.contains(entry) && !suppressed(entry) {
             rules.push(entry);
         }
     }
@@ -323,7 +268,7 @@ fn not_triggered_from_fired_names(
         && !KV_RULE_NAMES.iter().any(|n| suppressed(n))
         && !r2_adv_present
     {
-        rules.push(&NOT_TRIGGERED_KV);
+        rules.push(rule_names::KV_CACHE_PRESSURE);
     }
     rules
 }
@@ -388,27 +333,7 @@ pub fn format_diagnose_rules(
         advisories.r4_present,
     );
     if verbose_rules {
-        append_not_triggered_lines(
-            &mut out,
-            &not_fired,
-            verbose_rules,
-            Some(R1VerboseContext {
-                eval: R1EvalInput {
-                    snapshot,
-                    config_max_num_seqs: input.ctx.config.max_num_seqs,
-                    efficiency_pct: baseline_ref.and_then(|b| b.efficiency_pct),
-                    config_relative_efficiency_pct: baseline_ref
-                        .and_then(|b| b.config_relative_efficiency_pct),
-                    prompt_tokens_per_sec: snapshot.vllm.prompt_tokens_per_sec,
-                    generation_tokens_per_sec: snapshot.vllm.generation_tokens_per_sec,
-                    prefix_cache_hit_rate: snapshot.vllm.prefix_cache_hit_rate,
-                    ridge_batch_size: baseline_ref.map(|b| b.ridge_batch_size),
-                },
-                tpot_ms: snapshot.vllm.tpot_ms,
-                tpot_floor_ms: baseline_ref.map(|b| b.tpot_floor_ms),
-            }),
-            baseline_ref,
-        );
+        append_not_triggered_lines(&mut out, &not_fired, &report.suppressed_rules);
     }
 
     if !any_issue && !any_advisory && !verbose_rules {
@@ -489,33 +414,11 @@ pub fn format_diagnose_rules_for_windows(
         if verbose_rules {
             let not_fired = not_triggered_from_fired_names(
                 &HashSet::new(),
-                &[],
+                &report.suppressed_rules,
                 advisories.r2_present,
                 advisories.r4_present,
             );
-            append_not_triggered_lines(
-                &mut out,
-                &not_fired,
-                verbose_rules,
-                Some(R1VerboseContext {
-                    eval: R1EvalInput {
-                        snapshot: summary_snap,
-                        config_max_num_seqs: summary.ctx.config.max_num_seqs,
-                        efficiency_pct: report.baseline.as_ref().and_then(|b| b.efficiency_pct),
-                        config_relative_efficiency_pct: report
-                            .baseline
-                            .as_ref()
-                            .and_then(|b| b.config_relative_efficiency_pct),
-                        prompt_tokens_per_sec: summary_snap.vllm.prompt_tokens_per_sec,
-                        generation_tokens_per_sec: summary_snap.vllm.generation_tokens_per_sec,
-                        prefix_cache_hit_rate: summary_snap.vllm.prefix_cache_hit_rate,
-                        ridge_batch_size: report.baseline.as_ref().map(|b| b.ridge_batch_size),
-                    },
-                    tpot_ms: summary_snap.vllm.tpot_ms,
-                    tpot_floor_ms: report.baseline.as_ref().map(|b| b.tpot_floor_ms),
-                }),
-                report.baseline.as_ref(),
-            );
+            append_not_triggered_lines(&mut out, &not_fired, &report.suppressed_rules);
         }
         if !any_advisory && !verbose_rules {
             out.push(NO_ISSUES_LINE.to_string());
@@ -583,29 +486,7 @@ pub fn format_diagnose_rules_for_windows(
     );
     let any_warning = !report.groups.is_empty();
     if verbose_rules {
-        append_not_triggered_lines(
-            &mut out,
-            &not_fired,
-            verbose_rules,
-            Some(R1VerboseContext {
-                eval: R1EvalInput {
-                    snapshot: summary_snap,
-                    config_max_num_seqs: summary.ctx.config.max_num_seqs,
-                    efficiency_pct: report.baseline.as_ref().and_then(|b| b.efficiency_pct),
-                    config_relative_efficiency_pct: report
-                        .baseline
-                        .as_ref()
-                        .and_then(|b| b.config_relative_efficiency_pct),
-                    prompt_tokens_per_sec: summary_snap.vllm.prompt_tokens_per_sec,
-                    generation_tokens_per_sec: summary_snap.vllm.generation_tokens_per_sec,
-                    prefix_cache_hit_rate: summary_snap.vllm.prefix_cache_hit_rate,
-                    ridge_batch_size: report.baseline.as_ref().map(|b| b.ridge_batch_size),
-                },
-                tpot_ms: summary_snap.vllm.tpot_ms,
-                tpot_floor_ms: report.baseline.as_ref().map(|b| b.tpot_floor_ms),
-            }),
-            report.baseline.as_ref(),
-        );
+        append_not_triggered_lines(&mut out, &not_fired, &report.suppressed_rules);
     }
     if !any_warning && !any_advisory && !verbose_rules {
         out.push(NO_ISSUES_LINE.to_string());
