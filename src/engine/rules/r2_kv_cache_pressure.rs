@@ -183,8 +183,10 @@ pub fn rule2_kv_cache_pressure(snapshot: &RawSnapshot) -> Rule2Outcome {
     }
 
     let kv = snapshot.vllm.kv_cache_usage_perc.filter(|v| v.is_finite());
-    let kv_high = kv.is_some_and(|kv_p| kv_p >= KV_CACHE_PRESSURE_MIN_PERC);
-    if !kv_high {
+    let peak = snapshot.vllm.kv_cache_peak_perc.filter(|v| v.is_finite());
+    let kv_avg_high = kv.is_some_and(|kv_p| kv_p >= KV_CACHE_PRESSURE_MIN_PERC);
+    let kv_peak_high = peak.is_some_and(|p| p >= KV_CACHE_PRESSURE_MIN_PERC);
+    if !kv_avg_high && !kv_peak_high {
         return Rule2Outcome::NotFired;
     }
 
@@ -358,32 +360,38 @@ pub(super) fn format_kv_cache_pressure_fired(
         nvcc_available,
     } = *ctx;
     let kv_cache_dtype = snapshot.vllm.cache_config.cache_dtype.as_deref();
-    let peak = snapshot
-        .vllm
-        .kv_cache_peak_perc
-        .filter(|v| v.is_finite())
-        .unwrap_or(d.kv_cache_usage_perc);
+    let kv_avg = d.kv_cache_usage_perc;
+    let peak = d.kv_peak_pct.unwrap_or(kv_avg);
     let mut out = vec![
         "[!] KV Cache Pressure".to_string(),
         "    Cause:".to_string(),
     ];
-    out.push(format!(
-        "      - KV cache hit {peak:.1}% peak (threshold: {:.0}%)",
-        KV_CACHE_PRESSURE_MIN_PERC
-    ));
-    if d.preemptions_active {
-        out.push(
-            "      - Active preemptions: scheduler evicting sequences to free KV blocks"
-                .to_string(),
-        );
-    }
-    if d.queue_backpressure
-        && let Some(wait) = snapshot.vllm.num_requests_waiting.filter(|v| v.is_finite())
-    {
+    if kv_avg >= KV_CACHE_PRESSURE_MIN_PERC {
         out.push(format!(
-            "      - Queue backpressure: {wait:.0} requests waiting on KV admission"
+            "      KV cache {kv_avg:.0}% avg, {peak:.0}% peak (threshold: {:.0}%).",
+            KV_CACHE_PRESSURE_MIN_PERC
+        ));
+    } else {
+        out.push(format!(
+            "      KV cache {kv_avg:.0}% avg, {peak:.0}% peak (burst pressure, threshold: {:.0}%).",
+            KV_CACHE_PRESSURE_MIN_PERC
         ));
     }
+    let wait_count = snapshot.vllm.num_requests_waiting.filter(|v| v.is_finite());
+    let evidence = match (
+        d.preemptions_active,
+        d.queue_backpressure.then_some(wait_count).flatten(),
+    ) {
+        (true, Some(w)) => {
+            format!("      Scheduler evicting; {w:.0} requests queued on KV admission.")
+        }
+        (true, None) => "      Scheduler evicting sequences to free KV blocks.".to_string(),
+        (false, Some(w)) => format!("      {w:.0} requests queued on KV admission."),
+        (false, None) => {
+            unreachable!("R2 requires preemptions or queue backpressure to fire")
+        }
+    };
+    out.push(evidence);
     out.push(String::new());
     out.push("    Fix:".to_string());
     if d.preemptions_active {
@@ -455,12 +463,12 @@ pub(super) fn format_kv_admission_backlog_issue(
         "[!] KV Cache Pressure: Admission Backlog".to_string(),
         "    Cause:".to_string(),
         format!(
-            "      - Scheduler holding {:.0} requests in queue ({:.0}% of active requests waiting) to protect KV memory",
+            "      Scheduler holding {:.0} requests in queue ({:.0}% of active requests waiting) to protect KV memory.",
             d.requests_waiting,
             d.admission_ratio * 100.0
         ),
         format!(
-            "      - Free KV tokens: {:.0} available, {:.0} demanded",
+            "      Free KV tokens: {:.0} available, {:.0} demanded.",
             d.free_kv_tokens, d.demand_tokens
         ),
         String::new(),
@@ -1199,5 +1207,77 @@ mod tests {
         assert!(fp8_kv_cache_fix_bullet(Some("e4m3fnuz"), true).is_none());
         assert!(fp8_kv_cache_fix_bullet(Some("e5m2"), true).is_none());
         assert!(fp8_kv_cache_fix_bullet(Some("auto"), true).is_some());
+    }
+
+    #[test]
+    fn peak_fires_when_avg_below_threshold() {
+        let v = VllmRawMetrics {
+            kv_cache_usage_perc: Some(58.0),
+            kv_cache_peak_perc: Some(93.0),
+            num_preemptions_per_sec: Some(0.05),
+            ..Default::default()
+        };
+        match rule2_kv_cache_pressure(&snap(v)) {
+            Rule2Outcome::Fired(d) => {
+                assert!((d.kv_cache_usage_perc - 58.0).abs() < 1e-9);
+                assert_eq!(d.kv_peak_pct, Some(93.0));
+            }
+            Rule2Outcome::NotFired => panic!("expected fired on peak >= 88%"),
+        }
+    }
+
+    #[test]
+    fn peak_alone_without_corroboration_does_not_fire() {
+        let v = VllmRawMetrics {
+            kv_cache_usage_perc: Some(58.0),
+            kv_cache_peak_perc: Some(95.0),
+            ..Default::default()
+        };
+        assert!(matches!(
+            rule2_kv_cache_pressure(&snap(v)),
+            Rule2Outcome::NotFired
+        ));
+    }
+
+    #[test]
+    fn display_shows_burst_pressure_when_peak_triggered() {
+        let d = KvCachePressureDetail {
+            kv_cache_usage_perc: 58.0,
+            kv_peak_pct: Some(93.0),
+            preemptions_active: true,
+            queue_backpressure: false,
+        };
+        let v = VllmRawMetrics {
+            kv_cache_usage_perc: Some(58.0),
+            kv_cache_peak_perc: Some(93.0),
+            num_preemptions_per_sec: Some(0.05),
+            ..Default::default()
+        };
+        let text = format_kv_cache_pressure_fired(&d, &kv_ctx(&snap(v), None, None, None), 1, 1)
+            .join("\n");
+        assert!(text.contains("burst pressure"));
+        assert!(text.contains("58% avg, 93% peak"));
+        assert!(text.contains("Scheduler evicting"));
+    }
+
+    #[test]
+    fn display_shows_normal_when_avg_triggered() {
+        let d = KvCachePressureDetail {
+            kv_cache_usage_perc: 92.0,
+            kv_peak_pct: Some(97.0),
+            preemptions_active: true,
+            queue_backpressure: false,
+        };
+        let v = VllmRawMetrics {
+            kv_cache_usage_perc: Some(92.0),
+            kv_cache_peak_perc: Some(97.0),
+            num_preemptions_per_sec: Some(0.05),
+            ..Default::default()
+        };
+        let text = format_kv_cache_pressure_fired(&d, &kv_ctx(&snap(v), None, None, None), 1, 1)
+            .join("\n");
+        assert!(!text.contains("burst pressure"));
+        assert!(text.contains("92% avg, 97% peak"));
+        assert!(text.contains("Scheduler evicting"));
     }
 }
