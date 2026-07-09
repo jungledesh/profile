@@ -908,7 +908,7 @@ fn dag_layer2_suppresses_layer4_when_r2_fires() {
 }
 
 #[test]
-fn r7_suppresses_r1() {
+fn r1_suppresses_r7() {
     let windows: Vec<_> = (0..10)
         .map(|_| mk_r7_headroom_window(20.0, 32, 0.0, 10.0))
         .collect();
@@ -919,13 +919,13 @@ fn r7_suppresses_r1() {
         report
             .groups
             .iter()
-            .any(|g| g.primary.rule_name == rule_names::CONFIG_HEADROOM)
+            .any(|g| g.primary.rule_name == rule_names::UNDER_BATCHING)
     );
     assert!(
         !report
             .groups
             .iter()
-            .any(|g| g.primary.rule_name == rule_names::UNDER_BATCHING)
+            .any(|g| g.primary.rule_name == rule_names::CONFIG_HEADROOM)
     );
 }
 
@@ -1674,11 +1674,53 @@ fn r6_fires_as_primary_when_no_other_rules() {
 }
 
 #[test]
+fn r6_suppresses_r7_when_both_fire() {
+    let mut windows: Vec<_> = (0..10)
+        .map(|_| mk_r6_prefill_window(12.0, 10.0, 50.0, Some(50.0)))
+        .collect();
+    for w in &mut windows {
+        w.snapshot.vllm.max_num_seqs = Some(32);
+    }
+    let s = windows[0].snapshot.clone();
+    let mut cfg = VllmConfig {
+        dtype: Some("bf16".to_string()),
+        max_model_len: Some(2048),
+        max_num_seqs: Some(32),
+        ..Default::default()
+    };
+    cfg.enable_chunked_prefill = Some(false);
+    let ctx = StaticContext::from_snapshot(&s, cfg);
+    let summary = ai(&ctx, windows.last().expect("windows"));
+    let report = build_report_for_windows(&windows, summary);
+    assert!(
+        report
+            .groups
+            .iter()
+            .any(|g| g.primary.rule_name == rule_names::PREFILL_BOUND)
+    );
+    assert!(
+        !report
+            .groups
+            .iter()
+            .any(|g| g.primary.rule_name == rule_names::CONFIG_HEADROOM)
+    );
+    assert!(
+        report
+            .suppressed_rules
+            .iter()
+            .any(|(suppressed, suppressor)| {
+                *suppressed == rule_names::CONFIG_HEADROOM
+                    && *suppressor == rule_names::PREFILL_BOUND
+            })
+    );
+}
+
+#[test]
 fn r7_fires_as_primary_when_alone() {
     let windows: Vec<_> = (0..10)
-        .map(|_| mk_r7_headroom_window(20.0, 32, 0.0, 50.0))
+        .map(|_| mk_r7_headroom_window(60.0, 64, 0.0, 50.0))
         .collect();
-    let ctx = mk_r7_ctx(32);
+    let ctx = mk_r7_ctx(64);
     let summary = ai(&ctx, windows.last().expect("windows"));
     let report = build_report_for_windows(&windows, summary);
     assert_eq!(report.groups.len(), 1);

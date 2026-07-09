@@ -408,7 +408,7 @@ fn build_report_from_eval(
             format_config_headroom_window_issue(&d, pct(eval.r7_fired, eval.n_eval), conf);
         recs.push(Recommendation {
             rule_name: rule_names::CONFIG_HEADROOM,
-            layer: 3,
+            layer: 6,
             impact: 3,
             confidence: conf,
             action: format!(
