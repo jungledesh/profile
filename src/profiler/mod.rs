@@ -139,7 +139,7 @@ fn empty_snapshot(at: SystemTime) -> collectors::RawSnapshot {
         timestamp: at,
         vllm: collectors::VllmRawMetrics::default(),
         gpus: vec![],
-        nvml_host_gpu_count: None,
+        host_gpu_count: None,
     }
 }
 
@@ -171,7 +171,7 @@ fn context_only_diagnose_snapshot(
                 ..Default::default()
             })
             .collect(),
-        nvml_host_gpu_count: source.nvml_host_gpu_count,
+        host_gpu_count: source.host_gpu_count,
     }
 }
 
@@ -221,7 +221,7 @@ mod tests {
             timestamp: std::time::SystemTime::UNIX_EPOCH,
             vllm: v,
             gpus: vec![g],
-            nvml_host_gpu_count: None,
+            host_gpu_count: None,
         };
         let out = context_only_diagnose_snapshot(&src, std::time::SystemTime::UNIX_EPOCH);
         assert_eq!(out.vllm.model_name.as_deref(), Some("llama"));

@@ -128,11 +128,11 @@ pub struct VllmRawMetrics {
     pub model_weight_dtype: Option<String>,
 }
 
-/// NVML / DCGM / nvidia-smi scrape
+/// GPU telemetry scrape
 #[derive(Debug, Clone, Default)]
 pub struct GpuRawMetrics {
     pub gpu_name: Option<String>,
-    /// Device index on this host (`CUDA_VISIBLE_DEVICES` / NVML ordering).
+    /// Device index on this host (device driver ordering).
     pub gpu_index: Option<u32>,
     /// Stable per-device identifier from the driver (e.g. `GPU-xxxxxxxx-xxxx-...`).
     pub gpu_uuid: Option<String>,
@@ -142,11 +142,11 @@ pub struct GpuRawMetrics {
     pub power_watts: Option<f64>,
     pub power_limit_watts: Option<f64>,
     pub vram_used_mb: Option<u64>,
-    /// Max VRAM used (MiB) across NVML polls in this window. Multi-window: max over evaluable windows.
+    /// Max VRAM used (MiB) across GPU polls in this window. Multi-window: max over evaluable windows.
     pub vram_peak_mb: Option<u64>,
     pub vram_total_mb: Option<u64>,
     pub temperature_c: Option<f64>,
-    /// Max GPU temperature (°C) across NVML polls in this window. Multi-window: max over evaluable windows (with landing fold-in); stdout parenthetical uses threshold in `output/stdout.rs`.
+    /// Max GPU temperature (°C) across GPU polls in this window. Multi-window: max over evaluable windows (with landing fold-in); stdout parenthetical uses threshold in `output/stdout.rs`.
     pub temperature_peak_c: Option<f64>,
     pub sm_clock_mhz: Option<u32>,
 }
@@ -187,7 +187,7 @@ impl GpuRawMetrics {
         }
     }
 
-    /// True when fingerprint falls back to NVML device index (no UUID or PCIe bus ID, but has index).
+    /// True when fingerprint falls back to GPU device index (no UUID or PCIe bus ID, but has index).
     pub fn uses_index_only(&self) -> bool {
         self.gpu_uuid.is_none() && self.pcie_bus_id.is_none() && self.gpu_index.is_some()
     }
@@ -224,7 +224,7 @@ pub struct AggregateGpuMetrics {
 
 #[derive(Debug, Clone)]
 pub struct RawSnapshot {
-    /// When the GPU collector finished its sampling window (last NVML poll).
+    /// When the GPU collector finished its sampling window (last GPU poll).
     pub gpu_observed_at: SystemTime,
     /// When the vLLM collector finished its last `/metrics` scrape in the window.
     pub vllm_observed_at: SystemTime,
@@ -232,8 +232,8 @@ pub struct RawSnapshot {
     pub timestamp: SystemTime,
     pub vllm: VllmRawMetrics,
     pub gpus: Vec<GpuRawMetrics>,
-    /// NVML-reported GPU count on this host. None when NVML is unavailable.
-    pub nvml_host_gpu_count: Option<u32>,
+    /// GPU count on this host. None when driver is unavailable.
+    pub host_gpu_count: Option<u32>,
 }
 
 impl Default for RawSnapshot {
@@ -244,7 +244,7 @@ impl Default for RawSnapshot {
             timestamp: SystemTime::UNIX_EPOCH,
             vllm: VllmRawMetrics::default(),
             gpus: Vec::new(),
-            nvml_host_gpu_count: None,
+            host_gpu_count: None,
         }
     }
 }
@@ -413,7 +413,7 @@ pub const ACTIVE_GPU_UTIL_PCT_THRESHOLD: f64 = 20.0;
 ///
 /// Requires `running_reqs > 0` plus at least one activity signal:
 ///   - kv_cache_pct > 30%  (decode + sustained load)
-///   - gpu_util_pct > 20%  (prefill bursts; secondary - NVML is coarse)
+///   - gpu_util_pct > 20%  (prefill bursts; secondary, GPU util is coarse)
 ///
 /// If both signals are absent, `running_reqs > 0` alone is the fallback.
 pub fn window_is_active(s: &RawSnapshot) -> bool {
@@ -458,7 +458,7 @@ mod window_evaluable_tests {
                 ..Default::default()
             },
             gpus: vec![],
-            nvml_host_gpu_count: None,
+            host_gpu_count: None,
         }
     }
 
@@ -503,7 +503,7 @@ mod window_active_tests {
                 gpu_util_pct: gpu,
                 ..Default::default()
             }],
-            nvml_host_gpu_count: None,
+            host_gpu_count: None,
         }
     }
 
@@ -612,9 +612,7 @@ pub(crate) fn validate_tensor_parallel_scope(
     tp: Option<u32>,
 ) -> anyhow::Result<()> {
     if collected_gpus == 0 {
-        anyhow::bail!(
-            "0 GPUs collected - cannot profile without GPU telemetry. Check NVML/driver."
-        );
+        anyhow::bail!("0 GPUs collected - cannot profile without GPU telemetry. Check GPU driver.");
     }
     if let Some(tp_val) = tp {
         if collected_gpus < tp_val {
@@ -624,7 +622,7 @@ pub(crate) fn validate_tensor_parallel_scope(
         }
         if collected_gpus > tp_val {
             anyhow::bail!(
-                "Profile sees {collected_gpus} GPUs but TP is {tp_val}. Set CUDA_VISIBLE_DEVICES to match vLLM's GPU scope."
+                "Profile sees {collected_gpus} GPUs but TP is {tp_val}. Restrict GPU visibility to match vLLM's GPU scope."
             );
         }
     }
@@ -698,7 +696,7 @@ mod scope_and_drift_tests {
     fn test_validate_tensor_parallel_scope_dilution() {
         let err = validate_tensor_parallel_scope(8, Some(4)).unwrap_err();
         assert!(err.to_string().contains("Profile sees 8 GPUs but TP is 4"));
-        assert!(err.to_string().contains("CUDA_VISIBLE_DEVICES"));
+        assert!(err.to_string().contains("Restrict GPU visibility"));
     }
 
     #[test]

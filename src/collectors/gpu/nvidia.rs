@@ -5,17 +5,52 @@ use anyhow::Result;
 use nvml_wrapper::Nvml;
 use nvml_wrapper::enum_wrappers::device::{Clock, ClockId, TemperatureSensor};
 
-use super::GpuRawMetrics;
+use super::super::GpuRawMetrics;
 #[cfg(test)]
-use super::sampling::SAMPLE_COUNT;
-use super::sampling::{SAMPLE_INTERVAL, sample_count_for};
+use super::super::sampling::SAMPLE_COUNT;
+use super::super::sampling::{SAMPLE_INTERVAL, sample_count_for};
 
 const MIB: u64 = 1024 * 1024;
 
 /// Raw host GPU count from NVML. No CVD filtering, no polling.
 /// Returns None if NVML unavailable.
-pub fn host_gpu_count() -> Option<u32> {
+pub(super) fn host_gpu_count() -> Option<u32> {
     Nvml::init().ok()?.device_count().ok()
+}
+
+/// Single-shot NVML scan for gpu_assignment. No polling, no window.
+pub(super) fn scan_host_gpus() -> Option<Vec<super::GpuScanEntry>> {
+    let nvml = Nvml::init().ok()?;
+    let host_count = nvml.device_count().ok()?;
+    let mut out = Vec::with_capacity(host_count as usize);
+    for idx in 0..host_count {
+        let device = nvml.device_by_index(idx).ok();
+        let name = device
+            .as_ref()
+            .and_then(|d| d.name().ok())
+            .unwrap_or_else(|| "GPU".to_string());
+        let mem = device.as_ref().and_then(|d| d.memory_info().ok());
+        let vram_used_mb = mem.as_ref().map(|m| m.used / MIB).unwrap_or(0);
+        let vram_total_mb = mem.map(|m| m.total / MIB).unwrap_or(0);
+        let pids = device
+            .as_ref()
+            .and_then(|d| d.running_compute_processes().ok())
+            .map(|procs| procs.iter().map(|p| p.pid).collect())
+            .unwrap_or_default();
+        out.push(super::GpuScanEntry {
+            idx,
+            name,
+            vram_used_mb,
+            vram_total_mb,
+            pids,
+        });
+    }
+    Some(out)
+}
+
+/// True when `/usr/local/cuda/bin/nvcc` exists on this host.
+pub(super) fn fp8_compiler_available() -> bool {
+    std::path::Path::new("/usr/local/cuda/bin/nvcc").exists()
 }
 
 #[derive(Default)]
@@ -108,7 +143,7 @@ fn aggregate_polls(polls: &[GpuPoll]) -> AggregatedPolls {
 }
 
 /// Returns `(metrics, observed_at, host_count)` after the last NVML poll for the requested window.
-pub fn collect_gpu_metrics_for(
+pub(super) fn collect(
     window: Duration,
     explicit_indices: Option<&[u32]>,
 ) -> Result<(Vec<GpuRawMetrics>, SystemTime, Option<u32>)> {
@@ -243,7 +278,7 @@ pub fn collect_gpu_metrics_for(
 
 /// NVML device indices to poll. Scope vs TP is validated after collection in
 /// `validate_tensor_parallel_scope` - this only resolves CVD vs full host.
-pub(crate) fn resolve_device_indices(cvd_indices: Vec<u32>, host_device_count: u32) -> Vec<u32> {
+fn resolve_device_indices(cvd_indices: Vec<u32>, host_device_count: u32) -> Vec<u32> {
     if cvd_indices.is_empty() {
         (0..host_device_count).collect()
     } else {

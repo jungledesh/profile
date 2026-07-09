@@ -242,7 +242,7 @@ mod tests {
             vllm: v,
             gpus: vec![],
 
-            nvml_host_gpu_count: None,
+            host_gpu_count: None,
         }
     }
 

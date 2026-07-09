@@ -23,7 +23,10 @@ const FP8_KV_CACHE_FIX: &str = "      • Switch --kv-cache-dtype fp8 to halve K
 /// Suggest prefix caching when mean prompt length exceeds this (tokens).
 const PREFIX_CACHING_LONG_PROMPT_MIN_TOKENS: f64 = 200.0;
 
-fn fp8_kv_cache_fix_bullet(kv_cache_dtype: Option<&str>, nvcc_available: bool) -> Option<String> {
+fn fp8_kv_cache_fix_bullet(
+    kv_cache_dtype: Option<&str>,
+    fp8_compiler_available: bool,
+) -> Option<String> {
     // Already fp8 - don't suggest what's already applied
     if kv_cache_dtype.is_some_and(|d| {
         let d = d.trim().to_ascii_lowercase();
@@ -34,11 +37,10 @@ fn fp8_kv_cache_fix_bullet(kv_cache_dtype: Option<&str>, nvcc_available: bool) -
     // --kv-cache-dtype fp8 stores KV activations in fp8 via software cast - works on all GPUs
     // including A100. This is distinct from --quantization fp8 (weight quantization) which
     // requires native FP8 hardware and crashes on A100/Qwen3.6.
-    let nvcc_present = nvcc_available;
-    Some(if nvcc_present {
+    Some(if fp8_compiler_available {
         FP8_KV_CACHE_FIX.to_string()
     } else {
-        format!("{FP8_KV_CACHE_FIX} (requires nvcc)")
+        format!("{FP8_KV_CACHE_FIX} (FP8 compiler not found)")
     })
 }
 
@@ -218,7 +220,7 @@ pub fn r2_recommendation(
     kv_max_seqs: Option<u32>,
     windows_fired: usize,
     total_evaluable: usize,
-    nvcc_available: bool,
+    fp8_compiler_available: bool,
 ) -> Option<Recommendation> {
     let Rule2Outcome::Fired(d) = rule2_kv_cache_pressure(snapshot) else {
         return None;
@@ -254,7 +256,7 @@ pub fn r2_recommendation(
                 max_model_len,
                 kv_headroom_gb,
                 kv_max_seqs,
-                nvcc_available,
+                fp8_compiler_available,
             },
             windows_fired,
             total_evaluable,
@@ -343,7 +345,7 @@ pub(super) struct KvFormatCtx<'a> {
     pub max_model_len: Option<u32>,
     pub kv_headroom_gb: Option<f64>,
     pub kv_max_seqs: Option<u32>,
-    pub nvcc_available: bool,
+    pub fp8_compiler_available: bool,
 }
 
 pub(super) fn format_kv_cache_pressure_fired(
@@ -357,7 +359,7 @@ pub(super) fn format_kv_cache_pressure_fired(
         max_model_len,
         kv_headroom_gb,
         kv_max_seqs,
-        nvcc_available,
+        fp8_compiler_available,
     } = *ctx;
     let kv_cache_dtype = snapshot.vllm.cache_config.cache_dtype.as_deref();
     let kv_avg = d.kv_cache_usage_perc;
@@ -405,7 +407,7 @@ pub(super) fn format_kv_cache_pressure_fired(
                     .to_string(),
             );
         }
-        if let Some(bullet) = fp8_kv_cache_fix_bullet(kv_cache_dtype, nvcc_available) {
+        if let Some(bullet) = fp8_kv_cache_fix_bullet(kv_cache_dtype, fp8_compiler_available) {
             out.push(bullet);
         }
         let total_count = snapshot.vllm.generation_tokens_completed.unwrap_or(0.0);
@@ -423,7 +425,7 @@ pub(super) fn format_kv_cache_pressure_fired(
         if let Some(bullet) = prefix_caching_fix_bullet(snapshot) {
             out.push(bullet);
         }
-        if let Some(bullet) = fp8_kv_cache_fix_bullet(kv_cache_dtype, nvcc_available) {
+        if let Some(bullet) = fp8_kv_cache_fix_bullet(kv_cache_dtype, fp8_compiler_available) {
             out.push(bullet);
         }
         let total_count = snapshot.vllm.generation_tokens_completed.unwrap_or(0.0);
@@ -475,7 +477,7 @@ pub(super) fn format_kv_admission_backlog_issue(
         "    Fix:".to_string(),
         gpu_mem_bullet,
     ];
-    if let Some(bullet) = fp8_kv_cache_fix_bullet(kv_cache_dtype, ctx.nvcc_available) {
+    if let Some(bullet) = fp8_kv_cache_fix_bullet(kv_cache_dtype, ctx.fp8_compiler_available) {
         out.push(bullet);
     }
     let total_count = ctx.snapshot.vllm.generation_tokens_completed.unwrap_or(0.0);
@@ -570,7 +572,7 @@ mod tests {
             vllm,
             gpus: vec![],
 
-            nvml_host_gpu_count: None,
+            host_gpu_count: None,
         }
     }
 
@@ -585,7 +587,7 @@ mod tests {
             max_model_len,
             kv_headroom_gb,
             kv_max_seqs,
-            nvcc_available: false,
+            fp8_compiler_available: false,
         }
     }
 
@@ -1191,13 +1193,14 @@ mod tests {
     }
 
     #[test]
-    fn fp8_kv_cache_bullet_reflects_nvcc_availability() {
-        let with_nvcc = fp8_kv_cache_fix_bullet(None, true).expect("bf16/auto should suggest fp8");
-        assert!(with_nvcc.contains("Switch --kv-cache-dtype fp8"));
-        assert!(!with_nvcc.contains("requires nvcc"));
-        let without_nvcc =
+    fn fp8_kv_cache_bullet_reflects_compiler_availability() {
+        let with_compiler =
+            fp8_kv_cache_fix_bullet(None, true).expect("bf16/auto should suggest fp8");
+        assert!(with_compiler.contains("Switch --kv-cache-dtype fp8"));
+        assert!(!with_compiler.contains("FP8 compiler not found"));
+        let without_compiler =
             fp8_kv_cache_fix_bullet(None, false).expect("bf16/auto should suggest fp8");
-        assert!(without_nvcc.contains("(requires nvcc)"));
+        assert!(without_compiler.contains("(FP8 compiler not found)"));
     }
 
     #[test]

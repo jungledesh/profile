@@ -42,7 +42,7 @@ fn snap(
         timestamp: gpu_at,
         vllm,
         gpus: vec![gpu],
-        nvml_host_gpu_count: None,
+        host_gpu_count: None,
     }
 }
 
@@ -82,7 +82,7 @@ fn input_r4_suppresses_r2() -> (StaticContext, RuntimeWindow) {
             gpu_util_pct: Some(58.0),
             ..Default::default()
         }],
-        nvml_host_gpu_count: None,
+        host_gpu_count: None,
     };
     let cfg = VllmConfig {
         dtype: Some("bf16".to_string()),

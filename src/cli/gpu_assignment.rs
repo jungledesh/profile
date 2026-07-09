@@ -3,9 +3,8 @@ use std::collections::HashMap;
 use std::collections::{BTreeSet, HashSet};
 use std::io::{self, BufRead, IsTerminal, Write};
 
-use nvml_wrapper::Nvml;
-
 use crate::cli::diagnose::{TP_ABORT_HINT, prompt_u32_required};
+use crate::collectors::gpu::GpuScanEntry;
 
 const VRAM_ACTIVE_THRESHOLD: f64 = 0.20;
 
@@ -33,7 +32,7 @@ impl Term {
     }
 
     fn scan_header(&self, n: u32) -> String {
-        format!("Scanning {n} GPUs via NVML...")
+        format!("Scanning {n} GPUs...")
     }
 
     fn format_gpu_row(&self, row: &GpuSnapshot) -> String {
@@ -118,11 +117,14 @@ pub(crate) fn resolve_gpu_assignment(
     cli_tp: Option<u32>,
     url: &str,
 ) -> anyhow::Result<GpuAssignment> {
-    resolve_gpu_assignment_for_host(crate::collectors::gpu::host_gpu_count(), cli_tp, url)
+    let scan = crate::collectors::gpu::scan_host_gpus();
+    let host_count = scan.as_ref().map(|s| s.len() as u32);
+    resolve_gpu_assignment_inner(host_count, scan, cli_tp, url)
 }
 
-pub(crate) fn resolve_gpu_assignment_for_host(
+fn resolve_gpu_assignment_inner(
     host_count: Option<u32>,
+    scan: Option<Vec<GpuScanEntry>>,
     cli_tp: Option<u32>,
     url: &str,
 ) -> anyhow::Result<GpuAssignment> {
@@ -131,7 +133,7 @@ pub(crate) fn resolve_gpu_assignment_for_host(
             if let Some(tp) = cli_tp {
                 if tp > 1 {
                     anyhow::bail!(
-                        "NVML unavailable. Cannot verify hardware for TP {}. Is the GPU driver installed?",
+                        "GPU driver unavailable. Cannot verify hardware for TP {}. Is the driver installed?",
                         tp
                     );
                 } else {
@@ -141,7 +143,7 @@ pub(crate) fn resolve_gpu_assignment_for_host(
                     });
                 }
             }
-            anyhow::bail!("NVML unavailable. Is the GPU driver installed?")
+            anyhow::bail!("GPU driver unavailable. Is the driver installed?")
         }
         Some(0) => anyhow::bail!("No GPUs detected."),
         Some(1) => {
@@ -156,30 +158,41 @@ pub(crate) fn resolve_gpu_assignment_for_host(
             })
         }
         Some(n) => {
+            if let Some(tp) = cli_tp
+                && tp > n
+            {
+                anyhow::bail!("--tensor-parallel-size {tp} exceeds detected GPU count ({n}).")
+            }
+            let scan = scan.expect("scan must be present when host_count >= 2");
             if let Some(tp) = cli_tp {
-                if tp > n {
-                    anyhow::bail!("--tensor-parallel-size {tp} exceeds detected GPU count ({n}).")
-                } else {
-                    run_pipeline(n, Some(tp), url)
-                }
+                run_pipeline(n, Some(tp), url, scan)
             } else {
-                run_pipeline(n, None, url)
+                run_pipeline(n, None, url, scan)
             }
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn resolve_gpu_assignment_for_host(
+    host_count: Option<u32>,
+    cli_tp: Option<u32>,
+    url: &str,
+) -> anyhow::Result<GpuAssignment> {
+    resolve_gpu_assignment_inner(host_count, None, cli_tp, url)
 }
 
 fn run_pipeline(
     host_count: u32,
     known_tp: Option<u32>,
     #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] url: &str,
+    scan: Vec<GpuScanEntry>,
 ) -> anyhow::Result<GpuAssignment> {
-    let nvml = Nvml::init()?;
     let term = Term::new();
 
     eprintln!("{}", term.scan_header(host_count));
 
-    let snapshots = collect_gpu_snapshots(&nvml, host_count);
+    let snapshots = snapshots_from_scan(&scan);
     let fracs: Vec<Option<f64>> = snapshots.iter().map(|s| Some(s.vram_pct / 100.0)).collect();
     let model_weight_gb = preflight_model_weight_gb(url);
     let vram_total_gb: Vec<f64> = snapshots
@@ -216,40 +229,21 @@ fn run_pipeline(
     interactive_gpu_prompt(host_count, known_tp, &snapshots, &term)
 }
 
-fn collect_gpu_snapshots(nvml: &Nvml, host_count: u32) -> Vec<GpuSnapshot> {
-    let mut out = Vec::with_capacity(host_count as usize);
-    for idx in 0..host_count {
-        let device = nvml.device_by_index(idx).ok();
-        let name = device
-            .as_ref()
-            .and_then(|d| d.name().ok())
-            .unwrap_or_else(|| "GPU".to_string());
-        let mem = device.as_ref().and_then(|d| d.memory_info().ok());
-        let vram_pct = mem
-            .as_ref()
-            .map(|m| {
-                if m.total == 0 {
-                    0.0
-                } else {
-                    m.used as f64 / m.total as f64 * 100.0
-                }
-            })
-            .unwrap_or(0.0);
-        let vram_total_mb = mem.map(|m| m.total / (1024 * 1024)).unwrap_or(0);
-        let pids = device
-            .as_ref()
-            .and_then(|d| d.running_compute_processes().ok())
-            .map(|procs| procs.iter().map(|p| p.pid).collect())
-            .unwrap_or_default();
-        out.push(GpuSnapshot {
-            idx,
-            name,
-            vram_pct,
-            vram_total_mb,
-            pids,
-        });
-    }
-    out
+fn snapshots_from_scan(entries: &[GpuScanEntry]) -> Vec<GpuSnapshot> {
+    entries
+        .iter()
+        .map(|e| GpuSnapshot {
+            idx: e.idx,
+            name: e.name.clone(),
+            vram_pct: if e.vram_total_mb == 0 {
+                0.0
+            } else {
+                e.vram_used_mb as f64 / e.vram_total_mb as f64 * 100.0
+            },
+            vram_total_mb: e.vram_total_mb,
+            pids: e.pids.clone(),
+        })
+        .collect()
 }
 
 /// Fetch model weight in GB from the vLLM `/v1/models` endpoint + catalog.
@@ -352,7 +346,7 @@ fn ps_tiebreaker(
     known_tp: Option<u32>,
     term: &Term,
 ) -> Option<GpuAssignment> {
-    // Build pid → [gpu_indices] map from what NVML already gave us.
+    // Build pid → [gpu_indices] map from GPU snapshots.
     let mut pid_to_gpus: HashMap<u32, Vec<u32>> = HashMap::new();
     for snap in snapshots {
         for &pid in &snap.pids {
@@ -620,7 +614,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_cli_tp_without_nvml_uses_flag() {
+    fn resolve_cli_tp_without_driver_uses_flag() {
         let a = resolve_gpu_assignment_for_host(None, Some(1), "http://localhost:8000/metrics")
             .unwrap();
         assert_eq!(a.tp, 1);
@@ -628,10 +622,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_aborts_when_nvml_unavailable_and_no_cli() {
+    fn resolve_aborts_when_driver_unavailable_and_no_cli() {
         let err = resolve_gpu_assignment_for_host(None, None, "http://localhost:8000/metrics")
             .unwrap_err();
-        assert!(err.to_string().contains("NVML unavailable"));
+        assert!(err.to_string().contains("GPU driver unavailable"));
     }
 
     #[test]

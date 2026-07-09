@@ -211,12 +211,13 @@ fn journey_line(report: &engine::Report) -> Option<&'static str> {
 fn push_gpu_advisories(lines: &mut Vec<String>, snapshot: &RawSnapshot) {
     if snapshot_uses_display_names(&snapshot.gpus) {
         lines.push(
-            "[i] GPU identity unavailable. Assigning display names. Keep CUDA_VISIBLE_DEVICES stable."
+            "[i] GPU identity unavailable. Assigning display names. Keep GPU device ordering stable across runs."
                 .to_string(),
         );
     } else if snapshot_uses_index_only(&snapshot.gpus) {
         lines.push(
-            "[i] GPU identity: device index only. Keep CUDA_VISIBLE_DEVICES stable.".to_string(),
+            "[i] GPU identity: device index only. Keep GPU device ordering stable across runs."
+                .to_string(),
         );
     }
 }
@@ -390,7 +391,7 @@ fn print_boxed(lines: &[String]) {
 }
 
 // gpu_util_pct and mem_util_pct are intentionally absent here and from all top-level display.
-// NVML SM util reports "active" regardless of useful work (spin-locks, CUDA graphs, async polling
+// GPU SM util reports "active" regardless of useful work (spin-locks, graph capture, async polling
 // make 99% util compatible with near-zero MFU). Efficiency % is the honest saturation signal.
 fn gpu_gauges_line(
     g: &GpuRawMetrics,
@@ -1413,7 +1414,7 @@ mod tests {
                 ..Default::default()
             }],
 
-            nvml_host_gpu_count: None,
+            host_gpu_count: None,
         };
         let w1 = RuntimeWindow::from_snapshot(mk_snapshot());
         let w2 = RuntimeWindow::from_snapshot(mk_snapshot());
@@ -1451,7 +1452,7 @@ mod tests {
                 ..Default::default()
             }],
 
-            nvml_host_gpu_count: None,
+            host_gpu_count: None,
         };
         let result = DiagnoseResult {
             snapshot: idle_snap.clone(),
@@ -1518,7 +1519,7 @@ mod tests {
                     ..Default::default()
                 },
             ],
-            nvml_host_gpu_count: Some(2),
+            host_gpu_count: Some(2),
         };
         let static_ctx = StaticContext::from_snapshot(&snapshot, VllmConfig::default());
         let result = DiagnoseResult {

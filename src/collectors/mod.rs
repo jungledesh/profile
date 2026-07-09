@@ -1,6 +1,6 @@
 //! GPU + vLLM `/metrics` scrape.
 //!
-//! **Parallel:** NVML and `/metrics` run **concurrently** (`std::thread`). Cadence: `sampling`.
+//! **Parallel:** GPU and `/metrics` run **concurrently** (`std::thread`). Cadence: `sampling`.
 
 pub mod config;
 pub mod gpu;
@@ -34,7 +34,7 @@ pub fn collect_snapshot_for_window(
     let gpu_handle = thread::spawn(move || gpu::collect_gpu_metrics_for(window, Some(&indices)));
     let vllm_handle = thread::spawn(move || vllm::collect_vllm_metrics_for(&url, window));
 
-    let (mut gpus, gpu_observed_at, nvml_host_gpu_count) = gpu_handle
+    let (mut gpus, gpu_observed_at, host_gpu_count) = gpu_handle
         .join()
         .map_err(|_| anyhow::anyhow!("GPU collector panicked"))??;
 
@@ -57,7 +57,7 @@ pub fn collect_snapshot_for_window(
         timestamp: std::time::SystemTime::now(),
         vllm,
         gpus,
-        nvml_host_gpu_count,
+        host_gpu_count,
     })
 }
 
@@ -79,7 +79,7 @@ pub(crate) mod test_fixtures {
                     ..Default::default()
                 })
                 .collect(),
-            nvml_host_gpu_count: None,
+            host_gpu_count: None,
         }
     }
 }

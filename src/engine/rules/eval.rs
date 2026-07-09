@@ -275,7 +275,7 @@ fn build_report_from_eval(
     let max_model_len = summary.ctx.config.max_model_len;
     let prompt_tokens_mean = summary_snap.vllm.prompt_tokens_mean;
     let kv_headroom_gb = baseline.as_ref().and_then(|b| b.kv_headroom_gb);
-    let nvcc_available = summary.ctx.nvcc_available;
+    let fp8_compiler_available = summary.ctx.fp8_compiler_available;
     let kv_max_seqs: Option<u32> = compute_kv_max_seqs(
         kv_headroom_gb,
         max_model_len,
@@ -324,7 +324,7 @@ fn build_report_from_eval(
                 max_model_len,
                 kv_headroom_gb,
                 kv_max_seqs,
-                nvcc_available,
+                fp8_compiler_available,
             },
             eval.r2_fired,
             eval.n_eval,
@@ -353,7 +353,7 @@ fn build_report_from_eval(
                 max_model_len,
                 kv_headroom_gb,
                 kv_max_seqs,
-                nvcc_available,
+                fp8_compiler_available,
             },
             eval.r2_backlog_fired,
             eval.n_eval,

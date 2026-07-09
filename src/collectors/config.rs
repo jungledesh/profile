@@ -34,7 +34,7 @@ pub struct VllmConfig {
     pub enable_chunked_prefill: Option<bool>,
     pub block_size: Option<u32>,
     pub enable_prefix_caching: Option<bool>,
-    /// True when vLLM runs with `--enforce-eager` (CUDA graphs disabled).
+    /// True when vLLM runs with `--enforce-eager` (GPU graph capture disabled).
     pub enforce_eager: Option<bool>,
     /// Operator-supplied GPU cost ($/hr). Overrides catalog estimate when set.
     pub cost_per_hour: Option<f64>,
@@ -260,7 +260,7 @@ mod tests {
                 ..Default::default()
             },
             gpus: vec![],
-            nvml_host_gpu_count: None,
+            host_gpu_count: None,
         }
     }
 

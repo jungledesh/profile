@@ -49,7 +49,7 @@ mod tests {
                 ..Default::default()
             },
             gpus: vec![],
-            nvml_host_gpu_count: None,
+            host_gpu_count: None,
         }
     }
 
@@ -80,7 +80,7 @@ mod tests {
                 ..Default::default()
             },
             gpus: vec![],
-            nvml_host_gpu_count: None,
+            host_gpu_count: None,
         };
         assert_eq!(traffic_from_snapshot(&mk(Some(12.5))).qps, Some(12.5));
         assert!(traffic_from_snapshot(&mk(None)).qps.is_none());

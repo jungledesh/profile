@@ -373,7 +373,7 @@ mod tests {
                 peak_bw_gbps: peak_bw,
             },
             config: cfg,
-            nvcc_available: false,
+            fp8_compiler_available: false,
         };
         let win = RuntimeWindow::from_snapshot(RawSnapshot {
             gpu_observed_at: SystemTime::UNIX_EPOCH,
@@ -382,7 +382,7 @@ mod tests {
             vllm: snapshot,
             gpus: vec![GpuRawMetrics::default(); n_gpus],
 
-            nvml_host_gpu_count: None,
+            host_gpu_count: None,
         });
         (ctx, win)
     }
@@ -1352,7 +1352,7 @@ mod tests {
                 peak_bw_gbps: Some(3350.0),
             },
             config: cfg,
-            nvcc_available: false,
+            fp8_compiler_available: false,
         };
         let win = RuntimeWindow::from_snapshot(RawSnapshot {
             gpu_observed_at: SystemTime::UNIX_EPOCH,
@@ -1360,7 +1360,7 @@ mod tests {
             timestamp: SystemTime::UNIX_EPOCH,
             vllm: snapshot,
             gpus: vec![GpuRawMetrics::default()],
-            nvml_host_gpu_count: None,
+            host_gpu_count: None,
         });
         (ctx, win)
     }
@@ -1406,7 +1406,7 @@ mod tests {
                 ..Default::default()
             },
             gpus: vec![GpuRawMetrics::default()],
-            nvml_host_gpu_count: None,
+            host_gpu_count: None,
         });
         let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
         let expected = math::prefill_ops_per_sec(67.0, 37_000_000_000, 4096, 61, 139_264);
