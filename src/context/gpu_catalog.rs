@@ -55,7 +55,7 @@ static CATALOG: &[GpuEntry] = &[
         },
     },
     // ── A100 ─────────────────────────────────────────────────────────────────
-    // NVML names include VRAM size: "A100-SXM4-80GB", "A100-PCIE-40GB", etc.
+    // Driver-reported names include VRAM size: "A100-SXM4-80GB", "A100-PCIE-40GB", etc.
     // Require explicit size token; ambiguous "a100" alone returns None.
     GpuEntry {
         tokens: &["a100", "80gb"],

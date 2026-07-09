@@ -47,8 +47,8 @@ pub struct StaticContext {
     pub model: ModelArch,
     pub gpu: GPUModel,
     pub config: VllmConfig,
-    /// Resolved once at startup - whether `/usr/local/cuda/bin/nvcc` exists on this host.
-    pub nvcc_available: bool,
+    /// Whether host has the vendor toolchain for FP8 KV cache.
+    pub fp8_compiler_available: bool,
 }
 
 /// Last non-empty `/`-delimited segment; `None` if `s` is empty or whitespace only.
@@ -137,7 +137,7 @@ impl StaticContext {
             model,
             gpu,
             config,
-            nvcc_available: std::path::Path::new("/usr/local/cuda/bin/nvcc").exists(),
+            fp8_compiler_available: crate::collectors::gpu::fp8_compiler_available(),
         }
     }
 }

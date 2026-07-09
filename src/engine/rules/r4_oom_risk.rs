@@ -145,7 +145,7 @@ pub fn r4_advisory(
     }
     if vram_gb.is_none() {
         return Some(vec![
-            "[i] OOM Risk: GPU VRAM unavailable (NVML not reporting). Cannot verify model fits in memory.".to_string(),
+            "[i] OOM Risk: GPU VRAM unavailable (driver not reporting). Cannot verify model fits in memory.".to_string(),
         ]);
     }
     if weight_gb.is_none() {

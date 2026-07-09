@@ -516,7 +516,7 @@ mod tests {
             },
             gpus: vec![],
 
-            nvml_host_gpu_count: None,
+            host_gpu_count: None,
         }
     }
 

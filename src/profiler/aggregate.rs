@@ -176,7 +176,7 @@ pub(super) fn aggregate_windows(
         timestamp: last.timestamp,
         vllm: agg_v,
         gpus: agg_gpus,
-        nvml_host_gpu_count: last.nvml_host_gpu_count,
+        host_gpu_count: last.host_gpu_count,
     }
 }
 
@@ -411,7 +411,7 @@ mod tests {
                 ..Default::default()
             },
             gpus: vec![gpu],
-            nvml_host_gpu_count: None,
+            host_gpu_count: None,
         }
     }
 
@@ -641,7 +641,7 @@ mod tests {
             timestamp: SystemTime::UNIX_EPOCH,
             vllm: v,
             gpus: vec![g],
-            nvml_host_gpu_count: None,
+            host_gpu_count: None,
         };
         let agg = aggregate_windows(
             &[mk(v1, g1), mk(v2, g2)],
@@ -697,7 +697,7 @@ mod tests {
             timestamp: SystemTime::UNIX_EPOCH,
             vllm: v,
             gpus: vec![g],
-            nvml_host_gpu_count: None,
+            host_gpu_count: None,
         };
         let agg = aggregate_windows(
             &[mk(v1, g1), mk(v2, g2)],
@@ -731,7 +731,7 @@ mod tests {
             timestamp: SystemTime::UNIX_EPOCH,
             vllm: v,
             gpus: vec![g],
-            nvml_host_gpu_count: None,
+            host_gpu_count: None,
         };
         let w1 = mk(
             v.clone(),
@@ -767,7 +767,7 @@ mod tests {
             timestamp: SystemTime::UNIX_EPOCH,
             vllm: v,
             gpus: vec![g.clone()],
-            nvml_host_gpu_count: None,
+            host_gpu_count: None,
         };
         let w1 = mk(VllmRawMetrics {
             num_requests_running: Some(2.0),
@@ -813,7 +813,7 @@ mod tests {
             timestamp: SystemTime::UNIX_EPOCH,
             vllm: v,
             gpus: vec![g.clone()],
-            nvml_host_gpu_count: None,
+            host_gpu_count: None,
         };
         let w1 = mk(VllmRawMetrics {
             num_requests_running: Some(2.0),
@@ -902,7 +902,7 @@ mod tests {
             timestamp: SystemTime::UNIX_EPOCH,
             vllm: v,
             gpus: vec![g],
-            nvml_host_gpu_count: None,
+            host_gpu_count: None,
         };
         let idle_v = VllmRawMetrics {
             num_requests_running: Some(8.0),
@@ -981,7 +981,7 @@ mod tests {
                     ..Default::default()
                 },
             ],
-            nvml_host_gpu_count: Some(2),
+            host_gpu_count: Some(2),
         };
         let agg = aggregate_windows(
             &[mk(40.0, 60.0, 100.0, 200.0), mk(80.0, 20.0, 300.0, 100.0)],

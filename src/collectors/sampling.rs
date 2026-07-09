@@ -1,4 +1,4 @@
-//! Shared scrape cadence for GPU NVML and vLLM `/metrics` (parallel in `collect_snapshot`).
+//! Shared scrape cadence for GPU and vLLM `/metrics` (parallel in `collect_snapshot`).
 
 use std::time::Duration;
 

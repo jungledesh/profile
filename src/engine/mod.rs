@@ -99,7 +99,7 @@ pub(crate) fn build_report(input: AnalysisInput<'_>) -> Report {
         kv_max_seqs,
         r2_fired,
         n_eval,
-        input.ctx.nvcc_available,
+        input.ctx.fp8_compiler_available,
     ) {
         recs.push(r);
     }
@@ -251,7 +251,7 @@ mod build_report_tests {
             timestamp: t,
             vllm: v,
             gpus: vec![g],
-            nvml_host_gpu_count: None,
+            host_gpu_count: None,
         };
         let cfg = VllmConfig {
             dtype: Some("bf16".to_string()),
@@ -304,7 +304,7 @@ mod build_report_tests {
             timestamp: t,
             vllm: v,
             gpus: vec![g],
-            nvml_host_gpu_count: None,
+            host_gpu_count: None,
         };
         let cfg = VllmConfig {
             dtype: Some("bf16".to_string()),
@@ -357,7 +357,7 @@ mod build_report_tests {
             timestamp: t,
             vllm: v,
             gpus: vec![g],
-            nvml_host_gpu_count: None,
+            host_gpu_count: None,
         };
         let cfg = VllmConfig {
             dtype: Some("bf16".to_string()),
@@ -402,7 +402,7 @@ mod build_report_tests {
             timestamp: t,
             vllm: v,
             gpus: vec![g],
-            nvml_host_gpu_count: None,
+            host_gpu_count: None,
         };
         let cfg = VllmConfig {
             dtype: Some("bf16".to_string()),
