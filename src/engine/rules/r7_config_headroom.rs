@@ -177,6 +177,8 @@ pub(super) fn format_config_headroom_window_issue(
             String::new(),
             "    Expected: Higher decode throughput when traffic concurrency increases."
                 .to_string(),
+            "    Watch: Higher concurrency increases prefill load. Monitor decode latency after applying."
+                .to_string(),
             format!("    Confidence: {}", confidence_label(confidence)),
         ],
         seen_pct,
@@ -333,6 +335,7 @@ mod tests {
         let text = format_config_headroom_window_issue(&d, 100, 0.6).join("\n");
         assert!(text.contains("Ridge batch   -"));
         assert!(text.contains("Confidence: Moderate"));
+        assert!(text.contains("Watch: Higher concurrency increases prefill load"));
     }
 
     #[test]
