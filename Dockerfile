@@ -148,4 +148,6 @@ RUN chmod 0755 ./load.sh ./start.sh ./profile
 
 USER appuser
 
+# Reset ENTRYPOINT: vLLM ROCm base image sets ENTRYPOINT ["vllm"],
+# which would prepend "vllm" to our CMD args.
 CMD ["bash", "-lc", "/home/appuser/app/start.sh"]
