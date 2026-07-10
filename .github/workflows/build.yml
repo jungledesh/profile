@@ -92,9 +92,6 @@ jobs:
         if: steps.docker_meta.outputs.push == 'true'
         run: echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u ${{ github.repository_owner }} --password-stdin
 
-      - name: Build release binary
-        run: cargo build --release
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -103,6 +100,7 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
+          target: nvidia
           platforms: linux/amd64
           push: ${{ steps.docker_meta.outputs.push == 'true' }}
           tags: ${{ steps.docker_meta.outputs.tags }}
@@ -113,7 +111,8 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile.amd
+          file: ./Dockerfile
+          target: amd
           platforms: linux/amd64
           push: ${{ steps.docker_meta.outputs.push == 'true' }}
           tags: ${{ steps.docker_meta.outputs.tags_amd }}
