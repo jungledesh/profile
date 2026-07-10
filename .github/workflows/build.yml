@@ -99,11 +99,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
-          sudo docker image prune --all --force
-
       - name: Login to GHCR
         if: needs.scan.outputs.push == 'true'
         run: echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u ${{ github.repository_owner }} --password-stdin
@@ -121,7 +116,7 @@ jobs:
           push: ${{ needs.scan.outputs.push == 'true' }}
           tags: ${{ needs.scan.outputs.tags }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-to: type=gha,mode=min
 
   build-amd:
     needs: scan
@@ -152,4 +147,4 @@ jobs:
           push: ${{ needs.scan.outputs.push == 'true' }}
           tags: ${{ needs.scan.outputs.tags_amd }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-to: type=gha,mode=min

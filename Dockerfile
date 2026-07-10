@@ -123,6 +123,8 @@ RUN export DEBIAN_FRONTEND=noninteractive \
     ca-certificates \
     openssh-client \
     rsync \
+    libdrm2 \
+    libdrm-amdgpu1 \
     && /usr/sbin/useradd -m -u 1000 -s /bin/bash appuser \
     && echo "appuser ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/appuser \
     && rm -rf /var/lib/apt/lists/*
