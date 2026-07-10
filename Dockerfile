@@ -1,5 +1,6 @@
 # Build profile binary on Ubuntu 22.04 — matches runtime GLIBC and can load libnvidia-ml.so
 FROM ubuntu:22.04 AS profile-builder
+
 RUN export DEBIAN_FRONTEND=noninteractive \
     && apt-get update && apt-get install -y --no-install-recommends \
     curl \
@@ -7,13 +8,20 @@ RUN export DEBIAN_FRONTEND=noninteractive \
     build-essential \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
+
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+
 ENV PATH="/root/.cargo/bin:${PATH}"
+
 WORKDIR /build
+
 COPY Cargo.toml Cargo.lock ./
+
 RUN mkdir -p src && echo "fn main() {}" > src/main.rs
 RUN cargo build --release
+
 COPY src ./src
+
 RUN touch src/main.rs && cargo build --release
 
 # Re-pin with: docker buildx imagetools inspect nvidia/cuda:12.4.1-devel-ubuntu22.04 --format '{{json .Manifest.Digest}}'
