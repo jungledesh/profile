@@ -91,6 +91,12 @@ jobs:
       - name: Login to GHCR
         if: steps.docker_meta.outputs.push == 'true'
         run: echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u ${{ github.repository_owner }} --password-stdin
+      
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          sudo docker image prune --all --force
+          df -h /
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3

@@ -101,6 +101,16 @@
       "name": "AMD Instinct MI250X",
       "on_demand_per_hr": 1.50,
       "spot_per_hr": 0.80
+    },
+    "mi250": {
+      "name": "AMD Instinct MI250",
+      "on_demand_per_hr": 1.30,
+      "spot_per_hr": 0.70
+    },
+    "mi210": {
+      "name": "AMD Instinct MI210",
+      "on_demand_per_hr": 1.00,
+      "spot_per_hr": 0.50
     }
   }
 }

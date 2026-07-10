@@ -146,4 +146,48 @@ mod tests {
         // Consumer RDNA3: no cloud pricing entry.
         assert!(lookup_gpu_price("AMD Radeon RX 7900 XTX").is_none());
     }
+
+    #[test]
+    fn mi210_price() {
+        let p = lookup_gpu_price("AMD Instinct MI210").expect("mi210 price");
+        assert!((p.on_demand_per_hr - 1.00).abs() < 1e-9);
+        assert!((p.spot_per_hr - 0.50).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mi250_price() {
+        let p = lookup_gpu_price("AMD Instinct MI250").expect("mi250 price");
+        assert!((p.on_demand_per_hr - 1.30).abs() < 1e-9);
+        assert!((p.spot_per_hr - 0.70).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mi250x_not_matched_by_mi250_price() {
+        // MI250X must still hit the MI250X price entry, not MI250.
+        let p = lookup_gpu_price("AMD Instinct MI250X").expect("mi250x price");
+        assert!((p.on_demand_per_hr - 1.50).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mi350x_no_cloud_price() {
+        // Not broadly available yet.
+        assert!(lookup_gpu_price("AMD Instinct MI350X").is_none());
+    }
+
+    #[test]
+    fn mi355x_no_cloud_price() {
+        assert!(lookup_gpu_price("AMD Instinct MI355X").is_none());
+    }
+
+    #[test]
+    fn rx_9070_xt_no_cloud_price() {
+        // Consumer RDNA4: no cloud pricing entry.
+        assert!(lookup_gpu_price("AMD Radeon RX 9070 XT").is_none());
+    }
+
+    #[test]
+    fn w7900_no_cloud_price() {
+        // Workstation card: no cloud pricing entry.
+        assert!(lookup_gpu_price("AMD Radeon PRO W7900").is_none());
+    }
 }
