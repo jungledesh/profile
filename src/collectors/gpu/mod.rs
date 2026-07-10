@@ -1,4 +1,6 @@
+mod amd;
 mod nvidia;
+mod polling;
 
 use std::time::{Duration, SystemTime};
 
@@ -17,23 +19,38 @@ pub struct GpuScanEntry {
 }
 
 pub fn host_gpu_count() -> Option<u32> {
-    nvidia::host_gpu_count()
+    let nv = nvidia::host_gpu_count();
+    if nv.is_some_and(|c| c > 0) {
+        nv
+    } else {
+        amd::host_gpu_count()
+    }
 }
 
 /// Single-shot scan of all GPUs on host. Used by gpu_assignment before profiling starts.
 /// Returns None if no GPU driver is available.
 pub fn scan_host_gpus() -> Option<Vec<GpuScanEntry>> {
     nvidia::scan_host_gpus()
+        .filter(|v| !v.is_empty())
+        .or_else(amd::scan_host_gpus)
 }
 
 pub fn collect_gpu_metrics_for(
     window: Duration,
     explicit_indices: Option<&[u32]>,
 ) -> Result<(Vec<GpuRawMetrics>, SystemTime, Option<u32>)> {
-    nvidia::collect(window, explicit_indices)
+    let (metrics, ts, host_count) = nvidia::collect(window, explicit_indices)?;
+    if host_count.is_none_or(|c| c == 0) {
+        return amd::collect(window, explicit_indices);
+    }
+    Ok((metrics, ts, host_count))
 }
 
 /// Whether the host has the vendor toolchain needed for FP8 KV cache.
 pub fn fp8_compiler_available() -> bool {
-    nvidia::fp8_compiler_available()
+    if nvidia::host_gpu_count().is_some_and(|c| c > 0) {
+        nvidia::fp8_compiler_available()
+    } else {
+        amd::fp8_compiler_available()
+    }
 }

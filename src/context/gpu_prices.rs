@@ -120,4 +120,30 @@ mod tests {
     fn unknown_gpu_returns_none() {
         assert!(lookup_gpu_price("NVIDIA Tesla V100").is_none());
     }
+
+    #[test]
+    fn mi300x_price() {
+        let p = lookup_gpu_price("AMD Instinct MI300X").expect("mi300x price");
+        assert!((p.on_demand_per_hr - 2.50).abs() < 1e-9);
+        assert!((p.spot_per_hr - 1.85).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mi325x_price() {
+        let p = lookup_gpu_price("AMD Instinct MI325X").expect("mi325x price");
+        assert!((p.on_demand_per_hr - 3.50).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mi250x_price() {
+        let p =
+            lookup_gpu_price("AMD INSTINCT MI250X (MCM) OAM AC MBA MSFT").expect("mi250x price");
+        assert!((p.on_demand_per_hr - 1.50).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rx_7900_xtx_no_cloud_price() {
+        // Consumer RDNA3: no cloud pricing entry.
+        assert!(lookup_gpu_price("AMD Radeon RX 7900 XTX").is_none());
+    }
 }
