@@ -123,18 +123,41 @@ RUN export DEBIAN_FRONTEND=noninteractive \
     ca-certificates \
     openssh-client \
     rsync \
-    libdrm2 \
-    libdrm-amdgpu1 \
     && /usr/sbin/useradd -m -u 1000 -s /bin/bash appuser \
     && echo "appuser ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/appuser \
+    && rm -rf /var/lib/apt/lists/*
+
+# libdrm 2.4.113 (Ubuntu 22.04) is missing drmSyncobjEventfd (added 2.4.116).
+# libdrm_amdgpu_sys v0.8.16 requires all bound symbols at dlopen time.
+# Build libdrm 2.4.123 from source with only the amdgpu backend.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    meson ninja-build pkg-config \
+    && cd /tmp \
+    && wget -q https://dri.freedesktop.org/libdrm/libdrm-2.4.123.tar.xz \
+    && tar xf libdrm-2.4.123.tar.xz && cd libdrm-2.4.123 \
+    && meson setup build \
+       -Dprefix=/usr \
+       -Dlibdir=lib/x86_64-linux-gnu \
+       -Damdgpu=enabled \
+       -Dintel=disabled \
+       -Dnouveau=disabled \
+       -Dvmwgfx=disabled \
+       -Dradeon=disabled \
+    && ninja -C build install \
+    && ldconfig \
+    && cd / && rm -rf /tmp/libdrm* \
+    && apt-get purge -y meson ninja-build pkg-config \
+    && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Intentionally omitted vs NVIDIA stage:
 #   - python3, python3-venv, python3-pip, python3-dev, build-essential
 #     (already in vLLM base image)
-#   - ffmpeg, libnss3, libatk*, libcups2, libdrm2, libxkbcommon0, etc.
+#   - ffmpeg, libnss3, libatk*, libcups2, libxkbcommon0, etc.
 #     (X11/browser deps for VHS/ttyd, not needed for e2e testing)
 #   - ttyd and VHS binaries (demo tooling, not needed for e2e testing)
+# libdrm built from source above (2.4.123) because base image ships 2.4.113
+# which is missing drmSyncobjEventfd required by libdrm_amdgpu_sys v0.8.16.
 
 RUN mkdir -p "${APP_DIR}" "${MODELS_DIR}" /workspace && \
     chown -R appuser:appuser /home/appuser /workspace
