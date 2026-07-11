@@ -81,6 +81,36 @@
       "name": "NVIDIA RTX PRO 6000 Blackwell",
       "on_demand_per_hr": 1.80,
       "spot_per_hr": 0.90
+    },
+    "mi300x": {
+      "name": "AMD Instinct MI300X",
+      "on_demand_per_hr": 2.50,
+      "spot_per_hr": 1.85
+    },
+    "mi325x": {
+      "name": "AMD Instinct MI325X",
+      "on_demand_per_hr": 3.50,
+      "spot_per_hr": 2.50
+    },
+    "mi300a": {
+      "name": "AMD Instinct MI300A",
+      "on_demand_per_hr": 2.00,
+      "spot_per_hr": 1.50
+    },
+    "mi250x": {
+      "name": "AMD Instinct MI250X",
+      "on_demand_per_hr": 1.50,
+      "spot_per_hr": 0.80
+    },
+    "mi250": {
+      "name": "AMD Instinct MI250",
+      "on_demand_per_hr": 1.30,
+      "spot_per_hr": 0.70
+    },
+    "mi210": {
+      "name": "AMD Instinct MI210",
+      "on_demand_per_hr": 1.00,
+      "spot_per_hr": 0.50
     }
   }
 }

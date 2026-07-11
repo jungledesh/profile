@@ -171,6 +171,191 @@ static CATALOG: &[GpuEntry] = &[
             peak_bw_gbps: 600.0,
         },
     },
+    // ── AMD Instinct MI355X (CDNA4, HBM3e) ─────────────────────────────────
+    // Same die as MI350X; higher clock (2400 MHz) and TBP (1400W).
+    GpuEntry {
+        tokens: &["mi355x"],
+        entry: GpuCatalogEntry {
+            arch: "cdna4",
+            peak_flops_tc_tflops: 2500.0,
+            peak_bw_gbps: 8000.0,
+        },
+    },
+    // ── AMD Instinct MI350X (CDNA4, HBM3e) ─────────────────────────────────
+    // Current AMD datacenter flagship. Launched June 2025.
+    GpuEntry {
+        tokens: &["mi350x"],
+        entry: GpuCatalogEntry {
+            arch: "cdna4",
+            peak_flops_tc_tflops: 2300.0,
+            peak_bw_gbps: 8000.0,
+        },
+    },
+    // ── AMD Instinct MI325X (CDNA3, HBM3e) ─────────────────────────────────
+    // Same compute die as MI300X; HBM3e increases bandwidth.
+    GpuEntry {
+        tokens: &["mi325x"],
+        entry: GpuCatalogEntry {
+            arch: "cdna3",
+            peak_flops_tc_tflops: 1307.4,
+            peak_bw_gbps: 6000.0,
+        },
+    },
+    // ── AMD Instinct MI300A (CDNA3 APU) ─────────────────────────────────────
+    // 228 GPU CUs (vs 304 on MI300X). 128 GB HBM3 shared with CPU.
+    GpuEntry {
+        tokens: &["mi300a"],
+        entry: GpuCatalogEntry {
+            arch: "cdna3",
+            peak_flops_tc_tflops: 980.6,
+            peak_bw_gbps: 5300.0,
+        },
+    },
+    // ── AMD Instinct MI300X (CDNA3) ─────────────────────────────────────────
+    GpuEntry {
+        tokens: &["mi300x"],
+        entry: GpuCatalogEntry {
+            arch: "cdna3",
+            peak_flops_tc_tflops: 1307.4,
+            peak_bw_gbps: 5300.0,
+        },
+    },
+    // ── AMD Instinct MI250X (CDNA2) ─────────────────────────────────────────
+    // OAM has 2 GCDs; ROCm sees each as a separate device.
+    // Values are per-GCD (half of full-OAM: 383 / 2 = 191.5, 3276.8 / 2 = 1638.4).
+    GpuEntry {
+        tokens: &["mi250x"],
+        entry: GpuCatalogEntry {
+            arch: "cdna2",
+            peak_flops_tc_tflops: 191.5,
+            peak_bw_gbps: 1638.4,
+        },
+    },
+    // ── AMD Instinct MI250 (CDNA2) ──────────────────────────────────────────
+    // Dual-GCD OAM like MI250X but 208 CUs (104 per GCD) vs 220.
+    // Values are per-GCD (half of full-OAM: 362.1 / 2 = 181.0, 3200 / 2 = 1600).
+    // Must be after MI250X: "mi250" is a substring of "mi250x".
+    GpuEntry {
+        tokens: &["mi250"],
+        entry: GpuCatalogEntry {
+            arch: "cdna2",
+            peak_flops_tc_tflops: 181.0,
+            peak_bw_gbps: 1600.0,
+        },
+    },
+    // ── AMD Instinct MI210 (CDNA2, PCIe) ────────────────────────────────────
+    // Single-GCD PCIe card. 104 CUs, 64GB HBM2e.
+    GpuEntry {
+        tokens: &["mi210"],
+        entry: GpuCatalogEntry {
+            arch: "cdna2",
+            peak_flops_tc_tflops: 181.0,
+            peak_bw_gbps: 1638.4,
+        },
+    },
+    // ── AMD Radeon RX 9070 XT (RDNA4) ───────────────────────────────────────
+    // 64 CUs, 128 AI Accelerators, 16GB GDDR6.
+    // RDNA4 WMMA matrix ops. vLLM native RDNA4 kernel support in progress;
+    // roofline ceiling may be optimistic until kernels land.
+    GpuEntry {
+        tokens: &["rx", "9070", "xt"],
+        entry: GpuCatalogEntry {
+            arch: "rdna4",
+            peak_flops_tc_tflops: 194.6,
+            peak_bw_gbps: 644.0,
+        },
+    },
+    // ── AMD Radeon RX 9070 (RDNA4) ───────────────────────────────────────────
+    // 56 CUs, 112 AI Accelerators, 16GB GDDR6.
+    // Must be after RX 9070 XT: ["rx", "9070"] matches "RX 9070 XT" names.
+    GpuEntry {
+        tokens: &["rx", "9070"],
+        entry: GpuCatalogEntry {
+            arch: "rdna4",
+            peak_flops_tc_tflops: 144.5,
+            peak_bw_gbps: 644.0,
+        },
+    },
+    // ── AMD Radeon PRO W7900 (RDNA3) ─────────────────────────────────────────
+    // 96 CUs, 48GB GDDR6. Primary AMD card for local AI workstations.
+    GpuEntry {
+        tokens: &["w7900"],
+        entry: GpuCatalogEntry {
+            arch: "rdna3",
+            peak_flops_tc_tflops: 123.0,
+            peak_bw_gbps: 864.0,
+        },
+    },
+    // ── AMD Radeon PRO W7800 (RDNA3) ─────────────────────────────────────────
+    // 70 CUs, 32GB GDDR6.
+    GpuEntry {
+        tokens: &["w7800"],
+        entry: GpuCatalogEntry {
+            arch: "rdna3",
+            peak_flops_tc_tflops: 90.5,
+            peak_bw_gbps: 576.0,
+        },
+    },
+    // ── AMD Radeon RX 7900 XTX (RDNA3) ─────────────────────────────────────
+    // RDNA3 WMMA (shader-unit matrix ops, not dedicated tensor cores).
+    // Roofline ceiling may be optimistic for vLLM workloads.
+    // XTX before XT: "xt" is a substring of "xtx", so XTX must match first.
+    GpuEntry {
+        tokens: &["rx", "7900", "xtx"],
+        entry: GpuCatalogEntry {
+            arch: "rdna3",
+            peak_flops_tc_tflops: 123.0,
+            peak_bw_gbps: 960.0,
+        },
+    },
+    // ── AMD Radeon RX 7900 GRE (RDNA3) ───────────────────────────────────────
+    // 80 CUs, 16GB GDDR6. Budget 16GB option for local LLM inference.
+    GpuEntry {
+        tokens: &["rx", "7900", "gre"],
+        entry: GpuCatalogEntry {
+            arch: "rdna3",
+            peak_flops_tc_tflops: 92.0,
+            peak_bw_gbps: 576.0,
+        },
+    },
+    // ── AMD Radeon RX 7900 XT (RDNA3) ───────────────────────────────────────
+    GpuEntry {
+        tokens: &["rx", "7900", "xt"],
+        entry: GpuCatalogEntry {
+            arch: "rdna3",
+            peak_flops_tc_tflops: 103.0,
+            peak_bw_gbps: 800.0,
+        },
+    },
+    // ── AMD Radeon RX 7800 XT (RDNA3) ───────────────────────────────────────
+    GpuEntry {
+        tokens: &["rx", "7800", "xt"],
+        entry: GpuCatalogEntry {
+            arch: "rdna3",
+            peak_flops_tc_tflops: 74.6,
+            peak_bw_gbps: 624.0,
+        },
+    },
+    // ── AMD Radeon RX 7700 XT (RDNA3) ────────────────────────────────────────
+    // 54 CUs, 12GB GDDR6.
+    GpuEntry {
+        tokens: &["rx", "7700", "xt"],
+        entry: GpuCatalogEntry {
+            arch: "rdna3",
+            peak_flops_tc_tflops: 70.3,
+            peak_bw_gbps: 432.0,
+        },
+    },
+    // ── AMD Radeon RX 7600 XT (RDNA3) ────────────────────────────────────────
+    // 32 CUs, 16GB GDDR6. Cheapest 16GB RDNA3 option for local LLM inference.
+    GpuEntry {
+        tokens: &["rx", "7600", "xt"],
+        entry: GpuCatalogEntry {
+            arch: "rdna3",
+            peak_flops_tc_tflops: 45.1,
+            peak_bw_gbps: 288.0,
+        },
+    },
 ];
 
 /// Lowercase the name; replace non-alphanumeric characters (except `.`) with spaces.
@@ -353,5 +538,185 @@ mod tests {
         let e = lookup_gpu("NVIDIA GB200 NVL72").expect("no match");
         assert_eq!(e.arch, "blackwell");
         assert_eq!(e.peak_bw_gbps, 8000.0);
+    }
+
+    #[test]
+    fn mi300x() {
+        let e = lookup_gpu("AMD Instinct MI300X").expect("no match");
+        assert_eq!(e.arch, "cdna3");
+        assert_eq!(e.peak_flops_tc_tflops, 1307.4);
+        assert_eq!(e.peak_bw_gbps, 5300.0);
+    }
+
+    #[test]
+    fn mi300x_with_variant_suffix() {
+        // Some firmware reports "Aqua Vanjaram [Instinct MI300X VF]"
+        let e = lookup_gpu("Aqua Vanjaram [Instinct MI300X VF]").expect("no match");
+        assert_eq!(e.arch, "cdna3");
+    }
+
+    #[test]
+    fn mi325x() {
+        let e = lookup_gpu("AMD Instinct MI325X").expect("no match");
+        assert_eq!(e.arch, "cdna3");
+        assert_eq!(e.peak_bw_gbps, 6000.0);
+    }
+
+    #[test]
+    fn mi300a() {
+        let e = lookup_gpu("AMD Instinct MI300A").expect("no match");
+        assert_eq!(e.arch, "cdna3");
+        assert_eq!(e.peak_flops_tc_tflops, 980.6);
+    }
+
+    #[test]
+    fn mi250x_per_gcd() {
+        // Per-GCD values (half of full OAM).
+        let e = lookup_gpu("AMD INSTINCT MI250X (MCM) OAM AC MBA MSFT").expect("no match");
+        assert_eq!(e.arch, "cdna2");
+        assert_eq!(e.peak_flops_tc_tflops, 191.5);
+        assert_eq!(e.peak_bw_gbps, 1638.4);
+    }
+
+    #[test]
+    fn rx_7900_xtx() {
+        let e = lookup_gpu("AMD Radeon RX 7900 XTX").expect("no match");
+        assert_eq!(e.arch, "rdna3");
+        assert_eq!(e.peak_flops_tc_tflops, 123.0);
+        assert_eq!(e.peak_bw_gbps, 960.0);
+    }
+
+    #[test]
+    fn rx_7900_xt() {
+        let e = lookup_gpu("AMD Radeon RX 7900 XT").expect("no match");
+        assert_eq!(e.arch, "rdna3");
+        assert_eq!(e.peak_flops_tc_tflops, 103.0);
+        assert_eq!(e.peak_bw_gbps, 800.0);
+    }
+
+    #[test]
+    fn rx_7900_xtx_not_matched_by_xt_entry() {
+        // XTX must match the XTX entry, not the XT entry.
+        let e = lookup_gpu("AMD Radeon RX 7900 XTX").expect("no match");
+        assert_eq!(e.peak_bw_gbps, 960.0, "XTX matched XT entry");
+    }
+
+    #[test]
+    fn rx_7800_xt() {
+        let e = lookup_gpu("AMD Radeon RX 7800 XT").expect("no match");
+        assert_eq!(e.arch, "rdna3");
+        assert_eq!(e.peak_flops_tc_tflops, 74.6);
+        assert_eq!(e.peak_bw_gbps, 624.0);
+    }
+
+    #[test]
+    fn mi355x() {
+        let e = lookup_gpu("AMD Instinct MI355X").expect("no match");
+        assert_eq!(e.arch, "cdna4");
+        assert_eq!(e.peak_flops_tc_tflops, 2500.0);
+        assert_eq!(e.peak_bw_gbps, 8000.0);
+    }
+
+    #[test]
+    fn mi350x() {
+        let e = lookup_gpu("AMD Instinct MI350X").expect("no match");
+        assert_eq!(e.arch, "cdna4");
+        assert_eq!(e.peak_flops_tc_tflops, 2300.0);
+        assert_eq!(e.peak_bw_gbps, 8000.0);
+    }
+
+    #[test]
+    fn mi250_per_gcd() {
+        // Per-GCD values (half of full OAM).
+        // Must not match MI250X entry.
+        let e = lookup_gpu("AMD Instinct MI250").expect("no match");
+        assert_eq!(e.arch, "cdna2");
+        assert_eq!(e.peak_flops_tc_tflops, 181.0);
+        assert_eq!(e.peak_bw_gbps, 1600.0);
+    }
+
+    #[test]
+    fn mi250x_not_matched_by_mi250_entry() {
+        // MI250X must still match MI250X entry, not MI250.
+        let e = lookup_gpu("AMD Instinct MI250X").expect("no match");
+        assert_eq!(e.peak_flops_tc_tflops, 191.5);
+    }
+
+    #[test]
+    fn mi210() {
+        let e = lookup_gpu("AMD Instinct MI210").expect("no match");
+        assert_eq!(e.arch, "cdna2");
+        assert_eq!(e.peak_flops_tc_tflops, 181.0);
+        assert_eq!(e.peak_bw_gbps, 1638.4);
+    }
+
+    #[test]
+    fn radeon_pro_w7900() {
+        let e = lookup_gpu("AMD Radeon PRO W7900").expect("no match");
+        assert_eq!(e.arch, "rdna3");
+        assert_eq!(e.peak_flops_tc_tflops, 123.0);
+        assert_eq!(e.peak_bw_gbps, 864.0);
+    }
+
+    #[test]
+    fn radeon_pro_w7900_ds() {
+        // Dual-slot variant reports same GPU name.
+        let e = lookup_gpu("AMD Radeon PRO W7900 DS").expect("no match");
+        assert_eq!(e.peak_flops_tc_tflops, 123.0);
+    }
+
+    #[test]
+    fn radeon_pro_w7800() {
+        let e = lookup_gpu("AMD Radeon PRO W7800").expect("no match");
+        assert_eq!(e.arch, "rdna3");
+        assert_eq!(e.peak_flops_tc_tflops, 90.5);
+        assert_eq!(e.peak_bw_gbps, 576.0);
+    }
+
+    #[test]
+    fn rx_9070_xt() {
+        let e = lookup_gpu("AMD Radeon RX 9070 XT").expect("no match");
+        assert_eq!(e.arch, "rdna4");
+        assert_eq!(e.peak_flops_tc_tflops, 194.6);
+        assert_eq!(e.peak_bw_gbps, 644.0);
+    }
+
+    #[test]
+    fn rx_9070() {
+        let e = lookup_gpu("AMD Radeon RX 9070").expect("no match");
+        assert_eq!(e.arch, "rdna4");
+        assert_eq!(e.peak_flops_tc_tflops, 144.5);
+        assert_eq!(e.peak_bw_gbps, 644.0);
+    }
+
+    #[test]
+    fn rx_9070_xt_not_matched_by_9070_entry() {
+        // 9070 XT must match XT entry, not generic 9070.
+        let e = lookup_gpu("AMD Radeon RX 9070 XT").expect("no match");
+        assert_eq!(e.peak_flops_tc_tflops, 194.6);
+    }
+
+    #[test]
+    fn rx_7900_gre() {
+        let e = lookup_gpu("AMD Radeon RX 7900 GRE").expect("no match");
+        assert_eq!(e.arch, "rdna3");
+        assert_eq!(e.peak_flops_tc_tflops, 92.0);
+        assert_eq!(e.peak_bw_gbps, 576.0);
+    }
+
+    #[test]
+    fn rx_7700_xt() {
+        let e = lookup_gpu("AMD Radeon RX 7700 XT").expect("no match");
+        assert_eq!(e.arch, "rdna3");
+        assert_eq!(e.peak_flops_tc_tflops, 70.3);
+        assert_eq!(e.peak_bw_gbps, 432.0);
+    }
+
+    #[test]
+    fn rx_7600_xt() {
+        let e = lookup_gpu("AMD Radeon RX 7600 XT").expect("no match");
+        assert_eq!(e.arch, "rdna3");
+        assert_eq!(e.peak_flops_tc_tflops, 45.1);
+        assert_eq!(e.peak_bw_gbps, 288.0);
     }
 }
