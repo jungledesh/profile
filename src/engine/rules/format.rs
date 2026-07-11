@@ -425,17 +425,6 @@ pub fn format_diagnose_rules_for_windows(
         return no_evaluable_diagnose_lines(verbose_rules, windows, Some(&hint));
     }
 
-    let all_idle = windows.iter().all(|w| window_is_idle(&w.snapshot));
-    if all_idle {
-        let hint = LoadHintParams {
-            model_name: summary.window.snapshot.vllm.model_name.as_deref(),
-            metrics_url,
-            max_num_seqs: summary.ctx.config.max_num_seqs,
-            duration_secs: 30,
-        };
-        return no_evaluable_diagnose_lines(verbose_rules, windows, Some(&hint));
-    }
-
     if report.n_eval < ENGINE_MIN_PERSISTENT_WINDOWS {
         let mut out = vec![
             "[!] Insufficient Sustained Load".to_string(),

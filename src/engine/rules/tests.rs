@@ -864,6 +864,41 @@ fn format_diagnose_rules_for_windows_all_non_evaluable() {
 }
 
 #[test]
+fn idle_windows_skipped_in_rule_evaluation() {
+    let t = SystemTime::UNIX_EPOCH;
+    // High occupancy: R1 stays quiet on real traffic windows.
+    let mut active = vllm_base();
+    active.num_requests_running = Some(200.0);
+    active.generation_tokens_per_sec = Some(200.0);
+    active.max_num_seqs = Some(256);
+    // Evaluable idle. Tiny running would false-positive R1 if the engine scored it.
+    let mut idle = vllm_base();
+    idle.num_requests_running = Some(0.5);
+    idle.generation_tokens_per_sec = Some(0.0);
+    idle.max_num_seqs = Some(256);
+
+    let mut windows = Vec::with_capacity(15);
+    for _ in 0..10 {
+        windows.push(mk_win(snap(t, t, active.clone(), gpu_busy())));
+    }
+    for _ in 0..5 {
+        windows.push(mk_win(snap(t, t, idle.clone(), gpu_busy())));
+    }
+
+    let ctx = mk_ctx();
+    let summary = ai(&ctx, &windows[0]);
+    let report = build_report_for_windows(&windows, summary);
+    assert_eq!(report.n_eval, 10);
+    assert_eq!(report.skipped, 5);
+    assert!(
+        !report
+            .groups
+            .iter()
+            .any(|g| g.primary.rule_name == rule_names::UNDER_BATCHING)
+    );
+}
+
+#[test]
 fn waste_label_r1_only() {
     assert_eq!(
         waste_label_suffix(&[rule_names::UNDER_BATCHING]),

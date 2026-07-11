@@ -1,4 +1,4 @@
-use crate::collectors::{effective_tensor_parallel, window_is_evaluable};
+use crate::collectors::{effective_tensor_parallel, window_is_evaluable, window_is_idle};
 use crate::context::{AnalysisInput, RuntimeWindow};
 use crate::engine::Report;
 use crate::engine::baseline::{self, WeightDtypeSource};
@@ -139,7 +139,7 @@ fn eval_window_rules(
     };
 
     for w in windows {
-        if !window_is_evaluable(&w.snapshot) {
+        if !window_is_evaluable(&w.snapshot) || window_is_idle(&w.snapshot) {
             skipped += 1;
             continue;
         }
