@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 
-use crate::collectors::{RawSnapshot, effective_tensor_parallel, window_is_evaluable};
+use crate::collectors::{
+    RawSnapshot, effective_tensor_parallel, window_is_evaluable, window_is_idle,
+};
 use crate::context::{AnalysisInput, RuntimeWindow};
 use crate::engine::Report;
 use crate::engine::baseline::{CostSource, PhysicsBaseline, WeightDtypeSource};
@@ -329,7 +331,7 @@ pub fn format_diagnose_rules(
     metrics_url: &str,
 ) -> Vec<String> {
     let snapshot = &input.window.snapshot;
-    if !window_is_evaluable(snapshot) {
+    if !window_is_evaluable(snapshot) || window_is_idle(snapshot) {
         let hint = LoadHintParams {
             model_name: input.window.snapshot.vllm.model_name.as_deref(),
             metrics_url,
@@ -414,6 +416,17 @@ pub fn format_diagnose_rules_for_windows(
     metrics_url: &str,
 ) -> Vec<String> {
     if report.n_eval == 0 {
+        let hint = LoadHintParams {
+            model_name: summary.window.snapshot.vllm.model_name.as_deref(),
+            metrics_url,
+            max_num_seqs: summary.ctx.config.max_num_seqs,
+            duration_secs: 30,
+        };
+        return no_evaluable_diagnose_lines(verbose_rules, windows, Some(&hint));
+    }
+
+    let all_idle = windows.iter().all(|w| window_is_idle(&w.snapshot));
+    if all_idle {
         let hint = LoadHintParams {
             model_name: summary.window.snapshot.vllm.model_name.as_deref(),
             metrics_url,
@@ -758,5 +771,25 @@ mod load_hint_tests {
         };
         assert!(join_hint(&hint).contains("--request-rate 1"));
         assert!(!join_hint(&hint).contains("--request-rate 0"));
+    }
+
+    #[test]
+    fn idle_evaluable_window_is_detected() {
+        let mut w = idle_window();
+        w.snapshot.vllm.window_duration_secs = Some(2.0);
+        w.snapshot.vllm.num_requests_running = Some(0.0);
+        w.snapshot.vllm.generation_tokens_per_sec = Some(0.0);
+        assert!(window_is_evaluable(&w.snapshot));
+        assert!(window_is_idle(&w.snapshot));
+    }
+
+    #[test]
+    fn active_window_is_not_idle() {
+        let mut w = idle_window();
+        w.snapshot.vllm.window_duration_secs = Some(2.0);
+        w.snapshot.vllm.num_requests_running = Some(5.0);
+        w.snapshot.vllm.generation_tokens_per_sec = Some(100.0);
+        assert!(window_is_evaluable(&w.snapshot));
+        assert!(!window_is_idle(&w.snapshot));
     }
 }

@@ -104,7 +104,7 @@ fn build_diagnose_lines(
         lines.push(String::new());
     }
 
-    if !result.any_evaluable {
+    if !result.any_evaluable || result.all_idle {
         lines.push(vllm_label_row("Target:", &result.metrics_input));
         lines.push(String::new());
         let hint = engine::LoadHintParams {
@@ -1435,6 +1435,7 @@ mod tests {
             duration: Duration::from_secs(6),
             started_at: UNIX_EPOCH,
             any_evaluable: true,
+            all_idle: false,
             metrics_input: "http://127.0.0.1:8000/metrics".to_string(),
         };
         let text = diagnose_lines_for(&result, false).join("\n");
@@ -1468,6 +1469,7 @@ mod tests {
             duration: Duration::from_secs(2),
             started_at: UNIX_EPOCH,
             any_evaluable: false,
+            all_idle: false,
             metrics_input: "http://127.0.0.1:8000/metrics".into(),
         };
         let lines = diagnose_lines_for(&result, false);
@@ -1477,6 +1479,41 @@ mod tests {
         assert!(text.contains("benchmark_serving.py"));
         assert!(text.contains("--model \"test-model\""));
         assert!(!text.contains("GPU =>"));
+    }
+
+    #[test]
+    fn diagnose_lines_idle_server_shows_load_hint() {
+        let idle_snap = RawSnapshot {
+            gpu_observed_at: UNIX_EPOCH,
+            vllm_observed_at: UNIX_EPOCH,
+            timestamp: UNIX_EPOCH,
+            vllm: VllmRawMetrics {
+                num_requests_running: Some(0.0),
+                generation_tokens_per_sec: Some(0.0),
+                window_duration_secs: Some(2.0),
+                model_name: Some("test-model".into()),
+                ..Default::default()
+            },
+            gpus: vec![GpuRawMetrics {
+                gpu_name: Some("Test GPU".into()),
+                ..Default::default()
+            }],
+            host_gpu_count: None,
+        };
+        let result = DiagnoseResult {
+            snapshot: idle_snap.clone(),
+            windows: vec![RuntimeWindow::from_snapshot(idle_snap)],
+            static_ctx: StaticContext::default(),
+            duration: Duration::from_secs(30),
+            started_at: UNIX_EPOCH,
+            any_evaluable: true,
+            all_idle: true,
+            metrics_input: "http://127.0.0.1:8000/metrics".into(),
+        };
+        let text = diagnose_lines_for(&result, false).join("\n");
+        assert!(text.contains("Server is idle"));
+        assert!(text.contains("benchmark_serving.py"));
+        assert!(!text.contains("No issues detected"));
     }
 
     #[test]
@@ -1538,6 +1575,7 @@ mod tests {
             duration: Duration::from_secs(2),
             started_at: UNIX_EPOCH,
             any_evaluable: true,
+            all_idle: false,
             metrics_input: "http://127.0.0.1:8000/metrics".into(),
         };
         let text = diagnose_lines_for(&result, false).join("\n");

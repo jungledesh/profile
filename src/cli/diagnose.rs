@@ -37,7 +37,7 @@ pub fn execute(
 
     output::stdout::print_diagnose_table(&result, verbose_rules);
 
-    if !result.any_evaluable {
+    if !result.any_evaluable || result.all_idle {
         return Ok(());
     }
 

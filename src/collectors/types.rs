@@ -405,6 +405,25 @@ pub fn window_is_evaluable(s: &RawSnapshot) -> bool {
     duration_ok && vllm_ok
 }
 
+/// True when the window is evaluable but shows no meaningful traffic.
+/// Used to detect idle servers that have working telemetry.
+pub fn window_is_idle(s: &RawSnapshot) -> bool {
+    if !window_is_evaluable(s) {
+        return false;
+    }
+    let no_running = s
+        .vllm
+        .num_requests_running
+        .filter(|r| r.is_finite())
+        .is_none_or(|r| r < 1.0);
+    let no_throughput = s
+        .vllm
+        .generation_tokens_per_sec
+        .filter(|t| t.is_finite())
+        .is_none_or(|t| t < 1.0);
+    no_running && no_throughput
+}
+
 pub const ACTIVE_KV_CACHE_PCT_THRESHOLD: f64 = 30.0;
 pub const ACTIVE_GPU_UTIL_PCT_THRESHOLD: f64 = 20.0;
 
@@ -480,6 +499,32 @@ mod window_evaluable_tests {
     #[test]
     fn false_when_duration_zero() {
         assert!(!window_is_evaluable(&snap(Some(1.0), Some(0.0))));
+    }
+
+    #[test]
+    fn window_is_idle_zero_traffic() {
+        let s = RawSnapshot {
+            vllm: VllmRawMetrics {
+                num_requests_running: Some(0.0),
+                generation_tokens_per_sec: Some(0.0),
+                window_duration_secs: Some(2.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(window_is_idle(&s));
+    }
+
+    #[test]
+    fn window_is_idle_false_when_not_evaluable() {
+        let s = RawSnapshot {
+            vllm: VllmRawMetrics {
+                num_requests_running: None,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(!window_is_idle(&s));
     }
 }
 
