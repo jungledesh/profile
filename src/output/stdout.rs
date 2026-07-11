@@ -107,9 +107,16 @@ fn build_diagnose_lines(
     if !result.any_evaluable {
         lines.push(vllm_label_row("Target:", &result.metrics_input));
         lines.push(String::new());
+        let hint = engine::LoadHintParams {
+            model_name: result.snapshot.vllm.model_name.as_deref(),
+            metrics_url: &result.metrics_input,
+            max_num_seqs: result.static_ctx.config.max_num_seqs,
+            duration_secs: result.duration.as_secs(),
+        };
         lines.extend(engine::no_evaluable_diagnose_lines(
             verbose_rules,
             &result.windows,
+            Some(&hint),
         ));
         return lines;
     }
@@ -1466,7 +1473,9 @@ mod tests {
         let lines = diagnose_lines_for(&result, false);
         let text = lines.join("\n");
         assert!(text.contains("Target:") && text.contains("127.0.0.1"));
-        assert!(text.contains("No qualifying load"));
+        assert!(text.contains("Server is idle"));
+        assert!(text.contains("benchmark_serving.py"));
+        assert!(text.contains("--model \"test-model\""));
         assert!(!text.contains("GPU =>"));
     }
 

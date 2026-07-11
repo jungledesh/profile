@@ -707,10 +707,17 @@ fn format_diagnose_rules_non_evaluable_snapshot_shows_note() {
     let s = snap(t, t, v, gpu_busy());
     let ctx = mk_ctx();
     let win = mk_win(s);
-    let lines = format_diagnose_rules_test(ai(&ctx, &win), false, "http://127.0.0.1:8000/metrics");
+    let metrics_url = "http://127.0.0.1:8000/metrics";
+    let lines = format_diagnose_rules_test(ai(&ctx, &win), false, metrics_url);
+    let hint = LoadHintParams {
+        model_name: win.snapshot.vllm.model_name.as_deref(),
+        metrics_url,
+        max_num_seqs: ctx.config.max_num_seqs,
+        duration_secs: 30,
+    };
     assert_eq!(
         lines,
-        no_evaluable_diagnose_lines(false, std::slice::from_ref(&win))
+        no_evaluable_diagnose_lines(false, std::slice::from_ref(&win), Some(&hint))
     );
 }
 
@@ -842,13 +849,18 @@ fn format_diagnose_rules_for_windows_all_non_evaluable() {
     let w2 = mk_win(snap(t, t, v, gpu_busy()));
     let windows = vec![w1, w2];
     let summary = ai(&ctx, &windows[0]);
-    let lines = format_diagnose_rules_for_windows_test(
-        &windows,
-        summary,
-        false,
-        "http://127.0.0.1:8000/metrics",
+    let metrics_url = "http://127.0.0.1:8000/metrics";
+    let lines = format_diagnose_rules_for_windows_test(&windows, summary, false, metrics_url);
+    let hint = LoadHintParams {
+        model_name: windows[0].snapshot.vllm.model_name.as_deref(),
+        metrics_url,
+        max_num_seqs: ctx.config.max_num_seqs,
+        duration_secs: 30,
+    };
+    assert_eq!(
+        lines,
+        no_evaluable_diagnose_lines(false, &windows, Some(&hint))
     );
-    assert_eq!(lines, no_evaluable_diagnose_lines(false, &windows));
 }
 
 #[test]
