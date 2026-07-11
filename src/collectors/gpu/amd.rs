@@ -4,6 +4,8 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
 use libamdgpu_top::AMDGPU::DeviceHandle;
+use libamdgpu_top::AMDGPU::MetricsInfo;
+use libamdgpu_top::AMDGPU::SENSOR_INFO::SENSOR_TYPE;
 use libamdgpu_top::DevicePath;
 use libamdgpu_top::VramUsage;
 use libamdgpu_top::stat::{GpuActivity, Sensors};
@@ -121,35 +123,70 @@ fn poll_amd_device(device: &mut AmdDevice) -> GpuPoll {
 
     device.sensors.update_without_device_handle();
     device.sensors.update(&device.device_handle);
-    tick.power_watts = device
-        .sensors
-        .average_power
-        .as_ref()
-        .or(device.sensors.input_power.as_ref())
-        .map(|p| f64::from(p.value) / 1_000_000.0);
 
-    device.vram_usage.update_usage(&device.device_handle);
-    let mem_info = &device.vram_usage.0;
-    tick.vram_used_mb = Some(mem_info.vram.heap_usage / MIB);
-    tick.vram_total_mb = Some(mem_info.vram.total_heap_size / MIB);
+    // Stage 1: hwmon. HwmonPower.value is already watts; HwmonTemp.current is already °C.
+    tick.power_watts = sanitize_watts(
+        device
+            .sensors
+            .average_power
+            .as_ref()
+            .or(device.sensors.input_power.as_ref())
+            .map(|p| f64::from(p.value)),
+    );
 
     let temp = device
         .sensors
         .junction_temp
         .as_ref()
         .or(device.sensors.edge_temp.as_ref());
-    tick.temperature_c = temp.map(|t| t.current as f64 / 1000.0);
+    tick.temperature_c = sanitize_temp(temp.map(|t| t.current as f64));
+
+    // Stage 2: gpu_metrics binary blob (sysfs). Native watts / °C.
+    if (tick.power_watts.is_none() || tick.temperature_c.is_none())
+        && let Ok(metrics) = device.device_handle.get_gpu_metrics()
+    {
+        if tick.power_watts.is_none() {
+            tick.power_watts = sanitize_watts(metrics.get_average_socket_power().map(f64::from));
+        }
+        if tick.temperature_c.is_none() {
+            tick.temperature_c = sanitize_temp(metrics.get_temperature_hotspot().map(f64::from));
+        }
+    }
+
+    // Stage 3: DRM ioctl via render node. Power only; GPU_TEMP is -EOPNOTSUPP on MI300X.
+    if tick.power_watts.is_none() {
+        tick.power_watts = sanitize_watts(
+            device
+                .device_handle
+                .sensor_info(SENSOR_TYPE::GPU_AVG_POWER)
+                .ok()
+                .map(f64::from),
+        );
+    }
+
+    device.vram_usage.update_usage(&device.device_handle);
+    let mem_info = &device.vram_usage.0;
+    tick.vram_used_mb = Some(mem_info.vram.heap_usage / MIB);
+    tick.vram_total_mb = Some(mem_info.vram.total_heap_size / MIB);
 
     tick.sm_clock_mhz = device.sensors.sclk;
 
     tick
 }
 
+/// Thermodynamic floor for active silicon. Sub-1W readings are sensor noise, not load.
+fn sanitize_watts(watts: Option<f64>) -> Option<f64> {
+    watts.filter(|&w| w > 1.0)
+}
+
+/// Thermodynamic floor for active silicon. Sub-5°C readings are sensor noise, not load.
+fn sanitize_temp(temp: Option<f64>) -> Option<f64> {
+    temp.filter(|&t| t > 5.0)
+}
+
 fn power_limit_watts(sensors: &Sensors) -> Option<f64> {
-    sensors
-        .power_cap
-        .as_ref()
-        .map(|pc| f64::from(pc.current) / 1_000_000.0)
+    // PowerCap.current is already watts.
+    sanitize_watts(sensors.power_cap.as_ref().map(|pc| f64::from(pc.current)))
 }
 
 /// Returns `(metrics, observed_at, host_count)` after the last poll for the requested window.
@@ -237,7 +274,7 @@ fn parse_amd_visible_devices() -> Vec<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_device_indices;
+    use super::{parse_device_indices, sanitize_temp, sanitize_watts};
 
     #[test]
     fn empty_string_returns_empty() {
@@ -274,5 +311,25 @@ mod tests {
     fn uuid_style_skipped() {
         // AMD does not support UUID-based device selection.
         assert_eq!(parse_device_indices("GPU-abc123,0"), vec![0]);
+    }
+
+    #[test]
+    fn sanitize_watts_rejects_noise_and_zero() {
+        assert_eq!(sanitize_watts(None), None);
+        assert_eq!(sanitize_watts(Some(0.0)), None);
+        assert_eq!(sanitize_watts(Some(0.000494)), None);
+        assert_eq!(sanitize_watts(Some(1.0)), None);
+        assert_eq!(sanitize_watts(Some(1.01)), Some(1.01));
+        assert_eq!(sanitize_watts(Some(750.0)), Some(750.0));
+    }
+
+    #[test]
+    fn sanitize_temp_rejects_noise_and_zero() {
+        assert_eq!(sanitize_temp(None), None);
+        assert_eq!(sanitize_temp(Some(0.0)), None);
+        assert_eq!(sanitize_temp(Some(0.065)), None);
+        assert_eq!(sanitize_temp(Some(5.0)), None);
+        assert_eq!(sanitize_temp(Some(5.01)), Some(5.01));
+        assert_eq!(sanitize_temp(Some(65.0)), Some(65.0));
     }
 }
