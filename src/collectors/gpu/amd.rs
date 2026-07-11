@@ -4,6 +4,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
 use libamdgpu_top::AMDGPU::DeviceHandle;
+use libamdgpu_top::AMDGPU::SENSOR_INFO::SENSOR_TYPE;
 use libamdgpu_top::DevicePath;
 use libamdgpu_top::VramUsage;
 use libamdgpu_top::stat::{GpuActivity, Sensors};
@@ -121,12 +122,26 @@ fn poll_amd_device(device: &mut AmdDevice) -> GpuPoll {
 
     device.sensors.update_without_device_handle();
     device.sensors.update(&device.device_handle);
+
+    // Primary: hwmon average or input power
     tick.power_watts = device
         .sensors
         .average_power
         .as_ref()
         .or(device.sensors.input_power.as_ref())
-        .map(|p| f64::from(p.value) / 1_000_000.0);
+        .map(|p| f64::from(p.value) / 1_000_000.0)
+        .filter(|&w| w > 0.0);
+
+    // Fallback: ioctl when hwmon returns zero or unavailable.
+    // Same DRM ioctl path that works for SCLK in containers.
+    if tick.power_watts.is_none() {
+        tick.power_watts = device
+            .device_handle
+            .sensor_info(SENSOR_TYPE::GPU_AVG_POWER)
+            .ok()
+            .map(f64::from)
+            .filter(|&w| w > 0.0);
+    }
 
     device.vram_usage.update_usage(&device.device_handle);
     let mem_info = &device.vram_usage.0;
@@ -138,18 +153,36 @@ fn poll_amd_device(device: &mut AmdDevice) -> GpuPoll {
         .junction_temp
         .as_ref()
         .or(device.sensors.edge_temp.as_ref());
-    tick.temperature_c = temp.map(|t| t.current as f64 / 1000.0);
+    tick.temperature_c = temp.map(|t| t.current as f64 / 1000.0).filter(|&t| t > 0.0);
+
+    // Fallback: ioctl when hwmon returns zero or unavailable.
+    // Kernel returns millidegrees C.
+    if tick.temperature_c.is_none() {
+        tick.temperature_c = device
+            .device_handle
+            .sensor_info(SENSOR_TYPE::GPU_TEMP)
+            .ok()
+            .map(|t| f64::from(t) / 1000.0)
+            .filter(|&t| t > 0.0);
+    }
 
     tick.sm_clock_mhz = device.sensors.sclk;
 
     tick
 }
 
+/// Zero watts from AMD hwmon in containers means sensor unavailable, not measured zero.
+fn sanitize_watts(watts: Option<f64>) -> Option<f64> {
+    watts.filter(|&w| w > 0.0)
+}
+
 fn power_limit_watts(sensors: &Sensors) -> Option<f64> {
-    sensors
-        .power_cap
-        .as_ref()
-        .map(|pc| f64::from(pc.current) / 1_000_000.0)
+    sanitize_watts(
+        sensors
+            .power_cap
+            .as_ref()
+            .map(|pc| f64::from(pc.current) / 1_000_000.0),
+    )
 }
 
 /// Returns `(metrics, observed_at, host_count)` after the last poll for the requested window.
@@ -237,7 +270,7 @@ fn parse_amd_visible_devices() -> Vec<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_device_indices;
+    use super::{parse_device_indices, sanitize_watts};
 
     #[test]
     fn empty_string_returns_empty() {
@@ -274,5 +307,13 @@ mod tests {
     fn uuid_style_skipped() {
         // AMD does not support UUID-based device selection.
         assert_eq!(parse_device_indices("GPU-abc123,0"), vec![0]);
+    }
+
+    #[test]
+    fn sanitize_watts_zero_power_limit_to_none() {
+        // power_limit_watts uses sanitize_watts; Sensors cannot be mocked without hardware.
+        assert_eq!(sanitize_watts(Some(0.0)), None);
+        assert_eq!(sanitize_watts(Some(750.0)), Some(750.0));
+        assert_eq!(sanitize_watts(None), None);
     }
 }
