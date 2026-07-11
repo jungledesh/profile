@@ -16,12 +16,15 @@ const MIB: u64 = 1024 * 1024;
 
 fn amdgpu_device_paths() -> Option<Vec<DevicePath>> {
     let paths = panic::catch_unwind(AssertUnwindSafe(DevicePath::get_device_path_list)).ok()?;
-    let paths: Vec<_> = paths.into_iter().filter(|p| p.is_amdgpu()).collect();
+    let paths: Vec<_> = paths
+        .into_iter()
+        .filter(|p| p.is_amdgpu() && p.render.exists())
+        .collect();
     if paths.is_empty() { None } else { Some(paths) }
 }
 
-/// Raw host GPU count from libamdgpu_top. No env filtering, no polling.
-/// Returns None if AMD driver unavailable.
+/// Container-visible AMD GPU count. Filtered to render nodes present in /dev/dri/.
+/// No env filtering, no polling. Returns None if AMD driver unavailable.
 pub(super) fn host_gpu_count() -> Option<u32> {
     let paths = amdgpu_device_paths()?;
     Some(paths.len() as u32)
@@ -32,7 +35,8 @@ pub(super) fn scan_host_gpus() -> Option<Vec<super::GpuScanEntry>> {
     let paths = amdgpu_device_paths()?;
     let mut out = Vec::with_capacity(paths.len());
     for (i, device_path) in paths.iter().enumerate() {
-        let Ok(device_handle) = device_path.init() else {
+        let init_result = panic::catch_unwind(AssertUnwindSafe(|| device_path.init()));
+        let Ok(Ok(device_handle)) = init_result else {
             continue;
         };
         let mem_info = device_handle.memory_info().ok();
@@ -82,8 +86,10 @@ fn init_amd_devices(device_paths: &[DevicePath], indices: &[u32]) -> Result<Vec<
         let Some(device_path) = device_paths.get(idx as usize) else {
             anyhow::bail!("AMD GPU {idx} lost during telemetry polling: index out of range");
         };
-        let device_handle = device_path
-            .init()
+        let device_handle = panic::catch_unwind(AssertUnwindSafe(|| device_path.init()))
+            .map_err(|_| {
+                anyhow::anyhow!("AMD GPU {idx}: init panicked (device likely inaccessible)")
+            })?
             .map_err(|e| anyhow::anyhow!("AMD GPU {idx} lost during telemetry polling: {e}"))?;
         let ext_info = device_handle
             .device_info()
