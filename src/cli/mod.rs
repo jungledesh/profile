@@ -13,6 +13,7 @@ const DEFAULT_DURATION: &str = "30s";
 
 const ABOUT: &str = "Detects inefficiencies. Suggests fixes.";
 const MAX_DURATION: Duration = Duration::from_secs(3 * 60);
+const MIN_DURATION: Duration = Duration::from_secs(30);
 
 /// Shown for `profile diagnose --help` only (root help omits options via template).
 const DIAGNOSE_ABOUT: &str = "Collects metrics. Detects inefficiencies. Suggests fixes.\nPass -v to show per-rule status when no issue is detected.";
@@ -101,13 +102,13 @@ pub enum Commands {
             long = "duration",
             default_value = DEFAULT_DURATION,
             value_parser = parse_duration_arg,
-            help = "Observation window (default: 30s). s=seconds, m=minutes (not ms/mins). Examples: 30s, 1m, 2m, 3m",
+            help = "Observation window (default: 30s, minimum: 30s). s=seconds, m=minutes (not ms/mins). Examples: 30s, 1m, 2m, 3m",
             long_help = "How long to collect metrics before analyzing each iteration (default: 30s).\n\n\
                 Units:\n  \
                   s  seconds\n  \
                   m  minutes (not ms, not \"mins\", not bare m)\n\n\
                 Examples:\n  \
-                  30s   half-minute snapshot\n  \
+                  30s   minimum (default)\n  \
                   1m    one-minute run\n  \
                   2m    short run\n  \
                   3m    maximum"
@@ -166,6 +167,9 @@ fn parse_duration_arg(input: &str) -> Result<Duration, String> {
             ));
         }
     };
+    if duration < MIN_DURATION {
+        return Err("minimum duration is 30s".to_string());
+    }
     if duration > MAX_DURATION {
         return Err("maximum duration is 3m".to_string());
     }
@@ -197,6 +201,19 @@ mod tests {
     fn parse_duration_rejects_ms_and_bare_number() {
         assert!(parse_duration_arg("5ms").is_err());
         assert!(parse_duration_arg("5").is_err());
+    }
+
+    #[test]
+    fn parse_duration_rejects_below_30s() {
+        assert_eq!(
+            parse_duration_arg("29s").unwrap_err(),
+            "minimum duration is 30s"
+        );
+        assert_eq!(
+            parse_duration_arg("1s").unwrap_err(),
+            "minimum duration is 30s"
+        );
+        assert!(parse_duration_arg("30s").is_ok());
     }
 
     #[test]

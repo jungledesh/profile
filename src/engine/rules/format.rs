@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
-use crate::collectors::{
-    RawSnapshot, effective_tensor_parallel, window_is_evaluable, window_is_idle,
-};
+#[cfg(test)]
+use crate::collectors::window_is_idle;
+use crate::collectors::{RawSnapshot, effective_tensor_parallel, window_is_evaluable};
 use crate::context::{AnalysisInput, RuntimeWindow};
 use crate::engine::Report;
 use crate::engine::baseline::{CostSource, PhysicsBaseline, WeightDtypeSource};
@@ -239,42 +239,70 @@ fn load_hint_lines(hint: &LoadHintParams<'_>) -> Vec<String> {
     ]
 }
 
-/// User-facing lines when no window met `window_is_evaluable` (shared by stdout and rule formatters).
-pub fn no_evaluable_diagnose_lines(
+fn telemetry_failure_lines(metrics_url: &str) -> Vec<String> {
+    vec![
+        "[!] Telemetry Failure".to_string(),
+        String::new(),
+        "    Profile could not read metrics from the target server.".to_string(),
+        String::new(),
+        "    Fix:".to_string(),
+        "      Verify the endpoint is reachable:".to_string(),
+        String::new(),
+        format!("        curl -s {metrics_url}"),
+    ]
+}
+
+fn append_verbose_window_note(
+    out: &mut Vec<String>,
     verbose: bool,
     windows: &[RuntimeWindow],
-    hint: Option<&LoadHintParams<'_>>,
-) -> Vec<String> {
-    let mut out = if let Some(h) = hint {
-        load_hint_lines(h)
-    } else {
-        vec![
-            "No qualifying load was detected during this run. Profile only diagnoses behavior under active traffic.".to_string(),
-            "Run diagnose again while the server is handling requests (raise concurrency or wait for steady load).".to_string(),
-        ]
-    };
-    if verbose {
-        let total = windows.len();
-        if total == 0 {
-            out.push("Note: No collection windows were recorded.".to_string());
-        } else {
-            let skipped = windows
-                .iter()
-                .filter(|w| !window_is_evaluable(&w.snapshot))
-                .count();
-            if skipped > 0 {
-                if hint.is_some() {
-                    out.push(format!(
-                        "Note: {skipped} of {total} collected windows were not evaluable."
-                    ));
-                } else {
-                    out.push(format!(
-                        "Note: {skipped} of {total} collected windows dropped. Telemetry failure. Diagnosis may be incomplete."
-                    ));
-                }
-            }
-        }
+    idle: bool,
+) {
+    if !verbose {
+        return;
     }
+    let total = windows.len();
+    if total == 0 {
+        out.push("Note: No collection windows were recorded.".to_string());
+        return;
+    }
+    let skipped = windows
+        .iter()
+        .filter(|w| !window_is_evaluable(&w.snapshot))
+        .count();
+    if skipped == 0 {
+        return;
+    }
+    if idle {
+        out.push(format!(
+            "Note: {skipped} of {total} collected windows were not evaluable."
+        ));
+    } else {
+        out.push(format!(
+            "Note: {skipped} of {total} collected windows dropped. Telemetry failure. Diagnosis may be incomplete."
+        ));
+    }
+}
+
+/// Idle server with working telemetry: show load-generation hint.
+pub fn idle_diagnose_lines(
+    verbose: bool,
+    windows: &[RuntimeWindow],
+    hint: &LoadHintParams<'_>,
+) -> Vec<String> {
+    let mut out = load_hint_lines(hint);
+    append_verbose_window_note(&mut out, verbose, windows, true);
+    out
+}
+
+/// Unreachable or broken telemetry: show connectivity diagnostic.
+pub fn unreachable_diagnose_lines(
+    verbose: bool,
+    windows: &[RuntimeWindow],
+    metrics_url: &str,
+) -> Vec<String> {
+    let mut out = telemetry_failure_lines(metrics_url);
+    append_verbose_window_note(&mut out, verbose, windows, false);
     out
 }
 
@@ -324,6 +352,8 @@ fn not_triggered_from_fired_names(
     rules
 }
 
+/// Single-window path: test-only. Production always uses `format_diagnose_rules_for_windows`.
+#[cfg(test)]
 pub fn format_diagnose_rules(
     input: AnalysisInput<'_>,
     report: &Report,
@@ -331,18 +361,21 @@ pub fn format_diagnose_rules(
     metrics_url: &str,
 ) -> Vec<String> {
     let snapshot = &input.window.snapshot;
-    if !window_is_evaluable(snapshot) || window_is_idle(snapshot) {
+    if !window_is_evaluable(snapshot) {
+        return unreachable_diagnose_lines(
+            verbose_rules,
+            std::slice::from_ref(input.window),
+            metrics_url,
+        );
+    }
+    if window_is_idle(snapshot) {
         let hint = LoadHintParams {
             model_name: input.window.snapshot.vllm.model_name.as_deref(),
             metrics_url,
             max_num_seqs: input.ctx.config.max_num_seqs,
             duration_secs: 30,
         };
-        return no_evaluable_diagnose_lines(
-            verbose_rules,
-            std::slice::from_ref(input.window),
-            Some(&hint),
-        );
+        return idle_diagnose_lines(verbose_rules, std::slice::from_ref(input.window), &hint);
     }
 
     let any_issue = !report.groups.is_empty();
@@ -416,13 +449,17 @@ pub fn format_diagnose_rules_for_windows(
     metrics_url: &str,
 ) -> Vec<String> {
     if report.n_eval == 0 {
-        let hint = LoadHintParams {
-            model_name: summary.window.snapshot.vllm.model_name.as_deref(),
-            metrics_url,
-            max_num_seqs: summary.ctx.config.max_num_seqs,
-            duration_secs: 30,
-        };
-        return no_evaluable_diagnose_lines(verbose_rules, windows, Some(&hint));
+        let any_evaluable = windows.iter().any(|w| window_is_evaluable(&w.snapshot));
+        if any_evaluable {
+            let hint = LoadHintParams {
+                model_name: summary.window.snapshot.vllm.model_name.as_deref(),
+                metrics_url,
+                max_num_seqs: summary.ctx.config.max_num_seqs,
+                duration_secs: 30,
+            };
+            return idle_diagnose_lines(verbose_rules, windows, &hint);
+        }
+        return unreachable_diagnose_lines(verbose_rules, windows, metrics_url);
     }
 
     if report.n_eval < ENGINE_MIN_PERSISTENT_WINDOWS {
@@ -605,7 +642,7 @@ mod load_hint_tests {
     }
 
     fn join_hint(hint: &LoadHintParams<'_>) -> String {
-        no_evaluable_diagnose_lines(false, &[], Some(hint)).join("\n")
+        idle_diagnose_lines(false, &[], hint).join("\n")
     }
 
     #[test]
@@ -716,7 +753,7 @@ mod load_hint_tests {
             max_num_seqs: Some(256),
             duration_secs: 30,
         };
-        let text = no_evaluable_diagnose_lines(true, &windows, Some(&hint)).join("\n");
+        let text = idle_diagnose_lines(true, &windows, &hint).join("\n");
         assert!(text.contains("Server is idle"));
         assert!(text.contains("benchmark_serving.py"));
         assert!(text.contains("Note: 2 of 2 collected windows were not evaluable."));
@@ -724,19 +761,39 @@ mod load_hint_tests {
     }
 
     #[test]
-    fn verbose_without_hint_still_says_telemetry_failure() {
-        let windows = vec![idle_window(), idle_window()];
-        let text = no_evaluable_diagnose_lines(true, &windows, None).join("\n");
-        assert!(text.contains(
-            "Note: 2 of 2 collected windows dropped. Telemetry failure. Diagnosis may be incomplete."
-        ));
+    fn test_unreachable_shows_curl_command() {
+        let url = "http://broken:8000/metrics";
+        let text = unreachable_diagnose_lines(false, &[], url).join("\n");
+        assert!(text.contains("[!] Telemetry Failure"));
+        assert!(text.contains("Fix:"));
+        assert!(text.contains(&format!("curl -s {url}")));
+        assert!(!text.contains("Server is idle"));
+        assert!(!text.contains("benchmark_serving.py"));
     }
 
     #[test]
-    fn load_hint_none_falls_back_to_generic() {
-        let text = no_evaluable_diagnose_lines(false, &[], None).join("\n");
-        assert!(text.contains("No qualifying load was detected"));
-        assert!(!text.contains("Server is idle"));
+    fn test_idle_shows_benchmark_hint() {
+        let hint = LoadHintParams {
+            model_name: Some("m"),
+            metrics_url: "http://localhost:8000/metrics",
+            max_num_seqs: Some(256),
+            duration_secs: 30,
+        };
+        let text = idle_diagnose_lines(false, &[], &hint).join("\n");
+        assert!(text.contains("Server is idle"));
+        assert!(text.contains("benchmark_serving.py"));
+        assert!(!text.contains("[!] Telemetry Failure"));
+    }
+
+    #[test]
+    fn test_unreachable_verbose_shows_dropped_count() {
+        let windows = vec![idle_window(), idle_window()];
+        let text =
+            unreachable_diagnose_lines(true, &windows, "http://localhost:8000/metrics").join("\n");
+        assert!(text.contains("[!] Telemetry Failure"));
+        assert!(text.contains(
+            "Note: 2 of 2 collected windows dropped. Telemetry failure. Diagnosis may be incomplete."
+        ));
     }
 
     #[test]

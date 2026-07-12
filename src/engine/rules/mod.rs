@@ -13,11 +13,15 @@ mod r7_config_headroom;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use eval::aggregate_prefix_hit_rate_for_windows;
 pub use eval::build_report_for_windows;
-pub(crate) use eval::{aggregate_prefix_hit_rate_for_windows, finalize_report_groups};
+#[cfg(test)]
+pub(crate) use eval::finalize_report_groups;
+#[cfg(test)]
+pub use format::format_diagnose_rules;
 pub use format::{
-    LoadHintParams, format_diagnose_rules, format_diagnose_rules_for_windows,
-    no_evaluable_diagnose_lines,
+    LoadHintParams, format_diagnose_rules_for_windows, idle_diagnose_lines,
+    unreachable_diagnose_lines,
 };
 pub use r1_under_batching::{
     R1EvalInput, R1MissReport, Rule1Outcome, UnderBatchingDetail, r1_recommendation,

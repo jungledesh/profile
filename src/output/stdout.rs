@@ -104,7 +104,17 @@ fn build_diagnose_lines(
         lines.push(String::new());
     }
 
-    if !result.any_evaluable || result.all_idle {
+    if !result.any_evaluable {
+        lines.push(vllm_label_row("Target:", &result.metrics_input));
+        lines.push(String::new());
+        lines.extend(engine::unreachable_diagnose_lines(
+            verbose_rules,
+            &result.windows,
+            &result.metrics_input,
+        ));
+        return lines;
+    }
+    if result.all_idle {
         lines.push(vllm_label_row("Target:", &result.metrics_input));
         lines.push(String::new());
         let hint = engine::LoadHintParams {
@@ -113,10 +123,10 @@ fn build_diagnose_lines(
             max_num_seqs: result.static_ctx.config.max_num_seqs,
             duration_secs: result.duration.as_secs(),
         };
-        lines.extend(engine::no_evaluable_diagnose_lines(
+        lines.extend(engine::idle_diagnose_lines(
             verbose_rules,
             &result.windows,
-            Some(&hint),
+            &hint,
         ));
         return lines;
     }
@@ -185,17 +195,13 @@ fn build_diagnose_lines(
     }
 
     let summary_input = AnalysisInput::new(&result.static_ctx, aggregate_win);
-    let rule_lines = if result.windows.len() <= 1 {
-        engine::format_diagnose_rules(summary_input, report, verbose_rules, &result.metrics_input)
-    } else {
-        engine::format_diagnose_rules_for_windows(
-            &result.windows,
-            summary_input,
-            report,
-            verbose_rules,
-            &result.metrics_input,
-        )
-    };
+    let rule_lines = engine::format_diagnose_rules_for_windows(
+        &result.windows,
+        summary_input,
+        report,
+        verbose_rules,
+        &result.metrics_input,
+    );
     if !rule_lines.is_empty() {
         lines.push(String::new());
         lines.push("ISSUES:".to_string());
@@ -1475,9 +1481,10 @@ mod tests {
         let lines = diagnose_lines_for(&result, false);
         let text = lines.join("\n");
         assert!(text.contains("Target:") && text.contains("127.0.0.1"));
-        assert!(text.contains("Server is idle"));
-        assert!(text.contains("benchmark_serving.py"));
-        assert!(text.contains("--model \"test-model\""));
+        assert!(text.contains("[!] Telemetry Failure"));
+        assert!(text.contains("curl -s http://127.0.0.1:8000/metrics"));
+        assert!(!text.contains("Server is idle"));
+        assert!(!text.contains("benchmark_serving.py"));
         assert!(!text.contains("GPU =>"));
     }
 

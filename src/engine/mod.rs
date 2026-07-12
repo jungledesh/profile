@@ -2,6 +2,7 @@ pub mod baseline;
 pub mod limiter;
 mod rules;
 
+#[cfg(test)]
 use crate::collectors::{effective_tensor_parallel, window_is_evaluable};
 use crate::context::{AnalysisInput, RuntimeWindow};
 
@@ -23,18 +24,9 @@ pub struct Report {
     pub skipped: usize,
 }
 
-/// Single-window aggregate report, or multi-window significance report when `windows.len() > 1`.
-///
-/// On the first diagnose iteration there is typically only one collected window, so the
-/// single-window path fires. Subsequent iterations (after `run_diagnose` re-collects) accumulate
-/// enough windows for the multi-window significance gates to apply. This is intentional: the
-/// loop's exit decision and the UI rule text always use the same report.
+/// Multi-window diagnose report. Production always collects >= 15 windows (min duration 30s).
 pub fn build_report_for_diagnose(windows: &[RuntimeWindow], input: AnalysisInput<'_>) -> Report {
-    let mut report = if windows.len() <= 1 {
-        build_report(input)
-    } else {
-        rules::build_report_for_windows(windows, input)
-    };
+    let mut report = rules::build_report_for_windows(windows, input);
     maybe_add_massive_underutilization(
         &mut report.groups,
         report.baseline.as_ref(),
@@ -44,6 +36,8 @@ pub fn build_report_for_diagnose(windows: &[RuntimeWindow], input: AnalysisInput
     report
 }
 
+/// Single-window path: test-only. Production always uses `build_report_for_windows`.
+#[cfg(test)]
 pub(crate) fn build_report(input: AnalysisInput<'_>) -> Report {
     let baseline = baseline::compute(&input);
     let snapshot = &input.window.snapshot;
