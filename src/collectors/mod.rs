@@ -15,7 +15,7 @@ pub use types::{
     AggregateGpuMetrics, CacheConfigLabels, GpuFingerprint, GpuRawMetrics, HistogramCount,
     HistogramWindowMass, PrefixCacheScrapeSample, RawSnapshot, VllmRawMetrics,
     effective_tensor_parallel, snapshot_uses_display_names, snapshot_uses_index_only,
-    window_is_active, window_is_evaluable,
+    window_is_active, window_is_evaluable, window_is_idle,
 };
 pub(crate) use vllm::merge_p99_bucket_vecs;
 

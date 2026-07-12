@@ -2,7 +2,7 @@
 //!
 //! Multi-window aggregation rules: `docs/collection-policy.md`.
 
-use crate::collectors::{self, build_config, window_is_evaluable};
+use crate::collectors::{self, build_config, window_is_evaluable, window_is_idle};
 use crate::context::{RuntimeWindow, StaticContext};
 use std::time::{Duration, SystemTime};
 
@@ -22,6 +22,8 @@ pub struct DiagnoseResult {
     pub started_at: SystemTime,
     /// False when every collected window failed `window_is_evaluable` - not an under-load diagnosis.
     pub any_evaluable: bool,
+    /// True when every collected window is evaluable and idle (working telemetry, zero traffic).
+    pub all_idle: bool,
     /// Metrics URL passed to `diagnose` (for display when `any_evaluable` is false).
     pub metrics_input: String,
 }
@@ -45,6 +47,7 @@ pub fn run_diagnose(
         &gpu_indices,
     )?;
     let any_evaluable = raw_windows.iter().any(window_is_evaluable);
+    let all_idle = any_evaluable && raw_windows.iter().all(window_is_idle);
     let snapshot = if raw_windows.is_empty() {
         empty_snapshot(started_at)
     } else if any_evaluable {
@@ -70,6 +73,7 @@ pub fn run_diagnose(
         duration,
         started_at,
         any_evaluable,
+        all_idle,
         metrics_input,
     })
 }

@@ -181,6 +181,7 @@ mod tests {
             duration: Duration::from_secs(2),
             started_at: SystemTime::UNIX_EPOCH,
             any_evaluable: true,
+            all_idle: false,
             metrics_input: String::new(),
         }
     }

@@ -1,5 +1,7 @@
 use std::collections::HashSet;
 
+#[cfg(test)]
+use crate::collectors::window_is_idle;
 use crate::collectors::{RawSnapshot, effective_tensor_parallel, window_is_evaluable};
 use crate::context::{AnalysisInput, RuntimeWindow};
 use crate::engine::Report;
@@ -202,28 +204,105 @@ pub(super) fn append_waste_line(
     lines.push(format!("    ~${waste_per_hr:.2}/hr {suffix}"));
 }
 
-/// User-facing lines when no window met `window_is_evaluable` (shared by stdout and rule formatters).
-pub fn no_evaluable_diagnose_lines(verbose: bool, windows: &[RuntimeWindow]) -> Vec<String> {
-    let mut out = vec![
-        "No qualifying load was detected during this run. Profile only diagnoses behavior under active traffic.".to_string(),
-        "Run diagnose again while the server is handling requests (raise concurrency or wait for steady load).".to_string(),
-    ];
-    if verbose {
-        let total = windows.len();
-        if total == 0 {
-            out.push("Note: No collection windows were recorded.".to_string());
-        } else {
-            let skipped = windows
-                .iter()
-                .filter(|w| !window_is_evaluable(&w.snapshot))
-                .count();
-            if skipped > 0 {
-                out.push(format!(
-                    "Note: {skipped} of {total} collected windows dropped. Telemetry failure. Diagnosis may be incomplete."
-                ));
-            }
-        }
+/// Parameters for the idle-state load generation hint.
+pub struct LoadHintParams<'a> {
+    pub model_name: Option<&'a str>,
+    pub metrics_url: &'a str,
+    pub max_num_seqs: Option<u32>,
+    pub duration_secs: u64,
+}
+
+fn base_url_from_metrics(metrics_url: &str) -> &str {
+    metrics_url.strip_suffix("/metrics").unwrap_or(metrics_url)
+}
+
+fn load_hint_lines(hint: &LoadHintParams<'_>) -> Vec<String> {
+    let model = hint.model_name.unwrap_or("your-model-name");
+    let base_url = base_url_from_metrics(hint.metrics_url);
+    let rate = hint.max_num_seqs.map(|m| m / 2).unwrap_or(10).max(1);
+    let num_prompts = rate as u64 * hint.duration_secs * 2;
+
+    vec![
+        "Server is idle. Profile diagnoses under load, not at rest.".to_string(),
+        String::new(),
+        "Generate traffic in a separate terminal with vLLM's built-in benchmark:".to_string(),
+        String::new(),
+        "    python3 benchmarks/benchmark_serving.py \\".to_string(),
+        "        --backend vllm \\".to_string(),
+        format!("        --model \"{model}\" \\"),
+        format!("        --base-url \"{base_url}\" \\"),
+        "        --dataset-name sharegpt \\".to_string(),
+        format!("        --num-prompts {num_prompts} \\"),
+        format!("        --request-rate {rate}"),
+        String::new(),
+        "Then re-run: profile diagnose".to_string(),
+    ]
+}
+
+fn telemetry_failure_lines(metrics_url: &str) -> Vec<String> {
+    vec![
+        "[!] Telemetry Failure".to_string(),
+        String::new(),
+        "    Profile could not read metrics from the target server.".to_string(),
+        String::new(),
+        "    Fix:".to_string(),
+        "      Verify the endpoint is reachable:".to_string(),
+        String::new(),
+        format!("        curl -s {metrics_url}"),
+    ]
+}
+
+fn append_verbose_window_note(
+    out: &mut Vec<String>,
+    verbose: bool,
+    windows: &[RuntimeWindow],
+    idle: bool,
+) {
+    if !verbose {
+        return;
     }
+    let total = windows.len();
+    if total == 0 {
+        out.push("Note: No collection windows were recorded.".to_string());
+        return;
+    }
+    let skipped = windows
+        .iter()
+        .filter(|w| !window_is_evaluable(&w.snapshot))
+        .count();
+    if skipped == 0 {
+        return;
+    }
+    if idle {
+        out.push(format!(
+            "Note: {skipped} of {total} collected windows were not evaluable."
+        ));
+    } else {
+        out.push(format!(
+            "Note: {skipped} of {total} collected windows dropped. Telemetry failure. Diagnosis may be incomplete."
+        ));
+    }
+}
+
+/// Idle server with working telemetry: show load-generation hint.
+pub fn idle_diagnose_lines(
+    verbose: bool,
+    windows: &[RuntimeWindow],
+    hint: &LoadHintParams<'_>,
+) -> Vec<String> {
+    let mut out = load_hint_lines(hint);
+    append_verbose_window_note(&mut out, verbose, windows, true);
+    out
+}
+
+/// Unreachable or broken telemetry: show connectivity diagnostic.
+pub fn unreachable_diagnose_lines(
+    verbose: bool,
+    windows: &[RuntimeWindow],
+    metrics_url: &str,
+) -> Vec<String> {
+    let mut out = telemetry_failure_lines(metrics_url);
+    append_verbose_window_note(&mut out, verbose, windows, false);
     out
 }
 
@@ -273,6 +352,8 @@ fn not_triggered_from_fired_names(
     rules
 }
 
+/// Single-window path: test-only. Production always uses `format_diagnose_rules_for_windows`.
+#[cfg(test)]
 pub fn format_diagnose_rules(
     input: AnalysisInput<'_>,
     report: &Report,
@@ -281,7 +362,20 @@ pub fn format_diagnose_rules(
 ) -> Vec<String> {
     let snapshot = &input.window.snapshot;
     if !window_is_evaluable(snapshot) {
-        return no_evaluable_diagnose_lines(verbose_rules, std::slice::from_ref(input.window));
+        return unreachable_diagnose_lines(
+            verbose_rules,
+            std::slice::from_ref(input.window),
+            metrics_url,
+        );
+    }
+    if window_is_idle(snapshot) {
+        let hint = LoadHintParams {
+            model_name: input.window.snapshot.vllm.model_name.as_deref(),
+            metrics_url,
+            max_num_seqs: input.ctx.config.max_num_seqs,
+            duration_secs: 30,
+        };
+        return idle_diagnose_lines(verbose_rules, std::slice::from_ref(input.window), &hint);
     }
 
     let any_issue = !report.groups.is_empty();
@@ -355,7 +449,17 @@ pub fn format_diagnose_rules_for_windows(
     metrics_url: &str,
 ) -> Vec<String> {
     if report.n_eval == 0 {
-        return no_evaluable_diagnose_lines(verbose_rules, windows);
+        let any_evaluable = windows.iter().any(|w| window_is_evaluable(&w.snapshot));
+        if any_evaluable {
+            let hint = LoadHintParams {
+                model_name: summary.window.snapshot.vllm.model_name.as_deref(),
+                metrics_url,
+                max_num_seqs: summary.ctx.config.max_num_seqs,
+                duration_secs: 30,
+            };
+            return idle_diagnose_lines(verbose_rules, windows, &hint);
+        }
+        return unreachable_diagnose_lines(verbose_rules, windows, metrics_url);
     }
 
     if report.n_eval < ENGINE_MIN_PERSISTENT_WINDOWS {
@@ -512,5 +616,226 @@ fn append_display_block(out: &mut Vec<String>, block: Vec<String>) {
 fn trim_trailing_blank_lines(lines: &mut Vec<String>) {
     while lines.last().is_some_and(|l| l.is_empty()) {
         lines.pop();
+    }
+}
+
+#[cfg(test)]
+mod load_hint_tests {
+    use super::*;
+    use crate::collectors::{GpuRawMetrics, VllmRawMetrics};
+    use std::time::SystemTime;
+
+    fn idle_window() -> RuntimeWindow {
+        let t = SystemTime::UNIX_EPOCH;
+        RuntimeWindow::from_snapshot(RawSnapshot {
+            gpu_observed_at: t,
+            vllm_observed_at: t,
+            timestamp: t,
+            vllm: VllmRawMetrics {
+                num_requests_running: Some(0.0),
+                generation_tokens_per_sec: Some(0.0),
+                ..Default::default()
+            },
+            gpus: vec![GpuRawMetrics::default()],
+            host_gpu_count: None,
+        })
+    }
+
+    fn join_hint(hint: &LoadHintParams<'_>) -> String {
+        idle_diagnose_lines(false, &[], hint).join("\n")
+    }
+
+    #[test]
+    fn load_hint_contains_model_name() {
+        let hint = LoadHintParams {
+            model_name: Some("Qwen/Qwen3-27B"),
+            metrics_url: "http://localhost:8000/metrics",
+            max_num_seqs: Some(256),
+            duration_secs: 30,
+        };
+        assert!(join_hint(&hint).contains("--model \"Qwen/Qwen3-27B\""));
+    }
+
+    #[test]
+    fn load_hint_model_fallback() {
+        let hint = LoadHintParams {
+            model_name: None,
+            metrics_url: "http://localhost:8000/metrics",
+            max_num_seqs: Some(256),
+            duration_secs: 30,
+        };
+        assert!(join_hint(&hint).contains("--model \"your-model-name\""));
+    }
+
+    #[test]
+    fn load_hint_strips_metrics_suffix() {
+        let hint = LoadHintParams {
+            model_name: Some("m"),
+            metrics_url: "http://myhost:9000/metrics",
+            max_num_seqs: Some(256),
+            duration_secs: 30,
+        };
+        assert!(join_hint(&hint).contains("--base-url \"http://myhost:9000\""));
+    }
+
+    #[test]
+    fn load_hint_strips_metrics_no_suffix() {
+        let hint = LoadHintParams {
+            model_name: Some("m"),
+            metrics_url: "http://myhost:9000",
+            max_num_seqs: Some(256),
+            duration_secs: 30,
+        };
+        assert!(join_hint(&hint).contains("--base-url \"http://myhost:9000\""));
+    }
+
+    #[test]
+    fn load_hint_model_with_spaces_is_quoted() {
+        let hint = LoadHintParams {
+            model_name: Some("/mnt/models/my model"),
+            metrics_url: "http://localhost:8000/metrics",
+            max_num_seqs: Some(256),
+            duration_secs: 30,
+        };
+        assert!(join_hint(&hint).contains("--model \"/mnt/models/my model\""));
+    }
+
+    #[test]
+    fn load_hint_rate_from_max_num_seqs() {
+        let hint = LoadHintParams {
+            model_name: Some("m"),
+            metrics_url: "http://localhost:8000/metrics",
+            max_num_seqs: Some(256),
+            duration_secs: 30,
+        };
+        assert!(join_hint(&hint).contains("--request-rate 128"));
+    }
+
+    #[test]
+    fn load_hint_rate_fallback() {
+        let hint = LoadHintParams {
+            model_name: Some("m"),
+            metrics_url: "http://localhost:8000/metrics",
+            max_num_seqs: None,
+            duration_secs: 30,
+        };
+        assert!(join_hint(&hint).contains("--request-rate 10"));
+    }
+
+    #[test]
+    fn load_hint_num_prompts_scaled() {
+        let hint = LoadHintParams {
+            model_name: Some("m"),
+            metrics_url: "http://localhost:8000/metrics",
+            max_num_seqs: Some(256),
+            duration_secs: 30,
+        };
+        assert!(join_hint(&hint).contains("--num-prompts 7680"));
+    }
+
+    #[test]
+    fn load_hint_num_prompts_fallback() {
+        let hint = LoadHintParams {
+            model_name: Some("m"),
+            metrics_url: "http://localhost:8000/metrics",
+            max_num_seqs: None,
+            duration_secs: 30,
+        };
+        assert!(join_hint(&hint).contains("--num-prompts 600"));
+    }
+
+    #[test]
+    fn load_hint_verbose_appends_drop_note() {
+        let windows = vec![idle_window(), idle_window()];
+        let hint = LoadHintParams {
+            model_name: Some("m"),
+            metrics_url: "http://localhost:8000/metrics",
+            max_num_seqs: Some(256),
+            duration_secs: 30,
+        };
+        let text = idle_diagnose_lines(true, &windows, &hint).join("\n");
+        assert!(text.contains("Server is idle"));
+        assert!(text.contains("benchmark_serving.py"));
+        assert!(text.contains("Note: 2 of 2 collected windows were not evaluable."));
+        assert!(!text.contains("Telemetry failure"));
+    }
+
+    #[test]
+    fn test_unreachable_shows_curl_command() {
+        let url = "http://broken:8000/metrics";
+        let text = unreachable_diagnose_lines(false, &[], url).join("\n");
+        assert!(text.contains("[!] Telemetry Failure"));
+        assert!(text.contains("Fix:"));
+        assert!(text.contains(&format!("curl -s {url}")));
+        assert!(!text.contains("Server is idle"));
+        assert!(!text.contains("benchmark_serving.py"));
+    }
+
+    #[test]
+    fn test_idle_shows_benchmark_hint() {
+        let hint = LoadHintParams {
+            model_name: Some("m"),
+            metrics_url: "http://localhost:8000/metrics",
+            max_num_seqs: Some(256),
+            duration_secs: 30,
+        };
+        let text = idle_diagnose_lines(false, &[], &hint).join("\n");
+        assert!(text.contains("Server is idle"));
+        assert!(text.contains("benchmark_serving.py"));
+        assert!(!text.contains("[!] Telemetry Failure"));
+    }
+
+    #[test]
+    fn test_unreachable_verbose_shows_dropped_count() {
+        let windows = vec![idle_window(), idle_window()];
+        let text =
+            unreachable_diagnose_lines(true, &windows, "http://localhost:8000/metrics").join("\n");
+        assert!(text.contains("[!] Telemetry Failure"));
+        assert!(text.contains(
+            "Note: 2 of 2 collected windows dropped. Telemetry failure. Diagnosis may be incomplete."
+        ));
+    }
+
+    #[test]
+    fn load_hint_separate_terminal_mentioned() {
+        let hint = LoadHintParams {
+            model_name: Some("m"),
+            metrics_url: "http://localhost:8000/metrics",
+            max_num_seqs: Some(256),
+            duration_secs: 30,
+        };
+        assert!(join_hint(&hint).contains("separate terminal"));
+    }
+
+    #[test]
+    fn load_hint_rate_floor_at_one() {
+        let hint = LoadHintParams {
+            model_name: Some("m"),
+            metrics_url: "http://localhost:8000/metrics",
+            max_num_seqs: Some(1),
+            duration_secs: 30,
+        };
+        assert!(join_hint(&hint).contains("--request-rate 1"));
+        assert!(!join_hint(&hint).contains("--request-rate 0"));
+    }
+
+    #[test]
+    fn idle_evaluable_window_is_detected() {
+        let mut w = idle_window();
+        w.snapshot.vllm.window_duration_secs = Some(2.0);
+        w.snapshot.vllm.num_requests_running = Some(0.0);
+        w.snapshot.vllm.generation_tokens_per_sec = Some(0.0);
+        assert!(window_is_evaluable(&w.snapshot));
+        assert!(window_is_idle(&w.snapshot));
+    }
+
+    #[test]
+    fn active_window_is_not_idle() {
+        let mut w = idle_window();
+        w.snapshot.vllm.window_duration_secs = Some(2.0);
+        w.snapshot.vllm.num_requests_running = Some(5.0);
+        w.snapshot.vllm.generation_tokens_per_sec = Some(100.0);
+        assert!(window_is_evaluable(&w.snapshot));
+        assert!(!window_is_idle(&w.snapshot));
     }
 }

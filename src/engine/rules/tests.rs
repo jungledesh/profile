@@ -707,10 +707,11 @@ fn format_diagnose_rules_non_evaluable_snapshot_shows_note() {
     let s = snap(t, t, v, gpu_busy());
     let ctx = mk_ctx();
     let win = mk_win(s);
-    let lines = format_diagnose_rules_test(ai(&ctx, &win), false, "http://127.0.0.1:8000/metrics");
+    let metrics_url = "http://127.0.0.1:8000/metrics";
+    let lines = format_diagnose_rules_test(ai(&ctx, &win), false, metrics_url);
     assert_eq!(
         lines,
-        no_evaluable_diagnose_lines(false, std::slice::from_ref(&win))
+        unreachable_diagnose_lines(false, std::slice::from_ref(&win), metrics_url)
     );
 }
 
@@ -842,13 +843,47 @@ fn format_diagnose_rules_for_windows_all_non_evaluable() {
     let w2 = mk_win(snap(t, t, v, gpu_busy()));
     let windows = vec![w1, w2];
     let summary = ai(&ctx, &windows[0]);
-    let lines = format_diagnose_rules_for_windows_test(
-        &windows,
-        summary,
-        false,
-        "http://127.0.0.1:8000/metrics",
+    let metrics_url = "http://127.0.0.1:8000/metrics";
+    let lines = format_diagnose_rules_for_windows_test(&windows, summary, false, metrics_url);
+    assert_eq!(
+        lines,
+        unreachable_diagnose_lines(false, &windows, metrics_url)
     );
-    assert_eq!(lines, no_evaluable_diagnose_lines(false, &windows));
+}
+
+#[test]
+fn idle_windows_skipped_in_rule_evaluation() {
+    let t = SystemTime::UNIX_EPOCH;
+    // High occupancy: R1 stays quiet on real traffic windows.
+    let mut active = vllm_base();
+    active.num_requests_running = Some(200.0);
+    active.generation_tokens_per_sec = Some(200.0);
+    active.max_num_seqs = Some(256);
+    // Evaluable idle. Tiny running would false-positive R1 if the engine scored it.
+    let mut idle = vllm_base();
+    idle.num_requests_running = Some(0.5);
+    idle.generation_tokens_per_sec = Some(0.0);
+    idle.max_num_seqs = Some(256);
+
+    let mut windows = Vec::with_capacity(15);
+    for _ in 0..10 {
+        windows.push(mk_win(snap(t, t, active.clone(), gpu_busy())));
+    }
+    for _ in 0..5 {
+        windows.push(mk_win(snap(t, t, idle.clone(), gpu_busy())));
+    }
+
+    let ctx = mk_ctx();
+    let summary = ai(&ctx, &windows[0]);
+    let report = build_report_for_windows(&windows, summary);
+    assert_eq!(report.n_eval, 10);
+    assert_eq!(report.skipped, 5);
+    assert!(
+        !report
+            .groups
+            .iter()
+            .any(|g| g.primary.rule_name == rule_names::UNDER_BATCHING)
+    );
 }
 
 #[test]
