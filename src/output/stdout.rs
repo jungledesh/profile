@@ -105,6 +105,7 @@ fn build_diagnose_lines(
     }
 
     if !result.any_evaluable {
+        lines.push(String::new());
         lines.push(vllm_label_row("Target:", &result.metrics_input));
         lines.push(String::new());
         lines.extend(engine::unreachable_diagnose_lines(
@@ -115,6 +116,7 @@ fn build_diagnose_lines(
         return lines;
     }
     if result.all_idle {
+        lines.push(String::new());
         lines.push(vllm_label_row("Target:", &result.metrics_input));
         lines.push(String::new());
         let hint = engine::LoadHintParams {
@@ -1480,6 +1482,11 @@ mod tests {
         };
         let lines = diagnose_lines_for(&result, false);
         let text = lines.join("\n");
+        let target_idx = lines
+            .iter()
+            .position(|l| l.contains("Target:"))
+            .expect("Target row");
+        assert!(target_idx > 0 && lines[target_idx - 1].is_empty());
         assert!(text.contains("Target:") && text.contains("127.0.0.1"));
         assert!(text.contains("[!] Telemetry Failure"));
         assert!(text.contains("curl -s http://127.0.0.1:8000/metrics"));
@@ -1517,7 +1524,13 @@ mod tests {
             all_idle: true,
             metrics_input: "http://127.0.0.1:8000/metrics".into(),
         };
-        let text = diagnose_lines_for(&result, false).join("\n");
+        let lines = diagnose_lines_for(&result, false);
+        let text = lines.join("\n");
+        let target_idx = lines
+            .iter()
+            .position(|l| l.contains("Target:"))
+            .expect("Target row");
+        assert!(target_idx > 0 && lines[target_idx - 1].is_empty());
         assert!(text.contains("Server is idle"));
         assert!(text.contains("benchmark_serving.py"));
         assert!(!text.contains("No issues detected"));
