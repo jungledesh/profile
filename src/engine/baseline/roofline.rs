@@ -352,13 +352,10 @@ mod tests {
         let n_gpus = cfg.tensor_parallel_size.unwrap_or(1).max(1) as usize;
         let ctx = StaticContext {
             model: crate::context::ModelArch {
-                name: Some("model".to_string()),
-                family: Some("family".to_string()),
                 param_count: model_params,
                 active_param_count: active_params,
                 num_layers: Some(1),
                 hidden_dim: Some(1),
-                is_moe: active_params.is_some(),
                 default_weight_dtype: default_dtype.map(str::to_string),
                 num_kv_heads: None,
                 head_dim: None,
@@ -367,7 +364,6 @@ mod tests {
             },
             gpu: crate::context::GPUModel {
                 name: Some("gpu".to_string()),
-                arch: Some("arch".to_string()),
                 vram_gb: Some(80.0),
                 peak_flops_tc_tflops: peak_flops,
                 peak_bw_gbps: peak_bw,
@@ -381,8 +377,6 @@ mod tests {
             timestamp: SystemTime::UNIX_EPOCH,
             vllm: snapshot,
             gpus: vec![GpuRawMetrics::default(); n_gpus],
-
-            host_gpu_count: None,
         });
         (ctx, win)
     }
@@ -1331,13 +1325,10 @@ mod tests {
     ) -> (StaticContext, RuntimeWindow) {
         let ctx = StaticContext {
             model: crate::context::ModelArch {
-                name: Some("meta-llama/Llama-3.1-8B-Instruct".to_string()),
-                family: Some("llama3".to_string()),
                 param_count: Some(8_000_000_000),
                 active_param_count: None,
                 num_layers: Some(32),
                 hidden_dim: Some(4096),
-                is_moe: false,
                 default_weight_dtype: Some("bf16".to_string()),
                 num_kv_heads: Some(8),
                 head_dim: Some(128),
@@ -1346,7 +1337,6 @@ mod tests {
             },
             gpu: crate::context::GPUModel {
                 name: Some("NVIDIA H100 80GB HBM3".to_string()),
-                arch: Some("hopper".to_string()),
                 vram_gb: Some(80.0),
                 peak_flops_tc_tflops: Some(67.0),
                 peak_bw_gbps: Some(3350.0),
@@ -1360,7 +1350,6 @@ mod tests {
             timestamp: SystemTime::UNIX_EPOCH,
             vllm: snapshot,
             gpus: vec![GpuRawMetrics::default()],
-            host_gpu_count: None,
         });
         (ctx, win)
     }
@@ -1406,7 +1395,6 @@ mod tests {
                 ..Default::default()
             },
             gpus: vec![GpuRawMetrics::default()],
-            host_gpu_count: None,
         });
         let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
         let expected = math::prefill_ops_per_sec(67.0, 37_000_000_000, 4096, 61, 139_264);

@@ -2,7 +2,6 @@
 
 use std::time::Duration;
 
-pub const SAMPLE_COUNT: usize = 9;
 pub const SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 
 pub fn sample_count_for(window: Duration) -> usize {

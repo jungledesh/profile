@@ -4,8 +4,6 @@ use super::DiagnoseResult;
 
 #[derive(Debug, Clone)]
 pub struct Delta {
-    /// Relative % change in `generation_tokens_per_sec`.
-    pub throughput_delta_pct: Option<f64>,
     pub throughput_before: Option<f64>,
     pub throughput_after: Option<f64>,
     /// Absolute percentage-point change in efficiency.
@@ -26,29 +24,13 @@ pub struct Delta {
     pub ttft_after_ms: Option<f64>,
     pub tpot_before_ms: Option<f64>,
     pub tpot_after_ms: Option<f64>,
-    pub ttft_p99_before_ms: Option<f64>,
-    pub ttft_p99_after_ms: Option<f64>,
-    pub tpot_p99_before_ms: Option<f64>,
-    pub tpot_p99_after_ms: Option<f64>,
     pub ttft_p95_before_ms: Option<f64>,
     pub ttft_p95_after_ms: Option<f64>,
     pub tpot_p95_before_ms: Option<f64>,
     pub tpot_p95_after_ms: Option<f64>,
-    pub ttft_p99_delta_pct: Option<f64>,
-    pub ttft_p95_delta_pct: Option<f64>,
-    pub tpot_p95_delta_pct: Option<f64>,
     pub config_drifted: bool,
     /// Non-baseline config diffs for display (e.g. max_num_seqs).
     pub config_changes: Vec<String>,
-}
-
-fn pct_delta(before: Option<f64>, after: Option<f64>) -> Option<f64> {
-    match (before, after) {
-        (Some(b), Some(a)) if b > 0.0 && b.is_finite() && a.is_finite() => {
-            Some((a - b) / b * 100.0)
-        }
-        _ => None,
-    }
 }
 
 pub fn compute(
@@ -68,19 +50,10 @@ pub fn compute(
     let tpot_before_ms = prev_result.snapshot.vllm.tpot_ms;
     let tpot_after_ms = curr_result.snapshot.vllm.tpot_ms;
 
-    let ttft_p99_before_ms = prev_result.snapshot.vllm.ttft_p99_ms;
-    let ttft_p99_after_ms = curr_result.snapshot.vllm.ttft_p99_ms;
-    let tpot_p99_before_ms = prev_result.snapshot.vllm.tpot_p99_ms;
-    let tpot_p99_after_ms = curr_result.snapshot.vllm.tpot_p99_ms;
     let ttft_p95_before_ms = prev_result.snapshot.vllm.ttft_p95_ms;
     let ttft_p95_after_ms = curr_result.snapshot.vllm.ttft_p95_ms;
     let tpot_p95_before_ms = prev_result.snapshot.vllm.tpot_p95_ms;
     let tpot_p95_after_ms = curr_result.snapshot.vllm.tpot_p95_ms;
-
-    let throughput_delta_pct = pct_delta(throughput_before, throughput_after);
-    let ttft_p99_delta_pct = pct_delta(ttft_p99_before_ms, ttft_p99_after_ms);
-    let ttft_p95_delta_pct = pct_delta(ttft_p95_before_ms, ttft_p95_after_ms);
-    let tpot_p95_delta_pct = pct_delta(tpot_p95_before_ms, tpot_p95_after_ms);
 
     let efficiency_pct_before = prev_report.baseline.as_ref().and_then(|b| b.efficiency_pct);
     let efficiency_pct_after = curr_report.baseline.as_ref().and_then(|b| b.efficiency_pct);
@@ -118,7 +91,6 @@ pub fn compute(
         .and_then(|c| c.joules_per_token);
 
     Delta {
-        throughput_delta_pct,
         throughput_before,
         throughput_after,
         efficiency_delta_pp,
@@ -133,17 +105,10 @@ pub fn compute(
         ttft_after_ms,
         tpot_before_ms,
         tpot_after_ms,
-        ttft_p99_before_ms,
-        ttft_p99_after_ms,
-        tpot_p99_before_ms,
-        tpot_p99_after_ms,
         ttft_p95_before_ms,
         ttft_p95_after_ms,
         tpot_p95_before_ms,
         tpot_p95_after_ms,
-        ttft_p99_delta_pct,
-        ttft_p95_delta_pct,
-        tpot_p95_delta_pct,
         config_drifted,
         config_changes,
     }
@@ -151,6 +116,15 @@ pub fn compute(
 
 #[cfg(test)]
 mod tests {
+    fn pct_delta(before: Option<f64>, after: Option<f64>) -> Option<f64> {
+        match (before, after) {
+            (Some(b), Some(a)) if b > 0.0 && b.is_finite() && a.is_finite() => {
+                Some((a - b) / b * 100.0)
+            }
+            _ => None,
+        }
+    }
+
     use super::*;
     use crate::engine::baseline::{CostEstimate, CostSource};
     use crate::engine::{CeilingEstimate, PhysicsBaseline, WeightDtypeSource};
@@ -170,8 +144,6 @@ mod tests {
                 ..Default::default()
             },
             gpus: vec![],
-
-            host_gpu_count: None,
         }
     }
 
@@ -227,7 +199,8 @@ mod tests {
             suppressed_rules: Vec::new(),
             kv_max_seqs: None,
             n_eval: 0,
-            skipped: 0,
+            skipped_broken: 0,
+            skipped_idle: 0,
         }
     }
 
@@ -252,33 +225,8 @@ mod tests {
             Vec::new(),
         );
         assert!((d.efficiency_delta_pp.unwrap() - 5.0).abs() < 1e-9);
-        assert!((d.throughput_delta_pct.unwrap() - 12.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn throughput_delta_none_when_prev_zero() {
-        let d = compute(
-            &diagnose(Some(0.0)),
-            &report_eff(None, None, None),
-            &diagnose(Some(50.0)),
-            &report_eff(Some(10.0), None, None),
-            false,
-            Vec::new(),
-        );
-        assert!(d.throughput_delta_pct.is_none());
-    }
-
-    #[test]
-    fn throughput_delta_none_when_missing_gauge() {
-        let d = compute(
-            &diagnose(None),
-            &report_eff(None, None, None),
-            &diagnose(Some(50.0)),
-            &report_eff(None, None, None),
-            false,
-            Vec::new(),
-        );
-        assert!(d.throughput_delta_pct.is_none());
+        assert_eq!(d.throughput_before, Some(100.0));
+        assert_eq!(d.throughput_after, Some(112.0));
     }
 
     #[test]
@@ -342,29 +290,6 @@ mod tests {
     }
 
     #[test]
-    fn populates_p99_before_after() {
-        let mut prev = diagnose(Some(100.0));
-        prev.snapshot.vllm.ttft_p99_ms = Some(500.0);
-        prev.snapshot.vllm.tpot_p99_ms = Some(80.0);
-        let mut curr = diagnose(Some(110.0));
-        curr.snapshot.vllm.ttft_p99_ms = Some(450.0);
-        curr.snapshot.vllm.tpot_p99_ms = Some(75.0);
-        let d = compute(
-            &prev,
-            &report_eff(Some(40.0), None, None),
-            &curr,
-            &report_eff(Some(45.0), None, None),
-            false,
-            Vec::new(),
-        );
-        assert_eq!(d.ttft_p99_before_ms, Some(500.0));
-        assert_eq!(d.ttft_p99_after_ms, Some(450.0));
-        assert_eq!(d.tpot_p99_before_ms, Some(80.0));
-        assert_eq!(d.tpot_p99_after_ms, Some(75.0));
-        assert!((d.ttft_p99_delta_pct.unwrap() - (-10.0)).abs() < 1e-9);
-    }
-
-    #[test]
     fn populates_p95_before_after() {
         let mut prev = diagnose(Some(100.0));
         prev.snapshot.vllm.ttft_p95_ms = Some(400.0);
@@ -384,7 +309,5 @@ mod tests {
         assert_eq!(d.ttft_p95_after_ms, Some(340.0));
         assert_eq!(d.tpot_p95_before_ms, Some(70.0));
         assert_eq!(d.tpot_p95_after_ms, Some(63.0));
-        assert!((d.ttft_p95_delta_pct.unwrap() - (-15.0)).abs() < 1e-9);
-        assert!((d.tpot_p95_delta_pct.unwrap() - (-10.0)).abs() < 1e-9);
     }
 }

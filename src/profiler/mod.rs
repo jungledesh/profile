@@ -22,7 +22,8 @@ pub struct DiagnoseResult {
     pub started_at: SystemTime,
     /// False when every collected window failed `window_is_evaluable` - not an under-load diagnosis.
     pub any_evaluable: bool,
-    /// True when every collected window is evaluable and idle (working telemetry, zero traffic).
+    /// True when every evaluable window is idle (working telemetry, zero traffic).
+    /// Non-evaluable windows are ignored for this determination.
     pub all_idle: bool,
     /// Metrics URL passed to `diagnose` (for display when `any_evaluable` is false).
     pub metrics_input: String,
@@ -47,7 +48,11 @@ pub fn run_diagnose(
         &gpu_indices,
     )?;
     let any_evaluable = raw_windows.iter().any(window_is_evaluable);
-    let all_idle = any_evaluable && raw_windows.iter().all(window_is_idle);
+    let all_idle = any_evaluable
+        && raw_windows
+            .iter()
+            .filter(|w| window_is_evaluable(w))
+            .all(window_is_idle);
     let snapshot = if raw_windows.is_empty() {
         empty_snapshot(started_at)
     } else if any_evaluable {
@@ -143,7 +148,6 @@ fn empty_snapshot(at: SystemTime) -> collectors::RawSnapshot {
         timestamp: at,
         vllm: collectors::VllmRawMetrics::default(),
         gpus: vec![],
-        host_gpu_count: None,
     }
 }
 
@@ -175,7 +179,6 @@ fn context_only_diagnose_snapshot(
                 ..Default::default()
             })
             .collect(),
-        host_gpu_count: source.host_gpu_count,
     }
 }
 
@@ -225,7 +228,6 @@ mod tests {
             timestamp: std::time::SystemTime::UNIX_EPOCH,
             vllm: v,
             gpus: vec![g],
-            host_gpu_count: None,
         };
         let out = context_only_diagnose_snapshot(&src, std::time::SystemTime::UNIX_EPOCH);
         assert_eq!(out.vllm.model_name.as_deref(), Some("llama"));
@@ -259,5 +261,53 @@ mod tests {
         assert!(msg.contains("Topology drift detected"));
         assert!(msg.contains("missing [GPU-1]"));
         assert!(msg.contains("new [GPU-2]"));
+    }
+
+    #[test]
+    fn all_idle_true_when_evaluable_windows_idle_and_one_non_evaluable() {
+        use crate::collectors::{window_is_evaluable, window_is_idle};
+        use std::time::SystemTime;
+
+        let t = SystemTime::UNIX_EPOCH;
+
+        let idle_snap = RawSnapshot {
+            gpu_observed_at: t,
+            vllm_observed_at: t,
+            timestamp: t,
+            vllm: VllmRawMetrics {
+                num_requests_running: Some(0.0),
+                generation_tokens_per_sec: Some(0.0),
+                window_duration_secs: Some(2.0),
+                ..Default::default()
+            },
+            gpus: vec![],
+        };
+
+        let non_eval_snap = RawSnapshot {
+            gpu_observed_at: t,
+            vllm_observed_at: t,
+            timestamp: t,
+            vllm: VllmRawMetrics::default(),
+            gpus: vec![],
+        };
+
+        assert!(window_is_evaluable(&idle_snap));
+        assert!(window_is_idle(&idle_snap));
+        assert!(!window_is_evaluable(&non_eval_snap));
+        assert!(!window_is_idle(&non_eval_snap));
+
+        let windows = vec![idle_snap.clone(), idle_snap, non_eval_snap];
+        let any_evaluable = windows.iter().any(window_is_evaluable);
+        let all_idle = any_evaluable
+            && windows
+                .iter()
+                .filter(|w| window_is_evaluable(w))
+                .all(window_is_idle);
+
+        assert!(any_evaluable);
+        assert!(
+            all_idle,
+            "all_idle should be true when all evaluable windows are idle"
+        );
     }
 }

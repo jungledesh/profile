@@ -1,5 +1,5 @@
 {
-  "note": "Market-average estimates across major cloud providers (AWS, GCP, Azure, Lambda, Nebius, RunPod, CoreWeave, GMI Cloud). Not precise — use --cost-per-hour for exact rates. On-demand and spot are approximate midpoints of observed market range as of 2026-06. On-prem devices (e.g. DGX Spark) use amortized hardware + electricity cost; spot_per_hr equals on_demand_per_hr (no spot concept).",
+  "note": "Market-average estimates across major cloud providers (AWS, GCP, Azure, Lambda, Nebius, RunPod, CoreWeave, GMI Cloud). Not precise, use --cost-per-hour for exact rates. On-demand and spot are approximate midpoints of observed market range as of 2026-06. On-prem devices (e.g. DGX Spark) use amortized hardware + electricity cost; spot_per_hr equals on_demand_per_hr (no spot concept).",
   "updated": "2026-06",
   "gpus": {
     "a10g": {

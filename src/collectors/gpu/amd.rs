@@ -17,19 +17,18 @@ use super::polling::{GpuPoll, aggregate_polls, resolve_device_indices};
 const MIB: u64 = 1024 * 1024;
 
 fn amdgpu_device_paths() -> Option<Vec<DevicePath>> {
-    let paths = panic::catch_unwind(AssertUnwindSafe(DevicePath::get_device_path_list)).ok()?;
+    let paths = match panic::catch_unwind(AssertUnwindSafe(DevicePath::get_device_path_list)) {
+        Ok(paths) => paths,
+        Err(_) => {
+            eprintln!("Warning: AMD GPU driver probe panicked. Skipping AMD detection.");
+            return None;
+        }
+    };
     let paths: Vec<_> = paths
         .into_iter()
         .filter(|p| p.is_amdgpu() && p.render.exists())
         .collect();
     if paths.is_empty() { None } else { Some(paths) }
-}
-
-/// Container-visible AMD GPU count. Filtered to render nodes present in /dev/dri/.
-/// No env filtering, no polling. Returns None if AMD driver unavailable.
-pub(super) fn host_gpu_count() -> Option<u32> {
-    let paths = amdgpu_device_paths()?;
-    Some(paths.len() as u32)
 }
 
 /// Single-shot AMD GPU scan for gpu_assignment. No polling, no window.
@@ -38,8 +37,13 @@ pub(super) fn scan_host_gpus() -> Option<Vec<super::GpuScanEntry>> {
     let mut out = Vec::with_capacity(paths.len());
     for (i, device_path) in paths.iter().enumerate() {
         let init_result = panic::catch_unwind(AssertUnwindSafe(|| device_path.init()));
-        let Ok(Ok(device_handle)) = init_result else {
-            continue;
+        let device_handle = match init_result {
+            Ok(Ok(handle)) => handle,
+            Err(_) => {
+                eprintln!("Warning: AMD GPU {i} init panicked. Skipping device.");
+                continue;
+            }
+            Ok(Err(_)) => continue,
         };
         let mem_info = device_handle.memory_info().ok();
         let vram_used_mb = mem_info
@@ -78,7 +82,7 @@ pub(super) fn fp8_compiler_available() -> bool {
 struct AmdDevice {
     device_path: DevicePath,
     device_handle: DeviceHandle,
-    sensors: Sensors,
+    sensors: Option<Sensors>,
     vram_usage: VramUsage,
 }
 
@@ -88,17 +92,20 @@ fn init_amd_devices(device_paths: &[DevicePath], indices: &[u32]) -> Result<Vec<
         let Some(device_path) = device_paths.get(idx as usize) else {
             anyhow::bail!("AMD GPU {idx} lost during telemetry polling: index out of range");
         };
-        let device_handle = panic::catch_unwind(AssertUnwindSafe(|| device_path.init()))
-            .map_err(|_| {
-                anyhow::anyhow!("AMD GPU {idx}: init panicked (device likely inaccessible)")
-            })?
-            .map_err(|e| anyhow::anyhow!("AMD GPU {idx} lost during telemetry polling: {e}"))?;
+        let device_handle = match panic::catch_unwind(AssertUnwindSafe(|| device_path.init())) {
+            Ok(Ok(handle)) => handle,
+            Ok(Err(e)) => {
+                anyhow::bail!("AMD GPU {idx} lost during telemetry polling: {e}");
+            }
+            Err(_) => {
+                anyhow::bail!("AMD GPU {idx}: init panicked (device likely inaccessible)");
+            }
+        };
         let ext_info = device_handle
             .device_info()
             .map_err(|e| anyhow::anyhow!("AMD GPU {idx} lost during telemetry polling: {e}"))?;
-        let Some(sensors) = Sensors::new(&device_handle, &device_path.pci, &ext_info) else {
-            anyhow::bail!("AMD GPU {idx} lost during telemetry polling: sensors unavailable");
-        };
+        // No bail. sensors == None means Stage 1 (hwmon) unavailable; Stage 2/3 still run.
+        let sensors = Sensors::new(&device_handle, &device_path.pci, &ext_info);
         let mem_info = device_handle
             .memory_info()
             .map_err(|e| anyhow::anyhow!("AMD GPU {idx} lost during telemetry polling: {e}"))?;
@@ -121,25 +128,28 @@ fn poll_amd_device(device: &mut AmdDevice) -> GpuPoll {
     tick.util_gpu = activity.gfx.map(|v| v as u32);
     tick.util_mem = activity.umc.map(|v| v as u32);
 
-    device.sensors.update_without_device_handle();
-    device.sensors.update(&device.device_handle);
+    if let Some(ref mut sensors) = device.sensors {
+        sensors.update_without_device_handle();
+        sensors.update(&device.device_handle);
+    }
 
-    // Stage 1: hwmon. HwmonPower.value is already watts; HwmonTemp.current is already °C.
-    tick.power_watts = sanitize_watts(
-        device
-            .sensors
-            .average_power
+    // Stage 1: hwmon (only if sensors available).
+    // HwmonPower.value is already watts; HwmonTemp.current is already °C.
+    if let Some(ref sensors) = device.sensors {
+        tick.power_watts = sanitize_watts(
+            sensors
+                .average_power
+                .as_ref()
+                .or(sensors.input_power.as_ref())
+                .map(|p| f64::from(p.value)),
+        );
+
+        let temp = sensors
+            .junction_temp
             .as_ref()
-            .or(device.sensors.input_power.as_ref())
-            .map(|p| f64::from(p.value)),
-    );
-
-    let temp = device
-        .sensors
-        .junction_temp
-        .as_ref()
-        .or(device.sensors.edge_temp.as_ref());
-    tick.temperature_c = sanitize_temp(temp.map(|t| t.current as f64));
+            .or(sensors.edge_temp.as_ref());
+        tick.temperature_c = sanitize_temp(temp.map(|t| t.current as f64));
+    }
 
     // Stage 2: gpu_metrics binary blob (sysfs). Native watts / °C.
     if (tick.power_watts.is_none() || tick.temperature_c.is_none())
@@ -169,7 +179,7 @@ fn poll_amd_device(device: &mut AmdDevice) -> GpuPoll {
     tick.vram_used_mb = Some(mem_info.vram.heap_usage / MIB);
     tick.vram_total_mb = Some(mem_info.vram.total_heap_size / MIB);
 
-    tick.sm_clock_mhz = device.sensors.sclk;
+    tick.sm_clock_mhz = device.sensors.as_ref().and_then(|s| s.sclk);
 
     tick
 }
@@ -236,7 +246,7 @@ pub(super) fn collect(
     for (slot_idx, &d) in device_indices.iter().enumerate() {
         let device = &devices[slot_idx];
         let agg = aggregate_polls(all_device_polls.get(&d).map_or(&[], |v| v));
-        let power_limit_watts = power_limit_watts(&device.sensors);
+        let power_limit_watts = device.sensors.as_ref().and_then(power_limit_watts);
 
         results.push(GpuRawMetrics {
             gpu_name: Some(device.device_path.device_name.clone()),

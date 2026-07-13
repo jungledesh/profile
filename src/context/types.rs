@@ -1,20 +1,15 @@
-use std::time::SystemTime;
-
-use crate::collectors::{RawSnapshot, TrafficState, VllmConfig, traffic_from_snapshot};
+use crate::collectors::{RawSnapshot, VllmConfig};
 
 use super::{gpu_catalog, model_catalog};
 
 #[derive(Debug, Clone, Default)]
 pub struct ModelArch {
-    pub name: Option<String>,
-    pub family: Option<String>,
     /// Total parameter count (billions × 1e9 as u64). Dense and MoE total.
     pub param_count: Option<u64>,
     /// Active parameter count for MoE models. None for dense.
     pub active_param_count: Option<u64>,
     pub num_layers: Option<u32>,
     pub hidden_dim: Option<u32>,
-    pub is_moe: bool,
     pub default_weight_dtype: Option<String>,
     /// Number of KV heads (num_key_value_heads). None for special architectures
     /// (MLA, interleaved attention, hybrid) where standard KV formula doesn't apply.
@@ -34,7 +29,6 @@ pub struct ModelArch {
 #[derive(Debug, Clone, Default)]
 pub struct GPUModel {
     pub name: Option<String>,
-    pub arch: Option<String>,
     pub vram_gb: Option<f64>,
     /// BF16/FP16 Tensor Core TFLOPS.
     pub peak_flops_tc_tflops: Option<f64>,
@@ -86,27 +80,20 @@ fn lookup_model_catalog(
 
 impl StaticContext {
     pub fn from_snapshot(snapshot: &RawSnapshot, config: VllmConfig) -> Self {
-        let model_name = snapshot.vllm.model_name.clone();
-        let catalog_entry = lookup_model_catalog(&config, model_name.as_deref());
+        let catalog_entry = lookup_model_catalog(&config, snapshot.vllm.model_name.as_deref());
         let model = match catalog_entry {
             Some(e) => ModelArch {
-                name: model_name,
-                family: Some(e.family.to_string()),
                 param_count: Some(e.param_count),
                 active_param_count: e.active_param_count,
                 num_layers: Some(e.num_layers),
                 hidden_dim: Some(e.hidden_dim),
-                is_moe: e.is_moe,
                 default_weight_dtype: Some(e.default_weight_dtype.to_string()),
                 num_kv_heads: e.num_kv_heads,
                 head_dim: e.head_dim,
                 num_kv_layers: e.num_kv_layers,
                 attn_flops_coeff: e.attn_flops_coeff,
             },
-            None => ModelArch {
-                name: model_name,
-                ..Default::default()
-            },
+            None => ModelArch::default(),
         };
         let bottleneck_gpu = snapshot
             .gpus
@@ -120,14 +107,12 @@ impl StaticContext {
         let gpu = match gpu_entry {
             Some(e) => GPUModel {
                 name: gpu_name,
-                arch: Some(e.arch.to_string()),
                 vram_gb,
                 peak_flops_tc_tflops: Some(e.peak_flops_tc_tflops),
                 peak_bw_gbps: Some(e.peak_bw_gbps),
             },
             None => GPUModel {
                 name: gpu_name,
-                arch: None,
                 vram_gb,
                 peak_flops_tc_tflops: None,
                 peak_bw_gbps: None,
@@ -145,19 +130,11 @@ impl StaticContext {
 #[derive(Debug, Clone)]
 pub struct RuntimeWindow {
     pub snapshot: RawSnapshot,
-    pub traffic: TrafficState,
-    pub captured_at: SystemTime,
 }
 
 impl RuntimeWindow {
     pub fn from_snapshot(snapshot: RawSnapshot) -> Self {
-        let traffic = traffic_from_snapshot(&snapshot);
-        let captured_at = snapshot.timestamp;
-        RuntimeWindow {
-            snapshot,
-            traffic,
-            captured_at,
-        }
+        RuntimeWindow { snapshot }
     }
 }
 

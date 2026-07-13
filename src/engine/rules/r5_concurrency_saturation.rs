@@ -411,8 +411,6 @@ mod tests {
             timestamp: SystemTime::UNIX_EPOCH,
             vllm,
             gpus: vec![],
-
-            host_gpu_count: None,
         }
     }
 

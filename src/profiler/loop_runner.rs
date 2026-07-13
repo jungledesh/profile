@@ -179,7 +179,12 @@ pub fn run(
         let plateau_count = state.update_efficiency_plateau(current_eff, EFFICIENCY_PLATEAU_DELTA);
         print_delta(&d);
         println!();
-        output::stdout::print_diagnose_table(&new_result, verbose_rules);
+        output::stdout::print_diagnose_table_with_report(
+            &new_result,
+            &new_report,
+            &agg_win,
+            verbose_rules,
+        );
 
         let headroom = new_report.baseline.as_ref().and_then(|b| b.headroom_pct);
         if at_hardware_ceiling(headroom) {
@@ -878,7 +883,6 @@ mod tests {
     #[test]
     fn economics_header_shown_when_only_jtok_available() {
         let d = delta::Delta {
-            throughput_delta_pct: None,
             throughput_before: None,
             throughput_after: None,
             efficiency_delta_pp: None,
@@ -893,17 +897,10 @@ mod tests {
             ttft_after_ms: None,
             tpot_before_ms: None,
             tpot_after_ms: None,
-            ttft_p99_before_ms: None,
-            ttft_p99_after_ms: None,
-            tpot_p99_before_ms: None,
-            tpot_p99_after_ms: None,
             ttft_p95_before_ms: None,
             ttft_p95_after_ms: None,
             tpot_p95_before_ms: None,
             tpot_p95_after_ms: None,
-            ttft_p99_delta_pct: None,
-            ttft_p95_delta_pct: None,
-            tpot_p95_delta_pct: None,
             config_drifted: false,
             config_changes: Vec::new(),
         };
@@ -913,7 +910,6 @@ mod tests {
     #[test]
     fn economics_header_shown_for_recoverable_waste() {
         let d = delta::Delta {
-            throughput_delta_pct: Some(160.8),
             throughput_before: Some(1580.0),
             throughput_after: Some(4120.0),
             efficiency_delta_pp: Some(18.4),
@@ -928,17 +924,10 @@ mod tests {
             ttft_after_ms: None,
             tpot_before_ms: None,
             tpot_after_ms: None,
-            ttft_p99_before_ms: None,
-            ttft_p99_after_ms: None,
-            tpot_p99_before_ms: None,
-            tpot_p99_after_ms: None,
             ttft_p95_before_ms: None,
             ttft_p95_after_ms: None,
             tpot_p95_before_ms: None,
             tpot_p95_after_ms: None,
-            ttft_p99_delta_pct: None,
-            ttft_p95_delta_pct: None,
-            tpot_p95_delta_pct: None,
             config_drifted: false,
             config_changes: Vec::new(),
         };
@@ -952,7 +941,6 @@ mod tests {
         let tps = 1216.0;
         let eff = 50.0;
         let d = delta::Delta {
-            throughput_delta_pct: None,
             throughput_before: Some(tps),
             throughput_after: Some(tps),
             efficiency_delta_pp: None,
@@ -967,17 +955,10 @@ mod tests {
             ttft_after_ms: None,
             tpot_before_ms: None,
             tpot_after_ms: None,
-            ttft_p99_before_ms: None,
-            ttft_p99_after_ms: None,
-            tpot_p99_before_ms: None,
-            tpot_p99_after_ms: None,
             ttft_p95_before_ms: None,
             ttft_p95_after_ms: None,
             tpot_p95_before_ms: None,
             tpot_p95_after_ms: None,
-            ttft_p99_delta_pct: None,
-            ttft_p95_delta_pct: None,
-            tpot_p95_delta_pct: None,
             config_drifted: false,
             config_changes: Vec::new(),
         };

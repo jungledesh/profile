@@ -212,7 +212,6 @@ mod tests {
                 ..Default::default()
             },
             gpus: vec![],
-            host_gpu_count: None,
         }
     }
 

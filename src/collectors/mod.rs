@@ -5,12 +5,10 @@
 pub mod config;
 pub mod gpu;
 pub mod sampling;
-pub mod traffic;
 pub mod types;
 pub mod vllm;
 
 pub use config::{VllmConfig, build_config};
-pub use traffic::{TrafficSource, TrafficState, traffic_from_snapshot};
 pub use types::{
     AggregateGpuMetrics, CacheConfigLabels, GpuFingerprint, GpuRawMetrics, HistogramCount,
     HistogramWindowMass, PrefixCacheScrapeSample, RawSnapshot, VllmRawMetrics,
@@ -34,7 +32,7 @@ pub fn collect_snapshot_for_window(
     let gpu_handle = thread::spawn(move || gpu::collect_gpu_metrics_for(window, Some(&indices)));
     let vllm_handle = thread::spawn(move || vllm::collect_vllm_metrics_for(&url, window));
 
-    let (mut gpus, gpu_observed_at, host_gpu_count) = gpu_handle
+    let (mut gpus, gpu_observed_at, _) = gpu_handle
         .join()
         .map_err(|_| anyhow::anyhow!("GPU collector panicked"))??;
 
@@ -57,7 +55,6 @@ pub fn collect_snapshot_for_window(
         timestamp: std::time::SystemTime::now(),
         vllm,
         gpus,
-        host_gpu_count,
     })
 }
 
@@ -79,7 +76,6 @@ pub(crate) mod test_fixtures {
                     ..Default::default()
                 })
                 .collect(),
-            host_gpu_count: None,
         }
     }
 }

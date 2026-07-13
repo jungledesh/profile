@@ -39,14 +39,16 @@ fn show_gpu_temp_peak_parenthetical(current_c: f64, peak_c: f64) -> bool {
     peak_c > current_c && peak_c >= GPU_TEMP_PEAK_SHOW_THRESHOLD_C
 }
 
-pub fn print_diagnose_table(result: &DiagnoseResult, verbose_rules: bool) {
-    let aggregate_win = RuntimeWindow::from_snapshot(result.snapshot.clone());
-    let summary_input = AnalysisInput::new(&result.static_ctx, &aggregate_win);
-    let report = engine::build_report_for_diagnose(&result.windows, summary_input);
-
-    let lines = build_diagnose_lines(result, &aggregate_win, &report, verbose_rules);
+/// Print using a pre-computed report. Use when the caller already has the report.
+pub fn print_diagnose_table_with_report(
+    result: &DiagnoseResult,
+    report: &engine::Report,
+    aggregate_win: &RuntimeWindow,
+    verbose_rules: bool,
+) {
+    let lines = build_diagnose_lines(result, aggregate_win, report, verbose_rules);
     print_boxed(&lines);
-    if let Some(j) = journey_line(&report) {
+    if let Some(j) = journey_line(report) {
         println!();
         println!("{j}");
     }
@@ -104,32 +106,29 @@ fn build_diagnose_lines(
         lines.push(String::new());
     }
 
-    if !result.any_evaluable {
+    if !result.any_evaluable || result.all_idle {
         lines.push(String::new());
         lines.push(vllm_label_row("Target:", &result.metrics_input));
         lines.push(String::new());
-        lines.extend(engine::unreachable_diagnose_lines(
-            verbose_rules,
-            &result.windows,
-            &result.metrics_input,
-        ));
-        return lines;
-    }
-    if result.all_idle {
-        lines.push(String::new());
-        lines.push(vllm_label_row("Target:", &result.metrics_input));
-        lines.push(String::new());
-        let hint = engine::LoadHintParams {
-            model_name: result.snapshot.vllm.model_name.as_deref(),
-            metrics_url: &result.metrics_input,
-            max_num_seqs: result.static_ctx.config.max_num_seqs,
-            duration_secs: result.duration.as_secs(),
-        };
-        lines.extend(engine::idle_diagnose_lines(
-            verbose_rules,
-            &result.windows,
-            &hint,
-        ));
+        if !result.any_evaluable {
+            lines.extend(engine::unreachable_diagnose_lines(
+                verbose_rules,
+                &result.windows,
+                &result.metrics_input,
+            ));
+        } else {
+            let hint = engine::LoadHintParams {
+                model_name: result.snapshot.vllm.model_name.as_deref(),
+                metrics_url: &result.metrics_input,
+                max_num_seqs: result.static_ctx.config.max_num_seqs,
+                duration_secs: result.duration.as_secs(),
+            };
+            lines.extend(engine::idle_diagnose_lines(
+                verbose_rules,
+                &result.windows,
+                &hint,
+            ));
+        }
         return lines;
     }
 
@@ -203,6 +202,7 @@ fn build_diagnose_lines(
         report,
         verbose_rules,
         &result.metrics_input,
+        result.duration.as_secs(),
     );
     if !rule_lines.is_empty() {
         lines.push(String::new());
@@ -1428,8 +1428,6 @@ mod tests {
                 gpu_util_pct: Some(70.0),
                 ..Default::default()
             }],
-
-            host_gpu_count: None,
         };
         let w1 = RuntimeWindow::from_snapshot(mk_snapshot());
         let w2 = RuntimeWindow::from_snapshot(mk_snapshot());
@@ -1467,8 +1465,6 @@ mod tests {
                 gpu_name: Some("Test GPU".into()),
                 ..Default::default()
             }],
-
-            host_gpu_count: None,
         };
         let result = DiagnoseResult {
             snapshot: idle_snap.clone(),
@@ -1512,7 +1508,6 @@ mod tests {
                 gpu_name: Some("Test GPU".into()),
                 ..Default::default()
             }],
-            host_gpu_count: None,
         };
         let result = DiagnoseResult {
             snapshot: idle_snap.clone(),
@@ -1585,7 +1580,6 @@ mod tests {
                     ..Default::default()
                 },
             ],
-            host_gpu_count: Some(2),
         };
         let static_ctx = StaticContext::from_snapshot(&snapshot, VllmConfig::default());
         let result = DiagnoseResult {

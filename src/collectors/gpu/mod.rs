@@ -18,15 +18,6 @@ pub struct GpuScanEntry {
     pub pids: Vec<u32>,
 }
 
-pub fn host_gpu_count() -> Option<u32> {
-    let nv = nvidia::host_gpu_count();
-    if nv.is_some_and(|c| c > 0) {
-        nv
-    } else {
-        amd::host_gpu_count()
-    }
-}
-
 /// Single-shot scan of all GPUs on host. Used by gpu_assignment before profiling starts.
 /// Returns None if no GPU driver is available.
 pub fn scan_host_gpus() -> Option<Vec<GpuScanEntry>> {

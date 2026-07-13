@@ -23,9 +23,7 @@ pub use format::{
     LoadHintParams, format_diagnose_rules_for_windows, idle_diagnose_lines,
     unreachable_diagnose_lines,
 };
-pub use r1_under_batching::{
-    R1EvalInput, R1MissReport, Rule1Outcome, UnderBatchingDetail, r1_recommendation,
-};
+pub use r1_under_batching::{R1EvalInput, Rule1Outcome, UnderBatchingDetail, r1_recommendation};
 pub use r2_kv_cache_pressure::{
     KvAdmissionBacklogDetail, KvCachePressureDetail, Rule2Outcome, r2_recommendation,
     rule2_kv_admission_backlog, rule2_kv_cache_pressure,
@@ -158,13 +156,7 @@ pub struct IssueGroup {
     pub secondary: Vec<Recommendation>,
 }
 
-impl IssueGroup {
-    pub fn score(&self) -> f64 {
-        self.primary.impact as f64 * self.primary.confidence
-    }
-}
-
-const NO_ISSUES_LINE: &str = "No issues detected in this snapshot.";
+const NO_ISSUES_LINE: &str = "No issues detected.";
 
 /// Canonical `Recommendation.rule_name` values, single source of truth for DAG + output coupling.
 pub mod rule_names {

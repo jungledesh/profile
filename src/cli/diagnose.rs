@@ -35,15 +35,19 @@ pub fn execute(
         duration,
     )?;
 
-    output::stdout::print_diagnose_table(&result, verbose_rules);
+    let aggregate_win = context::RuntimeWindow::from_snapshot(result.snapshot.clone());
+    let summary_input = context::AnalysisInput::new(&result.static_ctx, &aggregate_win);
+    let report = engine::build_report_for_diagnose(&result.windows, summary_input);
+    output::stdout::print_diagnose_table_with_report(
+        &result,
+        &report,
+        &aggregate_win,
+        verbose_rules,
+    );
 
     if !result.any_evaluable || result.all_idle {
         return Ok(());
     }
-
-    let aggregate_win = context::RuntimeWindow::from_snapshot(result.snapshot.clone());
-    let summary_input = context::AnalysisInput::new(&result.static_ctx, &aggregate_win);
-    let report = engine::build_report_for_diagnose(&result.windows, summary_input);
 
     profiler::loop_runner::run(
         vllm_metrics_input,

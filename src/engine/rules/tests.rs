@@ -27,7 +27,7 @@ fn format_diagnose_rules_for_windows_test(
     metrics_url: &str,
 ) -> Vec<String> {
     let report = build_report_for_windows(windows, summary);
-    format_diagnose_rules_for_windows(windows, summary, &report, verbose, metrics_url)
+    format_diagnose_rules_for_windows(windows, summary, &report, verbose, metrics_url, 30)
 }
 
 fn snap(
@@ -42,7 +42,6 @@ fn snap(
         timestamp: gpu_at,
         vllm,
         gpus: vec![gpu],
-        host_gpu_count: None,
     }
 }
 
@@ -82,7 +81,6 @@ fn input_r4_suppresses_r2() -> (StaticContext, RuntimeWindow) {
             gpu_util_pct: Some(58.0),
             ..Default::default()
         }],
-        host_gpu_count: None,
     };
     let cfg = VllmConfig {
         dtype: Some("bf16".to_string()),
@@ -693,10 +691,7 @@ fn format_diagnose_rules_no_fires_default_is_only_no_issues_line() {
     let ctx = StaticContext::from_snapshot(&s, cfg);
     let win = mk_win(s);
     let lines = format_diagnose_rules_test(ai(&ctx, &win), false, "http://127.0.0.1:8000/metrics");
-    assert_eq!(
-        lines,
-        vec!["No issues detected in this snapshot.".to_string()]
-    );
+    assert_eq!(lines, vec!["No issues detected.".to_string()]);
 }
 
 #[test]
@@ -877,13 +872,129 @@ fn idle_windows_skipped_in_rule_evaluation() {
     let summary = ai(&ctx, &windows[0]);
     let report = build_report_for_windows(&windows, summary);
     assert_eq!(report.n_eval, 10);
-    assert_eq!(report.skipped, 5);
+    assert_eq!(report.skipped_idle, 5);
+    assert_eq!(report.skipped_broken, 0);
     assert!(
         !report
             .groups
             .iter()
             .any(|g| g.primary.rule_name == rule_names::UNDER_BATCHING)
     );
+}
+
+#[test]
+fn idle_and_broken_skip_counts_preserved_when_n_eval_zero() {
+    let t = SystemTime::UNIX_EPOCH;
+    let mut idle = vllm_base();
+    idle.num_requests_running = Some(0.5);
+    idle.generation_tokens_per_sec = Some(0.0);
+    idle.max_num_seqs = Some(256);
+    let mut broken = vllm_base();
+    broken.num_requests_running = None;
+
+    let mut all_idle = Vec::with_capacity(15);
+    for _ in 0..15 {
+        all_idle.push(mk_win(snap(t, t, idle.clone(), gpu_busy())));
+    }
+    let ctx = mk_ctx();
+    let summary = ai(&ctx, &all_idle[0]);
+    let report = build_report_for_windows(&all_idle, summary);
+    assert_eq!(report.n_eval, 0);
+    assert_eq!(report.skipped_idle, 15);
+    assert_eq!(report.skipped_broken, 0);
+
+    let mut mixed = Vec::with_capacity(15);
+    for _ in 0..14 {
+        mixed.push(mk_win(snap(t, t, idle.clone(), gpu_busy())));
+    }
+    mixed.push(mk_win(snap(t, t, broken, gpu_busy())));
+    let summary = ai(&ctx, &mixed[0]);
+    let report = build_report_for_windows(&mixed, summary);
+    assert_eq!(report.n_eval, 0);
+    assert_eq!(report.skipped_idle, 14);
+    assert_eq!(report.skipped_broken, 1);
+}
+
+#[test]
+fn format_notes_split_idle_vs_telemetry_failure() {
+    let t = SystemTime::UNIX_EPOCH;
+    let mut active = vllm_base();
+    active.num_requests_running = Some(200.0);
+    active.generation_tokens_per_sec = Some(200.0);
+    active.max_num_seqs = Some(256);
+    active.num_requests_waiting = Some(3.0);
+    active.kv_cache_usage_perc = Some(71.2);
+    active.prefix_cache_hit_rate = Some(0.524);
+    active.prompt_tokens_mean = Some(128.0);
+    let mut idle = vllm_base();
+    idle.num_requests_running = Some(0.5);
+    idle.generation_tokens_per_sec = Some(0.0);
+    idle.max_num_seqs = Some(256);
+    let mut broken = vllm_base();
+    broken.num_requests_running = None;
+
+    // 10 active + 5 idle: idle note only, no telemetry failure.
+    let mut windows = Vec::with_capacity(15);
+    for _ in 0..10 {
+        windows.push(mk_win(snap(t, t, active.clone(), gpu_busy())));
+    }
+    for _ in 0..5 {
+        windows.push(mk_win(snap(t, t, idle.clone(), gpu_busy())));
+    }
+    let ctx = mk_ctx();
+    let summary = ai(&ctx, &windows[0]);
+    let text = format_diagnose_rules_for_windows_test(
+        &windows,
+        summary,
+        false,
+        "http://127.0.0.1:8000/metrics",
+    )
+    .join("\n");
+    assert!(
+        text.contains("windows were idle (excluded from analysis)"),
+        "expected idle note, got:\n{text}"
+    );
+    assert!(
+        !text.contains("(telemetry failure)"),
+        "idle skips must not claim telemetry failure:\n{text}"
+    );
+
+    // 10 active + 2 non-evaluable: telemetry failure for exactly 2.
+    let mut windows = Vec::with_capacity(12);
+    for _ in 0..10 {
+        windows.push(mk_win(snap(t, t, active.clone(), gpu_busy())));
+    }
+    for _ in 0..2 {
+        windows.push(mk_win(snap(t, t, broken.clone(), gpu_busy())));
+    }
+    let summary = ai(&ctx, &windows[0]);
+    let text = format_diagnose_rules_for_windows_test(
+        &windows,
+        summary,
+        false,
+        "http://127.0.0.1:8000/metrics",
+    )
+    .join("\n");
+    assert!(
+        text.contains("2 of 12 windows dropped (telemetry failure)"),
+        "expected broken note for 2, got:\n{text}"
+    );
+    assert!(!text.contains("were idle"));
+
+    // All idle: no telemetry failure.
+    let mut windows = Vec::with_capacity(15);
+    for _ in 0..15 {
+        windows.push(mk_win(snap(t, t, idle.clone(), gpu_busy())));
+    }
+    let summary = ai(&ctx, &windows[0]);
+    let text = format_diagnose_rules_for_windows_test(
+        &windows,
+        summary,
+        false,
+        "http://127.0.0.1:8000/metrics",
+    )
+    .join("\n");
+    assert!(!text.contains("(telemetry failure)"));
 }
 
 #[test]
@@ -1588,10 +1699,7 @@ fn format_diagnose_rules_for_windows_no_fires_is_single_no_issues_line() {
         false,
         "http://127.0.0.1:8000/metrics",
     );
-    assert_eq!(
-        lines,
-        vec!["No issues detected in this snapshot.".to_string()]
-    );
+    assert_eq!(lines, vec!["No issues detected.".to_string()]);
 }
 
 #[test]
