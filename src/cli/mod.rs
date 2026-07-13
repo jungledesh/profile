@@ -136,10 +136,6 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
         }
     }
 
-    if cli.verbose > 0 {
-        eprintln!("Verbose level: {}", cli.verbose);
-    }
-
     Ok(())
 }
 

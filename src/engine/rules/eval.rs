@@ -40,7 +40,8 @@ const SUPPRESSION_TABLE: &[(&str, &str)] = &[
 ];
 
 struct WindowRuleEval {
-    skipped: usize,
+    skipped_broken: usize,
+    skipped_idle: usize,
     n_eval: usize,
     r1_fired: usize,
     r1_kv_warning_count: usize,
@@ -116,9 +117,11 @@ fn eval_window_rules(
         return None;
     }
 
-    let mut skipped = 0usize;
+    let mut skipped_broken = 0usize;
+    let mut skipped_idle = 0usize;
     let mut eval = WindowRuleEval {
-        skipped: 0,
+        skipped_broken: 0,
+        skipped_idle: 0,
         n_eval: 0,
         r1_fired: 0,
         r1_kv_warning_count: 0,
@@ -139,8 +142,12 @@ fn eval_window_rules(
     };
 
     for w in windows {
-        if !window_is_evaluable(&w.snapshot) || window_is_idle(&w.snapshot) {
-            skipped += 1;
+        if !window_is_evaluable(&w.snapshot) {
+            skipped_broken += 1;
+            continue;
+        }
+        if window_is_idle(&w.snapshot) {
+            skipped_idle += 1;
             continue;
         }
         eval.n_eval += 1;
@@ -237,7 +244,8 @@ fn eval_window_rules(
         }
     }
 
-    eval.skipped = skipped;
+    eval.skipped_broken = skipped_broken;
+    eval.skipped_idle = skipped_idle;
     Some(eval)
 }
 
@@ -267,7 +275,8 @@ fn build_report_from_eval(
             suppressed_rules: Vec::new(),
             kv_max_seqs,
             n_eval: 0,
-            skipped: 0,
+            skipped_broken: eval.skipped_broken,
+            skipped_idle: eval.skipped_idle,
         };
     }
 
@@ -492,7 +501,14 @@ fn build_report_from_eval(
         recs.push(r4);
     }
 
-    finalize_report_groups(recs, baseline, kv_max_seqs, eval.n_eval, eval.skipped)
+    finalize_report_groups(
+        recs,
+        baseline,
+        kv_max_seqs,
+        eval.n_eval,
+        eval.skipped_broken,
+        eval.skipped_idle,
+    )
 }
 
 pub(crate) fn finalize_report_groups(
@@ -500,7 +516,8 @@ pub(crate) fn finalize_report_groups(
     baseline: Option<baseline::PhysicsBaseline>,
     kv_max_seqs: Option<u32>,
     n_eval: usize,
-    skipped: usize,
+    skipped_broken: usize,
+    skipped_idle: usize,
 ) -> Report {
     let mut suppressed_rules = Vec::new();
     let Some(min_layer) = recs.iter().map(|r| r.layer).min() else {
@@ -510,7 +527,8 @@ pub(crate) fn finalize_report_groups(
             suppressed_rules,
             kv_max_seqs,
             n_eval,
-            skipped,
+            skipped_broken,
+            skipped_idle,
         };
     };
 
@@ -568,7 +586,8 @@ pub(crate) fn finalize_report_groups(
         suppressed_rules,
         kv_max_seqs,
         n_eval,
-        skipped,
+        skipped_broken,
+        skipped_idle,
     }
 }
 
@@ -583,7 +602,8 @@ pub fn build_report_for_windows(windows: &[RuntimeWindow], summary: AnalysisInpu
             suppressed_rules: Vec::new(),
             kv_max_seqs: None,
             n_eval: 0,
-            skipped: windows.len(),
+            skipped_broken: windows.len(),
+            skipped_idle: 0,
         };
     };
     let session_hit_rate = aggregate_prefix_hit_rate_for_windows(windows);

@@ -29,8 +29,6 @@ fn build_input(
             gpu_name: Some(gpu_name.to_string()),
             ..Default::default()
         }],
-
-        host_gpu_count: None,
     };
     let ctx = StaticContext::from_snapshot(&snap, cfg);
     let win = RuntimeWindow::from_snapshot(snap);

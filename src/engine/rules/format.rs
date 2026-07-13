@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
-#[cfg(test)]
-use crate::collectors::window_is_idle;
-use crate::collectors::{RawSnapshot, effective_tensor_parallel, window_is_evaluable};
+use crate::collectors::{
+    RawSnapshot, effective_tensor_parallel, window_is_evaluable, window_is_idle,
+};
 use crate::context::{AnalysisInput, RuntimeWindow};
 use crate::engine::Report;
 use crate::engine::baseline::{CostSource, PhysicsBaseline, WeightDtypeSource};
@@ -90,6 +90,23 @@ struct R4AdvisoryInput {
     weight_gb: Option<f64>,
     weight_dtype_source: WeightDtypeSource,
     tensor_parallel_size: Option<u32>,
+}
+
+fn build_r4_advisory_input(summary: &AnalysisInput<'_>, report: &Report) -> R4AdvisoryInput {
+    R4AdvisoryInput {
+        kv_headroom_gb: report.baseline.as_ref().and_then(|b| b.kv_headroom_gb),
+        gpu_vram_gb: summary.ctx.gpu.vram_gb,
+        weight_gb: report.baseline.as_ref().map(|b| b.weight_gb),
+        weight_dtype_source: report
+            .baseline
+            .as_ref()
+            .map(|b| b.weight_dtype_source)
+            .unwrap_or(WeightDtypeSource::Fallback),
+        tensor_parallel_size: effective_tensor_parallel(
+            summary.ctx.config.tensor_parallel_size,
+            summary.window.snapshot.collected_gpu_count(),
+        ),
+    }
 }
 
 fn collect_advisories(
@@ -266,20 +283,53 @@ fn append_verbose_window_note(
         out.push("Note: No collection windows were recorded.".to_string());
         return;
     }
-    let skipped = windows
+    let skipped_broken = windows
         .iter()
         .filter(|w| !window_is_evaluable(&w.snapshot))
         .count();
-    if skipped == 0 {
+    let skipped_idle = windows
+        .iter()
+        .filter(|w| window_is_idle(&w.snapshot))
+        .count();
+    if skipped_broken == 0 && skipped_idle == 0 {
         return;
     }
-    if idle {
+    if skipped_broken > 0 {
+        if idle {
+            out.push(format!(
+                "Note: {skipped_broken} of {total} collected windows were not evaluable."
+            ));
+        } else {
+            out.push(format!(
+                "Note: {skipped_broken} of {total} windows dropped (telemetry failure). Diagnosis may be incomplete."
+            ));
+        }
+    }
+    if skipped_idle > 0 {
         out.push(format!(
-            "Note: {skipped} of {total} collected windows were not evaluable."
+            "Note: {skipped_idle} of {total} windows were idle (excluded from analysis)."
         ));
-    } else {
+    }
+}
+
+fn append_report_skip_notes(out: &mut Vec<String>, report: &Report, blank_before: bool) {
+    let total = report.n_eval + report.skipped_broken + report.skipped_idle;
+    if report.skipped_broken == 0 && report.skipped_idle == 0 {
+        return;
+    }
+    if blank_before {
+        out.push(String::new());
+    }
+    if report.skipped_broken > 0 {
         out.push(format!(
-            "Note: {skipped} of {total} collected windows dropped. Telemetry failure. Diagnosis may be incomplete."
+            "Note: {} of {} windows dropped (telemetry failure). Diagnosis may be incomplete.",
+            report.skipped_broken, total
+        ));
+    }
+    if report.skipped_idle > 0 {
+        out.push(format!(
+            "Note: {} of {} windows were idle (excluded from analysis).",
+            report.skipped_idle, total
         ));
     }
 }
@@ -402,20 +452,7 @@ pub fn format_diagnose_rules(
         &fired_names,
         snapshot,
         metrics_url,
-        R4AdvisoryInput {
-            kv_headroom_gb: report.baseline.as_ref().and_then(|b| b.kv_headroom_gb),
-            gpu_vram_gb: input.ctx.gpu.vram_gb,
-            weight_gb: report.baseline.as_ref().map(|b| b.weight_gb),
-            weight_dtype_source: report
-                .baseline
-                .as_ref()
-                .map(|b| b.weight_dtype_source)
-                .unwrap_or(WeightDtypeSource::Fallback),
-            tensor_parallel_size: effective_tensor_parallel(
-                input.ctx.config.tensor_parallel_size,
-                input.window.snapshot.collected_gpu_count(),
-            ),
-        },
+        build_r4_advisory_input(&input, report),
     );
     let any_advisory = advisories.any();
     append_display_block(&mut out, advisories.lines);
@@ -447,6 +484,7 @@ pub fn format_diagnose_rules_for_windows(
     report: &Report,
     verbose_rules: bool,
     metrics_url: &str,
+    duration_secs: u64,
 ) -> Vec<String> {
     if report.n_eval == 0 {
         let any_evaluable = windows.iter().any(|w| window_is_evaluable(&w.snapshot));
@@ -455,7 +493,7 @@ pub fn format_diagnose_rules_for_windows(
                 model_name: summary.window.snapshot.vllm.model_name.as_deref(),
                 metrics_url,
                 max_num_seqs: summary.ctx.config.max_num_seqs,
-                duration_secs: 30,
+                duration_secs,
             };
             return idle_diagnose_lines(verbose_rules, windows, &hint);
         }
@@ -471,8 +509,8 @@ pub fn format_diagnose_rules_for_windows(
                  Required: {} evaluable windows. Captured: {}{}.",
                 ENGINE_MIN_PERSISTENT_WINDOWS,
                 report.n_eval,
-                if report.skipped > 0 {
-                    format!(" ({} windows dropped)", report.skipped)
+                if report.skipped_broken > 0 {
+                    format!(" ({} windows dropped)", report.skipped_broken)
                 } else {
                     String::new()
                 }
@@ -485,9 +523,6 @@ pub fn format_diagnose_rules_for_windows(
         return out;
     }
 
-    let total = report.n_eval + report.skipped;
-    let skipped = report.skipped;
-
     let summary_snap = &summary.window.snapshot;
     let baseline_ref = report.baseline.as_ref();
     let tps = summary_snap.vllm.generation_tokens_per_sec;
@@ -498,20 +533,7 @@ pub fn format_diagnose_rules_for_windows(
             &HashSet::new(),
             summary_snap,
             metrics_url,
-            R4AdvisoryInput {
-                kv_headroom_gb: report.baseline.as_ref().and_then(|b| b.kv_headroom_gb),
-                gpu_vram_gb: summary.ctx.gpu.vram_gb,
-                weight_gb: report.baseline.as_ref().map(|b| b.weight_gb),
-                weight_dtype_source: report
-                    .baseline
-                    .as_ref()
-                    .map(|b| b.weight_dtype_source)
-                    .unwrap_or(WeightDtypeSource::Fallback),
-                tensor_parallel_size: effective_tensor_parallel(
-                    summary.ctx.config.tensor_parallel_size,
-                    summary.window.snapshot.collected_gpu_count(),
-                ),
-            },
+            build_r4_advisory_input(&summary, report),
         );
         let any_advisory = advisories.any();
         append_display_block(&mut out, advisories.lines);
@@ -527,11 +549,7 @@ pub fn format_diagnose_rules_for_windows(
         if !any_advisory && !verbose_rules {
             out.push(NO_ISSUES_LINE.to_string());
         }
-        if skipped > 0 {
-            out.push(format!(
-                "Note: {skipped} of {total} windows dropped. Telemetry failure. Diagnosis may be incomplete."
-            ));
-        }
+        append_report_skip_notes(&mut out, report, false);
         trim_trailing_blank_lines(&mut out);
         return out;
     }
@@ -559,20 +577,7 @@ pub fn format_diagnose_rules_for_windows(
         &fired_names,
         summary_snap,
         metrics_url,
-        R4AdvisoryInput {
-            kv_headroom_gb: report.baseline.as_ref().and_then(|b| b.kv_headroom_gb),
-            gpu_vram_gb: summary.ctx.gpu.vram_gb,
-            weight_gb: report.baseline.as_ref().map(|b| b.weight_gb),
-            weight_dtype_source: report
-                .baseline
-                .as_ref()
-                .map(|b| b.weight_dtype_source)
-                .unwrap_or(WeightDtypeSource::Fallback),
-            tensor_parallel_size: effective_tensor_parallel(
-                summary.ctx.config.tensor_parallel_size,
-                summary.window.snapshot.collected_gpu_count(),
-            ),
-        },
+        build_r4_advisory_input(&summary, report),
     );
     let any_advisory = advisories.any();
     let mut out = warnings;
@@ -595,12 +600,7 @@ pub fn format_diagnose_rules_for_windows(
     if !any_warning && !any_advisory && !verbose_rules {
         out.push(NO_ISSUES_LINE.to_string());
     }
-    if skipped > 0 {
-        out.push(String::new());
-        out.push(format!(
-            "Note: {skipped} of {total} windows dropped. Telemetry failure. Diagnosis may be incomplete."
-        ));
-    }
+    append_report_skip_notes(&mut out, report, true);
 
     trim_trailing_blank_lines(&mut out);
     out
@@ -634,10 +634,25 @@ mod load_hint_tests {
             vllm: VllmRawMetrics {
                 num_requests_running: Some(0.0),
                 generation_tokens_per_sec: Some(0.0),
+                window_duration_secs: Some(2.0),
                 ..Default::default()
             },
             gpus: vec![GpuRawMetrics::default()],
-            host_gpu_count: None,
+        })
+    }
+
+    fn broken_window() -> RuntimeWindow {
+        let t = SystemTime::UNIX_EPOCH;
+        RuntimeWindow::from_snapshot(RawSnapshot {
+            gpu_observed_at: t,
+            vllm_observed_at: t,
+            timestamp: t,
+            vllm: VllmRawMetrics {
+                num_requests_running: None,
+                generation_tokens_per_sec: Some(0.0),
+                ..Default::default()
+            },
+            gpus: vec![GpuRawMetrics::default()],
         })
     }
 
@@ -745,7 +760,7 @@ mod load_hint_tests {
     }
 
     #[test]
-    fn load_hint_verbose_appends_drop_note() {
+    fn load_hint_verbose_appends_idle_note() {
         let windows = vec![idle_window(), idle_window()];
         let hint = LoadHintParams {
             model_name: Some("m"),
@@ -756,8 +771,8 @@ mod load_hint_tests {
         let text = idle_diagnose_lines(true, &windows, &hint).join("\n");
         assert!(text.contains("Server is idle"));
         assert!(text.contains("benchmark_serving.py"));
-        assert!(text.contains("Note: 2 of 2 collected windows were not evaluable."));
-        assert!(!text.contains("Telemetry failure"));
+        assert!(text.contains("Note: 2 of 2 windows were idle (excluded from analysis)."));
+        assert!(!text.contains("(telemetry failure)"));
     }
 
     #[test]
@@ -787,13 +802,23 @@ mod load_hint_tests {
 
     #[test]
     fn test_unreachable_verbose_shows_dropped_count() {
-        let windows = vec![idle_window(), idle_window()];
+        let windows = vec![broken_window(), broken_window()];
         let text =
             unreachable_diagnose_lines(true, &windows, "http://localhost:8000/metrics").join("\n");
         assert!(text.contains("[!] Telemetry Failure"));
         assert!(text.contains(
-            "Note: 2 of 2 collected windows dropped. Telemetry failure. Diagnosis may be incomplete."
+            "Note: 2 of 2 windows dropped (telemetry failure). Diagnosis may be incomplete."
         ));
+    }
+
+    #[test]
+    fn test_unreachable_verbose_idle_windows_not_labeled_failure() {
+        let windows = vec![idle_window(), idle_window()];
+        let text =
+            unreachable_diagnose_lines(true, &windows, "http://localhost:8000/metrics").join("\n");
+        assert!(text.contains("[!] Telemetry Failure"));
+        assert!(text.contains("Note: 2 of 2 windows were idle (excluded from analysis)."));
+        assert!(!text.contains("(telemetry failure)"));
     }
 
     #[test]
@@ -821,10 +846,7 @@ mod load_hint_tests {
 
     #[test]
     fn idle_evaluable_window_is_detected() {
-        let mut w = idle_window();
-        w.snapshot.vllm.window_duration_secs = Some(2.0);
-        w.snapshot.vllm.num_requests_running = Some(0.0);
-        w.snapshot.vllm.generation_tokens_per_sec = Some(0.0);
+        let w = idle_window();
         assert!(window_is_evaluable(&w.snapshot));
         assert!(window_is_idle(&w.snapshot));
     }
@@ -832,7 +854,6 @@ mod load_hint_tests {
     #[test]
     fn active_window_is_not_idle() {
         let mut w = idle_window();
-        w.snapshot.vllm.window_duration_secs = Some(2.0);
         w.snapshot.vllm.num_requests_running = Some(5.0);
         w.snapshot.vllm.generation_tokens_per_sec = Some(100.0);
         assert!(window_is_evaluable(&w.snapshot));

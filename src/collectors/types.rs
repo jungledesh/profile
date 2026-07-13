@@ -232,8 +232,6 @@ pub struct RawSnapshot {
     pub timestamp: SystemTime,
     pub vllm: VllmRawMetrics,
     pub gpus: Vec<GpuRawMetrics>,
-    /// GPU count on this host. None when driver is unavailable.
-    pub host_gpu_count: Option<u32>,
 }
 
 impl Default for RawSnapshot {
@@ -244,7 +242,6 @@ impl Default for RawSnapshot {
             timestamp: SystemTime::UNIX_EPOCH,
             vllm: VllmRawMetrics::default(),
             gpus: Vec::new(),
-            host_gpu_count: None,
         }
     }
 }
@@ -477,7 +474,6 @@ mod window_evaluable_tests {
                 ..Default::default()
             },
             gpus: vec![],
-            host_gpu_count: None,
         }
     }
 
@@ -548,7 +544,6 @@ mod window_active_tests {
                 gpu_util_pct: gpu,
                 ..Default::default()
             }],
-            host_gpu_count: None,
         }
     }
 

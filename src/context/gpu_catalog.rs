@@ -4,6 +4,7 @@
 /// in the normalized GPU name (lowercase, non-alphanumeric → space).
 /// Entries are ordered most-specific to least-specific so the first match wins.
 pub struct GpuCatalogEntry {
+    /// Test-only discriminator to verify token matching order.
     pub arch: &'static str,
     /// BF16/FP16 Tensor Core TFLOPS. Used for prefill roofline ceiling.
     pub peak_flops_tc_tflops: f64,
@@ -208,6 +209,7 @@ static CATALOG: &[GpuEntry] = &[
         entry: GpuCatalogEntry {
             arch: "cdna3",
             peak_flops_tc_tflops: 980.6,
+            // 5300 GB/s is total HBM3 bandwidth shared with CPU; GPU-available portion depends on workload.
             peak_bw_gbps: 5300.0,
         },
     },

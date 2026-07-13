@@ -21,7 +21,8 @@ pub struct Report {
     pub suppressed_rules: Vec<(&'static str, &'static str)>,
     pub kv_max_seqs: Option<u32>,
     pub n_eval: usize,
-    pub skipped: usize,
+    pub skipped_broken: usize,
+    pub skipped_idle: usize,
 }
 
 /// Multi-window diagnose report. Production always collects >= 15 windows (min duration 30s).
@@ -49,7 +50,8 @@ pub(crate) fn build_report(input: AnalysisInput<'_>) -> Report {
             suppressed_rules: Vec::new(),
             kv_max_seqs: None,
             n_eval: 0,
-            skipped: 1,
+            skipped_broken: 1,
+            skipped_idle: 0,
         };
     }
 
@@ -139,7 +141,7 @@ pub(crate) fn build_report(input: AnalysisInput<'_>) -> Report {
         recs.push(r);
     }
 
-    rules::finalize_report_groups(recs, baseline, kv_max_seqs, 1, 0)
+    rules::finalize_report_groups(recs, baseline, kv_max_seqs, 1, 0, 0)
 }
 
 fn maybe_add_massive_underutilization(
@@ -245,7 +247,6 @@ mod build_report_tests {
             timestamp: t,
             vllm: v,
             gpus: vec![g],
-            host_gpu_count: None,
         };
         let cfg = VllmConfig {
             dtype: Some("bf16".to_string()),
@@ -298,7 +299,6 @@ mod build_report_tests {
             timestamp: t,
             vllm: v,
             gpus: vec![g],
-            host_gpu_count: None,
         };
         let cfg = VllmConfig {
             dtype: Some("bf16".to_string()),
@@ -351,7 +351,6 @@ mod build_report_tests {
             timestamp: t,
             vllm: v,
             gpus: vec![g],
-            host_gpu_count: None,
         };
         let cfg = VllmConfig {
             dtype: Some("bf16".to_string()),
@@ -396,7 +395,6 @@ mod build_report_tests {
             timestamp: t,
             vllm: v,
             gpus: vec![g],
-            host_gpu_count: None,
         };
         let cfg = VllmConfig {
             dtype: Some("bf16".to_string()),

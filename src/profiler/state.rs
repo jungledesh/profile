@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use crate::engine::{Recommendation, Report};
+use crate::engine::Report;
 
 use super::DiagnoseResult;
 
@@ -26,16 +26,17 @@ pub struct LoopState {
 impl LoopState {
     pub fn new(result: DiagnoseResult, report: Report) -> Self {
         let mut history = VecDeque::with_capacity(MAX_LOOP_ITERATIONS);
+        let last_efficiency_pct = report.baseline.as_ref().and_then(|b| b.efficiency_pct);
         history.push_back(IterationRecord {
             result,
-            report: report.clone(),
+            report,
             recommendation_shown: None,
         });
         Self {
             history,
             rec_history: VecDeque::with_capacity(OSCILLATION_WINDOW + 1),
             midpoint_suggested: false,
-            last_efficiency_pct: report.baseline.as_ref().and_then(|b| b.efficiency_pct),
+            last_efficiency_pct,
             plateau_count: 0,
         }
     }
@@ -68,15 +69,6 @@ impl LoopState {
 
     pub fn last(&self) -> Option<&IterationRecord> {
         self.history.back()
-    }
-
-    pub fn prev(&self) -> Option<&IterationRecord> {
-        let len = self.history.len();
-        if len >= 2 {
-            self.history.get(len - 2)
-        } else {
-            None
-        }
     }
 
     pub fn record_recommendation(&mut self, rule_name: &'static str) {
@@ -113,10 +105,6 @@ impl LoopState {
         self.history.len().saturating_sub(1)
     }
 
-    pub fn current_primary_recommendation(&self) -> Option<&Recommendation> {
-        self.last()?.report.groups.first().map(|g| &g.primary)
-    }
-
     pub fn update_efficiency_plateau(&mut self, current_eff: Option<f64>, delta: f64) -> u32 {
         match (self.last_efficiency_pct, current_eff) {
             (Some(prev), Some(cur)) if (cur - prev).abs() < delta => {
@@ -145,7 +133,8 @@ mod tests {
             suppressed_rules: Vec::new(),
             kv_max_seqs: None,
             n_eval: 0,
-            skipped: 0,
+            skipped_broken: 0,
+            skipped_idle: 0,
         }
     }
 
@@ -173,8 +162,6 @@ mod tests {
                 timestamp: SystemTime::UNIX_EPOCH,
                 vllm: VllmRawMetrics::default(),
                 gpus: vec![],
-
-                host_gpu_count: None,
             },
             windows: Vec::new(),
             static_ctx: StaticContext::default(),
@@ -195,7 +182,8 @@ mod tests {
             suppressed_rules: Vec::new(),
             kv_max_seqs: None,
             n_eval: 1,
-            skipped: 0,
+            skipped_broken: 0,
+            skipped_idle: 0,
         };
         let mut s = LoopState::new(r, rep);
         s.record_recommendation("under_batching");
@@ -213,7 +201,8 @@ mod tests {
             suppressed_rules: Vec::new(),
             kv_max_seqs: None,
             n_eval: 1,
-            skipped: 0,
+            skipped_broken: 0,
+            skipped_idle: 0,
         };
         let mut s = LoopState::new(r, rep);
         s.record_recommendation("under_batching");

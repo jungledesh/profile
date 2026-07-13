@@ -8,6 +8,7 @@
 /// param_count and active_param_count are in raw parameter counts (not billions).
 /// e.g. 8B → 8_000_000_000u64.
 pub struct CatalogEntry {
+    /// Test-only discriminator to verify token matching order.
     pub family: &'static str,
     /// Total parameter count.
     pub param_count: u64,
@@ -15,7 +16,6 @@ pub struct CatalogEntry {
     pub active_param_count: Option<u64>,
     pub num_layers: u32,
     pub hidden_dim: u32,
-    pub is_moe: bool,
     pub default_weight_dtype: &'static str,
     /// Number of KV heads (num_key_value_heads from config.json).
     /// None for MLA (DeepSeek V3/R1), interleaved attention (Llama 4), or any
@@ -59,7 +59,6 @@ static CATALOG: &[ModelEntry] = &[
             active_param_count: Some(17 * B),
             num_layers: 48,
             hidden_dim: 5120,
-            is_moe: true,
             default_weight_dtype: "bf16",
             num_kv_heads: None,
             head_dim: None,
@@ -76,7 +75,6 @@ static CATALOG: &[ModelEntry] = &[
             active_param_count: Some(17 * B),
             num_layers: 48,
             hidden_dim: 5120,
-            is_moe: true,
             default_weight_dtype: "bf16",
             num_kv_heads: None,
             head_dim: None,
@@ -93,7 +91,6 @@ static CATALOG: &[ModelEntry] = &[
             active_param_count: None,
             num_layers: 80,
             hidden_dim: 8192,
-            is_moe: false,
             default_weight_dtype: "bf16",
             num_kv_heads: Some(8),
             head_dim: Some(128),
@@ -109,7 +106,6 @@ static CATALOG: &[ModelEntry] = &[
             active_param_count: None,
             num_layers: 32,
             hidden_dim: 4096,
-            is_moe: false,
             default_weight_dtype: "bf16",
             num_kv_heads: Some(8),
             head_dim: Some(128),
@@ -128,7 +124,6 @@ static CATALOG: &[ModelEntry] = &[
             active_param_count: None,
             num_layers: 126,
             hidden_dim: 16384,
-            is_moe: false,
             default_weight_dtype: "bf16",
             num_kv_heads: Some(8),
             head_dim: Some(128),
@@ -144,7 +139,6 @@ static CATALOG: &[ModelEntry] = &[
             active_param_count: None,
             num_layers: 80,
             hidden_dim: 8192,
-            is_moe: false,
             default_weight_dtype: "bf16",
             num_kv_heads: Some(8),
             head_dim: Some(128),
@@ -160,7 +154,6 @@ static CATALOG: &[ModelEntry] = &[
             active_param_count: None,
             num_layers: 32,
             hidden_dim: 4096,
-            is_moe: false,
             default_weight_dtype: "bf16",
             num_kv_heads: Some(8),
             head_dim: Some(128),
@@ -177,7 +170,6 @@ static CATALOG: &[ModelEntry] = &[
             active_param_count: Some(22 * B),
             num_layers: 94,
             hidden_dim: 7168,
-            is_moe: true,
             default_weight_dtype: "bf16",
             num_kv_heads: Some(4),
             head_dim: Some(128),
@@ -194,7 +186,6 @@ static CATALOG: &[ModelEntry] = &[
             active_param_count: Some(3 * B),
             num_layers: 48,
             hidden_dim: 2048,
-            is_moe: true,
             default_weight_dtype: "bf16",
             num_kv_heads: None,
             head_dim: None,
@@ -215,7 +206,6 @@ static CATALOG: &[ModelEntry] = &[
             active_param_count: None,
             num_layers: 64,
             hidden_dim: 5120,
-            is_moe: false,
             default_weight_dtype: "bf16",
             num_kv_heads: Some(8),
             head_dim: Some(128),
@@ -232,7 +222,6 @@ static CATALOG: &[ModelEntry] = &[
             active_param_count: None,
             num_layers: 80,
             hidden_dim: 8192,
-            is_moe: false,
             default_weight_dtype: "bf16",
             num_kv_heads: Some(8),
             head_dim: Some(128),
@@ -248,7 +237,6 @@ static CATALOG: &[ModelEntry] = &[
             active_param_count: None,
             num_layers: 64,
             hidden_dim: 5120,
-            is_moe: false,
             default_weight_dtype: "bf16",
             num_kv_heads: Some(8),
             head_dim: Some(128),
@@ -264,7 +252,6 @@ static CATALOG: &[ModelEntry] = &[
             active_param_count: None,
             num_layers: 40,
             hidden_dim: 5120,
-            is_moe: false,
             default_weight_dtype: "bf16",
             num_kv_heads: Some(8),
             head_dim: Some(128),
@@ -280,7 +267,6 @@ static CATALOG: &[ModelEntry] = &[
             active_param_count: None,
             num_layers: 28,
             hidden_dim: 3584,
-            is_moe: false,
             default_weight_dtype: "bf16",
             num_kv_heads: Some(4),
             head_dim: Some(128),
@@ -297,7 +283,6 @@ static CATALOG: &[ModelEntry] = &[
             active_param_count: None,
             num_layers: 80,
             hidden_dim: 8192,
-            is_moe: false,
             default_weight_dtype: "bf16",
             num_kv_heads: Some(8),
             head_dim: Some(128),
@@ -313,7 +298,6 @@ static CATALOG: &[ModelEntry] = &[
             active_param_count: None,
             num_layers: 64,
             hidden_dim: 5120,
-            is_moe: false,
             default_weight_dtype: "bf16",
             num_kv_heads: Some(8),
             head_dim: Some(128),
@@ -329,7 +313,6 @@ static CATALOG: &[ModelEntry] = &[
             active_param_count: None,
             num_layers: 48,
             hidden_dim: 5120,
-            is_moe: false,
             default_weight_dtype: "bf16",
             num_kv_heads: Some(8),
             head_dim: Some(128),
@@ -345,7 +328,6 @@ static CATALOG: &[ModelEntry] = &[
             active_param_count: None,
             num_layers: 28,
             hidden_dim: 3584,
-            is_moe: false,
             default_weight_dtype: "bf16",
             num_kv_heads: Some(4),
             head_dim: Some(128),
@@ -365,7 +347,6 @@ static CATALOG: &[ModelEntry] = &[
             active_param_count: Some(37 * B),
             num_layers: 61,
             hidden_dim: 7168,
-            is_moe: true,
             default_weight_dtype: "bf16",
             num_kv_heads: None,
             head_dim: None,
@@ -382,7 +363,6 @@ static CATALOG: &[ModelEntry] = &[
             active_param_count: Some(37 * B),
             num_layers: 61,
             hidden_dim: 7168,
-            is_moe: true,
             default_weight_dtype: "bf16",
             num_kv_heads: None,
             head_dim: None,
@@ -399,7 +379,6 @@ static CATALOG: &[ModelEntry] = &[
             active_param_count: Some(37 * B),
             num_layers: 61,
             hidden_dim: 7168,
-            is_moe: true,
             default_weight_dtype: "bf16",
             num_kv_heads: None,
             head_dim: None,
@@ -415,7 +394,6 @@ static CATALOG: &[ModelEntry] = &[
             active_param_count: None,
             num_layers: 80,
             hidden_dim: 8192,
-            is_moe: false,
             default_weight_dtype: "bf16",
             num_kv_heads: None,
             head_dim: None,
@@ -431,7 +409,6 @@ static CATALOG: &[ModelEntry] = &[
             active_param_count: None,
             num_layers: 30,
             hidden_dim: 4096,
-            is_moe: false,
             default_weight_dtype: "bf16",
             num_kv_heads: None,
             head_dim: None,
@@ -449,7 +426,6 @@ static CATALOG: &[ModelEntry] = &[
             active_param_count: Some(41 * B),
             num_layers: 88,
             hidden_dim: 8192,
-            is_moe: true,
             default_weight_dtype: "bf16",
             num_kv_heads: Some(8),
             head_dim: Some(128),
@@ -466,7 +442,6 @@ static CATALOG: &[ModelEntry] = &[
             active_param_count: None,
             num_layers: 88,
             hidden_dim: 8192,
-            is_moe: false,
             default_weight_dtype: "bf16",
             num_kv_heads: Some(8),
             head_dim: Some(128),
@@ -483,7 +458,6 @@ static CATALOG: &[ModelEntry] = &[
             active_param_count: None,
             num_layers: 88,
             hidden_dim: 8192,
-            is_moe: false,
             default_weight_dtype: "bf16",
             num_kv_heads: Some(8),
             head_dim: Some(128),
@@ -501,7 +475,6 @@ static CATALOG: &[ModelEntry] = &[
             active_param_count: Some(39 * B),
             num_layers: 56,
             hidden_dim: 6144,
-            is_moe: true,
             default_weight_dtype: "bf16",
             num_kv_heads: Some(8),
             head_dim: Some(128),
@@ -518,7 +491,6 @@ static CATALOG: &[ModelEntry] = &[
             active_param_count: Some(13 * B),
             num_layers: 32,
             hidden_dim: 4096,
-            is_moe: true,
             default_weight_dtype: "bf16",
             num_kv_heads: Some(8),
             head_dim: Some(128),
@@ -535,7 +507,6 @@ static CATALOG: &[ModelEntry] = &[
             active_param_count: None,
             num_layers: 32,
             hidden_dim: 4096,
-            is_moe: false,
             default_weight_dtype: "bf16",
             num_kv_heads: Some(8),
             head_dim: Some(128),
@@ -558,7 +529,6 @@ static CATALOG: &[ModelEntry] = &[
             active_param_count: None,
             num_layers: 60,
             hidden_dim: 5376,
-            is_moe: false,
             default_weight_dtype: "bf16",
             num_kv_heads: None,
             head_dim: None,
@@ -574,7 +544,6 @@ static CATALOG: &[ModelEntry] = &[
             active_param_count: None,
             num_layers: 60,
             hidden_dim: 5376,
-            is_moe: false,
             default_weight_dtype: "bf16",
             num_kv_heads: None,
             head_dim: None,
@@ -591,7 +560,6 @@ static CATALOG: &[ModelEntry] = &[
             active_param_count: Some(4 * B),
             num_layers: 30,   // Verified from HF config
             hidden_dim: 2816, // Verified from HF config
-            is_moe: true,
             default_weight_dtype: "bf16",
             num_kv_heads: None,
             head_dim: None,
@@ -608,7 +576,6 @@ static CATALOG: &[ModelEntry] = &[
             active_param_count: None,
             num_layers: 46,
             hidden_dim: 4608,
-            is_moe: false,
             default_weight_dtype: "bf16",
             num_kv_heads: Some(16),
             head_dim: Some(128),
@@ -625,7 +592,6 @@ static CATALOG: &[ModelEntry] = &[
             active_param_count: None,
             num_layers: 42,
             hidden_dim: 3584,
-            is_moe: false,
             default_weight_dtype: "bf16",
             num_kv_heads: Some(8),
             head_dim: Some(256),
@@ -643,7 +609,6 @@ static CATALOG: &[ModelEntry] = &[
             active_param_count: Some(32 * B),
             num_layers: 61,
             hidden_dim: 7168,
-            is_moe: true,
             default_weight_dtype: "bf16",
             num_kv_heads: None,
             head_dim: None,
@@ -661,7 +626,6 @@ static CATALOG: &[ModelEntry] = &[
             active_param_count: Some(56 * B),
             num_layers: 80,
             hidden_dim: 8192,
-            is_moe: true,
             default_weight_dtype: "bf16",
             num_kv_heads: None,
             head_dim: None,
@@ -678,7 +642,6 @@ static CATALOG: &[ModelEntry] = &[
             active_param_count: None,
             num_layers: 64,
             hidden_dim: 5120,
-            is_moe: false,
             default_weight_dtype: "bf16",
             num_kv_heads: None,
             head_dim: None,
@@ -697,7 +660,6 @@ static CATALOG: &[ModelEntry] = &[
             active_param_count: None,
             num_layers: 40,
             hidden_dim: 5120,
-            is_moe: false,
             default_weight_dtype: "bf16",
             num_kv_heads: Some(10),
             head_dim: Some(128),
@@ -714,7 +676,6 @@ static CATALOG: &[ModelEntry] = &[
             active_param_count: None,
             num_layers: 40,
             hidden_dim: 5120,
-            is_moe: false,
             default_weight_dtype: "bf16",
             num_kv_heads: Some(10),
             head_dim: Some(128),
@@ -766,7 +727,7 @@ mod tests {
             let e = lookup_model(name).unwrap_or_else(|| panic!("no match for {name}"));
             assert_eq!(e.family, "llama3");
             assert_eq!(e.param_count, 70 * B);
-            assert!(!e.is_moe);
+            assert!(e.active_param_count.is_none());
         }
     }
 
@@ -776,7 +737,7 @@ mod tests {
             .expect("should match maverick");
         assert_eq!(e.family, "llama4");
         assert_eq!(e.active_param_count, Some(17 * B));
-        assert!(e.is_moe);
+        assert!(e.active_param_count.is_some());
     }
 
     #[test]
@@ -784,7 +745,7 @@ mod tests {
         let e =
             lookup_model("meta-llama/Llama-4-Scout-17B-16E-Instruct").expect("should match scout");
         assert_eq!(e.family, "llama4");
-        assert!(e.is_moe);
+        assert!(e.active_param_count.is_some());
     }
 
     #[test]
@@ -793,7 +754,7 @@ mod tests {
         assert_eq!(e.family, "qwen3");
         assert_eq!(e.param_count, 235 * B);
         assert_eq!(e.active_param_count, Some(22 * B));
-        assert!(e.is_moe);
+        assert!(e.active_param_count.is_some());
     }
 
     #[test]
@@ -801,7 +762,7 @@ mod tests {
         let e = lookup_model("Qwen/Qwen2.5-72B-Instruct").expect("no match");
         assert_eq!(e.family, "qwen2.5");
         assert_eq!(e.param_count, 72 * B);
-        assert!(!e.is_moe);
+        assert!(e.active_param_count.is_none());
     }
 
     #[test]
@@ -809,7 +770,7 @@ mod tests {
         let e = lookup_model("deepseek-ai/DeepSeek-R1").expect("no match");
         assert_eq!(e.family, "deepseek");
         assert_eq!(e.param_count, 671 * B);
-        assert!(e.is_moe);
+        assert!(e.active_param_count.is_some());
     }
 
     #[test]
@@ -817,7 +778,7 @@ mod tests {
         let e = lookup_model("deepseek-ai/DeepSeek-V3").expect("no match");
         assert_eq!(e.family, "deepseek");
         assert_eq!(e.param_count, 671 * B);
-        assert!(e.is_moe);
+        assert!(e.active_param_count.is_some());
     }
 
     #[test]
@@ -825,7 +786,7 @@ mod tests {
         let e = lookup_model("mistralai/Mixtral-8x7B-Instruct-v0.1").expect("no match");
         assert_eq!(e.family, "mistral");
         assert_eq!(e.param_count, 47 * B);
-        assert!(e.is_moe);
+        assert!(e.active_param_count.is_some());
     }
 
     #[test]
@@ -833,7 +794,7 @@ mod tests {
         let e = lookup_model("mistralai/Mixtral-8x22B-Instruct-v0.1").expect("no match");
         assert_eq!(e.family, "mistral");
         assert_eq!(e.param_count, 141 * B);
-        assert!(e.is_moe);
+        assert!(e.active_param_count.is_some());
     }
 
     #[test]
@@ -841,7 +802,7 @@ mod tests {
         let e = lookup_model("mistralai/Mistral-Large-Instruct-2411").expect("no match");
         assert_eq!(e.family, "mistral");
         assert_eq!(e.param_count, 123 * B);
-        assert!(!e.is_moe);
+        assert!(e.active_param_count.is_none());
     }
 
     #[test]
@@ -856,7 +817,7 @@ mod tests {
         let e = lookup_model("moonshotai/Kimi-K2-Instruct").expect("no match");
         assert_eq!(e.family, "kimi");
         assert_eq!(e.param_count, 1_000 * B);
-        assert!(e.is_moe);
+        assert!(e.active_param_count.is_some());
     }
 
     #[test]
@@ -871,7 +832,7 @@ mod tests {
         let e = lookup_model("Qwen/Qwen3.6-27B").expect("no match");
         assert_eq!(e.family, "qwen3.6");
         assert_eq!(e.param_count, 27 * B);
-        assert!(!e.is_moe);
+        assert!(e.active_param_count.is_none());
         assert_eq!(e.num_layers, 64);
         assert_eq!(e.hidden_dim, 5120);
         assert_eq!(e.num_kv_heads, Some(8));
@@ -893,7 +854,7 @@ mod tests {
         let e = lookup_model("gemma-4-31b-it-bf16.gguf").expect("no match");
         assert_eq!(e.family, "gemma4");
         assert_eq!(e.param_count, 31 * B);
-        assert!(!e.is_moe);
+        assert!(e.active_param_count.is_none());
     }
 
     #[test]
@@ -902,7 +863,7 @@ mod tests {
         assert_eq!(e.family, "gemma4");
         assert_eq!(e.param_count, 26 * B);
         assert_eq!(e.active_param_count, Some(4 * B));
-        assert!(e.is_moe);
+        assert!(e.active_param_count.is_some());
     }
 
     #[test]

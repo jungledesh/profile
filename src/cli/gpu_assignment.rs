@@ -152,9 +152,14 @@ fn resolve_gpu_assignment_inner(
             {
                 anyhow::bail!("--tensor-parallel-size {tp} exceeds detected GPU count (1).")
             }
+            let idx = scan
+                .as_ref()
+                .and_then(|s| s.first())
+                .map(|e| e.idx)
+                .unwrap_or(0);
             Ok(GpuAssignment {
                 tp: 1,
-                indices: vec![0],
+                indices: vec![idx],
             })
         }
         Some(n) => {
@@ -603,6 +608,21 @@ mod tests {
                 indices: vec![0],
             }
         );
+    }
+
+    #[test]
+    fn single_gpu_uses_scan_index_not_hardcoded_zero() {
+        let scan = Some(vec![GpuScanEntry {
+            idx: 2, // GPU at device path index 2 (paths 0 and 1 failed init)
+            name: "AMD Instinct MI300X".into(),
+            vram_used_mb: 100,
+            vram_total_mb: 196608,
+            pids: vec![],
+        }]);
+        let result =
+            resolve_gpu_assignment_inner(Some(1), scan, None, "http://localhost:8000/metrics")
+                .expect("should succeed");
+        assert_eq!(result.indices, vec![2]);
     }
 
     #[test]

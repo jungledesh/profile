@@ -422,7 +422,7 @@ pub(crate) fn merge_p99_bucket_vecs(vecs: &[&[HistogramCount]]) -> Vec<Histogram
         .collect()
 }
 
-/// `first` = scrape from sample 1, `last` = scrape from sample [`SAMPLE_COUNT`] (~2s later).
+/// `first` = scrape from the first sample, `last` = scrape from the final sample in the window.
 fn apply_histogram_window(first: &Scrape, last: &Scrape, m: &mut VllmRawMetrics) {
     m.ttft_window_mass = histogram_window_mass(first, last, "vllm_time_to_first_token_seconds");
     m.tpot_window_mass = tpot_window_mass(first, last);

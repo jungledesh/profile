@@ -1,6 +1,8 @@
 use crate::collectors::RawSnapshot;
 
-use super::{MAX_OBSERVATION_SKEW_SECS, Recommendation, rule_names, skew_secs};
+use super::{MAX_OBSERVATION_SKEW_SECS, skew_secs};
+#[cfg(test)]
+use super::{Recommendation, rule_names};
 
 /// 88% matches observed vLLM production eviction onset; 85% was too conservative.
 const KV_CACHE_PRESSURE_MIN_PERC: f64 = 88.0;
@@ -213,6 +215,7 @@ pub fn rule2_kv_cache_pressure(snapshot: &RawSnapshot) -> Rule2Outcome {
     })
 }
 
+#[cfg(test)]
 pub fn r2_recommendation(
     snapshot: &RawSnapshot,
     max_model_len: Option<u32>,
@@ -571,8 +574,6 @@ mod tests {
             timestamp: SystemTime::UNIX_EPOCH,
             vllm,
             gpus: vec![],
-
-            host_gpu_count: None,
         }
     }
 

@@ -1,6 +1,8 @@
 use crate::collectors::RawSnapshot;
 
+#[cfg(test)]
 use super::Recommendation;
+#[cfg(test)]
 use super::rule_names;
 
 const PREFIX_HIT_RATE_LT: f64 = 0.35;
@@ -82,6 +84,7 @@ pub fn rule3_low_prefix_reuse(snapshot: &RawSnapshot) -> Rule3Outcome {
     })
 }
 
+#[cfg(test)]
 pub fn r3_recommendation(snapshot: &RawSnapshot) -> Option<Recommendation> {
     let Rule3Outcome::Fired(d) = rule3_low_prefix_reuse(snapshot) else {
         return None;
@@ -241,8 +244,6 @@ mod tests {
             timestamp: t,
             vllm: v,
             gpus: vec![],
-
-            host_gpu_count: None,
         }
     }
 

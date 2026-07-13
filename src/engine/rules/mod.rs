@@ -23,24 +23,17 @@ pub use format::{
     LoadHintParams, format_diagnose_rules_for_windows, idle_diagnose_lines,
     unreachable_diagnose_lines,
 };
-pub use r1_under_batching::{
-    R1EvalInput, R1MissReport, Rule1Outcome, UnderBatchingDetail, r1_recommendation,
-};
-pub use r2_kv_cache_pressure::{
-    KvAdmissionBacklogDetail, KvCachePressureDetail, Rule2Outcome, r2_recommendation,
-    rule2_kv_admission_backlog, rule2_kv_cache_pressure,
-};
-pub use r3_low_prefix_reuse::{
-    LowPrefixReuseDetail, Rule3Outcome, r3_recommendation, rule3_low_prefix_reuse,
-};
+#[cfg(test)]
+pub(crate) use r1_under_batching::{R1EvalInput, Rule1Outcome, r1_recommendation};
+#[cfg(test)]
+pub(crate) use r2_kv_cache_pressure::{Rule2Outcome, r2_recommendation, rule2_kv_cache_pressure};
+#[cfg(test)]
+pub(crate) use r3_low_prefix_reuse::{LowPrefixReuseDetail, Rule3Outcome, r3_recommendation};
 pub use r4_oom_risk::{r4_advisory, r4_recommendation};
-pub use r5_concurrency_saturation::{
-    ConcurrencySaturationDetail, r5_recommendation, rule5_concurrency_saturation,
-};
-pub use r6_prefill_bound::{
-    PrefillBoundDetail, PrefillBoundEvalInput, Rule6Outcome, r6_recommendation,
-};
-pub use r7_config_headroom::{ConfigHeadroomDetail, rule7_config_headroom};
+#[cfg(test)]
+pub(crate) use r5_concurrency_saturation::r5_recommendation;
+#[cfg(test)]
+pub(crate) use r6_prefill_bound::{PrefillBoundEvalInput, r6_recommendation};
 
 pub(super) const MAX_OBSERVATION_SKEW_SECS: f64 = 1.0;
 /// Enforces >= 6s temporal substance (3 windows × 2s).
@@ -158,13 +151,7 @@ pub struct IssueGroup {
     pub secondary: Vec<Recommendation>,
 }
 
-impl IssueGroup {
-    pub fn score(&self) -> f64 {
-        self.primary.impact as f64 * self.primary.confidence
-    }
-}
-
-const NO_ISSUES_LINE: &str = "No issues detected in this snapshot.";
+const NO_ISSUES_LINE: &str = "No issues detected.";
 
 /// Canonical `Recommendation.rule_name` values, single source of truth for DAG + output coupling.
 pub mod rule_names {
