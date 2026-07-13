@@ -1,7 +1,9 @@
 use crate::collectors::RawSnapshot;
 use crate::fmt::fmt_seconds_from_ms;
 
+#[cfg(test)]
 use super::Recommendation;
+#[cfg(test)]
 use super::rule_names;
 
 /// Minimum ratio of (waiting / total active) confirming the cap is structurally bottlenecking.
@@ -295,6 +297,7 @@ pub(super) fn format_concurrency_saturation_window_issue(
     )
 }
 
+#[cfg(test)]
 pub fn r5_recommendation(
     snapshot: &RawSnapshot,
     kv_cache_usage_perc: Option<f64>,

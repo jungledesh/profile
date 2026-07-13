@@ -1,7 +1,9 @@
 use crate::collectors::RawSnapshot;
 
+#[cfg(test)]
 use super::Recommendation;
 use super::r6_prefill_bound::effective_prompt_tps;
+#[cfg(test)]
 use super::rule_names;
 
 /// Occupancy ceiling: R1 does not fire above this. Server is not starved.
@@ -181,6 +183,7 @@ pub(super) fn rule1_under_batching_with_efficiency(input: R1EvalInput<'_>) -> Ru
     })
 }
 
+#[cfg(test)]
 pub fn r1_recommendation(input: R1EvalInput<'_>) -> Option<Recommendation> {
     let Rule1Outcome::Fired(d) = rule1_under_batching_with_efficiency(input) else {
         return None;

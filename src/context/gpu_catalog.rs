@@ -209,6 +209,7 @@ static CATALOG: &[GpuEntry] = &[
         entry: GpuCatalogEntry {
             arch: "cdna3",
             peak_flops_tc_tflops: 980.6,
+            // 5300 GB/s is total HBM3 bandwidth shared with CPU; GPU-available portion depends on workload.
             peak_bw_gbps: 5300.0,
         },
     },

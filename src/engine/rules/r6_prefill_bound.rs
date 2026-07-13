@@ -1,6 +1,8 @@
 use crate::collectors::RawSnapshot;
 
+#[cfg(test)]
 use super::Recommendation;
+#[cfg(test)]
 use super::rule_names;
 
 /// Primary trigger: prompt-to-generation token ratio.
@@ -480,6 +482,7 @@ pub(super) fn format_prefill_bound_window_issue(
     super::with_seen_pct(lines, seen_pct)
 }
 
+#[cfg(test)]
 pub fn r6_recommendation(input: PrefillBoundEvalInput<'_>) -> Option<Recommendation> {
     let Rule6Outcome::Fired(d) = evaluate(input) else {
         return None;
