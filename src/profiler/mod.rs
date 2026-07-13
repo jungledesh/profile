@@ -296,7 +296,7 @@ mod tests {
         assert!(!window_is_evaluable(&non_eval_snap));
         assert!(!window_is_idle(&non_eval_snap));
 
-        let windows = vec![idle_snap.clone(), idle_snap, non_eval_snap];
+        let windows = [idle_snap.clone(), idle_snap, non_eval_snap];
         let any_evaluable = windows.iter().any(window_is_evaluable);
         let all_idle = any_evaluable
             && windows
