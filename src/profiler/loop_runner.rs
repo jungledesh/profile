@@ -34,9 +34,9 @@ pub fn run(
             };
             let Some(rule_name) = last_state
                 .report
-                .groups
+                .recommendations
                 .first()
-                .map(|g| g.primary.rule_name)
+                .map(|r| r.rule_name)
             else {
                 let baseline = last_state.report.baseline.as_ref();
                 let efficiency = baseline.and_then(|b| b.efficiency_pct);
@@ -44,6 +44,7 @@ pub fn run(
                 let tpot_floor_ms = baseline.map(|b| b.tpot_floor_ms);
                 let kv_cache_usage_perc = last_state.result.snapshot.vllm.kv_cache_usage_perc;
                 let num_running = last_state.result.snapshot.vllm.num_requests_running;
+                let num_waiting = last_state.result.snapshot.vllm.num_requests_waiting;
                 let tpot_ms = last_state.result.snapshot.vllm.tpot_ms;
                 let chunked_prefill_enabled =
                     last_state.result.static_ctx.config.enable_chunked_prefill;
@@ -55,6 +56,7 @@ pub fn run(
                     efficiency,
                     kv_cache_usage_perc,
                     num_running,
+                    num_waiting,
                     ridge_batch_size,
                     tpot_ms,
                     tpot_floor_ms,
@@ -158,10 +160,20 @@ pub fn run(
             gpu_indices.clone(),
             duration,
         )?;
-        last_fingerprint = verified_pass_fingerprint(&last_fingerprint, &new_result.snapshot)?;
         let agg_win = RuntimeWindow::from_snapshot(new_result.snapshot.clone());
         let summary = AnalysisInput::new(&new_result.static_ctx, &agg_win);
         let new_report = engine::build_report_for_diagnose(&new_result.windows, summary);
+        if let Some(msg) = mid_loop_abort_message(
+            new_result.any_evaluable,
+            new_result.all_idle,
+            new_report.n_eval,
+            new_report.skipped_broken,
+            new_report.skipped_idle,
+        ) {
+            println!("{msg}");
+            break;
+        }
+        last_fingerprint = verified_pass_fingerprint(&last_fingerprint, &new_result.snapshot)?;
 
         let drifted = drift::config_changed(&prev_result.static_ctx, &new_result.static_ctx);
         let config_changes =
@@ -213,6 +225,34 @@ pub fn run(
     Ok(())
 }
 
+/// Mid-loop remesure abort copy. Pure so the gate is unit-testable.
+pub(crate) fn mid_loop_abort_message(
+    any_evaluable: bool,
+    all_idle: bool,
+    n_eval: usize,
+    skipped_broken: usize,
+    skipped_idle: usize,
+) -> Option<String> {
+    let captured = crate::engine::format_captured_windows(n_eval, skipped_broken, skipped_idle);
+    if !any_evaluable {
+        return Some(format!(
+            "\nProfile could not extract metrics mid-loop. {captured} Is the server still running?"
+        ));
+    }
+    if all_idle {
+        return Some(format!(
+            "\nServer went idle mid-loop. {captured} Send continuous traffic."
+        ));
+    }
+    if n_eval < crate::engine::ENGINE_MIN_PERSISTENT_WINDOWS {
+        return Some(format!(
+            "\nInsufficient data to verify. Required: {} windows. {captured}",
+            crate::engine::ENGINE_MIN_PERSISTENT_WINDOWS
+        ));
+    }
+    None
+}
+
 fn at_hardware_ceiling(headroom_pct: Option<f64>) -> bool {
     headroom_pct.is_some_and(|h| h < CEILING_HEADROOM_THRESHOLD_PCT)
 }
@@ -251,6 +291,7 @@ struct HealthyExitInput {
     efficiency: Option<f64>,
     kv_cache_usage_perc: Option<f64>,
     num_running: Option<f64>,
+    num_waiting: Option<f64>,
     ridge_batch_size: Option<f64>,
     tpot_ms: Option<f64>,
     tpot_floor_ms: Option<f64>,
@@ -265,6 +306,7 @@ fn healthy_exit_message(input: HealthyExitInput) -> String {
         efficiency,
         kv_cache_usage_perc,
         num_running,
+        num_waiting,
         ridge_batch_size,
         tpot_ms,
         tpot_floor_ms,
@@ -287,6 +329,15 @@ fn healthy_exit_message(input: HealthyExitInput) -> String {
             .filter(|e| e.is_finite())
             .map(|e| format!("Efficiency {e:.1}%"))
             .unwrap_or_else(|| "Efficiency unavailable".to_string());
+        let waiting = num_waiting.filter(|w| w.is_finite() && *w >= 0.0);
+        if waiting.is_some_and(|w| w >= 1.0) {
+            let wait_n = waiting
+                .map(|w| format!("{:.0}", w.trunc()))
+                .unwrap_or_else(|| "-".to_string());
+            return format!(
+                "No issues sustained. {eff} with {wait_n} requests waiting - queue present but no rule explains it. Re-run with longer duration; report this pattern if it persists."
+            );
+        }
         return format!(
             "No issues. {eff} - gap is traffic, not config. Increase load to find real limits."
         );
@@ -594,6 +645,7 @@ mod tests {
             efficiency: Some(60.0),
             kv_cache_usage_perc: Some(50.0),
             num_running: Some(50.0),
+            num_waiting: None,
             ridge_batch_size: Some(40.0),
             tpot_ms: Some(50.0),
             tpot_floor_ms: Some(10.0),
@@ -609,6 +661,7 @@ mod tests {
             efficiency: Some(42.5),
             kv_cache_usage_perc: Some(85.0),
             num_running: Some(50.0),
+            num_waiting: None,
             ridge_batch_size: Some(40.0),
             tpot_ms: Some(20.0),
             tpot_floor_ms: Some(5.0),
@@ -624,6 +677,7 @@ mod tests {
             efficiency: Some(91.0),
             kv_cache_usage_perc: Some(50.0),
             num_running: Some(50.0),
+            num_waiting: None,
             ridge_batch_size: Some(40.0),
             tpot_ms: Some(11.0),
             tpot_floor_ms: Some(10.0),
@@ -649,6 +703,7 @@ mod tests {
             efficiency: Some(34.0),
             kv_cache_usage_perc: Some(50.0),
             num_running: Some(5.0),
+            num_waiting: Some(0.0),
             ridge_batch_size: Some(100.0),
             tpot_ms: Some(20.0),
             tpot_floor_ms: Some(5.0),
@@ -665,11 +720,32 @@ mod tests {
     }
 
     #[test]
+    fn healthy_exit_traffic_with_queue_does_not_claim_traffic_gap() {
+        let msg = healthy_exit_message(HealthyExitInput {
+            efficiency: Some(12.4),
+            kv_cache_usage_perc: Some(10.0),
+            num_running: Some(10.0),
+            num_waiting: Some(5.0),
+            ridge_batch_size: Some(100.0),
+            tpot_ms: Some(20.0),
+            tpot_floor_ms: Some(5.0),
+            chunked_prefill_enabled: Some(false),
+            enforce_eager: None,
+            enable_prefix_caching: None,
+            quantization: None,
+        });
+        assert!(msg.contains("queue present but no rule explains it"));
+        assert!(msg.contains("5 requests waiting"));
+        assert!(!msg.contains("gap is traffic, not config"));
+    }
+
+    #[test]
     fn traffic_limiter_does_not_say_optimally_tuned() {
         let msg = healthy_exit_message(HealthyExitInput {
             efficiency: Some(34.0),
             kv_cache_usage_perc: Some(50.0),
             num_running: Some(5.0),
+            num_waiting: None,
             ridge_batch_size: Some(100.0),
             tpot_ms: Some(20.0),
             tpot_floor_ms: Some(5.0),
@@ -697,6 +773,7 @@ mod tests {
             efficiency: Some(55.0),
             kv_cache_usage_perc: Some(50.0),
             num_running: Some(50.0),
+            num_waiting: None,
             ridge_batch_size: Some(40.0),
             tpot_ms: Some(50.0),
             tpot_floor_ms: Some(10.0),
@@ -742,6 +819,7 @@ mod tests {
             efficiency: None,
             kv_cache_usage_perc: None,
             num_running: None,
+            num_waiting: None,
             ridge_batch_size: None,
             tpot_ms: None,
             tpot_floor_ms: None,
@@ -999,5 +1077,18 @@ mod tests {
         assert!(msg.contains("Topology drift detected"));
         assert!(msg.contains("missing [GPU-1]"));
         assert!(msg.contains("new [GPU-2]"));
+    }
+
+    #[test]
+    fn mid_loop_abort_message_tests() {
+        let crash = mid_loop_abort_message(false, false, 0, 15, 0).unwrap();
+        assert!(crash.contains("could not extract metrics mid-loop"));
+        assert!(crash.contains("Captured: 0 (15 dropped)."));
+        let idle_msg = mid_loop_abort_message(true, true, 0, 0, 3).unwrap();
+        assert!(idle_msg.contains("Server went idle mid-loop. Captured: 0 (3 idle)."));
+        let sparse_msg = mid_loop_abort_message(true, false, 2, 3, 10).unwrap();
+        assert!(sparse_msg.contains("Insufficient data to verify. Required: 3 windows."));
+        assert!(sparse_msg.contains("Captured: 2 (3 dropped, 10 idle)."));
+        assert_eq!(mid_loop_abort_message(true, false, 3, 0, 0), None);
     }
 }

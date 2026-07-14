@@ -9,17 +9,22 @@ use crate::context::{AnalysisInput, RuntimeWindow};
 pub use baseline::{CeilingEstimate, CostEstimate, CostSource, PhysicsBaseline, WeightDtypeSource};
 pub use rules::*;
 
-const MASSIVE_UNDERUTIL_THRESHOLD_PCT: f64 = 60.0;
+pub(crate) const MASSIVE_UNDERUTIL_THRESHOLD_PCT: f64 = 60.0;
 /// Occupancy at or above this: server is config-capped, not traffic-starved. Skip traffic fallback.
 const MASSIVE_UNDERUTIL_OCCUPANCY_CEILING: f64 = 0.75;
+/// Shared confidence for MU variants that infer cause without a direct observation.
+const MU_INFERRED_CONFIDENCE: f64 = 0.4;
 
 #[derive(Debug, Clone)]
 pub struct Report {
     pub baseline: Option<PhysicsBaseline>,
-    pub groups: Vec<IssueGroup>,
+    pub recommendations: Vec<rules::Recommendation>,
     /// Rules that fired but were removed by layer filtering or the suppression table.
     pub suppressed_rules: Vec<(&'static str, &'static str)>,
     pub kv_max_seqs: Option<u32>,
+    /// Evaluable window count. Stdout gates MU inject and the journey footer on
+    /// `ENGINE_MIN_PERSISTENT_WINDOWS`. `--json` (when emitted) should keep raw
+    /// recommendations and let consumers apply the same `n_eval` gate.
     pub n_eval: usize,
     pub skipped_broken: usize,
     pub skipped_idle: usize,
@@ -28,12 +33,15 @@ pub struct Report {
 /// Multi-window diagnose report. Production always collects >= 15 windows (min duration 30s).
 pub fn build_report_for_diagnose(windows: &[RuntimeWindow], input: AnalysisInput<'_>) -> Report {
     let mut report = rules::build_report_for_windows(windows, input);
-    maybe_add_massive_underutilization(
-        &mut report.groups,
-        report.baseline.as_ref(),
-        &input.window.snapshot,
-        input.ctx.config.max_num_seqs,
-    );
+    // MU is a traffic/efficiency judgment; below the sustained-load trust bar, skip.
+    if report.n_eval >= ENGINE_MIN_PERSISTENT_WINDOWS {
+        maybe_add_massive_underutilization(
+            &mut report.recommendations,
+            report.baseline.as_ref(),
+            &input.window.snapshot,
+            input.ctx.config.max_num_seqs,
+        );
+    }
     report
 }
 
@@ -46,7 +54,7 @@ pub(crate) fn build_report(input: AnalysisInput<'_>) -> Report {
     if !window_is_evaluable(snapshot) {
         return Report {
             baseline,
-            groups: Vec::new(),
+            recommendations: Vec::new(),
             suppressed_rules: Vec::new(),
             kv_max_seqs: None,
             n_eval: 0,
@@ -145,12 +153,12 @@ pub(crate) fn build_report(input: AnalysisInput<'_>) -> Report {
 }
 
 fn maybe_add_massive_underutilization(
-    groups: &mut Vec<IssueGroup>,
+    recommendations: &mut Vec<rules::Recommendation>,
     baseline: Option<&PhysicsBaseline>,
     snapshot: &crate::collectors::RawSnapshot,
     config_max_num_seqs: Option<u32>,
 ) {
-    if !groups.is_empty() {
+    if !recommendations.is_empty() {
         return;
     }
     let Some(eff) = baseline.and_then(|b| b.efficiency_pct) else {
@@ -159,52 +167,76 @@ fn maybe_add_massive_underutilization(
     if eff >= MASSIVE_UNDERUTIL_THRESHOLD_PCT {
         return;
     }
-    if let (Some(run), Some(max_n)) = (
-        snapshot
-            .vllm
-            .num_requests_running
-            .filter(|v| v.is_finite() && *v > 0.0),
-        snapshot
-            .vllm
-            .max_num_seqs
-            .or(config_max_num_seqs)
-            .filter(|&n| n > 0),
-    ) {
-        let occupancy = run / f64::from(max_n);
-        if occupancy >= MASSIVE_UNDERUTIL_OCCUPANCY_CEILING {
+    let running = snapshot
+        .vllm
+        .num_requests_running
+        .filter(|v| v.is_finite() && *v >= 0.0);
+    let waiting = snapshot
+        .vllm
+        .num_requests_waiting
+        .filter(|v| v.is_finite() && *v >= 0.0);
+    let max_num_seqs = snapshot
+        .vllm
+        .max_num_seqs
+        .or(config_max_num_seqs)
+        .filter(|&n| n > 0);
+    let kv = snapshot
+        .vllm
+        .kv_cache_usage_perc
+        .filter(|v| v.is_finite() && *v >= 0.0);
+
+    // Near-cap is R5 territory (occupancy ≈ 1.0 always clears 0.75).
+    if let Some(max_n) = max_num_seqs
+        && running.is_some_and(|run| {
+            run > 0.0 && run / f64::from(max_n) >= MASSIVE_UNDERUTIL_OCCUPANCY_CEILING
+        })
+    {
+        return;
+    }
+
+    let variant = match waiting {
+        None => rules::MuVariant::GaugeMissing,
+        Some(w) if w < 1.0 => rules::MuVariant::Starved,
+        Some(_) if kv.is_some_and(|k| k >= rules::KV_CACHE_PRESSURE_MIN_PERC) => {
+            // r2's shape; it did not sustain significance, don't mislabel as MU.
             return;
         }
-    }
-    groups.push(IssueGroup {
-        primary: Recommendation {
-            rule_name: rule_names::MASSIVE_UNDERUTILIZATION,
-            layer: 5,
-            impact: 5,
-            confidence: 0.7,
-            action: "Batch more requests or increase client concurrency until a wait queue forms".to_string(),
-            display_lines: vec![
-                "[!] Massive Under-utilization".to_string(),
-                String::new(),
-                format!(
-                    "  Decode eff. {eff:.1}%  (threshold: < {:.0}%)",
-                    MASSIVE_UNDERUTIL_THRESHOLD_PCT
-                ),
-                "  Wait queue  0  (server not saturated)".to_string(),
-                String::new(),
-                "  Cause:".to_string(),
-                "    GPU is idle. No config rule explains this - client traffic is too low."
-                    .to_string(),
-                String::new(),
-                "  Fix:".to_string(),
-                "    • Batch more requests or increase client concurrency until a wait queue forms.".to_string(),
-                String::new(),
-                "  Expected: Efficiency climbs as the GPU is fed more work.".to_string(),
-                "  Confidence: Medium".to_string(),
-            ],
-            short_action: "batch more requests or increase client concurrency until a wait queue forms".to_string(),
-            expected_impact: "Efficiency climbs as the GPU is fed more work.".to_string(),
+        Some(_) => rules::MuVariant::BlockedAdmission {
+            kv_measured: kv.is_some(),
         },
-        secondary: Vec::new(),
+    };
+
+    let (confidence, action, short_action, expected_impact) = match variant {
+        rules::MuVariant::Starved => (
+            0.7,
+            "Batch more requests or increase client concurrency until a wait queue forms",
+            "batch more requests or increase client concurrency until a wait queue forms",
+            "Efficiency climbs as the GPU is fed more work.",
+        ),
+        rules::MuVariant::BlockedAdmission { .. } => (
+            MU_INFERRED_CONFIDENCE,
+            "Raise --max-num-batched-tokens or enable chunked prefill",
+            "raise --max-num-batched-tokens or enable chunked prefill",
+            "Queue drains as admission unblocks.",
+        ),
+        rules::MuVariant::GaugeMissing => (
+            MU_INFERRED_CONFIDENCE,
+            "Batch more requests or increase client concurrency until a wait queue forms",
+            "batch more requests or increase client concurrency until a wait queue forms",
+            "Efficiency climbs as the GPU is fed more work.",
+        ),
+    };
+
+    recommendations.push(rules::Recommendation {
+        rule_name: rule_names::MASSIVE_UNDERUTILIZATION,
+        // Sentinel: post-DAG inject; not a DAG layer. Layer-min filtering does not apply.
+        layer: 0,
+        impact: 5,
+        confidence,
+        action: action.to_string(),
+        display_lines: rules::mu_diagnose_lines(eff, running, waiting, max_num_seqs, variant),
+        short_action: short_action.to_string(),
+        expected_impact: expected_impact.to_string(),
     });
 }
 
@@ -257,16 +289,16 @@ mod build_report_tests {
         let win = RuntimeWindow::from_snapshot(s);
         let input = AnalysisInput::new(&ctx, &win);
         let report = build_report(input);
-        assert_eq!(report.groups.len(), 1);
+        assert_eq!(report.recommendations.len(), 1);
         assert_eq!(
-            report.groups[0].primary.rule_name,
+            report.recommendations[0].rule_name,
             rule_names::KV_CACHE_PRESSURE
         );
         assert!(
             !report
-                .groups
+                .recommendations
                 .iter()
-                .any(|g| g.primary.rule_name == rule_names::UNDER_BATCHING)
+                .any(|r| r.rule_name == rule_names::UNDER_BATCHING)
         );
     }
 
@@ -312,15 +344,15 @@ mod build_report_tests {
 
         assert!(
             report
-                .groups
+                .recommendations
                 .iter()
-                .any(|g| g.primary.rule_name == rule_names::OOM_RISK)
+                .any(|r| r.rule_name == rule_names::OOM_RISK)
         );
         assert!(
             !report
-                .groups
+                .recommendations
                 .iter()
-                .any(|g| g.primary.rule_name == rule_names::KV_CACHE_PRESSURE)
+                .any(|r| r.rule_name == rule_names::KV_CACHE_PRESSURE)
         );
     }
 
@@ -361,9 +393,9 @@ mod build_report_tests {
         let win = RuntimeWindow::from_snapshot(s);
         let input = AnalysisInput::new(&ctx, &win);
         let report = build_report(input);
-        assert_eq!(report.groups.len(), 1);
+        assert_eq!(report.recommendations.len(), 1);
         assert_eq!(
-            report.groups[0].primary.rule_name,
+            report.recommendations[0].rule_name,
             rule_names::UNDER_BATCHING
         );
     }
@@ -375,7 +407,7 @@ mod build_report_tests {
         let v = VllmRawMetrics {
             model_name: Some("meta-llama/Llama-3.1-8B-Instruct".to_string()),
             num_requests_running: Some(64.0),
-            num_requests_waiting: Some(2.0),
+            num_requests_waiting: Some(0.0),
             max_num_seqs: Some(256),
             kv_cache_usage_perc: Some(10.0),
             prefix_cache_hit_rate: Some(0.5),
@@ -406,12 +438,30 @@ mod build_report_tests {
         (ctx, win)
     }
 
+    fn sustained_windows(win: &RuntimeWindow, n: usize) -> Vec<RuntimeWindow> {
+        (0..n).map(|_| win.clone()).collect()
+    }
+
+    fn diagnose_mu(ctx: &StaticContext, win: &RuntimeWindow, n_windows: usize) -> Report {
+        let windows = sustained_windows(win, n_windows);
+        let input = AnalysisInput::new(ctx, &windows[0]);
+        build_report_for_diagnose(&windows, input)
+    }
+
     fn massive_underutilization_count(report: &Report) -> usize {
         report
-            .groups
+            .recommendations
             .iter()
-            .filter(|g| g.primary.rule_name == rule_names::MASSIVE_UNDERUTILIZATION)
+            .filter(|r| r.rule_name == rule_names::MASSIVE_UNDERUTILIZATION)
             .count()
+    }
+
+    fn mu_rec(report: &Report) -> &rules::Recommendation {
+        report
+            .recommendations
+            .iter()
+            .find(|r| r.rule_name == rule_names::MASSIVE_UNDERUTILIZATION)
+            .expect("MU recommendation")
     }
 
     #[test]
@@ -434,12 +484,12 @@ mod build_report_tests {
             "fixture should be under-utilized: {eff}%"
         );
         assert!(
-            report.groups.is_empty(),
+            report.recommendations.is_empty(),
             "fixture should fire no rules before safety net: {:?}",
             report
-                .groups
+                .recommendations
                 .iter()
-                .map(|g| g.primary.rule_name)
+                .map(|r| r.rule_name)
                 .collect::<Vec<_>>()
         );
     }
@@ -447,13 +497,100 @@ mod build_report_tests {
     #[test]
     fn build_report_for_diagnose_adds_massive_underutilization_once() {
         let (ctx, win) = starved_no_rules_fixture();
-        let windows = vec![win];
-        let input = AnalysisInput::new(&ctx, &windows[0]);
-        let report = build_report_for_diagnose(&windows, input);
+        let report = diagnose_mu(&ctx, &win, ENGINE_MIN_PERSISTENT_WINDOWS);
         assert_eq!(
             massive_underutilization_count(&report),
             1,
             "diagnose path should inject safety net exactly once"
+        );
+        let mu = mu_rec(&report);
+        assert!((mu.confidence - 0.7).abs() < 1e-9);
+        let text = mu.display_lines.join("\n");
+        assert!(text.contains("Requests  64 running, 0 waiting  (server not saturated)"));
+        assert!(text.contains("Server is under-fed"));
+        assert!(!text.contains("GPU is idle"));
+        assert!(text.contains("    Cause:"));
+        assert!(text.contains("      Server is under-fed"));
+    }
+
+    #[test]
+    fn massive_underutilization_blocked_admission_when_waiting_with_free_seats() {
+        let (ctx, mut win) = starved_no_rules_fixture();
+        win.snapshot.vllm.num_requests_running = Some(10.0);
+        win.snapshot.vllm.num_requests_waiting = Some(5.0);
+        win.snapshot.vllm.kv_cache_usage_perc = Some(10.0);
+        let report = diagnose_mu(&ctx, &win, ENGINE_MIN_PERSISTENT_WINDOWS);
+        assert_eq!(massive_underutilization_count(&report), 1);
+        let mu = mu_rec(&report);
+        assert!((mu.confidence - MU_INFERRED_CONFIDENCE).abs() < 1e-9);
+        let text = mu.display_lines.join("\n");
+        assert!(text.contains("Requests  10 running, 5 waiting  (246 of 256 seats free)"));
+        assert!(text.contains("seats are free and KV cache is low"));
+        assert!(text.contains("Scheduler admission is blocked"));
+        assert!(text.contains("Raise --max-num-batched-tokens"));
+        assert!(!text.contains("server not saturated"));
+        assert!(text.contains("Confidence: Low (cause inferred, token budget not observed)"));
+    }
+
+    #[test]
+    fn massive_underutilization_blocked_admission_when_kv_gauge_missing() {
+        let (ctx, mut win) = starved_no_rules_fixture();
+        win.snapshot.vllm.num_requests_running = Some(10.0);
+        win.snapshot.vllm.num_requests_waiting = Some(5.0);
+        win.snapshot.vllm.kv_cache_usage_perc = None;
+        let report = diagnose_mu(&ctx, &win, ENGINE_MIN_PERSISTENT_WINDOWS);
+        assert_eq!(massive_underutilization_count(&report), 1);
+        let mu = mu_rec(&report);
+        assert!((mu.confidence - MU_INFERRED_CONFIDENCE).abs() < 1e-9);
+        let text = mu.display_lines.join("\n");
+        assert!(text.contains("Requests queue while seats are free."));
+        assert!(!text.contains("KV cache is low"));
+        assert!(text.contains("Confidence: Low (cause inferred; KV gauge unavailable)"));
+    }
+
+    #[test]
+    fn massive_underutilization_fires_when_waiting_blip_below_one() {
+        let (ctx, mut win) = starved_no_rules_fixture();
+        win.snapshot.vllm.num_requests_waiting = Some(0.01);
+        let report = diagnose_mu(&ctx, &win, ENGINE_MIN_PERSISTENT_WINDOWS);
+        assert_eq!(
+            massive_underutilization_count(&report),
+            1,
+            "waiting < 1.0 must fire Starved"
+        );
+        let text = mu_rec(&report).display_lines.join("\n");
+        assert!(text.contains("server not saturated"));
+        assert!(text.contains("Server is under-fed"));
+    }
+
+    #[test]
+    fn massive_underutilization_suppressed_when_kv_pressure_shape() {
+        // r2 must NOT fire here or this test proves nothing.
+        let (ctx, base) = starved_no_rules_fixture();
+        let mut high = base.clone();
+        high.snapshot.vllm.num_requests_running = Some(10.0);
+        high.snapshot.vllm.num_requests_waiting = Some(5.0);
+        high.snapshot.vllm.kv_cache_usage_perc = Some(95.0);
+        let mut mid = high.clone();
+        mid.snapshot.vllm.kv_cache_usage_perc = Some(80.0);
+        // 95, 95, 80 → r2 fires in 2 windows (< ENGINE_MIN_PERSISTENT_WINDOWS);
+        // aggregate mean kv = 90 >= 88 so MU's kv-pressure silence branch runs.
+        let windows = vec![high.clone(), high.clone(), mid];
+        let mut summary = high.clone();
+        summary.snapshot.vllm.kv_cache_usage_perc = Some(90.0);
+        let input = AnalysisInput::new(&ctx, &summary);
+        let report = build_report_for_diagnose(&windows, input);
+        assert!(
+            !report
+                .recommendations
+                .iter()
+                .any(|r| r.rule_name == rule_names::KV_CACHE_PRESSURE),
+            "r2 must be absent: silence must come from MU's kv branch"
+        );
+        assert_eq!(
+            massive_underutilization_count(&report),
+            0,
+            "aggregate kv >= r2 threshold with free seats: MU must stay silent"
         );
     }
 
@@ -461,24 +598,40 @@ mod build_report_tests {
     fn massive_underutilization_suppressed_at_high_occupancy() {
         let (mut ctx, mut win) = starved_no_rules_fixture();
         win.snapshot.vllm.num_requests_running = Some(200.0);
+        win.snapshot.vllm.num_requests_waiting = Some(5.0);
         win.snapshot.vllm.max_num_seqs = Some(256);
         ctx.config.max_num_seqs = Some(256);
-        let windows = vec![win.clone()];
-        let input = AnalysisInput::new(&ctx, &win);
-        let report = build_report_for_diagnose(&windows, input);
+        let report = diagnose_mu(&ctx, &win, ENGINE_MIN_PERSISTENT_WINDOWS);
         assert_eq!(
             massive_underutilization_count(&report),
             0,
-            "high occupancy should not trigger traffic-starvation fallback"
+            "high occupancy is R5 territory"
         );
-        let eff = report
-            .baseline
-            .as_ref()
-            .and_then(|b| b.efficiency_pct)
-            .expect("baseline efficiency");
-        assert!(
-            eff < MASSIVE_UNDERUTIL_THRESHOLD_PCT,
-            "fixture should still be under-utilized: {eff}%"
+    }
+
+    #[test]
+    fn massive_underutilization_gauge_missing_waiting() {
+        let (ctx, mut win) = starved_no_rules_fixture();
+        win.snapshot.vllm.num_requests_waiting = None;
+        let report = diagnose_mu(&ctx, &win, ENGINE_MIN_PERSISTENT_WINDOWS);
+        assert_eq!(massive_underutilization_count(&report), 1);
+        let mu = mu_rec(&report);
+        assert!((mu.confidence - MU_INFERRED_CONFIDENCE).abs() < 1e-9);
+        let text = mu.display_lines.join("\n");
+        assert!(text.contains("waiting gauge unavailable"));
+        assert!(text.contains("Confidence: Low (waiting gauge unavailable)"));
+        assert!(!text.contains("server not saturated"));
+    }
+
+    #[test]
+    fn massive_underutilization_skipped_when_sparse_n_eval() {
+        let (ctx, win) = starved_no_rules_fixture();
+        let report = diagnose_mu(&ctx, &win, 2);
+        assert_eq!(report.n_eval, 2);
+        assert_eq!(
+            massive_underutilization_count(&report),
+            0,
+            "MU must not inject below ENGINE_MIN_PERSISTENT_WINDOWS"
         );
     }
 }

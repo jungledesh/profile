@@ -514,12 +514,11 @@ ECONOMICS:
 num_requests_running  is Some (even if zero)</code></pre>
     <p><code>running = 0</code> is valid data: the server responded and reported no active requests. <code>None</code> means the endpoint did not respond.</p>
     <p><strong>Tier 2: active.</strong> Was the server doing real work? Aggregated means use this check. Throughput, efficiency %, GPU utilization, and latency averages are computed over active windows only.</p>
-    <pre><code>running_reqs > 0
-AND (kv_cache_pct > 30%  OR  gpu_util_pct > 20%)
+    <pre><code>window_is_evaluable(s) &amp;&amp; !window_is_idle(s)
 
-// both absent: running_reqs > 0 alone
-// one absent:  evaluate the other arm only</code></pre>
-    <p><code>kv_cache_pct</code> catches decode and sustained load. <code>gpu_util_pct</code> catches prefill bursts where the KV cache is still near-empty. Idle windows pass tier 1 but not tier 2 and are excluded from the averages.</p>
+// idle: running &lt; 1 AND generation_tokens_per_sec &lt; 1
+// (missing tok/s counts as &lt; 1)</code></pre>
+    <p>Active is the inverse of idle for evaluable windows. Low numbers are included; blank numbers are not. Idle windows pass tier 1 but not tier 2 and are excluded from the averages.</p>
     <p>Multi-window aggregation, which window set applies to which field, is in <a href="#math" data-page="math">Math</a>.</p>
 
     <h2>Source 1: NVML</h2>

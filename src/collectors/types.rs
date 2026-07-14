@@ -421,41 +421,11 @@ pub fn window_is_idle(s: &RawSnapshot) -> bool {
     no_running && no_throughput
 }
 
-pub const ACTIVE_KV_CACHE_PCT_THRESHOLD: f64 = 30.0;
-pub const ACTIVE_GPU_UTIL_PCT_THRESHOLD: f64 = 20.0;
-
-/// A window contributed real work - used to gate aggregated means.
-/// Separate from `window_is_evaluable`, which only checks structural validity.
-///
-/// Requires `running_reqs > 0` plus at least one activity signal:
-///   - kv_cache_pct > 30%  (decode + sustained load)
-///   - gpu_util_pct > 20%  (prefill bursts; secondary, GPU util is coarse)
-///
-/// If both signals are absent, `running_reqs > 0` alone is the fallback.
+/// True when the window is evaluable and not idle.
+/// Inverse of idle for evaluable windows. Gates aggregated gauge means
+/// (throughput, TTFT, TPOT, running/waiting). Low values are honest; blank is not.
 pub fn window_is_active(s: &RawSnapshot) -> bool {
-    let running = s
-        .vllm
-        .num_requests_running
-        .filter(|r| r.is_finite() && *r > 0.0);
-    let Some(_) = running else {
-        return false;
-    };
-
-    let kv = s.vllm.kv_cache_usage_perc;
-    let gpu = s
-        .gpus
-        .iter()
-        .filter_map(|g| g.gpu_util_pct)
-        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-    match (kv, gpu) {
-        (None, None) => true,
-        (Some(k), None) => k > ACTIVE_KV_CACHE_PCT_THRESHOLD,
-        (None, Some(g)) => g > ACTIVE_GPU_UTIL_PCT_THRESHOLD,
-        (Some(k), Some(g)) => {
-            k > ACTIVE_KV_CACHE_PCT_THRESHOLD || g > ACTIVE_GPU_UTIL_PCT_THRESHOLD
-        }
-    }
+    window_is_evaluable(s) && !window_is_idle(s)
 }
 
 #[cfg(test)]
@@ -529,13 +499,14 @@ mod window_active_tests {
     use super::*;
     use std::time::SystemTime;
 
-    fn snap(run: f64, kv: Option<f64>, gpu: Option<f64>) -> RawSnapshot {
+    fn snap(run: f64, tps: Option<f64>, kv: Option<f64>, gpu: Option<f64>) -> RawSnapshot {
         RawSnapshot {
             gpu_observed_at: SystemTime::UNIX_EPOCH,
             vllm_observed_at: SystemTime::UNIX_EPOCH,
             timestamp: SystemTime::UNIX_EPOCH,
             vllm: VllmRawMetrics {
                 num_requests_running: Some(run),
+                generation_tokens_per_sec: tps,
                 kv_cache_usage_perc: kv,
                 window_duration_secs: Some(2.0),
                 ..Default::default()
@@ -548,41 +519,70 @@ mod window_active_tests {
     }
 
     #[test]
-    fn false_when_running_zero() {
-        assert!(!window_is_active(&snap(0.0, Some(50.0), Some(50.0))));
+    fn false_when_idle_even_with_high_kv_gpu() {
+        assert!(!window_is_active(&snap(
+            0.0,
+            Some(0.0),
+            Some(50.0),
+            Some(50.0)
+        )));
+        assert!(!window_is_active(&snap(
+            0.5,
+            Some(0.0),
+            Some(50.0),
+            Some(50.0)
+        )));
     }
 
     #[test]
-    fn false_when_running_zero_and_both_signals_absent() {
-        assert!(!window_is_active(&snap(0.0, None, None)));
+    fn false_when_not_evaluable() {
+        let s = RawSnapshot {
+            vllm: VllmRawMetrics {
+                num_requests_running: None,
+                window_duration_secs: Some(2.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(!window_is_active(&s));
     }
 
     #[test]
-    fn true_when_both_signals_absent_and_running_positive() {
-        assert!(window_is_active(&snap(5.0, None, None)));
+    fn true_when_running_material_regardless_of_kv_gpu() {
+        // Former dead zone: trickle traffic below old 30%/20% heuristics.
+        assert!(window_is_active(&snap(
+            2.0,
+            Some(5.0),
+            Some(10.0),
+            Some(5.0)
+        )));
+        assert!(window_is_active(&snap(
+            5.0,
+            Some(0.0),
+            Some(10.0),
+            Some(10.0)
+        )));
+        assert!(window_is_active(&snap(5.0, None, None, None)));
+        // Finish ramp: running drained but tok/s still material.
+        assert!(window_is_active(&snap(
+            0.0,
+            Some(5.0),
+            Some(10.0),
+            Some(5.0)
+        )));
     }
 
     #[test]
-    fn true_when_kv_above_threshold() {
-        assert!(window_is_active(&snap(5.0, Some(31.0), None)));
-        assert!(!window_is_active(&snap(5.0, Some(30.0), None)));
-    }
+    fn mirrors_not_idle_for_evaluable_windows() {
+        let active = snap(3.0, Some(10.0), Some(1.0), Some(1.0));
+        assert!(window_is_evaluable(&active));
+        assert!(!window_is_idle(&active));
+        assert!(window_is_active(&active));
 
-    #[test]
-    fn true_when_gpu_above_threshold() {
-        assert!(window_is_active(&snap(5.0, None, Some(21.0))));
-        assert!(!window_is_active(&snap(5.0, None, Some(20.0))));
-    }
-
-    #[test]
-    fn false_when_both_present_neither_above_threshold() {
-        assert!(!window_is_active(&snap(5.0, Some(10.0), Some(10.0))));
-    }
-
-    #[test]
-    fn true_when_both_present_either_above_threshold() {
-        assert!(window_is_active(&snap(5.0, Some(10.0), Some(25.0))));
-        assert!(window_is_active(&snap(5.0, Some(35.0), Some(10.0))));
+        let idle = snap(0.0, Some(0.0), Some(90.0), Some(90.0));
+        assert!(window_is_evaluable(&idle));
+        assert!(window_is_idle(&idle));
+        assert!(!window_is_active(&idle));
     }
 }
 

@@ -241,19 +241,16 @@ fn baseline_for_waste(eff: f64, source: CostSource, cpm: f64) -> PhysicsBaseline
     }
 }
 
-fn issue_group(rule_name: &'static str) -> IssueGroup {
-    IssueGroup {
-        primary: Recommendation {
-            rule_name,
-            layer: 4,
-            impact: 4,
-            confidence: 0.8,
-            action: String::new(),
-            short_action: String::new(),
-            expected_impact: String::new(),
-            display_lines: Vec::new(),
-        },
-        secondary: Vec::new(),
+fn mk_rec(rule_name: &'static str) -> Recommendation {
+    Recommendation {
+        rule_name,
+        layer: 4,
+        impact: 4,
+        confidence: 0.8,
+        action: String::new(),
+        short_action: String::new(),
+        expected_impact: String::new(),
+        display_lines: Vec::new(),
     }
 }
 
@@ -525,7 +522,7 @@ fn format_diagnose_rules_for_windows_r4_suppresses_r2_when_both_significant() {
     }
     let summary = ai(&ctx, windows.last().expect("windows"));
     let report = build_report_for_windows(&windows, summary);
-    assert_eq!(report.groups[0].primary.rule_name, rule_names::OOM_RISK);
+    assert_eq!(report.recommendations[0].rule_name, rule_names::OOM_RISK);
     assert!(
         report
             .suppressed_rules
@@ -725,11 +722,11 @@ fn r2_confidence_equals_duration_density() {
     let summary = ai(&ctx, &summary_win);
     let report = build_report_for_windows(&windows, summary);
     let r2 = report
-        .groups
+        .recommendations
         .iter()
-        .find(|g| g.primary.rule_name == rule_names::KV_CACHE_PRESSURE)
-        .expect("r2 group");
-    assert!((r2.primary.confidence - (4.0 / 15.0)).abs() < 1e-9);
+        .find(|r| r.rule_name == rule_names::KV_CACHE_PRESSURE)
+        .expect("r2 recommendation");
+    assert!((r2.confidence - (4.0 / 15.0)).abs() < 1e-9);
 }
 
 #[test]
@@ -790,16 +787,16 @@ fn build_report_for_windows_r5_when_aggregate_snapshot_misses() {
     let aggregate_report = crate::engine::build_report(summary);
     assert!(
         !aggregate_report
-            .groups
+            .recommendations
             .iter()
-            .any(|g| g.primary.rule_name == rule_names::CONCURRENCY_SATURATION)
+            .any(|g| g.rule_name == rule_names::CONCURRENCY_SATURATION)
     );
     let multi_report = build_report_for_windows(&windows, summary);
     assert!(
         multi_report
-            .groups
+            .recommendations
             .iter()
-            .any(|g| g.primary.rule_name == rule_names::CONCURRENCY_SATURATION)
+            .any(|g| g.rule_name == rule_names::CONCURRENCY_SATURATION)
     );
 }
 
@@ -816,15 +813,15 @@ fn r5_suppressed_when_r2_fires() {
     let report = build_report_for_windows(&windows, summary);
     assert!(
         report
-            .groups
+            .recommendations
             .iter()
-            .any(|g| g.primary.rule_name == rule_names::KV_CACHE_PRESSURE)
+            .any(|g| g.rule_name == rule_names::KV_CACHE_PRESSURE)
     );
     assert!(
         !report
-            .groups
+            .recommendations
             .iter()
-            .any(|g| g.primary.rule_name == rule_names::CONCURRENCY_SATURATION)
+            .any(|g| g.rule_name == rule_names::CONCURRENCY_SATURATION)
     );
 }
 
@@ -876,9 +873,9 @@ fn idle_windows_skipped_in_rule_evaluation() {
     assert_eq!(report.skipped_broken, 0);
     assert!(
         !report
-            .groups
+            .recommendations
             .iter()
-            .any(|g| g.primary.rule_name == rule_names::UNDER_BATCHING)
+            .any(|g| g.rule_name == rule_names::UNDER_BATCHING)
     );
 }
 
@@ -1009,8 +1006,8 @@ fn waste_label_r1_only() {
 fn waste_line_multi_rule_compounding() {
     let b = baseline_for_waste(32.0, CostSource::Catalog, 1.84);
     let groups = vec![
-        issue_group(rule_names::UNDER_BATCHING),
-        issue_group(rule_names::KV_CACHE_PRESSURE),
+        mk_rec(rule_names::UNDER_BATCHING),
+        mk_rec(rule_names::KV_CACHE_PRESSURE),
     ];
     let mut lines = vec!["issue".to_string()];
     append_waste_line(&mut lines, &groups, Some(&b), Some(14.2));
@@ -1041,15 +1038,15 @@ fn dag_layer2_suppresses_layer4_when_r2_fires() {
     let report = build_report_for_windows(&windows, summary);
     assert!(
         report
-            .groups
+            .recommendations
             .iter()
-            .any(|g| g.primary.rule_name == rule_names::KV_CACHE_PRESSURE)
+            .any(|g| g.rule_name == rule_names::KV_CACHE_PRESSURE)
     );
     assert!(
         !report
-            .groups
+            .recommendations
             .iter()
-            .any(|g| g.primary.rule_name == rule_names::UNDER_BATCHING)
+            .any(|g| g.rule_name == rule_names::UNDER_BATCHING)
     );
 }
 
@@ -1063,15 +1060,15 @@ fn r1_suppresses_r7() {
     let report = build_report_for_windows(&windows, summary);
     assert!(
         report
-            .groups
+            .recommendations
             .iter()
-            .any(|g| g.primary.rule_name == rule_names::UNDER_BATCHING)
+            .any(|g| g.rule_name == rule_names::UNDER_BATCHING)
     );
     assert!(
         !report
-            .groups
+            .recommendations
             .iter()
-            .any(|g| g.primary.rule_name == rule_names::CONFIG_HEADROOM)
+            .any(|g| g.rule_name == rule_names::CONFIG_HEADROOM)
     );
 }
 
@@ -1082,7 +1079,7 @@ fn kv_warning_requires_significance() {
     let ctx = mk_ctx();
     let summary = ai(&ctx, windows.last().expect("windows"));
     let report = build_report_for_windows(&windows, summary);
-    let text = report.groups[0].primary.display_lines.join("\n");
+    let text = report.recommendations[0].display_lines.join("\n");
     assert!(!text.contains("Monitor KV cache when scaling up."));
 }
 
@@ -1095,7 +1092,7 @@ fn kv_warning_fires_when_significant() {
     let ctx = mk_ctx();
     let summary = ai(&ctx, windows.last().expect("windows"));
     let report = build_report_for_windows(&windows, summary);
-    let text = report.groups[0].primary.display_lines.join("\n");
+    let text = report.recommendations[0].display_lines.join("\n");
     assert!(text.contains("Monitor KV cache when scaling up."));
 }
 
@@ -1115,15 +1112,15 @@ fn r2_suppresses_r1_in_table() {
     let report = build_report_for_windows(&windows, summary);
     assert!(
         report
-            .groups
+            .recommendations
             .iter()
-            .any(|g| g.primary.rule_name == rule_names::KV_CACHE_PRESSURE)
+            .any(|g| g.rule_name == rule_names::KV_CACHE_PRESSURE)
     );
     assert!(
         !report
-            .groups
+            .recommendations
             .iter()
-            .any(|g| g.primary.rule_name == rule_names::UNDER_BATCHING)
+            .any(|g| g.rule_name == rule_names::UNDER_BATCHING)
     );
 }
 
@@ -1140,9 +1137,9 @@ fn r7_silent_when_waiting_nonzero_r5_territory() {
     let report = build_report_for_windows(&windows, summary);
     assert!(
         !report
-            .groups
+            .recommendations
             .iter()
-            .any(|g| g.primary.rule_name == rule_names::CONFIG_HEADROOM)
+            .any(|g| g.rule_name == rule_names::CONFIG_HEADROOM)
     );
 }
 
@@ -1156,15 +1153,15 @@ fn r6_suppressed_when_r1_fires() {
     let report = build_report_for_windows(&windows, summary);
     assert!(
         report
-            .groups
+            .recommendations
             .iter()
-            .any(|g| g.primary.rule_name == rule_names::UNDER_BATCHING)
+            .any(|g| g.rule_name == rule_names::UNDER_BATCHING)
     );
     assert!(
         !report
-            .groups
+            .recommendations
             .iter()
-            .any(|g| g.primary.rule_name == rule_names::PREFILL_BOUND)
+            .any(|g| g.rule_name == rule_names::PREFILL_BOUND)
     );
 }
 
@@ -1178,9 +1175,9 @@ fn r6_fires_when_r1_prefill_gate_suppresses_r1() {
     let report = build_report_for_windows(&windows, summary);
     assert!(
         report
-            .groups
+            .recommendations
             .iter()
-            .any(|g| g.primary.rule_name == rule_names::PREFILL_BOUND)
+            .any(|g| g.rule_name == rule_names::PREFILL_BOUND)
     );
 }
 
@@ -1197,15 +1194,15 @@ fn r6_not_primary_when_r2_outscores() {
     let report = build_report_for_windows(&windows, summary);
     assert!(
         report
-            .groups
+            .recommendations
             .iter()
-            .any(|g| g.primary.rule_name == rule_names::KV_CACHE_PRESSURE)
+            .any(|g| g.rule_name == rule_names::KV_CACHE_PRESSURE)
     );
     assert!(
         !report
-            .groups
+            .recommendations
             .iter()
-            .any(|g| g.primary.rule_name == rule_names::PREFILL_BOUND)
+            .any(|g| g.rule_name == rule_names::PREFILL_BOUND)
     );
 }
 
@@ -1267,12 +1264,12 @@ fn nan_running_suppresses() {
 fn format_diagnose_non_verbose_omits_kv_pressure_when_r4_fires() {
     let (ctx, win) = input_r4_suppresses_r2();
     let report = build_report(ai(&ctx, &win));
-    assert_eq!(report.groups[0].primary.rule_name, rule_names::OOM_RISK);
+    assert_eq!(report.recommendations[0].rule_name, rule_names::OOM_RISK);
     assert!(
         !report
-            .groups
+            .recommendations
             .iter()
-            .any(|g| g.primary.rule_name == rule_names::KV_CACHE_PRESSURE)
+            .any(|g| g.rule_name == rule_names::KV_CACHE_PRESSURE)
     );
 }
 
@@ -1363,9 +1360,9 @@ fn r2_fires_on_single_preemption_window() {
     let report = r2_report(&windows);
     assert!(
         !report
-            .groups
+            .recommendations
             .iter()
-            .any(|g| g.primary.rule_name == rule_names::KV_CACHE_PRESSURE)
+            .any(|g| g.rule_name == rule_names::KV_CACHE_PRESSURE)
     );
 }
 
@@ -1379,9 +1376,9 @@ fn r2_fires_on_two_critical_kv_windows_without_preemptions() {
     let report = r2_report(&windows);
     assert!(
         !report
-            .groups
+            .recommendations
             .iter()
-            .any(|g| g.primary.rule_name == rule_names::KV_CACHE_PRESSURE)
+            .any(|g| g.rule_name == rule_names::KV_CACHE_PRESSURE)
     );
 }
 
@@ -1396,9 +1393,9 @@ fn r2_does_not_fire_when_kv_high_but_tpot_stable_and_no_preemptions() {
     let report = r2_report(&windows);
     assert!(
         !report
-            .groups
+            .recommendations
             .iter()
-            .any(|g| g.primary.rule_name == rule_names::KV_CACHE_PRESSURE)
+            .any(|g| g.rule_name == rule_names::KV_CACHE_PRESSURE)
     );
 }
 
@@ -1501,11 +1498,10 @@ fn backlog_short_action_matches_spec() {
     let summary = ai(&ctx, windows.last().expect("windows"));
     let report = build_report_for_windows(&windows, summary);
     let r = report
-        .groups
+        .recommendations
         .iter()
-        .find(|g| g.primary.rule_name == rule_names::KV_ADMISSION_BACKLOG)
+        .find(|g| g.rule_name == rule_names::KV_ADMISSION_BACKLOG)
         .expect("backlog kv recommendation")
-        .primary
         .clone();
     assert_eq!(r.short_action, "raise --gpu-memory-utilization");
     let display = r.display_lines.join("\n");
@@ -1640,7 +1636,7 @@ fn format_diagnose_rules_for_windows_matches_requested_style_when_some_rules_fir
         v.num_requests_running = Some(3.2);
         v.tpot_ms = Some(35.0);
         let mut g = gpu_busy();
-        g.gpu_util_pct = Some(50.0);
+        g.gpu_util_pct = None;
         g.power_watts = Some(312.0);
         g.vram_used_mb = Some(62 * 1024);
         g.vram_total_mb = Some(80 * 1024);
@@ -1785,11 +1781,11 @@ fn session_kv_peak_from_non_r5_window_reaches_build_report_from_eval() {
     let summary = ai(&ctx, windows.last().expect("windows"));
     let report = build_report_for_windows(&windows, summary);
     let r5 = report
-        .groups
+        .recommendations
         .iter()
-        .find(|g| g.primary.rule_name == rule_names::CONCURRENCY_SATURATION)
+        .find(|g| g.rule_name == rule_names::CONCURRENCY_SATURATION)
         .expect("r5 group");
-    let text = r5.primary.display_lines.join("\n");
+    let text = r5.display_lines.join("\n");
     assert!(
         text.contains("Raise --max-num-seqs above 32"),
         "display fix line must use summary snapshot KV branch: {text}"
@@ -1798,7 +1794,7 @@ fn session_kv_peak_from_non_r5_window_reaches_build_report_from_eval() {
     assert!(!text.contains("Add a replica"));
     assert!(!text.contains("KV pool has room (70%)"));
     // action still uses aggregate session peak from eval.
-    assert_eq!(r5.primary.action, "Add a replica to scale out.");
+    assert_eq!(r5.action, "Add a replica to scale out.");
 }
 
 #[test]
@@ -1811,7 +1807,7 @@ fn r6_fires_as_primary_when_no_other_rules() {
     let summary = ai(&ctx, windows.last().expect("windows"));
     let report = build_report_for_windows(&windows, summary);
     assert_eq!(
-        report.groups[0].primary.rule_name,
+        report.recommendations[0].rule_name,
         rule_names::PREFILL_BOUND
     );
 }
@@ -1837,15 +1833,15 @@ fn r6_suppresses_r7_when_both_fire() {
     let report = build_report_for_windows(&windows, summary);
     assert!(
         report
-            .groups
+            .recommendations
             .iter()
-            .any(|g| g.primary.rule_name == rule_names::PREFILL_BOUND)
+            .any(|g| g.rule_name == rule_names::PREFILL_BOUND)
     );
     assert!(
         !report
-            .groups
+            .recommendations
             .iter()
-            .any(|g| g.primary.rule_name == rule_names::CONFIG_HEADROOM)
+            .any(|g| g.rule_name == rule_names::CONFIG_HEADROOM)
     );
     assert!(
         report
@@ -1866,9 +1862,9 @@ fn r7_fires_as_primary_when_alone() {
     let ctx = mk_r7_ctx(64);
     let summary = ai(&ctx, windows.last().expect("windows"));
     let report = build_report_for_windows(&windows, summary);
-    assert_eq!(report.groups.len(), 1);
+    assert_eq!(report.recommendations.len(), 1);
     assert_eq!(
-        report.groups[0].primary.rule_name,
+        report.recommendations[0].rule_name,
         rule_names::CONFIG_HEADROOM
     );
 }
@@ -1886,22 +1882,22 @@ fn dag_layer2_suppresses_layer3_when_r2_fires() {
     let report = build_report_for_windows(&windows, summary);
     assert!(
         report
-            .groups
+            .recommendations
             .iter()
-            .any(|g| g.primary.rule_name == rule_names::KV_CACHE_PRESSURE)
+            .any(|g| g.rule_name == rule_names::KV_CACHE_PRESSURE)
     );
     assert!(
         !report
-            .groups
+            .recommendations
             .iter()
-            .any(|g| g.primary.rule_name == rule_names::CONCURRENCY_SATURATION)
+            .any(|g| g.rule_name == rule_names::CONCURRENCY_SATURATION)
     );
 }
 
 #[test]
 fn waste_none_when_efficiency_above_ceiling() {
     let b = baseline_for_waste(85.0, CostSource::Catalog, 1.84);
-    let groups = vec![issue_group(rule_names::UNDER_BATCHING)];
+    let groups = vec![mk_rec(rule_names::UNDER_BATCHING)];
     let mut lines = vec!["issue".to_string()];
     append_waste_line(&mut lines, &groups, Some(&b), Some(14.2));
     assert!(
@@ -1922,7 +1918,7 @@ fn waste_computed_against_80_pct_ceiling() {
         "test must distinguish 80% ceiling from 100% roofline"
     );
     let b = baseline_for_waste(50.0, CostSource::Catalog, cpm);
-    let groups = vec![issue_group(rule_names::UNDER_BATCHING)];
+    let groups = vec![mk_rec(rule_names::UNDER_BATCHING)];
     let mut lines = vec!["issue".to_string()];
     append_waste_line(&mut lines, &groups, Some(&b), Some(tps));
     let waste_line = lines
@@ -1945,25 +1941,25 @@ fn waste_line_appended_for_r1_r2_r3_r5() {
     let tps = Some(14.2_f64);
     let cases = [
         (
-            vec![issue_group(rule_names::UNDER_BATCHING)],
+            vec![mk_rec(rule_names::UNDER_BATCHING)],
             "wasted on idle compute",
         ),
         (
-            vec![issue_group(rule_names::KV_CACHE_PRESSURE)],
+            vec![mk_rec(rule_names::KV_CACHE_PRESSURE)],
             "lost to memory thrashing",
         ),
         (
-            vec![issue_group(rule_names::LOW_PREFIX_REUSE)],
+            vec![mk_rec(rule_names::LOW_PREFIX_REUSE)],
             "wasted on redundant prefill",
         ),
         (
-            vec![issue_group(rule_names::CONCURRENCY_SATURATION)],
+            vec![mk_rec(rule_names::CONCURRENCY_SATURATION)],
             "lost to scheduler queuing",
         ),
     ];
-    for (groups, suffix) in cases {
+    for (recs, suffix) in cases {
         let mut lines = vec!["issue".to_string()];
-        append_waste_line(&mut lines, &groups, Some(&b), tps);
+        append_waste_line(&mut lines, &recs, Some(&b), tps);
         let waste = lines.iter().find(|l| l.contains("/hr ")).expect(suffix);
         assert!(waste.ends_with(suffix), "got {waste}");
     }
@@ -1971,7 +1967,7 @@ fn waste_line_appended_for_r1_r2_r3_r5() {
 
 #[test]
 fn waste_line_unknown_rule_name_unclassified() {
-    let groups = vec![issue_group(rule_names::OOM_RISK)];
+    let groups = vec![mk_rec(rule_names::OOM_RISK)];
 
     let b = baseline_for_waste(32.0, CostSource::Catalog, 1.84);
     let mut lines = vec!["issue".to_string()];
@@ -1991,7 +1987,7 @@ fn waste_line_efficiency_over_100_omitted() {
     let mut lines = vec!["issue".to_string()];
     append_waste_line(
         &mut lines,
-        &[issue_group(rule_names::UNDER_BATCHING)],
+        &[mk_rec(rule_names::UNDER_BATCHING)],
         Some(&b),
         Some(14.2),
     );
@@ -2006,7 +2002,7 @@ fn waste_line_absent_without_cost_or_efficiency() {
     let mut lines = vec!["issue".to_string()];
     append_waste_line(
         &mut lines,
-        &[issue_group(rule_names::UNDER_BATCHING)],
+        &[mk_rec(rule_names::UNDER_BATCHING)],
         Some(&b),
         Some(10.0),
     );
@@ -2016,7 +2012,7 @@ fn waste_line_absent_without_cost_or_efficiency() {
     b.cost = None;
     append_waste_line(
         &mut lines,
-        &[issue_group(rule_names::UNDER_BATCHING)],
+        &[mk_rec(rule_names::UNDER_BATCHING)],
         Some(&b),
         Some(10.0),
     );

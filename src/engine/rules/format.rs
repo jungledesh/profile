@@ -9,7 +9,7 @@ use crate::engine::baseline::{CostSource, PhysicsBaseline, WeightDtypeSource};
 
 use super::r4_oom_risk::r4_advisory;
 use super::{
-    ACHIEVABLE_EFFICIENCY_CEILING, ENGINE_MIN_PERSISTENT_WINDOWS, IssueGroup, NO_ISSUES_LINE,
+    ACHIEVABLE_EFFICIENCY_CEILING, ENGINE_MIN_PERSISTENT_WINDOWS, NO_ISSUES_LINE, Recommendation,
     rule_names,
 };
 
@@ -67,8 +67,8 @@ pub(super) fn r2_kv_cache_advisory(
     )])
 }
 
-fn rule_display_block(g: &IssueGroup) -> Vec<String> {
-    g.primary.display_lines.clone()
+fn rule_display_block(rec: &Recommendation) -> Vec<String> {
+    rec.display_lines.clone()
 }
 
 struct CollectedAdvisories {
@@ -204,11 +204,11 @@ pub(super) fn waste_label_suffix(rule_names_list: &[&str]) -> Option<&'static st
 /// Appends per-issue waste line when efficiency and cost data are available.
 pub(super) fn append_waste_line(
     lines: &mut Vec<String>,
-    groups: &[IssueGroup],
+    recommendations: &[Recommendation],
     baseline: Option<&PhysicsBaseline>,
     tps: Option<f64>,
 ) {
-    let rule_names: Vec<&str> = groups.iter().map(|g| g.primary.rule_name).collect();
+    let rule_names: Vec<&str> = recommendations.iter().map(|r| r.rule_name).collect();
     let Some(suffix) = waste_label_suffix(&rule_names) else {
         return;
     };
@@ -334,6 +334,124 @@ fn append_report_skip_notes(out: &mut Vec<String>, report: &Report, blank_before
     }
 }
 
+/// Skip accounting for "Captured: N" lines. Empty when nothing was skipped.
+fn captured_skip_suffix(skipped_broken: usize, skipped_idle: usize) -> String {
+    let mut parts = Vec::new();
+    if skipped_broken > 0 {
+        parts.push(format!("{skipped_broken} dropped"));
+    }
+    if skipped_idle > 0 {
+        parts.push(format!("{skipped_idle} idle"));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
+    }
+}
+
+/// e.g. `Captured: 2 (3 dropped, 10 idle).` or `Captured: 2.`
+pub fn format_captured_windows(
+    n_eval: usize,
+    skipped_broken: usize,
+    skipped_idle: usize,
+) -> String {
+    format!(
+        "Captured: {n_eval}{}.",
+        captured_skip_suffix(skipped_broken, skipped_idle)
+    )
+}
+
+/// Evidence state for the post-DAG MU safety net. Engine selects; this module renders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MuVariant {
+    Starved,
+    BlockedAdmission { kv_measured: bool },
+    GaugeMissing,
+}
+
+/// Post-DAG traffic/admission safety net (massive under-utilization).
+pub(crate) fn mu_diagnose_lines(
+    eff: f64,
+    run: Option<f64>,
+    wait: Option<f64>,
+    max_num_seqs: Option<u32>,
+    variant: MuVariant,
+) -> Vec<String> {
+    // Truncate (not round): mean waiting 0.6 must not print as "1 waiting".
+    let count_str = |v: Option<f64>| {
+        v.filter(|x| x.is_finite())
+            .map(|x| format!("{:.0}", x.trunc()))
+            .unwrap_or_else(|| "-".to_string())
+    };
+    let run_str = count_str(run);
+    let wait_str = count_str(wait);
+    let requests_line = match variant {
+        MuVariant::Starved => {
+            format!("    Requests  {run_str} running, {wait_str} waiting  (server not saturated)")
+        }
+        MuVariant::BlockedAdmission { .. } => {
+            let seats = match (max_num_seqs, run.filter(|r| r.is_finite())) {
+                (Some(max_n), Some(run_v)) => {
+                    let free = (f64::from(max_n) - run_v.trunc()).max(0.0);
+                    format!("{:.0} of {max_n} seats free", free.trunc())
+                }
+                _ => "seats free unknown".to_string(),
+            };
+            format!("    Requests  {run_str} running, {wait_str} waiting  ({seats})")
+        }
+        MuVariant::GaugeMissing => {
+            format!(
+                "    Requests  {run_str} running, {wait_str} waiting  (waiting gauge unavailable)"
+            )
+        }
+    };
+    let (cause, fix, expected, confidence) = match variant {
+        MuVariant::Starved => (
+            "      Server is under-fed. No config bottleneck detected - client traffic is too low to utilize the hardware.",
+            "      • Batch more requests or increase client concurrency until a wait queue forms.",
+            "    Expected: Efficiency climbs as the GPU is fed more work.",
+            "    Confidence: Medium",
+        ),
+        MuVariant::BlockedAdmission { kv_measured: true } => (
+            "      Requests queue while seats are free and KV cache is low. Scheduler admission is blocked - likely the prefill token budget.",
+            "      • Raise --max-num-batched-tokens or enable chunked prefill.",
+            "    Expected: Queue drains as admission unblocks.",
+            "    Confidence: Low (cause inferred, token budget not observed)",
+        ),
+        MuVariant::BlockedAdmission { kv_measured: false } => (
+            "      Requests queue while seats are free. Scheduler admission is blocked - likely the prefill token budget.",
+            "      • Raise --max-num-batched-tokens or enable chunked prefill.",
+            "    Expected: Queue drains as admission unblocks.",
+            "    Confidence: Low (cause inferred; KV gauge unavailable)",
+        ),
+        MuVariant::GaugeMissing => (
+            "      Server is under-fed. No config bottleneck detected - client traffic is too low to utilize the hardware.",
+            "      • Batch more requests or increase client concurrency until a wait queue forms.",
+            "    Expected: Efficiency climbs as the GPU is fed more work.",
+            "    Confidence: Low (waiting gauge unavailable)",
+        ),
+    };
+    vec![
+        "[!] Massive Under-utilization".to_string(),
+        String::new(),
+        format!(
+            "    Decode eff. {eff:.1}%  (threshold: < {:.0}%)",
+            crate::engine::MASSIVE_UNDERUTIL_THRESHOLD_PCT
+        ),
+        requests_line,
+        String::new(),
+        "    Cause:".to_string(),
+        cause.to_string(),
+        String::new(),
+        "    Fix:".to_string(),
+        fix.to_string(),
+        String::new(),
+        expected.to_string(),
+        confidence.to_string(),
+    ]
+}
+
 /// Idle server with working telemetry: show load-generation hint.
 pub fn idle_diagnose_lines(
     verbose: bool,
@@ -428,25 +546,20 @@ pub fn format_diagnose_rules(
         return idle_diagnose_lines(verbose_rules, std::slice::from_ref(input.window), &hint);
     }
 
-    let any_issue = !report.groups.is_empty();
+    let any_issue = !report.recommendations.is_empty();
     let baseline_ref = report.baseline.as_ref();
     let tps = snapshot.vllm.generation_tokens_per_sec;
 
-    let fired_names: HashSet<&'static str> = report
-        .groups
-        .iter()
-        .flat_map(|g| {
-            std::iter::once(g.primary.rule_name).chain(g.secondary.iter().map(|r| r.rule_name))
-        })
-        .collect();
+    let fired_names: HashSet<&'static str> =
+        report.recommendations.iter().map(|r| r.rule_name).collect();
 
     let mut out = Vec::new();
 
-    for g in &report.groups {
-        append_display_block(&mut out, rule_display_block(g));
+    for rec in &report.recommendations {
+        append_display_block(&mut out, rule_display_block(rec));
     }
 
-    append_waste_line(&mut out, &report.groups, baseline_ref, tps);
+    append_waste_line(&mut out, &report.recommendations, baseline_ref, tps);
 
     let advisories = collect_advisories(
         &fired_names,
@@ -506,14 +619,9 @@ pub fn format_diagnose_rules_for_windows(
             String::new(),
             format!(
                 "    Traffic detected but too brief for reliable diagnosis. \
-                 Required: {} evaluable windows. Captured: {}{}.",
+                 Required: {} evaluable windows. {}",
                 ENGINE_MIN_PERSISTENT_WINDOWS,
-                report.n_eval,
-                if report.skipped_broken > 0 {
-                    format!(" ({} windows dropped)", report.skipped_broken)
-                } else {
-                    String::new()
-                }
+                format_captured_windows(report.n_eval, report.skipped_broken, report.skipped_idle)
             ),
             String::new(),
             "    Fix:".to_string(),
@@ -527,7 +635,7 @@ pub fn format_diagnose_rules_for_windows(
     let baseline_ref = report.baseline.as_ref();
     let tps = summary_snap.vllm.generation_tokens_per_sec;
 
-    if report.groups.is_empty() {
+    if report.recommendations.is_empty() {
         let mut out = Vec::new();
         let advisories = collect_advisories(
             &HashSet::new(),
@@ -554,24 +662,19 @@ pub fn format_diagnose_rules_for_windows(
         return out;
     }
 
-    let fired_names: HashSet<&'static str> = report
-        .groups
-        .iter()
-        .flat_map(|g| {
-            std::iter::once(g.primary.rule_name).chain(g.secondary.iter().map(|r| r.rule_name))
-        })
-        .collect();
+    let fired_names: HashSet<&'static str> =
+        report.recommendations.iter().map(|r| r.rule_name).collect();
 
     let mut warnings: Vec<String> = Vec::new();
-    for g in &report.groups {
+    for rec in &report.recommendations {
         if !warnings.is_empty() && !warnings.last().is_some_and(|l| l.is_empty()) {
             warnings.push(String::new());
         }
-        warnings.extend(rule_display_block(g));
+        warnings.extend(rule_display_block(rec));
         warnings.push(String::new());
     }
 
-    append_waste_line(&mut warnings, &report.groups, baseline_ref, tps);
+    append_waste_line(&mut warnings, &report.recommendations, baseline_ref, tps);
 
     let advisories = collect_advisories(
         &fired_names,
@@ -593,7 +696,7 @@ pub fn format_diagnose_rules_for_windows(
         advisories.r2_present,
         advisories.r4_present,
     );
-    let any_warning = !report.groups.is_empty();
+    let any_warning = !report.recommendations.is_empty();
     if verbose_rules {
         append_not_triggered_lines(&mut out, &not_fired, &report.suppressed_rules);
     }
@@ -842,6 +945,86 @@ mod load_hint_tests {
         };
         assert!(join_hint(&hint).contains("--request-rate 1"));
         assert!(!join_hint(&hint).contains("--request-rate 0"));
+    }
+
+    #[test]
+    fn mu_diagnose_lines_starved_variant() {
+        let text = mu_diagnose_lines(12.5, Some(64.0), Some(0.0), Some(256), MuVariant::Starved)
+            .join("\n");
+        assert!(text.contains("Requests  64 running, 0 waiting  (server not saturated)"));
+        assert!(text.contains("Server is under-fed"));
+        assert!(text.contains("Confidence: Medium"));
+        assert!(!text.contains("GPU is idle"));
+        let blip = mu_diagnose_lines(12.5, Some(64.0), Some(0.6), Some(256), MuVariant::Starved)
+            .join("\n");
+        assert!(blip.contains("Requests  64 running, 0 waiting  (server not saturated)"));
+        assert!(!blip.contains("1 waiting"));
+    }
+
+    #[test]
+    fn mu_diagnose_lines_blocked_admission_variant() {
+        let measured = mu_diagnose_lines(
+            12.0,
+            Some(10.0),
+            Some(5.0),
+            Some(256),
+            MuVariant::BlockedAdmission { kv_measured: true },
+        )
+        .join("\n");
+        assert!(measured.contains("Requests  10 running, 5 waiting  (246 of 256 seats free)"));
+        assert!(measured.contains("seats are free and KV cache is low"));
+        assert!(measured.contains("Scheduler admission is blocked"));
+        assert!(measured.contains("Raise --max-num-batched-tokens"));
+        assert!(measured.contains("Confidence: Low (cause inferred, token budget not observed)"));
+        assert!(!measured.contains("server not saturated"));
+        assert!(!measured.contains("KV gauge unavailable"));
+
+        let unmeasured = mu_diagnose_lines(
+            12.0,
+            Some(10.0),
+            Some(5.0),
+            Some(256),
+            MuVariant::BlockedAdmission { kv_measured: false },
+        )
+        .join("\n");
+        assert!(unmeasured.contains("Requests  10 running, 5 waiting  (246 of 256 seats free)"));
+        assert!(unmeasured.contains("Requests queue while seats are free."));
+        assert!(!unmeasured.contains("KV cache is low"));
+        assert!(unmeasured.contains("Scheduler admission is blocked"));
+        assert!(unmeasured.contains("Raise --max-num-batched-tokens"));
+        assert!(unmeasured.contains("Confidence: Low (cause inferred; KV gauge unavailable)"));
+
+        let no_max = mu_diagnose_lines(
+            12.0,
+            Some(10.0),
+            Some(5.0),
+            None,
+            MuVariant::BlockedAdmission { kv_measured: true },
+        )
+        .join("\n");
+        assert!(no_max.contains("(seats free unknown)"));
+        assert!(!no_max.contains("server not saturated"));
+    }
+
+    #[test]
+    fn mu_diagnose_lines_gauge_missing_variant() {
+        let text = mu_diagnose_lines(12.5, Some(64.0), None, Some(256), MuVariant::GaugeMissing)
+            .join("\n");
+        assert!(text.contains("Requests  64 running, - waiting  (waiting gauge unavailable)"));
+        assert!(text.contains("Server is under-fed"));
+        assert!(text.contains("Confidence: Low (waiting gauge unavailable)"));
+        assert!(!text.contains("server not saturated"));
+    }
+
+    #[test]
+    fn format_captured_windows_variants() {
+        assert_eq!(format_captured_windows(2, 0, 0), "Captured: 2.");
+        assert_eq!(format_captured_windows(2, 3, 0), "Captured: 2 (3 dropped).");
+        assert_eq!(format_captured_windows(2, 0, 10), "Captured: 2 (10 idle).");
+        assert_eq!(
+            format_captured_windows(2, 3, 10),
+            "Captured: 2 (3 dropped, 10 idle)."
+        );
     }
 
     #[test]

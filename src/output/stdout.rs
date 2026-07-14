@@ -217,7 +217,12 @@ fn build_diagnose_lines(
 /// Action line: printed below the box, not inside it.
 /// Returns None when no issues fired (clean run or not evaluable).
 fn journey_line(report: &engine::Report) -> Option<&'static str> {
-    if report.groups.is_empty() {
+    // Same sparse gate as the formatter ISSUES branch: never prompt "apply the fix"
+    // when recommendations are hidden behind Insufficient Sustained Load.
+    if report.n_eval < engine::ENGINE_MIN_PERSISTENT_WINDOWS {
+        return None;
+    }
+    if report.recommendations.is_empty() {
         return None;
     }
     Some("▶  Apply the fix above. Profile re-measures after your change.")
@@ -1597,5 +1602,43 @@ mod tests {
         assert!(text.contains("GPU [0]"));
         assert!(text.contains("GPU [1]"));
         assert!(text.contains("power 610W"));
+    }
+
+    fn report_with_n_eval_and_rec(n_eval: usize) -> engine::Report {
+        engine::Report {
+            baseline: None,
+            recommendations: vec![engine::Recommendation {
+                rule_name: "oom_risk",
+                layer: 1,
+                impact: 5,
+                confidence: 0.9,
+                action: "add TP".to_string(),
+                short_action: "add TP".to_string(),
+                expected_impact: "fits".to_string(),
+                display_lines: vec!["[!] OOM".to_string()],
+            }],
+            suppressed_rules: Vec::new(),
+            kv_max_seqs: None,
+            n_eval,
+            skipped_broken: 0,
+            skipped_idle: 0,
+        }
+    }
+
+    #[test]
+    fn journey_line_none_when_sparse_even_with_recommendations() {
+        assert_eq!(
+            journey_line(&report_with_n_eval_and_rec(2)),
+            None,
+            "sparse n_eval must suppress apply-fix footer"
+        );
+    }
+
+    #[test]
+    fn journey_line_some_when_sustained_with_recommendations() {
+        assert_eq!(
+            journey_line(&report_with_n_eval_and_rec(3)),
+            Some("▶  Apply the fix above. Profile re-measures after your change.")
+        );
     }
 }

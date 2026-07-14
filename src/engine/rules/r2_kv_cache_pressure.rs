@@ -5,7 +5,7 @@ use super::{MAX_OBSERVATION_SKEW_SECS, skew_secs};
 use super::{Recommendation, rule_names};
 
 /// 88% matches observed vLLM production eviction onset; 85% was too conservative.
-const KV_CACHE_PRESSURE_MIN_PERC: f64 = 88.0;
+pub(crate) const KV_CACHE_PRESSURE_MIN_PERC: f64 = 88.0;
 /// 0.02/s = ~1 eviction/minute; below this the scheduler is recovering normally,
 /// not under sustained KV pressure. Avoids firing on a single-event spike.
 const PREEMPTION_RATE_MIN_PER_SEC: f64 = 0.02;
