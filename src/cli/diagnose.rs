@@ -45,7 +45,12 @@ pub fn execute(
         verbose_rules,
     );
 
-    if !result.any_evaluable || result.all_idle {
+    // Incomplete measurement: table already printed. Do not start the closed loop
+    // (avoids empty recommendations → false healthy exit).
+    if !result.any_evaluable
+        || result.all_idle
+        || report.n_eval < engine::ENGINE_MIN_PERSISTENT_WINDOWS
+    {
         return Ok(());
     }
 

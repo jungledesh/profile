@@ -392,16 +392,13 @@ mod tests {
             ],
             _ => vec![],
         };
-        // kv_cache_usage_perc and gpu_util_pct intentionally None.
-        // window_is_active falls back to running > 0 alone.
-        // Tests needing specific active/inactive behavior must set these fields explicitly.
+        // Activity is running >= 1 OR tok/s >= 1. KV/GPU util are not gates.
         RawSnapshot {
             gpu_observed_at: SystemTime::UNIX_EPOCH,
             vllm_observed_at: SystemTime::UNIX_EPOCH,
             timestamp: SystemTime::UNIX_EPOCH,
             vllm: VllmRawMetrics {
                 num_requests_running: run,
-                kv_cache_usage_perc: None,
                 generation_tokens_per_sec: tps,
                 prefix_cache_hit_rate: prefix_hit_rate,
                 prefix_cache_scrape_samples: samples,
@@ -411,28 +408,6 @@ mod tests {
             },
             gpus: vec![gpu],
         }
-    }
-
-    fn mk_active_snap(
-        run: Option<f64>,
-        tps: Option<f64>,
-        hits: Option<(f64, f64)>,
-        q: Option<(f64, f64)>,
-        prefix_hit_rate: Option<f64>,
-        gpu: GpuRawMetrics,
-        generation_tokens_total: Option<f64>,
-    ) -> RawSnapshot {
-        let mut snap = mk_snap(
-            run,
-            tps,
-            hits,
-            q,
-            prefix_hit_rate,
-            gpu,
-            generation_tokens_total,
-        );
-        snap.vllm.kv_cache_usage_perc = Some(50.0);
-        snap
     }
 
     #[test]
@@ -453,14 +428,11 @@ mod tests {
                 },
             ]
         }
-        let g = GpuRawMetrics {
-            gpu_util_pct: Some(50.0),
-            ..Default::default()
-        };
-        let mut w1 = mk_active_snap(Some(5.0), Some(100.0), None, None, None, g.clone(), None);
+        let g = GpuRawMetrics::default();
+        let mut w1 = mk_snap(Some(5.0), Some(100.0), None, None, None, g.clone(), None);
         w1.vllm.ttft_p99_buckets = latency_buckets();
         w1.vllm.tpot_p99_buckets = latency_buckets();
-        let mut w2 = mk_active_snap(Some(5.0), Some(200.0), None, None, None, g, None);
+        let mut w2 = mk_snap(Some(5.0), Some(200.0), None, None, None, g, None);
         w2.vllm.ttft_p99_buckets = latency_buckets();
         w2.vllm.tpot_p99_buckets = latency_buckets();
         let agg = aggregate_windows(
@@ -492,33 +464,40 @@ mod tests {
             sm_clock_mhz: Some(2000),
             ..Default::default()
         };
-        let windows = vec![
-            mk_snap(
-                Some(2.0),
-                Some(100.0),
-                Some((10.0, 20.0)),
-                Some((50.0, 130.0)),
-                None,
-                g1,
-                None,
-            ),
-            mk_active_snap(
-                Some(10.0),
-                Some(500.0),
-                Some((0.0, 10.0)),
-                Some((10.0, 20.0)),
-                None,
-                g2,
-                None,
-            ),
-        ];
-        let durations = vec![Duration::from_secs(2), Duration::from_secs(10)];
-        let agg = aggregate_windows(&windows, &durations, SystemTime::UNIX_EPOCH);
-        assert!((agg.vllm.num_requests_running.unwrap() - 10.0).abs() < 1e-9);
-        assert!((agg.vllm.generation_tokens_per_sec.unwrap() - 500.0).abs() < 1e-4);
+        let mut w1 = mk_snap(
+            Some(2.0),
+            Some(100.0),
+            Some((10.0, 20.0)),
+            Some((50.0, 130.0)),
+            None,
+            g1,
+            None,
+        );
+        w1.vllm.window_duration_secs = Some(2.0);
+        let mut w2 = mk_snap(
+            Some(10.0),
+            Some(500.0),
+            Some((0.0, 10.0)),
+            Some((10.0, 20.0)),
+            None,
+            g2,
+            None,
+        );
+        w2.vllm.window_duration_secs = Some(10.0);
+        let agg = aggregate_windows(
+            &[w1, w2],
+            &[Duration::from_secs(2), Duration::from_secs(10)],
+            SystemTime::UNIX_EPOCH,
+        );
+        // Both active. Duration-weighted: (2×2 + 10×10) / 12, (100×2 + 500×10) / 12,
+        // util (10×2 + 50×10) / 12.
+        assert!((agg.vllm.num_requests_running.unwrap() - (104.0 / 12.0)).abs() < 1e-9);
+        assert!((agg.vllm.generation_tokens_per_sec.unwrap() - (5200.0 / 12.0)).abs() < 1e-4);
         // (10+10)/(80+10) = 20/90 - sum of Δhits / sum of Δqueries, not last window only.
         assert!((agg.vllm.prefix_cache_hit_rate.unwrap() - 20.0 / 90.0).abs() < 1e-9);
-        assert!((agg.gpus.first().and_then(|g| g.gpu_util_pct).unwrap() - 50.0).abs() < 1e-4);
+        assert!(
+            (agg.gpus.first().and_then(|g| g.gpu_util_pct).unwrap() - (520.0 / 12.0)).abs() < 1e-4
+        );
         assert_eq!(agg.gpus.first().and_then(|g| g.vram_used_mb), Some(2000));
         assert!((agg.gpus.first().and_then(|g| g.temperature_c).unwrap() - 60.0).abs() < 1e-9);
         assert_eq!(agg.gpus.first().and_then(|g| g.sm_clock_mhz), Some(2000));
@@ -527,9 +506,9 @@ mod tests {
     #[test]
     fn actual_duration_used_over_planned_when_present() {
         let g = GpuRawMetrics::default();
-        let mut w1 = mk_active_snap(Some(2.0), Some(100.0), None, None, None, g.clone(), None);
+        let mut w1 = mk_snap(Some(2.0), Some(100.0), None, None, None, g.clone(), None);
         w1.vllm.window_duration_secs = Some(2.0);
-        let mut w2 = mk_active_snap(Some(2.0), Some(200.0), None, None, None, g, None);
+        let mut w2 = mk_snap(Some(2.0), Some(200.0), None, None, None, g, None);
         w2.vllm.window_duration_secs = Some(6.0);
         let planned = vec![Duration::from_secs(2), Duration::from_secs(2)];
         let agg = aggregate_windows(&[w1, w2], &planned, SystemTime::UNIX_EPOCH);
@@ -570,7 +549,7 @@ mod tests {
     #[test]
     fn aggregate_cumulative_tokens_from_chronological_last_not_last_evaluable() {
         let g = GpuRawMetrics::default();
-        let w1 = mk_active_snap(
+        let w1 = mk_snap(
             Some(2.0),
             Some(100.0),
             None,
@@ -765,7 +744,7 @@ mod tests {
         };
         let w1 = mk(VllmRawMetrics {
             num_requests_running: Some(2.0),
-            kv_cache_usage_perc: Some(50.0),
+            kv_cache_usage_perc: None,
             generation_tokens_per_sec: Some(100.0),
             window_duration_secs: Some(10.0),
             ttft_ms: Some(5000.0),
@@ -777,7 +756,7 @@ mod tests {
         });
         let w2 = mk(VllmRawMetrics {
             num_requests_running: Some(2.0),
-            kv_cache_usage_perc: Some(50.0),
+            kv_cache_usage_perc: None,
             generation_tokens_per_sec: Some(100.0),
             window_duration_secs: Some(2.0),
             ttft_ms: Some(50.0),
@@ -810,7 +789,7 @@ mod tests {
         };
         let w1 = mk(VllmRawMetrics {
             num_requests_running: Some(2.0),
-            kv_cache_usage_perc: Some(50.0),
+            kv_cache_usage_perc: None,
             window_duration_secs: Some(2.0),
             ttft_window_mass: Some(HistogramWindowMass {
                 sum_delta: 2.0,
@@ -832,7 +811,7 @@ mod tests {
         });
         let w2 = mk(VllmRawMetrics {
             num_requests_running: Some(2.0),
-            kv_cache_usage_perc: Some(50.0),
+            kv_cache_usage_perc: None,
             window_duration_secs: Some(2.0),
             ttft_window_mass: Some(HistogramWindowMass {
                 sum_delta: 3.0,
@@ -896,16 +875,16 @@ mod tests {
             vllm: v,
             gpus: vec![g],
         };
+        // True idle: evaluable, running < 1 and tok/s < 1. High KV proves KV is not a gate.
         let idle_v = VllmRawMetrics {
-            num_requests_running: Some(8.0),
-            kv_cache_usage_perc: Some(10.0),
-            generation_tokens_per_sec: Some(10.0),
+            num_requests_running: Some(0.0),
+            kv_cache_usage_perc: Some(90.0),
+            generation_tokens_per_sec: Some(0.0),
             window_duration_secs: Some(2.0),
             ..Default::default()
         };
         let active_v = VllmRawMetrics {
             num_requests_running: Some(20.0),
-            kv_cache_usage_perc: Some(50.0),
             generation_tokens_per_sec: Some(100.0),
             window_duration_secs: Some(2.0),
             ..Default::default()
@@ -942,8 +921,8 @@ mod tests {
         assert!((agg.vllm.generation_tokens_per_sec.unwrap() - 100.0).abs() < 1e-9);
         assert!((agg.vllm.num_requests_running.unwrap() - 20.0).abs() < 1e-9);
         assert!((agg.gpus.first().and_then(|g| g.gpu_util_pct).unwrap() - 60.0).abs() < 1e-9);
-        // Evaluable blend would be (10+100+100)/3 weighted by equal duration = 70 tok/s.
-        assert!((agg.vllm.generation_tokens_per_sec.unwrap() - 70.0).abs() > 10.0);
+        // If idle were included: (0+100+100)/3 = 66.7 tok/s.
+        assert!((agg.vllm.generation_tokens_per_sec.unwrap() - (200.0 / 3.0)).abs() > 10.0);
     }
 
     #[test]

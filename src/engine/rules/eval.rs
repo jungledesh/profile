@@ -32,7 +32,7 @@ use super::r7_config_headroom::{
     ConfigHeadroomDetail, aggregate_r7_detail, format_config_headroom_window_issue,
     rule7_config_headroom,
 };
-use super::{IssueGroup, Recommendation, compute_kv_max_seqs, rule_is_significant, rule_names};
+use super::{Recommendation, compute_kv_max_seqs, rule_is_significant, rule_names};
 
 const SUPPRESSION_TABLE: &[(&str, &str)] = &[
     (rule_names::OOM_RISK, rule_names::KV_CACHE_PRESSURE),
@@ -271,7 +271,7 @@ fn build_report_from_eval(
         );
         return Report {
             baseline,
-            groups: Vec::new(),
+            recommendations: Vec::new(),
             suppressed_rules: Vec::new(),
             kv_max_seqs,
             n_eval: 0,
@@ -523,7 +523,7 @@ pub(crate) fn finalize_report_groups(
     let Some(min_layer) = recs.iter().map(|r| r.layer).min() else {
         return Report {
             baseline,
-            groups: Vec::new(),
+            recommendations: Vec::new(),
             suppressed_rules,
             kv_max_seqs,
             n_eval,
@@ -572,17 +572,9 @@ pub(crate) fn finalize_report_groups(
         sb.total_cmp(&sa)
     });
 
-    let groups: Vec<IssueGroup> = recs
-        .into_iter()
-        .map(|r| IssueGroup {
-            primary: r,
-            secondary: Vec::new(),
-        })
-        .collect();
-
     Report {
         baseline,
-        groups,
+        recommendations: recs,
         suppressed_rules,
         kv_max_seqs,
         n_eval,
@@ -598,7 +590,7 @@ pub fn build_report_for_windows(windows: &[RuntimeWindow], summary: AnalysisInpu
     let Some(eval) = eval_window_rules(windows, &summary, summary_efficiency_pct) else {
         return Report {
             baseline,
-            groups: Vec::new(),
+            recommendations: Vec::new(),
             suppressed_rules: Vec::new(),
             kv_max_seqs: None,
             n_eval: 0,

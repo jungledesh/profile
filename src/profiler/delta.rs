@@ -195,7 +195,7 @@ mod tests {
                 config_relative_efficiency_pct: None,
                 cost,
             }),
-            groups: Vec::new(),
+            recommendations: Vec::new(),
             suppressed_rules: Vec::new(),
             kv_max_seqs: None,
             n_eval: 0,

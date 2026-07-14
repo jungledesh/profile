@@ -122,14 +122,14 @@ impl LoopState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::{IssueGroup, Recommendation};
+    use crate::engine::Recommendation;
     use crate::{collectors::VllmRawMetrics, context::StaticContext};
     use std::time::{Duration, SystemTime};
 
     fn empty_report() -> Report {
         Report {
             baseline: None,
-            groups: Vec::new(),
+            recommendations: Vec::new(),
             suppressed_rules: Vec::new(),
             kv_max_seqs: None,
             n_eval: 0,
@@ -138,19 +138,16 @@ mod tests {
         }
     }
 
-    fn group(rule: &'static str) -> IssueGroup {
-        IssueGroup {
-            primary: Recommendation {
-                rule_name: rule,
-                layer: 4,
-                impact: 1,
-                confidence: 1.0,
-                action: String::new(),
-                short_action: String::new(),
-                expected_impact: String::new(),
-                display_lines: Vec::new(),
-            },
-            secondary: Vec::new(),
+    fn recommendation(rule: &'static str) -> Recommendation {
+        Recommendation {
+            rule_name: rule,
+            layer: 4,
+            impact: 1,
+            confidence: 1.0,
+            action: String::new(),
+            short_action: String::new(),
+            expected_impact: String::new(),
+            display_lines: Vec::new(),
         }
     }
 
@@ -178,7 +175,7 @@ mod tests {
         let r = minimal_diagnose();
         let rep = Report {
             baseline: None,
-            groups: vec![group("under_batching")],
+            recommendations: vec![recommendation("under_batching")],
             suppressed_rules: Vec::new(),
             kv_max_seqs: None,
             n_eval: 1,
@@ -197,7 +194,7 @@ mod tests {
         let r = minimal_diagnose();
         let rep = Report {
             baseline: None,
-            groups: vec![group("a")],
+            recommendations: vec![recommendation("a")],
             suppressed_rules: Vec::new(),
             kv_max_seqs: None,
             n_eval: 1,
