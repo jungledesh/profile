@@ -167,7 +167,9 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
         .vllm
         .generation_tokens_per_sec
         .filter(|v| v.is_finite() && *v > 0.0);
-    let total_power: f64 = snap.gpus.iter().filter_map(|g| g.power_watts).sum();
+    // Energy: aligned_power only. Never divide misaligned NVML/vLLM clocks.
+    // $/1M tok joins cost/hr (config or catalog) with vLLM tok/s only; no GPU clock.
+    let total_power: f64 = snap.gpus.iter().filter_map(|g| g.aligned_power_watts).sum();
     let power_watts = (total_power > 0.0).then_some(total_power);
 
     let tok_per_watt = match (tps, power_watts) {
@@ -919,6 +921,11 @@ mod tests {
         );
         ctx.gpu.name = Some("NVIDIA H100 80GB HBM3".to_string());
         win.snapshot.gpus.first_mut().expect("gpu").power_watts = Some(50.0);
+        win.snapshot
+            .gpus
+            .first_mut()
+            .expect("gpu")
+            .aligned_power_watts = Some(50.0);
         let input = AnalysisInput::new(&ctx, &win);
         let b = compute(&input).expect("baseline");
         let cost = b.cost.expect("cost block");
@@ -929,9 +936,11 @@ mod tests {
 
     #[test]
     fn joules_per_token_none_when_power_missing() {
+        // No power telemetry: energy fields absent; $/1M still fires from cost_per_hour.
         let cfg = VllmConfig {
             kv_cache_dtype: Some("bf16".to_string()),
             max_model_len: Some(2048),
+            cost_per_hour: Some(2.0),
             ..Default::default()
         };
         let snap = VllmRawMetrics {
@@ -939,7 +948,7 @@ mod tests {
             num_requests_running: Some(1.0),
             ..Default::default()
         };
-        let (mut ctx, mut win) = baseline_input(
+        let (ctx, mut win) = baseline_input(
             Some(8_000_000_000),
             None,
             Some("bf16"),
@@ -948,13 +957,61 @@ mod tests {
             cfg,
             snap,
         );
-        ctx.gpu.name = Some("NVIDIA H100 80GB HBM3".to_string());
         win.snapshot.gpus.first_mut().expect("gpu").power_watts = None;
+        win.snapshot
+            .gpus
+            .first_mut()
+            .expect("gpu")
+            .aligned_power_watts = None;
         let cost = compute(&AnalysisInput::new(&ctx, &win))
             .expect("baseline")
             .cost
-            .expect("cost");
+            .expect("cost block");
+        assert!(cost.tok_per_watt.is_none());
         assert!(cost.joules_per_token.is_none());
+        assert!(cost.cost_per_million_tokens.is_some());
+        assert_eq!(cost.cost_source, CostSource::UserProvided);
+    }
+
+    #[test]
+    fn dollar_cost_survives_when_aligned_power_missing_but_raw_present() {
+        // All windows skewed: raw power exists, aligned is None. Energy refuses the
+        // bad join; $/1M tok still uses cost_per_hour × tok/s.
+        let cfg = VllmConfig {
+            kv_cache_dtype: Some("bf16".to_string()),
+            max_model_len: Some(2048),
+            cost_per_hour: Some(3.6),
+            ..Default::default()
+        };
+        let snap = VllmRawMetrics {
+            generation_tokens_per_sec: Some(100.0),
+            num_requests_running: Some(1.0),
+            ..Default::default()
+        };
+        let (ctx, mut win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(67.0),
+            Some(3350.0),
+            cfg,
+            snap,
+        );
+        win.snapshot.gpus.first_mut().expect("gpu").power_watts = Some(400.0);
+        win.snapshot
+            .gpus
+            .first_mut()
+            .expect("gpu")
+            .aligned_power_watts = None;
+        let cost = compute(&AnalysisInput::new(&ctx, &win))
+            .expect("baseline")
+            .cost
+            .expect("cost block");
+        assert!(cost.tok_per_watt.is_none());
+        assert!(cost.joules_per_token.is_none());
+        let cpm = cost.cost_per_million_tokens.expect("$/1M");
+        // 3.6 $/hr × 1e6 / (100 tok/s × 3600) = 10.0
+        assert!((cpm - 10.0).abs() < 1e-9);
     }
 
     #[test]
@@ -980,6 +1037,11 @@ mod tests {
         );
         ctx.gpu.name = Some("NVIDIA H100 80GB HBM3".to_string());
         win.snapshot.gpus.first_mut().expect("gpu").power_watts = Some(50.0);
+        win.snapshot
+            .gpus
+            .first_mut()
+            .expect("gpu")
+            .aligned_power_watts = Some(50.0);
         let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
         assert!(b.cost.is_none_or(|c| c.joules_per_token.is_none()));
     }
@@ -1007,6 +1069,11 @@ mod tests {
         );
         ctx.gpu.name = Some("NVIDIA H100 80GB HBM3".to_string());
         win.snapshot.gpus.first_mut().expect("gpu").power_watts = Some(100.0);
+        win.snapshot
+            .gpus
+            .first_mut()
+            .expect("gpu")
+            .aligned_power_watts = Some(100.0);
         let cost = compute(&AnalysisInput::new(&ctx, &win))
             .expect("baseline")
             .cost
@@ -1038,6 +1105,14 @@ mod tests {
             snap,
         );
         ctx.gpu.name = Some("NVIDIA H100 80GB HBM3".to_string());
+        // Cost join requires aligned power even for $/1M tok.
+        let mut win = win;
+        win.snapshot.gpus.first_mut().expect("gpu").power_watts = Some(400.0);
+        win.snapshot
+            .gpus
+            .first_mut()
+            .expect("gpu")
+            .aligned_power_watts = Some(400.0);
         let input = AnalysisInput::new(&ctx, &win);
         let b = compute(&input).expect("baseline");
         let cost = b.cost.expect("cost");
@@ -1060,7 +1135,7 @@ mod tests {
             num_requests_running: Some(1.0),
             ..Default::default()
         };
-        let (mut ctx, win) = baseline_input(
+        let (mut ctx, mut win) = baseline_input(
             Some(8_000_000_000),
             None,
             Some("bf16"),
@@ -1070,6 +1145,12 @@ mod tests {
             snap,
         );
         ctx.gpu.name = Some("NVIDIA H100 80GB HBM3".to_string());
+        win.snapshot.gpus.first_mut().expect("gpu").power_watts = Some(400.0);
+        win.snapshot
+            .gpus
+            .first_mut()
+            .expect("gpu")
+            .aligned_power_watts = Some(400.0);
         let input = AnalysisInput::new(&ctx, &win);
         let cost = compute(&input).expect("baseline").cost.expect("cost");
         assert_eq!(cost.cost_source, CostSource::UserProvided);
@@ -1156,7 +1237,7 @@ mod tests {
     }
 
     #[test]
-    fn cost_none_when_power_or_tps_missing() {
+    fn cost_none_when_tps_missing() {
         let cfg = VllmConfig {
             kv_cache_dtype: Some("bf16".to_string()),
             max_model_len: Some(2048),
@@ -1168,7 +1249,7 @@ mod tests {
             Some("bf16"),
             Some(67.0),
             Some(3350.0),
-            cfg.clone(),
+            cfg,
             VllmRawMetrics {
                 generation_tokens_per_sec: None,
                 num_requests_running: Some(1.0),
@@ -1178,7 +1259,16 @@ mod tests {
         ctx.gpu.name = Some("NVIDIA H100 80GB HBM3".to_string());
         let no_tps = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
         assert!(no_tps.cost.is_none());
+    }
 
+    #[test]
+    fn catalog_dollar_cost_without_aligned_power() {
+        // Catalog price + tok/s yields $/1M even when power telemetry is absent.
+        let cfg = VllmConfig {
+            kv_cache_dtype: Some("bf16".to_string()),
+            max_model_len: Some(2048),
+            ..Default::default()
+        };
         let (mut ctx2, mut win2) = baseline_input(
             Some(8_000_000_000),
             None,
@@ -1194,12 +1284,58 @@ mod tests {
         );
         ctx2.gpu.name = Some("NVIDIA H100 80GB HBM3".to_string());
         win2.snapshot.gpus.first_mut().expect("gpu").power_watts = None;
+        win2.snapshot
+            .gpus
+            .first_mut()
+            .expect("gpu")
+            .aligned_power_watts = None;
         let cost = compute(&AnalysisInput::new(&ctx2, &win2))
             .expect("baseline")
             .cost
-            .expect("cost without power");
+            .expect("catalog $/1M");
         assert!(cost.tok_per_watt.is_none());
+        assert!(cost.joules_per_token.is_none());
         assert!(cost.cost_per_million_tokens.is_some());
+        assert_eq!(cost.cost_source, CostSource::Catalog);
+    }
+
+    #[test]
+    fn consumer_amd_no_price_omits_dollar_per_million() {
+        // gpu_prices.json has no RX 7900 XTX row → no $/1M tok.
+        assert!(crate::context::gpu_prices::lookup_gpu_price("AMD Radeon RX 7900 XTX").is_none());
+        let cfg = VllmConfig {
+            kv_cache_dtype: Some("bf16".to_string()),
+            max_model_len: Some(2048),
+            ..Default::default()
+        };
+        let snap = VllmRawMetrics {
+            generation_tokens_per_sec: Some(100.0),
+            num_requests_running: Some(1.0),
+            ..Default::default()
+        };
+        let (mut ctx, mut win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(61.4),
+            Some(960.0),
+            cfg,
+            snap,
+        );
+        ctx.gpu.name = Some("AMD Radeon RX 7900 XTX".to_string());
+        win.snapshot.gpus.first_mut().expect("gpu").power_watts = Some(300.0);
+        win.snapshot
+            .gpus
+            .first_mut()
+            .expect("gpu")
+            .aligned_power_watts = Some(300.0);
+        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+        assert!(
+            b.cost
+                .as_ref()
+                .and_then(|c| c.cost_per_million_tokens)
+                .is_none()
+        );
     }
 
     #[test]
