@@ -177,7 +177,9 @@ static CATALOG: &[ModelEntry] = &[
             attn_flops_coeff: None,
         },
     },
-    // Qwen3-30B-A3B: unusual hidden_dim=2048 for a 30B MoE. KV formula unreliable.
+    // Qwen3-30B-A3B MoE.
+    // Source: https://huggingface.co/Qwen/Qwen3-30B-A3B/raw/main/config.json
+    // num_key_value_heads=4, head_dim=128, hidden_size=2048, num_hidden_layers=48.
     ModelEntry {
         tokens: &["qwen3", "30b"],
         entry: CatalogEntry {
@@ -187,8 +189,8 @@ static CATALOG: &[ModelEntry] = &[
             num_layers: 48,
             hidden_dim: 2048,
             default_weight_dtype: "bf16",
-            num_kv_heads: None,
-            head_dim: None,
+            num_kv_heads: Some(4),
+            head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
         },
@@ -214,21 +216,9 @@ static CATALOG: &[ModelEntry] = &[
         },
     },
     // ── Qwen 3 dense ─────────────────────────────────────────────────────────
-    ModelEntry {
-        tokens: &["qwen3", "72b"],
-        entry: CatalogEntry {
-            family: "qwen3",
-            param_count: 72 * B,
-            active_param_count: None,
-            num_layers: 80,
-            hidden_dim: 8192,
-            default_weight_dtype: "bf16",
-            num_kv_heads: Some(8),
-            head_dim: Some(128),
-            num_kv_layers: None,
-            attn_flops_coeff: None,
-        },
-    },
+    // Official dense SKUs: 0.6B, 1.7B, 4B, 8B, 14B, 32B (no dense 7B/72B).
+    // Sources: https://huggingface.co/Qwen/Qwen3-{size}/raw/main/config.json
+    // Larger sizes first; first-match wins.
     ModelEntry {
         tokens: &["qwen3", "32b"],
         entry: CatalogEntry {
@@ -260,15 +250,64 @@ static CATALOG: &[ModelEntry] = &[
         },
     },
     ModelEntry {
-        tokens: &["qwen3", "7b"],
+        // https://huggingface.co/Qwen/Qwen3-8B/raw/main/config.json
+        tokens: &["qwen3", "8b"],
         entry: CatalogEntry {
             family: "qwen3",
-            param_count: 7 * B,
+            param_count: 8 * B,
+            active_param_count: None,
+            num_layers: 36,
+            hidden_dim: 4096,
+            default_weight_dtype: "bf16",
+            num_kv_heads: Some(8),
+            head_dim: Some(128),
+            num_kv_layers: None,
+            attn_flops_coeff: None,
+        },
+    },
+    ModelEntry {
+        // https://huggingface.co/Qwen/Qwen3-4B/raw/main/config.json
+        tokens: &["qwen3", "4b"],
+        entry: CatalogEntry {
+            family: "qwen3",
+            param_count: 4 * B,
+            active_param_count: None,
+            num_layers: 36,
+            hidden_dim: 2560,
+            default_weight_dtype: "bf16",
+            num_kv_heads: Some(8),
+            head_dim: Some(128),
+            num_kv_layers: None,
+            attn_flops_coeff: None,
+        },
+    },
+    ModelEntry {
+        // https://huggingface.co/Qwen/Qwen3-1.7B/raw/main/config.json
+        tokens: &["qwen3", "1.7b"],
+        entry: CatalogEntry {
+            family: "qwen3",
+            param_count: 1_700_000_000,
             active_param_count: None,
             num_layers: 28,
-            hidden_dim: 3584,
+            hidden_dim: 2048,
             default_weight_dtype: "bf16",
-            num_kv_heads: Some(4),
+            num_kv_heads: Some(8),
+            head_dim: Some(128),
+            num_kv_layers: None,
+            attn_flops_coeff: None,
+        },
+    },
+    ModelEntry {
+        // https://huggingface.co/Qwen/Qwen3-0.6B/raw/main/config.json
+        tokens: &["qwen3", "0.6b"],
+        entry: CatalogEntry {
+            family: "qwen3",
+            param_count: 600_000_000,
+            active_param_count: None,
+            num_layers: 28,
+            hidden_dim: 1024,
+            default_weight_dtype: "bf16",
+            num_kv_heads: Some(8),
             head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
@@ -354,7 +393,106 @@ static CATALOG: &[ModelEntry] = &[
             attn_flops_coeff: Some(139_264),
         },
     },
-    // R1 without size token defaults to 671B
+    // R1 distills are Llama/Qwen dense arches (NOT MLA). Place before generic
+    // ["deepseek","r1"] so "DeepSeek-R1-Distill-*" never inherits 671B MLA params.
+    // Sources: https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-*/raw/main/config.json
+    ModelEntry {
+        // https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Llama-70B/raw/main/config.json
+        tokens: &["deepseek", "r1", "distill", "70b"],
+        entry: CatalogEntry {
+            family: "deepseek",
+            param_count: 70 * B,
+            active_param_count: None,
+            num_layers: 80,
+            hidden_dim: 8192,
+            default_weight_dtype: "bf16",
+            num_kv_heads: Some(8),
+            head_dim: Some(128),
+            num_kv_layers: None,
+            attn_flops_coeff: None,
+        },
+    },
+    ModelEntry {
+        // https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-32B/raw/main/config.json
+        tokens: &["deepseek", "r1", "distill", "32b"],
+        entry: CatalogEntry {
+            family: "deepseek",
+            param_count: 32 * B,
+            active_param_count: None,
+            num_layers: 64,
+            hidden_dim: 5120,
+            default_weight_dtype: "bf16",
+            num_kv_heads: Some(8),
+            head_dim: Some(128),
+            num_kv_layers: None,
+            attn_flops_coeff: None,
+        },
+    },
+    ModelEntry {
+        // https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-14B/raw/main/config.json
+        tokens: &["deepseek", "r1", "distill", "14b"],
+        entry: CatalogEntry {
+            family: "deepseek",
+            param_count: 14 * B,
+            active_param_count: None,
+            num_layers: 48,
+            hidden_dim: 5120,
+            default_weight_dtype: "bf16",
+            num_kv_heads: Some(8),
+            head_dim: Some(128),
+            num_kv_layers: None,
+            attn_flops_coeff: None,
+        },
+    },
+    ModelEntry {
+        // https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B/raw/main/config.json
+        tokens: &["deepseek", "r1", "distill", "7b"],
+        entry: CatalogEntry {
+            family: "deepseek",
+            param_count: 7 * B,
+            active_param_count: None,
+            num_layers: 28,
+            hidden_dim: 3584,
+            default_weight_dtype: "bf16",
+            num_kv_heads: Some(4),
+            head_dim: Some(128),
+            num_kv_layers: None,
+            attn_flops_coeff: None,
+        },
+    },
+    ModelEntry {
+        // https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Llama-8B/raw/main/config.json
+        tokens: &["deepseek", "r1", "distill", "8b"],
+        entry: CatalogEntry {
+            family: "deepseek",
+            param_count: 8 * B,
+            active_param_count: None,
+            num_layers: 32,
+            hidden_dim: 4096,
+            default_weight_dtype: "bf16",
+            num_kv_heads: Some(8),
+            head_dim: Some(128),
+            num_kv_layers: None,
+            attn_flops_coeff: None,
+        },
+    },
+    ModelEntry {
+        // https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B/raw/main/config.json
+        tokens: &["deepseek", "r1", "distill", "1.5b"],
+        entry: CatalogEntry {
+            family: "deepseek",
+            param_count: 1_500_000_000,
+            active_param_count: None,
+            num_layers: 28,
+            hidden_dim: 1536,
+            default_weight_dtype: "bf16",
+            num_kv_heads: Some(2),
+            head_dim: Some(128),
+            num_kv_layers: None,
+            attn_flops_coeff: None,
+        },
+    },
+    // R1 without size token defaults to 671B MLA
     ModelEntry {
         tokens: &["deepseek", "r1"],
         entry: CatalogEntry {
@@ -563,6 +701,137 @@ static CATALOG: &[ModelEntry] = &[
             default_weight_dtype: "bf16",
             num_kv_heads: None,
             head_dim: None,
+            num_kv_layers: None,
+            attn_flops_coeff: None,
+        },
+    },
+    // ── Gemma 3 ──────────────────────────────────────────────────────────────
+    // After Gemma 4, before Gemma 2. Hyphenated names normalize to "gemma 3 …"
+    // (token "gemma 3", not bare "3") so "gemma-2-27b-3bit" cannot false-match.
+    // Fused "gemma3-27b" covered by parallel entries. Sources: HF text_config.
+    ModelEntry {
+        // https://huggingface.co/google/gemma-3-27b-it (text_config)
+        tokens: &["gemma 3", "27b"],
+        entry: CatalogEntry {
+            family: "gemma3",
+            param_count: 27 * B,
+            active_param_count: None,
+            num_layers: 62,
+            hidden_dim: 5376,
+            default_weight_dtype: "bf16",
+            num_kv_heads: Some(16),
+            head_dim: Some(128),
+            num_kv_layers: None,
+            attn_flops_coeff: None,
+        },
+    },
+    ModelEntry {
+        tokens: &["gemma3", "27b"],
+        entry: CatalogEntry {
+            family: "gemma3",
+            param_count: 27 * B,
+            active_param_count: None,
+            num_layers: 62,
+            hidden_dim: 5376,
+            default_weight_dtype: "bf16",
+            num_kv_heads: Some(16),
+            head_dim: Some(128),
+            num_kv_layers: None,
+            attn_flops_coeff: None,
+        },
+    },
+    ModelEntry {
+        // https://huggingface.co/google/gemma-3-12b-it (text_config); head_dim=256
+        // from Gemma 3 reference config (gm.nn.Gemma3_12B).
+        tokens: &["gemma 3", "12b"],
+        entry: CatalogEntry {
+            family: "gemma3",
+            param_count: 12 * B,
+            active_param_count: None,
+            num_layers: 48,
+            hidden_dim: 3840,
+            default_weight_dtype: "bf16",
+            num_kv_heads: Some(8),
+            head_dim: Some(256),
+            num_kv_layers: None,
+            attn_flops_coeff: None,
+        },
+    },
+    ModelEntry {
+        tokens: &["gemma3", "12b"],
+        entry: CatalogEntry {
+            family: "gemma3",
+            param_count: 12 * B,
+            active_param_count: None,
+            num_layers: 48,
+            hidden_dim: 3840,
+            default_weight_dtype: "bf16",
+            num_kv_heads: Some(8),
+            head_dim: Some(256),
+            num_kv_layers: None,
+            attn_flops_coeff: None,
+        },
+    },
+    ModelEntry {
+        // https://huggingface.co/google/gemma-3-4b-it text_config (+ head/kv from
+        // published Gemma 3 configs: num_attention_heads=8, num_key_value_heads=4,
+        // head_dim=256).
+        tokens: &["gemma 3", "4b"],
+        entry: CatalogEntry {
+            family: "gemma3",
+            param_count: 4 * B,
+            active_param_count: None,
+            num_layers: 34,
+            hidden_dim: 2560,
+            default_weight_dtype: "bf16",
+            num_kv_heads: Some(4),
+            head_dim: Some(256),
+            num_kv_layers: None,
+            attn_flops_coeff: None,
+        },
+    },
+    ModelEntry {
+        tokens: &["gemma3", "4b"],
+        entry: CatalogEntry {
+            family: "gemma3",
+            param_count: 4 * B,
+            active_param_count: None,
+            num_layers: 34,
+            hidden_dim: 2560,
+            default_weight_dtype: "bf16",
+            num_kv_heads: Some(4),
+            head_dim: Some(256),
+            num_kv_layers: None,
+            attn_flops_coeff: None,
+        },
+    },
+    ModelEntry {
+        // https://huggingface.co/google/gemma-3-1b-it/raw/main/config.json
+        tokens: &["gemma 3", "1b"],
+        entry: CatalogEntry {
+            family: "gemma3",
+            param_count: B,
+            active_param_count: None,
+            num_layers: 26,
+            hidden_dim: 1152,
+            default_weight_dtype: "bf16",
+            num_kv_heads: Some(1),
+            head_dim: Some(256),
+            num_kv_layers: None,
+            attn_flops_coeff: None,
+        },
+    },
+    ModelEntry {
+        tokens: &["gemma3", "1b"],
+        entry: CatalogEntry {
+            family: "gemma3",
+            param_count: B,
+            active_param_count: None,
+            num_layers: 26,
+            hidden_dim: 1152,
+            default_weight_dtype: "bf16",
+            num_kv_heads: Some(1),
+            head_dim: Some(256),
             num_kv_layers: None,
             attn_flops_coeff: None,
         },
@@ -910,6 +1179,137 @@ mod tests {
     fn deepseek_r1_has_mla_coeff() {
         let e = lookup_model("deepseek-ai/DeepSeek-R1").expect("catalog hit");
         assert_eq!(e.attn_flops_coeff, Some(139_264));
+    }
+
+    #[test]
+    fn r1_distill_llama_8b_not_671b_mla() {
+        let e = lookup_model("deepseek-ai/DeepSeek-R1-Distill-Llama-8B").expect("no match");
+        assert_eq!(e.param_count, 8 * B);
+        assert!(e.active_param_count.is_none());
+        assert_eq!(e.num_kv_heads, Some(8));
+        assert_eq!(e.head_dim, Some(128));
+        assert!(e.attn_flops_coeff.is_none());
+    }
+
+    #[test]
+    fn r1_distill_qwen_32b() {
+        let e = lookup_model("deepseek-ai/DeepSeek-R1-Distill-Qwen-32B").expect("no match");
+        assert_eq!(e.param_count, 32 * B);
+        assert_eq!(e.num_layers, 64);
+        assert_eq!(e.num_kv_heads, Some(8));
+    }
+
+    #[test]
+    fn r1_distill_llama_70b() {
+        let e = lookup_model("deepseek-ai/DeepSeek-R1-Distill-Llama-70B").expect("no match");
+        assert_eq!(e.param_count, 70 * B);
+        assert_eq!(e.num_layers, 80);
+        assert_eq!(e.num_kv_heads, Some(8));
+    }
+
+    #[test]
+    fn r1_distill_qwen_1_5b() {
+        let e = lookup_model("deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B").expect("no match");
+        assert_eq!(e.param_count, 1_500_000_000);
+        assert_eq!(e.num_kv_heads, Some(2));
+        assert_eq!(e.head_dim, Some(128));
+    }
+
+    #[test]
+    fn gemma3_27b_not_gemma2() {
+        let e = lookup_model("google/gemma-3-27b-it").expect("no match");
+        assert_eq!(e.family, "gemma3");
+        assert_eq!(e.param_count, 27 * B);
+        assert_eq!(e.num_layers, 62);
+        assert_eq!(e.hidden_dim, 5376);
+        assert_eq!(e.num_kv_heads, Some(16));
+        assert_eq!(e.head_dim, Some(128));
+    }
+
+    #[test]
+    fn gemma3_compact_name() {
+        let e = lookup_model("gemma3-27b").expect("no match");
+        assert_eq!(e.family, "gemma3");
+        assert_eq!(e.param_count, 27 * B);
+        assert_eq!(e.num_layers, 62);
+    }
+
+    #[test]
+    fn gemma2_quant_with_3bit_does_not_match_gemma3() {
+        // Bare "3" token would false-match "3bit"; spaced "gemma 3" must not.
+        let e = lookup_model("google/gemma-2-27b-3bit").expect("gemma2");
+        assert_eq!(e.family, "gemma");
+        assert_eq!(e.num_layers, 46);
+        assert_eq!(e.hidden_dim, 4608);
+    }
+
+    #[test]
+    fn gemma_27b_v3_does_not_match_gemma3() {
+        let e = lookup_model("vendor/gemma-27b-v3").expect("gemma2");
+        assert_eq!(e.family, "gemma");
+    }
+
+    #[test]
+    fn gemma3_4b_and_1b() {
+        let e4 = lookup_model("google/gemma-3-4b-it").expect("4b");
+        assert_eq!(e4.family, "gemma3");
+        assert_eq!(e4.num_layers, 34);
+        assert_eq!(e4.num_kv_heads, Some(4));
+        let e1 = lookup_model("google/gemma-3-1b-it").expect("1b");
+        assert_eq!(e1.family, "gemma3");
+        assert_eq!(e1.num_layers, 26);
+        assert_eq!(e1.num_kv_heads, Some(1));
+    }
+
+    #[test]
+    fn gemma4_still_guarded_after_gemma3() {
+        let e = lookup_model("google/gemma-4-pt-27b-it").expect("gemma4");
+        assert_eq!(e.family, "gemma4");
+        assert_eq!(e.param_count, 31 * B);
+    }
+
+    #[test]
+    fn gemma2_27b_still_matches() {
+        let e = lookup_model("google/gemma-2-27b-it").expect("gemma2");
+        assert_eq!(e.family, "gemma");
+        assert_eq!(e.num_layers, 46);
+        assert_eq!(e.hidden_dim, 4608);
+    }
+
+    #[test]
+    fn qwen3_phantoms_7b_72b_gone() {
+        assert!(lookup_model("Qwen/Qwen3-7B").is_none());
+        assert!(lookup_model("Qwen/Qwen3-72B").is_none());
+        // Explicit Qwen2.5 still works.
+        let e = lookup_model("Qwen/Qwen2.5-7B").expect("qwen2.5");
+        assert_eq!(e.family, "qwen2.5");
+        assert_eq!(e.param_count, 7 * B);
+    }
+
+    #[test]
+    fn qwen3_dense_new_skus() {
+        let e06 = lookup_model("Qwen/Qwen3-0.6B").expect("0.6b");
+        assert_eq!(e06.param_count, 600_000_000);
+        assert_eq!(e06.hidden_dim, 1024);
+        let e17 = lookup_model("Qwen/Qwen3-1.7B").expect("1.7b");
+        assert_eq!(e17.param_count, 1_700_000_000);
+        let e4 = lookup_model("Qwen/Qwen3-4B").expect("4b");
+        assert_eq!(e4.num_layers, 36);
+        assert_eq!(e4.hidden_dim, 2560);
+        let e8 = lookup_model("Qwen/Qwen3-8B").expect("8b");
+        assert_eq!(e8.num_layers, 36);
+        assert_eq!(e8.hidden_dim, 4096);
+        assert_eq!(e8.num_kv_heads, Some(8));
+    }
+
+    #[test]
+    fn qwen3_30b_a3b_kv_fields_enable_kv_math() {
+        let e = lookup_model("Qwen/Qwen3-30B-A3B").expect("a3b");
+        assert_eq!(e.num_kv_heads, Some(4));
+        assert_eq!(e.head_dim, Some(128));
+        // Catalog fields alone are the gate for kv_max_concurrent_seqs (engine).
+        // Previously both were None and KV math short-circuited.
+        assert!(e.num_kv_heads.is_some() && e.head_dim.is_some());
     }
 
     #[test]
