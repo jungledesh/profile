@@ -1,10 +1,9 @@
-use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use prometheus_parse::{HistogramCount, Scrape, Value};
 
-use super::sampling::{SAMPLE_INTERVAL, sample_count_for};
+use super::sampling::{run_sampling_loop, sample_count_for};
 use super::types::{
     CacheConfigLabels, HistogramWindowMass, PrefixCacheScrapeSample, VllmRawMetrics,
 };
@@ -501,7 +500,7 @@ pub fn collect_vllm_metrics_for(
     let mut last_scrape: Option<Scrape> = None;
     let mut kv_cache_peak_perc: Option<f64> = None;
 
-    for i in 0..sample_count {
+    run_sampling_loop(sample_count, |i| {
         let body = fetch_metrics_body(&client, &url)?;
         let scrape = scrape_from_body(&body)?;
         if let Some(k) = kv_cache_usage_perc_from_scrape(&scrape).filter(|x| x.is_finite()) {
@@ -517,11 +516,8 @@ pub fn collect_vllm_metrics_for(
         } else {
             last_scrape = Some(scrape);
         }
-
-        if i + 1 < sample_count {
-            thread::sleep(SAMPLE_INTERVAL);
-        }
-    }
+        Ok(())
+    })?;
 
     let window_secs = window_start
         .map(|t| t.elapsed().as_secs_f64())

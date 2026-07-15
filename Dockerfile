@@ -104,7 +104,7 @@ CMD ["bash", "-lc", "/home/appuser/app/start.sh"]
 #   docker run --device=/dev/kfd --device=/dev/dri --group-add video \
 #     --shm-size 16G --security-opt seccomp=unconfined \
 #     -e HF_TOKEN="$HF_TOKEN" -p 8000:8000 -it profile:amd
-FROM vllm/vllm-openai-rocm:v0.21.0 AS amd
+FROM vllm/vllm-openai-rocm:v0.24.0 AS amd
 
 ENV APP_DIR=/home/appuser/app
 ENV MODELS_DIR=/workspace/models

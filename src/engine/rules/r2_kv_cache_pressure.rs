@@ -1,6 +1,5 @@
 use crate::collectors::RawSnapshot;
 
-use super::{MAX_OBSERVATION_SKEW_SECS, skew_secs};
 #[cfg(test)]
 use super::{Recommendation, rule_names};
 
@@ -180,12 +179,6 @@ fn queue_backpressure(snapshot: &RawSnapshot) -> bool {
 }
 
 pub fn rule2_kv_cache_pressure(snapshot: &RawSnapshot) -> Rule2Outcome {
-    let skew = skew_secs(snapshot.gpu_observed_at, snapshot.vllm_observed_at);
-
-    if skew > MAX_OBSERVATION_SKEW_SECS {
-        return Rule2Outcome::NotFired;
-    }
-
     let kv = snapshot.vllm.kv_cache_usage_perc.filter(|v| v.is_finite());
     let peak = snapshot.vllm.kv_cache_peak_perc.filter(|v| v.is_finite());
     let kv_avg_high = kv.is_some_and(|kv_p| kv_p >= KV_CACHE_PRESSURE_MIN_PERC);

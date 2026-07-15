@@ -19,13 +19,28 @@ struct GpuEntry {
 
 static CATALOG: &[GpuEntry] = &[
     // ── H100 ─────────────────────────────────────────────────────────────────
+    // Dense BF16 Tensor Core = half the sparsity-marked datasheet figure.
+    // Sources:
+    //   https://www.nvidia.com/en-us/data-center/h100/
+    //   https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/h100/PB-11773-001_v01.pdf
     // PCIe before generic H100 - "pcie" is the discriminating token.
     GpuEntry {
         tokens: &["h100", "pcie"],
         entry: GpuCatalogEntry {
             arch: "hopper",
-            peak_flops_tc_tflops: 756.0,
+            peak_flops_tc_tflops: 756.0, // dense BF16 (1513 sparse / 2)
             peak_bw_gbps: 2000.0,
+        },
+    },
+    // NVL: 94 GB HBM3 PCIe with NVLink bridge. Must precede hbm3/sxm: "nvl" is
+    // the discriminating token; NVML name is "NVIDIA H100 NVL".
+    // Dense BF16 835.5 TFLOPS (1671 sparse / 2); BW 3.9 TB/s.
+    GpuEntry {
+        tokens: &["h100", "nvl"],
+        entry: GpuCatalogEntry {
+            arch: "hopper",
+            peak_flops_tc_tflops: 835.5,
+            peak_bw_gbps: 3900.0,
         },
     },
     // SXM: "hbm3" is exclusive to the SXM variant; "sxm" also works.
@@ -33,7 +48,7 @@ static CATALOG: &[GpuEntry] = &[
         tokens: &["h100", "hbm3"],
         entry: GpuCatalogEntry {
             arch: "hopper",
-            peak_flops_tc_tflops: 989.0,
+            peak_flops_tc_tflops: 989.0, // dense BF16 (1979 sparse / 2)
             peak_bw_gbps: 3350.0,
         },
     },
@@ -279,17 +294,21 @@ static CATALOG: &[GpuEntry] = &[
         },
     },
     // ── AMD Radeon PRO W7900 (RDNA3) ─────────────────────────────────────────
-    // 96 CUs, 48GB GDDR6. Primary AMD card for local AI workstations.
+    // 96 CUs, 48GB GDDR6. Dense FP16 matrix TFLOPS / BW from AMD product page:
+    // https://www.amd.com/en/products/graphics/workstations/radeon-pro/w7000-series/amd-radeon-pro-w7900.html
+    // https://www.amd.com/content/dam/amd/en/documents/products/graphics/workstation/radeon-pro-w7900-datasheet.pdf
+    // No cloud $/GPU-hr row in gpu_prices.json → cost fields stay None.
     GpuEntry {
         tokens: &["w7900"],
         entry: GpuCatalogEntry {
             arch: "rdna3",
-            peak_flops_tc_tflops: 123.0,
+            peak_flops_tc_tflops: 123.0, // peak FP16 matrix
             peak_bw_gbps: 864.0,
         },
     },
     // ── AMD Radeon PRO W7800 (RDNA3) ─────────────────────────────────────────
-    // 70 CUs, 32GB GDDR6.
+    // 70 CUs, 32GB GDDR6. Dense FP16 matrix / BW:
+    // https://www.amd.com/en/products/graphics/workstations/radeon-pro/w7000-series/amd-radeon-pro-w7800.html
     GpuEntry {
         tokens: &["w7800"],
         entry: GpuCatalogEntry {
@@ -302,6 +321,8 @@ static CATALOG: &[GpuEntry] = &[
     // RDNA3 WMMA (shader-unit matrix ops, not dedicated tensor cores).
     // Roofline ceiling may be optimistic for vLLM workloads.
     // XTX before XT: "xt" is a substring of "xtx", so XTX must match first.
+    // Dense FP16 matrix 123 TFLOPS, BW 960 GB/s:
+    // https://www.amd.com/en/products/graphics/desktops/radeon/7000-series/amd-radeon-rx-7900xtx.html
     GpuEntry {
         tokens: &["rx", "7900", "xtx"],
         entry: GpuCatalogEntry {
@@ -312,6 +333,7 @@ static CATALOG: &[GpuEntry] = &[
     },
     // ── AMD Radeon RX 7900 GRE (RDNA3) ───────────────────────────────────────
     // 80 CUs, 16GB GDDR6. Budget 16GB option for local LLM inference.
+    // https://www.amd.com/en/products/graphics/desktops/radeon/7000-series/amd-radeon-rx-7900gre.html
     GpuEntry {
         tokens: &["rx", "7900", "gre"],
         entry: GpuCatalogEntry {
@@ -321,6 +343,8 @@ static CATALOG: &[GpuEntry] = &[
         },
     },
     // ── AMD Radeon RX 7900 XT (RDNA3) ───────────────────────────────────────
+    // Dense FP16 matrix ~103 TFLOPS, BW 800 GB/s:
+    // https://www.amd.com/en/products/graphics/desktops/radeon/7000-series/amd-radeon-rx-7900xt.html
     GpuEntry {
         tokens: &["rx", "7900", "xt"],
         entry: GpuCatalogEntry {
@@ -409,6 +433,21 @@ mod tests {
     fn h100_pcie() {
         let e = lookup_gpu("NVIDIA H100 PCIe").expect("no match");
         assert_eq!(e.peak_bw_gbps, 2000.0);
+    }
+
+    #[test]
+    fn h100_nvl() {
+        // NVML name for the 94 GB HBM3 NVL SKU.
+        let e = lookup_gpu("NVIDIA H100 NVL").expect("no match");
+        assert_eq!(e.arch, "hopper");
+        assert_eq!(e.peak_flops_tc_tflops, 835.5);
+        assert_eq!(e.peak_bw_gbps, 3900.0);
+    }
+
+    #[test]
+    fn h100_nvl_not_pcie() {
+        let e = lookup_gpu("NVIDIA H100 NVL").expect("no match");
+        assert_ne!(e.peak_bw_gbps, 2000.0);
     }
 
     #[test]

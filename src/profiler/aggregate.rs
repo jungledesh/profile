@@ -6,7 +6,9 @@
 
 use std::time::{Duration, SystemTime};
 
-use crate::collectors::{self, HistogramWindowMass, window_is_active, window_is_evaluable};
+use crate::collectors::{
+    self, HistogramWindowMass, observations_aligned, window_is_active, window_is_evaluable,
+};
 
 /// Aggregate a slice of per-window snapshots into a single summary snapshot.
 /// Returns `chronological_last` unchanged when no window is evaluable.
@@ -40,6 +42,11 @@ pub(super) fn aggregate_windows(
         .iter()
         .copied()
         .filter(|(w, _)| window_is_active(w))
+        .collect();
+    let energy_aligned_pairs: Vec<(&collectors::RawSnapshot, Duration)> = active_pairs
+        .iter()
+        .copied()
+        .filter(|(w, _)| observations_aligned(w))
         .collect();
 
     // Cumulative Prometheus counters: chronologically last collection (idle tail included).
@@ -160,6 +167,10 @@ pub(super) fn aggregate_windows(
             w.gpus.get(idx).and_then(|g| g.mem_util_pct)
         });
         agg_g.power_watts = weighted_mean(&active_pairs, |w| {
+            w.gpus.get(idx).and_then(|g| g.power_watts)
+        });
+        // Energy/cost join: only windows whose GPU and vLLM clocks align.
+        agg_g.aligned_power_watts = weighted_mean(&energy_aligned_pairs, |w| {
             w.gpus.get(idx).and_then(|g| g.power_watts)
         });
         agg_g.temperature_c = last.gpus.get(idx).and_then(|g| g.temperature_c);
@@ -963,6 +974,77 @@ mod tests {
         assert!((agg.gpus[1].gpu_util_pct.unwrap() - 40.0).abs() < 1e-9);
         assert!((agg.gpus[0].power_watts.unwrap() - 200.0).abs() < 1e-9);
         assert!((agg.gpus[1].power_watts.unwrap() - 150.0).abs() < 1e-9);
+        assert!((agg.gpus[0].aligned_power_watts.unwrap() - 200.0).abs() < 1e-9);
+        assert!((agg.gpus[1].aligned_power_watts.unwrap() - 150.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn aggregate_aligned_power_excludes_skewed_active_windows() {
+        let v = VllmRawMetrics {
+            num_requests_running: Some(10.0),
+            generation_tokens_per_sec: Some(100.0),
+            window_duration_secs: Some(2.0),
+            ..Default::default()
+        };
+        let aligned = RawSnapshot {
+            gpu_observed_at: SystemTime::UNIX_EPOCH,
+            vllm_observed_at: SystemTime::UNIX_EPOCH,
+            timestamp: SystemTime::UNIX_EPOCH,
+            vllm: v.clone(),
+            gpus: vec![GpuRawMetrics {
+                gpu_index: Some(0),
+                power_watts: Some(100.0),
+                ..Default::default()
+            }],
+        };
+        let skewed = RawSnapshot {
+            gpu_observed_at: SystemTime::UNIX_EPOCH,
+            vllm_observed_at: SystemTime::UNIX_EPOCH + Duration::from_secs(5),
+            timestamp: SystemTime::UNIX_EPOCH,
+            vllm: v,
+            gpus: vec![GpuRawMetrics {
+                gpu_index: Some(0),
+                power_watts: Some(300.0),
+                ..Default::default()
+            }],
+        };
+        let agg = aggregate_windows(
+            &[aligned, skewed],
+            &[Duration::from_secs(2), Duration::from_secs(2)],
+            SystemTime::UNIX_EPOCH,
+        );
+        // Display power includes both active windows.
+        assert!((agg.gpus[0].power_watts.unwrap() - 200.0).abs() < 1e-9);
+        // Aligned energy power keeps only the in-skew window.
+        assert!((agg.gpus[0].aligned_power_watts.unwrap() - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn aggregate_aligned_power_none_when_all_active_windows_skewed() {
+        let v = VllmRawMetrics {
+            num_requests_running: Some(10.0),
+            generation_tokens_per_sec: Some(100.0),
+            window_duration_secs: Some(2.0),
+            ..Default::default()
+        };
+        let skewed = |power: f64| RawSnapshot {
+            gpu_observed_at: SystemTime::UNIX_EPOCH,
+            vllm_observed_at: SystemTime::UNIX_EPOCH + Duration::from_secs(5),
+            timestamp: SystemTime::UNIX_EPOCH,
+            vllm: v.clone(),
+            gpus: vec![GpuRawMetrics {
+                gpu_index: Some(0),
+                power_watts: Some(power),
+                ..Default::default()
+            }],
+        };
+        let agg = aggregate_windows(
+            &[skewed(100.0), skewed(300.0)],
+            &[Duration::from_secs(2), Duration::from_secs(2)],
+            SystemTime::UNIX_EPOCH,
+        );
+        assert!(agg.gpus[0].power_watts.is_some());
+        assert!(agg.gpus[0].aligned_power_watts.is_none());
     }
 
     #[test]

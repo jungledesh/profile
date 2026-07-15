@@ -299,6 +299,20 @@ mod tests {
     }
 
     #[test]
+    fn kv_max_concurrent_seqs_qwen3_30b_a3b_catalog_fields() {
+        let e = crate::context::model_catalog::lookup_model("Qwen/Qwen3-30B-A3B").expect("a3b");
+        let n = kv_max_concurrent_seqs(
+            40.0,
+            40960,
+            e.num_layers,
+            e.num_kv_heads.expect("kv heads"),
+            e.head_dim.expect("head dim"),
+            2,
+        );
+        assert!(n.is_some_and(|v| v > 0));
+    }
+
+    #[test]
     fn kv_max_concurrent_seqs_none_on_zero_inputs() {
         assert!(kv_max_concurrent_seqs(0.0, 4096, 32, 8, 128, 2).is_none());
         assert!(kv_max_concurrent_seqs(20.0, 0, 32, 8, 128, 2).is_none());

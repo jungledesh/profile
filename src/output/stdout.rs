@@ -110,25 +110,19 @@ fn build_diagnose_lines(
         lines.push(String::new());
         lines.push(vllm_label_row("Target:", &result.metrics_input));
         lines.push(String::new());
-        if !result.any_evaluable {
-            lines.extend(engine::unreachable_diagnose_lines(
-                verbose_rules,
-                &result.windows,
-                &result.metrics_input,
-            ));
-        } else {
-            let hint = engine::LoadHintParams {
-                model_name: result.snapshot.vllm.model_name.as_deref(),
-                metrics_url: &result.metrics_input,
-                max_num_seqs: result.static_ctx.config.max_num_seqs,
-                duration_secs: result.duration.as_secs(),
-            };
-            lines.extend(engine::idle_diagnose_lines(
-                verbose_rules,
-                &result.windows,
-                &hint,
-            ));
-        }
+        let hint = engine::LoadHintParams {
+            model_name: result.snapshot.vllm.model_name.as_deref(),
+            metrics_url: &result.metrics_input,
+            max_num_seqs: result.static_ctx.config.max_num_seqs,
+            duration_secs: result.duration.as_secs(),
+        };
+        lines.extend(engine::empty_run_diagnose_lines(
+            verbose_rules,
+            &result.windows,
+            result.any_evaluable,
+            &hint,
+            &result.metrics_input,
+        ));
         return lines;
     }
 
@@ -147,6 +141,12 @@ fn build_diagnose_lines(
         ),
         width = GPU_LABEL_W
     ));
+    if verbose_rules && report.energy_skew_skipped > 0 {
+        lines.push(format!(
+            "energy: skipped {} windows (observation skew).",
+            report.energy_skew_skipped
+        ));
+    }
     if n_gpus <= 1 {
         let g = snapshot.gpus.first().unwrap_or(&cluster_gpu);
         lines.push(format!(
@@ -1622,6 +1622,8 @@ mod tests {
             n_eval,
             skipped_broken: 0,
             skipped_idle: 0,
+            energy_skew_skipped: 0,
+            gauge_missing: Default::default(),
         }
     }
 

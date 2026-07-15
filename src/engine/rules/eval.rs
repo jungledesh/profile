@@ -42,6 +42,8 @@ const SUPPRESSION_TABLE: &[(&str, &str)] = &[
 struct WindowRuleEval {
     skipped_broken: usize,
     skipped_idle: usize,
+    energy_skew_skipped: usize,
+    gauge_missing: crate::engine::GaugeMissingCounts,
     n_eval: usize,
     r1_fired: usize,
     r1_kv_warning_count: usize,
@@ -122,6 +124,8 @@ fn eval_window_rules(
     let mut eval = WindowRuleEval {
         skipped_broken: 0,
         skipped_idle: 0,
+        energy_skew_skipped: 0,
+        gauge_missing: crate::engine::GaugeMissingCounts::default(),
         n_eval: 0,
         r1_fired: 0,
         r1_kv_warning_count: 0,
@@ -153,6 +157,43 @@ fn eval_window_rules(
         eval.n_eval += 1;
 
         let snap = &w.snapshot;
+        if !crate::collectors::observations_aligned(snap) {
+            eval.energy_skew_skipped += 1;
+        }
+        if snap
+            .vllm
+            .num_requests_waiting
+            .filter(|v| v.is_finite())
+            .is_none()
+        {
+            eval.gauge_missing.under_batching += 1;
+            eval.gauge_missing.concurrency_saturation += 1;
+        }
+        let kv_present = snap
+            .vllm
+            .kv_cache_usage_perc
+            .filter(|v| v.is_finite())
+            .is_some()
+            || snap
+                .vllm
+                .kv_cache_peak_perc
+                .filter(|v| v.is_finite())
+                .is_some();
+        if !kv_present {
+            eval.gauge_missing.kv_cache_pressure += 1;
+        }
+        // r3: hit-rate gauge required unless prefix caching is explicitly off (that path fires).
+        let prefix_off = snap.vllm.cache_config.enable_prefix_caching == Some(false);
+        if !prefix_off
+            && snap
+                .vllm
+                .prefix_cache_hit_rate
+                .filter(|x| x.is_finite())
+                .is_none()
+        {
+            eval.gauge_missing.low_prefix_reuse += 1;
+        }
+
         if let Some(kv) = snap
             .vllm
             .kv_cache_peak_perc
@@ -189,7 +230,7 @@ fn eval_window_rules(
                 }
                 eval.r1_details.push(d);
             }
-            Rule1Outcome::NotFired(_) => {}
+            Rule1Outcome::NotFired => {}
         }
         match rule2_kv_cache_pressure(snap) {
             Rule2Outcome::Fired(d) => {
@@ -277,6 +318,8 @@ fn build_report_from_eval(
             n_eval: 0,
             skipped_broken: eval.skipped_broken,
             skipped_idle: eval.skipped_idle,
+            energy_skew_skipped: eval.energy_skew_skipped,
+            gauge_missing: eval.gauge_missing.clone(),
         };
     }
 
@@ -506,8 +549,12 @@ fn build_report_from_eval(
         baseline,
         kv_max_seqs,
         eval.n_eval,
-        eval.skipped_broken,
-        eval.skipped_idle,
+        crate::engine::EvalSkipStats {
+            skipped_broken: eval.skipped_broken,
+            skipped_idle: eval.skipped_idle,
+            energy_skew_skipped: eval.energy_skew_skipped,
+            gauge_missing: eval.gauge_missing.clone(),
+        },
     )
 }
 
@@ -516,8 +563,7 @@ pub(crate) fn finalize_report_groups(
     baseline: Option<baseline::PhysicsBaseline>,
     kv_max_seqs: Option<u32>,
     n_eval: usize,
-    skipped_broken: usize,
-    skipped_idle: usize,
+    skips: crate::engine::EvalSkipStats,
 ) -> Report {
     let mut suppressed_rules = Vec::new();
     let Some(min_layer) = recs.iter().map(|r| r.layer).min() else {
@@ -527,8 +573,10 @@ pub(crate) fn finalize_report_groups(
             suppressed_rules,
             kv_max_seqs,
             n_eval,
-            skipped_broken,
-            skipped_idle,
+            skipped_broken: skips.skipped_broken,
+            skipped_idle: skips.skipped_idle,
+            energy_skew_skipped: skips.energy_skew_skipped,
+            gauge_missing: skips.gauge_missing,
         };
     };
 
@@ -578,8 +626,10 @@ pub(crate) fn finalize_report_groups(
         suppressed_rules,
         kv_max_seqs,
         n_eval,
-        skipped_broken,
-        skipped_idle,
+        skipped_broken: skips.skipped_broken,
+        skipped_idle: skips.skipped_idle,
+        energy_skew_skipped: skips.energy_skew_skipped,
+        gauge_missing: skips.gauge_missing,
     }
 }
 
@@ -596,6 +646,8 @@ pub fn build_report_for_windows(windows: &[RuntimeWindow], summary: AnalysisInpu
             n_eval: 0,
             skipped_broken: windows.len(),
             skipped_idle: 0,
+            energy_skew_skipped: 0,
+            gauge_missing: Default::default(),
         };
     };
     let session_hit_rate = aggregate_prefix_hit_rate_for_windows(windows);

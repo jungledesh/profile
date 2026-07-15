@@ -140,6 +140,10 @@ pub struct GpuRawMetrics {
     pub gpu_util_pct: Option<f64>,
     pub mem_util_pct: Option<f64>,
     pub power_watts: Option<f64>,
+    /// Duration-weighted mean power over active windows with GPU/vLLM clocks aligned
+    /// within `MAX_OBSERVATION_SKEW_SECS`. For energy/cost joins only. Display uses
+    /// `power_watts`. `None` when no aligned active windows contribute.
+    pub aligned_power_watts: Option<f64>,
     pub power_limit_watts: Option<f64>,
     pub vram_used_mb: Option<u64>,
     /// Max VRAM used (MiB) across GPU polls in this window. Multi-window: max over evaluable windows.
@@ -426,6 +430,24 @@ pub fn window_is_idle(s: &RawSnapshot) -> bool {
 /// (throughput, TTFT, TPOT, running/waiting). Low values are honest; blank is not.
 pub fn window_is_active(s: &RawSnapshot) -> bool {
     window_is_evaluable(s) && !window_is_idle(s)
+}
+
+/// Max |gpu_observed_at − vllm_observed_at| (seconds) for a cross-source join.
+/// Cross-source joins only. Rules read single-source data and must not use this.
+pub(crate) const MAX_OBSERVATION_SKEW_SECS: f64 = 1.0;
+
+/// Absolute observation-time delta in seconds.
+pub(crate) fn skew_secs(a: SystemTime, b: SystemTime) -> f64 {
+    match a.duration_since(b) {
+        Ok(d) => d.as_secs_f64(),
+        Err(e) => -e.duration().as_secs_f64(),
+    }
+    .abs()
+}
+
+/// True when GPU and vLLM observation clocks are close enough to join.
+pub(crate) fn observations_aligned(s: &RawSnapshot) -> bool {
+    skew_secs(s.gpu_observed_at, s.vllm_observed_at) <= MAX_OBSERVATION_SKEW_SECS
 }
 
 #[cfg(test)]

@@ -1,5 +1,3 @@
-use std::time::SystemTime;
-
 mod eval;
 mod format;
 mod r1_under_batching;
@@ -15,30 +13,23 @@ mod tests;
 
 pub(crate) use eval::aggregate_prefix_hit_rate_for_windows;
 pub use eval::build_report_for_windows;
-#[cfg(test)]
-pub(crate) use eval::finalize_report_groups;
-#[cfg(test)]
-pub use format::format_diagnose_rules;
 pub use format::{
-    LoadHintParams, format_captured_windows, format_diagnose_rules_for_windows,
-    idle_diagnose_lines, unreachable_diagnose_lines,
+    LoadHintParams, empty_run_diagnose_lines, format_captured_windows,
+    format_diagnose_rules_for_windows,
 };
 pub(crate) use format::{MuVariant, mu_diagnose_lines};
 #[cfg(test)]
-pub(crate) use r1_under_batching::{R1EvalInput, Rule1Outcome, r1_recommendation};
+pub(crate) use r1_under_batching::{R1EvalInput, Rule1Outcome};
 pub(crate) use r2_kv_cache_pressure::KV_CACHE_PRESSURE_MIN_PERC;
 #[cfg(test)]
-pub(crate) use r2_kv_cache_pressure::{Rule2Outcome, r2_recommendation, rule2_kv_cache_pressure};
+pub(crate) use r2_kv_cache_pressure::r2_recommendation;
 #[cfg(test)]
 pub(crate) use r3_low_prefix_reuse::{LowPrefixReuseDetail, Rule3Outcome, r3_recommendation};
 pub use r4_oom_risk::{r4_advisory, r4_recommendation};
-#[cfg(test)]
-pub(crate) use r5_concurrency_saturation::r5_recommendation;
-#[cfg(test)]
-pub(crate) use r6_prefill_bound::{PrefillBoundEvalInput, r6_recommendation};
 
-pub(super) const MAX_OBSERVATION_SKEW_SECS: f64 = 1.0;
-/// Enforces >= 6s temporal substance (3 windows × 2s).
+/// Minimum active windows for a trustworthy verdict. Window size scales with run
+/// duration (2s for <= 30s runs, else 10s), so this enforces 6s to 30s of sustained
+/// traffic. See profiler::logical_window_size.
 pub const ENGINE_MIN_PERSISTENT_WINDOWS: usize = 3;
 /// Enforces >= 25% density floor across evaluable windows.
 pub(super) const ENGINE_MIN_WINDOW_PCT: f64 = 0.25;
@@ -182,11 +173,3 @@ pub mod rule_names {
 /// roofline due to framework overhead, scheduling, and memory contention. 80% represents
 /// a well-optimized production system. Waste is computed against this ceiling, not 100%.
 pub const ACHIEVABLE_EFFICIENCY_CEILING: f64 = 0.80;
-
-pub(super) fn skew_secs(a: SystemTime, b: SystemTime) -> f64 {
-    match a.duration_since(b) {
-        Ok(d) => d.as_secs_f64(),
-        Err(e) => -e.duration().as_secs_f64(),
-    }
-    .abs()
-}

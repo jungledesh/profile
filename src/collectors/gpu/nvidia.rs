@@ -1,4 +1,3 @@
-use std::thread;
 use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
@@ -6,7 +5,7 @@ use nvml_wrapper::Nvml;
 use nvml_wrapper::enum_wrappers::device::{Clock, ClockId, TemperatureSensor};
 
 use super::super::GpuRawMetrics;
-use super::super::sampling::{SAMPLE_INTERVAL, sample_count_for};
+use super::super::sampling::{run_sampling_loop, sample_count_for};
 use super::polling::{GpuPoll, aggregate_polls, resolve_device_indices};
 
 const MIB: u64 = 1024 * 1024;
@@ -69,6 +68,8 @@ pub(super) fn collect(
     let device_indices: Vec<u32> = if let Some(ei) = explicit_indices {
         ei.to_vec()
     } else {
+        // Not shared with AMD: CUDA_VISIBLE_DEVICES allows UUID/MIG tokens
+        // (resolved via NVML); AMD ROCR/HIP lists are numeric indices only.
         let mut cvd_indices = Vec::new();
         if let Ok(cvd) = std::env::var("CUDA_VISIBLE_DEVICES") {
             for part in cvd.split(',') {
@@ -97,7 +98,7 @@ pub(super) fn collect(
         all_device_polls.insert(d, Vec::with_capacity(sample_count));
     }
 
-    for i in 0..sample_count {
+    run_sampling_loop(sample_count, |_i| {
         for &d in &device_indices {
             let device = nvml.device_by_index(d).map_err(|e| {
                 anyhow::anyhow!("NVML device {d} lost during telemetry polling: {e}")
@@ -130,11 +131,8 @@ pub(super) fn collect(
                 slot.push(tick);
             }
         }
-
-        if i + 1 < sample_count {
-            thread::sleep(SAMPLE_INTERVAL);
-        }
-    }
+        Ok(())
+    })?;
 
     let mut results = Vec::with_capacity(device_indices.len());
     let mut failed_indices = Vec::new();
@@ -161,6 +159,7 @@ pub(super) fn collect(
                     gpu_util_pct: agg.gpu_util_pct,
                     mem_util_pct: agg.mem_util_pct,
                     power_watts: agg.power_watts,
+                    aligned_power_watts: None,
                     power_limit_watts,
                     vram_used_mb: agg.vram_used_mb,
                     vram_peak_mb: agg.vram_peak_mb,

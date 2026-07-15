@@ -9,6 +9,7 @@ pub mod types;
 pub mod vllm;
 
 pub use config::{VllmConfig, build_config};
+pub(crate) use types::observations_aligned;
 pub use types::{
     AggregateGpuMetrics, CacheConfigLabels, GpuFingerprint, GpuRawMetrics, HistogramCount,
     HistogramWindowMass, PrefixCacheScrapeSample, RawSnapshot, VllmRawMetrics,
