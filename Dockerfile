@@ -88,11 +88,10 @@ WORKDIR ${APP_DIR}
 
 COPY --chown=appuser:appuser scripts/load.sh ./load.sh
 COPY --chown=appuser:appuser scripts/start.sh ./start.sh
-COPY --chown=appuser:appuser scripts/demo.sh ./demo.sh
 
 COPY --from=profile-builder --chown=appuser:appuser /build/target/release/profile ./profile
 
-RUN chmod 0755 ./load.sh ./start.sh ./demo.sh ./profile
+RUN chmod 0755 ./load.sh ./start.sh ./profile
 
 USER appuser
 
@@ -104,7 +103,7 @@ CMD ["bash", "-lc", "/home/appuser/app/start.sh"]
 #   docker run --device=/dev/kfd --device=/dev/dri --group-add video \
 #     --shm-size 16G --security-opt seccomp=unconfined \
 #     -e HF_TOKEN="$HF_TOKEN" -p 8000:8000 -it profile:amd
-FROM vllm/vllm-openai-rocm:v0.24.0 AS amd
+FROM vllm/vllm-openai-rocm:v0.25.1 AS amd
 
 ENV APP_DIR=/home/appuser/app
 ENV MODELS_DIR=/workspace/models

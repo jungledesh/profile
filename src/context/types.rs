@@ -18,7 +18,7 @@ pub struct ModelArch {
     /// (e.g. Gemma 2 9B uses head_dim=256). None when architecture is non-standard.
     pub head_dim: Option<u32>,
     /// KV-relevant layer count for hybrid architectures where only a subset of layers
-    /// use standard KV cache (e.g. Qwen3.6: 32 attention layers out of 64 total).
+    /// use standard KV cache (e.g. Qwen3.6: 16 attention layers out of 64 total).
     /// None → fall back to num_layers in KV math (correct for pure-attention models).
     pub num_kv_layers: Option<u32>,
     /// Per-layer attention FLOPs coefficient for prefill ceiling (seq_len² term).

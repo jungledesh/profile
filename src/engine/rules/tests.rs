@@ -332,11 +332,12 @@ fn mk_r6_prefill_window(
 
 #[test]
 fn compute_kv_max_seqs_uses_kv_layers_over_total_layers() {
+    // Qwen3.6-27B hybrid shape: 16/64 full-attention layers → 4× KV capacity vs num_layers.
     let hybrid = ModelArch {
-        num_kv_heads: Some(8),
-        head_dim: Some(128),
+        num_kv_heads: Some(4),
+        head_dim: Some(256),
         num_layers: Some(64),
-        num_kv_layers: Some(32),
+        num_kv_layers: Some(16),
         ..Default::default()
     };
     #[allow(clippy::cast_precision_loss)]
@@ -350,7 +351,7 @@ fn compute_kv_max_seqs_uses_kv_layers_over_total_layers() {
     let without_kv_layers = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &dense, None, None);
 
     assert!(with_kv_layers.is_some() && without_kv_layers.is_some());
-    assert_eq!(with_kv_layers.unwrap(), without_kv_layers.unwrap() * 2);
+    assert_eq!(with_kv_layers.unwrap(), without_kv_layers.unwrap() * 4);
 }
 
 #[test]

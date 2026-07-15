@@ -200,6 +200,7 @@ static CATALOG: &[ModelEntry] = &[
     // Before generic qwen3 size entries, "7b" is a substring of "27b".
     // Released April 2026. Dense 27B; hybrid gated-DeltaNet + attention blocks.
     // Only attention layers use KV cache. Standard num_layers formula overstates.
+    // Source: https://huggingface.co/Qwen/Qwen3.6-27B/raw/main/config.json
     ModelEntry {
         tokens: &["qwen3.6", "27b"],
         entry: CatalogEntry {
@@ -209,9 +210,10 @@ static CATALOG: &[ModelEntry] = &[
             num_layers: 64,
             hidden_dim: 5120,
             default_weight_dtype: "bf16",
-            num_kv_heads: Some(8),
-            head_dim: Some(128),
-            num_kv_layers: Some(32), // 64 total layers, 50/50 DeltaNet/attention split
+            num_kv_heads: Some(4),
+            head_dim: Some(256),
+            // 64 total layers, 3:1 DeltaNet/attention interleave (full_attention_interval: 4)
+            num_kv_layers: Some(16),
             attn_flops_coeff: None,
         },
     },
@@ -1104,9 +1106,9 @@ mod tests {
         assert!(e.active_param_count.is_none());
         assert_eq!(e.num_layers, 64);
         assert_eq!(e.hidden_dim, 5120);
-        assert_eq!(e.num_kv_heads, Some(8));
-        assert_eq!(e.head_dim, Some(128));
-        assert_eq!(e.num_kv_layers, Some(32));
+        assert_eq!(e.num_kv_heads, Some(4));
+        assert_eq!(e.head_dim, Some(256));
+        assert_eq!(e.num_kv_layers, Some(16));
     }
 
     #[test]
