@@ -90,6 +90,7 @@ fn amd_device_inventory() -> Option<AmdDeviceInventory> {
 }
 
 /// Pure seam: split init outcomes into ready vs failed by original index.
+#[cfg(test)]
 fn partition_amd_init_outcomes(
     outcomes: &[(u32, String, bool)],
 ) -> (Vec<(u32, String)>, Vec<AmdFailedPath>) {
