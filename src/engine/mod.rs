@@ -2,8 +2,6 @@ pub mod baseline;
 pub mod limiter;
 mod rules;
 
-#[cfg(test)]
-use crate::collectors::{effective_tensor_parallel, window_is_evaluable};
 use crate::context::{AnalysisInput, RuntimeWindow};
 
 pub use baseline::{CeilingEstimate, CostEstimate, CostSource, PhysicsBaseline, WeightDtypeSource};
@@ -15,6 +13,25 @@ const MASSIVE_UNDERUTIL_OCCUPANCY_CEILING: f64 = 0.75;
 /// Shared confidence for MU variants that infer cause without a direct observation.
 const MU_INFERRED_CONFIDENCE: f64 = 0.4;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GaugeMissingCounts {
+    pub under_batching: usize,
+    pub kv_cache_pressure: usize,
+    pub low_prefix_reuse: usize,
+    pub concurrency_saturation: usize,
+}
+
+/// Window-level skip/gap counts threaded into `Report` construction.
+#[derive(Debug, Clone, Default)]
+pub struct EvalSkipStats {
+    pub skipped_broken: usize,
+    pub skipped_idle: usize,
+    /// Active windows excluded from energy/cost because GPU and vLLM clocks diverge.
+    pub energy_skew_skipped: usize,
+    /// Evaluable windows where a required gauge was absent (could not judge).
+    pub gauge_missing: GaugeMissingCounts,
+}
+
 #[derive(Debug, Clone)]
 pub struct Report {
     pub baseline: Option<PhysicsBaseline>,
@@ -22,12 +39,17 @@ pub struct Report {
     /// Rules that fired but were removed by layer filtering or the suppression table.
     pub suppressed_rules: Vec<(&'static str, &'static str)>,
     pub kv_max_seqs: Option<u32>,
-    /// Evaluable window count. Stdout gates MU inject and the journey footer on
-    /// `ENGINE_MIN_PERSISTENT_WINDOWS`. `--json` (when emitted) should keep raw
+    /// Evaluable window count. `engine::build_report_for_diagnose` gates MU
+    /// inject on `ENGINE_MIN_PERSISTENT_WINDOWS`; stdout gates only the journey
+    /// footer on the same threshold. `--json` (when emitted) should keep raw
     /// recommendations and let consumers apply the same `n_eval` gate.
     pub n_eval: usize,
     pub skipped_broken: usize,
     pub skipped_idle: usize,
+    /// Active windows excluded from energy/cost because GPU and vLLM clocks diverge.
+    pub energy_skew_skipped: usize,
+    /// Evaluable windows where a required gauge was absent (could not judge).
+    pub gauge_missing: GaugeMissingCounts,
 }
 
 /// Multi-window diagnose report. Production always collects >= 15 windows (min duration 30s).
@@ -43,113 +65,6 @@ pub fn build_report_for_diagnose(windows: &[RuntimeWindow], input: AnalysisInput
         );
     }
     report
-}
-
-/// Single-window path: test-only. Production always uses `build_report_for_windows`.
-#[cfg(test)]
-pub(crate) fn build_report(input: AnalysisInput<'_>) -> Report {
-    let baseline = baseline::compute(&input);
-    let snapshot = &input.window.snapshot;
-
-    if !window_is_evaluable(snapshot) {
-        return Report {
-            baseline,
-            recommendations: Vec::new(),
-            suppressed_rules: Vec::new(),
-            kv_max_seqs: None,
-            n_eval: 0,
-            skipped_broken: 1,
-            skipped_idle: 0,
-        };
-    }
-
-    let n_eval = 1;
-    let r2_fired = usize::from(matches!(
-        rules::rule2_kv_cache_pressure(snapshot),
-        rules::Rule2Outcome::Fired(_)
-    ));
-    let kv_max_seqs = rules::compute_kv_max_seqs(
-        baseline.as_ref().and_then(|b| b.kv_headroom_gb),
-        input.ctx.config.max_model_len,
-        &input.ctx.model,
-        input.ctx.config.kv_cache_dtype.as_deref(),
-        effective_tensor_parallel(
-            input.ctx.config.tensor_parallel_size,
-            input.window.snapshot.collected_gpu_count(),
-        ),
-    );
-
-    let mut recs: Vec<Recommendation> = Vec::new();
-    if let Some(r) = rules::r4_recommendation(
-        baseline.as_ref().and_then(|b| b.kv_headroom_gb),
-        effective_tensor_parallel(
-            input.ctx.config.tensor_parallel_size,
-            input.window.snapshot.collected_gpu_count(),
-        ),
-        baseline.as_ref().map(|b| b.weight_gb),
-        input.ctx.gpu.vram_gb,
-        input.ctx.config.gpu_memory_utilization,
-        baseline
-            .as_ref()
-            .map(|b| b.weight_dtype_source)
-            .unwrap_or(WeightDtypeSource::Fallback),
-    ) {
-        recs.push(r);
-    }
-    if let Some(r) = rules::r2_recommendation(
-        snapshot,
-        input.ctx.config.max_model_len,
-        baseline.as_ref().and_then(|b| b.kv_headroom_gb),
-        kv_max_seqs,
-        r2_fired,
-        n_eval,
-        input.ctx.fp8_compiler_available,
-    ) {
-        recs.push(r);
-    }
-    if let Some(r) = rules::r5_recommendation(
-        snapshot,
-        snapshot
-            .vllm
-            .kv_cache_peak_perc
-            .or(snapshot.vllm.kv_cache_usage_perc),
-        input.ctx.config.max_num_seqs,
-        input.ctx.config.max_model_len,
-        kv_max_seqs,
-    ) {
-        recs.push(r);
-    }
-    if let Some(r) = rules::r1_recommendation(rules::R1EvalInput {
-        snapshot,
-        config_max_num_seqs: input.ctx.config.max_num_seqs,
-        efficiency_pct: baseline.as_ref().and_then(|b| b.efficiency_pct),
-        config_relative_efficiency_pct: baseline
-            .as_ref()
-            .and_then(|b| b.config_relative_efficiency_pct),
-        prompt_tokens_per_sec: snapshot.vllm.prompt_tokens_per_sec,
-        generation_tokens_per_sec: snapshot.vllm.generation_tokens_per_sec,
-        prefix_cache_hit_rate: snapshot.vllm.prefix_cache_hit_rate,
-        ridge_batch_size: baseline.as_ref().map(|b| b.ridge_batch_size),
-    }) {
-        recs.push(r);
-    }
-    if let Some(r) = rules::r3_recommendation(snapshot) {
-        recs.push(r);
-    }
-    if let Some(r) = rules::r6_recommendation(rules::PrefillBoundEvalInput {
-        prompt_tokens_per_sec: snapshot.vllm.prompt_tokens_per_sec,
-        generation_tokens_per_sec: snapshot.vllm.generation_tokens_per_sec,
-        decode_efficiency_pct: baseline.as_ref().and_then(|b| b.efficiency_pct),
-        tpot_ms: snapshot.vllm.tpot_ms,
-        tpot_floor_ms: baseline.as_ref().map(|b| b.tpot_floor_ms),
-        prefix_cache_hit_rate: snapshot.vllm.prefix_cache_hit_rate,
-        snapshot,
-        chunked_prefill_enabled: input.ctx.config.enable_chunked_prefill,
-    }) {
-        recs.push(r);
-    }
-
-    rules::finalize_report_groups(recs, baseline, kv_max_seqs, 1, 0, 0)
 }
 
 fn maybe_add_massive_underutilization(
@@ -287,8 +202,7 @@ mod build_report_tests {
         };
         let ctx = StaticContext::from_snapshot(&s, cfg);
         let win = RuntimeWindow::from_snapshot(s);
-        let input = AnalysisInput::new(&ctx, &win);
-        let report = build_report(input);
+        let report = diagnose_windows(&ctx, &win);
         assert_eq!(report.recommendations.len(), 1);
         assert_eq!(
             report.recommendations[0].rule_name,
@@ -339,8 +253,7 @@ mod build_report_tests {
         };
         let ctx = StaticContext::from_snapshot(&s, cfg);
         let win = RuntimeWindow::from_snapshot(s);
-        let input = AnalysisInput::new(&ctx, &win);
-        let report = build_report(input);
+        let report = diagnose_windows(&ctx, &win);
 
         assert!(
             report
@@ -391,8 +304,7 @@ mod build_report_tests {
         };
         let ctx = StaticContext::from_snapshot(&s, cfg);
         let win = RuntimeWindow::from_snapshot(s);
-        let input = AnalysisInput::new(&ctx, &win);
-        let report = build_report(input);
+        let report = diagnose_windows(&ctx, &win);
         assert_eq!(report.recommendations.len(), 1);
         assert_eq!(
             report.recommendations[0].rule_name,
@@ -442,6 +354,13 @@ mod build_report_tests {
         (0..n).map(|_| win.clone()).collect()
     }
 
+    /// Multi-window engine path without MU inject (matches production aggregate eval).
+    fn diagnose_windows(ctx: &StaticContext, win: &RuntimeWindow) -> Report {
+        let windows = sustained_windows(win, ENGINE_MIN_PERSISTENT_WINDOWS);
+        let input = AnalysisInput::new(ctx, &windows[0]);
+        rules::build_report_for_windows(&windows, input)
+    }
+
     fn diagnose_mu(ctx: &StaticContext, win: &RuntimeWindow, n_windows: usize) -> Report {
         let windows = sustained_windows(win, n_windows);
         let input = AnalysisInput::new(ctx, &windows[0]);
@@ -465,14 +384,13 @@ mod build_report_tests {
     }
 
     #[test]
-    fn build_report_does_not_add_massive_underutilization() {
+    fn build_report_for_windows_does_not_add_massive_underutilization() {
         let (ctx, win) = starved_no_rules_fixture();
-        let input = AnalysisInput::new(&ctx, &win);
-        let report = build_report(input);
+        let report = diagnose_windows(&ctx, &win);
         assert_eq!(
             massive_underutilization_count(&report),
             0,
-            "build_report must not inject the safety net"
+            "windows path must not inject the diagnose-only safety net"
         );
         let eff = report
             .baseline

@@ -39,16 +39,9 @@ pub struct UnderBatchingDetail {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct R1MissReport {
-    /// Prompt/gen token ratio when the prefill gate suppressed R1.
-    /// None when suppressed for any other reason (missing data, occupancy, backlog).
-    pub prefill_saturation_ratio: Option<f64>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
 pub enum Rule1Outcome {
     Fired(UnderBatchingDetail),
-    NotFired(R1MissReport),
+    NotFired,
 }
 
 /// Inputs for R1 evaluation (per-window and single-window paths).
@@ -83,9 +76,7 @@ pub(super) fn rule1_under_batching_with_efficiency(input: R1EvalInput<'_>) -> Ru
         .window_duration_secs
         .is_some_and(|w| w.is_finite() && w > f64::EPSILON)
     {
-        return Rule1Outcome::NotFired(R1MissReport {
-            prefill_saturation_ratio: None,
-        });
+        return Rule1Outcome::NotFired;
     }
 
     // 2. Hard abort - max_num_seqs required (scrape or config)
@@ -95,9 +86,7 @@ pub(super) fn rule1_under_batching_with_efficiency(input: R1EvalInput<'_>) -> Ru
         .or(config_max_num_seqs)
         .filter(|&n| n > 0)
     else {
-        return Rule1Outcome::NotFired(R1MissReport {
-            prefill_saturation_ratio: None,
-        });
+        return Rule1Outcome::NotFired;
     };
 
     let effective_max = match ridge_batch_size.filter(|r| r.is_finite() && *r > 0.0) {
@@ -107,22 +96,16 @@ pub(super) fn rule1_under_batching_with_efficiency(input: R1EvalInput<'_>) -> Ru
 
     // 3. Hard abort - running required and > 0
     let Some(run) = running.filter(|v| v.is_finite() && *v > 0.0) else {
-        return Rule1Outcome::NotFired(R1MissReport {
-            prefill_saturation_ratio: None,
-        });
+        return Rule1Outcome::NotFired;
     };
 
     // 4. Occupancy + backlog check
     let occupancy = run / effective_max;
     let Some(wait) = snapshot.vllm.num_requests_waiting.filter(|v| v.is_finite()) else {
-        return Rule1Outcome::NotFired(R1MissReport {
-            prefill_saturation_ratio: None,
-        });
+        return Rule1Outcome::NotFired;
     };
     if wait >= UNDER_BATCHING_WAITING_LT {
-        return Rule1Outcome::NotFired(R1MissReport {
-            prefill_saturation_ratio: None,
-        });
+        return Rule1Outcome::NotFired;
     }
     let efficiency_pct = efficiency_pct.filter(|e| e.is_finite());
 
@@ -138,9 +121,7 @@ pub(super) fn rule1_under_batching_with_efficiency(input: R1EvalInput<'_>) -> Ru
             f64::INFINITY
         };
         if ratio >= PREFILL_FRACTION_GATE_RATIO {
-            return Rule1Outcome::NotFired(R1MissReport {
-                prefill_saturation_ratio: Some(ratio),
-            });
+            return Rule1Outcome::NotFired;
         }
     }
 
@@ -155,20 +136,14 @@ pub(super) fn rule1_under_batching_with_efficiency(input: R1EvalInput<'_>) -> Ru
             .filter(|e| e.is_finite())
             .unwrap_or(100.0);
         if config_eff >= CONFIG_EFFICIENCY_STARVATION_PCT {
-            return Rule1Outcome::NotFired(R1MissReport {
-                prefill_saturation_ratio: None,
-            });
+            return Rule1Outcome::NotFired;
         }
         if occupancy >= OCCUPANCY_CEILING_PCT {
-            return Rule1Outcome::NotFired(R1MissReport {
-                prefill_saturation_ratio: None,
-            });
+            return Rule1Outcome::NotFired;
         }
     } else if occupancy >= OCCUPANCY_FALLBACK_PCT {
         // Unknown GPU: stricter occupancy-only fallback.
-        return Rule1Outcome::NotFired(R1MissReport {
-            prefill_saturation_ratio: None,
-        });
+        return Rule1Outcome::NotFired;
     }
 
     Rule1Outcome::Fired(UnderBatchingDetail {
@@ -388,7 +363,7 @@ mod tests {
             Rule1Outcome::Fired(d) => {
                 assert!((d.occupancy_pct - (5.0 / 256.0 * 100.0)).abs() < 0.1);
             }
-            Rule1Outcome::NotFired(_) => panic!("expected fired"),
+            Rule1Outcome::NotFired => panic!("expected fired"),
         }
     }
 
@@ -399,7 +374,7 @@ mod tests {
             Rule1Outcome::Fired(d) => {
                 assert!(d.occupancy_pct < 25.0);
             }
-            Rule1Outcome::NotFired(_) => panic!("expected fired below 25% occupancy"),
+            Rule1Outcome::NotFired => panic!("expected fired below 25% occupancy"),
         }
     }
 
@@ -408,7 +383,7 @@ mod tests {
         let s = snap(Some(64.0), Some(256), Some(0.0));
         assert!(matches!(
             rule1_under_batching_with_efficiency(r1_input(&s, R1InputOpts::default())),
-            Rule1Outcome::NotFired(_)
+            Rule1Outcome::NotFired
         ));
     }
 
@@ -417,7 +392,7 @@ mod tests {
         let s = snap(Some(0.0), Some(256), Some(0.0));
         assert!(matches!(
             rule1_under_batching_with_efficiency(r1_input(&s, R1InputOpts::default())),
-            Rule1Outcome::NotFired(_)
+            Rule1Outcome::NotFired
         ));
     }
 
@@ -426,7 +401,7 @@ mod tests {
         let s = snap(Some(5.0), Some(256), Some(2.0));
         assert!(matches!(
             rule1_under_batching_with_efficiency(r1_input(&s, R1InputOpts::default())),
-            Rule1Outcome::NotFired(_)
+            Rule1Outcome::NotFired
         ));
     }
 
@@ -444,7 +419,7 @@ mod tests {
         let s = snap(Some(5.0), None, Some(0.0));
         assert!(matches!(
             rule1_under_batching_with_efficiency(r1_input(&s, R1InputOpts::default())),
-            Rule1Outcome::NotFired(_)
+            Rule1Outcome::NotFired
         ));
     }
 
@@ -453,7 +428,7 @@ mod tests {
         let s = snap(Some(5.0), Some(0), Some(0.0));
         assert!(matches!(
             rule1_under_batching_with_efficiency(r1_input(&s, R1InputOpts::default())),
-            Rule1Outcome::NotFired(_)
+            Rule1Outcome::NotFired
         ));
     }
 
@@ -471,7 +446,7 @@ mod tests {
                 assert_eq!(d.max_num_seqs, Some(64));
                 assert!((d.occupancy_pct - (4.0 / 64.0 * 100.0)).abs() < 0.1);
             }
-            Rule1Outcome::NotFired(_) => panic!("expected fired with config max 64"),
+            Rule1Outcome::NotFired => panic!("expected fired with config max 64"),
         }
     }
 
@@ -486,7 +461,7 @@ mod tests {
                     ..Default::default()
                 },
             )),
-            Rule1Outcome::NotFired(_)
+            Rule1Outcome::NotFired
         ));
     }
 
@@ -495,7 +470,7 @@ mod tests {
         let s = snap(None, Some(256), Some(0.0));
         assert!(matches!(
             rule1_under_batching_with_efficiency(r1_input(&s, R1InputOpts::default())),
-            Rule1Outcome::NotFired(_)
+            Rule1Outcome::NotFired
         ));
     }
 
@@ -504,7 +479,7 @@ mod tests {
         let s = snap_with_gates(Some(5.0), Some(256), Some(0.0), None, None);
         assert!(matches!(
             rule1_under_batching_with_efficiency(r1_input(&s, R1InputOpts::default())),
-            Rule1Outcome::NotFired(_)
+            Rule1Outcome::NotFired
         ));
     }
 
@@ -567,7 +542,7 @@ mod tests {
                 assert!(text.contains("max: 256"));
                 assert!(!text.contains("Config efficiency"));
             }
-            Rule1Outcome::NotFired(_) => panic!("expected fire via config efficiency path"),
+            Rule1Outcome::NotFired => panic!("expected fire via config efficiency path"),
         }
     }
 
@@ -582,7 +557,7 @@ mod tests {
                 assert!(text.contains("low confidence"));
                 assert!(!text.contains("Config efficiency"));
             }
-            Rule1Outcome::NotFired(_) => panic!("expected fire via occupancy fallback"),
+            Rule1Outcome::NotFired => panic!("expected fire via occupancy fallback"),
         }
     }
 
@@ -594,7 +569,7 @@ mod tests {
                 let text = format_under_batching_fired(&d, 0.5, true).join("\n");
                 assert!(text.contains("Monitor KV cache when scaling up."));
             }
-            Rule1Outcome::NotFired(_) => panic!("expected fired"),
+            Rule1Outcome::NotFired => panic!("expected fired"),
         }
     }
 
@@ -606,7 +581,7 @@ mod tests {
                 let text = format_under_batching_fired(&d, 0.5, false).join("\n");
                 assert!(!text.contains("Monitor KV cache when scaling up."));
             }
-            Rule1Outcome::NotFired(_) => panic!("expected fired"),
+            Rule1Outcome::NotFired => panic!("expected fired"),
         }
     }
 
@@ -624,7 +599,7 @@ mod tests {
                 assert!(d.known_gpu);
                 assert_eq!(d.config_relative_efficiency_pct, Some(15.0));
             }
-            Rule1Outcome::NotFired(_) => panic!("expected fired"),
+            Rule1Outcome::NotFired => panic!("expected fired"),
         }
     }
 
@@ -639,7 +614,7 @@ mod tests {
                     ..Default::default()
                 },
             )),
-            Rule1Outcome::NotFired(_)
+            Rule1Outcome::NotFired
         ));
     }
 
@@ -654,7 +629,7 @@ mod tests {
                     ..Default::default()
                 },
             )),
-            Rule1Outcome::NotFired(_)
+            Rule1Outcome::NotFired
         ));
     }
 
@@ -665,7 +640,7 @@ mod tests {
             Rule1Outcome::Fired(d) => {
                 assert!(!d.known_gpu);
             }
-            Rule1Outcome::NotFired(_) => panic!("expected fired on unknown GPU fallback"),
+            Rule1Outcome::NotFired => panic!("expected fired on unknown GPU fallback"),
         }
     }
 
@@ -674,7 +649,7 @@ mod tests {
         let s = snap(Some(70.0), Some(256), Some(0.0));
         assert!(matches!(
             rule1_under_batching_with_efficiency(r1_input(&s, R1InputOpts::default())),
-            Rule1Outcome::NotFired(_)
+            Rule1Outcome::NotFired
         ));
     }
 
@@ -690,9 +665,7 @@ mod tests {
                 ..Default::default()
             },
         )) {
-            Rule1Outcome::NotFired(m) => {
-                assert!(m.prefill_saturation_ratio.is_some());
-            }
+            Rule1Outcome::NotFired => {}
             Rule1Outcome::Fired(_) => panic!("expected suppressed by prefill gate"),
         }
     }
@@ -712,7 +685,7 @@ mod tests {
             },
         )) {
             Rule1Outcome::Fired(_) => {}
-            Rule1Outcome::NotFired(_) => panic!("prefix cache should prevent suppression"),
+            Rule1Outcome::NotFired => panic!("prefix cache should prevent suppression"),
         }
     }
 
@@ -728,10 +701,7 @@ mod tests {
                 ..Default::default()
             },
         )) {
-            Rule1Outcome::NotFired(m) => {
-                assert!(m.prefill_saturation_ratio.is_some());
-                assert!(m.prefill_saturation_ratio.expect("ratio").is_infinite());
-            }
+            Rule1Outcome::NotFired => {}
             Rule1Outcome::Fired(_) => panic!("R1 should suppress on pure prefill"),
         }
     }
@@ -749,7 +719,7 @@ mod tests {
                     ..Default::default()
                 },
             )),
-            Rule1Outcome::NotFired(_)
+            Rule1Outcome::NotFired
         ));
     }
 
@@ -807,7 +777,7 @@ mod tests {
                 assert!(d.known_gpu);
                 assert_eq!(d.config_relative_efficiency_pct, Some(15.0));
             }
-            Rule1Outcome::NotFired(_) => panic!("expected fired with all gates passing"),
+            Rule1Outcome::NotFired => panic!("expected fired with all gates passing"),
         }
     }
 }

@@ -1,10 +1,5 @@
 use crate::collectors::RawSnapshot;
 
-#[cfg(test)]
-use super::Recommendation;
-#[cfg(test)]
-use super::rule_names;
-
 /// Primary trigger: prompt-to-generation token ratio.
 /// Break-even is ridge / decode_batch. For A100-H100 at batch 30+, this falls in
 /// the 1.3-5.7 range. 5.0 catches meaningful prefill dominance without
@@ -480,26 +475,6 @@ pub(super) fn format_prefill_bound_window_issue(
     lines.push(format!("    Expected: {expected}"));
     lines.push(format!("    Confidence: {}", confidence_label(conf)));
     super::with_seen_pct(lines, seen_pct)
-}
-
-#[cfg(test)]
-pub fn r6_recommendation(input: PrefillBoundEvalInput<'_>) -> Option<Recommendation> {
-    let Rule6Outcome::Fired(d) = evaluate(input) else {
-        return None;
-    };
-    let sev = severity(d.prompt_gen_ratio);
-    let conf = confidence(sev);
-    let (_, action, short_action, expected) = prefill_fix_lines(&d, sev);
-    Some(Recommendation {
-        rule_name: rule_names::PREFILL_BOUND,
-        layer: 5,
-        impact: impact(sev),
-        confidence: conf,
-        action,
-        short_action,
-        expected_impact: expected,
-        display_lines: format_prefill_bound_window_issue(&d, 100),
-    })
 }
 
 #[cfg(test)]

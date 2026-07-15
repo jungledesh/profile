@@ -8,16 +8,19 @@ use crate::context::{AnalysisInput, ModelArch, RuntimeWindow, StaticContext};
 use crate::engine::baseline::{
     CeilingEstimate, CostEstimate, CostSource, PhysicsBaseline, WeightDtypeSource,
 };
-use crate::engine::build_report;
 use std::time::{Duration, SystemTime};
 
 fn format_diagnose_rules_test(
-    input: AnalysisInput<'_>,
+    ctx: &StaticContext,
+    win: &RuntimeWindow,
     verbose: bool,
     metrics_url: &str,
 ) -> Vec<String> {
-    let report = build_report(input);
-    format_diagnose_rules(input, &report, verbose, metrics_url)
+    let windows: Vec<_> = (0..ENGINE_MIN_PERSISTENT_WINDOWS)
+        .map(|_| win.clone())
+        .collect();
+    let summary = ai(ctx, &windows[0]);
+    format_diagnose_rules_for_windows_test(&windows, summary, verbose, metrics_url)
 }
 
 fn format_diagnose_rules_for_windows_test(
@@ -28,6 +31,20 @@ fn format_diagnose_rules_for_windows_test(
 ) -> Vec<String> {
     let report = build_report_for_windows(windows, summary);
     format_diagnose_rules_for_windows(windows, summary, &report, verbose, metrics_url, 30)
+}
+
+fn hint_for_empty<'a>(
+    ctx: &'a StaticContext,
+    win: &'a RuntimeWindow,
+    metrics_url: &'a str,
+    duration_secs: u64,
+) -> LoadHintParams<'a> {
+    LoadHintParams {
+        model_name: win.snapshot.vllm.model_name.as_deref(),
+        metrics_url,
+        max_num_seqs: ctx.config.max_num_seqs,
+        duration_secs,
+    }
 }
 
 fn snap(
@@ -465,7 +482,7 @@ fn under_batching_fires_when_gates_pass() {
     assert_eq!(r.rule_name, rule_names::UNDER_BATCHING);
     match rule1_under_batching_with_efficiency(r1_test_input(&win.snapshot)) {
         Rule1Outcome::Fired(d) => assert!(d.occupancy_pct < 25.0),
-        Rule1Outcome::NotFired(_) => panic!("expected fired"),
+        Rule1Outcome::NotFired => panic!("expected fired"),
     }
 }
 
@@ -505,8 +522,8 @@ fn format_under_batching_fired_matches_template() {
     };
     let ctx = StaticContext::from_snapshot(&s, cfg);
     let win = mk_win(s);
-    let text = format_diagnose_rules_test(ai(&ctx, &win), false, "http://127.0.0.1:8000/metrics")
-        .join("\n");
+    let text =
+        format_diagnose_rules_test(&ctx, &win, false, "http://127.0.0.1:8000/metrics").join("\n");
     assert!(text.contains("[!] Under-batching: Insufficient Concurrency"));
     assert!(text.contains("Batch more requests or increase client concurrency (251 slots idle)"));
 }
@@ -534,8 +551,8 @@ fn format_diagnose_rules_for_windows_r4_suppresses_r2_when_both_significant() {
 #[test]
 fn format_diagnose_verbose_shows_kv_pressure_suppressed_when_r4_fires() {
     let (ctx, win) = input_r4_suppresses_r2();
-    let text = format_diagnose_rules_test(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics")
-        .join("\n");
+    let text =
+        format_diagnose_rules_test(&ctx, &win, true, "http://127.0.0.1:8000/metrics").join("\n");
     assert!(text.contains("KV Cache Pressure: suppressed by OOM Risk"));
     assert!(!text.contains("KV Cache Pressure: not triggered"));
 }
@@ -550,8 +567,8 @@ fn not_triggered_shows_plain_label() {
     let s = snap(t, t, v, gpu_busy());
     let ctx = mk_ctx();
     let win = mk_win(s);
-    let text = format_diagnose_rules_test(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics")
-        .join("\n");
+    let text =
+        format_diagnose_rules_test(&ctx, &win, true, "http://127.0.0.1:8000/metrics").join("\n");
     assert!(text.contains("Under-batching: not triggered"));
     assert!(!text.contains("Under-batching: not triggered ("));
 }
@@ -606,8 +623,8 @@ fn format_diagnose_verbose_r1_shows_plain_not_triggered_when_gate_suppresses() {
     let s = snap(t, t, v, gpu_busy());
     let ctx = mk_ctx();
     let win = mk_win(s);
-    let text = format_diagnose_rules_test(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics")
-        .join("\n");
+    let text =
+        format_diagnose_rules_test(&ctx, &win, true, "http://127.0.0.1:8000/metrics").join("\n");
     assert!(text.contains("Under-batching: not triggered"));
     assert!(!text.contains("prompt/gen ratio"));
 }
@@ -622,24 +639,26 @@ fn format_diagnose_verbose_shows_not_indicated_when_no_issue() {
     let s = snap(t, t, v, g);
     let ctx = mk_ctx();
     let win = mk_win(s);
-    let text = format_diagnose_rules_test(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics")
-        .join("\n");
+    let text =
+        format_diagnose_rules_test(&ctx, &win, true, "http://127.0.0.1:8000/metrics").join("\n");
     assert!(text.contains("Under-batching: not triggered"));
     assert!(text.contains("KV Cache Pressure: not triggered"));
     assert!(text.contains("Low Prefix Reuse: not triggered"));
 }
 
 #[test]
-fn kv_cache_pressure_skew_suppresses() {
+fn kv_cache_pressure_fires_despite_observation_skew() {
+    // r2 is vLLM-only; GPU/vLLM clock divergence must not suppress KV pressure.
     let t0 = SystemTime::UNIX_EPOCH;
-    let t1 = t0 + Duration::from_secs(2);
+    let t1 = t0 + Duration::from_secs(5);
     let mut v = vllm_high_kv();
     v.num_requests_running = Some(64.0);
+    v.num_requests_waiting = Some(5.0); // queue corroboration
     let s = snap(t0, t1, v, gpu_low());
-    assert!(matches!(
-        rule2_kv_cache_pressure(&s),
-        Rule2Outcome::NotFired
-    ));
+    assert!(
+        matches!(rule2_kv_cache_pressure(&s), Rule2Outcome::Fired(_)),
+        "skew must not gate r2"
+    );
 }
 
 #[test]
@@ -651,8 +670,8 @@ fn kv_cache_miss_unavailable_without_gauge_verbose() {
     let s = snap(t, t, v, gpu_busy());
     let ctx = mk_ctx();
     let win = mk_win(s);
-    let text = format_diagnose_rules_test(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics")
-        .join("\n");
+    let text =
+        format_diagnose_rules_test(&ctx, &win, true, "http://127.0.0.1:8000/metrics").join("\n");
     assert!(text.contains("[i] KV Cache Pressure: core metric unavailable"));
     assert!(!text.contains("KV Cache Pressure: not triggered"));
 }
@@ -687,7 +706,7 @@ fn format_diagnose_rules_no_fires_default_is_only_no_issues_line() {
     };
     let ctx = StaticContext::from_snapshot(&s, cfg);
     let win = mk_win(s);
-    let lines = format_diagnose_rules_test(ai(&ctx, &win), false, "http://127.0.0.1:8000/metrics");
+    let lines = format_diagnose_rules_test(&ctx, &win, false, "http://127.0.0.1:8000/metrics");
     assert_eq!(lines, vec!["No issues detected.".to_string()]);
 }
 
@@ -700,10 +719,19 @@ fn format_diagnose_rules_non_evaluable_snapshot_shows_note() {
     let ctx = mk_ctx();
     let win = mk_win(s);
     let metrics_url = "http://127.0.0.1:8000/metrics";
-    let lines = format_diagnose_rules_test(ai(&ctx, &win), false, metrics_url);
+    let windows: Vec<_> = (0..ENGINE_MIN_PERSISTENT_WINDOWS)
+        .map(|_| win.clone())
+        .collect();
+    let lines = format_diagnose_rules_test(&ctx, &win, false, metrics_url);
     assert_eq!(
         lines,
-        unreachable_diagnose_lines(false, std::slice::from_ref(&win), metrics_url)
+        empty_run_diagnose_lines(
+            false,
+            &windows,
+            false,
+            &hint_for_empty(&ctx, &win, metrics_url, 30),
+            metrics_url
+        )
     );
 }
 
@@ -775,7 +803,7 @@ fn r5_concurrency_saturation_fires_on_sustained_saturation() {
 }
 
 #[test]
-fn build_report_for_windows_r5_when_aggregate_snapshot_misses() {
+fn build_report_for_windows_fires_r5_when_sustained() {
     let mut windows: Vec<_> = (0..15)
         .map(|_| mk_evaluable_kv_window(50.0, false))
         .collect();
@@ -784,16 +812,9 @@ fn build_report_for_windows_r5_when_aggregate_snapshot_misses() {
     }
     let ctx = mk_ctx();
     let summary = ai(&ctx, windows.last().expect("windows"));
-    let aggregate_report = crate::engine::build_report(summary);
+    let report = build_report_for_windows(&windows, summary);
     assert!(
-        !aggregate_report
-            .recommendations
-            .iter()
-            .any(|g| g.rule_name == rule_names::CONCURRENCY_SATURATION)
-    );
-    let multi_report = build_report_for_windows(&windows, summary);
-    assert!(
-        multi_report
+        report
             .recommendations
             .iter()
             .any(|g| g.rule_name == rule_names::CONCURRENCY_SATURATION)
@@ -839,8 +860,70 @@ fn format_diagnose_rules_for_windows_all_non_evaluable() {
     let lines = format_diagnose_rules_for_windows_test(&windows, summary, false, metrics_url);
     assert_eq!(
         lines,
-        unreachable_diagnose_lines(false, &windows, metrics_url)
+        empty_run_diagnose_lines(
+            false,
+            &windows,
+            false,
+            &hint_for_empty(&ctx, &windows[0], metrics_url, 30),
+            metrics_url
+        )
     );
+}
+
+#[test]
+fn empty_run_stdout_and_format_sites_byte_identical() {
+    let t = SystemTime::UNIX_EPOCH;
+    let metrics_url = "http://127.0.0.1:8000/metrics";
+    let duration_secs = 30u64;
+    let ctx = mk_ctx();
+
+    let idle_v = {
+        let mut v = vllm_base();
+        v.num_requests_running = Some(0.0);
+        v.generation_tokens_per_sec = Some(0.0);
+        v
+    };
+    let broken_v = {
+        let mut v = vllm_base();
+        v.num_requests_running = None;
+        v
+    };
+
+    let cases: [(bool, VllmRawMetrics); 2] = [(true, idle_v), (false, broken_v)];
+    for (any_evaluable, vllm) in cases {
+        let win = mk_win(snap(t, t, vllm, gpu_busy()));
+        let windows = vec![win.clone(), win.clone()];
+        let summary = ai(&ctx, &windows[0]);
+        let hint = hint_for_empty(&ctx, &windows[0], metrics_url, duration_secs);
+        for verbose in [false, true] {
+            // stdout empty-run site: calls chooser directly with its any_evaluable flag.
+            let from_stdout_site =
+                empty_run_diagnose_lines(verbose, &windows, any_evaluable, &hint, metrics_url);
+            // format.rs empty-run site: n_eval == 0 branch → same chooser.
+            let from_format_site = format_diagnose_rules_for_windows(
+                &windows,
+                summary,
+                &crate::engine::Report {
+                    baseline: None,
+                    recommendations: Vec::new(),
+                    suppressed_rules: Vec::new(),
+                    kv_max_seqs: None,
+                    n_eval: 0,
+                    skipped_broken: if any_evaluable { 0 } else { windows.len() },
+                    skipped_idle: if any_evaluable { windows.len() } else { 0 },
+                    energy_skew_skipped: 0,
+                    gauge_missing: Default::default(),
+                },
+                verbose,
+                metrics_url,
+                duration_secs,
+            );
+            assert_eq!(
+                from_stdout_site, from_format_site,
+                "any_evaluable={any_evaluable} verbose={verbose}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1263,7 +1346,11 @@ fn nan_running_suppresses() {
 #[test]
 fn format_diagnose_non_verbose_omits_kv_pressure_when_r4_fires() {
     let (ctx, win) = input_r4_suppresses_r2();
-    let report = build_report(ai(&ctx, &win));
+    let windows: Vec<_> = (0..ENGINE_MIN_PERSISTENT_WINDOWS)
+        .map(|_| win.clone())
+        .collect();
+    let summary = ai(&ctx, &windows[0]);
+    let report = build_report_for_windows(&windows, summary);
     assert_eq!(report.recommendations[0].rule_name, rule_names::OOM_RISK);
     assert!(
         !report
@@ -1338,12 +1425,9 @@ fn kv_cache_pressure_preemption_displays_without_premature_confidence() {
         .display_lines
         .join("\n");
     assert!(!r2_text.contains("Confidence:"));
-    let text = format_diagnose_rules_test(
-        ai(&ctx2, &win_kv_only),
-        false,
-        "http://127.0.0.1:8000/metrics",
-    )
-    .join("\n");
+    let text =
+        format_diagnose_rules_test(&ctx2, &win_kv_only, false, "http://127.0.0.1:8000/metrics")
+            .join("\n");
     assert!(text.contains("Cause:"));
     assert!(text.contains("KV cache 89% avg, 89% peak (threshold: 88%)."));
     assert!(text.contains("Expected: TTFT and TPOT recover once evictions stop."));
@@ -1551,8 +1635,8 @@ fn format_diagnose_rule3_verbose_working_effectively_when_rate_healthy() {
     let s = snap(t, t, v, gpu_busy());
     let ctx = mk_ctx();
     let win = mk_win(s);
-    let text = format_diagnose_rules_test(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics")
-        .join("\n");
+    let text =
+        format_diagnose_rules_test(&ctx, &win, true, "http://127.0.0.1:8000/metrics").join("\n");
     assert!(text.contains("Low Prefix Reuse: not triggered"));
 }
 
@@ -1565,8 +1649,8 @@ fn format_diagnose_rule3_verbose_not_indicated_when_rate_low_but_prompt_below_fl
     let s = snap(t, t, v, gpu_busy());
     let ctx = mk_ctx();
     let win = mk_win(s);
-    let text = format_diagnose_rules_test(ai(&ctx, &win), true, "http://127.0.0.1:8000/metrics")
-        .join("\n");
+    let text =
+        format_diagnose_rules_test(&ctx, &win, true, "http://127.0.0.1:8000/metrics").join("\n");
     assert!(text.contains("Low Prefix Reuse: not triggered"));
     assert!(!text.contains("working effectively"));
 }
@@ -1581,6 +1665,8 @@ fn format_diagnose_rules_inserts_blank_between_rule_blocks() {
         v.model_name = Some("meta-llama/Llama-3.1-8B-Instruct".to_string());
         let mut g = gpu_low();
         g.gpu_name = Some("NVIDIA H100 80GB HBM3".to_string());
+        g.power_watts = Some(400.0);
+        g.aligned_power_watts = Some(400.0);
         let t = SystemTime::UNIX_EPOCH;
         let snap = snap(t, t, v, g);
         let cfg = VllmConfig {
@@ -1592,7 +1678,7 @@ fn format_diagnose_rules_inserts_blank_between_rule_blocks() {
         let win = mk_win(snap);
         (ctx, win)
     };
-    let lines = format_diagnose_rules_test(ai(&ctx, &win), false, "http://127.0.0.1:8000/metrics");
+    let lines = format_diagnose_rules_test(&ctx, &win, false, "http://127.0.0.1:8000/metrics");
     let idx_kv = lines
         .iter()
         .position(|l| l.contains("[!] KV Cache Pressure"))
@@ -2057,4 +2143,98 @@ fn waste_label_unknown_rule() {
         waste_label_suffix(&[rule_names::OOM_RISK]),
         Some("unclassified overhead")
     );
+}
+
+#[test]
+fn verbose_not_evaluated_when_waiting_gauge_missing_all_windows() {
+    let t = SystemTime::UNIX_EPOCH;
+    let mut v = vllm_base();
+    v.num_requests_waiting = None;
+    v.num_requests_running = Some(64.0);
+    v.generation_tokens_per_sec = Some(100.0);
+    v.kv_cache_usage_perc = Some(10.0);
+    v.prefix_cache_hit_rate = Some(0.9);
+    let s = snap(t, t, v, gpu_busy());
+    let ctx = mk_ctx();
+    let win = mk_win(s);
+    let text =
+        format_diagnose_rules_test(&ctx, &win, true, "http://127.0.0.1:8000/metrics").join("\n");
+    assert!(
+        text.contains("Under-batching: not evaluated (waiting gauge missing)."),
+        "{text}"
+    );
+    assert!(
+        text.contains("Concurrency Saturation: not evaluated (waiting gauge missing)."),
+        "{text}"
+    );
+    assert!(!text.contains("Under-batching: not triggered"));
+}
+
+#[test]
+fn verbose_not_triggered_suffix_when_waiting_missing_in_some_windows() {
+    let t = SystemTime::UNIX_EPOCH;
+    let mut present = vllm_base();
+    present.num_requests_running = Some(64.0);
+    present.generation_tokens_per_sec = Some(100.0);
+    present.num_requests_waiting = Some(0.0);
+    present.kv_cache_usage_perc = Some(10.0);
+    present.prefix_cache_hit_rate = Some(0.9);
+    let mut missing = present.clone();
+    missing.num_requests_waiting = None;
+    let ctx = mk_ctx();
+    let windows = vec![
+        mk_win(snap(t, t, present.clone(), gpu_busy())),
+        mk_win(snap(t, t, present.clone(), gpu_busy())),
+        mk_win(snap(t, t, missing, gpu_busy())),
+        mk_win(snap(t, t, present, gpu_busy())),
+    ];
+    let summary = ai(&ctx, &windows[0]);
+    let text = format_diagnose_rules_for_windows_test(
+        &windows,
+        summary,
+        true,
+        "http://127.0.0.1:8000/metrics",
+    )
+    .join("\n");
+    assert!(
+        text.contains("Under-batching: not triggered (waiting gauge missing in 1/4 windows)."),
+        "{text}"
+    );
+}
+
+#[test]
+fn verbose_not_triggered_byte_identical_when_no_gauge_gaps() {
+    let t = SystemTime::UNIX_EPOCH;
+    let mut v = vllm_base();
+    v.num_requests_running = Some(64.0);
+    v.generation_tokens_per_sec = Some(100.0);
+    v.num_requests_waiting = Some(0.0);
+    v.kv_cache_usage_perc = Some(10.0);
+    v.prefix_cache_hit_rate = Some(0.9);
+    let s = snap(t, t, v, gpu_busy());
+    let ctx = mk_ctx();
+    let win = mk_win(s);
+    let text =
+        format_diagnose_rules_test(&ctx, &win, true, "http://127.0.0.1:8000/metrics").join("\n");
+    assert!(text.contains("Under-batching: not triggered"));
+    assert!(!text.contains("waiting gauge missing"));
+    assert!(!text.contains("not evaluated"));
+}
+
+#[test]
+fn energy_skew_skipped_counted_on_report() {
+    let t0 = SystemTime::UNIX_EPOCH;
+    let t1 = t0 + Duration::from_secs(5);
+    let mut v = vllm_base();
+    v.num_requests_running = Some(64.0);
+    v.generation_tokens_per_sec = Some(100.0);
+    v.num_requests_waiting = Some(0.0);
+    let aligned = mk_win(snap(t0, t0, v.clone(), gpu_busy()));
+    let skewed = mk_win(snap(t0, t1, v, gpu_busy()));
+    let windows = vec![aligned.clone(), aligned.clone(), skewed];
+    let ctx = mk_ctx();
+    let summary = ai(&ctx, &windows[0]);
+    let report = build_report_for_windows(&windows, summary);
+    assert_eq!(report.n_eval, 3);
+    assert_eq!(report.energy_skew_skipped, 1);
 }

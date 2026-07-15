@@ -1,5 +1,4 @@
 use std::panic::{self, AssertUnwindSafe};
-use std::thread;
 use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
@@ -11,8 +10,8 @@ use libamdgpu_top::VramUsage;
 use libamdgpu_top::stat::{GpuActivity, Sensors};
 
 use super::super::GpuRawMetrics;
-use super::super::sampling::{SAMPLE_INTERVAL, sample_count_for};
-use super::polling::{GpuPoll, aggregate_polls, resolve_device_indices};
+use super::super::sampling::{run_sampling_loop, sample_count_for};
+use super::polling::{GpuPoll, aggregate_polls};
 
 const MIB: u64 = 1024 * 1024;
 
@@ -31,21 +30,128 @@ fn amdgpu_device_paths() -> Option<Vec<DevicePath>> {
     if paths.is_empty() { None } else { Some(paths) }
 }
 
+/// Successfully initialized AMDGPU path, keyed by original probe ordinal.
+/// Carries the open `DeviceHandle` from the inventory probe so scan/collect
+/// do not call `init()` a second time on the same device.
+struct AmdReadyPath {
+    original_index: u32,
+    device_path: DevicePath,
+    device_handle: DeviceHandle,
+}
+
+/// Probe ordinal that failed `init()`, kept for visible-device warnings.
+struct AmdFailedPath {
+    original_index: u32,
+    name: String,
+}
+
+struct AmdDeviceInventory {
+    ready: Vec<AmdReadyPath>,
+    failed: Vec<AmdFailedPath>,
+}
+
+/// Single source of truth for scan and collect: paths that successfully init.
+/// Original path indices are preserved so assignment and telemetry agree.
+fn amd_device_inventory() -> Option<AmdDeviceInventory> {
+    let paths = amdgpu_device_paths()?;
+    let mut ready = Vec::new();
+    let mut failed = Vec::new();
+    for (i, device_path) in paths.into_iter().enumerate() {
+        let original_index = i as u32;
+        let name = device_path.device_name.clone();
+        match panic::catch_unwind(AssertUnwindSafe(|| device_path.init())) {
+            Ok(Ok(device_handle)) => {
+                ready.push(AmdReadyPath {
+                    original_index,
+                    device_path,
+                    device_handle,
+                });
+            }
+            Err(_) => {
+                eprintln!("Warning: AMD GPU {original_index} init panicked. Skipping device.");
+                failed.push(AmdFailedPath {
+                    original_index,
+                    name,
+                });
+            }
+            Ok(Err(_)) => {
+                failed.push(AmdFailedPath {
+                    original_index,
+                    name,
+                });
+            }
+        }
+    }
+    if ready.is_empty() {
+        None
+    } else {
+        Some(AmdDeviceInventory { ready, failed })
+    }
+}
+
+/// Pure seam: split init outcomes into ready vs failed by original index.
+#[cfg(test)]
+fn partition_amd_init_outcomes(
+    outcomes: &[(u32, String, bool)],
+) -> (Vec<(u32, String)>, Vec<AmdFailedPath>) {
+    let mut ready = Vec::new();
+    let mut failed = Vec::new();
+    for (original_index, name, ok) in outcomes {
+        if *ok {
+            ready.push((*original_index, name.clone()));
+        } else {
+            failed.push(AmdFailedPath {
+                original_index: *original_index,
+                name: name.clone(),
+            });
+        }
+    }
+    (ready, failed)
+}
+
+/// Select original path indices for collection.
+/// Empty env → all ready. Env/explicit indices map by original ordinal (never by
+/// compacted slot), so a visible-devices index for a failed init cannot alias another GPU.
+fn select_amd_original_indices(
+    explicit: Option<&[u32]>,
+    env_indices: Vec<u32>,
+    ready: &[(u32, String)],
+    failed: &[AmdFailedPath],
+) -> Vec<u32> {
+    let requested: Vec<u32> = if let Some(ei) = explicit {
+        ei.to_vec()
+    } else if env_indices.is_empty() {
+        ready.iter().map(|(i, _)| *i).collect()
+    } else {
+        env_indices
+    };
+
+    let mut selected = Vec::with_capacity(requested.len());
+    for idx in requested {
+        if ready.iter().any(|(i, _)| *i == idx) {
+            selected.push(idx);
+            continue;
+        }
+        if let Some(f) = failed.iter().find(|f| f.original_index == idx) {
+            eprintln!(
+                "Warning: AMD GPU {} ({}) is not available (init failed). Skipping.",
+                f.original_index, f.name
+            );
+            continue;
+        }
+        eprintln!("Warning: AMD GPU {idx} is out of range for initialized devices. Skipping.");
+    }
+    selected
+}
+
 /// Single-shot AMD GPU scan for gpu_assignment. No polling, no window.
 pub(super) fn scan_host_gpus() -> Option<Vec<super::GpuScanEntry>> {
-    let paths = amdgpu_device_paths()?;
-    let mut out = Vec::with_capacity(paths.len());
-    for (i, device_path) in paths.iter().enumerate() {
-        let init_result = panic::catch_unwind(AssertUnwindSafe(|| device_path.init()));
-        let device_handle = match init_result {
-            Ok(Ok(handle)) => handle,
-            Err(_) => {
-                eprintln!("Warning: AMD GPU {i} init panicked. Skipping device.");
-                continue;
-            }
-            Ok(Err(_)) => continue,
-        };
-        let mem_info = device_handle.memory_info().ok();
+    let inventory = amd_device_inventory()?;
+    let mut out = Vec::with_capacity(inventory.ready.len());
+    for entry in inventory.ready {
+        let i = entry.original_index;
+        let device_path = &entry.device_path;
+        let mem_info = entry.device_handle.memory_info().ok();
         let vram_used_mb = mem_info
             .as_ref()
             .map(|m| m.vram.heap_usage / MIB)
@@ -63,7 +169,7 @@ pub(super) fn scan_host_gpus() -> Option<Vec<super::GpuScanEntry>> {
             .map(|procs| procs.iter().map(|p| p.pid as u32).collect())
             .unwrap_or_default();
         out.push(super::GpuScanEntry {
-            idx: i as u32,
+            idx: i,
             name: device_path.device_name.clone(),
             vram_used_mb,
             vram_total_mb,
@@ -86,21 +192,17 @@ struct AmdDevice {
     vram_usage: VramUsage,
 }
 
-fn init_amd_devices(device_paths: &[DevicePath], indices: &[u32]) -> Result<Vec<AmdDevice>> {
-    let mut devices = Vec::with_capacity(indices.len());
-    for &idx in indices {
-        let Some(device_path) = device_paths.get(idx as usize) else {
+fn init_amd_devices(
+    ready: &mut std::collections::HashMap<u32, AmdReadyPath>,
+    original_indices: &[u32],
+) -> Result<Vec<AmdDevice>> {
+    let mut devices = Vec::with_capacity(original_indices.len());
+    for &idx in original_indices {
+        let Some(entry) = ready.remove(&idx) else {
             anyhow::bail!("AMD GPU {idx} lost during telemetry polling: index out of range");
         };
-        let device_handle = match panic::catch_unwind(AssertUnwindSafe(|| device_path.init())) {
-            Ok(Ok(handle)) => handle,
-            Ok(Err(e)) => {
-                anyhow::bail!("AMD GPU {idx} lost during telemetry polling: {e}");
-            }
-            Err(_) => {
-                anyhow::bail!("AMD GPU {idx}: init panicked (device likely inaccessible)");
-            }
-        };
+        let device_path = entry.device_path;
+        let device_handle = entry.device_handle;
         let ext_info = device_handle
             .device_info()
             .map_err(|e| anyhow::anyhow!("AMD GPU {idx} lost during telemetry polling: {e}"))?;
@@ -112,7 +214,7 @@ fn init_amd_devices(device_paths: &[DevicePath], indices: &[u32]) -> Result<Vec<
         let mut vram_usage = VramUsage::new(&mem_info);
         vram_usage.update_usable_heap_size(&device_handle);
         devices.push(AmdDevice {
-            device_path: device_path.clone(),
+            device_path,
             device_handle,
             sensors,
             vram_usage,
@@ -204,23 +306,33 @@ pub(super) fn collect(
     window: Duration,
     explicit_indices: Option<&[u32]>,
 ) -> Result<(Vec<GpuRawMetrics>, SystemTime, Option<u32>)> {
-    let Some(device_paths) = amdgpu_device_paths() else {
+    let Some(inventory) = amd_device_inventory() else {
         return Ok((vec![], SystemTime::now(), None));
     };
 
-    let host_count = device_paths.len() as u32;
-
-    let device_indices: Vec<u32> = if let Some(ei) = explicit_indices {
-        ei.to_vec()
-    } else {
-        resolve_device_indices(parse_amd_visible_devices(), host_count)
-    };
+    let host_count = inventory.ready.len() as u32;
+    let ready_meta: Vec<(u32, String)> = inventory
+        .ready
+        .iter()
+        .map(|e| (e.original_index, e.device_path.device_name.clone()))
+        .collect();
+    let device_indices = select_amd_original_indices(
+        explicit_indices,
+        parse_amd_visible_devices(),
+        &ready_meta,
+        &inventory.failed,
+    );
 
     if device_indices.is_empty() {
         return Ok((vec![], SystemTime::now(), Some(host_count)));
     }
 
-    let mut devices = init_amd_devices(&device_paths, &device_indices)?;
+    let mut ready_by_idx: std::collections::HashMap<u32, AmdReadyPath> = inventory
+        .ready
+        .into_iter()
+        .map(|e| (e.original_index, e))
+        .collect();
+    let mut devices = init_amd_devices(&mut ready_by_idx, &device_indices)?;
 
     let sample_count = sample_count_for(window);
     let mut all_device_polls: std::collections::HashMap<u32, Vec<GpuPoll>> =
@@ -229,18 +341,15 @@ pub(super) fn collect(
         all_device_polls.insert(d, Vec::with_capacity(sample_count));
     }
 
-    for i in 0..sample_count {
+    run_sampling_loop(sample_count, |_i| {
         for (slot_idx, &d) in device_indices.iter().enumerate() {
             let tick = poll_amd_device(&mut devices[slot_idx]);
             if let Some(slot) = all_device_polls.get_mut(&d) {
                 slot.push(tick);
             }
         }
-
-        if i + 1 < sample_count {
-            thread::sleep(SAMPLE_INTERVAL);
-        }
-    }
+        Ok(())
+    })?;
 
     let mut results = Vec::with_capacity(device_indices.len());
     for (slot_idx, &d) in device_indices.iter().enumerate() {
@@ -256,6 +365,7 @@ pub(super) fn collect(
             gpu_util_pct: agg.gpu_util_pct,
             mem_util_pct: agg.mem_util_pct,
             power_watts: agg.power_watts,
+            aligned_power_watts: None,
             power_limit_watts,
             vram_used_mb: agg.vram_used_mb,
             vram_peak_mb: agg.vram_peak_mb,
@@ -276,6 +386,8 @@ fn parse_device_indices(var: &str) -> Vec<u32> {
 }
 
 fn parse_amd_visible_devices() -> Vec<u32> {
+    // Numeric indices only. Unlike CUDA_VISIBLE_DEVICES, ROCR/HIP do not take
+    // UUID tokens here - keep parse local rather than force a shared helper.
     let var = std::env::var("ROCR_VISIBLE_DEVICES")
         .or_else(|_| std::env::var("HIP_VISIBLE_DEVICES"))
         .unwrap_or_default();
@@ -284,7 +396,10 @@ fn parse_amd_visible_devices() -> Vec<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_device_indices, sanitize_temp, sanitize_watts};
+    use super::{
+        AmdFailedPath, parse_device_indices, partition_amd_init_outcomes, sanitize_temp,
+        sanitize_watts, select_amd_original_indices,
+    };
 
     #[test]
     fn empty_string_returns_empty() {
@@ -341,5 +456,74 @@ mod tests {
         assert_eq!(sanitize_temp(Some(5.0)), None);
         assert_eq!(sanitize_temp(Some(5.01)), Some(5.01));
         assert_eq!(sanitize_temp(Some(65.0)), Some(65.0));
+    }
+
+    #[test]
+    fn partial_init_keeps_original_index_and_host_count() {
+        // 2 paths, second init fails → 1 ready GPU at original index 0.
+        let outcomes = [
+            (0_u32, "GPU-0".to_string(), true),
+            (1_u32, "GPU-1".to_string(), false),
+        ];
+        let (ready, failed) = partition_amd_init_outcomes(&outcomes);
+        assert_eq!(ready, vec![(0, "GPU-0".to_string())]);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].original_index, 1);
+        let host_count = ready.len() as u32;
+        assert_eq!(host_count, 1);
+        let selected = select_amd_original_indices(None, vec![], &ready, &failed);
+        assert_eq!(selected, vec![0]);
+        // Assignment-style explicit index must stay the original ordinal.
+        let selected_explicit = select_amd_original_indices(Some(&[0]), vec![], &ready, &failed);
+        assert_eq!(selected_explicit, vec![0]);
+    }
+
+    #[test]
+    fn visible_index_for_failed_init_does_not_alias_ready_gpu() {
+        // Paths 0 failed, 1 ok. Env asks for index 0 → warn/skip, never poll GPU 1 as "0".
+        let outcomes = [
+            (0_u32, "phantom".to_string(), false),
+            (1_u32, "real".to_string(), true),
+        ];
+        let (ready, failed) = partition_amd_init_outcomes(&outcomes);
+        assert_eq!(ready, vec![(1, "real".to_string())]);
+        let selected = select_amd_original_indices(None, vec![0], &ready, &failed);
+        assert!(selected.is_empty());
+        let selected_ok = select_amd_original_indices(None, vec![1], &ready, &failed);
+        assert_eq!(selected_ok, vec![1]);
+    }
+
+    #[test]
+    fn all_init_selects_every_original_index() {
+        let outcomes = [
+            (0_u32, "a".to_string(), true),
+            (1_u32, "b".to_string(), true),
+        ];
+        let (ready, failed) = partition_amd_init_outcomes(&outcomes);
+        assert!(failed.is_empty());
+        assert_eq!(
+            select_amd_original_indices(None, vec![], &ready, &failed),
+            vec![0, 1]
+        );
+        assert_eq!(ready.len() as u32, 2);
+    }
+
+    #[test]
+    fn zero_init_partition_is_empty() {
+        let outcomes: [(u32, String, bool); 0] = [];
+        let (ready, failed) = partition_amd_init_outcomes(&outcomes);
+        assert!(ready.is_empty());
+        assert!(failed.is_empty());
+        assert!(select_amd_original_indices(None, vec![], &ready, &failed).is_empty());
+    }
+
+    #[test]
+    fn failed_path_struct_carries_name_for_warnings() {
+        let failed = [AmdFailedPath {
+            original_index: 2,
+            name: "MI300X".into(),
+        }];
+        let ready = [(0_u32, "other".to_string())];
+        assert!(select_amd_original_indices(None, vec![2], &ready, &failed).is_empty());
     }
 }
