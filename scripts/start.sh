@@ -55,15 +55,30 @@ if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
     tmux kill-session -t "$TMUX_SESSION"
 fi
 
+# Baseline config: maximum defaults. Every flag below was forced by the server,
+# the model, or the workload; none is performance tuning. Validated on H100, Jul 16 2026.
+#   --max-model-len 32768        agent harness preamble is 8193+ tokens; 8192 rejects the
+#                                first request. 32K is the standard agent-serving rung.
+#   --max-num-seqs 345           vLLM default (1024) refuses to boot: hybrid mamba state
+#                                fits 345 seqs in the post-weights pool. 345 is vLLM's own number.
+#   --trust-remote-code          model ships custom architecture code; load fails without it.
+#   --enable-auto-tool-choice    lets the model emit tool calls on its own (agent workload).
+#   --tool-call-parser qwen3_coder  Qwen3.6 emits XML-style tool calls; hermes (JSON) mangles them.
+#                                   qwen3_xml is an alias of the same parser.
+#   --reasoning-parser qwen3     routes <think> text to the reasoning field; without it the
+#                                model's monologue floods content and breaks the client.
+# Everything else (dtype, gpu-memory-utilization, TP, scheduling, caching) stays default.
 tmux new-session -d -s "$TMUX_SESSION" \
 "bash -lc 'source \"$VENV_DIR/bin/activate\" && \
 export LD_LIBRARY_PATH=\"${CUDA13_LIB}:\${LD_LIBRARY_PATH:-}\" && \
 vllm serve \"$MODEL_PATH\" \
   --served-model-name Qwen3.6-27B \
-  --max-model-len 8192 \
+  --max-model-len 32768 \
+  --max-num-seqs 345 \
   --trust-remote-code \
   --enable-auto-tool-choice \
-  --tool-call-parser hermes \
+  --tool-call-parser qwen3_coder \
+  --reasoning-parser qwen3 \
   2>&1 | tee \"$LOG_FILE\"'"
 
 echo
