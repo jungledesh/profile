@@ -1,6 +1,10 @@
 use crate::context::StaticContext;
 
 /// Returns true if any config field that affects the physics baseline changed.
+///
+/// Note: `CacheConfigLabels::{kv_cache_size_tokens,kv_cache_max_concurrency,
+/// mamba_block_size,mamba_page_size_padded}` are allocator consequences of
+/// config, not config themselves. Do not add them here.
 pub fn config_changed(prev: &StaticContext, curr: &StaticContext) -> bool {
     prev.config.tensor_parallel_size != curr.config.tensor_parallel_size
         || prev.config.dtype != curr.config.dtype

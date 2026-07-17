@@ -45,17 +45,22 @@ pub enum WeightDtypeSource {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PhysicsBaseline {
     pub decode: CeilingEstimate,
+    /// Prefill ceiling in **prompts/s** (full forward passes at `seq_len`), not tok/s.
+    /// See [`math::prefill_ops_per_sec`].
     pub prefill: Option<CeilingEstimate>,
     pub efficiency_pct: Option<f64>,
     pub headroom_pct: Option<f64>,
     pub weight_dtype_source: WeightDtypeSource,
     /// Model weight memory footprint in GB. Derived from bits_per_param (quantization chain or dtype chain).
     pub weight_gb: f64,
+    /// Bytes per weight parameter (`bits_per_param / 8`). Used when KV dtype is `auto`/absent.
+    pub weight_bytes_per_param: u8,
     /// VRAM remaining after weights, if total VRAM is known. Negative means weights alone exceed VRAM.
     pub kv_headroom_gb: Option<f64>,
     /// Theoretical minimum time-per-output-token at decode ceiling (ms).
     pub tpot_floor_ms: f64,
-    /// Theoretical minimum prefill latency at prefill ceiling (ms). None when seq_len unknown.
+    /// Theoretical minimum prefill latency (ms per full prompt) at prefill ceiling.
+    /// None when seq_len unknown.
     pub prefill_latency_floor_ms: Option<f64>,
     /// Concurrent batch size at which decode crosses from BW-bound to compute-bound (roofline ridge).
     pub ridge_batch_size: f64,
@@ -152,6 +157,7 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
     let headroom_pct = efficiency_pct.map(|raw| 100.0 - raw.min(100.0));
 
     let weight_gb = math::weight_gb(weight_params, bits_per_param);
+    let weight_bytes_per_param = (bits_per_param / 8).max(1);
     let kv_headroom_gb = ctx.gpu.vram_gb.map(|vram| {
         let gpu_util = ctx
             .config
@@ -215,6 +221,7 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
         headroom_pct,
         weight_dtype_source,
         weight_gb,
+        weight_bytes_per_param,
         kv_headroom_gb,
         tpot_floor_ms,
         prefill_latency_floor_ms,
@@ -363,6 +370,13 @@ mod tests {
                 head_dim: None,
                 num_kv_layers: None,
                 attn_flops_coeff: None,
+                linear_num_layers: None,
+                linear_key_heads: None,
+                linear_value_heads: None,
+                linear_key_head_dim: None,
+                linear_value_head_dim: None,
+                linear_conv_kernel_dim: None,
+                state_dtype: None,
             },
             gpu: crate::context::GPUModel {
                 name: Some("gpu".to_string()),
@@ -1118,7 +1132,7 @@ mod tests {
         let cost = b.cost.expect("cost");
         assert_eq!(cost.cost_source, CostSource::Catalog);
         let cpm = cost.cost_per_million_tokens.expect("cpm");
-        let expected = 2.80 * 1_000_000.0 / (100.0 * 3600.0);
+        let expected = 2.99 * 1_000_000.0 / (100.0 * 3600.0);
         assert!((cpm - expected).abs() < 1e-6);
     }
 
@@ -1470,6 +1484,13 @@ mod tests {
                 head_dim: Some(128),
                 num_kv_layers: None,
                 attn_flops_coeff: None,
+                linear_num_layers: None,
+                linear_key_heads: None,
+                linear_value_heads: None,
+                linear_key_head_dim: None,
+                linear_value_head_dim: None,
+                linear_conv_kernel_dim: None,
+                state_dtype: None,
             },
             gpu: crate::context::GPUModel {
                 name: Some("NVIDIA H100 80GB HBM3".to_string()),

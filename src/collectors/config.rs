@@ -314,6 +314,7 @@ mod tests {
             cache_dtype: Some("fp8".to_string()),
             enable_prefix_caching: Some(true),
             enable_chunked_prefill: Some(false),
+            ..Default::default()
         };
         let cfg = config_from_snapshot(&s, None);
         assert_eq!(cfg.block_size, Some(32));

@@ -39,6 +39,13 @@ pub struct Report {
     /// Rules that fired but were removed by layer filtering or the suppression table.
     pub suppressed_rules: Vec<(&'static str, &'static str)>,
     pub kv_max_seqs: Option<u32>,
+    /// Capacity value R2 prescribed this iteration (`≤N`). Used for self-grade after restart.
+    pub prescribed_kv_capacity: Option<u32>,
+    /// When labels and catalog hybrid facts both exist and disagree on state
+    /// pages: `(catalog_pages, observed_pages)`. Verbose (-v) only. Default
+    /// output is unaffected. Label uncertainty tracks the printed number's
+    /// source, not the existence of disagreement between sources.
+    pub catalog_state_mismatch: Option<(u64, u64)>,
     /// Evaluable window count. `engine::build_report_for_diagnose` gates MU
     /// inject on `ENGINE_MIN_PERSISTENT_WINDOWS`; stdout gates only the journey
     /// footer on the same threshold. `--json` (when emitted) should keep raw

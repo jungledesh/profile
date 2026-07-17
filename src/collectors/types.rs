@@ -4,6 +4,14 @@ pub use prometheus_parse::HistogramCount;
 
 /// Config fields extracted from the `vllm:cache_config_info` labeled gauge.
 /// All `Option<T>` - absent when the metric isn't present in the scrape.
+///
+/// `kv_cache_size_tokens`, `kv_cache_max_concurrency`, `mamba_block_size`, and
+/// `mamba_page_size_padded` are allocator-computed in vLLM v0.25.1
+/// (`vllm/config/cache.py`). Their docstring notes that `num_gpu_blocks ×
+/// block_size` can be wrong for hybrid models. Never guess when absent.
+///
+/// These are consequences of config, not config themselves. Do not add them to
+/// `drift.rs::config_changed`.
 #[derive(Debug, Clone, Default)]
 pub struct CacheConfigLabels {
     pub block_size: Option<u32>,
@@ -12,6 +20,12 @@ pub struct CacheConfigLabels {
     pub cache_dtype: Option<String>,
     pub enable_prefix_caching: Option<bool>,
     pub enable_chunked_prefill: Option<bool>,
+    /// Total KV token capacity reported by the allocator.
+    pub kv_cache_size_tokens: Option<u64>,
+    /// Max concurrent full-context sequences at `max_model_len` (may be fractional).
+    pub kv_cache_max_concurrency: Option<f64>,
+    pub mamba_block_size: Option<u32>,
+    pub mamba_page_size_padded: Option<u64>,
 }
 
 /// One `/metrics` scrape: cumulative prefix cache counters (internal + external).

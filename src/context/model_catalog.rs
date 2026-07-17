@@ -36,6 +36,15 @@ pub struct CatalogEntry {
     /// None → standard MHA/GQA: use 2 × hidden_dim.
     /// Some(0) → architecture has no quadratic attention term (skip correction).
     pub attn_flops_coeff: Option<u64>,
+    /// Hybrid (linear-attention/mamba-class) state facts, from config.json verbatim.
+    /// Used to derive fixed per-sequence state bytes. None => pure-attention model.
+    pub linear_num_layers: Option<u32>,
+    pub linear_key_heads: Option<u32>,
+    pub linear_value_heads: Option<u32>,
+    pub linear_key_head_dim: Option<u32>,
+    pub linear_value_head_dim: Option<u32>,
+    pub linear_conv_kernel_dim: Option<u32>,
+    pub state_dtype: Option<&'static str>,
 }
 
 struct ModelEntry {
@@ -49,8 +58,9 @@ const B: u64 = 1_000_000_000;
 static CATALOG: &[ModelEntry] = &[
     // ── Llama 4 ──────────────────────────────────────────────────────────────
     // Interleaved attention architecture: standard KV formula doesn't apply.
-    // TODO: Interleaved attention: layer-level breakdown needed for accurate prefill ceiling.
-    // Maverick: 17B active / 400B total MoE
+    // Maverick: 17B active / 400B total MoE (model card; not confirmed from config.json here).
+    // Source: https://huggingface.co/meta-llama/Llama-4-Maverick-17B-128E-Instruct/raw/main/config.json (fetch timed out — gated; unverified)
+    // config.json gated from this environment; layer/hidden dims unverified — do not trust for physics.
     ModelEntry {
         tokens: &["llama", "4", "maverick"],
         entry: CatalogEntry {
@@ -64,9 +74,18 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: None,
             num_kv_layers: None,
             attn_flops_coeff: Some(0),
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
-    // Scout: 17B active / 109B total MoE
+    // Scout: 17B active / 109B total MoE (model card; not confirmed from config.json here).
+    // Source: https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct/raw/main/config.json (fetch timed out — gated; unverified)
+    // config.json gated from this environment; layer/hidden dims unverified — do not trust for physics.
     ModelEntry {
         tokens: &["llama", "4", "scout"],
         entry: CatalogEntry {
@@ -80,9 +99,17 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: None,
             num_kv_layers: None,
             attn_flops_coeff: Some(0),
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
     // ── Nemotron (before generic llama entries, names contain "llama" + size) ─
+    // Source: https://huggingface.co/nvidia/Llama-3.1-Nemotron-70B-Instruct/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["nemotron", "70b"],
         entry: CatalogEntry {
@@ -96,8 +123,16 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
+    // Source: https://huggingface.co/nvidia/Llama-3.1-Nemotron-8B-Instruct/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["nemotron", "8b"],
         entry: CatalogEntry {
@@ -111,11 +146,19 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
     // ── Llama 3.x ────────────────────────────────────────────────────────────
     // "3" token required: "3.1" contains "3"; guards against a hypothetical
     // "Llama-4-70B" (no version tag) matching as llama3.
+    // Source: https://huggingface.co/meta-llama/Meta-Llama-3.1-405B-Instruct/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["llama", "3", "405b"],
         entry: CatalogEntry {
@@ -129,8 +172,16 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
+    // Source: https://huggingface.co/meta-llama/Meta-Llama-3.1-70B-Instruct/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["llama", "3", "70b"],
         entry: CatalogEntry {
@@ -144,8 +195,16 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
+    // Source: https://huggingface.co/meta-llama/Meta-Llama-3.1-8B-Instruct/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["llama", "3", "8b"],
         entry: CatalogEntry {
@@ -159,9 +218,17 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
     // ── Qwen 3 MoE ───────────────────────────────────────────────────────────
+    // Source: https://huggingface.co/Qwen/Qwen3-235B-A22B/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["qwen3", "235b"],
         entry: CatalogEntry {
@@ -175,11 +242,18 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
     // Qwen3-30B-A3B MoE.
-    // Source: https://huggingface.co/Qwen/Qwen3-30B-A3B/raw/main/config.json
     // num_key_value_heads=4, head_dim=128, hidden_size=2048, num_hidden_layers=48.
+    // Source: https://huggingface.co/Qwen/Qwen3-30B-A3B/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["qwen3", "30b"],
         entry: CatalogEntry {
@@ -193,6 +267,13 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
     // ── Qwen 3.6 dense / hybrid ──────────────────────────────────────────────
@@ -200,6 +281,7 @@ static CATALOG: &[ModelEntry] = &[
     // Before generic qwen3 size entries, "7b" is a substring of "27b".
     // Released April 2026. Dense 27B; hybrid gated-DeltaNet + attention blocks.
     // Only attention layers use KV cache. Standard num_layers formula overstates.
+    // Source: https://huggingface.co/Qwen/Qwen3.6-27B/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["qwen3.6", "27b"],
         entry: CatalogEntry {
@@ -209,16 +291,24 @@ static CATALOG: &[ModelEntry] = &[
             num_layers: 64,
             hidden_dim: 5120,
             default_weight_dtype: "bf16",
-            num_kv_heads: Some(8),
-            head_dim: Some(128),
-            num_kv_layers: Some(32), // 64 total layers, 50/50 DeltaNet/attention split
+            num_kv_heads: Some(4),
+            head_dim: Some(256),
+            // 64 total layers, 3:1 DeltaNet/attention interleave (full_attention_interval: 4)
+            num_kv_layers: Some(16),
             attn_flops_coeff: None,
+            linear_num_layers: Some(48),
+            linear_key_heads: Some(16),
+            linear_value_heads: Some(48),
+            linear_key_head_dim: Some(128),
+            linear_value_head_dim: Some(128),
+            linear_conv_kernel_dim: Some(4),
+            state_dtype: Some("fp32"),
         },
     },
     // ── Qwen 3 dense ─────────────────────────────────────────────────────────
     // Official dense SKUs: 0.6B, 1.7B, 4B, 8B, 14B, 32B (no dense 7B/72B).
-    // Sources: https://huggingface.co/Qwen/Qwen3-{size}/raw/main/config.json
     // Larger sizes first; first-match wins.
+    // Source: https://huggingface.co/Qwen/Qwen3-32B/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["qwen3", "32b"],
         entry: CatalogEntry {
@@ -232,8 +322,16 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
+    // Source: https://huggingface.co/Qwen/Qwen3-14B/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["qwen3", "14b"],
         entry: CatalogEntry {
@@ -247,8 +345,16 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
+    // Source: https://huggingface.co/Qwen/Qwen3-8B/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         // https://huggingface.co/Qwen/Qwen3-8B/raw/main/config.json
         tokens: &["qwen3", "8b"],
@@ -263,8 +369,16 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
+    // Source: https://huggingface.co/Qwen/Qwen3-4B/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         // https://huggingface.co/Qwen/Qwen3-4B/raw/main/config.json
         tokens: &["qwen3", "4b"],
@@ -279,8 +393,16 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
+    // Source: https://huggingface.co/Qwen/Qwen3-1.7B/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         // https://huggingface.co/Qwen/Qwen3-1.7B/raw/main/config.json
         tokens: &["qwen3", "1.7b"],
@@ -295,8 +417,16 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
+    // Source: https://huggingface.co/Qwen/Qwen3-0.6B/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         // https://huggingface.co/Qwen/Qwen3-0.6B/raw/main/config.json
         tokens: &["qwen3", "0.6b"],
@@ -311,9 +441,17 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
     // ── Qwen 2.5 dense ───────────────────────────────────────────────────────
+    // Source: https://huggingface.co/Qwen/Qwen2.5-72B-Instruct/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["qwen2.5", "72b"],
         entry: CatalogEntry {
@@ -327,8 +465,16 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
+    // Source: https://huggingface.co/Qwen/Qwen2.5-32B-Instruct/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["qwen2.5", "32b"],
         entry: CatalogEntry {
@@ -342,8 +488,16 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
+    // Source: https://huggingface.co/Qwen/Qwen2.5-14B-Instruct/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["qwen2.5", "14b"],
         entry: CatalogEntry {
@@ -357,8 +511,16 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
+    // Source: https://huggingface.co/Qwen/Qwen2.5-7B-Instruct/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["qwen2.5", "7b"],
         entry: CatalogEntry {
@@ -372,12 +534,20 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
     // ── DeepSeek V3 / R1 ─────────────────────────────────────────────────────
     // Uses MLA (Multi-head Latent Attention): KV cache is a compressed latent,
     // not num_kv_heads × head_dim. Standard formula doesn't apply.
     // 671B MoE (37B active)
+    // Source: https://huggingface.co/deepseek-ai/DeepSeek-V3/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["deepseek", "671b"],
         entry: CatalogEntry {
@@ -391,11 +561,18 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: None,
             num_kv_layers: None,
             attn_flops_coeff: Some(139_264),
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
     // R1 distills are Llama/Qwen dense arches (NOT MLA). Place before generic
     // ["deepseek","r1"] so "DeepSeek-R1-Distill-*" never inherits 671B MLA params.
-    // Sources: https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-*/raw/main/config.json
+    // Source: https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Llama-70B/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         // https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Llama-70B/raw/main/config.json
         tokens: &["deepseek", "r1", "distill", "70b"],
@@ -410,8 +587,16 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
+    // Source: https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-32B/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         // https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-32B/raw/main/config.json
         tokens: &["deepseek", "r1", "distill", "32b"],
@@ -426,8 +611,16 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
+    // Source: https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-14B/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         // https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-14B/raw/main/config.json
         tokens: &["deepseek", "r1", "distill", "14b"],
@@ -442,8 +635,16 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
+    // Source: https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         // https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B/raw/main/config.json
         tokens: &["deepseek", "r1", "distill", "7b"],
@@ -458,8 +659,16 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
+    // Source: https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Llama-8B/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         // https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Llama-8B/raw/main/config.json
         tokens: &["deepseek", "r1", "distill", "8b"],
@@ -474,8 +683,16 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
+    // Source: https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         // https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B/raw/main/config.json
         tokens: &["deepseek", "r1", "distill", "1.5b"],
@@ -490,9 +707,17 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
     // R1 without size token defaults to 671B MLA
+    // Source: https://huggingface.co/deepseek-ai/DeepSeek-R1/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["deepseek", "r1"],
         entry: CatalogEntry {
@@ -506,9 +731,17 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: None,
             num_kv_layers: None,
             attn_flops_coeff: Some(139_264),
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
     // V3 without size token defaults to 671B
+    // Source: https://huggingface.co/deepseek-ai/DeepSeek-V3/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["deepseek", "v3"],
         entry: CatalogEntry {
@@ -522,8 +755,16 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: None,
             num_kv_layers: None,
             attn_flops_coeff: Some(139_264),
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
+    // Source: https://huggingface.co/deepseek-ai/deepseek-llm-70b-chat/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["deepseek", "70b"],
         entry: CatalogEntry {
@@ -537,8 +778,16 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: None,
             num_kv_layers: None,
             attn_flops_coeff: Some(69_632),
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
+    // Source: https://huggingface.co/deepseek-ai/deepseek-llm-7b-chat/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["deepseek", "7b"],
         entry: CatalogEntry {
@@ -552,26 +801,43 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: None,
             num_kv_layers: None,
             attn_flops_coeff: Some(34_816),
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
     // ── Mistral Large 3 ──────────────────────────────────────────────────────
-    // 675B MoE (41B active est.)
+    // MLA (kv_lora_rank in params.json): standard KV formula doesn't apply.
+    // 675B total / 41B active from model card. dim=7168, n_layers=61 from params.json.
+    // Source: https://huggingface.co/mistralai/Mistral-Large-3-675B-Instruct-2512/raw/main/params.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["mistral", "large", "675b"],
         entry: CatalogEntry {
             family: "mistral",
             param_count: 675 * B,
             active_param_count: Some(41 * B),
-            num_layers: 88,
-            hidden_dim: 8192,
+            num_layers: 61,
+            hidden_dim: 7168,
             default_weight_dtype: "bf16",
-            num_kv_heads: Some(8),
-            head_dim: Some(128),
+            num_kv_heads: None,
+            head_dim: None,
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
     // 123B dense
+    // Source: https://huggingface.co/mistralai/Mistral-Large-Instruct-2407/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["mistral", "large", "123b"],
         entry: CatalogEntry {
@@ -585,9 +851,17 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
     // Mistral Large without explicit size, 123B default
+    // Source: https://huggingface.co/mistralai/Mistral-Large-Instruct-2407/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["mistral", "large"],
         entry: CatalogEntry {
@@ -601,10 +875,18 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
     // ── Mixtral MoE ──────────────────────────────────────────────────────────
     // 8x22B: 141B total, ~39B active
+    // Source: https://huggingface.co/mistralai/Mixtral-8x22B-Instruct-v0.1/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["mixtral", "8x22b"],
         entry: CatalogEntry {
@@ -618,9 +900,17 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
     // 8x7B: 47B total, ~13B active
+    // Source: https://huggingface.co/mistralai/Mixtral-8x7B-Instruct-v0.1/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["mixtral", "8x7b"],
         entry: CatalogEntry {
@@ -634,9 +924,17 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
     // ── Mistral 7B dense ─────────────────────────────────────────────────────
+    // Source: https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.3/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["mistral", "7b"],
         entry: CatalogEntry {
@@ -650,6 +948,13 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
     // ── Gemma 2 / 3 / 4 ──────────────────────────────────────────────────────
@@ -659,6 +964,7 @@ static CATALOG: &[ModelEntry] = &[
     // the Gemma 2 27B entry, otherwise "gemma-4-27b-it" falls through and
     // matches Gemma 2 27B (wrong arch params).
     // KV architecture non-standard (per-token head quantization): num_kv_heads = None.
+    // Source: https://huggingface.co/google/gemma-4-27b-it/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["gemma", "4", "27b"],
         entry: CatalogEntry {
@@ -672,8 +978,16 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: None,
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
+    // Source: https://huggingface.co/google/gemma-4-27b-it/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["gemma", "4", "31b"],
         entry: CatalogEntry {
@@ -687,9 +1001,17 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: None,
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
     // Gemma 4 26B-A4B MoE
+    // Source: https://huggingface.co/google/gemma-4-26b-it/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["gemma", "4", "26b"],
         entry: CatalogEntry {
@@ -703,12 +1025,20 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: None,
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
     // ── Gemma 3 ──────────────────────────────────────────────────────────────
     // After Gemma 4, before Gemma 2. Hyphenated names normalize to "gemma 3 …"
     // (token "gemma 3", not bare "3") so "gemma-2-27b-3bit" cannot false-match.
     // Fused "gemma3-27b" covered by parallel entries. Sources: HF text_config.
+    // Source: https://huggingface.co/google/gemma-3-27b-it/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         // https://huggingface.co/google/gemma-3-27b-it (text_config)
         tokens: &["gemma 3", "27b"],
@@ -723,8 +1053,16 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
+    // Source: https://huggingface.co/google/gemma-3-27b-it/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["gemma3", "27b"],
         entry: CatalogEntry {
@@ -738,8 +1076,16 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
+    // Source: https://huggingface.co/google/gemma-3-12b-it/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         // https://huggingface.co/google/gemma-3-12b-it (text_config); head_dim=256
         // from Gemma 3 reference config (gm.nn.Gemma3_12B).
@@ -755,8 +1101,16 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(256),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
+    // Source: https://huggingface.co/google/gemma-3-12b-it/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["gemma3", "12b"],
         entry: CatalogEntry {
@@ -770,8 +1124,16 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(256),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
+    // Source: https://huggingface.co/google/gemma-3-4b-it/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         // https://huggingface.co/google/gemma-3-4b-it text_config (+ head/kv from
         // published Gemma 3 configs: num_attention_heads=8, num_key_value_heads=4,
@@ -788,8 +1150,16 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(256),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
+    // Source: https://huggingface.co/google/gemma-3-4b-it/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["gemma3", "4b"],
         entry: CatalogEntry {
@@ -803,8 +1173,16 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(256),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
+    // Source: https://huggingface.co/google/gemma-3-1b-it/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         // https://huggingface.co/google/gemma-3-1b-it/raw/main/config.json
         tokens: &["gemma 3", "1b"],
@@ -819,8 +1197,16 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(256),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
+    // Source: https://huggingface.co/google/gemma-3-1b-it/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["gemma3", "1b"],
         entry: CatalogEntry {
@@ -834,9 +1220,17 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(256),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
     // Gemma 2 27B: head_dim=128, 32 attn heads, 16 KV heads.
+    // Source: https://huggingface.co/google/gemma-2-27b-it/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["gemma", "27b"],
         entry: CatalogEntry {
@@ -850,9 +1244,17 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
     // Gemma 2 9B: head_dim=256 (larger than typical), 16 attn heads, 8 KV heads.
+    // Source: https://huggingface.co/google/gemma-2-9b-it/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["gemma", "9b"],
         entry: CatalogEntry {
@@ -866,10 +1268,18 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(256),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
-    // ── Kimi K2.5 ────────────────────────────────────────────────────────────
-    // 1T total MoE, ~32B active; KV architecture unconfirmed.
+    // ── Kimi K2 ──────────────────────────────────────────────────────────────
+    // MLA (kv_lora_rank in config): standard KV formula doesn't apply.
+    // Source: https://huggingface.co/moonshotai/Kimi-K2-Instruct/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["kimi", "k2"],
         entry: CatalogEntry {
@@ -883,44 +1293,117 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: None,
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
-    // ── GLM-5 / 5.1 MoE ──────────────────────────────────────────────────────
-    // 744B total MoE, ~56B active (est.); KV architecture unconfirmed.
+    // ── GLM-5.2 MoE ───────────────────────────────────────────────────────────
+    // glm_moe_dsa + sparse/index attention (kv_lora_rank in config): standard KV formula doesn't apply.
+    // Total/active params from https://huggingface.co/zai-org/GLM-5.2 model card (753B / 40B).
+    // Source: https://huggingface.co/zai-org/GLM-5.2/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
-        tokens: &["glm", "744b"],
+        tokens: &["glm", "5.2"],
         entry: CatalogEntry {
             family: "glm",
-            param_count: 744 * B,
-            active_param_count: Some(56 * B),
-            num_layers: 80,
-            hidden_dim: 8192,
+            param_count: 753 * B,
+            active_param_count: Some(40 * B),
+            num_layers: 78,
+            hidden_dim: 6144,
             default_weight_dtype: "bf16",
             num_kv_heads: None,
             head_dim: None,
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
-    // 32B dense variant; KV architecture unconfirmed.
+    // Source: https://huggingface.co/zai-org/GLM-5.2/raw/main/config.json (accessed 2026-07-16)
+    ModelEntry {
+        tokens: &["glm", "744b"],
+        entry: CatalogEntry {
+            family: "glm",
+            param_count: 753 * B,
+            active_param_count: Some(40 * B),
+            num_layers: 78,
+            hidden_dim: 6144,
+            default_weight_dtype: "bf16",
+            num_kv_heads: None,
+            head_dim: None,
+            num_kv_layers: None,
+            attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
+        },
+    },
+    // Source: https://huggingface.co/zai-org/GLM-4-32B-0414/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["glm", "32b"],
         entry: CatalogEntry {
             family: "glm",
             param_count: 32 * B,
             active_param_count: None,
-            num_layers: 64,
-            hidden_dim: 5120,
+            num_layers: 61,
+            hidden_dim: 6144,
+            default_weight_dtype: "bf16",
+            num_kv_heads: Some(2),
+            head_dim: Some(128),
+            num_kv_layers: None,
+            attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
+        },
+    },
+    // ── Inkling (Thinking Machines) ───────────────────────────────────────────
+    // Hybrid sliding-window + global attention; separate SWA/GQA KV fields in text_config.
+    // Total/active params from https://huggingface.co/thinkingmachines/Inkling model card (975B / 41B).
+    // Source: https://huggingface.co/thinkingmachines/Inkling/raw/main/config.json (accessed 2026-07-16)
+    ModelEntry {
+        tokens: &["inkling"],
+        entry: CatalogEntry {
+            family: "inkling",
+            param_count: 975 * B,
+            active_param_count: Some(41 * B),
+            num_layers: 66,
+            hidden_dim: 6144,
             default_weight_dtype: "bf16",
             num_kv_heads: None,
             head_dim: None,
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
     // ── Phi-4 ────────────────────────────────────────────────────────────────
     // (Phi-4 32B phantom entry removed, no official release at this size)
     // Phi-4 14B: 40 attn heads, 10 KV heads (GQA 4:1), head_dim=128.
+    // Source: https://huggingface.co/microsoft/phi-4/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["phi", "4", "14b"],
         entry: CatalogEntry {
@@ -934,9 +1417,17 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
     // Phi-4 without explicit size, 14B default
+    // Source: https://huggingface.co/microsoft/phi-4/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["phi", "4"],
         entry: CatalogEntry {
@@ -950,6 +1441,13 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            linear_num_layers: None,
+            linear_key_heads: None,
+            linear_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            linear_conv_kernel_dim: None,
+            state_dtype: None,
         },
     },
 ];
@@ -1039,7 +1537,9 @@ mod tests {
         let e = lookup_model("deepseek-ai/DeepSeek-R1").expect("no match");
         assert_eq!(e.family, "deepseek");
         assert_eq!(e.param_count, 671 * B);
-        assert!(e.active_param_count.is_some());
+        assert_eq!(e.active_param_count, Some(37 * B));
+        assert!(e.num_kv_heads.is_none());
+        assert!(e.head_dim.is_none());
     }
 
     #[test]
@@ -1047,7 +1547,9 @@ mod tests {
         let e = lookup_model("deepseek-ai/DeepSeek-V3").expect("no match");
         assert_eq!(e.family, "deepseek");
         assert_eq!(e.param_count, 671 * B);
-        assert!(e.active_param_count.is_some());
+        assert_eq!(e.active_param_count, Some(37 * B));
+        assert!(e.num_kv_heads.is_none());
+        assert!(e.head_dim.is_none());
     }
 
     #[test]
@@ -1064,6 +1566,18 @@ mod tests {
         assert_eq!(e.family, "mistral");
         assert_eq!(e.param_count, 141 * B);
         assert!(e.active_param_count.is_some());
+    }
+
+    #[test]
+    fn mistral_large_675b() {
+        let e = lookup_model("mistralai/Mistral-Large-3-675B-Instruct-2512").expect("no match");
+        assert_eq!(e.family, "mistral");
+        assert_eq!(e.param_count, 675 * B);
+        assert_eq!(e.active_param_count, Some(41 * B));
+        assert_eq!(e.num_layers, 61);
+        assert_eq!(e.hidden_dim, 7168);
+        assert!(e.num_kv_heads.is_none());
+        assert!(e.head_dim.is_none());
     }
 
     #[test]
@@ -1086,7 +1600,11 @@ mod tests {
         let e = lookup_model("moonshotai/Kimi-K2-Instruct").expect("no match");
         assert_eq!(e.family, "kimi");
         assert_eq!(e.param_count, 1_000 * B);
-        assert!(e.active_param_count.is_some());
+        assert_eq!(e.active_param_count, Some(32 * B));
+        assert_eq!(e.num_layers, 61);
+        assert_eq!(e.hidden_dim, 7168);
+        assert!(e.num_kv_heads.is_none());
+        assert!(e.head_dim.is_none());
     }
 
     #[test]
@@ -1097,6 +1615,57 @@ mod tests {
     }
 
     #[test]
+    fn glm_52_token_matches() {
+        let e = lookup_model("zai-org/GLM-5.2").expect("no match");
+        assert_eq!(e.family, "glm");
+        assert_eq!(e.param_count, 753 * B);
+        assert_eq!(e.active_param_count, Some(40 * B));
+        assert_eq!(e.num_layers, 78);
+        assert_eq!(e.hidden_dim, 6144);
+        assert!(e.num_kv_heads.is_none());
+    }
+
+    #[test]
+    fn glm_32b() {
+        let e = lookup_model("zai-org/GLM-4-32B-0414").expect("no match");
+        assert_eq!(e.family, "glm");
+        assert_eq!(e.param_count, 32 * B);
+        assert_eq!(e.num_layers, 61);
+        assert_eq!(e.hidden_dim, 6144);
+        assert_eq!(e.num_kv_heads, Some(2));
+        assert_eq!(e.head_dim, Some(128));
+    }
+
+    #[test]
+    fn inkling_hf_name() {
+        let e = lookup_model("thinkingmachines/Inkling").expect("no match");
+        assert_eq!(e.family, "inkling");
+        assert_eq!(e.param_count, 975 * B);
+        assert_eq!(e.active_param_count, Some(41 * B));
+        assert_eq!(e.num_layers, 66);
+        assert_eq!(e.hidden_dim, 6144);
+        assert!(e.num_kv_heads.is_none());
+    }
+
+    /// Ground truth from vllm.log (H100 80GB, gpu-mem-util 0.9, max-model-len 32768, 2026-07-16):
+    /// KV pool 201,874 tokens; mamba block cap 345; concurrency 24.64x at 8,192.
+    /// Catalog-only assertions here; derivation math is a follow-up work package.
+    #[test]
+    fn qwen36_27b_h100_boot_log_catalog_facts() {
+        let e = lookup_model("Qwen/Qwen3.6-27B").expect("no match");
+        assert_eq!(e.num_kv_layers, Some(16));
+        assert_eq!(e.num_kv_heads, Some(4));
+        assert_eq!(e.head_dim, Some(256));
+        assert_eq!(e.linear_num_layers, Some(48));
+        assert_eq!(e.linear_key_heads, Some(16));
+        assert_eq!(e.linear_value_heads, Some(48));
+        assert_eq!(e.linear_key_head_dim, Some(128));
+        assert_eq!(e.linear_value_head_dim, Some(128));
+        assert_eq!(e.linear_conv_kernel_dim, Some(4));
+        assert_eq!(e.state_dtype, Some("fp32"));
+    }
+
+    #[test]
     fn qwen36_27b() {
         let e = lookup_model("Qwen/Qwen3.6-27B").expect("no match");
         assert_eq!(e.family, "qwen3.6");
@@ -1104,9 +1673,16 @@ mod tests {
         assert!(e.active_param_count.is_none());
         assert_eq!(e.num_layers, 64);
         assert_eq!(e.hidden_dim, 5120);
-        assert_eq!(e.num_kv_heads, Some(8));
-        assert_eq!(e.head_dim, Some(128));
-        assert_eq!(e.num_kv_layers, Some(32));
+        assert_eq!(e.num_kv_heads, Some(4));
+        assert_eq!(e.head_dim, Some(256));
+        assert_eq!(e.num_kv_layers, Some(16));
+        assert_eq!(e.linear_num_layers, Some(48));
+        assert_eq!(e.linear_key_heads, Some(16));
+        assert_eq!(e.linear_value_heads, Some(48));
+        assert_eq!(e.linear_key_head_dim, Some(128));
+        assert_eq!(e.linear_value_head_dim, Some(128));
+        assert_eq!(e.linear_conv_kernel_dim, Some(4));
+        assert_eq!(e.state_dtype, Some("fp32"));
     }
 
     #[test]

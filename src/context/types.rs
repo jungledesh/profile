@@ -18,12 +18,21 @@ pub struct ModelArch {
     /// (e.g. Gemma 2 9B uses head_dim=256). None when architecture is non-standard.
     pub head_dim: Option<u32>,
     /// KV-relevant layer count for hybrid architectures where only a subset of layers
-    /// use standard KV cache (e.g. Qwen3.6: 32 attention layers out of 64 total).
+    /// use standard KV cache (e.g. Qwen3.6: 16 attention layers out of 64 total).
     /// None → fall back to num_layers in KV math (correct for pure-attention models).
     pub num_kv_layers: Option<u32>,
     /// Per-layer attention FLOPs coefficient for prefill ceiling (seq_len² term).
     /// None → standard MHA/GQA uses 2 × hidden_dim.
     pub attn_flops_coeff: Option<u64>,
+    /// Hybrid (linear-attention/mamba-class) state facts, from config.json verbatim.
+    /// Used to derive fixed per-sequence state bytes. None => pure-attention model.
+    pub linear_num_layers: Option<u32>,
+    pub linear_key_heads: Option<u32>,
+    pub linear_value_heads: Option<u32>,
+    pub linear_key_head_dim: Option<u32>,
+    pub linear_value_head_dim: Option<u32>,
+    pub linear_conv_kernel_dim: Option<u32>,
+    pub state_dtype: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -92,6 +101,13 @@ impl StaticContext {
                 head_dim: e.head_dim,
                 num_kv_layers: e.num_kv_layers,
                 attn_flops_coeff: e.attn_flops_coeff,
+                linear_num_layers: e.linear_num_layers,
+                linear_key_heads: e.linear_key_heads,
+                linear_value_heads: e.linear_value_heads,
+                linear_key_head_dim: e.linear_key_head_dim,
+                linear_value_head_dim: e.linear_value_head_dim,
+                linear_conv_kernel_dim: e.linear_conv_kernel_dim,
+                state_dtype: e.state_dtype.map(str::to_string),
             },
             None => ModelArch::default(),
         };

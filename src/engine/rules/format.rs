@@ -184,6 +184,22 @@ fn kv_ceiling_unknown_verbose_line(
     }
 }
 
+/// Verbose (-v) only. Label uncertainty tracks the printed number's source, not
+/// the existence of disagreement between sources; this note does not change
+/// `(est)` labeling on observed-derived capacity.
+fn catalog_state_mismatch_verbose_line(
+    mismatch: Option<(u64, u64)>,
+    verbose_rules: bool,
+) -> Option<String> {
+    if !verbose_rules {
+        return None;
+    }
+    let (catalog_pages, observed_pages) = mismatch?;
+    Some(format!(
+        "Note: Catalog state {catalog_pages} pages, observed {observed_pages}; entry may be stale."
+    ))
+}
+
 // COUPLING: keys must match `rule_names` constants.
 pub(super) fn waste_label_suffix(rule_names_list: &[&str]) -> Option<&'static str> {
     match rule_names_list.len() {
@@ -658,6 +674,11 @@ pub fn format_diagnose_rules_for_windows(
     if let Some(line) = kv_ceiling_unknown_verbose_line(report.kv_max_seqs, verbose_rules) {
         append_display_block(&mut out, vec![line]);
     }
+    if let Some(line) =
+        catalog_state_mismatch_verbose_line(report.catalog_state_mismatch, verbose_rules)
+    {
+        append_display_block(&mut out, vec![line]);
+    }
 
     let not_fired = not_triggered_from_fired_names(
         &fired_names,
@@ -1035,5 +1056,21 @@ mod load_hint_tests {
         w.snapshot.vllm.generation_tokens_per_sec = Some(100.0);
         assert!(window_is_evaluable(&w.snapshot));
         assert!(!window_is_idle(&w.snapshot));
+    }
+}
+
+#[cfg(test)]
+mod catalog_mismatch_note_tests {
+    use super::catalog_state_mismatch_verbose_line;
+
+    #[test]
+    fn verbose_only_on_mismatch() {
+        assert!(catalog_state_mismatch_verbose_line(Some((7, 3)), false).is_none());
+        assert!(catalog_state_mismatch_verbose_line(None, true).is_none());
+        let line = catalog_state_mismatch_verbose_line(Some((7, 3)), true).unwrap();
+        assert_eq!(
+            line,
+            "Note: Catalog state 7 pages, observed 3; entry may be stale."
+        );
     }
 }

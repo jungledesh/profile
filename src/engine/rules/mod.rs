@@ -22,8 +22,6 @@ pub(crate) use format::{MuVariant, mu_diagnose_lines};
 pub(crate) use r1_under_batching::{R1EvalInput, Rule1Outcome};
 pub(crate) use r2_kv_cache_pressure::KV_CACHE_PRESSURE_MIN_PERC;
 #[cfg(test)]
-pub(crate) use r2_kv_cache_pressure::r2_recommendation;
-#[cfg(test)]
 pub(crate) use r3_low_prefix_reuse::{LowPrefixReuseDetail, Rule3Outcome, r3_recommendation};
 pub use r4_oom_risk::{r4_advisory, r4_recommendation};
 
@@ -34,40 +32,128 @@ pub const ENGINE_MIN_PERSISTENT_WINDOWS: usize = 3;
 /// Enforces >= 25% density floor across evaluable windows.
 pub(super) const ENGINE_MIN_WINDOW_PCT: f64 = 0.25;
 
-/// Push a max_model_len shrink suggestion into `lines`.
+/// Inputs for projecting capacity at a hypothetical `max_model_len`.
+///
+/// Preference order (see [`capacity_at_hypothetical_max_len`]):
+/// 1. observed-geometry page model when labels present
+/// 2. attention-only catalog math when labels absent
+/// 3. no number (caller stays directional)
+///
+/// Assumptions: block geometry constant across `max_model_len` (ladder-proven);
+/// NOT proven constant across `gpu-memory-utilization` or vLLM versions.
+/// `mamba_cache_mode` changes shift `state_pages` (measured 3→6 none→align) —
+/// counterfactuals that change caching mode stay directional, no number.
+pub(super) struct HypCapacityCtx<'a> {
+    pub cache: &'a crate::collectors::CacheConfigLabels,
+    pub kv_headroom_gb: Option<f64>,
+    pub model: Option<&'a crate::context::ModelArch>,
+    pub kv_cache_dtype: Option<&'a str>,
+    pub tp: Option<u32>,
+    pub weight_bytes: u8,
+}
+
+/// Capacity at a hypothetical `max_model_len`. Both derived tiers are `(est)`.
+///
+/// Formatter vocabulary: counts of simultaneous work are always
+/// "N concurrent requests"; never bare "capacity". Bounds name their source
+/// and condition.
+pub(super) fn capacity_at_hypothetical_max_len(
+    target_max_len: u32,
+    current_max_len: Option<u32>,
+    ctx: &HypCapacityCtx<'_>,
+) -> Option<u32> {
+    use crate::engine::baseline::counterfactual_concurrency;
+
+    // Hybrid ladder geometry uses mamba_block_size when present; dense uses block_size.
+    let block_size = ctx.cache.mamba_block_size.or(ctx.cache.block_size);
+    if let (Some(bs), Some(blocks), Some(obs), Some(cur)) = (
+        block_size,
+        ctx.cache.num_gpu_blocks,
+        ctx.cache.kv_cache_max_concurrency,
+        current_max_len,
+    ) && let Some(c) = counterfactual_concurrency(target_max_len, bs, blocks, obs, cur)
+    {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let n = c.floor() as u32;
+        if n > 0 {
+            return Some(n);
+        }
+    }
+    let model = ctx.model?;
+    compute_kv_max_seqs(
+        ctx.kv_headroom_gb,
+        Some(target_max_len),
+        model,
+        ctx.kv_cache_dtype,
+        ctx.tp,
+        ctx.weight_bytes,
+    )
+}
+
+/// True when observed p99 prompt+output is below half of `max_model_len`.
+/// Used to lead with model-len shrink: worst-case full-context concurrency is a
+/// floor, not a target; leading with it on short-prompt workloads prescribes a
+/// large throughput cut the traffic does not require. Fix order follows fit to
+/// observed traffic.
+pub(super) fn p99_sum_below_half_max_model_len(
+    max_model_len: u32,
+    prompt_p99: Option<f64>,
+    generation_p99: Option<f64>,
+) -> bool {
+    match (prompt_p99, generation_p99) {
+        (Some(pp), Some(gp)) if pp.is_finite() && gp.is_finite() => {
+            pp + gp < f64::from(max_model_len) / 2.0
+        }
+        _ => false,
+    }
+}
+
+/// Build max_model_len shrink suggestion lines (may be empty).
 /// Hard number only when `total_count >= 100` and both p99s are present.
-/// No-op when `max_model_len` is None.
-pub(super) fn push_model_len_shrink_suggestion(
-    lines: &mut Vec<String>,
+/// Empty when `max_model_len` is None or the shrink is < 5%.
+///
+/// Projected concurrency at `{suggested}` comes only from
+/// [`capacity_at_hypothetical_max_len`](suggested) — never from the current-config
+/// R2 ceiling (`r2_kv_max_seqs` / observed concurrency at full `max_model_len`).
+pub(super) fn model_len_shrink_suggestion_lines(
     max_model_len: Option<u32>,
     prompt_p99: Option<f64>,
     generation_p99: Option<f64>,
     total_count: f64,
     indent: &str,
-) {
-    let Some(m) = max_model_len else { return };
+    hyp: Option<&HypCapacityCtx<'_>>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    let Some(m) = max_model_len else {
+        return lines;
+    };
 
     if total_count >= 100.0 {
         let Some(pp) = prompt_p99 else {
             lines.push(format!(
                 "{indent}• Lower --max-model-len (current: {m}) to safely raise concurrency."
             ));
-            return;
+            return lines;
         };
         let Some(gp) = generation_p99 else {
             lines.push(format!(
                 "{indent}• Lower --max-model-len (current: {m}) to safely raise concurrency."
             ));
-            return;
+            return lines;
         };
         let suggested = (pp as u32).saturating_add(gp as u32);
         // Suppress if reduction is < 5% - not a meaningful change (avoids "5464 → 5465" no-ops)
         if suggested >= m.saturating_sub(m / 20) {
-            return;
+            return lines;
         }
+        // Projection at the *suggested* length only — not current observed concurrency.
+        let fits = hyp
+            .and_then(|h| capacity_at_hypothetical_max_len(suggested, Some(m), h))
+            .map(|n| format!("; fits {n} concurrent requests (est)"))
+            .unwrap_or_default();
         lines.push(format!(
-            "{indent}• Lower --max-model-len (current: {m}) to ~{suggested} \
-             (prompt p99 {pp:.0} tok + output p99 {gp:.0} tok), to shrink KV footprint."
+            "{indent}• Lower --max-model-len {m} → {suggested} \
+             (fits p99 of observed requests){fits}"
         ));
         lines.push(format!(
             "{indent}  Warning: max_model_len is total context (prompt + completion). Truncation risk!"
@@ -77,6 +163,72 @@ pub(super) fn push_model_len_shrink_suggestion(
             "{indent}• Lower --max-model-len (current: {m}) to safely raise concurrency."
         ));
     }
+    lines
+}
+
+/// Push a max_model_len shrink suggestion into `lines`.
+pub(super) fn push_model_len_shrink_suggestion(
+    lines: &mut Vec<String>,
+    max_model_len: Option<u32>,
+    prompt_p99: Option<f64>,
+    generation_p99: Option<f64>,
+    total_count: f64,
+    indent: &str,
+    hyp: Option<&HypCapacityCtx<'_>>,
+) {
+    lines.extend(model_len_shrink_suggestion_lines(
+        max_model_len,
+        prompt_p99,
+        generation_p99,
+        total_count,
+        indent,
+        hyp,
+    ));
+}
+
+/// Compare observed geometry `state_pages` to catalog hybrid estimate.
+///
+/// Runs only when labels (`num_gpu_blocks`, concurrency, page size, max_len)
+/// AND catalog hybrid facts both exist. Returns `Some((catalog_pages,
+/// observed_pages))` on mismatch; `None` on agreement or incomplete inputs.
+///
+/// Label uncertainty tracks the printed number's source, not the existence of
+/// disagreement between sources. Callers must not change `(est)` labeling from
+/// this result; verbose output may surface the note.
+pub(super) fn catalog_state_pages_mismatch(
+    cache: &crate::collectors::CacheConfigLabels,
+    current_max_len: Option<u32>,
+    model: &crate::context::ModelArch,
+) -> Option<(u64, u64)> {
+    use crate::engine::baseline::{
+        catalog_hybrid_state_bytes, catalog_state_pages, observed_state_pages, state_dtype_bytes,
+    };
+
+    let block_size = cache.mamba_block_size.or(cache.block_size)?;
+    let num_gpu_blocks = cache.num_gpu_blocks?;
+    let observed_concurrency = cache.kv_cache_max_concurrency?;
+    let current_max_len = current_max_len?;
+    let page_bytes = cache.mamba_page_size_padded?;
+
+    let observed = observed_state_pages(
+        block_size,
+        num_gpu_blocks,
+        observed_concurrency,
+        current_max_len,
+    )?;
+
+    let dtype_b = state_dtype_bytes(model.state_dtype.as_deref())?;
+    let state_bytes = catalog_hybrid_state_bytes(
+        model.linear_num_layers?,
+        model.linear_key_heads?,
+        model.linear_value_heads?,
+        model.linear_key_head_dim?,
+        model.linear_value_head_dim?,
+        model.linear_conv_kernel_dim?,
+        dtype_b,
+    )?;
+    let catalog = catalog_state_pages(state_bytes, page_bytes)?;
+    (catalog != observed).then_some((catalog, observed))
 }
 
 pub(super) fn compute_kv_max_seqs(
@@ -85,6 +237,7 @@ pub(super) fn compute_kv_max_seqs(
     model: &crate::context::ModelArch,
     kv_cache_dtype: Option<&str>,
     tp: Option<u32>,
+    weight_bytes: u8,
 ) -> Option<u32> {
     use crate::engine::baseline::{kv_bytes_per_element, kv_max_concurrent_seqs};
     let headroom = kv_headroom_gb?;
@@ -95,7 +248,8 @@ pub(super) fn compute_kv_max_seqs(
     let sharded_kv_heads = tp
         .map(|t| num_kv_heads / num_kv_heads.min(t))
         .unwrap_or(num_kv_heads);
-    let kv_bpp = kv_bytes_per_element(kv_cache_dtype, 2);
+    // "auto"/absent KV dtype inherits weight bytes (fp8 weights → 1, bf16 → 2).
+    let kv_bpp = kv_bytes_per_element(kv_cache_dtype, weight_bytes.max(1));
     kv_max_concurrent_seqs(
         headroom,
         max_len,

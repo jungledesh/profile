@@ -10,8 +10,9 @@ use super::r1_under_batching::{
 use super::r2_kv_cache_pressure::{
     KvAdmissionBacklogDetail, KvCachePressureDetail, KvFormatCtx, Rule2Outcome,
     aggregate_backlog_detail, aggregate_r2_detail, format_kv_admission_backlog_issue,
-    format_kv_cache_window_issue, kv_pressure_confidence, r2_action, r2_backlog_short_action,
-    r2_kv_pressure_short_action, rule2_kv_admission_backlog, rule2_kv_cache_pressure,
+    format_kv_cache_window_issue, kv_pressure_confidence, model_is_hybrid,
+    prescribed_for_self_grade, r2_action, r2_backlog_short_action, r2_kv_pressure_short_action,
+    resolve_r2_kv_capacity, rule2_kv_admission_backlog, rule2_kv_cache_pressure,
 };
 use super::r3_low_prefix_reuse::{
     LowPrefixReuseDetail, Rule3Outcome, aggregate_r3_detail, format_low_prefix_window_issue,
@@ -32,7 +33,10 @@ use super::r7_config_headroom::{
     ConfigHeadroomDetail, aggregate_r7_detail, format_config_headroom_window_issue,
     rule7_config_headroom,
 };
-use super::{Recommendation, compute_kv_max_seqs, rule_is_significant, rule_names};
+use super::{
+    Recommendation, catalog_state_pages_mismatch, compute_kv_max_seqs, rule_is_significant,
+    rule_names,
+};
 
 const SUPPRESSION_TABLE: &[(&str, &str)] = &[
     (rule_names::OOM_RISK, rule_names::KV_CACHE_PRESSURE),
@@ -270,6 +274,8 @@ fn eval_window_rules(
             prefix_cache_hit_rate: snap.vllm.prefix_cache_hit_rate,
             snapshot: snap,
             chunked_prefill_enabled: summary.ctx.config.enable_chunked_prefill,
+            ridge_batch_size: win_baseline.as_ref().map(|b| b.ridge_batch_size),
+            is_hybrid: model_is_hybrid(&summary.ctx.model),
         }) {
             Rule6Outcome::Fired(d) => {
                 eval.r6_fired += 1;
@@ -309,12 +315,22 @@ fn build_report_from_eval(
                 summary.ctx.config.tensor_parallel_size,
                 summary.window.snapshot.collected_gpu_count(),
             ),
+            baseline
+                .as_ref()
+                .map(|b| b.weight_bytes_per_param)
+                .unwrap_or(2),
         );
         return Report {
             baseline,
             recommendations: Vec::new(),
             suppressed_rules: Vec::new(),
             kv_max_seqs,
+            prescribed_kv_capacity: None,
+            catalog_state_mismatch: catalog_state_pages_mismatch(
+                &summary.window.snapshot.vllm.cache_config,
+                summary.ctx.config.max_model_len,
+                &summary.ctx.model,
+            ),
             n_eval: 0,
             skipped_broken: eval.skipped_broken,
             skipped_idle: eval.skipped_idle,
@@ -328,20 +344,33 @@ fn build_report_from_eval(
     let prompt_tokens_mean = summary_snap.vllm.prompt_tokens_mean;
     let kv_headroom_gb = baseline.as_ref().and_then(|b| b.kv_headroom_gb);
     let fp8_compiler_available = summary.ctx.fp8_compiler_available;
+    let weight_bytes_per_param = baseline
+        .as_ref()
+        .map(|b| b.weight_bytes_per_param)
+        .unwrap_or(2);
+    let tp = effective_tensor_parallel(
+        summary.ctx.config.tensor_parallel_size,
+        summary.window.snapshot.collected_gpu_count(),
+    );
+    // Derived ceiling for R5 / verbose / Report.kv_max_seqs. R2 prefers observed.
     let kv_max_seqs: Option<u32> = compute_kv_max_seqs(
         kv_headroom_gb,
         max_model_len,
         &summary.ctx.model,
         summary.ctx.config.kv_cache_dtype.as_deref(),
-        effective_tensor_parallel(
-            summary.ctx.config.tensor_parallel_size,
-            summary.window.snapshot.collected_gpu_count(),
-        ),
+        tp,
+        weight_bytes_per_param,
+    );
+    let (r2_kv_max_seqs, r2_capacity_label) = resolve_r2_kv_capacity(
+        summary_snap.vllm.cache_config.kv_cache_max_concurrency,
+        kv_max_seqs,
+        model_is_hybrid(&summary.ctx.model),
     );
     let r2_significant = eval.r2_significant();
     let r2_backlog_significant = eval.r2_backlog_significant();
 
     let mut recs: Vec<Recommendation> = Vec::new();
+    let mut prescribed_kv_capacity: Option<u32> = None;
 
     if eval.r1_significant() {
         let d = aggregate_r1_detail(&eval.r1_details);
@@ -368,6 +397,7 @@ fn build_report_from_eval(
     if r2_significant {
         let r2_agg = aggregate_r2_detail(&eval.r2_details);
         let conf = kv_pressure_confidence(eval.r2_fired, eval.n_eval);
+        prescribed_kv_capacity = prescribed_for_self_grade(r2_kv_max_seqs, r2_capacity_label);
         let display_lines = format_kv_cache_window_issue(
             &r2_agg,
             pct(eval.r2_fired, eval.n_eval),
@@ -375,8 +405,12 @@ fn build_report_from_eval(
                 snapshot: summary_snap,
                 max_model_len,
                 kv_headroom_gb,
-                kv_max_seqs,
+                kv_max_seqs: r2_kv_max_seqs,
+                capacity_label: r2_capacity_label,
+                weight_bytes_per_param,
                 fp8_compiler_available,
+                model: Some(&summary.ctx.model),
+                tp,
             },
             eval.r2_fired,
             eval.n_eval,
@@ -386,7 +420,12 @@ fn build_report_from_eval(
             layer: 2,
             impact: 5,
             confidence: conf,
-            action: r2_action(r2_agg.preemptions_active, kv_max_seqs, max_model_len),
+            action: r2_action(
+                r2_agg.preemptions_active,
+                r2_kv_max_seqs,
+                max_model_len,
+                r2_capacity_label,
+            ),
             short_action: if r2_agg.preemptions_active {
                 r2_kv_pressure_short_action().to_string()
             } else {
@@ -397,6 +436,7 @@ fn build_report_from_eval(
         });
     } else if r2_backlog_significant {
         let agg = aggregate_backlog_detail(&eval.r2_backlog_details);
+        prescribed_kv_capacity = prescribed_for_self_grade(r2_kv_max_seqs, r2_capacity_label);
         let display_lines = format_kv_admission_backlog_issue(
             &agg,
             pct(eval.r2_backlog_fired, eval.n_eval),
@@ -404,8 +444,12 @@ fn build_report_from_eval(
                 snapshot: summary_snap,
                 max_model_len,
                 kv_headroom_gb,
-                kv_max_seqs,
+                kv_max_seqs: r2_kv_max_seqs,
+                capacity_label: r2_capacity_label,
+                weight_bytes_per_param,
                 fp8_compiler_available,
+                model: Some(&summary.ctx.model),
+                tp,
             },
             eval.r2_backlog_fired,
             eval.n_eval,
@@ -415,7 +459,7 @@ fn build_report_from_eval(
             layer: 2,
             impact: 5,
             confidence: kv_pressure_confidence(eval.r2_backlog_fired, eval.n_eval),
-            action: r2_action(false, kv_max_seqs, max_model_len),
+            action: r2_action(false, r2_kv_max_seqs, max_model_len, r2_capacity_label),
             short_action: r2_backlog_short_action().to_string(),
             expected_impact: "Wait queue drains, TTFT recovers.".to_string(),
             display_lines,
@@ -426,12 +470,21 @@ fn build_report_from_eval(
         && let Some(agg) =
             aggregate_concurrency_saturation_detail(&eval.r5_details, eval.session_kv_peak)
     {
+        let hyp = super::HypCapacityCtx {
+            cache: &summary_snap.vllm.cache_config,
+            kv_headroom_gb,
+            model: Some(&summary.ctx.model),
+            kv_cache_dtype: summary.ctx.config.kv_cache_dtype.as_deref(),
+            tp,
+            weight_bytes: weight_bytes_per_param,
+        };
         let display_lines = format_concurrency_saturation_window_issue(
             &agg,
             pct(eval.r5_fired, eval.n_eval),
             max_model_len,
             kv_max_seqs,
             summary_snap,
+            Some(&hyp),
         );
         recs.push(Recommendation {
             rule_name: rule_names::CONCURRENCY_SATURATION,
@@ -548,6 +601,12 @@ fn build_report_from_eval(
         recs,
         baseline,
         kv_max_seqs,
+        prescribed_kv_capacity,
+        catalog_state_pages_mismatch(
+            &summary_snap.vllm.cache_config,
+            max_model_len,
+            &summary.ctx.model,
+        ),
         eval.n_eval,
         crate::engine::EvalSkipStats {
             skipped_broken: eval.skipped_broken,
@@ -562,6 +621,8 @@ pub(crate) fn finalize_report_groups(
     recs: Vec<Recommendation>,
     baseline: Option<baseline::PhysicsBaseline>,
     kv_max_seqs: Option<u32>,
+    prescribed_kv_capacity: Option<u32>,
+    catalog_state_mismatch: Option<(u64, u64)>,
     n_eval: usize,
     skips: crate::engine::EvalSkipStats,
 ) -> Report {
@@ -572,6 +633,8 @@ pub(crate) fn finalize_report_groups(
             recommendations: Vec::new(),
             suppressed_rules,
             kv_max_seqs,
+            prescribed_kv_capacity: None,
+            catalog_state_mismatch,
             n_eval,
             skipped_broken: skips.skipped_broken,
             skipped_idle: skips.skipped_idle,
@@ -620,11 +683,22 @@ pub(crate) fn finalize_report_groups(
         sb.total_cmp(&sa)
     });
 
+    let prescribed_kv_capacity = if recs.iter().any(|r| {
+        r.rule_name == rule_names::KV_CACHE_PRESSURE
+            || r.rule_name == rule_names::KV_ADMISSION_BACKLOG
+    }) {
+        prescribed_kv_capacity
+    } else {
+        None
+    };
+
     Report {
         baseline,
         recommendations: recs,
         suppressed_rules,
         kv_max_seqs,
+        prescribed_kv_capacity,
+        catalog_state_mismatch,
         n_eval,
         skipped_broken: skips.skipped_broken,
         skipped_idle: skips.skipped_idle,
@@ -643,6 +717,8 @@ pub fn build_report_for_windows(windows: &[RuntimeWindow], summary: AnalysisInpu
             recommendations: Vec::new(),
             suppressed_rules: Vec::new(),
             kv_max_seqs: None,
+            prescribed_kv_capacity: None,
+            catalog_state_mismatch: None,
             n_eval: 0,
             skipped_broken: windows.len(),
             skipped_idle: 0,
