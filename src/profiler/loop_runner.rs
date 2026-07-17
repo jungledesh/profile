@@ -471,6 +471,14 @@ fn print_delta(d: &delta::Delta) {
     if let Some(line) = format_efficiency_delta_line(d.efficiency_delta_pp) {
         println!("{line}");
     }
+    if let Some((x, y)) = d.capacity_self_grade {
+        let y_disp = if (y - y.round()).abs() < 1e-9 {
+            format!("{y:.0}")
+        } else {
+            format!("{y:.2}")
+        };
+        println!("  Capacity: prescribed ≤{x}, vLLM now reports {y_disp}.");
+    }
     let has_cost = economics_section_active(d);
     if has_cost {
         println!();
@@ -981,6 +989,7 @@ mod tests {
             tpot_p95_after_ms: None,
             config_drifted: false,
             config_changes: Vec::new(),
+            capacity_self_grade: None,
         };
         assert!(economics_section_active(&d));
     }
@@ -1008,6 +1017,7 @@ mod tests {
             tpot_p95_after_ms: None,
             config_drifted: false,
             config_changes: Vec::new(),
+            capacity_self_grade: None,
         };
         assert!(recoverable_waste_available(&d));
         assert!(economics_section_active(&d));
@@ -1039,6 +1049,7 @@ mod tests {
             tpot_p95_after_ms: None,
             config_drifted: false,
             config_changes: Vec::new(),
+            capacity_self_grade: None,
         };
         assert!(recoverable_waste_available(&d));
         let waste = recoverable_waste_per_hr(

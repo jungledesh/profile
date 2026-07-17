@@ -22,8 +22,6 @@ pub(crate) use format::{MuVariant, mu_diagnose_lines};
 pub(crate) use r1_under_batching::{R1EvalInput, Rule1Outcome};
 pub(crate) use r2_kv_cache_pressure::KV_CACHE_PRESSURE_MIN_PERC;
 #[cfg(test)]
-pub(crate) use r2_kv_cache_pressure::r2_recommendation;
-#[cfg(test)]
 pub(crate) use r3_low_prefix_reuse::{LowPrefixReuseDetail, Rule3Outcome, r3_recommendation};
 pub use r4_oom_risk::{r4_advisory, r4_recommendation};
 
@@ -85,6 +83,7 @@ pub(super) fn compute_kv_max_seqs(
     model: &crate::context::ModelArch,
     kv_cache_dtype: Option<&str>,
     tp: Option<u32>,
+    weight_bytes: u8,
 ) -> Option<u32> {
     use crate::engine::baseline::{kv_bytes_per_element, kv_max_concurrent_seqs};
     let headroom = kv_headroom_gb?;
@@ -95,7 +94,8 @@ pub(super) fn compute_kv_max_seqs(
     let sharded_kv_heads = tp
         .map(|t| num_kv_heads / num_kv_heads.min(t))
         .unwrap_or(num_kv_heads);
-    let kv_bpp = kv_bytes_per_element(kv_cache_dtype, 2);
+    // "auto"/absent KV dtype inherits weight bytes (fp8 weights → 1, bf16 → 2).
+    let kv_bpp = kv_bytes_per_element(kv_cache_dtype, weight_bytes.max(1));
     kv_max_concurrent_seqs(
         headroom,
         max_len,

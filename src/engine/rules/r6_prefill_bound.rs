@@ -4,7 +4,9 @@ use crate::collectors::RawSnapshot;
 /// Break-even is ridge / decode_batch. For A100-H100 at batch 30+, this falls in
 /// the 1.3-5.7 range. 5.0 catches meaningful prefill dominance without
 /// false-positiving on agent workloads (~4:1 ratio). Calibrate with production data.
-const PROMPT_GEN_RATIO_MILD: f64 = 5.0;
+/// Prompt-to-generation token ratio above which prefill dominates decode.
+/// Shared by R1 (defer to R6) and R6 (mild fire gate). Calibrate in one place.
+pub(super) const PROMPT_GEN_RATIO_MILD: f64 = 5.0;
 const PROMPT_GEN_RATIO_MODERATE: f64 = 10.0;
 const PROMPT_GEN_RATIO_SEVERE: f64 = 20.0;
 
@@ -26,20 +28,77 @@ fn r6_metric_line(label: &str, value: &str) -> String {
 /// Fallback when prompt mean or running count unavailable for budget derivation.
 const DEFAULT_BATCH_TOKEN_BUDGET: u64 = 2048;
 
-/// Compute recommended --max-num-batched-tokens from workload.
-/// Target: chunk average prompt into ~2 steps after decode overhead.
-/// Round up to nearest 128 for readability.
+/// Wall-clock policy: how much decode-step stretch we accept when prefill
+/// shares the step. Judgment constant, operator-arguable. Not physics coupling.
+const DECODE_STRETCH_TARGET: f64 = 0.25;
+
+/// Fallback heuristic: target steps to ingest an average prompt.
+/// 1 = no chunking benefit (whole prompt stalls decode once, hard);
+/// large = smooth decode but slow TTFT. 2 halves the worst-case decode
+/// stall while only modestly delaying prompts. Judgment constant.
+/// Used only when `ridge_batch_size` is unavailable.
+const PREFILL_TARGET_CHUNKS: f64 = 2.0;
+
+fn round_up_128(n: f64) -> u64 {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    {
+        ((n / 128.0).ceil() as u64).saturating_mul(128)
+    }
+}
+
+/// Primary budget from decode ridge. No `running` term: `--max-num-batched-tokens`
+/// is the whole step budget; vLLM subtracts live decodes itself.
+///
+/// "(est)" comes off only after a hardware sweep (512 / 2048 / 8192 / formula
+/// value) shows predicted stretch tracks measured TPOT. Until then: estimate,
+/// by policy.
+fn ridge_batch_token_budget(ridge_batch_size: f64) -> u64 {
+    round_up_128(ridge_batch_size * (1.0 + DECODE_STRETCH_TARGET))
+}
+
+/// Fallback: chunk average prompt into PREFILL_TARGET_CHUNKS steps after decode overhead.
 fn recommended_batch_token_budget(prompt_mean: f64, running: f64) -> u64 {
-    let raw = prompt_mean / 2.0 + running;
-    ((raw / 128.0).ceil() as u64) * 128
+    let raw = prompt_mean / PREFILL_TARGET_CHUNKS + running;
+    round_up_128(raw)
 }
 
 fn batch_token_budget(d: &PrefillBoundDetail) -> u64 {
+    if let Some(ridge) = d.ridge_batch_size.filter(|r| r.is_finite() && *r > 0.0) {
+        return ridge_batch_token_budget(ridge);
+    }
     match (d.prompt_tokens_mean, d.running_count) {
         (Some(pm), Some(rc)) if pm.is_finite() && pm > 0.0 && rc.is_finite() && rc >= 0.0 => {
             recommended_batch_token_budget(pm, rc)
         }
         _ => DEFAULT_BATCH_TOKEN_BUDGET,
+    }
+}
+
+fn batch_budget_paren(d: &PrefillBoundDetail) -> Option<&'static str> {
+    d.ridge_batch_size
+        .filter(|r| r.is_finite() && *r > 0.0)
+        .map(|_| {
+            if d.is_hybrid {
+                "(est; optimistic on long prompts)"
+            } else {
+                "(est; targets ~25% decode stretch vs floor)"
+            }
+        })
+}
+
+fn batch_budget_fix_bullet(d: &PrefillBoundDetail, verb: &str) -> String {
+    let budget = batch_token_budget(d);
+    match batch_budget_paren(d) {
+        Some(paren) => {
+            format!(
+                "      • {verb} --max-num-batched-tokens to {budget} {paren}. Lower for smoother TPOT, raise for lower TTFT."
+            )
+        }
+        None => {
+            format!(
+                "      • {verb} --max-num-batched-tokens to {budget}. Lower for smoother TPOT, raise for lower TTFT."
+            )
+        }
     }
 }
 
@@ -55,6 +114,10 @@ pub struct PrefillBoundDetail {
     pub prompt_tokens_p99: Option<f64>,
     pub prompt_skew_ratio: Option<f64>,
     pub running_count: Option<f64>,
+    /// Decode ridge batch size (tokens). When set, drives the primary budget.
+    pub ridge_batch_size: Option<f64>,
+    /// Hybrid/linear catalog model: ridge budget is optimistic on long prompts.
+    pub is_hybrid: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +147,8 @@ pub struct PrefillBoundEvalInput<'a> {
     pub prefix_cache_hit_rate: Option<f64>,
     pub snapshot: &'a RawSnapshot,
     pub chunked_prefill_enabled: Option<bool>,
+    pub ridge_batch_size: Option<f64>,
+    pub is_hybrid: bool,
 }
 
 pub fn severity(prompt_gen_ratio: f64) -> Severity {
@@ -155,6 +220,8 @@ pub fn evaluate(input: PrefillBoundEvalInput<'_>) -> Rule6Outcome {
         prefix_cache_hit_rate,
         snapshot,
         chunked_prefill_enabled,
+        ridge_batch_size,
+        is_hybrid,
     } = input;
     let Some(raw_prompt_tps) = prompt_tokens_per_sec.filter(|v| v.is_finite() && *v > 0.0) else {
         return Rule6Outcome::NotFired;
@@ -214,6 +281,8 @@ pub fn evaluate(input: PrefillBoundEvalInput<'_>) -> Rule6Outcome {
         prompt_tokens_p99: snapshot.vllm.prompt_tokens_p99,
         prompt_skew_ratio,
         running_count: snapshot.vllm.num_requests_running,
+        ridge_batch_size,
+        is_hybrid,
     })
 }
 
@@ -267,6 +336,8 @@ pub(super) fn aggregate_r6_detail(details: &[PrefillBoundDetail]) -> PrefillBoun
                 Some(vals.iter().sum::<f64>() / vals.len() as f64)
             }
         },
+        ridge_batch_size: details.last().and_then(|d| d.ridge_batch_size),
+        is_hybrid: details.last().is_some_and(|d| d.is_hybrid),
     }
 }
 
@@ -335,12 +406,11 @@ pub(super) fn prefill_fix_lines(
         )
     } else if chunked_not_enabled {
         let budget = batch_token_budget(d);
+        let bullet = batch_budget_fix_bullet(d, "Set");
         (
             vec![
                 "      • Enable chunked prefill (--enable-chunked-prefill).".to_string(),
-                format!(
-                    "      • Set --max-num-batched-tokens to {budget}. Lower for smoother TPOT, raise for lower TTFT."
-                ),
+                bullet,
             ],
             format!(
                 "Enable chunked prefill (--enable-chunked-prefill) and set --max-num-batched-tokens to {budget}"
@@ -360,11 +430,9 @@ pub(super) fn prefill_fix_lines(
     } else if chunked_on {
         let budget = batch_token_budget(d);
         (
-            vec![format!(
-                "      • Reduce --max-num-batched-tokens to {budget}. Lower for smoother TPOT, raise for lower TTFT."
-            )],
-            format!("Reduce --max-num-batched-tokens to {budget} to shrink prefill chunk size"),
-            "Reduce --max-num-batched-tokens".to_string(),
+            vec![batch_budget_fix_bullet(d, "Set")],
+            format!("Set --max-num-batched-tokens to {budget} to shrink prefill chunk size"),
+            "Set --max-num-batched-tokens".to_string(),
             "Lower TTFT variance, steadier decode throughput.".to_string(),
         )
     } else {
@@ -372,11 +440,9 @@ pub(super) fn prefill_fix_lines(
         // Safe fallback instead of panic in library code.
         let budget = batch_token_budget(d);
         (
-            vec![format!(
-                "      • Reduce --max-num-batched-tokens to {budget}. Lower for smoother TPOT, raise for lower TTFT."
-            )],
-            format!("Reduce --max-num-batched-tokens to {budget} to shrink prefill chunk size"),
-            "Reduce --max-num-batched-tokens".to_string(),
+            vec![batch_budget_fix_bullet(d, "Set")],
+            format!("Set --max-num-batched-tokens to {budget} to shrink prefill chunk size"),
+            "Set --max-num-batched-tokens".to_string(),
             "Lower TTFT variance, steadier decode throughput.".to_string(),
         )
     }
@@ -517,6 +583,8 @@ mod tests {
             prefix_cache_hit_rate: p.prefix_cache_hit_rate,
             snapshot: p.snapshot,
             chunked_prefill_enabled: None,
+            ridge_batch_size: None,
+            is_hybrid: false,
         })
     }
 
@@ -553,6 +621,8 @@ mod tests {
             prefix_cache_hit_rate: Some(0.996),
             snapshot: &s,
             chunked_prefill_enabled: None,
+            ridge_batch_size: None,
+            is_hybrid: false,
         });
         assert!(matches!(result, Rule6Outcome::NotFired));
     }
@@ -745,6 +815,8 @@ mod tests {
             prefix_cache_hit_rate: Some(1.0),
             snapshot: &s,
             chunked_prefill_enabled: None,
+            ridge_batch_size: None,
+            is_hybrid: false,
         });
         assert!(matches!(result, Rule6Outcome::NotFired));
     }
@@ -772,6 +844,8 @@ mod tests {
             prompt_tokens_p99: Some(4096.0),
             prompt_skew_ratio: Some(2.0),
             running_count: None,
+            ridge_batch_size: None,
+            is_hybrid: false,
         };
         let inf_window = PrefillBoundDetail {
             prompt_gen_ratio: f64::INFINITY,
@@ -799,6 +873,8 @@ mod tests {
             prompt_tokens_p99: None,
             prompt_skew_ratio: None,
             running_count: None,
+            ridge_batch_size: None,
+            is_hybrid: false,
         };
         let agg = aggregate_r6_detail(&[d.clone(), d]);
         assert!(agg.prompt_gen_ratio.is_infinite());
@@ -823,11 +899,13 @@ mod tests {
             prompt_tokens_p99: Some(51_200.0),
             prompt_skew_ratio: Some(25.0),
             running_count: None,
+            ridge_batch_size: None,
+            is_hybrid: false,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
         assert!(text.contains("Route long-context requests"));
         assert!(text.contains("Prefill ratio"));
-        assert!(!text.contains("Reduce --max-num-batched-tokens to shrink prefill chunk size"));
+        assert!(!text.contains("Set --max-num-batched-tokens to shrink prefill chunk size"));
     }
 
     #[test]
@@ -843,6 +921,8 @@ mod tests {
             prompt_tokens_p99: Some(6000.0),
             prompt_skew_ratio: Some(1.46),
             running_count: None,
+            ridge_batch_size: None,
+            is_hybrid: false,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
         assert!(text.contains("--enable-prefix-caching"));
@@ -861,6 +941,8 @@ mod tests {
             prompt_tokens_p99: Some(6000.0),
             prompt_skew_ratio: Some(1.46),
             running_count: None,
+            ridge_batch_size: None,
+            is_hybrid: false,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
         assert!(text.contains("--enable-chunked-prefill"));
@@ -880,9 +962,11 @@ mod tests {
             prompt_tokens_p99: Some(6000.0),
             prompt_skew_ratio: Some(1.46),
             running_count: None,
+            ridge_batch_size: None,
+            is_hybrid: false,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
-        assert!(text.contains("Reduce --max-num-batched-tokens to 2048"));
+        assert!(text.contains("Set --max-num-batched-tokens to 2048"));
         assert!(!text.contains("Disaggregate prefill and decode"));
     }
 
@@ -899,6 +983,8 @@ mod tests {
             prompt_tokens_p99: Some(6000.0),
             prompt_skew_ratio: Some(1.46),
             running_count: None,
+            ridge_batch_size: None,
+            is_hybrid: false,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
         assert!(text.contains("Disaggregate prefill and decode"));
@@ -917,6 +1003,8 @@ mod tests {
             prompt_tokens_p99: Some(6000.0),
             prompt_skew_ratio: Some(1.46),
             running_count: None,
+            ridge_batch_size: None,
+            is_hybrid: false,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
         assert!(text.contains("avg when prefill-bound"));
@@ -936,6 +1024,8 @@ mod tests {
             prompt_tokens_p99: Some(6000.0),
             prompt_skew_ratio: Some(1.46),
             running_count: None,
+            ridge_batch_size: None,
+            is_hybrid: false,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
         assert!(text.contains("Reduce prompt length where possible"));
@@ -954,6 +1044,8 @@ mod tests {
             prompt_tokens_p99: Some(51_200.0),
             prompt_skew_ratio: Some(25.0),
             running_count: None,
+            ridge_batch_size: None,
+            is_hybrid: false,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
         assert!(!text.contains("Reduce prompt length where possible"));
@@ -973,6 +1065,8 @@ mod tests {
             prompt_tokens_p99: Some(51_200.0),
             prompt_skew_ratio: Some(25.0),
             running_count: None,
+            ridge_batch_size: None,
+            is_hybrid: false,
         };
         let skewed_lines = format_prefill_bound_window_issue(&skewed, 40);
         assert_eq!(
@@ -1000,6 +1094,8 @@ mod tests {
             prompt_tokens_p99: Some(6000.0),
             prompt_skew_ratio: Some(1.46),
             running_count: None,
+            ridge_batch_size: None,
+            is_hybrid: false,
         };
         let uniform_lines = format_prefill_bound_window_issue(&uniform, 100);
         assert_eq!(
@@ -1033,8 +1129,87 @@ mod tests {
             prompt_tokens_p99: Some(6000.0),
             prompt_skew_ratio: Some(1.46),
             running_count: Some(161.0),
+            ridge_batch_size: None,
+            is_hybrid: false,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
-        assert!(text.contains("Reduce --max-num-batched-tokens to 896"));
+        assert!(text.contains("Set --max-num-batched-tokens to 896"));
+    }
+
+    #[test]
+    fn ridge_budget_rounds_up_128_with_stretch_target() {
+        // 153 × 1.25 = 191.25 → 256
+        assert_eq!(ridge_batch_token_budget(153.0), 256);
+        // 128 × 1.25 = 160 → 256
+        assert_eq!(ridge_batch_token_budget(128.0), 256);
+        // 1024 × 1.25 = 1280 → 1280
+        assert_eq!(ridge_batch_token_budget(1024.0), 1280);
+    }
+
+    #[test]
+    fn ridge_budget_preferred_over_prompt_heuristic() {
+        let d = PrefillBoundDetail {
+            prompt_gen_ratio: 12.0,
+            decode_efficiency_pct: 8.0,
+            tpot_ms: Some(80.0),
+            tpot_floor_ms: Some(7.85),
+            prefix_caching_enabled: Some(true),
+            chunked_prefill_enabled: Some(true),
+            prompt_tokens_mean: Some(1333.0),
+            prompt_tokens_p99: Some(6000.0),
+            prompt_skew_ratio: Some(1.46),
+            running_count: Some(161.0),
+            ridge_batch_size: Some(153.0),
+            is_hybrid: false,
+        };
+        assert_eq!(batch_token_budget(&d), 256);
+        let text = format_prefill_bound_window_issue(&d, 100).join("\n");
+        assert!(text.contains(
+            "Set --max-num-batched-tokens to 256 (est; targets ~25% decode stretch vs floor)"
+        ));
+    }
+
+    #[test]
+    fn ridge_budget_hybrid_wording() {
+        let d = PrefillBoundDetail {
+            prompt_gen_ratio: 12.0,
+            decode_efficiency_pct: 8.0,
+            tpot_ms: Some(80.0),
+            tpot_floor_ms: Some(7.85),
+            prefix_caching_enabled: Some(true),
+            chunked_prefill_enabled: Some(true),
+            prompt_tokens_mean: Some(1333.0),
+            prompt_tokens_p99: Some(6000.0),
+            prompt_skew_ratio: Some(1.46),
+            running_count: Some(161.0),
+            ridge_batch_size: Some(153.0),
+            is_hybrid: true,
+        };
+        let text = format_prefill_bound_window_issue(&d, 100).join("\n");
+        assert!(
+            text.contains("Set --max-num-batched-tokens to 256 (est; optimistic on long prompts)")
+        );
+    }
+
+    #[test]
+    fn fallback_budget_when_ridge_absent() {
+        let d = PrefillBoundDetail {
+            prompt_gen_ratio: 12.0,
+            decode_efficiency_pct: 8.0,
+            tpot_ms: Some(80.0),
+            tpot_floor_ms: Some(7.85),
+            prefix_caching_enabled: Some(true),
+            chunked_prefill_enabled: Some(true),
+            prompt_tokens_mean: None,
+            prompt_tokens_p99: None,
+            prompt_skew_ratio: None,
+            running_count: None,
+            ridge_batch_size: None,
+            is_hybrid: false,
+        };
+        assert_eq!(batch_token_budget(&d), DEFAULT_BATCH_TOKEN_BUDGET);
+        let text = format_prefill_bound_window_issue(&d, 100).join("\n");
+        assert!(text.contains("Set --max-num-batched-tokens to 2048"));
+        assert!(!text.contains("decode stretch"));
     }
 }

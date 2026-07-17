@@ -20,10 +20,8 @@ struct GpuEntry {
 static CATALOG: &[GpuEntry] = &[
     // ── H100 ─────────────────────────────────────────────────────────────────
     // Dense BF16 Tensor Core = half the sparsity-marked datasheet figure.
-    // Sources:
-    //   https://www.nvidia.com/en-us/data-center/h100/
-    //   https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/h100/PB-11773-001_v01.pdf
     // PCIe before generic H100 - "pcie" is the discriminating token.
+    // Source: https://www.nvidia.com/en-us/data-center/h100/ (accessed 2026-07-16)
     GpuEntry {
         tokens: &["h100", "pcie"],
         entry: GpuCatalogEntry {
@@ -35,6 +33,7 @@ static CATALOG: &[GpuEntry] = &[
     // NVL: 94 GB HBM3 PCIe with NVLink bridge. Must precede hbm3/sxm: "nvl" is
     // the discriminating token; NVML name is "NVIDIA H100 NVL".
     // Dense BF16 835.5 TFLOPS (1671 sparse / 2); BW 3.9 TB/s.
+    // Source: https://www.nvidia.com/en-us/data-center/h100/ (accessed 2026-07-16)
     GpuEntry {
         tokens: &["h100", "nvl"],
         entry: GpuCatalogEntry {
@@ -44,6 +43,7 @@ static CATALOG: &[GpuEntry] = &[
         },
     },
     // SXM: "hbm3" is exclusive to the SXM variant; "sxm" also works.
+    // Source: https://www.nvidia.com/en-us/data-center/h100/ (accessed 2026-07-16)
     GpuEntry {
         tokens: &["h100", "hbm3"],
         entry: GpuCatalogEntry {
@@ -52,6 +52,7 @@ static CATALOG: &[GpuEntry] = &[
             peak_bw_gbps: 3350.0,
         },
     },
+    // Source: https://www.nvidia.com/en-us/data-center/h100/ (accessed 2026-07-16)
     GpuEntry {
         tokens: &["h100", "sxm"],
         entry: GpuCatalogEntry {
@@ -62,6 +63,7 @@ static CATALOG: &[GpuEntry] = &[
     },
     // ── H200 ─────────────────────────────────────────────────────────────────
     // Same compute die as H100 SXM; HBM3e doubles the bandwidth.
+    // Source: https://www.nvidia.com/en-us/data-center/h200/ (accessed 2026-07-16)
     GpuEntry {
         tokens: &["h200"],
         entry: GpuCatalogEntry {
@@ -73,6 +75,7 @@ static CATALOG: &[GpuEntry] = &[
     // ── A100 ─────────────────────────────────────────────────────────────────
     // Driver-reported names include VRAM size: "A100-SXM4-80GB", "A100-PCIE-40GB", etc.
     // Require explicit size token; ambiguous "a100" alone returns None.
+    // Source: https://www.nvidia.com/en-us/data-center/a100/ (accessed 2026-07-16)
     GpuEntry {
         tokens: &["a100", "80gb"],
         entry: GpuCatalogEntry {
@@ -81,6 +84,7 @@ static CATALOG: &[GpuEntry] = &[
             peak_bw_gbps: 2039.0,
         },
     },
+    // Source: https://www.nvidia.com/en-us/data-center/a100/ (accessed 2026-07-16)
     GpuEntry {
         tokens: &["a100", "40gb"],
         entry: GpuCatalogEntry {
@@ -90,18 +94,36 @@ static CATALOG: &[GpuEntry] = &[
         },
     },
     // ── B200 SXM ─────────────────────────────────────────────────────────────
-    // Blackwell deprioritised FP32 in favour of FP4/FP8/BF16 tensor throughput.
+    // Dense BF16 Tensor Core = without structural sparsity (½ the sparse-marketed figure).
+    // Source: https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/blackwell/blackwell-architecture-datasheet-us-nvidia-1015540.pdf (accessed 2026-07-16)
+    // peak_flops_tc 2250: per-GPU FP16/BF16 Tensor Core sparse 4.5 PFLOPS; footnote 2
+    //   "Dense is ½ sparse spec shown" → 2.25 PFLOPS dense BF16.
+    // peak_bw 7700: per-GPU "180 GB HBM3E | 7.7 TB/s" row in the same datasheet GPU Memory table.
     GpuEntry {
         tokens: &["b200"],
         entry: GpuCatalogEntry {
             arch: "blackwell",
-            peak_flops_tc_tflops: 2250.0, // BF16 Dense Tensor Core (unverified - no production B200 to test against)
+            peak_flops_tc_tflops: 2250.0,
+            peak_bw_gbps: 7700.0,
+        },
+    },
+    // ── B300 SXM (Blackwell Ultra) ───────────────────────────────────────────
+    // Source: https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/blackwell-ultra/blackwell-datasheet-ultra-blackwell-4169750.pdf (accessed 2026-07-16)
+    // peak_flops_tc 4500: datasheet p.5 per-GPU "FP16/BF16 Tensor Core" dense column 4.5 PFLOPS;
+    //   footnote 2: "Dense is ½ sparse spec shown" (sparse headline 5 PFLOPS on same row).
+    // peak_bw 8000: datasheet p.5 per-GPU GPU Memory row "288 GB HBM3E | 8 TB/s".
+    GpuEntry {
+        tokens: &["b300"],
+        entry: GpuCatalogEntry {
+            arch: "blackwell",
+            peak_flops_tc_tflops: 4500.0,
             peak_bw_gbps: 8000.0,
         },
     },
     // ── RTX PRO 6000 Blackwell ────────────────────────────────────────────────
     // 96GB GDDR7; consumer/workstation Blackwell.
     // Before generic "blackwell" token entries to prevent false matches.
+    // Source: https://www.nvidia.com/en-us/products/workstations/professional-desktop-gpus/rtx-pro-6000/ (accessed 2026-07-16)
     GpuEntry {
         tokens: &["rtx", "pro", "6000", "blackwell"],
         entry: GpuCatalogEntry {
@@ -111,6 +133,7 @@ static CATALOG: &[GpuEntry] = &[
         },
     },
     // ── L40S ─────────────────────────────────────────────────────────────────
+    // Source: https://www.nvidia.com/en-us/data-center/l40s/ (accessed 2026-07-16)
     GpuEntry {
         tokens: &["l40s"],
         entry: GpuCatalogEntry {
@@ -120,6 +143,7 @@ static CATALOG: &[GpuEntry] = &[
         },
     },
     // ── RTX 4090 ─────────────────────────────────────────────────────────────
+    // Source: https://www.nvidia.com/en-us/geforce/graphics-cards/40-series/rtx-4090/ (accessed 2026-07-16)
     GpuEntry {
         tokens: &["rtx", "4090"],
         entry: GpuCatalogEntry {
@@ -129,6 +153,7 @@ static CATALOG: &[GpuEntry] = &[
         },
     },
     // ── RTX A6000 (Ampere) ───────────────────────────────────────────────────
+    // Source: https://www.nvidia.com/en-us/design-visualization/rtx-a6000/ (accessed 2026-07-16)
     GpuEntry {
         tokens: &["rtx", "a6000"],
         entry: GpuCatalogEntry {
@@ -138,6 +163,7 @@ static CATALOG: &[GpuEntry] = &[
         },
     },
     // ── RTX 3090 Ti ──────────────────────────────────────────────────────────
+    // Source: https://www.nvidia.com/en-us/geforce/graphics-cards/30-series/rtx-3090-3090ti/ (accessed 2026-07-16)
     GpuEntry {
         tokens: &["rtx", "3090", "ti"],
         entry: GpuCatalogEntry {
@@ -147,6 +173,7 @@ static CATALOG: &[GpuEntry] = &[
         },
     },
     // ── RTX 3090 ─────────────────────────────────────────────────────────────
+    // Source: https://www.nvidia.com/en-us/geforce/graphics-cards/30-series/rtx-3090-3090ti/ (accessed 2026-07-16)
     GpuEntry {
         tokens: &["rtx", "3090"],
         entry: GpuCatalogEntry {
@@ -156,6 +183,7 @@ static CATALOG: &[GpuEntry] = &[
         },
     },
     // ── RTX 5090 ─────────────────────────────────────────────────────────────
+    // Source: https://www.nvidia.com/en-us/geforce/graphics-cards/50-series/rtx-5090/ (accessed 2026-07-16)
     GpuEntry {
         tokens: &["rtx", "5090"],
         entry: GpuCatalogEntry {
@@ -170,6 +198,7 @@ static CATALOG: &[GpuEntry] = &[
     // NVML reports device name "NVIDIA GB10" - token "gb10" matches.
     // BF16 Dense TC: 212.9 TFLOPS measured (mma_bf16bf16f32 via mmapeak on real hardware).
     // The marketed "1000 TOPS" figure is FP4 2:4 sparse - not BF16 dense.
+    // Source: https://www.nvidia.com/en-us/products/workstations/dgx-spark/ (accessed 2026-07-16)
     GpuEntry {
         tokens: &["gb10"],
         entry: GpuCatalogEntry {
@@ -179,6 +208,7 @@ static CATALOG: &[GpuEntry] = &[
         },
     },
     // ── A10G ─────────────────────────────────────────────────────────────────
+    // Source: https://www.nvidia.com/en-us/data-center/products/a10/ (accessed 2026-07-16)
     GpuEntry {
         tokens: &["a10g"],
         entry: GpuCatalogEntry {
@@ -188,27 +218,28 @@ static CATALOG: &[GpuEntry] = &[
         },
     },
     // ── AMD Instinct MI355X (CDNA4, HBM3e) ─────────────────────────────────
-    // Same die as MI350X; higher clock (2400 MHz) and TBP (1400W).
+    // Source: https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/product-briefs/amd-instinct-mi355x-gpu-brochure.pdf (accessed 2026-07-16)
     GpuEntry {
         tokens: &["mi355x"],
         entry: GpuCatalogEntry {
             arch: "cdna4",
-            peak_flops_tc_tflops: 2500.0,
+            peak_flops_tc_tflops: 2500.0, // dense BF16 matrix
             peak_bw_gbps: 8000.0,
         },
     },
     // ── AMD Instinct MI350X (CDNA4, HBM3e) ─────────────────────────────────
-    // Current AMD datacenter flagship. Launched June 2025.
+    // Source: https://www.amd.com/en/products/accelerators/instinct/mi350/mi350x.html (accessed 2026-07-16)
     GpuEntry {
         tokens: &["mi350x"],
         entry: GpuCatalogEntry {
             arch: "cdna4",
-            peak_flops_tc_tflops: 2300.0,
+            peak_flops_tc_tflops: 2300.0, // dense BF16 matrix
             peak_bw_gbps: 8000.0,
         },
     },
     // ── AMD Instinct MI325X (CDNA3, HBM3e) ─────────────────────────────────
     // Same compute die as MI300X; HBM3e increases bandwidth.
+    // Source: https://www.amd.com/en/products/accelerators/instinct/mi300/mi325x.html (accessed 2026-07-16)
     GpuEntry {
         tokens: &["mi325x"],
         entry: GpuCatalogEntry {
@@ -219,6 +250,7 @@ static CATALOG: &[GpuEntry] = &[
     },
     // ── AMD Instinct MI300A (CDNA3 APU) ─────────────────────────────────────
     // 228 GPU CUs (vs 304 on MI300X). 128 GB HBM3 shared with CPU.
+    // Source: https://www.amd.com/en/products/accelerators/instinct/mi300/mi300a.html (accessed 2026-07-16)
     GpuEntry {
         tokens: &["mi300a"],
         entry: GpuCatalogEntry {
@@ -229,6 +261,7 @@ static CATALOG: &[GpuEntry] = &[
         },
     },
     // ── AMD Instinct MI300X (CDNA3) ─────────────────────────────────────────
+    // Source: https://www.amd.com/en/products/accelerators/instinct/mi300/mi300x.html (accessed 2026-07-16)
     GpuEntry {
         tokens: &["mi300x"],
         entry: GpuCatalogEntry {
@@ -240,6 +273,7 @@ static CATALOG: &[GpuEntry] = &[
     // ── AMD Instinct MI250X (CDNA2) ─────────────────────────────────────────
     // OAM has 2 GCDs; ROCm sees each as a separate device.
     // Values are per-GCD (half of full-OAM: 383 / 2 = 191.5, 3276.8 / 2 = 1638.4).
+    // Source: https://www.amd.com/en/products/accelerators/instinct/mi200/mi250x.html (accessed 2026-07-16)
     GpuEntry {
         tokens: &["mi250x"],
         entry: GpuCatalogEntry {
@@ -252,6 +286,7 @@ static CATALOG: &[GpuEntry] = &[
     // Dual-GCD OAM like MI250X but 208 CUs (104 per GCD) vs 220.
     // Values are per-GCD (half of full-OAM: 362.1 / 2 = 181.0, 3200 / 2 = 1600).
     // Must be after MI250X: "mi250" is a substring of "mi250x".
+    // Source: https://www.amd.com/en/products/accelerators/instinct/mi200/mi250.html (accessed 2026-07-16)
     GpuEntry {
         tokens: &["mi250"],
         entry: GpuCatalogEntry {
@@ -262,6 +297,7 @@ static CATALOG: &[GpuEntry] = &[
     },
     // ── AMD Instinct MI210 (CDNA2, PCIe) ────────────────────────────────────
     // Single-GCD PCIe card. 104 CUs, 64GB HBM2e.
+    // Source: https://www.amd.com/en/products/accelerators/instinct/mi200/mi210.html (accessed 2026-07-16)
     GpuEntry {
         tokens: &["mi210"],
         entry: GpuCatalogEntry {
@@ -274,6 +310,7 @@ static CATALOG: &[GpuEntry] = &[
     // 64 CUs, 128 AI Accelerators, 16GB GDDR6.
     // RDNA4 WMMA matrix ops. vLLM native RDNA4 kernel support in progress;
     // roofline ceiling may be optimistic until kernels land.
+    // Source: https://www.amd.com/en/products/graphics/desktops/radeon/9000-series/amd-radeon-rx-9070xt.html (accessed 2026-07-16)
     GpuEntry {
         tokens: &["rx", "9070", "xt"],
         entry: GpuCatalogEntry {
@@ -285,6 +322,7 @@ static CATALOG: &[GpuEntry] = &[
     // ── AMD Radeon RX 9070 (RDNA4) ───────────────────────────────────────────
     // 56 CUs, 112 AI Accelerators, 16GB GDDR6.
     // Must be after RX 9070 XT: ["rx", "9070"] matches "RX 9070 XT" names.
+    // Source: https://www.amd.com/en/products/graphics/desktops/radeon/9000-series/amd-radeon-rx-9070.html (accessed 2026-07-16)
     GpuEntry {
         tokens: &["rx", "9070"],
         entry: GpuCatalogEntry {
@@ -295,9 +333,8 @@ static CATALOG: &[GpuEntry] = &[
     },
     // ── AMD Radeon PRO W7900 (RDNA3) ─────────────────────────────────────────
     // 96 CUs, 48GB GDDR6. Dense FP16 matrix TFLOPS / BW from AMD product page:
-    // https://www.amd.com/en/products/graphics/workstations/radeon-pro/w7000-series/amd-radeon-pro-w7900.html
-    // https://www.amd.com/content/dam/amd/en/documents/products/graphics/workstation/radeon-pro-w7900-datasheet.pdf
     // No cloud $/GPU-hr row in gpu_prices.json → cost fields stay None.
+    // Source: https://www.amd.com/en/products/graphics/workstations/radeon-pro/w7000-series/amd-radeon-pro-w7900.html (accessed 2026-07-16)
     GpuEntry {
         tokens: &["w7900"],
         entry: GpuCatalogEntry {
@@ -308,7 +345,7 @@ static CATALOG: &[GpuEntry] = &[
     },
     // ── AMD Radeon PRO W7800 (RDNA3) ─────────────────────────────────────────
     // 70 CUs, 32GB GDDR6. Dense FP16 matrix / BW:
-    // https://www.amd.com/en/products/graphics/workstations/radeon-pro/w7000-series/amd-radeon-pro-w7800.html
+    // Source: https://www.amd.com/en/products/graphics/workstations/radeon-pro/w7000-series/amd-radeon-pro-w7800.html (accessed 2026-07-16)
     GpuEntry {
         tokens: &["w7800"],
         entry: GpuCatalogEntry {
@@ -322,7 +359,7 @@ static CATALOG: &[GpuEntry] = &[
     // Roofline ceiling may be optimistic for vLLM workloads.
     // XTX before XT: "xt" is a substring of "xtx", so XTX must match first.
     // Dense FP16 matrix 123 TFLOPS, BW 960 GB/s:
-    // https://www.amd.com/en/products/graphics/desktops/radeon/7000-series/amd-radeon-rx-7900xtx.html
+    // Source: https://www.amd.com/en/products/graphics/desktops/radeon/7000-series/amd-radeon-rx-7900xtx.html (accessed 2026-07-16)
     GpuEntry {
         tokens: &["rx", "7900", "xtx"],
         entry: GpuCatalogEntry {
@@ -333,7 +370,7 @@ static CATALOG: &[GpuEntry] = &[
     },
     // ── AMD Radeon RX 7900 GRE (RDNA3) ───────────────────────────────────────
     // 80 CUs, 16GB GDDR6. Budget 16GB option for local LLM inference.
-    // https://www.amd.com/en/products/graphics/desktops/radeon/7000-series/amd-radeon-rx-7900gre.html
+    // Source: https://www.amd.com/en/products/graphics/desktops/radeon/7000-series/amd-radeon-rx-7900gre.html (accessed 2026-07-16)
     GpuEntry {
         tokens: &["rx", "7900", "gre"],
         entry: GpuCatalogEntry {
@@ -344,7 +381,7 @@ static CATALOG: &[GpuEntry] = &[
     },
     // ── AMD Radeon RX 7900 XT (RDNA3) ───────────────────────────────────────
     // Dense FP16 matrix ~103 TFLOPS, BW 800 GB/s:
-    // https://www.amd.com/en/products/graphics/desktops/radeon/7000-series/amd-radeon-rx-7900xt.html
+    // Source: https://www.amd.com/en/products/graphics/desktops/radeon/7000-series/amd-radeon-rx-7900xt.html (accessed 2026-07-16)
     GpuEntry {
         tokens: &["rx", "7900", "xt"],
         entry: GpuCatalogEntry {
@@ -354,6 +391,7 @@ static CATALOG: &[GpuEntry] = &[
         },
     },
     // ── AMD Radeon RX 7800 XT (RDNA3) ───────────────────────────────────────
+    // Source: https://www.amd.com/en/products/graphics/desktops/radeon/7000-series/amd-radeon-rx-7800xt.html (accessed 2026-07-16)
     GpuEntry {
         tokens: &["rx", "7800", "xt"],
         entry: GpuCatalogEntry {
@@ -364,6 +402,7 @@ static CATALOG: &[GpuEntry] = &[
     },
     // ── AMD Radeon RX 7700 XT (RDNA3) ────────────────────────────────────────
     // 54 CUs, 12GB GDDR6.
+    // Source: https://www.amd.com/en/products/graphics/desktops/radeon/7000-series/amd-radeon-rx-7700xt.html (accessed 2026-07-16)
     GpuEntry {
         tokens: &["rx", "7700", "xt"],
         entry: GpuCatalogEntry {
@@ -374,6 +413,7 @@ static CATALOG: &[GpuEntry] = &[
     },
     // ── AMD Radeon RX 7600 XT (RDNA3) ────────────────────────────────────────
     // 32 CUs, 16GB GDDR6. Cheapest 16GB RDNA3 option for local LLM inference.
+    // Source: https://www.amd.com/en/products/graphics/desktops/radeon/7000-series/amd-radeon-rx-7600xt.html (accessed 2026-07-16)
     GpuEntry {
         tokens: &["rx", "7600", "xt"],
         entry: GpuCatalogEntry {
@@ -493,8 +533,16 @@ mod tests {
     fn b200() {
         let e = lookup_gpu("NVIDIA B200 SXM").expect("no match");
         assert_eq!(e.arch, "blackwell");
-        assert_eq!(e.peak_bw_gbps, 8000.0);
+        assert_eq!(e.peak_bw_gbps, 7700.0);
         assert_eq!(e.peak_flops_tc_tflops, 2250.0);
+    }
+
+    #[test]
+    fn b300() {
+        let e = lookup_gpu("NVIDIA B300 SXM").expect("no match");
+        assert_eq!(e.arch, "blackwell");
+        assert_eq!(e.peak_flops_tc_tflops, 4500.0);
+        assert_eq!(e.peak_bw_gbps, 8000.0);
     }
 
     #[test]
@@ -578,7 +626,7 @@ mod tests {
         // GB200 is the superchip (B200 GPU + Grace CPU). Same physics specs as B200.
         let e = lookup_gpu("NVIDIA GB200 NVL72").expect("no match");
         assert_eq!(e.arch, "blackwell");
-        assert_eq!(e.peak_bw_gbps, 8000.0);
+        assert_eq!(e.peak_bw_gbps, 7700.0);
     }
 
     #[test]

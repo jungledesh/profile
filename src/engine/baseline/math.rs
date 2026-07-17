@@ -1,7 +1,12 @@
 /// Conservative activation memory buffer vLLM reserves inside the allocated VRAM block.
 pub const ACTIVATION_KV_BUFFER_GB: f64 = 3.0;
 
-/// Prefill operations per second at the compute ceiling.
+/// Prefill throughput at the compute ceiling, in full prompts per second.
+///
+/// One "op" is one full forward pass over a prompt of length `seq_len`
+/// (linear GEMMs + attention). This is **prompts/s**, not tokens/s.
+/// Token throughput ≈ `prompts/s × seq_len`. Callers that need tok/s must
+/// multiply; display sites must not label this value as tok/s.
 ///
 /// Accounts for both linear layer FLOPs (2 × params × seq_len) and
 /// quadratic attention FLOPs (coeff × num_layers × seq_len²).
@@ -55,8 +60,8 @@ pub fn weight_gb(param_count: u64, bits_per_param: u8) -> f64 {
     (param_count as f64 * bits_per_param as f64) / (8.0 * 1e9)
 }
 
-/// Theoretical minimum latency (ms) for one token at the given ceiling.
-/// decode ceiling → tpot floor; prefill ceiling → prefill latency floor.
+/// Theoretical minimum latency (ms) for one unit of work at the given ceiling.
+/// decode ceiling (tok/s) → tpot floor; prefill ceiling (prompts/s) → ms per full prompt.
 pub fn latency_floor_ms(ceiling_tps: f64) -> f64 {
     1000.0 / ceiling_tps
 }
@@ -66,7 +71,14 @@ pub fn latency_floor_ms(ceiling_tps: f64) -> f64 {
 /// vLLM does not support fp32 KV cache, so 2 is the correct non-fp8 default.
 pub fn kv_bytes_per_element(kv_cache_dtype: Option<&str>, weight_bytes: u8) -> u8 {
     match kv_cache_dtype {
-        Some(d) if d.trim().to_ascii_lowercase().contains("fp8") => 1,
+        Some(d)
+            if {
+                let d = d.trim().to_ascii_lowercase();
+                d.contains("fp8") || d.contains("e4m3") || d.contains("e5m2")
+            } =>
+        {
+            1
+        }
         Some(d)
             if {
                 let d = d.trim().to_ascii_lowercase();
@@ -262,6 +274,8 @@ mod tests {
     fn kv_bytes_per_element_fp8() {
         assert_eq!(kv_bytes_per_element(Some("fp8"), 2), 1);
         assert_eq!(kv_bytes_per_element(Some("FP8"), 2), 1);
+        assert_eq!(kv_bytes_per_element(Some("e4m3fnuz"), 2), 1);
+        assert_eq!(kv_bytes_per_element(Some("e5m2"), 2), 1);
     }
 
     #[test]

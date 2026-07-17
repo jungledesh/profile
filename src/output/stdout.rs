@@ -319,10 +319,12 @@ fn baseline_lines(
         )];
     };
 
+    // ~ marks values derived from estimated ceilings. Measured values carry no tilde.
+    // Keep this distinction strict.
     // Line 1: efficiency + throughput ceilings
     let mut seg1 = Vec::new();
     let eff = match b.efficiency_pct {
-        Some(e) => format!("{e:.1}%"),
+        Some(e) => format!("~{e:.1}%"),
         None => "-".to_string(),
     };
     seg1.push(format!("decode_eff {eff}"));
@@ -332,7 +334,7 @@ fn baseline_lines(
     if let Some(prefill) = b.prefill
         && prefill.expected >= 10.0
     {
-        seg1.push(format!("prefill ~{:.0} tok/s (est)", prefill.expected));
+        seg1.push(format!("prefill ~{:.0} prompts/s (est)", prefill.expected));
     }
 
     // Line 2: memory budget + latency floors
@@ -482,8 +484,10 @@ fn format_efficiency_label(
     actual_tps: Option<f64>,
     decode_ceiling: Option<f64>,
 ) -> String {
+    // ~ marks values derived from estimated ceilings. Measured values carry no tilde.
+    // Keep this distinction strict.
     if let Some(e) = efficiency_pct.filter(|e| e.is_finite()) {
-        return format!("decode_eff {:.1}%", e);
+        return format!("decode_eff ~{:.1}%", e);
     }
     let actual = actual_tps.filter(|t| t.is_finite() && *t > 0.0);
     let ceiling = decode_ceiling.filter(|c| c.is_finite() && *c > 0.0);
@@ -860,6 +864,7 @@ mod tests {
             headroom_pct: None,
             weight_dtype_source: engine::WeightDtypeSource::EnvVar,
             weight_gb: 16.0,
+            weight_bytes_per_param: 2,
             kv_headroom_gb: Some(8.0),
             tpot_floor_ms: 10.0,
             prefill_latency_floor_ms: Some(20.0),
@@ -874,7 +879,7 @@ mod tests {
                 "{:<width$}{}{}",
                 "HW LIMITS",
                 VLLM_LABEL_METRICS_GAP,
-                "decode_eff - | decode ~100 tok/s (est) | prefill ~50 tok/s (est)",
+                "decode_eff - | decode ~100 tok/s (est) | prefill ~50 prompts/s (est)",
                 width = GPU_LABEL_W
             )
         );
@@ -902,6 +907,7 @@ mod tests {
             headroom_pct: Some(50.0),
             weight_dtype_source: engine::WeightDtypeSource::EnvVar,
             weight_gb: 16.0,
+            weight_bytes_per_param: 2,
             kv_headroom_gb: Some(8.0),
             tpot_floor_ms: 10.0,
             prefill_latency_floor_ms: Some(42.0),
@@ -910,6 +916,11 @@ mod tests {
             cost: None,
         };
         let above = baseline_lines(Some(base()), Some(40.0), None);
+        assert!(
+            above[0].contains("decode_eff ~50.0%"),
+            "derived efficiency should carry estimate marker: {}",
+            above[0]
+        );
         assert!(
             !above[1].contains("prefill_floor"),
             "expected no prefill_floor at ridge: {}",
@@ -940,6 +951,7 @@ mod tests {
             headroom_pct: Some(50.0),
             weight_dtype_source: engine::WeightDtypeSource::EnvVar,
             weight_gb: 16.0,
+            weight_bytes_per_param: 2,
             kv_headroom_gb: Some(8.0),
             tpot_floor_ms: 10.0,
             prefill_latency_floor_ms: Some(200.0),
@@ -977,6 +989,7 @@ mod tests {
             headroom_pct: Some(50.0),
             weight_dtype_source: engine::WeightDtypeSource::EnvVar,
             weight_gb: 16.0,
+            weight_bytes_per_param: 2,
             kv_headroom_gb: Some(8.0),
             tpot_floor_ms: 10.0,
             prefill_latency_floor_ms: Some(20.0),
@@ -986,7 +999,7 @@ mod tests {
         };
         let lines = baseline_lines(Some(b), Some(10.0), None);
         assert!(
-            lines[0].contains("prefill ~50 tok/s (est)"),
+            lines[0].contains("prefill ~50 prompts/s (est)"),
             "line1 should include prefill ceiling: {}",
             lines[0]
         );
@@ -1017,6 +1030,7 @@ mod tests {
             headroom_pct: None,
             weight_dtype_source: WeightDtypeSource::Fallback,
             weight_gb: 1.0,
+            weight_bytes_per_param: 2,
             kv_headroom_gb: None,
             tpot_floor_ms: 10.0,
             prefill_latency_floor_ms: None,
@@ -1047,6 +1061,7 @@ mod tests {
             headroom_pct: None,
             weight_dtype_source: WeightDtypeSource::Fallback,
             weight_gb: 1.0,
+            weight_bytes_per_param: 2,
             kv_headroom_gb: None,
             tpot_floor_ms: 10.0,
             prefill_latency_floor_ms: None,
@@ -1075,7 +1090,7 @@ mod tests {
             Some(0.31),
         );
         let s = gpu_gauges_line(&g, Some(&b), Some(5978.2), false);
-        assert!(s.contains("decode_eff 31.7%"));
+        assert!(s.contains("decode_eff ~31.7%"));
         assert!(s.contains("power 421W"));
         assert!(s.contains("0.31 J/tok"));
         assert!(!s.contains("tok/W"));
@@ -1124,7 +1139,7 @@ mod tests {
             ..Default::default()
         };
         let s = gpu_gauges_line(&g, Some(&baseline_efficiency(28.0)), None, false);
-        assert!(s.contains("decode_eff 28.0%"));
+        assert!(s.contains("decode_eff ~28.0%"));
         assert!(s.contains("power 310W"));
         assert!(s.contains("vRAM 72/80GB"));
         let g_peak = GpuRawMetrics {
@@ -1279,6 +1294,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(vllm_throughput_value(&v), "59 tok/s");
+        assert!(!vllm_throughput_value(&v).contains('~'));
     }
 
     #[test]
@@ -1293,6 +1309,7 @@ mod tests {
             vllm_prompt_value(&v, false, v.prefix_cache_hit_rate),
             "kv_cache 45.2% avg | pfix_cache 50.0%"
         );
+        assert!(!vllm_prompt_value(&v, false, v.prefix_cache_hit_rate).contains('~'));
     }
 
     #[test]
@@ -1619,6 +1636,7 @@ mod tests {
             }],
             suppressed_rules: Vec::new(),
             kv_max_seqs: None,
+            prescribed_kv_capacity: None,
             n_eval,
             skipped_broken: 0,
             skipped_idle: 0,

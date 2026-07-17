@@ -36,6 +36,12 @@ jobs:
       - name: cargo audit
         uses: actions-rust-lang/audit@v1
 
+      - name: cargo deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features
+
       - name: OSV-Scanner (fail on HIGH/CRITICAL)
         run: |
           curl -sSfL https://github.com/google/osv-scanner/releases/latest/download/osv-scanner_linux_amd64 \

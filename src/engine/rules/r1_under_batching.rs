@@ -2,7 +2,7 @@ use crate::collectors::RawSnapshot;
 
 #[cfg(test)]
 use super::Recommendation;
-use super::r6_prefill_bound::effective_prompt_tps;
+use super::r6_prefill_bound::{PROMPT_GEN_RATIO_MILD, effective_prompt_tps};
 #[cfg(test)]
 use super::rule_names;
 
@@ -14,10 +14,6 @@ const OCCUPANCY_FALLBACK_PCT: f64 = 0.25;
 
 /// Config-relative efficiency below this means server is underperforming its config.
 const CONFIG_EFFICIENCY_STARVATION_PCT: f64 = 60.0;
-
-/// Prompt-to-generation ratio above which R1 defers to R6.
-/// Matches R6's PROMPT_GEN_RATIO_MILD threshold.
-const PREFILL_FRACTION_GATE_RATIO: f64 = 5.0;
 
 /// Waiting requests below this means no backlog pressure.
 const UNDER_BATCHING_WAITING_LT: f64 = 2.0;
@@ -120,7 +116,7 @@ pub(super) fn rule1_under_batching_with_efficiency(input: R1EvalInput<'_>) -> Ru
         } else {
             f64::INFINITY
         };
-        if ratio >= PREFILL_FRACTION_GATE_RATIO {
+        if ratio >= PROMPT_GEN_RATIO_MILD {
             return Rule1Outcome::NotFired;
         }
     }

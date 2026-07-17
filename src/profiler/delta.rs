@@ -31,6 +31,8 @@ pub struct Delta {
     pub config_drifted: bool,
     /// Non-baseline config diffs for display (e.g. max_num_seqs).
     pub config_changes: Vec<String>,
+    /// Self-grade after R2 prescribed a capacity and fresh observed concurrency exists.
+    pub capacity_self_grade: Option<(u32, f64)>,
 }
 
 pub fn compute(
@@ -90,6 +92,19 @@ pub fn compute(
         .and_then(|b| b.cost.as_ref())
         .and_then(|c| c.joules_per_token);
 
+    let capacity_self_grade = match (
+        prev_report.prescribed_kv_capacity,
+        curr_result
+            .snapshot
+            .vllm
+            .cache_config
+            .kv_cache_max_concurrency
+            .filter(|c| c.is_finite() && *c > 0.0),
+    ) {
+        (Some(x), Some(y)) => Some((x, y)),
+        _ => None,
+    };
+
     Delta {
         throughput_before,
         throughput_after,
@@ -111,6 +126,7 @@ pub fn compute(
         tpot_p95_after_ms,
         config_drifted,
         config_changes,
+        capacity_self_grade,
     }
 }
 
@@ -188,6 +204,7 @@ mod tests {
                 headroom_pct: eff.map(|e| 100.0 - e.min(100.0)),
                 weight_dtype_source: WeightDtypeSource::Fallback,
                 weight_gb: 1.0,
+                weight_bytes_per_param: 2,
                 kv_headroom_gb: None,
                 tpot_floor_ms: 1.0,
                 prefill_latency_floor_ms: None,
@@ -198,6 +215,7 @@ mod tests {
             recommendations: Vec::new(),
             suppressed_rules: Vec::new(),
             kv_max_seqs: None,
+            prescribed_kv_capacity: None,
             n_eval: 0,
             skipped_broken: 0,
             skipped_idle: 0,
@@ -257,6 +275,58 @@ mod tests {
             changes.clone(),
         );
         assert_eq!(d.config_changes, changes);
+    }
+
+    #[test]
+    fn capacity_self_grade_when_derived_prescription_and_observed() {
+        // Derived prescriptions are captured on Report; Observed sets None (see
+        // prescribed_for_self_grade). Delta only grades when both sides exist.
+        let mut prev_rep = report_eff(Some(40.0), None, None);
+        prev_rep.prescribed_kv_capacity = Some(24);
+        let mut curr = diagnose(Some(100.0));
+        curr.snapshot.vllm.cache_config.kv_cache_max_concurrency = Some(24.64);
+        let d = compute(
+            &diagnose(Some(100.0)),
+            &prev_rep,
+            &curr,
+            &report_eff(Some(50.0), None, None),
+            false,
+            Vec::new(),
+        );
+        assert_eq!(d.capacity_self_grade, Some((24, 24.64)));
+    }
+
+    #[test]
+    fn capacity_self_grade_absent_when_observed_prescription_not_captured() {
+        // Observed R2 prescriptions leave prescribed_kv_capacity = None.
+        let prev_rep = report_eff(Some(40.0), None, None);
+        assert_eq!(prev_rep.prescribed_kv_capacity, None);
+        let mut curr = diagnose(Some(100.0));
+        curr.snapshot.vllm.cache_config.kv_cache_max_concurrency = Some(24.64);
+        let d = compute(
+            &diagnose(Some(100.0)),
+            &prev_rep,
+            &curr,
+            &report_eff(Some(50.0), None, None),
+            false,
+            Vec::new(),
+        );
+        assert_eq!(d.capacity_self_grade, None);
+    }
+
+    #[test]
+    fn capacity_self_grade_absent_without_both() {
+        let mut prev_rep = report_eff(Some(40.0), None, None);
+        prev_rep.prescribed_kv_capacity = Some(24);
+        let d = compute(
+            &diagnose(Some(100.0)),
+            &prev_rep,
+            &diagnose(Some(100.0)),
+            &report_eff(Some(50.0), None, None),
+            false,
+            Vec::new(),
+        );
+        assert_eq!(d.capacity_self_grade, None);
     }
 
     #[test]

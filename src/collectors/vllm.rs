@@ -589,6 +589,24 @@ fn parse_cache_config_labels(scrape: &Scrape) -> CacheConfigLabels {
             .labels
             .get("enable_chunked_prefill")
             .and_then(super::config::parse_bool),
+        // Allocator-computed (vLLM v0.25.1 cache.py); absent → None, never guessed.
+        kv_cache_size_tokens: s
+            .labels
+            .get("kv_cache_size_tokens")
+            .and_then(|v| v.parse().ok()),
+        kv_cache_max_concurrency: s
+            .labels
+            .get("kv_cache_max_concurrency")
+            .and_then(|v| v.parse().ok())
+            .filter(|v: &f64| v.is_finite() && *v > 0.0),
+        mamba_block_size: s
+            .labels
+            .get("mamba_block_size")
+            .and_then(|v| v.parse().ok()),
+        mamba_page_size_padded: s
+            .labels
+            .get("mamba_page_size_padded")
+            .and_then(|v| v.parse().ok()),
     }
 }
 
@@ -1191,6 +1209,10 @@ vllm:cache_config_info{block_size="16",cache_dtype="auto",cpu_offload_gb="0",ena
         assert_eq!(cc.cache_dtype.as_deref(), Some("auto"));
         assert_eq!(cc.enable_prefix_caching, Some(true));
         assert_eq!(cc.enable_chunked_prefill, Some(false));
+        assert!(cc.kv_cache_size_tokens.is_none());
+        assert!(cc.kv_cache_max_concurrency.is_none());
+        assert!(cc.mamba_block_size.is_none());
+        assert!(cc.mamba_page_size_padded.is_none());
     }
 
     #[test]
@@ -1203,6 +1225,26 @@ vllm:cache_config_info{block_size="16",cache_dtype="auto",cpu_offload_gb="0",ena
         assert!(cc.cache_dtype.is_none());
         assert!(cc.enable_prefix_caching.is_none());
         assert!(cc.enable_chunked_prefill.is_none());
+        assert!(cc.kv_cache_size_tokens.is_none());
+        assert!(cc.kv_cache_max_concurrency.is_none());
+        assert!(cc.mamba_block_size.is_none());
+        assert!(cc.mamba_page_size_padded.is_none());
+    }
+
+    /// Ground truth from H100 boot log Jul 16: concurrency 24.64x at max_model_len 8192.
+    #[test]
+    fn cache_config_info_allocator_labels_parsed() {
+        // 345 was the Jul 16 boot log's mamba block COUNT; that number is not what
+        // mamba_block_size carries. Field semantics per vllm/config/cache.py.
+        let body = r#"
+vllm:cache_config_info{block_size="16",num_gpu_blocks="4096",cache_dtype="auto",enable_prefix_caching="True",enable_chunked_prefill="False",kv_cache_size_tokens="201874",kv_cache_max_concurrency="24.64",mamba_block_size="784",mamba_page_size_padded="25690112"} 1.0
+"#;
+        let scrape = scrape_from_body(body).unwrap();
+        let cc = parse_cache_config_labels(&scrape);
+        assert_eq!(cc.kv_cache_size_tokens, Some(201_874));
+        assert_eq!(cc.kv_cache_max_concurrency, Some(24.64));
+        assert_eq!(cc.mamba_block_size, Some(784));
+        assert_eq!(cc.mamba_page_size_padded, Some(25_690_112));
     }
 
     #[test]

@@ -1,6 +1,8 @@
 use super::format::{append_waste_line, r2_kv_cache_advisory, waste_label_suffix};
 use super::r1_under_batching::{r1_recommendation, rule1_under_batching_with_efficiency};
-use super::r2_kv_cache_pressure::{Rule2Outcome, rule2_kv_cache_pressure};
+use super::r2_kv_cache_pressure::{
+    KvCapacityLabel, Rule2Outcome, r2_recommendation, rule2_kv_cache_pressure,
+};
 use super::r3_low_prefix_reuse::{format_low_prefix_hit_rate_fired, rule3_low_prefix_reuse};
 use super::*;
 use crate::collectors::{GpuRawMetrics, RawSnapshot, VllmConfig, VllmRawMetrics};
@@ -244,6 +246,7 @@ fn baseline_for_waste(eff: f64, source: CostSource, cpm: f64) -> PhysicsBaseline
         headroom_pct: Some(100.0 - eff),
         weight_dtype_source: WeightDtypeSource::Fallback,
         weight_gb: 1.0,
+        weight_bytes_per_param: 2,
         kv_headroom_gb: None,
         tpot_floor_ms: 10.0,
         prefill_latency_floor_ms: None,
@@ -342,13 +345,14 @@ fn compute_kv_max_seqs_uses_kv_layers_over_total_layers() {
     };
     #[allow(clippy::cast_precision_loss)]
     let headroom_gb = (1u64 << 34) as f64 / 1e9;
-    let with_kv_layers = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &hybrid, None, None);
+    let with_kv_layers = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &hybrid, None, None, 2);
 
     let dense = ModelArch {
         num_kv_layers: None,
         ..hybrid
     };
-    let without_kv_layers = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &dense, None, None);
+    let without_kv_layers =
+        compute_kv_max_seqs(Some(headroom_gb), Some(4096), &dense, None, None, 2);
 
     assert!(with_kv_layers.is_some() && without_kv_layers.is_some());
     assert_eq!(with_kv_layers.unwrap(), without_kv_layers.unwrap() * 4);
@@ -363,8 +367,8 @@ fn compute_kv_max_seqs_tp2_doubles_capacity() {
         ..Default::default()
     };
     let headroom_gb = 20.0;
-    let tp1 = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &model, None, Some(1));
-    let tp2 = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &model, None, Some(2));
+    let tp1 = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &model, None, Some(1), 2);
+    let tp2 = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &model, None, Some(2), 2);
     assert_eq!(tp2.unwrap(), tp1.unwrap() * 2);
 }
 
@@ -377,8 +381,8 @@ fn compute_kv_max_seqs_tp_greater_than_kv_heads_no_benefit() {
         ..Default::default()
     };
     let headroom_gb = 20.0;
-    let tp2 = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &model, None, Some(2));
-    let tp4 = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &model, None, Some(4));
+    let tp2 = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &model, None, Some(2), 2);
+    let tp4 = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &model, None, Some(4), 2);
     assert_eq!(tp2, tp4);
 }
 
@@ -391,9 +395,23 @@ fn compute_kv_max_seqs_tp_none_uses_full_heads() {
         ..Default::default()
     };
     let headroom_gb = 20.0;
-    let none = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &model, None, None);
-    let one = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &model, None, Some(1));
+    let none = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &model, None, None, 2);
+    let one = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &model, None, Some(1), 2);
     assert_eq!(none, one);
+}
+
+#[test]
+fn compute_kv_max_seqs_auto_kv_inherits_weight_bytes() {
+    let model = ModelArch {
+        num_kv_heads: Some(8),
+        head_dim: Some(128),
+        num_layers: Some(32),
+        ..Default::default()
+    };
+    let headroom_gb = 20.0;
+    let bf16 = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &model, Some("auto"), None, 2);
+    let fp8_w = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &model, Some("auto"), None, 1);
+    assert_eq!(fp8_w.unwrap(), bf16.unwrap() * 2);
 }
 
 #[test]
@@ -909,6 +927,7 @@ fn empty_run_stdout_and_format_sites_byte_identical() {
                     recommendations: Vec::new(),
                     suppressed_rules: Vec::new(),
                     kv_max_seqs: None,
+                    prescribed_kv_capacity: None,
                     n_eval: 0,
                     skipped_broken: if any_evaluable { 0 } else { windows.len() },
                     skipped_idle: if any_evaluable { windows.len() } else { 0 },
@@ -1367,7 +1386,8 @@ fn r2_recommendation_confidence_from_density_counts() {
     let mut v = vllm_high_kv();
     v.num_preemptions_per_sec = Some(0.05);
     let s = snap(t, t, v, gpu_low());
-    let r = r2_recommendation(&s, None, None, None, 1, 4, false).expect("fired");
+    let r = r2_recommendation(&s, None, None, None, KvCapacityLabel::Derived, 1, 4, false)
+        .expect("fired");
     assert_eq!(r.rule_name, rule_names::KV_CACHE_PRESSURE);
     assert_eq!(r.impact, 5);
     assert!((r.confidence - 0.5).abs() < 1e-9);
@@ -1381,7 +1401,8 @@ fn r2_recommendation_includes_peak_from_detail() {
     v.kv_cache_peak_perc = Some(99.4);
     v.num_preemptions_per_sec = Some(0.05);
     let s = snap(t, t, v, gpu_low());
-    let r = r2_recommendation(&s, None, None, None, 1, 1, false).expect("fired");
+    let r = r2_recommendation(&s, None, None, None, KvCapacityLabel::Derived, 1, 1, false)
+        .expect("fired");
     let text = r.display_lines.join("\n");
     assert!(text.contains("KV cache 89% avg, 99% peak (threshold: 88%)."));
 }
@@ -1421,10 +1442,19 @@ fn kv_cache_pressure_preemption_displays_without_premature_confidence() {
     let s_kv_only = snap(t, t, vllm_high_kv_stressed(), gpu_busy());
     let ctx2 = mk_ctx();
     let win_kv_only = mk_win(s_kv_only);
-    let r2_text = r2_recommendation(&win_kv_only.snapshot, None, None, None, 1, 1, false)
-        .expect("r2 fired")
-        .display_lines
-        .join("\n");
+    let r2_text = r2_recommendation(
+        &win_kv_only.snapshot,
+        None,
+        None,
+        None,
+        KvCapacityLabel::Derived,
+        1,
+        1,
+        false,
+    )
+    .expect("r2 fired")
+    .display_lines
+    .join("\n");
     assert!(!r2_text.contains("Confidence:"));
     let text =
         format_diagnose_rules_test(&ctx2, &win_kv_only, false, "http://127.0.0.1:8000/metrics")

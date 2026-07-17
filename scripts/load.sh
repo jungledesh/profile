@@ -20,8 +20,8 @@
 set -euo pipefail
 
 VLLM_URL="${VLLM_URL:-http://localhost:8000}"
-MODEL="${MODEL:-llama3}"
-MODE="${MODE:-r1}"
+MODEL="${MODEL:-Qwen3.6-27B}"
+MODE="${MODE:-rag}"
 
 post() {
   local prompt="$1" max_tokens="$2"

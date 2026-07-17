@@ -74,26 +74,26 @@ mod tests {
     #[test]
     fn h200_matches_sxm_name() {
         let p = lookup_gpu_price("NVIDIA H200 SXM5").expect("h200 price");
-        assert!((p.on_demand_per_hr - 3.50).abs() < 1e-9);
+        assert!((p.on_demand_per_hr - 4.39).abs() < 1e-9);
         assert!((p.spot_per_hr - 2.50).abs() < 1e-9);
     }
 
     #[test]
     fn h100_pcie_does_not_match_sxm_price() {
         let p = lookup_gpu_price("NVIDIA H100 PCIe 80GB").expect("h100 pcie price");
-        assert!((p.on_demand_per_hr - 2.20).abs() < 1e-9);
+        assert!((p.on_demand_per_hr - 2.89).abs() < 1e-9);
     }
 
     #[test]
     fn h100_sxm_price() {
         let p = lookup_gpu_price("NVIDIA H100 SXM5 80GB HBM3").expect("h100 sxm price");
-        assert!((p.on_demand_per_hr - 2.80).abs() < 1e-9);
+        assert!((p.on_demand_per_hr - 2.99).abs() < 1e-9);
     }
 
     #[test]
     fn h100_hbm3_price_without_sxm_token() {
         let p = lookup_gpu_price("NVIDIA H100 80GB HBM3").expect("h100 hbm3 price");
-        assert!((p.on_demand_per_hr - 2.80).abs() < 1e-9);
+        assert!((p.on_demand_per_hr - 2.99).abs() < 1e-9);
     }
 
     #[test]
@@ -105,14 +105,14 @@ mod tests {
     #[test]
     fn rtx_4090_price() {
         let p = lookup_gpu_price("NVIDIA GeForce RTX 4090").expect("rtx 4090 price");
-        assert!((p.on_demand_per_hr - 0.44).abs() < 1e-9);
+        assert!((p.on_demand_per_hr - 0.69).abs() < 1e-9);
         assert!((p.spot_per_hr - 0.35).abs() < 1e-9);
     }
 
     #[test]
     fn a100_80gb_price() {
         let p = lookup_gpu_price("NVIDIA A100-SXM4-80GB").expect("a100 80gb price");
-        assert!((p.on_demand_per_hr - 1.50).abs() < 1e-9);
+        assert!((p.on_demand_per_hr - 1.49).abs() < 1e-9);
         assert!((p.spot_per_hr - 0.60).abs() < 1e-9);
     }
 
@@ -124,7 +124,7 @@ mod tests {
     #[test]
     fn mi300x_price() {
         let p = lookup_gpu_price("AMD Instinct MI300X").expect("mi300x price");
-        assert!((p.on_demand_per_hr - 2.50).abs() < 1e-9);
+        assert!((p.on_demand_per_hr - 3.49).abs() < 1e-9);
         assert!((p.spot_per_hr - 1.85).abs() < 1e-9);
     }
 
