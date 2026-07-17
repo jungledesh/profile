@@ -258,6 +258,8 @@ pub fn r2_recommendation(
                 capacity_label,
                 weight_bytes_per_param: 2,
                 fp8_compiler_available,
+                model: None,
+                tp: None,
             },
             windows_fired,
             total_evaluable,
@@ -420,6 +422,21 @@ pub(super) struct KvFormatCtx<'a> {
     pub capacity_label: KvCapacityLabel,
     pub weight_bytes_per_param: u8,
     pub fp8_compiler_available: bool,
+    pub model: Option<&'a crate::context::ModelArch>,
+    pub tp: Option<u32>,
+}
+
+impl<'a> KvFormatCtx<'a> {
+    fn hyp_capacity(&self) -> super::HypCapacityCtx<'a> {
+        super::HypCapacityCtx {
+            cache: &self.snapshot.vllm.cache_config,
+            kv_headroom_gb: self.kv_headroom_gb,
+            model: self.model,
+            kv_cache_dtype: self.snapshot.vllm.cache_config.cache_dtype.as_deref(),
+            tp: self.tp,
+            weight_bytes: self.weight_bytes_per_param,
+        }
+    }
 }
 
 pub(super) fn format_kv_cache_pressure_fired(
@@ -428,15 +445,14 @@ pub(super) fn format_kv_cache_pressure_fired(
     windows_fired: usize,
     total_evaluable: usize,
 ) -> Vec<String> {
-    let KvFormatCtx {
-        snapshot,
-        max_model_len,
-        kv_headroom_gb,
-        kv_max_seqs,
-        capacity_label,
-        weight_bytes_per_param,
-        fp8_compiler_available,
-    } = *ctx;
+    let hyp = ctx.hyp_capacity();
+    let snapshot = ctx.snapshot;
+    let max_model_len = ctx.max_model_len;
+    let kv_headroom_gb = ctx.kv_headroom_gb;
+    let kv_max_seqs = ctx.kv_max_seqs;
+    let capacity_label = ctx.capacity_label;
+    let weight_bytes_per_param = ctx.weight_bytes_per_param;
+    let fp8_compiler_available = ctx.fp8_compiler_available;
     let kv_cache_dtype = snapshot.vllm.cache_config.cache_dtype.as_deref();
     let kv_avg = d.kv_cache_usage_perc;
     let peak = d.kv_peak_pct.unwrap_or(kv_avg);
@@ -503,6 +519,7 @@ pub(super) fn format_kv_cache_pressure_fired(
             snapshot.vllm.generation_tokens_p99,
             total_count,
             "      ",
+            Some(&hyp),
         );
     } else {
         out.push(max_num_seqs_bullet(
@@ -530,6 +547,7 @@ pub(super) fn format_kv_cache_pressure_fired(
             snapshot.vllm.generation_tokens_p99,
             total_count,
             "      ",
+            Some(&hyp),
         );
     }
     let expected = if d.preemptions_active {
@@ -579,6 +597,7 @@ pub(super) fn format_kv_admission_backlog_issue(
         out.push(bullet);
     }
     let total_count = ctx.snapshot.vllm.generation_tokens_completed.unwrap_or(0.0);
+    let hyp = ctx.hyp_capacity();
     super::push_model_len_shrink_suggestion(
         &mut out,
         ctx.max_model_len,
@@ -586,6 +605,7 @@ pub(super) fn format_kv_admission_backlog_issue(
         ctx.snapshot.vllm.generation_tokens_p99,
         total_count,
         "      ",
+        Some(&hyp),
     );
     out.push(String::new());
     out.push("    Expected: Wait queue drains, TTFT recovers.".to_string());
@@ -686,6 +706,8 @@ mod tests {
             capacity_label: KvCapacityLabel::Derived,
             weight_bytes_per_param: 2,
             fp8_compiler_available: false,
+            model: None,
+            tp: None,
         }
     }
 

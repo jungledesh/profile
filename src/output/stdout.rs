@@ -1637,6 +1637,7 @@ mod tests {
             suppressed_rules: Vec::new(),
             kv_max_seqs: None,
             prescribed_kv_capacity: None,
+            catalog_state_mismatch: None,
             n_eval,
             skipped_broken: 0,
             skipped_idle: 0,

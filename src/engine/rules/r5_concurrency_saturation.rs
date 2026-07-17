@@ -148,6 +148,7 @@ pub(super) fn format_concurrency_saturation_issue(
     max_model_len: Option<u32>,
     kv_max_seqs: Option<u32>,
     snapshot: &RawSnapshot,
+    hyp: Option<&super::HypCapacityCtx<'_>>,
 ) -> Vec<String> {
     let max_str = d
         .max_num_seqs
@@ -235,6 +236,7 @@ pub(super) fn format_concurrency_saturation_issue(
                     snapshot.vllm.generation_tokens_p99,
                     snapshot.vllm.generation_tokens_completed.unwrap_or(0.0),
                     "      ",
+                    hyp,
                 );
             } else {
                 match kv_max_seqs {
@@ -270,6 +272,7 @@ pub(super) fn format_concurrency_saturation_issue(
                     snapshot.vllm.generation_tokens_p99,
                     snapshot.vllm.generation_tokens_completed.unwrap_or(0.0),
                     "      ",
+                    hyp,
                 );
             } else {
                 lines.push(format!(
@@ -290,9 +293,10 @@ pub(super) fn format_concurrency_saturation_window_issue(
     max_model_len: Option<u32>,
     kv_max_seqs: Option<u32>,
     snapshot: &RawSnapshot,
+    hyp: Option<&super::HypCapacityCtx<'_>>,
 ) -> Vec<String> {
     super::with_seen_pct(
-        format_concurrency_saturation_issue(d, max_model_len, kv_max_seqs, snapshot),
+        format_concurrency_saturation_issue(d, max_model_len, kv_max_seqs, snapshot, hyp),
         seen_pct,
     )
 }
@@ -323,6 +327,7 @@ pub fn r5_recommendation(
             max_model_len,
             kv_max_seqs,
             snapshot,
+            None,
         ),
     })
 }
@@ -534,6 +539,7 @@ mod tests {
             None,
             None,
             &blank_snap(),
+            None,
         )
         .join("\n");
         assert!(text.contains("ceiling unknown"));
@@ -549,6 +555,7 @@ mod tests {
             Some(8192),
             Some(13),
             &model_len_snap(6000.0, 450.0, 150.0),
+            None,
         )
         .join("\n");
         assert!(text.contains("physics ceiling for max_model_len=8192"));
@@ -564,6 +571,7 @@ mod tests {
             Some(8192),
             None,
             &blank_snap(),
+            None,
         )
         .join("\n");
         assert!(text.contains("KV at 85%"));
@@ -580,6 +588,7 @@ mod tests {
             None,
             None,
             &blank_snap(),
+            None,
         )
         .join("\n");
         assert!(text.contains("if KV cache has headroom"));
@@ -593,6 +602,7 @@ mod tests {
             None,
             None,
             &blank_snap(),
+            None,
         )
         .join("\n");
         assert!(text.contains("Confidence: High"));
@@ -605,6 +615,7 @@ mod tests {
             None,
             None,
             &blank_snap(),
+            None,
         )
         .join("\n");
         assert!(text.contains("Confidence: Medium"));
@@ -613,6 +624,7 @@ mod tests {
             None,
             None,
             &blank_snap(),
+            None,
         )
         .join("\n");
         assert!(text2.contains("Confidence: Medium"));
@@ -625,6 +637,7 @@ mod tests {
             Some(8192),
             None,
             &blank_snap(),
+            None,
         )
         .join("\n");
         assert!(text.contains("Add a replica to scale out"));
@@ -644,7 +657,7 @@ mod tests {
             max_num_seqs: Some(13),
             ..Default::default()
         });
-        let text = format_concurrency_saturation_issue(&d, None, None, &s).join("\n");
+        let text = format_concurrency_saturation_issue(&d, None, None, &s, None).join("\n");
         assert!(text.contains("237 waiting, 13 running"));
         assert!(!text.contains("of 13 active"));
         assert!(!text.contains("of 250 active"));
@@ -657,6 +670,7 @@ mod tests {
             None,
             None,
             &blank_snap(),
+            None,
         )
         .join("\n");
         assert!(text.contains("TTFT 5.0s"));
@@ -666,7 +680,8 @@ mod tests {
     fn cause_falls_back_to_ttft_p99_when_snapshot_has_no_p95() {
         let mut d = fired_detail(Some(5000.0), None);
         d.ttft_p99_ms = Some(12400.0);
-        let text = format_concurrency_saturation_issue(&d, None, None, &blank_snap()).join("\n");
+        let text =
+            format_concurrency_saturation_issue(&d, None, None, &blank_snap(), None).join("\n");
         // snapshot has no p95 → falls back to d.ttft_p99_ms
         assert!(text.contains("TTFT (p99 12.4s) (5.0s avg)"));
     }
@@ -680,7 +695,7 @@ mod tests {
             ttft_ms: Some(5000.0),     // snapshot avg: 5.0s
             ..Default::default()
         });
-        let text = format_concurrency_saturation_issue(&d, None, None, &s).join("\n");
+        let text = format_concurrency_saturation_issue(&d, None, None, &s, None).join("\n");
         assert!(
             text.contains("TTFT (p95 9.5s)"),
             "snapshot p95 must win over d.ttft_p99"
@@ -700,7 +715,7 @@ mod tests {
             kv_cache_usage_perc: Some(70.0),
             ..Default::default()
         });
-        let text = format_concurrency_saturation_issue(&d, None, None, &s).join("\n");
+        let text = format_concurrency_saturation_issue(&d, None, None, &s, None).join("\n");
         assert!(
             text.contains("Raise --max-num-seqs"),
             "snapshot KV (70%) should flip fix to raise cap"
@@ -715,7 +730,8 @@ mod tests {
     fn cause_shows_ttft_p99_only_when_mean_missing() {
         let mut d = fired_detail(None, None);
         d.ttft_p99_ms = Some(12400.0);
-        let text = format_concurrency_saturation_issue(&d, None, None, &blank_snap()).join("\n");
+        let text =
+            format_concurrency_saturation_issue(&d, None, None, &blank_snap(), None).join("\n");
         assert!(text.contains("TTFT (p99 12.4s)"));
         assert!(!text.contains("avg"));
     }
@@ -727,6 +743,7 @@ mod tests {
             None,
             None,
             &blank_snap(),
+            None,
         )
         .join("\n");
         assert!(!text.contains("requests queued ahead"));
@@ -809,6 +826,7 @@ mod tests {
             None,
             None,
             &blank_snap(),
+            None,
         );
         assert_eq!(lines[1], "    Seen in 40% of windows");
     }
@@ -943,6 +961,7 @@ mod tests {
             Some(8192),
             Some(15),
             &model_len_snap(6000.0, 450.0, 150.0),
+            None,
         )
         .join("\n");
         assert!(text.contains("physics ceiling for max_model_len=8192"));
@@ -957,6 +976,7 @@ mod tests {
             Some(4096),
             None,
             &blank_snap(),
+            None,
         )
         .join("\n");
         assert!(text.contains("Add a replica to scale out"));

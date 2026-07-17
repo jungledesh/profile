@@ -444,6 +444,7 @@ fn model_len_suggestion_uses_p99_sum_when_count_sufficient() {
         Some(450.0),
         150.0,
         "      ",
+        None,
     );
     let text = lines.join("\n");
     assert!(text.contains("to ~6450"));
@@ -461,6 +462,7 @@ fn model_len_suggestion_no_op_when_count_below_threshold() {
         Some(450.0),
         50.0,
         "      ",
+        None,
     );
     let text = lines.join("\n");
     assert!(text.contains("to safely raise concurrency"));
@@ -470,7 +472,15 @@ fn model_len_suggestion_no_op_when_count_below_threshold() {
 #[test]
 fn model_len_suggestion_no_op_when_p99_missing() {
     let mut lines = Vec::new();
-    push_model_len_shrink_suggestion(&mut lines, Some(8192), Some(6000.0), None, 150.0, "      ");
+    push_model_len_shrink_suggestion(
+        &mut lines,
+        Some(8192),
+        Some(6000.0),
+        None,
+        150.0,
+        "      ",
+        None,
+    );
     let text = lines.join("\n");
     assert!(text.contains("to safely raise concurrency"));
     assert!(!text.contains("to ~"));
@@ -486,8 +496,169 @@ fn model_len_suggestion_suppressed_when_delta_below_5pct() {
         Some(65.0),
         150.0,
         "      ",
+        None,
     );
     assert!(lines.is_empty());
+}
+
+#[test]
+fn model_len_suggestion_projects_capacity_from_observed_geometry() {
+    // Source: H100 ladder 2026-07-17 — 390 blocks, mamba_block_size 784,
+    // obs 8.667 @ 32768. Suggested ~16384 → capacity floor(16.25)=16 (est).
+    let cache = crate::collectors::CacheConfigLabels {
+        block_size: Some(16),
+        num_gpu_blocks: Some(390),
+        mamba_block_size: Some(784),
+        kv_cache_max_concurrency: Some(8.667),
+        ..Default::default()
+    };
+    let hyp = HypCapacityCtx {
+        cache: &cache,
+        kv_headroom_gb: None,
+        model: None,
+        kv_cache_dtype: None,
+        tp: None,
+        weight_bytes: 2,
+    };
+    let mut lines = Vec::new();
+    push_model_len_shrink_suggestion(
+        &mut lines,
+        Some(32768),
+        Some(15000.0),
+        Some(1384.0),
+        150.0,
+        "      ",
+        Some(&hyp),
+    );
+    let text = lines.join("\n");
+    assert!(text.contains("to ~16384"), "got: {text}");
+    assert!(text.contains("capacity ≤16 (est)"), "got: {text}");
+}
+
+#[test]
+fn capacity_at_hypothetical_falls_to_catalog_when_labels_absent() {
+    let cache = crate::collectors::CacheConfigLabels::default();
+    let model = ModelArch {
+        num_kv_heads: Some(8),
+        head_dim: Some(128),
+        num_layers: Some(32),
+        ..Default::default()
+    };
+    let catalog = compute_kv_max_seqs(Some(20.0), Some(4096), &model, None, None, 2);
+    assert!(catalog.is_some());
+    let hyp = HypCapacityCtx {
+        cache: &cache,
+        kv_headroom_gb: Some(20.0),
+        model: Some(&model),
+        kv_cache_dtype: None,
+        tp: None,
+        weight_bytes: 2,
+    };
+    assert_eq!(
+        capacity_at_hypothetical_max_len(4096, Some(8192), &hyp),
+        catalog
+    );
+}
+
+#[test]
+fn capacity_at_hypothetical_prefers_geometry_over_catalog() {
+    // Geometry predicts floor(16.25)=16; catalog with huge headroom would differ.
+    let cache = crate::collectors::CacheConfigLabels {
+        block_size: Some(16),
+        num_gpu_blocks: Some(390),
+        mamba_block_size: Some(784),
+        kv_cache_max_concurrency: Some(8.667),
+        ..Default::default()
+    };
+    let model = ModelArch {
+        num_kv_heads: Some(8),
+        head_dim: Some(128),
+        num_layers: Some(32),
+        ..Default::default()
+    };
+    let hyp = HypCapacityCtx {
+        cache: &cache,
+        kv_headroom_gb: Some(80.0),
+        model: Some(&model),
+        kv_cache_dtype: None,
+        tp: None,
+        weight_bytes: 2,
+    };
+    assert_eq!(
+        capacity_at_hypothetical_max_len(16384, Some(32768), &hyp),
+        Some(16)
+    );
+}
+
+fn qwen36_hybrid_model() -> ModelArch {
+    ModelArch {
+        linear_num_layers: Some(48),
+        linear_key_heads: Some(16),
+        linear_value_heads: Some(48),
+        linear_key_head_dim: Some(128),
+        linear_value_head_dim: Some(128),
+        linear_conv_kernel_dim: Some(4),
+        state_dtype: Some("fp32".to_string()),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn catalog_state_mismatch_none_when_qwen36_agrees_with_ladder() {
+    // Source: H100 ladder 2026-07-17 — observed state_pages=3; fixed formula agrees.
+    let cache = crate::collectors::CacheConfigLabels {
+        block_size: Some(16),
+        num_gpu_blocks: Some(390),
+        mamba_block_size: Some(784),
+        mamba_page_size_padded: Some(25_690_112),
+        kv_cache_max_concurrency: Some(8.667),
+        ..Default::default()
+    };
+    let model = qwen36_hybrid_model();
+    assert_eq!(
+        catalog_state_pages_mismatch(&cache, Some(32768), &model),
+        None
+    );
+}
+
+#[test]
+fn catalog_state_mismatch_when_synthetic_catalog_differs() {
+    // Synthetic: inflate key heads so catalog pages diverge from ladder-observed 3.
+    let cache = crate::collectors::CacheConfigLabels {
+        block_size: Some(16),
+        num_gpu_blocks: Some(390),
+        mamba_block_size: Some(784),
+        mamba_page_size_padded: Some(25_690_112),
+        kv_cache_max_concurrency: Some(8.667),
+        ..Default::default()
+    };
+    let mut model = qwen36_hybrid_model();
+    model.linear_key_heads = Some(64);
+    let mismatch = catalog_state_pages_mismatch(&cache, Some(32768), &model);
+    assert!(mismatch.is_some());
+    let (catalog_pages, observed_pages) = mismatch.unwrap();
+    assert_eq!(observed_pages, 3);
+    assert_ne!(catalog_pages, observed_pages);
+}
+
+#[test]
+fn catalog_state_mismatch_none_when_labels_absent() {
+    let cache = crate::collectors::CacheConfigLabels::default();
+    assert!(catalog_state_pages_mismatch(&cache, Some(32768), &qwen36_hybrid_model()).is_none());
+}
+
+#[test]
+fn catalog_state_mismatch_none_when_catalog_hybrid_absent() {
+    let cache = crate::collectors::CacheConfigLabels {
+        block_size: Some(16),
+        num_gpu_blocks: Some(390),
+        mamba_block_size: Some(784),
+        mamba_page_size_padded: Some(25_690_112),
+        kv_cache_max_concurrency: Some(8.667),
+        ..Default::default()
+    };
+    let dense = ModelArch::default();
+    assert!(catalog_state_pages_mismatch(&cache, Some(32768), &dense).is_none());
 }
 
 #[test]
@@ -928,6 +1099,7 @@ fn empty_run_stdout_and_format_sites_byte_identical() {
                     suppressed_rules: Vec::new(),
                     kv_max_seqs: None,
                     prescribed_kv_capacity: None,
+                    catalog_state_mismatch: None,
                     n_eval: 0,
                     skipped_broken: if any_evaluable { 0 } else { windows.len() },
                     skipped_idle: if any_evaluable { windows.len() } else { 0 },

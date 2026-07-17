@@ -89,7 +89,6 @@ WORKDIR ${APP_DIR}
 COPY --chown=appuser:appuser scripts/load.sh ./load.sh
 COPY --chown=appuser:appuser scripts/start.sh ./start.sh
 COPY --chown=appuser:appuser scripts/agent-swarm.sh ./agent-swarm.sh
-
 COPY --from=profile-builder --chown=appuser:appuser /build/target/release/profile ./profile
 
 RUN chmod 0755 ./load.sh ./start.sh ./agent-swarm.sh ./profile

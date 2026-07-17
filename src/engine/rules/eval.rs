@@ -33,7 +33,10 @@ use super::r7_config_headroom::{
     ConfigHeadroomDetail, aggregate_r7_detail, format_config_headroom_window_issue,
     rule7_config_headroom,
 };
-use super::{Recommendation, compute_kv_max_seqs, rule_is_significant, rule_names};
+use super::{
+    Recommendation, catalog_state_pages_mismatch, compute_kv_max_seqs, rule_is_significant,
+    rule_names,
+};
 
 const SUPPRESSION_TABLE: &[(&str, &str)] = &[
     (rule_names::OOM_RISK, rule_names::KV_CACHE_PRESSURE),
@@ -323,6 +326,11 @@ fn build_report_from_eval(
             suppressed_rules: Vec::new(),
             kv_max_seqs,
             prescribed_kv_capacity: None,
+            catalog_state_mismatch: catalog_state_pages_mismatch(
+                &summary.window.snapshot.vllm.cache_config,
+                summary.ctx.config.max_model_len,
+                &summary.ctx.model,
+            ),
             n_eval: 0,
             skipped_broken: eval.skipped_broken,
             skipped_idle: eval.skipped_idle,
@@ -340,16 +348,17 @@ fn build_report_from_eval(
         .as_ref()
         .map(|b| b.weight_bytes_per_param)
         .unwrap_or(2);
+    let tp = effective_tensor_parallel(
+        summary.ctx.config.tensor_parallel_size,
+        summary.window.snapshot.collected_gpu_count(),
+    );
     // Derived ceiling for R5 / verbose / Report.kv_max_seqs. R2 prefers observed.
     let kv_max_seqs: Option<u32> = compute_kv_max_seqs(
         kv_headroom_gb,
         max_model_len,
         &summary.ctx.model,
         summary.ctx.config.kv_cache_dtype.as_deref(),
-        effective_tensor_parallel(
-            summary.ctx.config.tensor_parallel_size,
-            summary.window.snapshot.collected_gpu_count(),
-        ),
+        tp,
         weight_bytes_per_param,
     );
     let (r2_kv_max_seqs, r2_capacity_label) = resolve_r2_kv_capacity(
@@ -400,6 +409,8 @@ fn build_report_from_eval(
                 capacity_label: r2_capacity_label,
                 weight_bytes_per_param,
                 fp8_compiler_available,
+                model: Some(&summary.ctx.model),
+                tp,
             },
             eval.r2_fired,
             eval.n_eval,
@@ -437,6 +448,8 @@ fn build_report_from_eval(
                 capacity_label: r2_capacity_label,
                 weight_bytes_per_param,
                 fp8_compiler_available,
+                model: Some(&summary.ctx.model),
+                tp,
             },
             eval.r2_backlog_fired,
             eval.n_eval,
@@ -457,12 +470,21 @@ fn build_report_from_eval(
         && let Some(agg) =
             aggregate_concurrency_saturation_detail(&eval.r5_details, eval.session_kv_peak)
     {
+        let hyp = super::HypCapacityCtx {
+            cache: &summary_snap.vllm.cache_config,
+            kv_headroom_gb,
+            model: Some(&summary.ctx.model),
+            kv_cache_dtype: summary.ctx.config.kv_cache_dtype.as_deref(),
+            tp,
+            weight_bytes: weight_bytes_per_param,
+        };
         let display_lines = format_concurrency_saturation_window_issue(
             &agg,
             pct(eval.r5_fired, eval.n_eval),
             max_model_len,
             kv_max_seqs,
             summary_snap,
+            Some(&hyp),
         );
         recs.push(Recommendation {
             rule_name: rule_names::CONCURRENCY_SATURATION,
@@ -580,6 +602,11 @@ fn build_report_from_eval(
         baseline,
         kv_max_seqs,
         prescribed_kv_capacity,
+        catalog_state_pages_mismatch(
+            &summary_snap.vllm.cache_config,
+            max_model_len,
+            &summary.ctx.model,
+        ),
         eval.n_eval,
         crate::engine::EvalSkipStats {
             skipped_broken: eval.skipped_broken,
@@ -595,6 +622,7 @@ pub(crate) fn finalize_report_groups(
     baseline: Option<baseline::PhysicsBaseline>,
     kv_max_seqs: Option<u32>,
     prescribed_kv_capacity: Option<u32>,
+    catalog_state_mismatch: Option<(u64, u64)>,
     n_eval: usize,
     skips: crate::engine::EvalSkipStats,
 ) -> Report {
@@ -606,6 +634,7 @@ pub(crate) fn finalize_report_groups(
             suppressed_rules,
             kv_max_seqs,
             prescribed_kv_capacity: None,
+            catalog_state_mismatch,
             n_eval,
             skipped_broken: skips.skipped_broken,
             skipped_idle: skips.skipped_idle,
@@ -669,6 +698,7 @@ pub(crate) fn finalize_report_groups(
         suppressed_rules,
         kv_max_seqs,
         prescribed_kv_capacity,
+        catalog_state_mismatch,
         n_eval,
         skipped_broken: skips.skipped_broken,
         skipped_idle: skips.skipped_idle,
@@ -688,6 +718,7 @@ pub fn build_report_for_windows(windows: &[RuntimeWindow], summary: AnalysisInpu
             suppressed_rules: Vec::new(),
             kv_max_seqs: None,
             prescribed_kv_capacity: None,
+            catalog_state_mismatch: None,
             n_eval: 0,
             skipped_broken: windows.len(),
             skipped_idle: 0,

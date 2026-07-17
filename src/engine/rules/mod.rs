@@ -32,9 +32,65 @@ pub const ENGINE_MIN_PERSISTENT_WINDOWS: usize = 3;
 /// Enforces >= 25% density floor across evaluable windows.
 pub(super) const ENGINE_MIN_WINDOW_PCT: f64 = 0.25;
 
+/// Inputs for projecting capacity at a hypothetical `max_model_len`.
+///
+/// Preference order (see [`capacity_at_hypothetical_max_len`]):
+/// 1. observed-geometry page model when labels present
+/// 2. attention-only catalog math when labels absent
+/// 3. no number (caller stays directional)
+///
+/// Assumptions: block geometry constant across `max_model_len` (ladder-proven);
+/// NOT proven constant across `gpu-memory-utilization` or vLLM versions.
+/// `mamba_cache_mode` changes shift `state_pages` (measured 3→6 none→align) —
+/// counterfactuals that change caching mode stay directional, no number.
+pub(super) struct HypCapacityCtx<'a> {
+    pub cache: &'a crate::collectors::CacheConfigLabels,
+    pub kv_headroom_gb: Option<f64>,
+    pub model: Option<&'a crate::context::ModelArch>,
+    pub kv_cache_dtype: Option<&'a str>,
+    pub tp: Option<u32>,
+    pub weight_bytes: u8,
+}
+
+/// Capacity at a hypothetical `max_model_len`. Both derived tiers are `(est)`.
+pub(super) fn capacity_at_hypothetical_max_len(
+    target_max_len: u32,
+    current_max_len: Option<u32>,
+    ctx: &HypCapacityCtx<'_>,
+) -> Option<u32> {
+    use crate::engine::baseline::counterfactual_concurrency;
+
+    // Hybrid ladder geometry uses mamba_block_size when present; dense uses block_size.
+    let block_size = ctx.cache.mamba_block_size.or(ctx.cache.block_size);
+    if let (Some(bs), Some(blocks), Some(obs), Some(cur)) = (
+        block_size,
+        ctx.cache.num_gpu_blocks,
+        ctx.cache.kv_cache_max_concurrency,
+        current_max_len,
+    ) && let Some(c) = counterfactual_concurrency(target_max_len, bs, blocks, obs, cur)
+    {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let n = c.floor() as u32;
+        if n > 0 {
+            return Some(n);
+        }
+    }
+    let model = ctx.model?;
+    compute_kv_max_seqs(
+        ctx.kv_headroom_gb,
+        Some(target_max_len),
+        model,
+        ctx.kv_cache_dtype,
+        ctx.tp,
+        ctx.weight_bytes,
+    )
+}
+
 /// Push a max_model_len shrink suggestion into `lines`.
 /// Hard number only when `total_count >= 100` and both p99s are present.
 /// No-op when `max_model_len` is None.
+/// When `hyp` is set and a target length is suggested, append projected capacity
+/// (`≤n (est)`) via the observed-geometry → catalog preference order.
 pub(super) fn push_model_len_shrink_suggestion(
     lines: &mut Vec<String>,
     max_model_len: Option<u32>,
@@ -42,6 +98,7 @@ pub(super) fn push_model_len_shrink_suggestion(
     generation_p99: Option<f64>,
     total_count: f64,
     indent: &str,
+    hyp: Option<&HypCapacityCtx<'_>>,
 ) {
     let Some(m) = max_model_len else { return };
 
@@ -63,9 +120,13 @@ pub(super) fn push_model_len_shrink_suggestion(
         if suggested >= m.saturating_sub(m / 20) {
             return;
         }
+        let capacity_suffix = hyp
+            .and_then(|h| capacity_at_hypothetical_max_len(suggested, Some(m), h))
+            .map(|n| format!("; capacity ≤{n} (est)"))
+            .unwrap_or_default();
         lines.push(format!(
             "{indent}• Lower --max-model-len (current: {m}) to ~{suggested} \
-             (prompt p99 {pp:.0} tok + output p99 {gp:.0} tok), to shrink KV footprint."
+             (prompt p99 {pp:.0} tok + output p99 {gp:.0} tok), to shrink KV footprint{capacity_suffix}."
         ));
         lines.push(format!(
             "{indent}  Warning: max_model_len is total context (prompt + completion). Truncation risk!"
@@ -75,6 +136,51 @@ pub(super) fn push_model_len_shrink_suggestion(
             "{indent}• Lower --max-model-len (current: {m}) to safely raise concurrency."
         ));
     }
+}
+
+/// Compare observed geometry `state_pages` to catalog hybrid estimate.
+///
+/// Runs only when labels (`num_gpu_blocks`, concurrency, page size, max_len)
+/// AND catalog hybrid facts both exist. Returns `Some((catalog_pages,
+/// observed_pages))` on mismatch; `None` on agreement or incomplete inputs.
+///
+/// Label uncertainty tracks the printed number's source, not the existence of
+/// disagreement between sources. Callers must not change `(est)` labeling from
+/// this result; verbose output may surface the note.
+pub(super) fn catalog_state_pages_mismatch(
+    cache: &crate::collectors::CacheConfigLabels,
+    current_max_len: Option<u32>,
+    model: &crate::context::ModelArch,
+) -> Option<(u64, u64)> {
+    use crate::engine::baseline::{
+        catalog_hybrid_state_bytes, catalog_state_pages, observed_state_pages, state_dtype_bytes,
+    };
+
+    let block_size = cache.mamba_block_size.or(cache.block_size)?;
+    let num_gpu_blocks = cache.num_gpu_blocks?;
+    let observed_concurrency = cache.kv_cache_max_concurrency?;
+    let current_max_len = current_max_len?;
+    let page_bytes = cache.mamba_page_size_padded?;
+
+    let observed = observed_state_pages(
+        block_size,
+        num_gpu_blocks,
+        observed_concurrency,
+        current_max_len,
+    )?;
+
+    let dtype_b = state_dtype_bytes(model.state_dtype.as_deref())?;
+    let state_bytes = catalog_hybrid_state_bytes(
+        model.linear_num_layers?,
+        model.linear_key_heads?,
+        model.linear_value_heads?,
+        model.linear_key_head_dim?,
+        model.linear_value_head_dim?,
+        model.linear_conv_kernel_dim?,
+        dtype_b,
+    )?;
+    let catalog = catalog_state_pages(state_bytes, page_bytes)?;
+    (catalog != observed).then_some((catalog, observed))
 }
 
 pub(super) fn compute_kv_max_seqs(
