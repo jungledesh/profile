@@ -559,7 +559,7 @@ mod tests {
         )
         .join("\n");
         assert!(text.contains("physics ceiling for max_model_len=8192"));
-        assert!(text.contains("to ~6450"));
+        assert!(text.contains("Lower --max-model-len 8192 → 6450"));
         assert!(text.contains("Truncation risk"));
         assert!(!text.contains("free KV blocks"));
     }
@@ -965,7 +965,7 @@ mod tests {
         )
         .join("\n");
         assert!(text.contains("physics ceiling for max_model_len=8192"));
-        assert!(text.contains("to ~6450"));
+        assert!(text.contains("Lower --max-model-len 8192 → 6450"));
         assert!(text.contains("Truncation risk"));
     }
 

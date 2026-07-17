@@ -53,6 +53,10 @@ pub(super) struct HypCapacityCtx<'a> {
 }
 
 /// Capacity at a hypothetical `max_model_len`. Both derived tiers are `(est)`.
+///
+/// Formatter vocabulary: counts of simultaneous work are always
+/// "N concurrent requests"; never bare "capacity". Bounds name their source
+/// and condition.
 pub(super) fn capacity_at_hypothetical_max_len(
     target_max_len: u32,
     current_max_len: Option<u32>,
@@ -86,47 +90,70 @@ pub(super) fn capacity_at_hypothetical_max_len(
     )
 }
 
-/// Push a max_model_len shrink suggestion into `lines`.
+/// True when observed p99 prompt+output is below half of `max_model_len`.
+/// Used to lead with model-len shrink: worst-case full-context concurrency is a
+/// floor, not a target; leading with it on short-prompt workloads prescribes a
+/// large throughput cut the traffic does not require. Fix order follows fit to
+/// observed traffic.
+pub(super) fn p99_sum_below_half_max_model_len(
+    max_model_len: u32,
+    prompt_p99: Option<f64>,
+    generation_p99: Option<f64>,
+) -> bool {
+    match (prompt_p99, generation_p99) {
+        (Some(pp), Some(gp)) if pp.is_finite() && gp.is_finite() => {
+            pp + gp < f64::from(max_model_len) / 2.0
+        }
+        _ => false,
+    }
+}
+
+/// Build max_model_len shrink suggestion lines (may be empty).
 /// Hard number only when `total_count >= 100` and both p99s are present.
-/// No-op when `max_model_len` is None.
-/// When `hyp` is set and a target length is suggested, append projected capacity
-/// (`≤n (est)`) via the observed-geometry → catalog preference order.
-pub(super) fn push_model_len_shrink_suggestion(
-    lines: &mut Vec<String>,
+/// Empty when `max_model_len` is None or the shrink is < 5%.
+///
+/// Projected concurrency at `{suggested}` comes only from
+/// [`capacity_at_hypothetical_max_len`](suggested) — never from the current-config
+/// R2 ceiling (`r2_kv_max_seqs` / observed concurrency at full `max_model_len`).
+pub(super) fn model_len_shrink_suggestion_lines(
     max_model_len: Option<u32>,
     prompt_p99: Option<f64>,
     generation_p99: Option<f64>,
     total_count: f64,
     indent: &str,
     hyp: Option<&HypCapacityCtx<'_>>,
-) {
-    let Some(m) = max_model_len else { return };
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    let Some(m) = max_model_len else {
+        return lines;
+    };
 
     if total_count >= 100.0 {
         let Some(pp) = prompt_p99 else {
             lines.push(format!(
                 "{indent}• Lower --max-model-len (current: {m}) to safely raise concurrency."
             ));
-            return;
+            return lines;
         };
         let Some(gp) = generation_p99 else {
             lines.push(format!(
                 "{indent}• Lower --max-model-len (current: {m}) to safely raise concurrency."
             ));
-            return;
+            return lines;
         };
         let suggested = (pp as u32).saturating_add(gp as u32);
         // Suppress if reduction is < 5% - not a meaningful change (avoids "5464 → 5465" no-ops)
         if suggested >= m.saturating_sub(m / 20) {
-            return;
+            return lines;
         }
-        let capacity_suffix = hyp
+        // Projection at the *suggested* length only — not current observed concurrency.
+        let fits = hyp
             .and_then(|h| capacity_at_hypothetical_max_len(suggested, Some(m), h))
-            .map(|n| format!("; capacity ≤{n} (est)"))
+            .map(|n| format!("; fits {n} concurrent requests (est)"))
             .unwrap_or_default();
         lines.push(format!(
-            "{indent}• Lower --max-model-len (current: {m}) to ~{suggested} \
-             (prompt p99 {pp:.0} tok + output p99 {gp:.0} tok), to shrink KV footprint{capacity_suffix}."
+            "{indent}• Lower --max-model-len {m} → {suggested} \
+             (fits p99 of observed requests){fits}"
         ));
         lines.push(format!(
             "{indent}  Warning: max_model_len is total context (prompt + completion). Truncation risk!"
@@ -136,6 +163,27 @@ pub(super) fn push_model_len_shrink_suggestion(
             "{indent}• Lower --max-model-len (current: {m}) to safely raise concurrency."
         ));
     }
+    lines
+}
+
+/// Push a max_model_len shrink suggestion into `lines`.
+pub(super) fn push_model_len_shrink_suggestion(
+    lines: &mut Vec<String>,
+    max_model_len: Option<u32>,
+    prompt_p99: Option<f64>,
+    generation_p99: Option<f64>,
+    total_count: f64,
+    indent: &str,
+    hyp: Option<&HypCapacityCtx<'_>>,
+) {
+    lines.extend(model_len_shrink_suggestion_lines(
+        max_model_len,
+        prompt_p99,
+        generation_p99,
+        total_count,
+        indent,
+        hyp,
+    ));
 }
 
 /// Compare observed geometry `state_pages` to catalog hybrid estimate.

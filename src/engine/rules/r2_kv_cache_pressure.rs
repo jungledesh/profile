@@ -331,27 +331,46 @@ pub(super) fn prescribed_for_self_grade(
 }
 
 fn r2_capacity_phrase(n: u32, max_model_len: Option<u32>, label: KvCapacityLabel) -> String {
+    // Vocabulary: simultaneous-work counts are "N concurrent requests", never bare
+    // "capacity". Bounds name their source and condition.
     match label {
         KvCapacityLabel::Observed => match max_model_len {
             Some(m) => {
                 format!(
-                    "Lower --max-num-seqs to ≤{n} (vLLM-reported capacity at max_model_len={m})"
+                    "Lower --max-num-seqs to ≤{n} concurrent requests \
+                     (vLLM-reported at max_model_len={m})"
                 )
             }
-            None => format!("Lower --max-num-seqs to ≤{n} (vLLM-reported capacity)"),
+            None => {
+                format!("Lower --max-num-seqs to ≤{n} concurrent requests (vLLM-reported)")
+            }
         },
         KvCapacityLabel::Derived => match max_model_len {
             Some(m) => {
-                format!("Lower --max-num-seqs to ≤{n} (est; physics ceiling for max_model_len={m})")
+                format!(
+                    "Lower --max-num-seqs to ≤{n} concurrent requests \
+                     (est; physics ceiling for max_model_len={m})"
+                )
             }
-            None => format!("Lower --max-num-seqs to ≤{n} (est)"),
+            None => format!("Lower --max-num-seqs to ≤{n} concurrent requests (est)"),
         },
         KvCapacityLabel::DerivedHybrid => {
             format!(
-                "Lower --max-num-seqs to ≤{n} (attention-KV est; hybrid state overhead lowers the true limit)"
+                "Lower --max-num-seqs to ≤{n} concurrent requests \
+                 (attention-KV est; hybrid state overhead lowers the true limit)"
             )
         }
     }
+}
+
+/// Cap bullet when model-len shrink leads: full-context concurrency is a floor,
+/// not a target. Worst-case capacity is a floor; leading with it on short-prompt
+/// workloads prescribes a large throughput cut the traffic does not require.
+fn max_num_seqs_cap_after_shrink_bullet(n: u32, max_model_len: u32) -> String {
+    format!(
+        "      • Or cap --max-num-seqs at {n} \
+         (vLLM-reported; guaranteed at full {max_model_len}-token contexts)"
+    )
 }
 
 fn r2_max_num_seqs_ceiling_phrase(
@@ -488,21 +507,92 @@ pub(super) fn format_kv_cache_pressure_fired(
     out.push(evidence);
     out.push(String::new());
     out.push("    Fix:".to_string());
+
+    let total_count = snapshot.vllm.generation_tokens_completed.unwrap_or(0.0);
+    let prompt_p99 = snapshot.vllm.prompt_tokens_p99;
+    let generation_p99 = snapshot.vllm.generation_tokens_p99;
+    let shrink_lines = super::model_len_shrink_suggestion_lines(
+        max_model_len,
+        prompt_p99,
+        generation_p99,
+        total_count,
+        "      ",
+        Some(&hyp),
+    );
+    // Lead with model-len when observed traffic fits in half the window: the
+    // full-context concurrency floor is then a secondary bound, not the primary fix.
+    let lead_with_shrink = !shrink_lines.is_empty()
+        && max_model_len.is_some_and(|m| {
+            super::p99_sum_below_half_max_model_len(m, prompt_p99, generation_p99)
+        });
+
     if d.preemptions_active {
-        out.push(max_num_seqs_bullet(
-            kv_max_seqs,
-            max_model_len,
-            capacity_label,
-            true,
-        ));
+        if lead_with_shrink {
+            out.extend(shrink_lines);
+            match (kv_max_seqs, max_model_len) {
+                (Some(n), Some(m)) => out.push(max_num_seqs_cap_after_shrink_bullet(n, m)),
+                _ => out.push(max_num_seqs_bullet(
+                    kv_max_seqs,
+                    max_model_len,
+                    capacity_label,
+                    true,
+                )),
+            }
+            if let Some(bullet) = prefix_caching_fix_bullet(snapshot) {
+                out.push(bullet);
+            }
+            if kv_headroom_gb.is_some_and(|h| h >= KV_HEADROOM_SAFE_MIN_GB) {
+                out.push(
+                    "      • Once stable, raise --gpu-memory-utilization (check vRAM header) to expand KV pool"
+                        .to_string(),
+                );
+            }
+            if let Some(bullet) = fp8_kv_cache_fix_bullet(
+                kv_cache_dtype,
+                weight_bytes_per_param,
+                fp8_compiler_available,
+            ) {
+                out.push(bullet);
+            }
+        } else {
+            out.push(max_num_seqs_bullet(
+                kv_max_seqs,
+                max_model_len,
+                capacity_label,
+                true,
+            ));
+            if let Some(bullet) = prefix_caching_fix_bullet(snapshot) {
+                out.push(bullet);
+            }
+            if kv_headroom_gb.is_some_and(|h| h >= KV_HEADROOM_SAFE_MIN_GB) {
+                out.push(
+                    "      • Once stable, raise --gpu-memory-utilization (check vRAM header) to expand KV pool"
+                        .to_string(),
+                );
+            }
+            if let Some(bullet) = fp8_kv_cache_fix_bullet(
+                kv_cache_dtype,
+                weight_bytes_per_param,
+                fp8_compiler_available,
+            ) {
+                out.push(bullet);
+            }
+            out.extend(shrink_lines);
+        }
+    } else if lead_with_shrink {
+        out.extend(shrink_lines);
+        match (kv_max_seqs, max_model_len) {
+            (Some(n), Some(m)) => out.push(max_num_seqs_cap_after_shrink_bullet(n, m)),
+            _ => out.push(max_num_seqs_bullet(
+                kv_max_seqs,
+                max_model_len,
+                capacity_label,
+                false,
+            )),
+        }
+        out.push(kv_headroom_gpu_mem_bullet(kv_headroom_gb));
         if let Some(bullet) = prefix_caching_fix_bullet(snapshot) {
             out.push(bullet);
-        }
-        if kv_headroom_gb.is_some_and(|h| h >= KV_HEADROOM_SAFE_MIN_GB) {
-            out.push(
-                "      • Once stable, raise --gpu-memory-utilization (check vRAM header) to expand KV pool"
-                    .to_string(),
-            );
         }
         if let Some(bullet) = fp8_kv_cache_fix_bullet(
             kv_cache_dtype,
@@ -511,16 +601,6 @@ pub(super) fn format_kv_cache_pressure_fired(
         ) {
             out.push(bullet);
         }
-        let total_count = snapshot.vllm.generation_tokens_completed.unwrap_or(0.0);
-        super::push_model_len_shrink_suggestion(
-            &mut out,
-            max_model_len,
-            snapshot.vllm.prompt_tokens_p99,
-            snapshot.vllm.generation_tokens_p99,
-            total_count,
-            "      ",
-            Some(&hyp),
-        );
     } else {
         out.push(max_num_seqs_bullet(
             kv_max_seqs,
@@ -539,16 +619,7 @@ pub(super) fn format_kv_cache_pressure_fired(
         ) {
             out.push(bullet);
         }
-        let total_count = snapshot.vllm.generation_tokens_completed.unwrap_or(0.0);
-        super::push_model_len_shrink_suggestion(
-            &mut out,
-            max_model_len,
-            snapshot.vllm.prompt_tokens_p99,
-            snapshot.vllm.generation_tokens_p99,
-            total_count,
-            "      ",
-            Some(&hyp),
-        );
+        out.extend(shrink_lines);
     }
     let expected = if d.preemptions_active {
         "    Expected: TTFT and TPOT recover once evictions stop."
@@ -1032,7 +1103,10 @@ mod tests {
             false,
         )
         .expect("fired");
-        assert_eq!(r.action, "Lower --max-num-seqs to ≤18 (est)");
+        assert_eq!(
+            r.action,
+            "Lower --max-num-seqs to ≤18 concurrent requests (est)"
+        );
     }
 
     #[test]
@@ -1078,7 +1152,7 @@ mod tests {
         let text =
             format_kv_cache_pressure_fired(&d, &kv_ctx(&snap(v), Some(8192), None, None), 3, 4)
                 .join("\n");
-        assert!(text.contains("to ~6450"));
+        assert!(text.contains("Lower --max-model-len 8192 → 6450"));
         assert!(text.contains("Truncation risk"));
     }
 
@@ -1099,7 +1173,7 @@ mod tests {
             4,
         )
         .join("\n");
-        assert!(text.contains("to ~6450"));
+        assert!(text.contains("Lower --max-model-len 8192 → 6450"));
         assert!(text.contains("Truncation risk"));
     }
 
@@ -1221,7 +1295,7 @@ mod tests {
             4,
         )
         .join("\n");
-        assert!(lines.contains("to ~6450"));
+        assert!(lines.contains("Lower --max-model-len 8192 → 6450"));
         assert!(lines.contains("Truncation risk"));
     }
 
@@ -1466,7 +1540,8 @@ mod tests {
     #[test]
     fn observed_capacity_fix_omits_est_label() {
         let phrase = r2_capacity_phrase(24, Some(8192), KvCapacityLabel::Observed);
-        assert!(phrase.contains("vLLM-reported capacity"));
+        assert!(phrase.contains("vLLM-reported"));
+        assert!(phrase.contains("concurrent requests"));
         assert!(phrase.contains("≤24"));
         assert!(!phrase.contains("(est)"));
         let action = r2_action(true, Some(24), Some(8192), KvCapacityLabel::Observed);
@@ -1491,6 +1566,100 @@ mod tests {
         let phrase = r2_capacity_phrase(18, Some(8192), label);
         assert!(phrase.contains("attention-KV est"));
         assert!(phrase.contains("hybrid state overhead"));
+        assert!(phrase.contains("concurrent requests"));
+    }
+
+    #[test]
+    fn fix_order_leads_with_model_len_when_p99_below_half() {
+        // Source: live run 2026-07-17 — short p99 vs max_model_len; shrink leads.
+        // 5465 < 32768/2; projection at 5465 is 39, not observed 8.
+        let v = VllmRawMetrics {
+            kv_cache_usage_perc: Some(90.0),
+            num_requests_waiting: Some(5.0),
+            prompt_tokens_p99: Some(5000.0),
+            generation_tokens_p99: Some(465.0),
+            generation_tokens_completed: Some(150.0),
+            cache_config: CacheConfigLabels {
+                block_size: Some(16),
+                num_gpu_blocks: Some(390),
+                mamba_block_size: Some(784),
+                kv_cache_max_concurrency: Some(8.667),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let snap = snap(v);
+        let ctx = KvFormatCtx {
+            snapshot: &snap,
+            max_model_len: Some(32768),
+            kv_headroom_gb: None,
+            kv_max_seqs: Some(8),
+            capacity_label: KvCapacityLabel::Observed,
+            weight_bytes_per_param: 2,
+            fp8_compiler_available: false,
+            model: None,
+            tp: None,
+        };
+        let d = KvCachePressureDetail {
+            kv_cache_usage_perc: 90.0,
+            kv_peak_pct: Some(90.0),
+            preemptions_active: false,
+            queue_backpressure: true,
+        };
+        let lines = format_kv_cache_pressure_fired(&d, &ctx, 3, 4);
+        let text = lines.join("\n");
+        let shrink_idx = lines
+            .iter()
+            .position(|l| l.contains("Lower --max-model-len 32768 → 5465"))
+            .expect("shrink line");
+        let cap_idx = lines
+            .iter()
+            .position(|l| l.contains("vLLM-reported; guaranteed at full"))
+            .expect("cap line");
+        assert!(
+            shrink_idx < cap_idx,
+            "model-len shrink must lead the cap bullet"
+        );
+        assert!(text.contains("fits 39 concurrent requests (est)"));
+        assert!(text.contains("Or cap --max-num-seqs at 8"));
+        assert!(text.contains("guaranteed at full 32768-token contexts"));
+        assert!(!text.contains("fits 8 concurrent"));
+    }
+
+    #[test]
+    fn fix_order_leads_with_max_num_seqs_when_p99_at_or_above_half() {
+        // 6450 >= 8192/2 → full-context bound leads; no "guaranteed at full" reword.
+        let v = VllmRawMetrics {
+            kv_cache_usage_perc: Some(90.0),
+            num_requests_waiting: Some(5.0),
+            prompt_tokens_p99: Some(6000.0),
+            generation_tokens_p99: Some(450.0),
+            generation_tokens_completed: Some(150.0),
+            ..Default::default()
+        };
+        let text = format_kv_cache_pressure_fired(
+            &KvCachePressureDetail {
+                kv_cache_usage_perc: 90.0,
+                kv_peak_pct: Some(90.0),
+                preemptions_active: false,
+                queue_backpressure: true,
+            },
+            &kv_ctx(&snap(v), Some(8192), None, Some(16)),
+            3,
+            4,
+        )
+        .join("\n");
+        let seqs_pos = text
+            .find("Lower --max-num-seqs")
+            .expect("max-num-seqs bullet");
+        let shrink_pos = text
+            .find("Lower --max-model-len 8192 → 6450")
+            .expect("shrink line");
+        assert!(
+            seqs_pos < shrink_pos,
+            "max-num-seqs must lead when p99 >= half max_model_len"
+        );
+        assert!(!text.contains("guaranteed at full"));
     }
 
     #[test]

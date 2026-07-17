@@ -81,7 +81,7 @@ fn batch_budget_paren(d: &PrefillBoundDetail) -> Option<&'static str> {
             if d.is_hybrid {
                 "(est; optimistic on long prompts)"
             } else {
-                "(est; targets ~25% decode stretch vs floor)"
+                "(est)"
             }
         })
 }
@@ -347,19 +347,18 @@ fn skewed_mode(d: &PrefillBoundDetail) -> bool {
         .is_some_and(|r| r >= PROMPT_SKEW_RATIO)
 }
 
-fn cause_severity_line(sev: Severity, d: &PrefillBoundDetail) -> String {
-    if sev == Severity::Severe
-        && d.prefix_caching_enabled == Some(true)
-        && d.chunked_prefill_enabled == Some(true)
-    {
-        "      Prefix caching and chunked prefill are enabled but insufficient for this workload."
-            .to_string()
-    } else if sev == Severity::Severe {
-        "      The GPU is busy, but mostly doing prompt processing, not token generation."
-            .to_string()
+fn cause_tpot_line(d: &PrefillBoundDetail) -> Option<String> {
+    let tpot = d.tpot_ms.filter(|v| v.is_finite() && *v > 0.0)?;
+    let floor = d.tpot_floor_ms.filter(|v| v.is_finite() && *v > 0.0)?;
+    let mult = tpot / floor;
+    let mult_display = if mult >= 10.0 {
+        format!("{:.0}x", mult)
     } else {
-        "      The GPU is busy, but decode throughput is limited.".to_string()
-    }
+        format!("{:.1}x", mult)
+    };
+    Some(format!(
+        "      Decode starves while each step swallows prompt: tpot {tpot:.0}ms vs {floor:.1}ms floor ({mult_display})."
+    ))
 }
 
 pub(super) fn prefill_fix_lines(
@@ -528,7 +527,9 @@ pub(super) fn format_prefill_bound_window_issue(
         lines.push(format!(
             "      Prompt input rate is {ratio_display} generation output rate, starving decode throughput."
         ));
-        lines.push(cause_severity_line(sev, d));
+        if let Some(line) = cause_tpot_line(d) {
+            lines.push(line);
+        }
     }
 
     lines.push(String::new());
@@ -1164,9 +1165,32 @@ mod tests {
         };
         assert_eq!(batch_token_budget(&d), 256);
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
+        assert!(text.contains("Set --max-num-batched-tokens to 256 (est)."));
+        assert!(text.contains("Lower for smoother TPOT, raise for lower TTFT"));
+        assert!(!text.contains("decode stretch"));
+    }
+
+    #[test]
+    fn cause_line_tpot_vs_floor() {
+        let d = PrefillBoundDetail {
+            prompt_gen_ratio: 12.0,
+            decode_efficiency_pct: 8.0,
+            tpot_ms: Some(80.0),
+            tpot_floor_ms: Some(7.85),
+            prefix_caching_enabled: Some(true),
+            chunked_prefill_enabled: Some(true),
+            prompt_tokens_mean: Some(4096.0),
+            prompt_tokens_p99: Some(6000.0),
+            prompt_skew_ratio: Some(1.46),
+            running_count: None,
+            ridge_batch_size: Some(153.0),
+            is_hybrid: false,
+        };
+        let text = format_prefill_bound_window_issue(&d, 100).join("\n");
         assert!(text.contains(
-            "Set --max-num-batched-tokens to 256 (est; targets ~25% decode stretch vs floor)"
+            "Decode starves while each step swallows prompt: tpot 80ms vs 7.8ms floor (10x)."
         ));
+        assert!(!text.contains("GPU is busy"));
     }
 
     #[test]
@@ -1187,8 +1211,9 @@ mod tests {
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
         assert!(
-            text.contains("Set --max-num-batched-tokens to 256 (est; optimistic on long prompts)")
+            text.contains("Set --max-num-batched-tokens to 256 (est; optimistic on long prompts).")
         );
+        assert!(!text.contains("decode stretch"));
     }
 
     #[test]

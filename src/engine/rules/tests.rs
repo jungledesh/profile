@@ -447,8 +447,9 @@ fn model_len_suggestion_uses_p99_sum_when_count_sufficient() {
         None,
     );
     let text = lines.join("\n");
-    assert!(text.contains("to ~6450"));
-    assert!(text.contains("prompt p99 6000 tok + output p99 450 tok"));
+    assert!(text.contains("Lower --max-model-len 8192 → 6450"));
+    assert!(text.contains("fits p99 of observed requests"));
+    assert!(!text.contains("prompt p99"));
     assert!(text.contains("Truncation risk"));
 }
 
@@ -466,7 +467,7 @@ fn model_len_suggestion_no_op_when_count_below_threshold() {
     );
     let text = lines.join("\n");
     assert!(text.contains("to safely raise concurrency"));
-    assert!(!text.contains("to ~"));
+    assert!(!text.contains('→'));
 }
 
 #[test]
@@ -483,7 +484,7 @@ fn model_len_suggestion_no_op_when_p99_missing() {
     );
     let text = lines.join("\n");
     assert!(text.contains("to safely raise concurrency"));
-    assert!(!text.contains("to ~"));
+    assert!(!text.contains('→'));
 }
 
 #[test]
@@ -504,7 +505,7 @@ fn model_len_suggestion_suppressed_when_delta_below_5pct() {
 #[test]
 fn model_len_suggestion_projects_capacity_from_observed_geometry() {
     // Source: H100 ladder 2026-07-17 — 390 blocks, mamba_block_size 784,
-    // obs 8.667 @ 32768. Suggested ~16384 → capacity floor(16.25)=16 (est).
+    // obs 8.667 @ 32768. Suggested 16384 → floor(16.25)=16 concurrent (est).
     let cache = crate::collectors::CacheConfigLabels {
         block_size: Some(16),
         num_gpu_blocks: Some(390),
@@ -531,8 +532,67 @@ fn model_len_suggestion_projects_capacity_from_observed_geometry() {
         Some(&hyp),
     );
     let text = lines.join("\n");
-    assert!(text.contains("to ~16384"), "got: {text}");
-    assert!(text.contains("capacity ≤16 (est)"), "got: {text}");
+    assert!(
+        text.contains("Lower --max-model-len 32768 → 16384"),
+        "got: {text}"
+    );
+    assert!(
+        text.contains("fits 16 concurrent requests (est)"),
+        "got: {text}"
+    );
+    assert!(
+        !text.contains("fits 8 concurrent"),
+        "must not use current observed"
+    );
+}
+
+#[test]
+fn model_len_suggestion_live_run_projection_at_5465_is_39_not_observed_8() {
+    // Source: live pressure run 2026-07-17 05:53 UTC — 390 blocks / 784
+    // block_size / state_pages 3. At suggested 5465:
+    // 390 ÷ (ceil(5465/784) + 3) = 390 ÷ 10 = 39. Never current observed (8).
+    let cache = crate::collectors::CacheConfigLabels {
+        block_size: Some(16),
+        num_gpu_blocks: Some(390),
+        mamba_block_size: Some(784),
+        kv_cache_max_concurrency: Some(8.667),
+        ..Default::default()
+    };
+    let hyp = HypCapacityCtx {
+        cache: &cache,
+        kv_headroom_gb: None,
+        model: None,
+        kv_cache_dtype: None,
+        tp: None,
+        weight_bytes: 2,
+    };
+    assert_eq!(
+        capacity_at_hypothetical_max_len(5465, Some(32768), &hyp),
+        Some(39)
+    );
+    let mut lines = Vec::new();
+    push_model_len_shrink_suggestion(
+        &mut lines,
+        Some(32768),
+        Some(5000.0),
+        Some(465.0),
+        150.0,
+        "      ",
+        Some(&hyp),
+    );
+    let text = lines.join("\n");
+    assert!(
+        text.contains("Lower --max-model-len 32768 → 5465"),
+        "got: {text}"
+    );
+    assert!(
+        text.contains("fits 39 concurrent requests (est)"),
+        "got: {text}"
+    );
+    assert!(
+        !text.contains("fits 8 concurrent"),
+        "suffix must not be current observed concurrency"
+    );
 }
 
 #[test]
