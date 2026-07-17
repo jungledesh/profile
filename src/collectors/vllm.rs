@@ -484,6 +484,19 @@ pub(crate) fn max_num_seqs_from_scrape(scrape: &Scrape) -> Option<u32> {
     })
 }
 
+/// One-shot startup scrape for `--max-num-seqs` before diagnose collection starts.
+pub(crate) fn preflight_max_num_seqs(url: &str, timeout: Duration) -> Option<u32> {
+    let client = reqwest::blocking::Client::builder()
+        .use_rustls_tls()
+        .timeout(timeout)
+        .build()
+        .ok()?;
+    let metrics_url = metrics_url(url);
+    let body = fetch_metrics_body(&client, &metrics_url).ok()?;
+    let scrape = scrape_from_body(&body).ok()?;
+    max_num_seqs_from_scrape(&scrape)
+}
+
 pub fn collect_vllm_metrics_for(
     input: &str,
     window: Duration,

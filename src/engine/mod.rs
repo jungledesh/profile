@@ -4,7 +4,10 @@ mod rules;
 
 use crate::context::{AnalysisInput, RuntimeWindow};
 
-pub use baseline::{CeilingEstimate, CostEstimate, CostSource, PhysicsBaseline, WeightDtypeSource};
+pub use baseline::{
+    CeilingEstimate, CostEstimate, CostSource, PhysicsBaseline, WeightDtypeSource,
+    catalog_model_weight_gb,
+};
 pub use rules::*;
 
 pub(crate) const MASSIVE_UNDERUTIL_THRESHOLD_PCT: f64 = 60.0;

@@ -8,6 +8,11 @@ pub mod sampling;
 pub mod types;
 pub mod vllm;
 
+#[cfg(test)]
+mod test_support;
+#[cfg(test)]
+pub(crate) use test_support::{RawSnapshotFixture, snap_vllm};
+
 pub use config::{VllmConfig, build_config};
 pub(crate) use types::observations_aligned;
 pub use types::{

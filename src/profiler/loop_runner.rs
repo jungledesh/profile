@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use super::{DiagnoseResult, delta, drift, poll, run_diagnose, state::LoopState};
+use super::{DiagnoseResult, MaxNumSeqsPrompt, delta, drift, poll, run_diagnose, state::LoopState};
 use crate::context::{AnalysisInput, RuntimeWindow};
 use crate::engine::{self, ACHIEVABLE_EFFICIENCY_CEILING};
 use crate::output;
@@ -10,18 +10,34 @@ const EFFICIENCY_DISPLAY_MIN_PP: f64 = 0.05;
 const EFFICIENCY_PLATEAU_DELTA: f64 = 2.0;
 const PLATEAU_CONSECUTIVE_ITERS: u32 = 3;
 
-#[allow(clippy::too_many_arguments)]
-pub fn run(
-    url: &str,
-    max_num_seqs: u32,
-    cost_per_hour: Option<f64>,
-    tensor_parallel_size: u32,
-    gpu_indices: Vec<u32>,
-    duration: Duration,
-    initial_result: DiagnoseResult,
-    initial_report: engine::Report,
-    verbose_rules: bool,
-) -> anyhow::Result<()> {
+/// Inputs for the interactive diagnose closed loop.
+pub struct LoopRunnerInput<'a> {
+    pub url: &'a str,
+    pub max_num_seqs: u32,
+    pub cost_per_hour: Option<f64>,
+    pub tensor_parallel_size: u32,
+    pub gpu_indices: Vec<u32>,
+    pub duration: Duration,
+    pub initial_result: DiagnoseResult,
+    pub initial_report: engine::Report,
+    pub verbose_rules: bool,
+    pub max_num_seqs_prompt: &'a mut dyn MaxNumSeqsPrompt,
+}
+
+pub fn run(input: LoopRunnerInput<'_>) -> anyhow::Result<()> {
+    let LoopRunnerInput {
+        url,
+        max_num_seqs,
+        cost_per_hour,
+        tensor_parallel_size,
+        gpu_indices,
+        duration,
+        initial_result,
+        initial_report,
+        verbose_rules,
+        max_num_seqs_prompt,
+    } = input;
+
     let mut last_fingerprint = initial_result.snapshot.fingerprint();
     let mut state = LoopState::new(initial_result, initial_report);
     let stdin_rx = poll::spawn_stdin_watcher();
@@ -148,8 +164,7 @@ pub fn run(
         let _outcome = poll::wait_for_restart_or_skip(url, &stdin_rx);
 
         println!();
-        current_max_num_seqs =
-            crate::cli::prompt_for_updated_max_num_seqs(current_max_num_seqs, &stdin_rx)?;
+        current_max_num_seqs = max_num_seqs_prompt.ask(current_max_num_seqs, &stdin_rx)?;
 
         println!("\nMeasuring delta...\n");
         let new_result = run_diagnose(

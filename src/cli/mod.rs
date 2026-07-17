@@ -3,8 +3,6 @@
 mod diagnose;
 mod gpu_assignment;
 
-pub(crate) use diagnose::prompt_for_updated_max_num_seqs;
-
 use clap::{CommandFactory, Parser, Subcommand};
 use std::time::Duration;
 

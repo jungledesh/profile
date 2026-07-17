@@ -1294,7 +1294,6 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(vllm_throughput_value(&v), "59 tok/s");
-        assert!(!vllm_throughput_value(&v).contains('~'));
     }
 
     #[test]
@@ -1309,7 +1308,6 @@ mod tests {
             vllm_prompt_value(&v, false, v.prefix_cache_hit_rate),
             "kv_cache 45.2% avg | pfix_cache 50.0%"
         );
-        assert!(!vllm_prompt_value(&v, false, v.prefix_cache_hit_rate).contains('~'));
     }
 
     #[test]

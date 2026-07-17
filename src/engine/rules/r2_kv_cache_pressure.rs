@@ -210,17 +210,29 @@ pub fn rule2_kv_cache_pressure(snapshot: &RawSnapshot) -> Rule2Outcome {
 }
 
 #[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-pub fn r2_recommendation(
-    snapshot: &RawSnapshot,
-    max_model_len: Option<u32>,
-    kv_headroom_gb: Option<f64>,
-    kv_max_seqs: Option<u32>,
-    capacity_label: KvCapacityLabel,
-    windows_fired: usize,
-    total_evaluable: usize,
-    fp8_compiler_available: bool,
-) -> Option<Recommendation> {
+pub struct R2RecommendationInput<'a> {
+    pub snapshot: &'a RawSnapshot,
+    pub max_model_len: Option<u32>,
+    pub kv_headroom_gb: Option<f64>,
+    pub kv_max_seqs: Option<u32>,
+    pub capacity_label: KvCapacityLabel,
+    pub windows_fired: usize,
+    pub total_evaluable: usize,
+    pub fp8_compiler_available: bool,
+}
+
+#[cfg(test)]
+pub fn r2_recommendation(input: R2RecommendationInput<'_>) -> Option<Recommendation> {
+    let R2RecommendationInput {
+        snapshot,
+        max_model_len,
+        kv_headroom_gb,
+        kv_max_seqs,
+        capacity_label,
+        windows_fired,
+        total_evaluable,
+        fp8_compiler_available,
+    } = input;
     let Rule2Outcome::Fired(d) = rule2_kv_cache_pressure(snapshot) else {
         return None;
     };
@@ -751,16 +763,9 @@ pub(super) fn aggregate_r2_detail(details: &[KvCachePressureDetail]) -> KvCacheP
 mod tests {
     use super::*;
     use crate::collectors::{CacheConfigLabels, VllmRawMetrics};
-    use std::time::SystemTime;
 
     fn snap(vllm: VllmRawMetrics) -> RawSnapshot {
-        RawSnapshot {
-            gpu_observed_at: SystemTime::UNIX_EPOCH,
-            vllm_observed_at: SystemTime::UNIX_EPOCH,
-            timestamp: SystemTime::UNIX_EPOCH,
-            vllm,
-            gpus: vec![],
-        }
+        crate::collectors::snap_vllm(vllm)
     }
 
     fn kv_ctx(
@@ -1034,16 +1039,16 @@ mod tests {
             generation_tokens_per_sec: Some(100.0),
             ..Default::default()
         };
-        let r = r2_recommendation(
-            &snap(v.clone()),
-            None,
-            None,
-            None,
-            KvCapacityLabel::Derived,
-            1,
-            1,
-            false,
-        )
+        let r = r2_recommendation(R2RecommendationInput {
+            snapshot: &snap(v.clone()),
+            max_model_len: None,
+            kv_headroom_gb: None,
+            kv_max_seqs: None,
+            capacity_label: KvCapacityLabel::Derived,
+            windows_fired: 1,
+            total_evaluable: 1,
+            fp8_compiler_available: false,
+        })
         .expect("fired");
         assert!(!r.display_lines.join("\n").contains("evictions stop"));
         assert_eq!(r.short_action, "raise --gpu-memory-utilization");
@@ -1069,16 +1074,16 @@ mod tests {
             generation_tokens_per_sec: Some(100.0),
             ..Default::default()
         };
-        let r = r2_recommendation(
-            &snap(v),
-            Some(8192),
-            None,
-            Some(15),
-            KvCapacityLabel::Derived,
-            1,
-            4,
-            false,
-        )
+        let r = r2_recommendation(R2RecommendationInput {
+            snapshot: &snap(v),
+            max_model_len: Some(8192),
+            kv_headroom_gb: None,
+            kv_max_seqs: Some(15),
+            capacity_label: KvCapacityLabel::Derived,
+            windows_fired: 1,
+            total_evaluable: 4,
+            fp8_compiler_available: false,
+        })
         .expect("fired");
         assert!(r.action.contains("max_model_len=8192"));
         assert!(r.action.contains("≤15"));
@@ -1092,16 +1097,16 @@ mod tests {
             generation_tokens_per_sec: Some(100.0),
             ..Default::default()
         };
-        let r = r2_recommendation(
-            &snap(v),
-            None,
-            None,
-            Some(18),
-            KvCapacityLabel::Derived,
-            1,
-            4,
-            false,
-        )
+        let r = r2_recommendation(R2RecommendationInput {
+            snapshot: &snap(v),
+            max_model_len: None,
+            kv_headroom_gb: None,
+            kv_max_seqs: Some(18),
+            capacity_label: KvCapacityLabel::Derived,
+            windows_fired: 1,
+            total_evaluable: 4,
+            fp8_compiler_available: false,
+        })
         .expect("fired");
         assert_eq!(
             r.action,
@@ -1117,16 +1122,16 @@ mod tests {
             generation_tokens_per_sec: Some(100.0),
             ..Default::default()
         };
-        let r = r2_recommendation(
-            &snap(v),
-            None,
-            None,
-            None,
-            KvCapacityLabel::Derived,
-            1,
-            4,
-            false,
-        )
+        let r = r2_recommendation(R2RecommendationInput {
+            snapshot: &snap(v),
+            max_model_len: None,
+            kv_headroom_gb: None,
+            kv_max_seqs: None,
+            capacity_label: KvCapacityLabel::Derived,
+            windows_fired: 1,
+            total_evaluable: 4,
+            fp8_compiler_available: false,
+        })
         .expect("fired");
         assert_eq!(r.short_action, "lower --max-num-seqs");
         assert_eq!(r.action, "Lower --max-num-seqs to stop evictions");

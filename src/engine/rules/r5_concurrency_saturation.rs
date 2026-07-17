@@ -410,16 +410,9 @@ pub(super) fn aggregate_concurrency_saturation_detail(
 mod tests {
     use super::*;
     use crate::collectors::VllmRawMetrics;
-    use std::time::SystemTime;
 
     fn snap(vllm: VllmRawMetrics) -> RawSnapshot {
-        RawSnapshot {
-            gpu_observed_at: SystemTime::UNIX_EPOCH,
-            vllm_observed_at: SystemTime::UNIX_EPOCH,
-            timestamp: SystemTime::UNIX_EPOCH,
-            vllm,
-            gpus: vec![],
-        }
+        crate::collectors::snap_vllm(vllm)
     }
 
     fn blank_snap() -> RawSnapshot {

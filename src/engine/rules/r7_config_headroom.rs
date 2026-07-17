@@ -138,7 +138,7 @@ fn confidence_label(conf: f64) -> &'static str {
     if conf >= 0.8 {
         "High"
     } else if conf >= 0.6 {
-        "Moderate"
+        "Medium"
     } else {
         "Low"
     }
@@ -333,7 +333,7 @@ mod tests {
         };
         let text = format_config_headroom_window_issue(&d, 100, 0.6).join("\n");
         assert!(text.contains("Ridge batch   -"));
-        assert!(text.contains("Confidence: Moderate"));
+        assert!(text.contains("Confidence: Medium"));
         assert!(text.contains("Watch: Higher concurrency increases prefill load"));
     }
 

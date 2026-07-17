@@ -265,25 +265,12 @@ pub(super) fn aggregate_r1_detail(details: &[UnderBatchingDetail]) -> UnderBatch
         max_num_seqs: details.first().and_then(|d| d.max_num_seqs),
         effective_max: details.iter().map(|d| d.effective_max).sum::<f64>() / n,
         occupancy_pct,
-        efficiency_pct: {
-            let values: Vec<f64> = details.iter().filter_map(|d| d.efficiency_pct).collect();
-            if values.is_empty() {
-                None
-            } else {
-                Some(values.iter().sum::<f64>() / values.len() as f64)
-            }
-        },
-        config_relative_efficiency_pct: {
-            let values: Vec<f64> = details
+        efficiency_pct: super::mean_of_present(details.iter().filter_map(|d| d.efficiency_pct)),
+        config_relative_efficiency_pct: super::mean_of_present(
+            details
                 .iter()
-                .filter_map(|d| d.config_relative_efficiency_pct)
-                .collect();
-            if values.is_empty() {
-                None
-            } else {
-                Some(values.iter().sum::<f64>() / values.len() as f64)
-            }
-        },
+                .filter_map(|d| d.config_relative_efficiency_pct),
+        ),
         known_gpu: details.first().is_some_and(|d| d.known_gpu),
     }
 }

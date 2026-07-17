@@ -214,15 +214,8 @@ pub(super) fn aggregate_r3_detail(
             Some(details.iter().filter_map(|d| d.hit_rate).sum::<f64>() / n)
         })
     };
-    let with_pm: Vec<f64> = details
-        .iter()
-        .filter_map(|d| d.prompt_tokens_mean)
-        .collect();
-    let prompt_tokens_mean = if with_pm.is_empty() {
-        None
-    } else {
-        Some(with_pm.iter().sum::<f64>() / with_pm.len() as f64)
-    };
+    let prompt_tokens_mean =
+        super::mean_of_present(details.iter().filter_map(|d| d.prompt_tokens_mean));
     LowPrefixReuseDetail {
         hit_rate,
         prompt_tokens_mean,

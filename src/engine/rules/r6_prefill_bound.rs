@@ -309,17 +309,9 @@ pub(super) fn aggregate_r6_detail(details: &[PrefillBoundDetail]) -> PrefillBoun
         tpot_floor_ms: details.last().and_then(|d| d.tpot_floor_ms),
         prefix_caching_enabled: details.last().and_then(|d| d.prefix_caching_enabled),
         chunked_prefill_enabled: details.last().and_then(|d| d.chunked_prefill_enabled),
-        prompt_tokens_mean: {
-            let vals: Vec<f64> = details
-                .iter()
-                .filter_map(|d| d.prompt_tokens_mean)
-                .collect();
-            if vals.is_empty() {
-                None
-            } else {
-                Some(vals.iter().sum::<f64>() / vals.len() as f64)
-            }
-        },
+        prompt_tokens_mean: super::mean_of_present(
+            details.iter().filter_map(|d| d.prompt_tokens_mean),
+        ),
         prompt_tokens_p99: details
             .iter()
             .filter_map(|d| d.prompt_tokens_p99)
@@ -328,14 +320,7 @@ pub(super) fn aggregate_r6_detail(details: &[PrefillBoundDetail]) -> PrefillBoun
             .iter()
             .filter_map(|d| d.prompt_skew_ratio)
             .fold(None, |acc, v| Some(acc.map_or(v, |a: f64| a.max(v)))),
-        running_count: {
-            let vals: Vec<f64> = details.iter().filter_map(|d| d.running_count).collect();
-            if vals.is_empty() {
-                None
-            } else {
-                Some(vals.iter().sum::<f64>() / vals.len() as f64)
-            }
-        },
+        running_count: super::mean_of_present(details.iter().filter_map(|d| d.running_count)),
         ridge_batch_size: details.last().and_then(|d| d.ridge_batch_size),
         is_hybrid: details.last().is_some_and(|d| d.is_hybrid),
     }
@@ -548,44 +533,11 @@ pub(super) fn format_prefill_bound_window_issue(
 mod tests {
     use super::*;
     use crate::collectors::{CacheConfigLabels, RawSnapshot, VllmRawMetrics};
-    use std::time::SystemTime;
 
     fn test_snapshot() -> RawSnapshot {
-        RawSnapshot {
-            gpu_observed_at: SystemTime::UNIX_EPOCH,
-            vllm_observed_at: SystemTime::UNIX_EPOCH,
-            timestamp: SystemTime::UNIX_EPOCH,
-            vllm: VllmRawMetrics {
-                cache_config: CacheConfigLabels::default(),
-                ..Default::default()
-            },
-            gpus: vec![],
-        }
-    }
-
-    #[derive(Copy, Clone)]
-    struct EvalR6Params<'a> {
-        prompt_tps: Option<f64>,
-        gen_tps: Option<f64>,
-        eff: Option<f64>,
-        tpot_ms: Option<f64>,
-        tpot_floor_ms: Option<f64>,
-        prefix_cache_hit_rate: Option<f64>,
-        snapshot: &'a RawSnapshot,
-    }
-
-    fn eval_r6(p: EvalR6Params<'_>) -> Rule6Outcome {
-        evaluate(PrefillBoundEvalInput {
-            prompt_tokens_per_sec: p.prompt_tps,
-            generation_tokens_per_sec: p.gen_tps,
-            decode_efficiency_pct: p.eff,
-            tpot_ms: p.tpot_ms,
-            tpot_floor_ms: p.tpot_floor_ms,
-            prefix_cache_hit_rate: p.prefix_cache_hit_rate,
-            snapshot: p.snapshot,
-            chunked_prefill_enabled: None,
-            ridge_batch_size: None,
-            is_hybrid: false,
+        crate::collectors::snap_vllm(VllmRawMetrics {
+            cache_config: CacheConfigLabels::default(),
+            ..Default::default()
         })
     }
 
@@ -597,14 +549,17 @@ mod tests {
         tpot_ms: Option<f64>,
         tpot_floor_ms: Option<f64>,
     ) -> Rule6Outcome {
-        eval_r6(EvalR6Params {
-            prompt_tps,
-            gen_tps,
-            eff,
+        evaluate(PrefillBoundEvalInput {
+            prompt_tokens_per_sec: prompt_tps,
+            generation_tokens_per_sec: gen_tps,
+            decode_efficiency_pct: eff,
             tpot_ms,
             tpot_floor_ms,
             prefix_cache_hit_rate: None,
             snapshot,
+            chunked_prefill_enabled: None,
+            ridge_batch_size: None,
+            is_hybrid: false,
         })
     }
 

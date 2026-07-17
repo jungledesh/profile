@@ -11,7 +11,10 @@ pub mod delta;
 pub mod drift;
 pub mod loop_runner;
 pub mod poll;
+pub mod prompt;
 pub mod state;
+
+pub use prompt::MaxNumSeqsPrompt;
 
 #[derive(Debug, Clone)]
 pub struct DiagnoseResult {

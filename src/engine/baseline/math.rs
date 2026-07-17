@@ -60,6 +60,28 @@ pub fn weight_gb(param_count: u64, bits_per_param: u8) -> f64 {
     (param_count as f64 * bits_per_param as f64) / (8.0 * 1e9)
 }
 
+/// Coarse preflight weight estimate for GPU-assignment threshold only. Runs
+/// before live config exists, so it uses the catalog's default_weight_dtype
+/// directly, NOT the full resolve_bits_per_param chain. Intentionally separate
+/// from the baseline resolver; they answer different questions (fits-on-boot
+/// vs runtime ceiling). Do not unify.
+///
+/// Uses total param_count (not active): for MoE this overstates weight, which
+/// is the SAFE direction for a fits-on-boot gate (conservative = won't
+/// under-provision). Not a physics figure.
+pub fn catalog_model_weight_gb(model_id: &str) -> Option<f64> {
+    let entry = crate::context::model_catalog::lookup_model(model_id)?;
+    let bits: u8 = match entry.default_weight_dtype {
+        "fp8" | "e4m3" | "e5m2" => 8,
+        "fp16" | "bf16" => 16,
+        "fp32" => 32,
+        // Unknown dtype → bf16 fallback, matches baseline resolver; catalog
+        // dtypes are tested so unreachable in practice, kept for exhaustiveness.
+        _ => 16,
+    };
+    Some(weight_gb(entry.param_count, bits))
+}
+
 /// Theoretical minimum latency (ms) for one unit of work at the given ceiling.
 /// decode ceiling (tok/s) → tpot floor; prefill ceiling (prompts/s) → ms per full prompt.
 pub fn latency_floor_ms(ceiling_tps: f64) -> f64 {

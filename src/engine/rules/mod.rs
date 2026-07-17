@@ -279,17 +279,34 @@ pub(super) fn with_seen_pct(mut lines: Vec<String>, seen_pct: u32) -> Vec<String
 pub struct Recommendation {
     pub rule_name: &'static str,
     pub layer: u8,
-    /// 1–5; 5 = highest impact
+    /// 1-5; 5 = highest impact
     pub impact: u8,
-    /// 0.0–1.0
+    /// 0.0-1.0
     pub confidence: f64,
     /// Prescriptive: what to change
     pub action: String,
     /// One-liner for closed-loop direction block
     pub short_action: String,
     pub expected_impact: String,
-    /// Pre-formatted cause + recommendation lines for stdout
+    /// Pre-formatted cause + recommendation lines for stdout.
+    ///
+    /// NOTE (future work): `display_lines` couples presentation to the engine.
+    /// Rules build terminal strings here, so wording changes grow rule files.
+    /// Deferred decision: migrate formatting to `output/` (rules return structured
+    /// facts) if rule-file growth becomes painful. Tracked in
+    /// `architecture_audit_specs.md`.
     pub display_lines: Vec<String>,
+}
+
+/// Mean of present `f64` values. Empty iterator → `None`.
+pub(crate) fn mean_of_present(vals: impl Iterator<Item = f64>) -> Option<f64> {
+    let mut sum = 0.0_f64;
+    let mut n = 0usize;
+    for v in vals {
+        sum += v;
+        n += 1;
+    }
+    (n > 0).then_some(sum / n as f64)
 }
 
 const NO_ISSUES_LINE: &str = "No issues detected.";
