@@ -13,10 +13,10 @@ PIP_VERSION="${PIP_VERSION:-26.0.1}"
 UV_VERSION="${UV_VERSION:-0.11.1}"
 VLLM_VERSION="${VLLM_VERSION:-0.25.1}"
 
-# Gemma 4 31B Dense (sliding-window + global attention, ~62GB bf16, fits H100 80GB).
-# Repo pattern matches the catalog's confirmed google/gemma-4-27b-it / 26b-it.
-# If download 404s, verify the exact id or fall back to google/gemma-4-27b-it.
-MODEL_REPO="${MODEL_REPO:-google/gemma-4-31b-it}"
+# Gemma 4 31B (interleaved sliding-window + global attention; multimodal
+# image+text + reasoning model). ~66GB bf16 incl. vision encoder; fits H100 80GB.
+# Apache-2.0, NOT gated — no license to accept, download is open.
+MODEL_REPO="${MODEL_REPO:-google/gemma-4-31B-it}"
 
 APP_DIR="${APP_DIR:-/home/appuser/app}"
 VENV_DIR="${VENV_DIR:-/home/appuser/vllm-env}"
@@ -39,14 +39,11 @@ python -m pip install "pip==${PIP_VERSION}"
 python -m pip install "uv==${UV_VERSION}"
 uv pip install "vllm==${VLLM_VERSION}"
 
-# Gemma is gated: HF_TOKEN is required for the download.
-if [[ -z "${HF_TOKEN:-}" ]]; then
-    echo "ERROR: Gemma is gated on HuggingFace. Accept the license at"
-    echo "  https://huggingface.co/${MODEL_REPO}"
-    echo "then re-run with: docker run -e HF_TOKEN=hf_... ..."
-    exit 1
+# Gemma 4 is Apache-2.0 and ungated — no token required for access.
+# A read token only helps with download rate limits; use it if you have one.
+if [[ -n "${HF_TOKEN:-}" ]]; then
+    export HF_TOKEN
 fi
-export HF_TOKEN
 
 if [[ ! -d "$MODEL_PATH" ]] || [[ -z "$(ls -A "$MODEL_PATH" 2>/dev/null)" ]]; then
     echo "Downloading ${MODEL_REPO}..."
