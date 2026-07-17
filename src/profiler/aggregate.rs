@@ -12,6 +12,10 @@ use crate::collectors::{
 
 /// Aggregate a slice of per-window snapshots into a single summary snapshot.
 /// Returns `chronological_last` unchanged when no window is evaluable.
+///
+/// Called once per diagnose run after collection stops, not in the 250ms hot
+/// loop. The owned clones below build the summary snapshot from borrowed windows;
+/// they run once over a handful of windows, not per-sample. Intentional.
 pub(super) fn aggregate_windows(
     windows: &[collectors::RawSnapshot],
     window_durations: &[Duration],

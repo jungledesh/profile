@@ -119,13 +119,33 @@ pub fn build_config(
 }
 
 /// Strip `/metrics` suffix to get the vLLM server base URL.
-fn base_url_from_metrics(input: &str) -> String {
+/// Strips /metrics, preserves any other path segments. Consistent with
+/// collector URL handling. Common diagnose URL (scheme://host/metrics)
+/// resolves identically to the old scheme://host preflight.
+pub(crate) fn base_url_from_metrics(input: &str) -> String {
     let t = input.trim().trim_end_matches('/');
     if let Some(base) = t.strip_suffix("/metrics") {
         base.to_string()
     } else {
         t.to_string()
     }
+}
+
+/// Startup-only: served model id from GET `/v1/models`. None on any failure.
+pub(crate) fn preflight_served_model_id(url: &str, timeout: Duration) -> Option<String> {
+    let client = reqwest::blocking::Client::builder()
+        .use_rustls_tls()
+        .timeout(timeout)
+        .build()
+        .ok()?;
+    let base = base_url_from_metrics(url);
+    let models_url = format!("{}/v1/models", base.trim_end_matches('/'));
+    let body = client.get(&models_url).send().ok()?.text().ok()?;
+    let json: serde_json::Value = serde_json::from_str(&body).ok()?;
+    json["data"][0]["id"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /// GET /v1/models and extract model_name + max_model_len. Returns Default on any failure.

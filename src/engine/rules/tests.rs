@@ -1,7 +1,8 @@
 use super::format::{append_waste_line, r2_kv_cache_advisory, waste_label_suffix};
 use super::r1_under_batching::{r1_recommendation, rule1_under_batching_with_efficiency};
 use super::r2_kv_cache_pressure::{
-    KvCapacityLabel, Rule2Outcome, r2_recommendation, rule2_kv_cache_pressure,
+    KvCapacityLabel, R2RecommendationInput, Rule2Outcome, r2_recommendation,
+    rule2_kv_cache_pressure,
 };
 use super::r3_low_prefix_reuse::{format_low_prefix_hit_rate_fired, rule3_low_prefix_reuse};
 use super::*;
@@ -55,13 +56,11 @@ fn snap(
     vllm: VllmRawMetrics,
     gpu: GpuRawMetrics,
 ) -> RawSnapshot {
-    RawSnapshot {
-        gpu_observed_at: gpu_at,
-        vllm_observed_at: vllm_at,
-        timestamp: gpu_at,
-        vllm,
-        gpus: vec![gpu],
-    }
+    crate::collectors::RawSnapshotFixture::default()
+        .observed_at(gpu_at, vllm_at)
+        .vllm(vllm)
+        .gpus(vec![gpu])
+        .build()
 }
 
 fn mk_ctx() -> StaticContext {
@@ -1618,8 +1617,17 @@ fn r2_recommendation_confidence_from_density_counts() {
     let mut v = vllm_high_kv();
     v.num_preemptions_per_sec = Some(0.05);
     let s = snap(t, t, v, gpu_low());
-    let r = r2_recommendation(&s, None, None, None, KvCapacityLabel::Derived, 1, 4, false)
-        .expect("fired");
+    let r = r2_recommendation(R2RecommendationInput {
+        snapshot: &s,
+        max_model_len: None,
+        kv_headroom_gb: None,
+        kv_max_seqs: None,
+        capacity_label: KvCapacityLabel::Derived,
+        windows_fired: 1,
+        total_evaluable: 4,
+        fp8_compiler_available: false,
+    })
+    .expect("fired");
     assert_eq!(r.rule_name, rule_names::KV_CACHE_PRESSURE);
     assert_eq!(r.impact, 5);
     assert!((r.confidence - 0.5).abs() < 1e-9);
@@ -1633,8 +1641,17 @@ fn r2_recommendation_includes_peak_from_detail() {
     v.kv_cache_peak_perc = Some(99.4);
     v.num_preemptions_per_sec = Some(0.05);
     let s = snap(t, t, v, gpu_low());
-    let r = r2_recommendation(&s, None, None, None, KvCapacityLabel::Derived, 1, 1, false)
-        .expect("fired");
+    let r = r2_recommendation(R2RecommendationInput {
+        snapshot: &s,
+        max_model_len: None,
+        kv_headroom_gb: None,
+        kv_max_seqs: None,
+        capacity_label: KvCapacityLabel::Derived,
+        windows_fired: 1,
+        total_evaluable: 1,
+        fp8_compiler_available: false,
+    })
+    .expect("fired");
     let text = r.display_lines.join("\n");
     assert!(text.contains("KV cache 89% avg, 99% peak (threshold: 88%)."));
 }
@@ -1674,16 +1691,16 @@ fn kv_cache_pressure_preemption_displays_without_premature_confidence() {
     let s_kv_only = snap(t, t, vllm_high_kv_stressed(), gpu_busy());
     let ctx2 = mk_ctx();
     let win_kv_only = mk_win(s_kv_only);
-    let r2_text = r2_recommendation(
-        &win_kv_only.snapshot,
-        None,
-        None,
-        None,
-        KvCapacityLabel::Derived,
-        1,
-        1,
-        false,
-    )
+    let r2_text = r2_recommendation(R2RecommendationInput {
+        snapshot: &win_kv_only.snapshot,
+        max_model_len: None,
+        kv_headroom_gb: None,
+        kv_max_seqs: None,
+        capacity_label: KvCapacityLabel::Derived,
+        windows_fired: 1,
+        total_evaluable: 1,
+        fp8_compiler_available: false,
+    })
     .expect("r2 fired")
     .display_lines
     .join("\n");

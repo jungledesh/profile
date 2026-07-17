@@ -151,16 +151,10 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     fn snap(tps: Option<f64>) -> RawSnapshot {
-        RawSnapshot {
-            gpu_observed_at: SystemTime::UNIX_EPOCH,
-            vllm_observed_at: SystemTime::UNIX_EPOCH,
-            timestamp: SystemTime::UNIX_EPOCH,
-            vllm: VllmRawMetrics {
-                generation_tokens_per_sec: tps,
-                ..Default::default()
-            },
-            gpus: vec![],
-        }
+        crate::collectors::snap_vllm(VllmRawMetrics {
+            generation_tokens_per_sec: tps,
+            ..Default::default()
+        })
     }
 
     fn diagnose(tps: Option<f64>) -> DiagnoseResult {

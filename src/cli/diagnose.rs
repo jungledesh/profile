@@ -54,31 +54,36 @@ pub fn execute(
         return Ok(());
     }
 
-    profiler::loop_runner::run(
-        vllm_metrics_input,
-        resolved,
+    profiler::loop_runner::run(profiler::loop_runner::LoopRunnerInput {
+        url: vllm_metrics_input,
+        max_num_seqs: resolved,
         cost_per_hour,
-        assignment.tp,
-        assignment.indices,
+        tensor_parallel_size: assignment.tp,
+        gpu_indices: assignment.indices,
         duration,
-        result,
-        report,
+        initial_result: result,
+        initial_report: report,
         verbose_rules,
-    )?;
+        max_num_seqs_prompt: &mut DiagnoseMaxNumSeqsPrompt,
+    })?;
 
     Ok(())
 }
 
+struct DiagnoseMaxNumSeqsPrompt;
+
+impl profiler::MaxNumSeqsPrompt for DiagnoseMaxNumSeqsPrompt {
+    fn ask(
+        &mut self,
+        current: u32,
+        stdin_rx: &std::sync::mpsc::Receiver<String>,
+    ) -> anyhow::Result<u32> {
+        prompt_for_updated_max_num_seqs(current, stdin_rx)
+    }
+}
+
 fn pre_flight_max_num_seqs(url: &str) -> Option<u32> {
-    let client = reqwest::blocking::Client::builder()
-        .use_rustls_tls()
-        .timeout(PRE_FLIGHT_TIMEOUT)
-        .build()
-        .ok()?;
-    let metrics_url = crate::collectors::vllm::metrics_url(url);
-    let body = crate::collectors::vllm::fetch_metrics_body(&client, &metrics_url).ok()?;
-    let scrape = crate::collectors::vllm::scrape_from_body(&body).ok()?;
-    crate::collectors::vllm::max_num_seqs_from_scrape(&scrape)
+    crate::collectors::vllm::preflight_max_num_seqs(url, PRE_FLIGHT_TIMEOUT)
 }
 
 const MAX_NUM_SEQS_PROMPT: &str =

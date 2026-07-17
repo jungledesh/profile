@@ -24,89 +24,71 @@ struct GpuSnapshot {
     pids: Vec<u32>,
 }
 
-struct Term;
+fn scan_header(n: u32) -> String {
+    format!("Scanning {n} GPUs...")
+}
 
-impl Term {
-    fn new() -> Self {
-        Self
-    }
-
-    fn scan_header(&self, n: u32) -> String {
-        format!("Scanning {n} GPUs...")
-    }
-
-    fn format_gpu_row(&self, row: &GpuSnapshot) -> String {
-        let filled = ((row.vram_pct / 10.0).round() as usize).min(10);
-        let empty = 10usize.saturating_sub(filled);
-        let bar = format!("{}{}", "█".repeat(filled), "░".repeat(empty));
-        let pct = format!("{:>3.0}% vRAM", row.vram_pct.round());
-        let status = if row.vram_pct >= VRAM_ACTIVE_THRESHOLD * 100.0 {
-            if !row.pids.is_empty() {
-                let pids_str = row
-                    .pids
-                    .iter()
-                    .map(|p| p.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let prefix = if row.pids.len() > 1 { "pids" } else { "pid" };
-                format!("{prefix} {pids_str}")
-            } else {
-                "active".to_string()
-            }
+fn format_gpu_row(row: &GpuSnapshot) -> String {
+    let filled = ((row.vram_pct / 10.0).round() as usize).min(10);
+    let empty = 10usize.saturating_sub(filled);
+    let bar = format!("{}{}", "█".repeat(filled), "░".repeat(empty));
+    let pct = format!("{:>3.0}% vRAM", row.vram_pct.round());
+    let status = if row.vram_pct >= VRAM_ACTIVE_THRESHOLD * 100.0 {
+        if !row.pids.is_empty() {
+            let pids_str = row
+                .pids
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let prefix = if row.pids.len() > 1 { "pids" } else { "pid" };
+            format!("{prefix} {pids_str}")
         } else {
-            "idle".to_string()
-        };
+            "active".to_string()
+        }
+    } else {
+        "idle".to_string()
+    };
+    format!(
+        "  [{}] {:<12}  {}  {}  {}",
+        row.idx,
+        short_gpu_name(&row.name),
+        bar,
+        pct,
+        status
+    )
+}
+
+fn detected_vllm_success(indices: &[u32], tp: u32) -> String {
+    let idxs = indices
+        .iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("Detected vLLM on GPUs [{idxs}]: TP = {tp} inferred")
+}
+
+#[cfg(target_os = "linux")]
+fn step2_progress() -> String {
+    "Scanning GPU processes via ps...".to_string()
+}
+
+fn step3_header(pid_list: &str) -> String {
+    if pid_list.is_empty() {
+        "[!] No GPU processes detected. Enter TP and GPU indices manually.".to_string()
+    } else {
         format!(
-            "  [{}] {:<12}  {}  {}  {}",
-            row.idx,
-            short_gpu_name(&row.name),
-            bar,
-            pct,
-            status
+            "[!] Cannot find vLLM GPUs. Run: ps -f -p {pid_list}, match vLLM PID to GPUs above."
         )
     }
+}
 
-    fn step1_success(&self, indices: &[u32], tp: u32) -> String {
-        let idxs = indices
-            .iter()
-            .map(|i| i.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("Detected vLLM on GPUs [{idxs}]: TP = {tp} inferred")
-    }
+fn prompt_tp(host_gpus: u32) -> String {
+    format!("Enter value for --tensor-parallel-size ({host_gpus} gpus detected): ")
+}
 
-    #[cfg(target_os = "linux")]
-    fn step2_progress(&self) -> String {
-        "Scanning GPU processes via ps...".to_string()
-    }
-
-    #[cfg(target_os = "linux")]
-    fn step2_success(&self, indices: &[u32], tp: u32) -> String {
-        let idxs = indices
-            .iter()
-            .map(|i| i.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("Detected vLLM on GPUs [{idxs}]: TP = {tp} inferred")
-    }
-
-    fn step3_header(&self, pid_list: &str) -> String {
-        if pid_list.is_empty() {
-            "[!] No GPU processes detected. Enter TP and GPU indices manually.".to_string()
-        } else {
-            format!(
-                "[!] Cannot find vLLM GPUs. Run: ps -f -p {pid_list}, match vLLM PID to GPUs above."
-            )
-        }
-    }
-
-    fn prompt_tp(&self, host_gpus: u32) -> String {
-        format!("Enter value for --tensor-parallel-size ({host_gpus} gpus detected): ")
-    }
-
-    fn prompt_indices(&self) -> String {
-        "Enter value for --gpu-indices (e.g. 0,1): ".to_string()
-    }
+fn prompt_indices() -> String {
+    "Enter value for --gpu-indices (e.g. 0,1): ".to_string()
 }
 
 fn short_gpu_name(name: &str) -> String {
@@ -193,9 +175,7 @@ fn run_pipeline(
     #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] url: &str,
     scan: Vec<GpuScanEntry>,
 ) -> anyhow::Result<GpuAssignment> {
-    let term = Term::new();
-
-    eprintln!("{}", term.scan_header(host_count));
+    eprintln!("{}", scan_header(host_count));
 
     let snapshots = snapshots_from_scan(&scan);
     let fracs: Vec<Option<f64>> = snapshots.iter().map(|s| Some(s.vram_pct / 100.0)).collect();
@@ -213,25 +193,25 @@ fn run_pipeline(
         &vram_total_gb,
     ) {
         for row in snapshots {
-            eprintln!("{}", term.format_gpu_row(&row));
+            eprintln!("{}", format_gpu_row(&row));
         }
         eprintln!();
-        eprintln!("{}", term.step1_success(&a.indices, a.tp));
+        eprintln!("{}", detected_vllm_success(&a.indices, a.tp));
         eprintln!();
         return Ok(a);
     }
 
     for row in &snapshots {
-        eprintln!("{}", term.format_gpu_row(row));
+        eprintln!("{}", format_gpu_row(row));
     }
     eprintln!();
 
     #[cfg(target_os = "linux")]
-    if let Some(a) = ps_tiebreaker(&snapshots, known_tp, &term) {
+    if let Some(a) = ps_tiebreaker(&snapshots, known_tp) {
         return Ok(a);
     }
 
-    interactive_gpu_prompt(host_count, known_tp, &snapshots, &term)
+    interactive_gpu_prompt(host_count, known_tp, &snapshots)
 }
 
 fn snapshots_from_scan(entries: &[GpuScanEntry]) -> Vec<GpuSnapshot> {
@@ -254,32 +234,11 @@ fn snapshots_from_scan(entries: &[GpuScanEntry]) -> Vec<GpuSnapshot> {
 /// Fetch model weight in GB from the vLLM `/v1/models` endpoint + catalog.
 /// Returns None on any failure - callers fall back to VRAM_ACTIVE_THRESHOLD.
 fn preflight_model_weight_gb(url: &str) -> Option<f64> {
-    let base = {
-        let (scheme, rest) = url.split_once("://")?;
-        let host = rest.split('/').next()?;
-        format!("{scheme}://{host}")
-    };
-    let models_url = format!("{base}/v1/models");
-    let body = reqwest::blocking::Client::builder()
-        .use_rustls_tls()
-        .timeout(std::time::Duration::from_secs(2))
-        .build()
-        .ok()?
-        .get(&models_url)
-        .send()
-        .ok()?
-        .text()
-        .ok()?;
-    let json: serde_json::Value = serde_json::from_str(&body).ok()?;
-    let model_id = json["data"][0]["id"].as_str()?;
-    let entry = crate::context::model_catalog::lookup_model(model_id)?;
-    let bits: u8 = match entry.default_weight_dtype {
-        "fp8" | "e4m3" | "e5m2" => 8,
-        "fp16" | "bf16" => 16,
-        "fp32" => 32,
-        _ => 16,
-    };
-    Some(crate::engine::baseline::weight_gb(entry.param_count, bits))
+    let model_id = crate::collectors::config::preflight_served_model_id(
+        url,
+        std::time::Duration::from_secs(2),
+    )?;
+    crate::engine::catalog_model_weight_gb(&model_id)
 }
 
 #[cfg(test)]
@@ -346,11 +305,7 @@ fn vram_heuristic_from_fracs_inner(
 /// More reliable than /proc socket walking - /proc/{pid}/cmdline is world-readable
 /// even when /proc/{pid}/fd/ is not.
 #[cfg(target_os = "linux")]
-fn ps_tiebreaker(
-    snapshots: &[GpuSnapshot],
-    known_tp: Option<u32>,
-    term: &Term,
-) -> Option<GpuAssignment> {
+fn ps_tiebreaker(snapshots: &[GpuSnapshot], known_tp: Option<u32>) -> Option<GpuAssignment> {
     // Build pid → [gpu_indices] map from GPU snapshots.
     let mut pid_to_gpus: HashMap<u32, Vec<u32>> = HashMap::new();
     for snap in snapshots {
@@ -362,7 +317,7 @@ fn ps_tiebreaker(
         return None;
     }
 
-    eprintln!("{}", term.step2_progress());
+    eprintln!("{}", step2_progress());
 
     let pid_list = pid_to_gpus
         .keys()
@@ -405,7 +360,7 @@ fn ps_tiebreaker(
         return None;
     }
 
-    eprintln!("{}", term.step2_success(&indices, tp));
+    eprintln!("{}", detected_vllm_success(&indices, tp));
     eprintln!();
     Some(GpuAssignment { tp, indices })
 }
@@ -414,7 +369,6 @@ fn interactive_gpu_prompt(
     host_count: u32,
     known_tp: Option<u32>,
     snapshots: &[GpuSnapshot],
-    term: &Term,
 ) -> anyhow::Result<GpuAssignment> {
     let mut hint_pids = BTreeSet::new();
     for row in snapshots {
@@ -429,7 +383,7 @@ fn interactive_gpu_prompt(
         .join(",");
 
     eprintln!();
-    eprintln!("{}", term.step3_header(&pid_list));
+    eprintln!("{}", step3_header(&pid_list));
     eprintln!();
 
     if !io::stdin().is_terminal() {
@@ -441,19 +395,13 @@ fn interactive_gpu_prompt(
     let tp = if let Some(tp) = known_tp {
         tp
     } else {
-        let prompt = term.prompt_tp(host_count);
+        let prompt = prompt_tp(host_count);
         let v = prompt_u32_required(&mut io::stdin().lock(), &mut io::stderr(), &prompt)?;
         eprintln!();
         v
     };
 
-    let indices = prompt_gpu_indices(
-        &mut io::stdin().lock(),
-        &mut io::stderr(),
-        tp,
-        host_count,
-        term,
-    )?;
+    let indices = prompt_gpu_indices(&mut io::stdin().lock(), &mut io::stderr(), tp, host_count)?;
     let idxs = indices
         .iter()
         .map(|i| i.to_string())
@@ -469,11 +417,10 @@ fn prompt_gpu_indices<R: BufRead, W: Write>(
     writer: &mut W,
     tp: u32,
     host_count: u32,
-    term: &Term,
 ) -> anyhow::Result<Vec<u32>> {
     const MAX_ATTEMPTS: u8 = 4;
     let mut attempts: u8 = 0;
-    let prompt = term.prompt_indices();
+    let prompt = prompt_indices();
     loop {
         write!(writer, "{prompt}")?;
         writer.flush()?;
@@ -512,7 +459,7 @@ pub(crate) fn parse_gpu_indices_line(
             .parse()
             .map_err(|_| format!("expected a positive integer, got {part:?}"))?;
         if i >= host_count {
-            return Err(format!("index {i} out of range (0–{max_idx})"));
+            return Err(format!("index {i} out of range (0-{max_idx})"));
         }
         indices.push(i);
     }
@@ -584,16 +531,9 @@ mod tests {
 
     #[test]
     fn interactive_prompt_aborts_after_four_bad_attempts() {
-        let term = Term::new();
         let mut out = Vec::new();
-        let err = prompt_gpu_indices(
-            &mut std::io::Cursor::new(b"\n\n\n\n"),
-            &mut out,
-            2,
-            4,
-            &term,
-        )
-        .unwrap_err();
+        let err =
+            prompt_gpu_indices(&mut std::io::Cursor::new(b"\n\n\n\n"), &mut out, 2, 4).unwrap_err();
         assert!(err.to_string().contains("Pass --tensor-parallel-size"));
     }
 
@@ -673,7 +613,6 @@ mod tests {
 
     #[test]
     fn gpu_row_formats_correctly() {
-        let term = Term::new();
         let row = GpuSnapshot {
             idx: 0,
             name: "NVIDIA A100".to_string(),
@@ -681,7 +620,7 @@ mod tests {
             vram_total_mb: 80 * 1024,
             pids: vec![40592],
         };
-        let line = term.format_gpu_row(&row);
+        let line = format_gpu_row(&row);
         assert!(!line.contains('\x1b'));
         assert!(line.contains("[0]"));
         assert!(line.contains("92% vRAM"));
