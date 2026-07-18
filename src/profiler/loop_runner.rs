@@ -136,18 +136,7 @@ pub fn run(input: LoopRunnerInput<'_>) -> anyhow::Result<()> {
                         }
                     }
                 }
-                Some((a, b)) => {
-                    println!(
-                        "\nCycling between [{a}] and [{b}]. No further improvement found. Stopping."
-                    );
-                    break;
-                }
-                None => {
-                    println!(
-                        "\nCycling between recommendations. No further improvement found. Stopping."
-                    );
-                    break;
-                }
+                _ => {}
             }
         }
 
