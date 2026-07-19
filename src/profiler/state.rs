@@ -148,9 +148,6 @@ mod tests {
             layer: 4,
             impact: 1,
             confidence: 1.0,
-            action: String::new(),
-            short_action: String::new(),
-            expected_impact: String::new(),
             display_lines: Vec::new(),
         }
     }

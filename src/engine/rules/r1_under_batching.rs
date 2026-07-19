@@ -22,12 +22,24 @@ const UNDER_BATCHING_WAITING_LT: f64 = 2.0;
 /// 75% sits below R5's 80% safe-to-scale gate and well below R2's 88% threshold.
 pub(super) const KV_MONITOR_WARNING_PCT: f64 = 75.0;
 
+/// Which wall set `effective_max`. Tie-break priority: memory > ridge > config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum R1BindingWall {
+    Config,
+    Ridge,
+    /// Floored Observed `kv_cache_max_concurrency`.
+    Memory {
+        cap: u32,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnderBatchingDetail {
     pub running: f64,
     pub waiting: f64,
     pub max_num_seqs: Option<u32>,
     pub effective_max: f64,
+    pub binding_wall: R1BindingWall,
     pub occupancy_pct: f64,
     pub efficiency_pct: Option<f64>,
     pub config_relative_efficiency_pct: Option<f64>,
@@ -51,6 +63,39 @@ pub struct R1EvalInput<'a> {
     pub generation_tokens_per_sec: Option<f64>,
     pub prefix_cache_hit_rate: Option<f64>,
     pub ridge_batch_size: Option<f64>,
+}
+
+/// Three-wall headroom: `min(max_num_seqs, ridge?, kv_capacity?)`.
+/// `kv_capacity` is Observed `kv_cache_max_concurrency.floor()` when present and finite.
+/// Absent → two-way min; never claim memory.
+/// Ties: memory > ridge > config (memory hurts fastest).
+fn effective_max_and_binder(
+    max_n: u32,
+    ridge_batch_size: Option<f64>,
+    kv_cache_max_concurrency: Option<f64>,
+) -> (f64, R1BindingWall) {
+    let mut value = f64::from(max_n);
+    let mut wall = R1BindingWall::Config;
+
+    // Order + `<=` encodes tie-break: ridge beats config, memory beats both.
+    if let Some(ridge) = ridge_batch_size.filter(|r| r.is_finite() && *r > 0.0)
+        && ridge <= value
+    {
+        value = ridge;
+        wall = R1BindingWall::Ridge;
+    }
+
+    if let Some(raw) = kv_cache_max_concurrency.filter(|c| c.is_finite() && *c > 0.0) {
+        let cap = raw.floor();
+        if cap > 0.0 && cap <= f64::from(u32::MAX) && cap <= value {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let cap_u = cap as u32;
+            value = cap;
+            wall = R1BindingWall::Memory { cap: cap_u };
+        }
+    }
+
+    (value, wall)
 }
 
 pub(super) fn rule1_under_batching_with_efficiency(input: R1EvalInput<'_>) -> Rule1Outcome {
@@ -85,10 +130,11 @@ pub(super) fn rule1_under_batching_with_efficiency(input: R1EvalInput<'_>) -> Ru
         return Rule1Outcome::NotFired;
     };
 
-    let effective_max = match ridge_batch_size.filter(|r| r.is_finite() && *r > 0.0) {
-        Some(ridge) => f64::from(max_n).min(ridge),
-        None => f64::from(max_n),
-    };
+    let (effective_max, binding_wall) = effective_max_and_binder(
+        max_n,
+        ridge_batch_size,
+        snapshot.vllm.cache_config.kv_cache_max_concurrency,
+    );
 
     // 3. Hard abort - running required and > 0
     let Some(run) = running.filter(|v| v.is_finite() && *v > 0.0) else {
@@ -147,6 +193,7 @@ pub(super) fn rule1_under_batching_with_efficiency(input: R1EvalInput<'_>) -> Ru
         waiting: wait,
         max_num_seqs: Some(max_n),
         effective_max,
+        binding_wall,
         occupancy_pct: occupancy * 100.0,
         efficiency_pct,
         config_relative_efficiency_pct,
@@ -170,16 +217,24 @@ pub fn r1_recommendation(input: R1EvalInput<'_>) -> Option<Recommendation> {
         layer: 4,
         impact: 4,
         confidence,
-        action: "Batch more requests or increase client concurrency".to_string(),
-        short_action: r1_short_action(d.running, d.effective_max),
-        expected_impact: "Higher throughput, stable TPOT".to_string(),
         display_lines: format_under_batching_fired(&d, confidence, kv_warning),
     })
 }
 
-pub(super) fn r1_short_action(running: f64, effective_max: f64) -> String {
-    let idle = (effective_max - running).max(0.0);
-    format!("batch more requests or increase client concurrency ({idle:.0} slots idle)")
+fn r1_fix_line(idle: f64, binding_wall: R1BindingWall) -> String {
+    match binding_wall {
+        R1BindingWall::Config => {
+            format!(
+                "      • Batch more requests or increase client concurrency ({idle:.0} slots idle)"
+            )
+        }
+        R1BindingWall::Ridge => format!(
+            "      • Batch more requests or increase client concurrency ({idle:.0} slots idle before hardware degrades TPOT)"
+        ),
+        R1BindingWall::Memory { cap } => format!(
+            "      • Batch more requests or increase client concurrency ({idle:.0} slots idle; memory fits ~{cap} concurrent, worst case)"
+        ),
+    }
 }
 
 pub(super) fn format_under_batching_fired(
@@ -193,13 +248,7 @@ pub(super) fn format_under_batching_fired(
     };
     let max_str = max_n.to_string();
     let idle = (d.effective_max - d.running).max(0.0);
-    let fix_line = if d.effective_max < max_n as f64 {
-        format!(
-            "      • Batch more requests or increase client concurrency ({idle:.0} slots idle before hardware degrades TPOT)"
-        )
-    } else {
-        format!("      • Batch more requests or increase client concurrency ({idle:.0} slots idle)")
-    };
+    let fix_line = r1_fix_line(idle, d.binding_wall);
     let confidence_str = if confidence >= 0.8 {
         "High"
     } else if confidence >= 0.6 {
@@ -227,7 +276,10 @@ pub(super) fn format_under_batching_fired(
         lines.push("      • Monitor KV cache when scaling up.".to_string());
     }
     lines.push(String::new());
-    lines.push("    Expected: Higher throughput, stable TPOT.".to_string());
+    lines.push(
+        "    Expected: Higher throughput. TPOT stable until the GPU is fully fed, then it starts to rise."
+            .to_string(),
+    );
     lines.push(format!("    Confidence: {confidence_str}"));
     if !d.known_gpu {
         lines.push(
@@ -259,11 +311,13 @@ pub(super) fn aggregate_r1_detail(details: &[UnderBatchingDetail]) -> UnderBatch
     let running = details.iter().map(|d| d.running).sum::<f64>() / n;
     let waiting = details.iter().map(|d| d.waiting).sum::<f64>() / n;
     let occupancy_pct = details.iter().map(|d| d.occupancy_pct).sum::<f64>() / n;
+    // binding_wall / effective_max: static walls; mean effective_max, keep first binder.
     UnderBatchingDetail {
         running,
         waiting,
         max_num_seqs: details.first().and_then(|d| d.max_num_seqs),
         effective_max: details.iter().map(|d| d.effective_max).sum::<f64>() / n,
+        binding_wall: details[0].binding_wall,
         occupancy_pct,
         efficiency_pct: super::mean_of_present(details.iter().filter_map(|d| d.efficiency_pct)),
         config_relative_efficiency_pct: super::mean_of_present(
@@ -475,12 +529,12 @@ mod tests {
     }
 
     #[test]
-    fn short_action_includes_batch_or_increase_concurrency() {
+    fn fix_line_includes_idle_slots() {
         let s = entry_fired_snap();
         let r = r1_recommendation(r1_input(&s, R1InputOpts::default())).expect("fired");
-        assert_eq!(
-            r.short_action,
-            "batch more requests or increase client concurrency (251 slots idle)"
+        let text = r.display_lines.join("\n");
+        assert!(
+            text.contains("Batch more requests or increase client concurrency (251 slots idle)")
         );
     }
 
@@ -719,6 +773,68 @@ mod tests {
             )),
             Rule1Outcome::Fired(_)
         ));
+    }
+
+    #[test]
+    fn memory_binds_when_kv_capacity_below_ridge_and_max() {
+        // kv_capacity 35 < ridge 153 < max 256; running 6 → idle 29; memory label.
+        let mut s = snap(Some(6.0), Some(256), Some(0.0));
+        s.vllm.cache_config.kv_cache_max_concurrency = Some(35.0);
+        match rule1_under_batching_with_efficiency(r1_input(
+            &s,
+            R1InputOpts {
+                config_relative_efficiency_pct: Some(15.0),
+                ridge_batch_size: Some(153.0),
+                ..Default::default()
+            },
+        )) {
+            Rule1Outcome::Fired(d) => {
+                assert!((d.effective_max - 35.0).abs() < 1e-9);
+                assert_eq!(d.binding_wall, R1BindingWall::Memory { cap: 35 });
+                let idle = (d.effective_max - d.running).max(0.0);
+                assert!((idle - 29.0).abs() < 1e-9);
+                let text = format_under_batching_fired(&d, 0.8, false).join("\n");
+                assert!(text.contains("29 slots idle; memory fits ~35 concurrent, worst case"));
+                assert!(!text.contains("before hardware degrades TPOT"));
+            }
+            Rule1Outcome::NotFired => panic!("expected memory-bound under-batching"),
+        }
+    }
+
+    #[test]
+    fn observed_absent_no_memory_claim() {
+        let s = snap(Some(6.0), Some(256), Some(0.0));
+        match rule1_under_batching_with_efficiency(r1_input(
+            &s,
+            R1InputOpts {
+                config_relative_efficiency_pct: Some(15.0),
+                ridge_batch_size: Some(153.0),
+                ..Default::default()
+            },
+        )) {
+            Rule1Outcome::Fired(d) => {
+                assert!((d.effective_max - 153.0).abs() < 1e-9);
+                assert_eq!(d.binding_wall, R1BindingWall::Ridge);
+                let text = format_under_batching_fired(&d, 0.8, false).join("\n");
+                assert!(text.contains("before hardware degrades TPOT"));
+                assert!(!text.contains("memory fits"));
+            }
+            Rule1Outcome::NotFired => panic!("expected ridge-bound fire"),
+        }
+    }
+
+    #[test]
+    fn kv_capacity_float_floors_to_integer_slots() {
+        let (eff, wall) = effective_max_and_binder(256, Some(153.0), Some(24.64));
+        assert!((eff - 24.0).abs() < 1e-9);
+        assert_eq!(wall, R1BindingWall::Memory { cap: 24 });
+    }
+
+    #[test]
+    fn tie_prefers_memory_over_ridge_and_config() {
+        let (eff, wall) = effective_max_and_binder(35, Some(35.0), Some(35.9));
+        assert!((eff - 35.0).abs() < 1e-9);
+        assert_eq!(wall, R1BindingWall::Memory { cap: 35 });
     }
 
     #[test]

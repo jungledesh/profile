@@ -5,14 +5,14 @@ use crate::engine::baseline::{self, WeightDtypeSource};
 
 use super::r1_under_batching::{
     KV_MONITOR_WARNING_PCT, R1EvalInput, Rule1Outcome, UnderBatchingDetail, aggregate_r1_detail,
-    format_under_batching_window_issue, r1_short_action, rule1_under_batching_with_efficiency,
+    format_under_batching_window_issue, rule1_under_batching_with_efficiency,
 };
 use super::r2_kv_cache_pressure::{
     KvAdmissionBacklogDetail, KvCachePressureDetail, KvFormatCtx, Rule2Outcome,
     aggregate_backlog_detail, aggregate_r2_detail, format_kv_admission_backlog_issue,
     format_kv_cache_window_issue, kv_pressure_confidence, model_is_hybrid,
-    prescribed_for_self_grade, r2_action, r2_backlog_short_action, r2_kv_pressure_short_action,
-    resolve_r2_kv_capacity, rule2_kv_admission_backlog, rule2_kv_cache_pressure,
+    prescribed_for_self_grade, resolve_r2_kv_capacity, rule2_kv_admission_backlog,
+    rule2_kv_cache_pressure,
 };
 use super::r3_low_prefix_reuse::{
     LowPrefixReuseDetail, Rule3Outcome, aggregate_r3_detail, format_low_prefix_window_issue,
@@ -21,13 +21,12 @@ use super::r3_low_prefix_reuse::{
 use super::r4_oom_risk::r4_recommendation;
 use super::r5_concurrency_saturation::{
     ConcurrencySaturationDetail, aggregate_concurrency_saturation_detail,
-    format_concurrency_saturation_window_issue, r5_action, r5_short_action,
-    rule5_concurrency_saturation,
+    format_concurrency_saturation_window_issue, rule5_concurrency_saturation,
 };
 use super::r6_prefill_bound::{
     PrefillBoundDetail, PrefillBoundEvalInput, Rule6Outcome, aggregate_r6_detail,
     confidence as r6_confidence, evaluate as r6_evaluate, format_prefill_bound_window_issue,
-    impact as r6_impact, prefill_fix_lines as r6_prefill_fix_lines, severity as r6_severity,
+    impact as r6_impact, severity as r6_severity,
 };
 use super::r7_config_headroom::{
     ConfigHeadroomDetail, aggregate_r7_detail, format_config_headroom_window_issue,
@@ -341,7 +340,6 @@ fn build_report_from_eval(
 
     let summary_snap = &summary.window.snapshot;
     let max_model_len = summary.ctx.config.max_model_len;
-    let prompt_tokens_mean = summary_snap.vllm.prompt_tokens_mean;
     let kv_headroom_gb = baseline.as_ref().and_then(|b| b.kv_headroom_gb);
     let fp8_compiler_available = summary.ctx.fp8_compiler_available;
     let weight_bytes_per_param = baseline
@@ -387,9 +385,6 @@ fn build_report_from_eval(
             layer: 4,
             impact: 4,
             confidence,
-            action: "Batch more requests or increase client concurrency".to_string(),
-            short_action: r1_short_action(d.running, d.effective_max),
-            expected_impact: "Higher throughput, stable TPOT".to_string(),
             display_lines,
         });
     }
@@ -420,18 +415,6 @@ fn build_report_from_eval(
             layer: 2,
             impact: 5,
             confidence: conf,
-            action: r2_action(
-                r2_agg.preemptions_active,
-                r2_kv_max_seqs,
-                max_model_len,
-                r2_capacity_label,
-            ),
-            short_action: if r2_agg.preemptions_active {
-                r2_kv_pressure_short_action().to_string()
-            } else {
-                r2_backlog_short_action().to_string()
-            },
-            expected_impact: "Reduced KV evictions and lower latency variance".to_string(),
             display_lines,
         });
     } else if r2_backlog_significant {
@@ -459,9 +442,6 @@ fn build_report_from_eval(
             layer: 2,
             impact: 5,
             confidence: kv_pressure_confidence(eval.r2_backlog_fired, eval.n_eval),
-            action: r2_action(false, r2_kv_max_seqs, max_model_len, r2_capacity_label),
-            short_action: r2_backlog_short_action().to_string(),
-            expected_impact: "Wait queue drains, TTFT recovers.".to_string(),
             display_lines,
         });
     }
@@ -494,9 +474,6 @@ fn build_report_from_eval(
                 (Some(_), Some(_)) => 0.9,
                 _ => 0.6,
             },
-            action: r5_action(&agg, kv_max_seqs, max_model_len, prompt_tokens_mean),
-            short_action: r5_short_action(&agg, kv_max_seqs, max_model_len),
-            expected_impact: "Queue drains, TTFT recovers.".to_string(),
             display_lines,
         });
     }
@@ -516,12 +493,6 @@ fn build_report_from_eval(
             layer: 6,
             impact: 3,
             confidence: conf,
-            action: format!(
-                "Raise --max-num-seqs from {} to {}",
-                d.max_num_seqs, d.recommended_seqs
-            ),
-            short_action: format!("raise max_num_seqs to {}", d.recommended_seqs),
-            expected_impact: "Higher concurrency ceiling, better hardware utilization.".to_string(),
             display_lines,
         });
     }
@@ -529,29 +500,16 @@ fn build_report_from_eval(
     if eval.r3_significant() {
         let d = aggregate_r3_detail(&eval.r3_details, summary_snap);
         let enable_prefix = summary_snap.vllm.cache_config.enable_prefix_caching;
-        let (action, short_action, impact, confidence) = if d.hit_rate.is_none() {
-            (
-                "Enable --enable-prefix-caching".to_string(),
-                "enable prefix caching".to_string(),
-                3,
-                0.95_f64,
-            )
+        let (impact, confidence) = if d.hit_rate.is_none() {
+            (3, 0.95_f64)
         } else {
-            (
-                "Move shared context to prompt prefix; standardize prompt templates".to_string(),
-                "standardize prompts to share prefix context".to_string(),
-                2,
-                0.9_f64,
-            )
+            (2, 0.9_f64)
         };
         recs.push(Recommendation {
             rule_name: rule_names::LOW_PREFIX_REUSE,
             layer: 5,
             impact,
             confidence,
-            action,
-            short_action,
-            expected_impact: "Higher prefix cache hit rate and lower TTFT".to_string(),
             display_lines: format_low_prefix_window_issue(
                 &d,
                 pct(eval.r3_fired, eval.n_eval),
@@ -567,15 +525,11 @@ fn build_report_from_eval(
         let conf = r6_confidence(sev);
         let imp = r6_impact(sev);
         let display_lines = format_prefill_bound_window_issue(&d, pct(eval.r6_fired, eval.n_eval));
-        let (_, action, short_action, expected_impact) = r6_prefill_fix_lines(&d, sev);
         recs.push(Recommendation {
             rule_name: rule_names::PREFILL_BOUND,
             layer: 5,
             impact: imp,
             confidence: conf,
-            action,
-            short_action,
-            expected_impact,
             display_lines,
         });
     }

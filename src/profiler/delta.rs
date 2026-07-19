@@ -2,6 +2,14 @@ use crate::engine::Report;
 
 use super::DiagnoseResult;
 
+/// Relative load move (running or QPS) that counts as a witness flip.
+/// Judgment threshold: traffic noise below this is not labeled "Load changed."
+const LOAD_CHANGE_MIN_REL: f64 = 0.25;
+
+/// Absolute prefix-hit move (percentage points) that counts as a witness flip.
+/// Judgment threshold: hit-rate noise below this is not labeled.
+const PREFIX_HIT_CHANGE_MIN_PP: f64 = 5.0;
+
 #[derive(Debug, Clone)]
 pub struct Delta {
     pub throughput_before: Option<f64>,
@@ -29,8 +37,12 @@ pub struct Delta {
     pub tpot_p95_before_ms: Option<f64>,
     pub tpot_p95_after_ms: Option<f64>,
     pub config_drifted: bool,
-    /// Non-baseline config diffs for display (e.g. max_num_seqs).
-    pub config_changes: Vec<String>,
+    /// Non-baseline config knobs changed (max_num_seqs, batched tokens, caching, eager).
+    pub non_baseline_drifted: bool,
+    /// Relative move in running concurrency or QPS past [`LOAD_CHANGE_MIN_REL`].
+    pub load_changed: bool,
+    /// Absolute move in prefix hit rate past [`PREFIX_HIT_CHANGE_MIN_PP`] pp.
+    pub prefix_hit_changed: bool,
     /// Self-grade after R2 prescribed a capacity and fresh observed concurrency exists.
     pub capacity_self_grade: Option<(u32, f64)>,
 }
@@ -41,7 +53,7 @@ pub fn compute(
     curr_result: &DiagnoseResult,
     curr_report: &Report,
     config_drifted: bool,
-    config_changes: Vec<String>,
+    non_baseline_drifted: bool,
 ) -> Delta {
     let throughput_before = prev_result.snapshot.vllm.generation_tokens_per_sec;
     let throughput_after = curr_result.snapshot.vllm.generation_tokens_per_sec;
@@ -105,6 +117,19 @@ pub fn compute(
         _ => None,
     };
 
+    let load_changed = relative_load_changed(
+        prev_result.snapshot.vllm.num_requests_running,
+        curr_result.snapshot.vllm.num_requests_running,
+    ) || relative_load_changed(
+        prev_result.snapshot.vllm.request_success_per_sec,
+        curr_result.snapshot.vllm.request_success_per_sec,
+    );
+
+    let prefix_hit_changed = prefix_hit_rate_changed(
+        prev_result.snapshot.vllm.prefix_cache_hit_rate,
+        curr_result.snapshot.vllm.prefix_cache_hit_rate,
+    );
+
     Delta {
         throughput_before,
         throughput_after,
@@ -125,9 +150,37 @@ pub fn compute(
         tpot_p95_before_ms,
         tpot_p95_after_ms,
         config_drifted,
-        config_changes,
+        non_baseline_drifted,
+        load_changed,
+        prefix_hit_changed,
         capacity_self_grade,
     }
+}
+
+/// Relative change ≥ [`LOAD_CHANGE_MIN_REL`]. If prev is 0, any finite curr > 0 counts.
+fn relative_load_changed(before: Option<f64>, after: Option<f64>) -> bool {
+    let (Some(prev), Some(curr)) = (before, after) else {
+        return false;
+    };
+    if !prev.is_finite() || !curr.is_finite() {
+        return false;
+    }
+    if prev == 0.0 {
+        return curr > 0.0;
+    }
+    ((curr - prev).abs() / prev.abs()) >= LOAD_CHANGE_MIN_REL
+}
+
+/// Absolute hit-rate change ≥ [`PREFIX_HIT_CHANGE_MIN_PP`] percentage points.
+/// Rates are stored as fractions (0–1); convert to pp via ×100.
+fn prefix_hit_rate_changed(before: Option<f64>, after: Option<f64>) -> bool {
+    let (Some(prev), Some(curr)) = (before, after) else {
+        return false;
+    };
+    if !prev.is_finite() || !curr.is_finite() {
+        return false;
+    }
+    ((curr - prev).abs() * 100.0) >= PREFIX_HIT_CHANGE_MIN_PP
 }
 
 #[cfg(test)]
@@ -237,7 +290,7 @@ mod tests {
             &diagnose(Some(112.0)),
             &report_eff(Some(55.0), None, None),
             false,
-            Vec::new(),
+            false,
         );
         assert!((d.efficiency_delta_pp.unwrap() - 5.0).abs() < 1e-9);
         assert_eq!(d.throughput_before, Some(100.0));
@@ -252,24 +305,61 @@ mod tests {
             &diagnose(Some(100.0)),
             &report_eff(Some(50.0), None, None),
             true,
-            vec!["  max_num_seqs  32 -> 98".to_string()],
+            true,
         );
         assert!(d.config_drifted);
-        assert_eq!(d.config_changes.len(), 1);
+        assert!(d.non_baseline_drifted);
     }
 
     #[test]
-    fn config_changes_passthrough() {
-        let changes = vec!["  max_num_seqs  32 -> 98".to_string()];
+    fn load_changed_fires_at_25_pct_rel() {
+        assert!(relative_load_changed(Some(100.0), Some(125.0)));
+        assert!(relative_load_changed(Some(100.0), Some(75.0)));
+    }
+
+    #[test]
+    fn load_changed_absent_below_25_pct() {
+        assert!(!relative_load_changed(Some(100.0), Some(124.0)));
+        assert!(!relative_load_changed(Some(100.0), Some(76.0)));
+    }
+
+    #[test]
+    fn load_changed_zero_prev_guard() {
+        assert!(relative_load_changed(Some(0.0), Some(1.0)));
+        assert!(!relative_load_changed(Some(0.0), Some(0.0)));
+    }
+
+    #[test]
+    fn prefix_hit_changed_at_5pp() {
+        // Stay clear of exact 5.0pp float boundary (0.05 in fraction space).
+        assert!(prefix_hit_rate_changed(Some(0.20), Some(0.26)));
+        assert!(prefix_hit_rate_changed(Some(0.50), Some(0.44)));
+    }
+
+    #[test]
+    fn prefix_hit_changed_absent_below_5pp() {
+        assert!(!prefix_hit_rate_changed(Some(0.20), Some(0.249)));
+        assert!(!prefix_hit_rate_changed(Some(0.50), Some(0.46)));
+    }
+
+    #[test]
+    fn compute_sets_load_and_prefix_witnesses() {
+        let mut prev = diagnose(Some(100.0));
+        prev.snapshot.vllm.num_requests_running = Some(10.0);
+        prev.snapshot.vllm.prefix_cache_hit_rate = Some(0.20);
+        let mut curr = diagnose(Some(100.0));
+        curr.snapshot.vllm.num_requests_running = Some(15.0);
+        curr.snapshot.vllm.prefix_cache_hit_rate = Some(0.30);
         let d = compute(
-            &diagnose(Some(100.0)),
+            &prev,
             &report_eff(Some(50.0), None, None),
-            &diagnose(Some(100.0)),
+            &curr,
             &report_eff(Some(50.0), None, None),
             false,
-            changes.clone(),
+            false,
         );
-        assert_eq!(d.config_changes, changes);
+        assert!(d.load_changed);
+        assert!(d.prefix_hit_changed);
     }
 
     #[test]
@@ -286,7 +376,7 @@ mod tests {
             &curr,
             &report_eff(Some(50.0), None, None),
             false,
-            Vec::new(),
+            false,
         );
         assert_eq!(d.capacity_self_grade, Some((24, 24.64)));
     }
@@ -304,7 +394,7 @@ mod tests {
             &curr,
             &report_eff(Some(50.0), None, None),
             false,
-            Vec::new(),
+            false,
         );
         assert_eq!(d.capacity_self_grade, None);
     }
@@ -319,7 +409,7 @@ mod tests {
             &diagnose(Some(100.0)),
             &report_eff(Some(50.0), None, None),
             false,
-            Vec::new(),
+            false,
         );
         assert_eq!(d.capacity_self_grade, None);
     }
@@ -332,7 +422,7 @@ mod tests {
             &diagnose(Some(120.0)),
             &report_eff(Some(55.0), Some(2.00), Some(0.28)),
             false,
-            Vec::new(),
+            false,
         );
         assert_eq!(d.efficiency_pct_before, Some(40.0));
         assert_eq!(d.efficiency_pct_after, Some(55.0));
@@ -350,7 +440,7 @@ mod tests {
             &diagnose(Some(110.0)),
             &report_eff(Some(45.0), None, Some(0.28)),
             false,
-            Vec::new(),
+            false,
         );
         assert_eq!(d.joules_per_token_before, Some(0.31));
         assert_eq!(d.joules_per_token_after, Some(0.28));
@@ -370,7 +460,7 @@ mod tests {
             &curr,
             &report_eff(Some(45.0), None, None),
             false,
-            Vec::new(),
+            false,
         );
         assert_eq!(d.ttft_p95_before_ms, Some(400.0));
         assert_eq!(d.ttft_p95_after_ms, Some(340.0));

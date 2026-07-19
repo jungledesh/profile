@@ -72,6 +72,7 @@ pub(super) fn aggregate_windows(
     let mut agg_v = collectors::VllmRawMetrics {
         model_name: last.vllm.model_name.clone(),
         max_num_seqs: last.vllm.max_num_seqs,
+        max_num_batched_tokens: last.vllm.max_num_batched_tokens,
         ..Default::default()
     };
     let mut agg_gpus = last.gpus.clone();

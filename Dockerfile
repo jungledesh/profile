@@ -88,14 +88,16 @@ WORKDIR ${APP_DIR}
 
 COPY --chown=appuser:appuser scripts/load.sh ./load.sh
 COPY --chown=appuser:appuser scripts/start.sh ./start.sh
+COPY --chown=appuser:appuser scripts/start-gemma.sh ./start-gemma.sh
 COPY --chown=appuser:appuser scripts/agent-swarm.sh ./agent-swarm.sh
 COPY --from=profile-builder --chown=appuser:appuser /build/target/release/profile ./profile
 
-RUN chmod 0755 ./load.sh ./start.sh ./agent-swarm.sh ./profile
+RUN chmod 0755 ./load.sh ./start.sh ./start-gemma.sh ./agent-swarm.sh ./profile
 
 USER appuser
 
-CMD ["bash", "-lc", "/home/appuser/app/start.sh"]
+# Gemma 4 validation run (temporary). Swap back to start.sh for the demo record.
+CMD ["bash", "-lc", "/home/appuser/app/start-gemma.sh"]
 
 # AMD runtime: official vLLM ROCm image (includes ROCm + Python 3.12 + vLLM + PyTorch).
 # Build: docker build --target amd -t profile:amd .

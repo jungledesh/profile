@@ -2,13 +2,30 @@ use std::time::Duration;
 
 use super::{DiagnoseResult, MaxNumSeqsPrompt, delta, drift, poll, run_diagnose, state::LoopState};
 use crate::context::{AnalysisInput, RuntimeWindow};
-use crate::engine::{self, ACHIEVABLE_EFFICIENCY_CEILING};
+use crate::engine;
 use crate::output;
 
 const CEILING_HEADROOM_THRESHOLD_PCT: f64 = 10.0;
+/// Minimum |Δpp| to print Decode eff.; below this the line is omitted (noise).
 const EFFICIENCY_DISPLAY_MIN_PP: f64 = 0.05;
+/// Absolute efficiency drop (pp) required before appending `worse`.
+const EFFICIENCY_WORSE_MIN_PP: f64 = 1.0;
+/// Relative throughput drop (%) required before appending `worse`.
+const THROUGHPUT_WORSE_MIN_PCT: f64 = 5.0;
+/// Absolute USD rise required before Cost/1M appends `worse`.
+const COST_WORSE_THRESHOLD_USD: f64 = 0.01;
+/// Absolute J/tok rise required before the energy line appends `worse`.
+const JTOK_WORSE_THRESHOLD: f64 = 0.02;
+/// TTFT avg materiality gate (ms).
+const TTFT_WORSE_MIN_MS: f64 = 5.0;
+/// TPOT avg materiality gate (ms).
+const TPOT_WORSE_MIN_MS: f64 = 0.5;
 const EFFICIENCY_PLATEAU_DELTA: f64 = 2.0;
 const PLATEAU_CONSECUTIVE_ITERS: u32 = 3;
+
+fn worse_suffix(material_regression: bool) -> &'static str {
+    if material_regression { "  worse" } else { "" }
+}
 
 /// Inputs for the interactive diagnose closed loop.
 pub struct LoopRunnerInput<'a> {
@@ -136,18 +153,7 @@ pub fn run(input: LoopRunnerInput<'_>) -> anyhow::Result<()> {
                         }
                     }
                 }
-                Some((a, b)) => {
-                    println!(
-                        "\nCycling between [{a}] and [{b}]. No further improvement found. Stopping."
-                    );
-                    break;
-                }
-                None => {
-                    println!(
-                        "\nCycling between recommendations. No further improvement found. Stopping."
-                    );
-                    break;
-                }
+                _ => {}
             }
         }
 
@@ -191,8 +197,8 @@ pub fn run(input: LoopRunnerInput<'_>) -> anyhow::Result<()> {
         last_fingerprint = verified_pass_fingerprint(&last_fingerprint, &new_result.snapshot)?;
 
         let drifted = drift::config_changed(&prev_result.static_ctx, &new_result.static_ctx);
-        let config_changes =
-            drift::non_baseline_changes(&prev_result.static_ctx, &new_result.static_ctx);
+        let non_baseline =
+            drift::non_baseline_drifted(&prev_result.static_ctx, &new_result.static_ctx);
 
         let d = delta::compute(
             &prev_result,
@@ -200,11 +206,11 @@ pub fn run(input: LoopRunnerInput<'_>) -> anyhow::Result<()> {
             &new_result,
             &new_report,
             drifted,
-            config_changes,
+            non_baseline,
         );
         let current_eff = new_report.baseline.as_ref().and_then(|b| b.efficiency_pct);
         let plateau_count = state.update_efficiency_plateau(current_eff, EFFICIENCY_PLATEAU_DELTA);
-        print_delta(&d);
+        print_delta(&d, Some(rule_name));
         println!();
         output::stdout::print_diagnose_table_with_report(
             &new_result,
@@ -418,70 +424,148 @@ fn healthy_exit_message(input: HealthyExitInput) -> String {
 
 fn format_efficiency_delta_line(delta_pp: Option<f64>) -> Option<String> {
     match delta_pp {
-        Some(v) if v >= EFFICIENCY_DISPLAY_MIN_PP => Some(format!("  Decode eff. +{v:.1}pp ↑")),
-        Some(v) if v <= -EFFICIENCY_DISPLAY_MIN_PP => Some(format!("  Decode eff. {v:.1}pp ↓")),
+        Some(v) if v >= EFFICIENCY_DISPLAY_MIN_PP => Some(format!("  Decode eff. +{v:.1}pp")),
+        Some(v) if v <= -EFFICIENCY_DISPLAY_MIN_PP => Some(format!(
+            "  Decode eff. {v:.1}pp{}",
+            worse_suffix(v <= -EFFICIENCY_WORSE_MIN_PP)
+        )),
         _ => None,
     }
 }
 
-fn config_status_lines(config_drifted: bool, config_changes: &[String]) -> Vec<String> {
-    if config_drifted {
-        vec![
-            "  Config changed, baseline reset.".to_string(),
-            String::new(),
-        ]
-    } else if !config_changes.is_empty() {
-        let mut lines = vec!["  Config changed:".to_string()];
-        lines.extend(config_changes.iter().cloned());
-        lines.push(String::new());
-        lines
+fn format_throughput_delta_line(before: f64, after: f64) -> String {
+    let drop_pct = if before > 0.0 {
+        (before - after) / before * 100.0
     } else {
-        vec!["  No config changed.".to_string(), String::new()]
-    }
+        0.0
+    };
+    let worse = after < before && drop_pct >= THROUGHPUT_WORSE_MIN_PCT;
+    format!(
+        "  Throughput  {before:.0} → {after:.0} tok/s{}",
+        worse_suffix(worse)
+    )
 }
 
-fn print_delta(d: &delta::Delta) {
-    for line in config_status_lines(d.config_drifted, &d.config_changes) {
+fn format_ttft_delta_line(
+    before: f64,
+    after: f64,
+    p95_before: Option<f64>,
+    p95_after: Option<f64>,
+) -> Option<String> {
+    let delta = after - before;
+    if delta.abs() <= TTFT_WORSE_MIN_MS {
+        return None;
+    }
+    let p95_suffix = match (p95_before, p95_after) {
+        (Some(pb), Some(pa)) if pb.is_finite() && pa.is_finite() => {
+            format!(" (p95 {pb:.0} → {pa:.0}ms)")
+        }
+        _ => String::new(),
+    };
+    Some(format!(
+        "  TTFT        {before:.0} → {after:.0}ms{p95_suffix}{}",
+        worse_suffix(delta > TTFT_WORSE_MIN_MS)
+    ))
+}
+
+fn format_tpot_delta_line(
+    before: f64,
+    after: f64,
+    p95_before: Option<f64>,
+    p95_after: Option<f64>,
+) -> Option<String> {
+    let delta = after - before;
+    if delta.abs() <= TPOT_WORSE_MIN_MS {
+        return None;
+    }
+    let p95_suffix = match (p95_before, p95_after) {
+        (Some(pb), Some(pa)) if pb.is_finite() && pa.is_finite() => {
+            format!(" (p95 {pb:.1} → {pa:.1}ms)")
+        }
+        _ => String::new(),
+    };
+    Some(format!(
+        "  TPOT        {before:.1} → {after:.1}ms{p95_suffix}{}",
+        worse_suffix(delta > TPOT_WORSE_MIN_MS)
+    ))
+}
+
+fn format_jtok_delta_line(before: f64, after: f64) -> String {
+    let worse = after - before > JTOK_WORSE_THRESHOLD;
+    format!(
+        "  J/tok         {before:.2} → {after:.2}{}",
+        worse_suffix(worse)
+    )
+}
+
+fn format_cost_delta_line(before: f64, after: f64, est_suffix: &str) -> String {
+    let worse = after - before > COST_WORSE_THRESHOLD_USD;
+    format!(
+        "  Cost/1M tok   ${before:.2} → ${after:.2}{est_suffix}{}",
+        worse_suffix(worse)
+    )
+}
+
+/// One status line for the remesure delta header.
+///
+/// Precedence (first match wins): baseline drift → non-baseline drift → load
+/// witness (R1 primary only) → prefix-hit witness (R3 primary only) → no change.
+///
+/// R6 (and any other primary whose fix has no dedicated witness) intentionally
+/// falls through to "No change detected." when config did not drift — do not
+/// invent attribution from metric moves for those rules.
+fn config_status_lines(
+    config_drifted: bool,
+    non_baseline_drifted: bool,
+    load_changed: bool,
+    prefix_hit_changed: bool,
+    prev_primary: Option<&str>,
+) -> Vec<String> {
+    let line = if config_drifted {
+        "  Config changed. Baseline reset."
+    } else if non_baseline_drifted {
+        "  Config changed."
+    } else if prev_primary == Some(engine::rule_names::UNDER_BATCHING) && load_changed {
+        "  Load changed."
+    } else if prev_primary == Some(engine::rule_names::LOW_PREFIX_REUSE) && prefix_hit_changed {
+        "  Prefix cache hit rate changed."
+    } else {
+        "  No change detected."
+    };
+    vec![line.to_string(), String::new()]
+}
+
+fn print_delta(d: &delta::Delta, prev_primary: Option<&str>) {
+    for line in config_status_lines(
+        d.config_drifted,
+        d.non_baseline_drifted,
+        d.load_changed,
+        d.prefix_hit_changed,
+        prev_primary,
+    ) {
         println!("{line}");
     }
     if let (Some(before), Some(after)) = (d.throughput_before, d.throughput_after)
         && before.is_finite()
         && after.is_finite()
     {
-        let arrow = throughput_arrow(before, after);
-        println!("  Throughput  {before:.0} → {after:.0} tok/s {arrow}");
+        println!("{}", format_throughput_delta_line(before, after));
     }
     if let (Some(before), Some(after)) = (d.ttft_before_ms, d.ttft_after_ms)
         && before.is_finite()
         && after.is_finite()
+        && let Some(line) =
+            format_ttft_delta_line(before, after, d.ttft_p95_before_ms, d.ttft_p95_after_ms)
     {
-        let delta = after - before;
-        if delta.abs() > 5.0 {
-            let arrow = latency_quality(delta);
-            let p95_suffix = match (d.ttft_p95_before_ms, d.ttft_p95_after_ms) {
-                (Some(pb), Some(pa)) if pb.is_finite() && pa.is_finite() => {
-                    format!("  (p95 {pb:.0} → {pa:.0}ms {})", latency_quality(pa - pb))
-                }
-                _ => String::new(),
-            };
-            println!("  TTFT        {before:.0} → {after:.0}ms {arrow}{p95_suffix}");
-        }
+        println!("{line}");
     }
     if let (Some(before), Some(after)) = (d.tpot_before_ms, d.tpot_after_ms)
         && before.is_finite()
         && after.is_finite()
+        && let Some(line) =
+            format_tpot_delta_line(before, after, d.tpot_p95_before_ms, d.tpot_p95_after_ms)
     {
-        let delta = after - before;
-        if delta.abs() > 0.5 {
-            let arrow = latency_quality(delta);
-            let p95_suffix = match (d.tpot_p95_before_ms, d.tpot_p95_after_ms) {
-                (Some(pb), Some(pa)) if pb.is_finite() && pa.is_finite() => {
-                    format!("  (p95 {pb:.1} → {pa:.1}ms {})", latency_quality(pa - pb))
-                }
-                _ => String::new(),
-            };
-            println!("  TPOT        {before:.1} → {after:.1}ms {arrow}{p95_suffix}");
-        }
+        println!("{line}");
     }
     if let Some(line) = format_efficiency_delta_line(d.efficiency_delta_pp) {
         println!("{line}");
@@ -494,142 +578,31 @@ fn print_delta(d: &delta::Delta) {
         };
         println!("  Capacity: prescribed ≤{x}, vLLM now reports {y_disp}.");
     }
-    let has_cost = economics_section_active(d);
-    if has_cost {
+    if economics_section_active(d) {
         println!();
         println!("ECONOMICS:");
     }
     match (d.joules_per_token_before, d.joules_per_token_after) {
         (Some(before), Some(after)) if before.is_finite() && after.is_finite() => {
-            let arrow = jtok_change_arrow(before, after);
-            println!("  J/tok         {before:.2} → {after:.2} {arrow}");
+            println!("{}", format_jtok_delta_line(before, after));
         }
         _ => {}
     }
     match (d.cost_per_million_before, d.cost_per_million_after) {
         (Some(before), Some(after)) if before.is_finite() && after.is_finite() => {
-            let arrow = cost_change_arrow(before, after);
             let est = match d.cost_source_after {
                 Some(engine::CostSource::Catalog) | None => " (est)",
                 _ => "",
             };
-            println!("  Cost/1M tok   ${before:.2} → ${after:.2} {arrow}{est}");
+            println!("{}", format_cost_delta_line(before, after, est));
         }
         _ => {}
     }
-    if let (Some(cpm_b), Some(cpm_a), Some(tps_b), Some(tps_a), Some(eff_b), Some(eff_a)) = (
-        d.cost_per_million_before,
-        d.cost_per_million_after,
-        d.throughput_before,
-        d.throughput_after,
-        d.efficiency_pct_before,
-        d.efficiency_pct_after,
-    ) && cpm_b.is_finite()
-        && cpm_a.is_finite()
-        && tps_b > 0.0
-        && tps_a > 0.0
-    {
-        let waste_b = recoverable_waste_per_hr(cpm_b, tps_b, eff_b);
-        let waste_a = recoverable_waste_per_hr(cpm_a, tps_a, eff_a);
-        if waste_b.is_finite() && waste_a.is_finite() {
-            let arrow = recoverable_waste_arrow(waste_b, waste_a);
-            println!("  Waste         ${waste_b:.2} → ${waste_a:.2}/hr {arrow}");
-        }
-    }
-}
-
-const COST_ARROW_THRESHOLD_USD: f64 = 0.01;
-const RECOVERABLE_ARROW_THRESHOLD_USD_PER_HR: f64 = 0.05;
-const JTOK_ARROW_THRESHOLD: f64 = 0.02;
-
-fn recoverable_waste_per_hr(cpm: f64, tps: f64, efficiency_pct: f64) -> f64 {
-    let cost_per_hr = cpm * tps * 3600.0 / 1_000_000.0;
-    cost_per_hr * (ACHIEVABLE_EFFICIENCY_CEILING - efficiency_pct / 100.0).max(0.0)
-}
-
-fn recoverable_waste_available(d: &delta::Delta) -> bool {
-    matches!(
-        (
-            d.cost_per_million_before,
-            d.cost_per_million_after,
-            d.throughput_before,
-            d.throughput_after,
-            d.efficiency_pct_before,
-            d.efficiency_pct_after,
-        ),
-        (
-            Some(cpm_b),
-            Some(cpm_a),
-            Some(tps_b),
-            Some(tps_a),
-            Some(eff_b),
-            Some(eff_a),
-        ) if cpm_b.is_finite()
-            && cpm_a.is_finite()
-            && tps_b > 0.0
-            && tps_a > 0.0
-            && eff_b.is_finite()
-            && eff_a.is_finite()
-    )
 }
 
 fn economics_section_active(d: &delta::Delta) -> bool {
     (d.cost_per_million_before.is_some() && d.cost_per_million_after.is_some())
         || (d.joules_per_token_before.is_some() && d.joules_per_token_after.is_some())
-        || recoverable_waste_available(d)
-}
-
-fn jtok_change_arrow(before: f64, after: f64) -> &'static str {
-    let diff = after - before;
-    if diff < -JTOK_ARROW_THRESHOLD {
-        "↓ (improved)"
-    } else if diff > JTOK_ARROW_THRESHOLD {
-        "↑ (regressed)"
-    } else {
-        ""
-    }
-}
-
-fn cost_change_arrow(before: f64, after: f64) -> &'static str {
-    let diff = after - before;
-    if diff < -COST_ARROW_THRESHOLD_USD {
-        "↓ (improved)"
-    } else if diff > COST_ARROW_THRESHOLD_USD {
-        "↑ (regressed)"
-    } else {
-        ""
-    }
-}
-
-fn recoverable_waste_arrow(waste_before: f64, waste_after: f64) -> &'static str {
-    let waste_diff = waste_after - waste_before;
-    if waste_diff < -RECOVERABLE_ARROW_THRESHOLD_USD_PER_HR {
-        "↓ (improved)"
-    } else if waste_diff > RECOVERABLE_ARROW_THRESHOLD_USD_PER_HR {
-        "↑ (regressed)"
-    } else {
-        ""
-    }
-}
-
-fn throughput_arrow(before: f64, after: f64) -> &'static str {
-    if after > before {
-        "↑"
-    } else if after < before {
-        "↓"
-    } else {
-        ""
-    }
-}
-
-fn latency_quality(delta_ms: f64) -> &'static str {
-    if delta_ms < 0.0 {
-        "↓ (improved)"
-    } else if delta_ms > 0.0 {
-        "↑ (regressed)"
-    } else {
-        ""
-    }
 }
 
 /// Closed-loop pass gate: fingerprint must match the prior iteration.
@@ -908,34 +881,85 @@ mod tests {
             ..StaticContext::default()
         };
         assert!(!drift::config_changed(&prev, &curr));
-        assert_eq!(
-            drift::non_baseline_changes(&prev, &curr),
-            vec!["  max_num_seqs  32 -> 98".to_string()]
-        );
+        assert!(drift::non_baseline_drifted(&prev, &curr));
     }
 
     #[test]
-    fn config_status_lines_drifted() {
-        let lines = config_status_lines(true, &[]);
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("Config changed, baseline reset."))
+    fn config_status_lines_baseline_beats_non_baseline() {
+        let lines = config_status_lines(
+            true,
+            true,
+            true,
+            true,
+            Some(engine::rule_names::UNDER_BATCHING),
         );
+        assert_eq!(lines[0], "  Config changed. Baseline reset.");
     }
 
     #[test]
-    fn config_status_lines_non_baseline_changes() {
-        let changes = vec!["  max_num_seqs  32 -> 98".to_string()];
-        let lines = config_status_lines(false, &changes);
-        assert!(lines.iter().any(|l| l.contains("Config changed:")));
-        assert!(lines.iter().any(|l| l.contains("max_num_seqs  32 -> 98")));
+    fn config_status_lines_non_baseline_beats_witness() {
+        let lines = config_status_lines(
+            false,
+            true,
+            true,
+            true,
+            Some(engine::rule_names::UNDER_BATCHING),
+        );
+        assert_eq!(lines[0], "  Config changed.");
+    }
+
+    #[test]
+    fn config_status_lines_r1_load_witness() {
+        let lines = config_status_lines(
+            false,
+            false,
+            true,
+            false,
+            Some(engine::rule_names::UNDER_BATCHING),
+        );
+        assert_eq!(lines[0], "  Load changed.");
+    }
+
+    #[test]
+    fn config_status_lines_r1_without_load_is_no_change() {
+        let lines = config_status_lines(
+            false,
+            false,
+            false,
+            true,
+            Some(engine::rule_names::UNDER_BATCHING),
+        );
+        assert_eq!(lines[0], "  No change detected.");
+    }
+
+    #[test]
+    fn config_status_lines_r3_prefix_witness() {
+        let lines = config_status_lines(
+            false,
+            false,
+            false,
+            true,
+            Some(engine::rule_names::LOW_PREFIX_REUSE),
+        );
+        assert_eq!(lines[0], "  Prefix cache hit rate changed.");
+    }
+
+    #[test]
+    fn config_status_lines_non_r1_r3_load_move_is_no_change() {
+        let lines = config_status_lines(
+            false,
+            false,
+            true,
+            false,
+            Some(engine::rule_names::PREFILL_BOUND),
+        );
+        assert_eq!(lines[0], "  No change detected.");
     }
 
     #[test]
     fn config_status_lines_no_changes() {
-        let lines = config_status_lines(false, &[]);
-        assert!(lines.iter().any(|l| l == "  No config changed."));
+        let lines = config_status_lines(false, false, false, false, None);
+        assert_eq!(lines[0], "  No change detected.");
     }
 
     #[test]
@@ -945,40 +969,75 @@ mod tests {
     }
 
     #[test]
-    fn efficiency_delta_below_threshold_prints_down() {
+    fn efficiency_delta_small_drop_prints_without_worse() {
         let line = format_efficiency_delta_line(Some(-0.06)).expect("line");
-        assert!(line.contains('↓'));
+        assert!(!line.contains("worse"));
         assert!(line.contains("-0.1pp"));
+        assert!(!line.contains('↓') && !line.contains('↑'));
     }
 
     #[test]
-    fn cost_arrow_suppressed_when_delta_below_threshold() {
-        assert_eq!(cost_change_arrow(2.00, 2.005), "");
+    fn worse_appears_on_material_regression() {
+        let ttft = format_ttft_delta_line(98.0, 5793.0, Some(228.0), Some(10556.0)).unwrap();
+        assert!(ttft.ends_with("  worse"));
+        let tpot = format_tpot_delta_line(26.3, 47.8, Some(48.8), Some(85.0)).unwrap();
+        assert!(tpot.ends_with("  worse"));
+        assert!(format_throughput_delta_line(1000.0, 900.0).ends_with("  worse"));
+        assert!(format_jtok_delta_line(0.70, 0.80).ends_with("  worse"));
+        assert!(format_cost_delta_line(0.92, 1.00, " (est)").ends_with("  worse"));
+        let eff = format_efficiency_delta_line(Some(-4.2)).unwrap();
+        assert!(eff.ends_with("  worse"));
     }
 
     #[test]
-    fn cost_arrow_down_when_improvement_above_threshold() {
-        assert_eq!(cost_change_arrow(2.00, 1.98), "↓ (improved)");
+    fn worse_absent_on_improvement() {
+        assert!(!format_throughput_delta_line(230.0, 902.0).contains("worse"));
+        let ttft = format_ttft_delta_line(5793.0, 98.0, Some(10556.0), Some(228.0)).unwrap();
+        assert!(!ttft.contains("worse"));
+        let tpot = format_tpot_delta_line(47.8, 26.3, Some(85.0), Some(48.8)).unwrap();
+        assert!(!tpot.contains("worse"));
+        assert!(!format_jtok_delta_line(2.23, 0.70).contains("worse"));
+        assert!(!format_cost_delta_line(3.60, 0.92, " (est)").contains("worse"));
+        let eff = format_efficiency_delta_line(Some(4.2)).unwrap();
+        assert!(!eff.contains("worse"));
+        assert_eq!(eff, "  Decode eff. +4.2pp");
     }
 
     #[test]
-    fn recoverable_arrow_suppressed_when_delta_below_threshold() {
-        assert_eq!(recoverable_waste_arrow(10.0, 9.97), "");
+    fn worse_absent_below_gate() {
+        // Throughput: 4% drop < 5% gate → silent.
+        assert!(!format_throughput_delta_line(1000.0, 960.0).contains("worse"));
+        // TTFT/TPOT: below materiality → no line.
+        assert!(format_ttft_delta_line(100.0, 104.0, None, None).is_none());
+        assert!(format_tpot_delta_line(26.0, 26.4, None, None).is_none());
+        // Cost/Jtok: rise below absolute gate → silent.
+        assert!(!format_cost_delta_line(2.00, 2.005, " (est)").contains("worse"));
+        assert!(!format_jtok_delta_line(0.31, 0.32).contains("worse"));
+        // Eff below display min → no line.
+        assert!(format_efficiency_delta_line(Some(-0.04)).is_none());
+        // Eff displayed but below 1.0pp worse gate → silent.
+        let small = format_efficiency_delta_line(Some(-0.5)).unwrap();
+        assert!(!small.contains("worse"));
+        assert!(
+            format_efficiency_delta_line(Some(-1.5))
+                .unwrap()
+                .ends_with("  worse")
+        );
     }
 
     #[test]
-    fn recoverable_arrow_down_when_waste_reduced_above_threshold() {
-        assert_eq!(recoverable_waste_arrow(10.0, 9.94), "↓ (improved)");
-    }
-
-    #[test]
-    fn jtok_arrow_down_when_energy_improves() {
-        assert_eq!(jtok_change_arrow(0.31, 0.28), "↓ (improved)");
-    }
-
-    #[test]
-    fn jtok_arrow_suppressed_below_threshold() {
-        assert_eq!(jtok_change_arrow(0.31, 0.30), "");
+    fn p95_has_no_own_label() {
+        let line = format_ttft_delta_line(98.0, 5793.0, Some(228.0), Some(10556.0)).unwrap();
+        assert!(line.contains("(p95 228 → 10556ms)"));
+        assert_eq!(line.matches("worse").count(), 1);
+        assert!(line.ends_with("  worse"));
+        let start = line.find("(p95").unwrap();
+        let end = line.find(')').unwrap();
+        let p95 = &line[start..=end];
+        assert!(p95.ends_with("ms)"));
+        assert!(!p95.contains("worse"));
+        assert!(!p95.contains('↑') && !p95.contains('↓'));
+        assert!(!p95.contains("improved") && !p95.contains("regressed"));
     }
 
     #[test]
@@ -1003,88 +1062,12 @@ mod tests {
             tpot_p95_before_ms: None,
             tpot_p95_after_ms: None,
             config_drifted: false,
-            config_changes: Vec::new(),
+            non_baseline_drifted: false,
+            load_changed: false,
+            prefix_hit_changed: false,
             capacity_self_grade: None,
         };
         assert!(economics_section_active(&d));
-    }
-
-    #[test]
-    fn economics_header_shown_for_recoverable_waste() {
-        let d = delta::Delta {
-            throughput_before: Some(1580.0),
-            throughput_after: Some(4120.0),
-            efficiency_delta_pp: Some(18.4),
-            efficiency_pct_before: Some(36.0),
-            efficiency_pct_after: Some(54.4),
-            cost_per_million_before: Some(0.16),
-            cost_per_million_after: Some(0.16),
-            joules_per_token_before: None,
-            joules_per_token_after: None,
-            cost_source_after: Some(engine::CostSource::Catalog),
-            ttft_before_ms: None,
-            ttft_after_ms: None,
-            tpot_before_ms: None,
-            tpot_after_ms: None,
-            ttft_p95_before_ms: None,
-            ttft_p95_after_ms: None,
-            tpot_p95_before_ms: None,
-            tpot_p95_after_ms: None,
-            config_drifted: false,
-            config_changes: Vec::new(),
-            capacity_self_grade: None,
-        };
-        assert!(recoverable_waste_available(&d));
-        assert!(economics_section_active(&d));
-    }
-
-    #[test]
-    fn delta_waste_uses_80_pct_ceiling() {
-        let cpm = 0.34;
-        let tps = 1216.0;
-        let eff = 50.0;
-        let d = delta::Delta {
-            throughput_before: Some(tps),
-            throughput_after: Some(tps),
-            efficiency_delta_pp: None,
-            efficiency_pct_before: Some(eff),
-            efficiency_pct_after: Some(eff),
-            cost_per_million_before: Some(cpm),
-            cost_per_million_after: Some(cpm),
-            joules_per_token_before: None,
-            joules_per_token_after: None,
-            cost_source_after: Some(engine::CostSource::Catalog),
-            ttft_before_ms: None,
-            ttft_after_ms: None,
-            tpot_before_ms: None,
-            tpot_after_ms: None,
-            ttft_p95_before_ms: None,
-            ttft_p95_after_ms: None,
-            tpot_p95_before_ms: None,
-            tpot_p95_after_ms: None,
-            config_drifted: false,
-            config_changes: Vec::new(),
-            capacity_self_grade: None,
-        };
-        assert!(recoverable_waste_available(&d));
-        let waste = recoverable_waste_per_hr(
-            d.cost_per_million_before.unwrap(),
-            d.throughput_before.unwrap(),
-            d.efficiency_pct_before.unwrap(),
-        );
-        let cost_per_hr = cpm * tps * 3600.0 / 1_000_000.0;
-        let expected = cost_per_hr * 0.30;
-        let full_roofline_gap = cost_per_hr * 0.50;
-        assert!(
-            (waste - expected).abs() < 1e-9,
-            "expected {expected}, got {waste}"
-        );
-        assert!(
-            (waste - full_roofline_gap).abs() > 1e-9,
-            "must not use 100% roofline gap"
-        );
-        let waste_at_85 = recoverable_waste_per_hr(cpm, tps, 85.0);
-        assert_eq!(waste_at_85, 0.0);
     }
 
     #[test]

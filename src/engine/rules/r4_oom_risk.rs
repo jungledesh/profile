@@ -77,32 +77,17 @@ pub fn r4_recommendation(
         }
     };
 
-    let short_action = if unrunnable {
-        "model unrunnable - GPU has insufficient VRAM for activation memory".to_string()
-    } else {
-        match computed_min_tp {
-            Some(n) => format!("set --tensor-parallel-size to at least {n}"),
-            None => {
-                format!("increase --tensor-parallel-size (weights overflow by ~{overflow:.0}GB)")
-            }
-        }
-    };
-
     Some(Recommendation {
         rule_name: rule_names::OOM_RISK,
         layer: 2,
         impact: 5,
         confidence,
-        action: format!(
-            "Model weights exceed GPU VRAM by {overflow:.0}GB. Server may OOM without tensor parallelism"
-        ),
-        short_action,
-        expected_impact: "Model fits in memory; eliminates OOM risk".to_string(),
         display_lines: vec![
             "[!] OOM Risk".to_string(),
             String::new(),
             "    Cause:".to_string(),
             format!("      • Model weights exceed GPU VRAM by ~{overflow:.0}GB"),
+            "      • Server may OOM without tensor parallelism.".to_string(),
             String::new(),
             "    Fix:".to_string(),
             fix_line,
@@ -351,11 +336,8 @@ mod tests {
         let text = r.display_lines.join("\n");
         assert!(text.contains("[!] OOM Risk"));
         assert!(text.contains("      • Model weights exceed GPU VRAM by ~12GB"));
+        assert!(text.contains("Server may OOM without tensor parallelism"));
         assert!(text.contains("weights overflow by ~12GB"));
-        assert!(
-            r.short_action
-                .contains("increase --tensor-parallel-size (weights overflow by ~12GB)")
-        );
     }
 
     #[test]
@@ -389,7 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn short_action_includes_min_tp_when_weight_and_vram_known() {
+    fn display_includes_min_tp_when_weight_and_vram_known() {
         let r = r4_recommendation(
             Some(-12.5),
             Some(1),
@@ -399,7 +381,9 @@ mod tests {
             WeightDtypeSource::EnvVar,
         )
         .expect("fired");
-        assert_eq!(r.short_action, "set --tensor-parallel-size to at least 3");
+        let text = r.display_lines.join("\n");
+        assert!(text.contains("Increase --tensor-parallel-size to at least 3"));
+        assert!(text.contains("Server may OOM without tensor parallelism"));
     }
 
     #[test]

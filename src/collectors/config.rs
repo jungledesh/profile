@@ -17,6 +17,8 @@ pub struct VllmConfig {
     /// HF repo id or weight path from `/v1/models` `root` when present.
     pub model_root: Option<String>,
     pub max_num_seqs: Option<u32>,
+    /// Scheduler token budget (`--max-num-batched-tokens`).
+    pub max_num_batched_tokens: Option<u32>,
     pub tensor_parallel_size: Option<u32>,
     pub pipeline_parallel_size: Option<u32>,
     pub dtype: Option<String>,
@@ -59,13 +61,20 @@ pub(crate) fn config_from_snapshot(
             .max_num_seqs
             .or(cli_max_num_seqs)
             .or_else(|| env_u32("MAX_NUM_SEQS")),
+        max_num_batched_tokens: snapshot
+            .vllm
+            .max_num_batched_tokens
+            .or_else(|| env_u32("MAX_NUM_BATCHED_TOKENS"))
+            .or_else(|| env_u32("VLLM_MAX_NUM_BATCHED_TOKENS")),
         tensor_parallel_size: None,
         pipeline_parallel_size: env_u32("PIPELINE_PARALLEL_SIZE")
             .or_else(|| env_u32("VLLM_PIPELINE_PARALLEL_SIZE")),
         dtype: env_str("DTYPE").or_else(|| env_str("VLLM_DTYPE")),
         quantization: env_str("QUANTIZATION").or_else(|| env_str("VLLM_QUANTIZATION")),
         max_model_len: env_u32("MAX_MODEL_LEN").or_else(|| env_u32("VLLM_MAX_MODEL_LEN")),
-        gpu_memory_utilization: env_f64("GPU_MEMORY_UTILIZATION")
+        gpu_memory_utilization: cc
+            .gpu_memory_utilization
+            .or_else(|| env_f64("GPU_MEMORY_UTILIZATION"))
             .or_else(|| env_f64("VLLM_GPU_MEMORY_UTILIZATION")),
         kv_cache_dtype: cc
             .cache_dtype
@@ -334,6 +343,7 @@ mod tests {
             cache_dtype: Some("fp8".to_string()),
             enable_prefix_caching: Some(true),
             enable_chunked_prefill: Some(false),
+            gpu_memory_utilization: Some(0.85),
             ..Default::default()
         };
         let cfg = config_from_snapshot(&s, None);
@@ -341,6 +351,15 @@ mod tests {
         assert_eq!(cfg.kv_cache_dtype.as_deref(), Some("fp8"));
         assert_eq!(cfg.enable_prefix_caching, Some(true));
         assert_eq!(cfg.enable_chunked_prefill, Some(false));
+        assert_eq!(cfg.gpu_memory_utilization, Some(0.85));
+    }
+
+    #[test]
+    fn config_from_snapshot_reads_max_num_batched_tokens() {
+        let mut s = mk_snap(None, None);
+        s.vllm.max_num_batched_tokens = Some(2048);
+        let cfg = config_from_snapshot(&s, None);
+        assert_eq!(cfg.max_num_batched_tokens, Some(2048));
     }
 
     #[test]

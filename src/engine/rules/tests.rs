@@ -1,4 +1,4 @@
-use super::format::{append_waste_line, r2_kv_cache_advisory, waste_label_suffix};
+use super::format::r2_kv_cache_advisory;
 use super::r1_under_batching::{r1_recommendation, rule1_under_batching_with_efficiency};
 use super::r2_kv_cache_pressure::{
     KvCapacityLabel, R2RecommendationInput, Rule2Outcome, r2_recommendation,
@@ -8,9 +8,6 @@ use super::r3_low_prefix_reuse::{format_low_prefix_hit_rate_fired, rule3_low_pre
 use super::*;
 use crate::collectors::{GpuRawMetrics, RawSnapshot, VllmConfig, VllmRawMetrics};
 use crate::context::{AnalysisInput, ModelArch, RuntimeWindow, StaticContext};
-use crate::engine::baseline::{
-    CeilingEstimate, CostEstimate, CostSource, PhysicsBaseline, WeightDtypeSource,
-};
 use std::time::{Duration, SystemTime};
 
 fn format_diagnose_rules_test(
@@ -233,46 +230,6 @@ fn mk_evaluable_concurrency_saturation_window(
     mk_win(snap(t, t, v, gpu_busy()))
 }
 
-fn baseline_for_waste(eff: f64, source: CostSource, cpm: f64) -> PhysicsBaseline {
-    PhysicsBaseline {
-        decode: CeilingEstimate {
-            lower: 90.0,
-            expected: 100.0,
-            upper: 110.0,
-        },
-        prefill: None,
-        efficiency_pct: Some(eff),
-        headroom_pct: Some(100.0 - eff),
-        weight_dtype_source: WeightDtypeSource::Fallback,
-        weight_gb: 1.0,
-        weight_bytes_per_param: 2,
-        kv_headroom_gb: None,
-        tpot_floor_ms: 10.0,
-        prefill_latency_floor_ms: None,
-        ridge_batch_size: 1.0,
-        config_relative_efficiency_pct: None,
-        cost: Some(CostEstimate {
-            tok_per_watt: None,
-            joules_per_token: None,
-            cost_per_million_tokens: Some(cpm),
-            cost_source: source,
-        }),
-    }
-}
-
-fn mk_rec(rule_name: &'static str) -> Recommendation {
-    Recommendation {
-        rule_name,
-        layer: 4,
-        impact: 4,
-        confidence: 0.8,
-        action: String::new(),
-        short_action: String::new(),
-        expected_impact: String::new(),
-        display_lines: Vec::new(),
-    }
-}
-
 fn mk_llama8b_h100_ctx(s: &RawSnapshot) -> StaticContext {
     let cfg = VllmConfig {
         dtype: Some("bf16".to_string()),
@@ -436,14 +393,16 @@ fn rule_is_significant_zero_evaluable_windows_is_false() {
 #[test]
 fn model_len_suggestion_uses_p99_sum_when_count_sufficient() {
     let mut lines = Vec::new();
-    push_model_len_shrink_suggestion(
+    extend_with_shrink_suggestion(
         &mut lines,
-        Some(8192),
-        Some(6000.0),
-        Some(450.0),
-        150.0,
-        "      ",
-        None,
+        model_len_shrink_suggestion_lines(
+            Some(8192),
+            Some(6000.0),
+            Some(450.0),
+            150.0,
+            "      ",
+            None,
+        ),
     );
     let text = lines.join("\n");
     assert!(text.contains("Lower --max-model-len 8192 → 6450"));
@@ -455,14 +414,16 @@ fn model_len_suggestion_uses_p99_sum_when_count_sufficient() {
 #[test]
 fn model_len_suggestion_no_op_when_count_below_threshold() {
     let mut lines = Vec::new();
-    push_model_len_shrink_suggestion(
+    extend_with_shrink_suggestion(
         &mut lines,
-        Some(8192),
-        Some(6000.0),
-        Some(450.0),
-        50.0,
-        "      ",
-        None,
+        model_len_shrink_suggestion_lines(
+            Some(8192),
+            Some(6000.0),
+            Some(450.0),
+            50.0,
+            "      ",
+            None,
+        ),
     );
     let text = lines.join("\n");
     assert!(text.contains("to safely raise concurrency"));
@@ -472,14 +433,9 @@ fn model_len_suggestion_no_op_when_count_below_threshold() {
 #[test]
 fn model_len_suggestion_no_op_when_p99_missing() {
     let mut lines = Vec::new();
-    push_model_len_shrink_suggestion(
+    extend_with_shrink_suggestion(
         &mut lines,
-        Some(8192),
-        Some(6000.0),
-        None,
-        150.0,
-        "      ",
-        None,
+        model_len_shrink_suggestion_lines(Some(8192), Some(6000.0), None, 150.0, "      ", None),
     );
     let text = lines.join("\n");
     assert!(text.contains("to safely raise concurrency"));
@@ -489,14 +445,16 @@ fn model_len_suggestion_no_op_when_p99_missing() {
 #[test]
 fn model_len_suggestion_suppressed_when_delta_below_5pct() {
     let mut lines = Vec::new();
-    push_model_len_shrink_suggestion(
+    extend_with_shrink_suggestion(
         &mut lines,
-        Some(5464),
-        Some(5400.0),
-        Some(65.0),
-        150.0,
-        "      ",
-        None,
+        model_len_shrink_suggestion_lines(
+            Some(5464),
+            Some(5400.0),
+            Some(65.0),
+            150.0,
+            "      ",
+            None,
+        ),
     );
     assert!(lines.is_empty());
 }
@@ -521,14 +479,16 @@ fn model_len_suggestion_projects_capacity_from_observed_geometry() {
         weight_bytes: 2,
     };
     let mut lines = Vec::new();
-    push_model_len_shrink_suggestion(
+    extend_with_shrink_suggestion(
         &mut lines,
-        Some(32768),
-        Some(15000.0),
-        Some(1384.0),
-        150.0,
-        "      ",
-        Some(&hyp),
+        model_len_shrink_suggestion_lines(
+            Some(32768),
+            Some(15000.0),
+            Some(1384.0),
+            150.0,
+            "      ",
+            Some(&hyp),
+        ),
     );
     let text = lines.join("\n");
     assert!(
@@ -570,14 +530,16 @@ fn model_len_suggestion_live_run_projection_at_5465_is_39_not_observed_8() {
         Some(39)
     );
     let mut lines = Vec::new();
-    push_model_len_shrink_suggestion(
+    extend_with_shrink_suggestion(
         &mut lines,
-        Some(32768),
-        Some(5000.0),
-        Some(465.0),
-        150.0,
-        "      ",
-        Some(&hyp),
+        model_len_shrink_suggestion_lines(
+            Some(32768),
+            Some(5000.0),
+            Some(465.0),
+            150.0,
+            "      ",
+            Some(&hyp),
+        ),
     );
     let text = lines.join("\n");
     assert!(
@@ -775,6 +737,155 @@ fn format_under_batching_fired_matches_template() {
         format_diagnose_rules_test(&ctx, &win, false, "http://127.0.0.1:8000/metrics").join("\n");
     assert!(text.contains("[!] Under-batching: Insufficient Concurrency"));
     assert!(text.contains("Batch more requests or increase client concurrency (251 slots idle)"));
+    assert!(!text.contains("/hr "));
+}
+
+#[test]
+fn issue_blocks_r1_through_r7_have_no_waste_per_hr() {
+    let url = "http://127.0.0.1:8000/metrics";
+    let assert_no_waste = |label: &str, text: &str| {
+        assert!(
+            !text.contains("/hr "),
+            "{label} still has $/hr waste line: {text}"
+        );
+        for fragment in [
+            "wasted on idle compute",
+            "lost to memory thrashing",
+            "wasted on redundant prefill",
+            "lost to prefill interference",
+            "lost to scheduler queuing",
+            "wasted on config-limited batching",
+            "lost to compounding bottlenecks",
+            "unclassified overhead",
+        ] {
+            assert!(
+                !text.contains(fragment),
+                "{label} still has waste label `{fragment}`: {text}"
+            );
+        }
+    };
+
+    // R1
+    {
+        let t = SystemTime::UNIX_EPOCH;
+        let mut v = vllm_base();
+        v.num_requests_running = Some(5.0);
+        v.model_name = Some("meta-llama/Llama-3.1-8B-Instruct".to_string());
+        v.generation_tokens_per_sec = Some(100.0);
+        let mut g = gpu_low();
+        g.gpu_name = Some("NVIDIA H100 80GB HBM3".to_string());
+        g.power_watts = Some(400.0);
+        g.aligned_power_watts = Some(400.0);
+        let s = snap(t, t, v, g);
+        let cfg = VllmConfig {
+            dtype: Some("bf16".to_string()),
+            max_model_len: Some(2048),
+            ..Default::default()
+        };
+        let ctx = StaticContext::from_snapshot(&s, cfg);
+        let win = mk_win(s);
+        let text = format_diagnose_rules_test(&ctx, &win, false, url).join("\n");
+        assert!(text.contains("[!] Under-batching"));
+        assert_no_waste("R1", &text);
+    }
+
+    // R2
+    {
+        let mut windows: Vec<_> = (0..15)
+            .map(|_| mk_evaluable_kv_window(50.0, false))
+            .collect();
+        for w in windows.iter_mut().take(4) {
+            *w = mk_evaluable_kv_window(89.0, true);
+            w.snapshot.gpus[0].gpu_name = Some("NVIDIA H100 80GB HBM3".to_string());
+            w.snapshot.gpus[0].power_watts = Some(400.0);
+            w.snapshot.gpus[0].aligned_power_watts = Some(400.0);
+        }
+        let text = r2_issue_lines(&windows).join("\n");
+        assert!(text.contains("[!] KV Cache Pressure"));
+        assert_no_waste("R2", &text);
+    }
+
+    // R3 (raise occupancy so R1 does not win the layer filter)
+    {
+        let t = SystemTime::UNIX_EPOCH;
+        let mut v = vllm_base();
+        v.prefix_cache_hit_rate = Some(0.20);
+        v.prompt_tokens_mean = Some(25.0);
+        v.request_success_per_sec = Some(40.0);
+        v.num_requests_running = Some(200.0);
+        v.num_requests_waiting = Some(0.0);
+        v.max_num_seqs = Some(256);
+        v.generation_tokens_per_sec = Some(80.0);
+        v.kv_cache_usage_perc = Some(40.0);
+        let mut g = gpu_busy();
+        g.gpu_name = Some("NVIDIA H100 80GB HBM3".to_string());
+        g.power_watts = Some(400.0);
+        g.aligned_power_watts = Some(400.0);
+        let s = snap(t, t, v, g);
+        let ctx = mk_ctx();
+        let win = mk_win(s);
+        let text = format_diagnose_rules_test(&ctx, &win, false, url).join("\n");
+        assert!(
+            text.contains("[!] Low Prefix"),
+            "expected R3 primary: {text}"
+        );
+        assert_no_waste("R3", &text);
+    }
+
+    // R4
+    {
+        let (ctx, win) = input_r4_suppresses_r2();
+        let mut windows: Vec<_> = (0..15)
+            .map(|_| mk_evaluable_kv_window(50.0, false))
+            .collect();
+        for w in windows.iter_mut().take(8) {
+            *w = win.clone();
+        }
+        let summary = ai(&ctx, windows.last().expect("windows"));
+        let text = format_diagnose_rules_for_windows_test(&windows, summary, false, url).join("\n");
+        assert!(text.contains("[!] OOM Risk") || text.contains("OOM"));
+        assert_no_waste("R4", &text);
+    }
+
+    // R5
+    {
+        let mut windows: Vec<_> = (0..15)
+            .map(|_| mk_evaluable_kv_window(50.0, false))
+            .collect();
+        for w in windows.iter_mut().take(4) {
+            *w = mk_evaluable_concurrency_saturation_window(32.0, 15.0, 32);
+            w.snapshot.vllm.kv_cache_usage_perc = Some(70.0);
+        }
+        let ctx = mk_ctx();
+        let summary = ai(&ctx, windows.last().expect("windows"));
+        let text = format_diagnose_rules_for_windows_test(&windows, summary, false, url).join("\n");
+        assert!(text.contains("[!] Concurrency Saturation"));
+        assert_no_waste("R5", &text);
+    }
+
+    // R6
+    {
+        let windows: Vec<_> = (0..10)
+            .map(|_| mk_r6_prefill_window(12.0, 10.0, 5.0, Some(50.0)))
+            .collect();
+        let ctx = mk_llama8b_h100_ctx(&windows[0].snapshot);
+        let summary = ai(&ctx, windows.last().expect("windows"));
+        let text = format_diagnose_rules_for_windows_test(&windows, summary, false, url).join("\n");
+        assert!(text.contains("[!] Prefill-Bound") || text.contains("Prefill"));
+        assert_no_waste("R6", &text);
+    }
+
+    // R7
+    {
+        let windows: Vec<_> = (0..10)
+            .map(|_| mk_r7_headroom_window(60.0, 64, 0.0, 50.0))
+            .collect();
+        let ctx = mk_r7_ctx(64);
+        let summary = ai(&ctx, windows.last().expect("windows"));
+        let text = format_diagnose_rules_for_windows_test(&windows, summary, false, url).join("\n");
+        assert!(text.contains("Configured Batch Limit") || text.contains("config"));
+        assert_no_waste("R7", &text);
+    }
 }
 
 #[test]
@@ -1329,30 +1440,6 @@ fn format_notes_split_idle_vs_telemetry_failure() {
 }
 
 #[test]
-fn waste_label_r1_only() {
-    assert_eq!(
-        waste_label_suffix(&[rule_names::UNDER_BATCHING]),
-        Some("wasted on idle compute")
-    );
-}
-
-#[test]
-fn waste_line_multi_rule_compounding() {
-    let b = baseline_for_waste(32.0, CostSource::Catalog, 1.84);
-    let groups = vec![
-        mk_rec(rule_names::UNDER_BATCHING),
-        mk_rec(rule_names::KV_CACHE_PRESSURE),
-    ];
-    let mut lines = vec!["issue".to_string()];
-    append_waste_line(&mut lines, &groups, Some(&b), Some(14.2));
-    assert!(
-        lines
-            .iter()
-            .any(|l| l.contains("lost to compounding bottlenecks"))
-    );
-}
-
-#[test]
 fn dag_layer2_suppresses_layer4_when_r2_fires() {
     let mut windows: Vec<_> = (0..15)
         .map(|_| mk_evaluable_kv_window(50.0, false))
@@ -1851,7 +1938,7 @@ fn cause_kv_line_precedes_preemptions_and_queue() {
 }
 
 #[test]
-fn backlog_short_action_matches_spec() {
+fn backlog_display_matches_spec() {
     let mut windows: Vec<_> = (0..15)
         .map(|_| mk_evaluable_backlog_window(10.0, 1.0, 9.0, 10.0, 10_000, 16))
         .collect();
@@ -1867,9 +1954,20 @@ fn backlog_short_action_matches_spec() {
         .find(|g| g.rule_name == rule_names::KV_ADMISSION_BACKLOG)
         .expect("backlog kv recommendation")
         .clone();
-    assert_eq!(r.short_action, "raise --gpu-memory-utilization");
     let display = r.display_lines.join("\n");
     assert!(display.contains("[!] KV Cache Pressure: Admission Backlog"));
+    assert!(display.contains("gpu-memory-utilization") || display.contains("GPU memory"));
+    assert!(
+        !display.contains("Lower --max-num-seqs"),
+        "backlog must not prescribe lowering max-num-seqs: {display}"
+    );
+    if display.contains("Lower --max-model-len") {
+        let cuts = display
+            .find("    Cuts throughput:")
+            .expect("shrink requires Cuts throughput header");
+        let shrink = display.find("Lower --max-model-len").expect("shrink");
+        assert!(cuts < shrink, "shrink must sit under Cuts throughput:");
+    }
 }
 
 #[test]
@@ -1972,12 +2070,10 @@ fn format_diagnose_rules_inserts_blank_between_rule_blocks() {
         "should not append no-issues line when at least one rule fired"
     );
     let waste_lines: Vec<_> = lines.iter().filter(|l| l.contains("/hr ")).collect();
-    assert_eq!(
-        waste_lines.len(),
-        1,
-        "expected one shared waste line: {lines:?}"
+    assert!(
+        waste_lines.is_empty(),
+        "waste lines removed from diagnose output: {lines:?}"
     );
-    assert!(waste_lines[0].contains("lost to memory thrashing"));
     let _ = idx_kv;
 }
 
@@ -2159,8 +2255,6 @@ fn session_kv_peak_from_non_r5_window_reaches_build_report_from_eval() {
     assert!(!text.contains("KV at 95%: scheduler at cap, pool full."));
     assert!(!text.contains("Add a replica"));
     assert!(!text.contains("KV pool has room (70%)"));
-    // action still uses aggregate session peak from eval.
-    assert_eq!(r5.action, "Add a replica to scale out.");
 }
 
 #[test]
@@ -2257,171 +2351,6 @@ fn dag_layer2_suppresses_layer3_when_r2_fires() {
             .recommendations
             .iter()
             .any(|g| g.rule_name == rule_names::CONCURRENCY_SATURATION)
-    );
-}
-
-#[test]
-fn waste_none_when_efficiency_above_ceiling() {
-    let b = baseline_for_waste(85.0, CostSource::Catalog, 1.84);
-    let groups = vec![mk_rec(rule_names::UNDER_BATCHING)];
-    let mut lines = vec!["issue".to_string()];
-    append_waste_line(&mut lines, &groups, Some(&b), Some(14.2));
-    assert!(
-        !lines.iter().any(|l| l.contains("/hr ")),
-        "85% efficiency is above 80% ceiling; no recoverable waste"
-    );
-}
-
-#[test]
-fn waste_computed_against_80_pct_ceiling() {
-    let cpm = 1.84;
-    let tps = 14.2_f64;
-    let cost_per_hr = cpm * tps * 3600.0 / 1_000_000.0;
-    let expected_waste = cost_per_hr * 0.30;
-    let not_full_gap_waste = cost_per_hr * 0.50;
-    assert!(
-        (expected_waste - not_full_gap_waste).abs() > 1e-9,
-        "test must distinguish 80% ceiling from 100% roofline"
-    );
-    let b = baseline_for_waste(50.0, CostSource::Catalog, cpm);
-    let groups = vec![mk_rec(rule_names::UNDER_BATCHING)];
-    let mut lines = vec!["issue".to_string()];
-    append_waste_line(&mut lines, &groups, Some(&b), Some(tps));
-    let waste_line = lines
-        .iter()
-        .find(|l| l.contains("/hr "))
-        .expect("50% efficiency should produce waste line");
-    assert!(
-        waste_line.contains(&format!("~${expected_waste:.2}/hr")),
-        "expected ~${expected_waste:.2}/hr (30% gap to 80% ceiling), got {waste_line}"
-    );
-    assert!(
-        !waste_line.contains(&format!("~${not_full_gap_waste:.2}/hr")),
-        "must not use 100% roofline gap: {waste_line}"
-    );
-}
-
-#[test]
-fn waste_line_appended_for_r1_r2_r3_r5() {
-    let b = baseline_for_waste(32.0, CostSource::Catalog, 1.84);
-    let tps = Some(14.2_f64);
-    let cases = [
-        (
-            vec![mk_rec(rule_names::UNDER_BATCHING)],
-            "wasted on idle compute",
-        ),
-        (
-            vec![mk_rec(rule_names::KV_CACHE_PRESSURE)],
-            "lost to memory thrashing",
-        ),
-        (
-            vec![mk_rec(rule_names::LOW_PREFIX_REUSE)],
-            "wasted on redundant prefill",
-        ),
-        (
-            vec![mk_rec(rule_names::CONCURRENCY_SATURATION)],
-            "lost to scheduler queuing",
-        ),
-    ];
-    for (recs, suffix) in cases {
-        let mut lines = vec!["issue".to_string()];
-        append_waste_line(&mut lines, &recs, Some(&b), tps);
-        let waste = lines.iter().find(|l| l.contains("/hr ")).expect(suffix);
-        assert!(waste.ends_with(suffix), "got {waste}");
-    }
-}
-
-#[test]
-fn waste_line_unknown_rule_name_unclassified() {
-    let groups = vec![mk_rec(rule_names::OOM_RISK)];
-
-    let b = baseline_for_waste(32.0, CostSource::Catalog, 1.84);
-    let mut lines = vec!["issue".to_string()];
-    append_waste_line(&mut lines, &groups, Some(&b), Some(14.2));
-    assert!(lines.iter().any(|l| l.contains("unclassified overhead")));
-
-    // UserProvided source is accepted; label still falls through to unclassified.
-    let b = baseline_for_waste(32.0, CostSource::UserProvided, 1.0);
-    let mut lines = vec!["issue".to_string()];
-    append_waste_line(&mut lines, &groups, Some(&b), Some(100.0));
-    assert!(lines.iter().any(|l| l.contains("unclassified overhead")));
-}
-
-#[test]
-fn waste_line_efficiency_over_100_omitted() {
-    let b = baseline_for_waste(110.0, CostSource::Catalog, 1.84);
-    let mut lines = vec!["issue".to_string()];
-    append_waste_line(
-        &mut lines,
-        &[mk_rec(rule_names::UNDER_BATCHING)],
-        Some(&b),
-        Some(14.2),
-    );
-    assert_eq!(lines.len(), 1);
-    assert!(!lines.iter().any(|l| l.contains("/hr ")));
-}
-
-#[test]
-fn waste_line_absent_without_cost_or_efficiency() {
-    let mut b = baseline_for_waste(32.0, CostSource::Catalog, 1.84);
-    b.efficiency_pct = None;
-    let mut lines = vec!["issue".to_string()];
-    append_waste_line(
-        &mut lines,
-        &[mk_rec(rule_names::UNDER_BATCHING)],
-        Some(&b),
-        Some(10.0),
-    );
-    assert_eq!(lines.len(), 1);
-
-    b.efficiency_pct = Some(32.0);
-    b.cost = None;
-    append_waste_line(
-        &mut lines,
-        &[mk_rec(rule_names::UNDER_BATCHING)],
-        Some(&b),
-        Some(10.0),
-    );
-    assert_eq!(lines.len(), 1);
-}
-
-#[test]
-fn waste_label_r2_only() {
-    assert_eq!(
-        waste_label_suffix(&[rule_names::KV_CACHE_PRESSURE]),
-        Some("lost to memory thrashing")
-    );
-}
-
-#[test]
-fn waste_label_r3_only() {
-    assert_eq!(
-        waste_label_suffix(&[rule_names::LOW_PREFIX_REUSE]),
-        Some("wasted on redundant prefill")
-    );
-}
-
-#[test]
-fn waste_label_r5_only() {
-    assert_eq!(
-        waste_label_suffix(&[rule_names::CONCURRENCY_SATURATION]),
-        Some("lost to scheduler queuing")
-    );
-}
-
-#[test]
-fn waste_label_multi_rule() {
-    assert_eq!(
-        waste_label_suffix(&[rule_names::UNDER_BATCHING, rule_names::KV_CACHE_PRESSURE]),
-        Some("lost to compounding bottlenecks")
-    );
-}
-
-#[test]
-fn waste_label_unknown_rule() {
-    assert_eq!(
-        waste_label_suffix(&[rule_names::OOM_RISK]),
-        Some("unclassified overhead")
     );
 }
 
