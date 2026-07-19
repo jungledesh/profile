@@ -470,7 +470,15 @@ fn apply_histogram_window(first: &Scrape, last: &Scrape, m: &mut VllmRawMetrics)
 }
 
 pub(crate) fn max_num_seqs_from_scrape(scrape: &Scrape) -> Option<u32> {
-    first_gauge(scrape, "vllm_max_num_seqs").and_then(|v| {
+    u32_gauge_from_scrape(scrape, "vllm_max_num_seqs")
+}
+
+pub(crate) fn max_num_batched_tokens_from_scrape(scrape: &Scrape) -> Option<u32> {
+    u32_gauge_from_scrape(scrape, "vllm_max_num_batched_tokens")
+}
+
+fn u32_gauge_from_scrape(scrape: &Scrape, name: &str) -> Option<u32> {
+    first_gauge(scrape, name).and_then(|v| {
         if v.is_finite() && v >= 0.0 {
             let r = v.round();
             if r <= u32::MAX as f64 {
@@ -602,6 +610,11 @@ fn parse_cache_config_labels(scrape: &Scrape) -> CacheConfigLabels {
             .labels
             .get("enable_chunked_prefill")
             .and_then(super::config::parse_bool),
+        gpu_memory_utilization: s
+            .labels
+            .get("gpu_memory_utilization")
+            .and_then(|v| v.parse().ok())
+            .filter(|v: &f64| v.is_finite() && *v > 0.0),
         // Allocator-computed (vLLM v0.25.1 cache.py); absent → None, never guessed.
         kv_cache_size_tokens: s
             .labels
@@ -648,6 +661,7 @@ fn parse_vllm_metrics(scrape: &Scrape) -> Result<VllmRawMetrics> {
     let generation_tokens_total = total_generation_tokens(scrape);
 
     let max_num_seqs = max_num_seqs_from_scrape(scrape);
+    let max_num_batched_tokens = max_num_batched_tokens_from_scrape(scrape);
     let num_requests_swapped = first_gauge(scrape, "vllm_num_requests_swapped");
     let num_preemptions_total = total_preemptions(scrape);
     let cpu_cache_usage_perc = first_gauge(scrape, "vllm_cpu_cache_usage_perc").map(|v| v * 100.0);
@@ -691,6 +705,7 @@ fn parse_vllm_metrics(scrape: &Scrape) -> Result<VllmRawMetrics> {
         prefix_cache_hit_rate: None,
         prefix_cache_scrape_samples: vec![],
         max_num_seqs,
+        max_num_batched_tokens,
         num_requests_swapped,
         num_preemptions_total,
         num_preemptions_per_sec: None,
@@ -762,6 +777,13 @@ vllm_max_num_seqs 256
         let body = "vllm_num_requests_running 1\n";
         let s = scrape_from_body(body).unwrap();
         assert_eq!(max_num_seqs_from_scrape(&s), None);
+    }
+
+    #[test]
+    fn max_num_batched_tokens_gauge_parsed() {
+        let body = "vllm_max_num_batched_tokens 2048\n";
+        let s = scrape_from_body(body).unwrap();
+        assert_eq!(max_num_batched_tokens_from_scrape(&s), Some(2048));
     }
 
     #[test]
@@ -1213,7 +1235,7 @@ vllm_prompt_tokens_total{model_name="b"} 60
         let body = r#"
 # HELP vllm:cache_config_info Information of the cache configuration.
 # TYPE vllm:cache_config_info gauge
-vllm:cache_config_info{block_size="16",cache_dtype="auto",cpu_offload_gb="0",enable_prefix_caching="True",enable_chunked_prefill="False",num_cpu_blocks="2048",num_gpu_blocks="4096",sliding_window="None"} 1.0
+vllm:cache_config_info{block_size="16",cache_dtype="auto",cpu_offload_gb="0",enable_prefix_caching="True",enable_chunked_prefill="False",gpu_memory_utilization="0.9",num_cpu_blocks="2048",num_gpu_blocks="4096",sliding_window="None"} 1.0
 "#;
         let scrape = scrape_from_body(body).unwrap();
         let cc = parse_cache_config_labels(&scrape);
@@ -1222,6 +1244,7 @@ vllm:cache_config_info{block_size="16",cache_dtype="auto",cpu_offload_gb="0",ena
         assert_eq!(cc.cache_dtype.as_deref(), Some("auto"));
         assert_eq!(cc.enable_prefix_caching, Some(true));
         assert_eq!(cc.enable_chunked_prefill, Some(false));
+        assert_eq!(cc.gpu_memory_utilization, Some(0.9));
         assert!(cc.kv_cache_size_tokens.is_none());
         assert!(cc.kv_cache_max_concurrency.is_none());
         assert!(cc.mamba_block_size.is_none());

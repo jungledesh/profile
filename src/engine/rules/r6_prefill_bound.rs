@@ -17,6 +17,7 @@ const TPOT_INFLATION_GATE: f64 = 4.0;
 /// Decode efficiency below this indicates underperformance that prefill might explain.
 const DECODE_EFFICIENCY_GATE: f64 = 40.0;
 const PROMPT_SKEW_RATIO: f64 = 5.0;
+const SKEWED_EXPECTED: &str = "Eliminates head-of-line blocking from long-tail prompts.";
 
 /// Fixed label column width for R6 metric rows (longest label: "Prefill ratio").
 const R6_METRIC_LABEL_W: usize = 20;
@@ -91,12 +92,12 @@ fn batch_budget_fix_bullet(d: &PrefillBoundDetail, verb: &str) -> String {
     match batch_budget_paren(d) {
         Some(paren) => {
             format!(
-                "      • {verb} --max-num-batched-tokens to {budget} {paren}. Lower for smoother TPOT, raise for lower TTFT."
+                "      • {verb} --max-num-batched-tokens to {budget} {paren} to shrink prefill chunk size. Lower for smoother TPOT, raise for lower TTFT."
             )
         }
         None => {
             format!(
-                "      • {verb} --max-num-batched-tokens to {budget}. Lower for smoother TPOT, raise for lower TTFT."
+                "      • {verb} --max-num-batched-tokens to {budget} to shrink prefill chunk size. Lower for smoother TPOT, raise for lower TTFT."
             )
         }
     }
@@ -346,34 +347,7 @@ fn cause_tpot_line(d: &PrefillBoundDetail) -> Option<String> {
     ))
 }
 
-pub(super) fn prefill_fix_lines(
-    d: &PrefillBoundDetail,
-    sev: Severity,
-) -> (Vec<String>, String, String, String) {
-    if skewed_mode(d)
-        && let (Some(p99), Some(mean)) = (
-            d.prompt_tokens_p99.filter(|v| v.is_finite() && *v > 0.0),
-            d.prompt_tokens_mean.filter(|v| v.is_finite() && *v > 0.0),
-        )
-    {
-        return (
-            vec![
-                format!(
-                    "      • Route long-context requests (p99: {p99:.0} tok) to a dedicated vLLM instance."
-                ),
-                format!(
-                    "      Short requests ({mean:.0} tok mean) are blocked by outlier prefills."
-                ),
-                "      • Or cap --max-model-len to reject prompts above the p95 threshold, or truncate at the application layer.".to_string(),
-            ],
-            format!(
-                "Route long-context requests (p99: {p99:.0} tok) to a dedicated instance, or cap --max-model-len above p95"
-            ),
-            "Route long-context requests to a dedicated vLLM instance".to_string(),
-            "Eliminates head-of-line blocking from long-tail prompts.".to_string(),
-        );
-    }
-
+pub(super) fn prefill_fix_lines(d: &PrefillBoundDetail, sev: Severity) -> (Vec<String>, String) {
     let prefix_off = d.prefix_caching_enabled == Some(false);
     let chunked_on = d.chunked_prefill_enabled == Some(true);
     let chunked_not_enabled = d.chunked_prefill_enabled != Some(true);
@@ -384,22 +358,15 @@ pub(super) fn prefill_fix_lines(
                 "      • Enable automatic prefix caching (--enable-prefix-caching).".to_string(),
                 "      Repeated prompt prefixes are re-computed every request.".to_string(),
             ],
-            "Enable automatic prefix caching (--enable-prefix-caching) to avoid re-computing shared prompt prefixes".to_string(),
-            "Enable prefix caching (--enable-prefix-caching)".to_string(),
             "20-40% reduction in prefill time for workloads with shared prefixes.".to_string(),
         )
     } else if chunked_not_enabled {
-        let budget = batch_token_budget(d);
         let bullet = batch_budget_fix_bullet(d, "Set");
         (
             vec![
                 "      • Enable chunked prefill (--enable-chunked-prefill).".to_string(),
                 bullet,
             ],
-            format!(
-                "Enable chunked prefill (--enable-chunked-prefill) and set --max-num-batched-tokens to {budget}"
-            ),
-            "Enable chunked prefill (--enable-chunked-prefill)".to_string(),
             "Decode batches interleave with prefill, reducing head-of-line blocking.".to_string(),
         )
     } else if sev == Severity::Severe && d.prefix_caching_enabled == Some(true) && chunked_on {
@@ -407,26 +374,18 @@ pub(super) fn prefill_fix_lines(
             vec![
                 "      • Disaggregate prefill and decode onto separate workers (vLLM disaggregated serving, requires 2+ nodes).".to_string(),
             ],
-            "Disaggregate prefill and decode onto separate workers (vLLM disaggregated serving, requires 2+ nodes)".to_string(),
-            "Disaggregate prefill and decode workers".to_string(),
             "Full separation of prefill and decode compute paths.".to_string(),
         )
     } else if chunked_on {
-        let budget = batch_token_budget(d);
         (
             vec![batch_budget_fix_bullet(d, "Set")],
-            format!("Set --max-num-batched-tokens to {budget} to shrink prefill chunk size"),
-            "Set --max-num-batched-tokens".to_string(),
             "Lower TTFT variance, steadier decode throughput.".to_string(),
         )
     } else {
         // Logically unreachable: branch 2 forces chunked_on=true, branch 4 catches it.
         // Safe fallback instead of panic in library code.
-        let budget = batch_token_budget(d);
         (
             vec![batch_budget_fix_bullet(d, "Set")],
-            format!("Set --max-num-batched-tokens to {budget} to shrink prefill chunk size"),
-            "Set --max-num-batched-tokens".to_string(),
             "Lower TTFT variance, steadier decode throughput.".to_string(),
         )
     }
@@ -438,7 +397,7 @@ pub(super) fn format_prefill_bound_window_issue(
 ) -> Vec<String> {
     let sev = severity(d.prompt_gen_ratio);
     let conf = confidence(sev);
-    let (fix_bullets, _, _, expected) = prefill_fix_lines(d, sev);
+    let (fix_bullets, expected_normal) = prefill_fix_lines(d, sev);
     let skewed = skewed_mode(d);
 
     let ratio_display = if d.prompt_gen_ratio.is_finite() {
@@ -518,11 +477,40 @@ pub(super) fn format_prefill_bound_window_issue(
     }
 
     lines.push(String::new());
-    lines.push("    Fix:".to_string());
-    lines.extend(fix_bullets);
-    if !skewed {
-        lines.push("      • Reduce prompt length where possible.".to_string());
-    }
+    let expected = if let (true, Some(p99), Some(mean)) = (
+        skewed,
+        d.prompt_tokens_p99.filter(|v| v.is_finite() && *v > 0.0),
+        d.prompt_tokens_mean.filter(|v| v.is_finite() && *v > 0.0),
+    ) {
+        let mut safe = Vec::new();
+        if d.chunked_prefill_enabled != Some(true) {
+            safe.push(
+                "      • Enable --enable-chunked-prefill to interleave short requests with long-prompt chunks."
+                    .to_string(),
+            );
+        }
+        super::push_bullet_with_subline(
+            &mut safe,
+            format!(
+                "      • Route long-context requests (p99: {p99:.0} tok) to a dedicated vLLM instance."
+            ),
+            Some(&format!(
+                "Short requests ({mean:.0} tok mean) are blocked by outlier prefills."
+            )),
+        );
+        let rejects = vec![
+            "      • Cap --max-model-len at p99 prompt length to reject outlier prompts, or truncate them at app layer.".to_string(),
+        ];
+        super::push_grouped_fixes(&mut lines, safe, Vec::new(), rejects);
+        SKEWED_EXPECTED.to_string()
+    } else {
+        lines.push("    Fix:".to_string());
+        lines.extend(fix_bullets);
+        if !skewed {
+            lines.push("      • Reduce prompt length where possible.".to_string());
+        }
+        expected_normal
+    };
     lines.push(String::new());
     lines.push(format!("    Expected: {expected}"));
     lines.push(format!("    Confidence: {}", confidence_label(conf)));
@@ -850,7 +838,7 @@ mod tests {
             tpot_ms: Some(130.0),
             tpot_floor_ms: Some(7.85),
             prefix_caching_enabled: Some(true),
-            chunked_prefill_enabled: Some(true),
+            chunked_prefill_enabled: Some(false),
             prompt_tokens_mean: Some(2048.0),
             prompt_tokens_p99: Some(51_200.0),
             prompt_skew_ratio: Some(25.0),
@@ -861,7 +849,47 @@ mod tests {
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
         assert!(text.contains("Route long-context requests"));
         assert!(text.contains("Prefill ratio"));
+        assert!(text.contains("    Rejects requests:"));
+        assert!(text.contains(&format!("Expected: {SKEWED_EXPECTED}")));
+        let fix = text.find("    Fix:").expect("Fix");
+        let chunked = text
+            .find(
+                "Enable --enable-chunked-prefill to interleave short requests with long-prompt chunks.",
+            )
+            .expect("chunked bullet");
+        let rejects = text.find("    Rejects requests:").expect("Rejects");
+        let route = text.find("Route long-context requests").expect("route");
+        let cap = text
+            .find("Cap --max-model-len at p99 prompt length")
+            .expect("reject bullet");
+        assert!(fix < chunked && chunked < route && route < rejects && rejects < cap);
         assert!(!text.contains("Set --max-num-batched-tokens to shrink prefill chunk size"));
+    }
+
+    #[test]
+    fn skewed_with_chunked_on_skips_chunked_bullet() {
+        let d = PrefillBoundDetail {
+            prompt_gen_ratio: 15.0,
+            decode_efficiency_pct: 6.7,
+            tpot_ms: Some(130.0),
+            tpot_floor_ms: Some(7.85),
+            prefix_caching_enabled: Some(true),
+            chunked_prefill_enabled: Some(true),
+            prompt_tokens_mean: Some(2048.0),
+            prompt_tokens_p99: Some(51_200.0),
+            prompt_skew_ratio: Some(25.0),
+            running_count: None,
+            ridge_batch_size: None,
+            is_hybrid: false,
+        };
+        let text = format_prefill_bound_window_issue(&d, 100).join("\n");
+        assert!(!text.contains("Enable --enable-chunked-prefill to interleave short requests"));
+        assert!(text.contains("    Rejects requests:"));
+        assert!(text.contains(&format!("Expected: {SKEWED_EXPECTED}")));
+        let fix = text.find("    Fix:").expect("Fix");
+        let route = text.find("Route long-context requests").expect("route");
+        let rejects = text.find("    Rejects requests:").expect("Rejects");
+        assert!(fix < route && route < rejects);
     }
 
     #[test]
@@ -923,6 +951,7 @@ mod tests {
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
         assert!(text.contains("Set --max-num-batched-tokens to 2048"));
+        assert!(text.contains("to shrink prefill chunk size"));
         assert!(!text.contains("Disaggregate prefill and decode"));
     }
 
@@ -1006,6 +1035,31 @@ mod tests {
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
         assert!(!text.contains("Reduce prompt length where possible"));
         assert!(text.contains("Route long-context requests"));
+    }
+
+    #[test]
+    fn skewed_mode_without_p99_falls_back_to_normal_fix() {
+        let d = PrefillBoundDetail {
+            prompt_gen_ratio: 15.0,
+            decode_efficiency_pct: 6.7,
+            tpot_ms: Some(130.0),
+            tpot_floor_ms: Some(7.85),
+            prefix_caching_enabled: Some(true),
+            chunked_prefill_enabled: Some(true),
+            prompt_tokens_mean: Some(2048.0),
+            prompt_tokens_p99: None,
+            prompt_skew_ratio: Some(25.0),
+            running_count: None,
+            ridge_batch_size: None,
+            is_hybrid: false,
+        };
+        assert!(skewed_mode(&d));
+        let text = format_prefill_bound_window_issue(&d, 100).join("\n");
+        assert!(!text.contains("Route long-context requests"));
+        assert!(!text.contains("    Rejects requests:"));
+        assert!(text.contains("    Fix:"));
+        assert!(text.contains("--max-num-batched-tokens"));
+        assert!(!text.contains(SKEWED_EXPECTED));
     }
 
     #[test]
@@ -1120,7 +1174,11 @@ mod tests {
         };
         assert_eq!(batch_token_budget(&d), 256);
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
-        assert!(text.contains("Set --max-num-batched-tokens to 256 (est)."));
+        assert!(
+            text.contains(
+                "Set --max-num-batched-tokens to 256 (est) to shrink prefill chunk size."
+            )
+        );
         assert!(text.contains("Lower for smoother TPOT, raise for lower TTFT"));
         assert!(!text.contains("decode stretch"));
     }
@@ -1165,9 +1223,9 @@ mod tests {
             is_hybrid: true,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
-        assert!(
-            text.contains("Set --max-num-batched-tokens to 256 (est; optimistic on long prompts).")
-        );
+        assert!(text.contains(
+            "Set --max-num-batched-tokens to 256 (est; optimistic on long prompts) to shrink prefill chunk size."
+        ));
         assert!(!text.contains("decode stretch"));
     }
 

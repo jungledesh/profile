@@ -20,6 +20,8 @@ pub struct CacheConfigLabels {
     pub cache_dtype: Option<String>,
     pub enable_prefix_caching: Option<bool>,
     pub enable_chunked_prefill: Option<bool>,
+    /// Fraction of GPU memory reserved for the engine (cache_config_info label).
+    pub gpu_memory_utilization: Option<f64>,
     /// Total KV token capacity reported by the allocator.
     pub kv_cache_size_tokens: Option<u64>,
     /// Max concurrent full-context sequences at `max_model_len` (may be fractional).
@@ -117,6 +119,8 @@ pub struct VllmRawMetrics {
 
     // Not always available
     pub max_num_seqs: Option<u32>,
+    /// From `vllm_max_num_batched_tokens` gauge when present.
+    pub max_num_batched_tokens: Option<u32>,
 
     // Memory pressure / offload state
     /// Sequences actively offloaded to CPU KV cache (PCIe is now on the decode path).

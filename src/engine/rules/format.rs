@@ -5,13 +5,10 @@ use crate::collectors::{
 };
 use crate::context::{AnalysisInput, RuntimeWindow};
 use crate::engine::Report;
-use crate::engine::baseline::{CostSource, PhysicsBaseline, WeightDtypeSource};
+use crate::engine::baseline::WeightDtypeSource;
 
 use super::r4_oom_risk::r4_advisory;
-use super::{
-    ACHIEVABLE_EFFICIENCY_CEILING, ENGINE_MIN_PERSISTENT_WINDOWS, NO_ISSUES_LINE, Recommendation,
-    rule_names,
-};
+use super::{ENGINE_MIN_PERSISTENT_WINDOWS, NO_ISSUES_LINE, Recommendation, rule_names};
 
 const KV_RULE_NAMES: &[&str] = &[
     rule_names::KV_CACHE_PRESSURE,
@@ -146,30 +143,6 @@ fn collect_advisories(
     }
 }
 
-fn compute_waste_per_hr(baseline: Option<&PhysicsBaseline>, tps: Option<f64>) -> Option<f64> {
-    let b = baseline?;
-    let eff = b.efficiency_pct.filter(|e| e.is_finite())?;
-    let cost = b.cost.as_ref()?;
-    if !matches!(
-        cost.cost_source,
-        CostSource::UserProvided | CostSource::Catalog
-    ) {
-        return None;
-    }
-    let cpm = cost.cost_per_million_tokens?;
-    let tps = tps.filter(|v| v.is_finite() && *v > 0.0)?;
-    let cost_per_hr = cpm * tps * 3600.0 / 1_000_000.0;
-    if cost_per_hr <= 0.0 {
-        return None;
-    }
-    let waste_fraction = (ACHIEVABLE_EFFICIENCY_CEILING - eff / 100.0).max(0.0);
-    let waste = cost_per_hr * waste_fraction;
-    if !waste.is_finite() || waste <= 0.0 {
-        return None;
-    }
-    Some(waste)
-}
-
 fn kv_ceiling_unknown_verbose_line(
     kv_max_seqs: Option<u32>,
     verbose_rules: bool,
@@ -198,43 +171,6 @@ fn catalog_state_mismatch_verbose_line(
     Some(format!(
         "Note: Catalog state {catalog_pages} pages, observed {observed_pages}; entry may be stale."
     ))
-}
-
-// COUPLING: keys must match `rule_names` constants.
-pub(super) fn waste_label_suffix(rule_names_list: &[&str]) -> Option<&'static str> {
-    match rule_names_list.len() {
-        0 => None,
-        1 => match rule_names_list[0] {
-            rule_names::UNDER_BATCHING => Some("wasted on idle compute"),
-            rule_names::KV_CACHE_PRESSURE => Some("lost to memory thrashing"),
-            rule_names::LOW_PREFIX_REUSE => Some("wasted on redundant prefill"),
-            rule_names::PREFILL_BOUND => Some("lost to prefill interference"),
-            rule_names::CONCURRENCY_SATURATION => Some("lost to scheduler queuing"),
-            rule_names::CONFIG_HEADROOM => Some("wasted on config-limited batching"),
-            _ => Some("unclassified overhead"),
-        },
-        _ => Some("lost to compounding bottlenecks"),
-    }
-}
-
-/// Appends per-issue waste line when efficiency and cost data are available.
-pub(super) fn append_waste_line(
-    lines: &mut Vec<String>,
-    recommendations: &[Recommendation],
-    baseline: Option<&PhysicsBaseline>,
-    tps: Option<f64>,
-) {
-    let rule_names: Vec<&str> = recommendations.iter().map(|r| r.rule_name).collect();
-    let Some(suffix) = waste_label_suffix(&rule_names) else {
-        return;
-    };
-    let Some(waste_per_hr) = compute_waste_per_hr(baseline, tps) else {
-        return;
-    };
-    if !lines.is_empty() && !lines.last().is_some_and(|l| l.is_empty()) {
-        lines.push(String::new());
-    }
-    lines.push(format!("    ~${waste_per_hr:.2}/hr {suffix}"));
 }
 
 /// Parameters for the idle-state load generation hint.
@@ -611,8 +547,6 @@ pub fn format_diagnose_rules_for_windows(
     }
 
     let summary_snap = &summary.window.snapshot;
-    let baseline_ref = report.baseline.as_ref();
-    let tps = summary_snap.vllm.generation_tokens_per_sec;
 
     if report.recommendations.is_empty() {
         let mut out = Vec::new();
@@ -658,8 +592,6 @@ pub fn format_diagnose_rules_for_windows(
         warnings.extend(rule_display_block(rec));
         warnings.push(String::new());
     }
-
-    append_waste_line(&mut warnings, &report.recommendations, baseline_ref, tps);
 
     let advisories = collect_advisories(
         &fired_names,

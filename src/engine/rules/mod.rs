@@ -166,26 +166,6 @@ pub(super) fn model_len_shrink_suggestion_lines(
     lines
 }
 
-/// Push a max_model_len shrink suggestion into `lines`.
-pub(super) fn push_model_len_shrink_suggestion(
-    lines: &mut Vec<String>,
-    max_model_len: Option<u32>,
-    prompt_p99: Option<f64>,
-    generation_p99: Option<f64>,
-    total_count: f64,
-    indent: &str,
-    hyp: Option<&HypCapacityCtx<'_>>,
-) {
-    lines.extend(model_len_shrink_suggestion_lines(
-        max_model_len,
-        prompt_p99,
-        generation_p99,
-        total_count,
-        indent,
-        hyp,
-    ));
-}
-
 /// Compare observed geometry `state_pages` to catalog hybrid estimate.
 ///
 /// Runs only when labels (`num_gpu_blocks`, concurrency, page size, max_len)
@@ -275,6 +255,75 @@ pub(super) fn with_seen_pct(mut lines: Vec<String>, seen_pct: u32) -> Vec<String
     lines
 }
 
+fn trim_group_trailing_blanks(lines: &mut Vec<String>) {
+    while lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+}
+
+/// Bullet plus optional continuation sub-line. After a sub-line, inserts one blank
+/// line before the next bullet (D5). Callers rely on group-end trimming so a
+/// trailing blank is not left when this bullet is last in its group.
+pub(super) fn push_bullet_with_subline(
+    out: &mut Vec<String>,
+    bullet: String,
+    subline: Option<&str>,
+) {
+    out.push(bullet);
+    if let Some(sub) = subline {
+        out.push(format!("        {}", sub.trim_start()));
+        out.push(String::new());
+    }
+}
+
+/// Emit `Fix:` then safe bullets, then optional `Cuts throughput:` / `Rejects requests:`
+/// groups. Empty safe group: `Cuts throughput:` follows `Fix:` with no blank between.
+pub(super) fn push_grouped_fixes(
+    out: &mut Vec<String>,
+    mut safe: Vec<String>,
+    mut cuts_throughput: Vec<String>,
+    mut rejects: Vec<String>,
+) {
+    trim_group_trailing_blanks(&mut safe);
+    trim_group_trailing_blanks(&mut cuts_throughput);
+    trim_group_trailing_blanks(&mut rejects);
+
+    out.push("    Fix:".to_string());
+    let had_safe = !safe.is_empty();
+    out.extend(safe);
+
+    if !cuts_throughput.is_empty() {
+        if had_safe {
+            out.push(String::new());
+        }
+        out.push("    Cuts throughput:".to_string());
+        out.extend(cuts_throughput);
+    }
+
+    if !rejects.is_empty() {
+        let only_fix_header = out.last().is_some_and(|l| l == "    Fix:");
+        if !only_fix_header && !out.last().is_some_and(|l| l.is_empty()) {
+            out.push(String::new());
+        }
+        out.push("    Rejects requests:".to_string());
+        out.extend(rejects);
+    }
+}
+
+/// Push shrink suggestion lines into a group, routing the truncation Warning
+/// through [`push_bullet_with_subline`].
+pub(super) fn extend_with_shrink_suggestion(out: &mut Vec<String>, shrink_lines: Vec<String>) {
+    let mut it = shrink_lines.into_iter();
+    let Some(bullet) = it.next() else {
+        return;
+    };
+    let warning = it.next();
+    push_bullet_with_subline(out, bullet, warning.as_deref());
+    for extra in it {
+        out.push(extra);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Recommendation {
     pub rule_name: &'static str,
@@ -283,11 +332,6 @@ pub struct Recommendation {
     pub impact: u8,
     /// 0.0-1.0
     pub confidence: f64,
-    /// Prescriptive: what to change
-    pub action: String,
-    /// One-liner for closed-loop direction block
-    pub short_action: String,
-    pub expected_impact: String,
     /// Pre-formatted cause + recommendation lines for stdout.
     ///
     /// NOTE (future work): `display_lines` couples presentation to the engine.
@@ -339,8 +383,3 @@ pub mod rule_names {
         }
     }
 }
-
-/// Practical achievable efficiency ceiling. No production workload reaches 100% of the
-/// roofline due to framework overhead, scheduling, and memory contention. 80% represents
-/// a well-optimized production system. Waste is computed against this ceiling, not 100%.
-pub const ACHIEVABLE_EFFICIENCY_CEILING: f64 = 0.80;

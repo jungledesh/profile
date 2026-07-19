@@ -90,27 +90,16 @@ pub fn r3_recommendation(snapshot: &RawSnapshot) -> Option<Recommendation> {
         return None;
     };
     let enable_prefix = snapshot.vllm.cache_config.enable_prefix_caching;
-    let (action, short_action, confidence) = if d.hit_rate.is_none() {
-        (
-            "Enable --enable-prefix-caching".to_string(),
-            "enable prefix caching".to_string(),
-            0.95_f64,
-        )
+    let (impact, confidence) = if d.hit_rate.is_none() {
+        (3, 0.95_f64)
     } else {
-        (
-            "Move shared context to prompt prefix; standardize prompt templates".to_string(),
-            "standardize prompts to share prefix context".to_string(),
-            0.9_f64,
-        )
+        (2, 0.9_f64)
     };
     Some(Recommendation {
         rule_name: rule_names::LOW_PREFIX_REUSE,
         layer: 5,
-        impact: if d.hit_rate.is_none() { 3 } else { 2 },
+        impact,
         confidence,
-        action,
-        short_action,
-        expected_impact: "Higher prefix cache hit rate and lower TTFT".to_string(),
         // Single-window path has no session context - use hit rate from this window only.
         display_lines: format_low_prefix_hit_rate_fired(&d, enable_prefix, None),
     })
@@ -157,7 +146,7 @@ pub(super) fn format_low_prefix_hit_rate_fired(
     lines.push("    Fix:".to_string());
     lines.extend(fix_lines);
     lines.push(String::new());
-    lines.push("    Expected: Lower TTFT on repeated prefixes".to_string());
+    lines.push("    Expected: Higher prefix cache hit rate and lower TTFT.".to_string());
     lines.push("    Confidence: High".to_string());
     lines
 }
@@ -369,10 +358,11 @@ mod tests {
     }
 
     #[test]
-    fn short_action_is_enable_flag_when_prefix_caching_disabled() {
+    fn display_enable_prefix_when_caching_disabled() {
         let r = r3_recommendation(&traffic_gates_snap(path_b_base_vllm())).expect("fired");
-        assert_eq!(r.short_action, "enable prefix caching");
-        assert_eq!(r.action, "Enable --enable-prefix-caching");
+        let text = r.display_lines.join("\n");
+        assert!(text.contains("Enable prefix caching: --enable-prefix-caching"));
+        assert!(text.contains("Higher prefix cache hit rate and lower TTFT"));
     }
 
     #[test]

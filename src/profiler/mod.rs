@@ -166,6 +166,7 @@ fn context_only_diagnose_snapshot(
         vllm: collectors::VllmRawMetrics {
             model_name: source.vllm.model_name.clone(),
             max_num_seqs: source.vllm.max_num_seqs,
+            max_num_batched_tokens: source.vllm.max_num_batched_tokens,
             cache_config: source.vllm.cache_config.clone(),
             ..Default::default()
         },

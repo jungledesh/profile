@@ -1,5 +1,8 @@
 use crate::context::StaticContext;
 
+/// Absolute epsilon for `gpu_memory_utilization` baseline drift (fraction units).
+const GPU_MEM_UTIL_EPS: f64 = 1e-6;
+
 /// Returns true if any config field that affects the physics baseline changed.
 ///
 /// Note: `CacheConfigLabels::{kv_cache_size_tokens,kv_cache_max_concurrency,
@@ -7,32 +10,38 @@ use crate::context::StaticContext;
 /// config, not config themselves. Do not add them here.
 pub fn config_changed(prev: &StaticContext, curr: &StaticContext) -> bool {
     prev.config.tensor_parallel_size != curr.config.tensor_parallel_size
+        || prev.config.pipeline_parallel_size != curr.config.pipeline_parallel_size
         || prev.config.dtype != curr.config.dtype
         || prev.config.kv_cache_dtype != curr.config.kv_cache_dtype
         || prev.config.max_model_len != curr.config.max_model_len
         || prev.config.quantization != curr.config.quantization
         || prev.config.vllm_reported_dtype != curr.config.vllm_reported_dtype
         || prev.config.vllm_reported_quantization != curr.config.vllm_reported_quantization
+        || prev.config.block_size != curr.config.block_size
+        || f64_opt_changed(
+            prev.config.gpu_memory_utilization,
+            curr.config.gpu_memory_utilization,
+            GPU_MEM_UTIL_EPS,
+        )
 }
 
-/// Config fields that changed but don't affect the physics baseline.
-/// Returns a list of human-readable change descriptions for display.
-pub fn non_baseline_changes(prev: &StaticContext, curr: &StaticContext) -> Vec<String> {
-    let mut changes = Vec::new();
-    if prev.config.max_num_seqs != curr.config.max_num_seqs {
-        let before = prev
-            .config
-            .max_num_seqs
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "-".to_string());
-        let after = curr
-            .config
-            .max_num_seqs
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "-".to_string());
-        changes.push(format!("  max_num_seqs  {before} -> {after}"));
+/// True when a non-baseline config knob changed (scheduler / caching knobs).
+/// Does not reset the physics baseline; stdout only labels "Config changed."
+pub fn non_baseline_drifted(prev: &StaticContext, curr: &StaticContext) -> bool {
+    prev.config.max_num_seqs != curr.config.max_num_seqs
+        || prev.config.max_num_batched_tokens != curr.config.max_num_batched_tokens
+        || prev.config.enable_chunked_prefill != curr.config.enable_chunked_prefill
+        || prev.config.enable_prefix_caching != curr.config.enable_prefix_caching
+        || prev.config.enforce_eager != curr.config.enforce_eager
+}
+
+fn f64_opt_changed(a: Option<f64>, b: Option<f64>, eps: f64) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) if x.is_finite() && y.is_finite() => (x - y).abs() > eps,
+        (None, None) => false,
+        (Some(x), None) | (None, Some(x)) => x.is_finite(),
+        _ => true,
     }
-    changes
 }
 
 #[cfg(test)]
@@ -57,6 +66,9 @@ mod tests {
             kv_cache_dtype: Some("auto".into()),
             max_model_len: Some(8192),
             quantization: None,
+            gpu_memory_utilization: Some(0.90),
+            pipeline_parallel_size: Some(1),
+            block_size: Some(16),
             ..Default::default()
         }
     }
@@ -67,6 +79,7 @@ mod tests {
         let a = ctx(c.clone());
         let b = ctx(c);
         assert!(!config_changed(&a, &b));
+        assert!(!non_baseline_drifted(&a, &b));
     }
 
     #[test]
@@ -126,25 +139,80 @@ mod tests {
     }
 
     #[test]
-    fn max_num_seqs_change_not_baseline_drift() {
+    fn gpu_memory_utilization_change_is_baseline_drift() {
         let mut c2 = base_cfg();
-        c2.max_num_seqs = Some(98);
+        c2.gpu_memory_utilization = Some(0.95);
+        assert!(config_changed(&ctx(base_cfg()), &ctx(c2)));
+    }
+
+    #[test]
+    fn gpu_memory_utilization_within_epsilon_not_drift() {
+        let mut c2 = base_cfg();
+        c2.gpu_memory_utilization = Some(0.90 + 1e-9);
         assert!(!config_changed(&ctx(base_cfg()), &ctx(c2)));
     }
 
     #[test]
-    fn non_baseline_changes_reports_max_num_seqs() {
-        let mut prev = base_cfg();
-        prev.max_num_seqs = Some(32);
-        let mut curr = base_cfg();
-        curr.max_num_seqs = Some(98);
-        let changes = non_baseline_changes(&ctx(prev), &ctx(curr));
-        assert_eq!(changes, vec!["  max_num_seqs  32 -> 98".to_string()]);
+    fn pipeline_parallel_change_is_baseline_drift() {
+        let mut c2 = base_cfg();
+        c2.pipeline_parallel_size = Some(2);
+        assert!(config_changed(&ctx(base_cfg()), &ctx(c2)));
     }
 
     #[test]
-    fn non_baseline_changes_empty_when_unchanged() {
+    fn block_size_change_is_baseline_drift() {
+        let mut c2 = base_cfg();
+        c2.block_size = Some(32);
+        assert!(config_changed(&ctx(base_cfg()), &ctx(c2)));
+    }
+
+    #[test]
+    fn max_num_seqs_change_not_baseline_drift() {
+        let mut c2 = base_cfg();
+        c2.max_num_seqs = Some(98);
+        let prev = ctx(base_cfg());
+        let curr = ctx(c2);
+        assert!(!config_changed(&prev, &curr));
+        assert!(non_baseline_drifted(&prev, &curr));
+    }
+
+    #[test]
+    fn max_num_batched_tokens_change_is_non_baseline() {
+        let mut c2 = base_cfg();
+        c2.max_num_batched_tokens = Some(2048);
+        let prev = ctx(base_cfg());
+        let curr = ctx(c2);
+        assert!(!config_changed(&prev, &curr));
+        assert!(non_baseline_drifted(&prev, &curr));
+    }
+
+    #[test]
+    fn enable_chunked_prefill_change_is_non_baseline() {
+        let mut c2 = base_cfg();
+        c2.enable_chunked_prefill = Some(true);
+        let prev = ctx(base_cfg());
+        let curr = ctx(c2);
+        assert!(non_baseline_drifted(&prev, &curr));
+        assert!(!config_changed(&prev, &curr));
+    }
+
+    #[test]
+    fn enable_prefix_caching_change_is_non_baseline() {
+        let mut c2 = base_cfg();
+        c2.enable_prefix_caching = Some(true);
+        assert!(non_baseline_drifted(&ctx(base_cfg()), &ctx(c2)));
+    }
+
+    #[test]
+    fn enforce_eager_change_is_non_baseline() {
+        let mut c2 = base_cfg();
+        c2.enforce_eager = Some(true);
+        assert!(non_baseline_drifted(&ctx(base_cfg()), &ctx(c2)));
+    }
+
+    #[test]
+    fn non_baseline_false_when_unchanged() {
         let c = base_cfg();
-        assert!(non_baseline_changes(&ctx(c.clone()), &ctx(c)).is_empty());
+        assert!(!non_baseline_drifted(&ctx(c.clone()), &ctx(c)));
     }
 }

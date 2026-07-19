@@ -131,25 +131,11 @@ fn maybe_add_massive_underutilization(
         },
     };
 
-    let (confidence, action, short_action, expected_impact) = match variant {
-        rules::MuVariant::Starved => (
-            0.7,
-            "Batch more requests or increase client concurrency until a wait queue forms",
-            "batch more requests or increase client concurrency until a wait queue forms",
-            "Efficiency climbs as the GPU is fed more work.",
-        ),
-        rules::MuVariant::BlockedAdmission { .. } => (
-            MU_INFERRED_CONFIDENCE,
-            "Raise --max-num-batched-tokens or enable chunked prefill",
-            "raise --max-num-batched-tokens or enable chunked prefill",
-            "Queue drains as admission unblocks.",
-        ),
-        rules::MuVariant::GaugeMissing => (
-            MU_INFERRED_CONFIDENCE,
-            "Batch more requests or increase client concurrency until a wait queue forms",
-            "batch more requests or increase client concurrency until a wait queue forms",
-            "Efficiency climbs as the GPU is fed more work.",
-        ),
+    let confidence = match &variant {
+        rules::MuVariant::Starved => 0.7,
+        rules::MuVariant::BlockedAdmission { .. } | rules::MuVariant::GaugeMissing => {
+            MU_INFERRED_CONFIDENCE
+        }
     };
 
     recommendations.push(rules::Recommendation {
@@ -158,10 +144,7 @@ fn maybe_add_massive_underutilization(
         layer: 0,
         impact: 5,
         confidence,
-        action: action.to_string(),
         display_lines: rules::mu_diagnose_lines(eff, running, waiting, max_num_seqs, variant),
-        short_action: short_action.to_string(),
-        expected_impact: expected_impact.to_string(),
     });
 }
 
