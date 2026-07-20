@@ -73,27 +73,14 @@ pub fn run(input: LoopRunnerInput<'_>) -> anyhow::Result<()> {
             else {
                 let baseline = last_state.report.baseline.as_ref();
                 let efficiency = baseline.and_then(|b| b.efficiency_pct);
-                let ridge_batch_size = baseline.map(|b| b.ridge_batch_size);
-                let tpot_floor_ms = baseline.map(|b| b.tpot_floor_ms);
-                let kv_cache_usage_perc = last_state.result.snapshot.vllm.kv_cache_usage_perc;
-                let num_running = last_state.result.snapshot.vllm.num_requests_running;
-                let num_waiting = last_state.result.snapshot.vllm.num_requests_waiting;
-                let tpot_ms = last_state.result.snapshot.vllm.tpot_ms;
-                let chunked_prefill_enabled =
-                    last_state.result.static_ctx.config.enable_chunked_prefill;
                 let enforce_eager = last_state.result.static_ctx.config.enforce_eager;
                 let enable_prefix_caching =
                     last_state.result.static_ctx.config.enable_prefix_caching;
                 let quantization = last_state.result.static_ctx.config.quantization.clone();
                 let msg = healthy_exit_message(HealthyExitInput {
                     efficiency,
-                    kv_cache_usage_perc,
-                    num_running,
-                    num_waiting,
-                    ridge_batch_size,
-                    tpot_ms,
-                    tpot_floor_ms,
-                    chunked_prefill_enabled,
+                    limiter_evidence: last_state.report.limiter_evidence.unwrap_or_default(),
+                    n_eval: last_state.report.n_eval,
                     enforce_eager,
                     enable_prefix_caching,
                     quantization,
@@ -310,13 +297,8 @@ fn framework_overhead_levers(enforce_eager: Option<bool>) -> String {
 
 struct HealthyExitInput {
     efficiency: Option<f64>,
-    kv_cache_usage_perc: Option<f64>,
-    num_running: Option<f64>,
-    num_waiting: Option<f64>,
-    ridge_batch_size: Option<f64>,
-    tpot_ms: Option<f64>,
-    tpot_floor_ms: Option<f64>,
-    chunked_prefill_enabled: Option<bool>,
+    limiter_evidence: engine::limiter::LimiterEvidence,
+    n_eval: usize,
     enforce_eager: Option<bool>,
     enable_prefix_caching: Option<bool>,
     quantization: Option<String>,
@@ -325,91 +307,77 @@ struct HealthyExitInput {
 fn healthy_exit_message(input: HealthyExitInput) -> String {
     let HealthyExitInput {
         efficiency,
-        kv_cache_usage_perc,
-        num_running,
-        num_waiting,
-        ridge_batch_size,
-        tpot_ms,
-        tpot_floor_ms,
-        chunked_prefill_enabled,
+        limiter_evidence,
+        n_eval,
         enforce_eager,
         enable_prefix_caching,
         quantization,
     } = input;
-    let limiter = engine::limiter::identify(
-        kv_cache_usage_perc,
-        num_running,
-        ridge_batch_size,
-        tpot_ms,
-        tpot_floor_ms,
-        chunked_prefill_enabled,
-    );
-
-    if limiter == Some(engine::limiter::PrimaryLimiter::Traffic) {
-        let eff = efficiency
-            .filter(|e| e.is_finite())
-            .map(|e| format!("Efficiency {e:.1}%"))
-            .unwrap_or_else(|| "Efficiency unavailable".to_string());
-        let waiting = num_waiting.filter(|w| w.is_finite() && *w >= 0.0);
-        if waiting.is_some_and(|w| w >= 1.0) {
-            let wait_n = waiting
-                .map(|w| format!("{:.0}", w.trunc()))
-                .unwrap_or_else(|| "-".to_string());
-            return format!(
-                "No issues sustained. {eff} with {wait_n} requests waiting - queue present but no rule explains it. Re-run with longer duration; report this pattern if it persists."
-            );
-        }
-        return format!(
-            "No issues. {eff} - gap is traffic, not config. Increase load to find real limits."
-        );
-    }
+    let limiter_line = if n_eval > 0 {
+        engine::limiter::limiter_line(&limiter_evidence)
+    } else {
+        None
+    };
+    let limiter = engine::limiter::identify(&limiter_evidence);
 
     let eff_str = efficiency
         .map(|e| format!("Efficiency: {e:.1}%"))
         .unwrap_or_else(|| "Efficiency: unavailable".to_string());
 
     let limiter_block = match limiter {
-        Some(engine::limiter::PrimaryLimiter::Capacity) => {
-            let kv = kv_cache_usage_perc
-                .map(|k| format!(" KV cache at {k:.0}%."))
-                .unwrap_or_default();
+        Some(engine::limiter::LimiterVerdict::Known(engine::limiter::PrimaryLimiter::Capacity)) => {
             let levers = capacity_levers(enable_prefix_caching);
             format!(
                 "Primary Limiter: KV Cache Capacity\n\
-                 {eff_str} -{kv} concurrency is capped before bandwidth saturates.\n\
-                 {levers}"
+                 {eff_str}\n\
+                 {}\n\
+                 {levers}",
+                limiter_line.as_deref().unwrap_or_default()
             )
         }
-        Some(engine::limiter::PrimaryLimiter::Physics) => {
-            let floor_str = tpot_floor_ms
-                .zip(tpot_ms)
-                .map(|(floor, actual)| format!(" TPOT {actual:.1}ms vs floor {floor:.1}ms."))
-                .unwrap_or_default();
+        Some(engine::limiter::LimiterVerdict::Known(engine::limiter::PrimaryLimiter::Physics)) => {
             let levers = physics_levers(&quantization);
             format!(
                 "Primary Limiter: Physics (Hardware Ceiling)\n\
-                 {eff_str} -{floor_str} Hardware is at the limits of this model and dtype.\n\
-                 {levers}"
+                 {eff_str}\n\
+                 {}\n\
+                 {levers}",
+                limiter_line.as_deref().unwrap_or_default()
             )
         }
-        Some(engine::limiter::PrimaryLimiter::PrefillInterference) => {
+        Some(engine::limiter::LimiterVerdict::Known(
+            engine::limiter::PrimaryLimiter::PrefillInterference,
+        )) => {
             format!(
                 "Primary Limiter: Prefill Interference\n\
-                 {eff_str} - chunked prefill is sharing decode memory bandwidth with prefill GEMMs.\n\
-                 Levers: disaggregate prefill/decode onto separate workers, or tune chunk size."
+                 {eff_str}\n\
+                 {}\n\
+                 Levers: disaggregate prefill/decode onto separate workers, or tune chunk size.",
+                limiter_line.as_deref().unwrap_or_default()
             )
         }
-        Some(engine::limiter::PrimaryLimiter::FrameworkOverhead) => {
+        Some(engine::limiter::LimiterVerdict::Known(
+            engine::limiter::PrimaryLimiter::FrameworkOverhead,
+        )) => {
             let levers = framework_overhead_levers(enforce_eager);
             format!(
                 "Primary Limiter: Framework Overhead\n\
-                 {eff_str} - batch healthy, VRAM available, but GPU is waiting on the system.\n\
-                 {levers}"
+                 {eff_str}\n\
+                 {}\n\
+                 {levers}",
+                limiter_line.as_deref().unwrap_or_default()
             )
         }
-        Some(engine::limiter::PrimaryLimiter::Traffic) => {
-            unreachable!("traffic limiter returns before limiter_block")
+        Some(engine::limiter::LimiterVerdict::Known(engine::limiter::PrimaryLimiter::Traffic)) => {
+            format!(
+                "Primary Limiter: Traffic\n\
+                 {eff_str}\n\
+                 {}",
+                limiter_line.as_deref().unwrap_or_default()
+            )
         }
+        Some(engine::limiter::LimiterVerdict::CeilingUnknown(_)) => limiter_line
+            .unwrap_or_else(|| "Hardware ceiling unknown (GPU not in catalog).".to_string()),
         None => {
             format!("{eff_str} - insufficient data to identify primary limiter.")
         }
@@ -639,13 +607,16 @@ mod tests {
     fn framework_overhead_input(enforce_eager: Option<bool>) -> HealthyExitInput {
         HealthyExitInput {
             efficiency: Some(60.0),
-            kv_cache_usage_perc: Some(50.0),
-            num_running: Some(50.0),
-            num_waiting: None,
-            ridge_batch_size: Some(40.0),
-            tpot_ms: Some(50.0),
-            tpot_floor_ms: Some(10.0),
-            chunked_prefill_enabled: Some(false),
+            limiter_evidence: engine::limiter::LimiterEvidence {
+                kv_cache_peak_perc: Some(50.0),
+                mean_running: Some(50.0),
+                ridge_batch_size: Some(40.0),
+                mean_tpot_ms: Some(50.0),
+                tpot_floor_ms: Some(10.0),
+                effective_prompt_decode_ratio: None,
+                chunked_prefill_enabled: Some(false),
+            },
+            n_eval: 1,
             enforce_eager,
             enable_prefix_caching: None,
             quantization: None,
@@ -655,13 +626,16 @@ mod tests {
     fn capacity_input(enable_prefix_caching: Option<bool>) -> HealthyExitInput {
         HealthyExitInput {
             efficiency: Some(42.5),
-            kv_cache_usage_perc: Some(85.0),
-            num_running: Some(50.0),
-            num_waiting: None,
-            ridge_batch_size: Some(40.0),
-            tpot_ms: Some(20.0),
-            tpot_floor_ms: Some(5.0),
-            chunked_prefill_enabled: Some(false),
+            limiter_evidence: engine::limiter::LimiterEvidence {
+                kv_cache_peak_perc: Some(85.0),
+                mean_running: Some(50.0),
+                ridge_batch_size: Some(40.0),
+                mean_tpot_ms: Some(20.0),
+                tpot_floor_ms: Some(5.0),
+                effective_prompt_decode_ratio: None,
+                chunked_prefill_enabled: Some(false),
+            },
+            n_eval: 1,
             enforce_eager: None,
             enable_prefix_caching,
             quantization: None,
@@ -671,13 +645,16 @@ mod tests {
     fn physics_input(quantization: Option<String>) -> HealthyExitInput {
         HealthyExitInput {
             efficiency: Some(91.0),
-            kv_cache_usage_perc: Some(50.0),
-            num_running: Some(50.0),
-            num_waiting: None,
-            ridge_batch_size: Some(40.0),
-            tpot_ms: Some(11.0),
-            tpot_floor_ms: Some(10.0),
-            chunked_prefill_enabled: Some(false),
+            limiter_evidence: engine::limiter::LimiterEvidence {
+                kv_cache_peak_perc: Some(50.0),
+                mean_running: Some(50.0),
+                ridge_batch_size: Some(40.0),
+                mean_tpot_ms: Some(11.0),
+                tpot_floor_ms: Some(10.0),
+                effective_prompt_decode_ratio: None,
+                chunked_prefill_enabled: Some(false),
+            },
+            n_eval: 1,
             enforce_eager: None,
             enable_prefix_caching: None,
             quantization,
@@ -697,62 +674,70 @@ mod tests {
     fn healthy_exit_traffic_limiter() {
         let msg = healthy_exit_message(HealthyExitInput {
             efficiency: Some(34.0),
-            kv_cache_usage_perc: Some(50.0),
-            num_running: Some(5.0),
-            num_waiting: Some(0.0),
-            ridge_batch_size: Some(100.0),
-            tpot_ms: Some(20.0),
-            tpot_floor_ms: Some(5.0),
-            chunked_prefill_enabled: Some(false),
+            limiter_evidence: engine::limiter::LimiterEvidence {
+                kv_cache_peak_perc: Some(50.0),
+                mean_running: Some(5.0),
+                ridge_batch_size: Some(100.0),
+                mean_tpot_ms: Some(20.0),
+                tpot_floor_ms: Some(5.0),
+                effective_prompt_decode_ratio: None,
+                chunked_prefill_enabled: Some(false),
+            },
+            n_eval: 1,
             enforce_eager: None,
             enable_prefix_caching: None,
             quantization: None,
         });
-        assert_eq!(
-            msg,
-            "No issues. Efficiency 34.0% - gap is traffic, not config. Increase load to find real limits."
-        );
-        assert!(!msg.contains('\n'));
+        assert!(msg.contains("Primary Limiter: Traffic"));
+        assert!(msg.contains(
+            "Capped by traffic: 5 requests running, hardware has room for ~100. More concurrent requests raises throughput."
+        ));
+        assert!(!msg.contains("--max-num-seqs"));
     }
 
     #[test]
     fn healthy_exit_traffic_with_queue_does_not_claim_traffic_gap() {
         let msg = healthy_exit_message(HealthyExitInput {
             efficiency: Some(12.4),
-            kv_cache_usage_perc: Some(10.0),
-            num_running: Some(10.0),
-            num_waiting: Some(5.0),
-            ridge_batch_size: Some(100.0),
-            tpot_ms: Some(20.0),
-            tpot_floor_ms: Some(5.0),
-            chunked_prefill_enabled: Some(false),
+            limiter_evidence: engine::limiter::LimiterEvidence {
+                kv_cache_peak_perc: Some(10.0),
+                mean_running: Some(10.0),
+                ridge_batch_size: Some(100.0),
+                mean_tpot_ms: Some(20.0),
+                tpot_floor_ms: Some(5.0),
+                effective_prompt_decode_ratio: None,
+                chunked_prefill_enabled: Some(false),
+            },
+            n_eval: 1,
             enforce_eager: None,
             enable_prefix_caching: None,
             quantization: None,
         });
-        assert!(msg.contains("queue present but no rule explains it"));
-        assert!(msg.contains("5 requests waiting"));
-        assert!(!msg.contains("gap is traffic, not config"));
+        assert!(msg.contains("Primary Limiter: Traffic"));
+        assert!(msg.contains("Capped by traffic: 10 requests running"));
+        assert!(!msg.contains("--max-num-seqs"));
     }
 
     #[test]
     fn traffic_limiter_does_not_say_optimally_tuned() {
         let msg = healthy_exit_message(HealthyExitInput {
             efficiency: Some(34.0),
-            kv_cache_usage_perc: Some(50.0),
-            num_running: Some(5.0),
-            num_waiting: None,
-            ridge_batch_size: Some(100.0),
-            tpot_ms: Some(20.0),
-            tpot_floor_ms: Some(5.0),
-            chunked_prefill_enabled: Some(false),
+            limiter_evidence: engine::limiter::LimiterEvidence {
+                kv_cache_peak_perc: Some(50.0),
+                mean_running: Some(5.0),
+                ridge_batch_size: Some(100.0),
+                mean_tpot_ms: Some(20.0),
+                tpot_floor_ms: Some(5.0),
+                effective_prompt_decode_ratio: None,
+                chunked_prefill_enabled: Some(false),
+            },
+            n_eval: 1,
             enforce_eager: None,
             enable_prefix_caching: None,
             quantization: None,
         });
-        assert!(msg.contains("No issues."));
-        assert!(!msg.contains("No actionable config fix identified."));
-        assert!(!msg.contains("Rules clear"));
+        assert!(msg.contains("Capped by traffic:"));
+        assert!(!msg.contains("--max-num-seqs"));
     }
 
     #[test]
@@ -760,26 +745,30 @@ mod tests {
         let msg = healthy_exit_message(physics_input(None));
         assert!(msg.contains("Physics (Hardware Ceiling)"));
         assert!(msg.contains("Efficiency: 91.0%"));
-        assert!(msg.contains("TPOT 11.0ms vs floor 10.0ms"));
+        assert!(msg.contains("Capped by hardware: TPOT 11.0ms vs ~10.0ms floor."));
     }
 
     #[test]
     fn healthy_exit_prefill_interference_limiter() {
         let msg = healthy_exit_message(HealthyExitInput {
             efficiency: Some(55.0),
-            kv_cache_usage_perc: Some(50.0),
-            num_running: Some(50.0),
-            num_waiting: None,
-            ridge_batch_size: Some(40.0),
-            tpot_ms: Some(50.0),
-            tpot_floor_ms: Some(10.0),
-            chunked_prefill_enabled: Some(true),
+            limiter_evidence: engine::limiter::LimiterEvidence {
+                kv_cache_peak_perc: Some(50.0),
+                mean_running: Some(50.0),
+                ridge_batch_size: Some(40.0),
+                mean_tpot_ms: Some(50.0),
+                tpot_floor_ms: Some(10.0),
+                effective_prompt_decode_ratio: Some(0.6),
+                chunked_prefill_enabled: Some(true),
+            },
+            n_eval: 1,
             enforce_eager: None,
             enable_prefix_caching: None,
             quantization: None,
         });
         assert!(msg.contains("Prefill Interference"));
         assert!(msg.contains("Efficiency: 55.0%"));
+        assert!(msg.contains("Capped by prefill: prompt work at 0.6x of decode (effective)."));
     }
 
     #[test]
@@ -787,6 +776,29 @@ mod tests {
         let msg = healthy_exit_message(framework_overhead_input(None));
         assert!(msg.contains("Framework Overhead"));
         assert!(msg.contains("Efficiency: 60.0%"));
+    }
+
+    #[test]
+    fn healthy_exit_reuses_same_limiter_line_as_quiet_report() {
+        let ev = engine::limiter::LimiterEvidence {
+            kv_cache_peak_perc: Some(84.0),
+            mean_running: Some(50.0),
+            ridge_batch_size: Some(153.0),
+            mean_tpot_ms: Some(20.0),
+            tpot_floor_ms: Some(10.0),
+            effective_prompt_decode_ratio: Some(0.2),
+            chunked_prefill_enabled: Some(false),
+        };
+        let line = engine::limiter::limiter_line(&ev).expect("limiter line");
+        let msg = healthy_exit_message(HealthyExitInput {
+            efficiency: Some(42.0),
+            limiter_evidence: ev,
+            n_eval: 3,
+            enforce_eager: None,
+            enable_prefix_caching: None,
+            quantization: None,
+        });
+        assert!(msg.contains(&line));
     }
 
     #[test]
@@ -813,13 +825,8 @@ mod tests {
     fn healthy_exit_insufficient_data_when_limiter_unknown() {
         let msg = healthy_exit_message(HealthyExitInput {
             efficiency: None,
-            kv_cache_usage_perc: None,
-            num_running: None,
-            num_waiting: None,
-            ridge_batch_size: None,
-            tpot_ms: None,
-            tpot_floor_ms: None,
-            chunked_prefill_enabled: None,
+            limiter_evidence: engine::limiter::LimiterEvidence::default(),
+            n_eval: 1,
             enforce_eager: None,
             enable_prefix_caching: None,
             quantization: None,

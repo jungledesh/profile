@@ -1,5 +1,7 @@
 use crate::collectors::RawSnapshot;
 
+use super::{BindingWall, KvBoundSource, RecommendedSeqs, recommended_seqs, resolve_kv_bound};
+
 /// Fire when max_num_seqs is less than 90% of hardware-recommended capacity.
 const CONFIG_HEADROOM_RATIO: f64 = 0.90;
 
@@ -9,45 +11,39 @@ const OCCUPANCY_FLOOR: f64 = 0.50;
 /// No backlog; R5 owns that signal. Below 1.0 is gauge noise, not a real queue.
 const WAITING_CEILING: f64 = 1.0;
 
-/// Safety margin on recommended max_num_seqs.
-const RECOMMENDED_SEQS_SAFETY_MARGIN: f64 = 0.80;
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConfigHeadroomDetail {
     pub max_num_seqs: u32,
     pub recommended_seqs: u32,
     pub ridge_batch_size: Option<f64>,
-    pub empirical_kv_seqs: Option<u32>,
     pub occupancy_pct: f64,
     pub running: f64,
 }
 
-/// Empirical KV capacity estimate from live metrics.
-/// running / kv_usage_fraction gives the number of sequences that would fill KV to 100%.
-/// Returns None if either metric is missing or kv_usage is too small to extrapolate reliably.
-fn empirical_kv_max(running: f64, kv_cache_usage_perc: Option<f64>) -> Option<f64> {
-    let kv_frac = kv_cache_usage_perc.filter(|v| v.is_finite() && *v > 1.0)?; // below 1% is noise
-    let kv_as_fraction = kv_frac / 100.0;
-    Some(running / kv_as_fraction)
+/// R7 confidence keyed to the binding wall's source (Decided #3: Observed > derived
+/// > empirical). Ridge-bound (no memory source) is a physics ceiling: High.
+pub(super) fn r7_confidence(rec: Option<&RecommendedSeqs>) -> f64 {
+    match rec {
+        None => 0.6,
+        Some(r) if r.empirical => 0.5,
+        Some(r) => match r.source {
+            Some(KvBoundSource::Derived | KvBoundSource::DerivedHybrid) => 0.6,
+            // Observed memory or ridge (source None): firm ceiling.
+            _ => 0.8,
+        },
+    }
 }
 
-fn recommended_seqs(ridge_batch_size: Option<f64>, empirical_kv: Option<f64>) -> Option<u32> {
-    let ridge = ridge_batch_size.filter(|r| r.is_finite() && *r > 0.0);
-    let kv = empirical_kv.filter(|k| k.is_finite() && *k > 0.0);
-    let raw = match (ridge, kv) {
-        (Some(r), Some(k)) => r.min(k),
-        (Some(r), None) => r,
-        (None, Some(k)) => k,
-        (None, None) => return None,
-    };
-    let margined = (raw * RECOMMENDED_SEQS_SAFETY_MARGIN).floor();
-    u32::try_from(margined as u64).ok().filter(|&n| n > 0)
-}
-
+/// Per-window fire: resolve the KV bound Observed else derived else this window's
+/// empirical, then take the two-wall min with ridge via the shared helper. The
+/// displayed recommendation is overridden at report time with the run-level
+/// resolution so R5 and R7 print one number.
 pub fn rule7_config_headroom(
     snapshot: &RawSnapshot,
     config_max_num_seqs: Option<u32>,
     ridge_batch_size: Option<f64>,
+    derived_kv: Option<u32>,
+    is_hybrid: bool,
 ) -> Option<ConfigHeadroomDetail> {
     let max_n = snapshot
         .vllm
@@ -63,9 +59,15 @@ pub fn rule7_config_headroom(
         .num_requests_waiting
         .filter(|v| v.is_finite())?;
 
-    let emp_kv = empirical_kv_max(run, snapshot.vllm.kv_cache_usage_perc);
-    let recommended = recommended_seqs(ridge_batch_size, emp_kv)?;
-    if f64::from(max_n) >= f64::from(recommended) * CONFIG_HEADROOM_RATIO {
+    let (kv_bound, kv_source) = resolve_kv_bound(
+        snapshot.vllm.cache_config.kv_cache_max_concurrency,
+        derived_kv,
+        is_hybrid,
+        Some(run),
+        snapshot.vllm.kv_cache_usage_perc,
+    );
+    let rec = recommended_seqs(ridge_batch_size, kv_bound, kv_source, Some(max_n))?;
+    if f64::from(max_n) >= f64::from(rec.target) * CONFIG_HEADROOM_RATIO {
         return None;
     }
 
@@ -79,9 +81,8 @@ pub fn rule7_config_headroom(
 
     Some(ConfigHeadroomDetail {
         max_num_seqs: max_n,
-        recommended_seqs: recommended,
+        recommended_seqs: rec.target,
         ridge_batch_size: ridge_batch_size.filter(|r| r.is_finite() && *r > 0.0),
-        empirical_kv_seqs: emp_kv.and_then(|v| u32::try_from(v.floor() as u64).ok()),
         occupancy_pct: occupancy * 100.0,
         running: run,
     })
@@ -95,16 +96,6 @@ fn median_u32(mut values: Vec<u32>) -> Option<u32> {
     Some(values[values.len() / 2])
 }
 
-fn median_option_u32(values: &[Option<u32>]) -> Option<u32> {
-    let mut present: Vec<u32> = values.iter().filter_map(|v| *v).collect();
-    if present.is_empty() {
-        None
-    } else {
-        present.sort_unstable();
-        Some(present[present.len() / 2])
-    }
-}
-
 pub(super) fn aggregate_r7_detail(details: &[ConfigHeadroomDetail]) -> ConfigHeadroomDetail {
     debug_assert!(
         !details.is_empty(),
@@ -114,21 +105,15 @@ pub(super) fn aggregate_r7_detail(details: &[ConfigHeadroomDetail]) -> ConfigHea
     let occupancy_pct = details.iter().map(|d| d.occupancy_pct).sum::<f64>() / n;
     let running = details.iter().map(|d| d.running).sum::<f64>() / n;
     // occupancy_pct and running: mean over fired windows. max_num_seqs and ridge are static.
-    // recommended_seqs and empirical_kv vary per window; median over fired windows.
+    // recommended_seqs varies per window; median over fired windows. The displayed
+    // value is overridden at report time with the run-level resolution.
     let first = &details[0];
     let recommended_seqs = median_u32(details.iter().map(|d| d.recommended_seqs).collect())
         .unwrap_or(first.recommended_seqs);
-    let empirical_kv_seqs = median_option_u32(
-        &details
-            .iter()
-            .map(|d| d.empirical_kv_seqs)
-            .collect::<Vec<_>>(),
-    );
     ConfigHeadroomDetail {
         max_num_seqs: first.max_num_seqs,
         recommended_seqs,
         ridge_batch_size: first.ridge_batch_size,
-        empirical_kv_seqs,
         occupancy_pct,
         running,
     }
@@ -144,51 +129,84 @@ fn confidence_label(conf: f64) -> &'static str {
     }
 }
 
+/// Recommended line binder label. Ridge number is on its own line (do not repeat).
+/// Memory cap appears nowhere else in the block, so show it. Empirical: "(est)" only.
+fn recommended_binder_suffix(rec: &RecommendedSeqs) -> String {
+    if rec.empirical {
+        return " (est)".to_string();
+    }
+    match rec.binder {
+        BindingWall::Ridge | BindingWall::Config => " (bound by compute ridge)".to_string(),
+        BindingWall::Memory { cap } => match rec.source {
+            Some(KvBoundSource::Observed) => {
+                format!(" (bound by memory limit {cap}, vLLM-reported)")
+            }
+            Some(KvBoundSource::Derived) | Some(KvBoundSource::DerivedHybrid) => {
+                format!(" (bound by memory limit ~{cap}, est)")
+            }
+            // Empirical handled above; None on a memory binder is a defensive fallback.
+            Some(KvBoundSource::Empirical) | None => {
+                format!(" (bound by memory limit {cap})")
+            }
+        },
+    }
+}
+
 pub(super) fn format_config_headroom_window_issue(
     d: &ConfigHeadroomDetail,
     seen_pct: u32,
     confidence: f64,
+    rec: Option<&RecommendedSeqs>,
 ) -> Vec<String> {
     let cap_pct = (f64::from(d.max_num_seqs) / f64::from(d.recommended_seqs)) * 100.0;
     let ridge_str = d
         .ridge_batch_size
         .map(|r| format!("{r:.0}"))
         .unwrap_or_else(|| "-".to_string());
-    super::with_seen_pct(
-        vec![
-            "[!] Configured Batch Limit".to_string(),
-            String::new(),
-            format!("    Config max    {}", d.max_num_seqs),
-            format!("    Ridge batch   {ridge_str}"),
-            format!("    Recommended   {}", d.recommended_seqs),
-            String::new(),
-            "    Cause:".to_string(),
-            format!(
-                "      --max-num-seqs={} caps batch size at {:.0}% of hardware capacity.",
-                d.max_num_seqs, cap_pct
-            ),
-            "      Compute and KV memory headroom available.".to_string(),
-            String::new(),
-            "    Fix:".to_string(),
-            format!(
-                "      • Raise --max-num-seqs to at least {}.",
-                d.recommended_seqs
-            ),
-            String::new(),
-            "    Expected: Higher decode throughput when traffic concurrency increases."
-                .to_string(),
-            "    Watch: Higher concurrency increases prefill load. Monitor decode latency after applying."
-                .to_string(),
-            format!("    Confidence: {}", confidence_label(confidence)),
-        ],
-        seen_pct,
-    )
+    let recommended = match rec {
+        Some(r) => format!(
+            "    Recommended   {}{}",
+            d.recommended_seqs,
+            recommended_binder_suffix(r)
+        ),
+        None => format!("    Recommended   {}", d.recommended_seqs),
+    };
+    let empirical = rec.is_some_and(|r| r.empirical);
+    let mut lines = vec![
+        "[!] Configured Batch Limit".to_string(),
+        String::new(),
+        format!("    Config max    {}", d.max_num_seqs),
+        format!("    Ridge batch   {ridge_str}"),
+        recommended,
+        String::new(),
+        "    Cause:".to_string(),
+        format!(
+            "      --max-num-seqs={} caps batch size at {:.0}% of hardware capacity.",
+            d.max_num_seqs, cap_pct
+        ),
+        "      Compute and KV memory headroom available.".to_string(),
+        String::new(),
+        "    Fix:".to_string(),
+        format!("      • Raise --max-num-seqs to {}.", d.recommended_seqs),
+    ];
+    if empirical {
+        lines.push("      • Monitor KV cache when scaling up.".to_string());
+    }
+    lines.extend([
+        String::new(),
+        "    Expected: Higher decode throughput when traffic concurrency increases."
+            .to_string(),
+        "    Watch: Higher concurrency increases prefill load. Monitor decode latency after applying."
+            .to_string(),
+        format!("    Confidence: {}", confidence_label(confidence)),
+    ]);
+    super::with_seen_pct(lines, seen_pct)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::collectors::VllmRawMetrics;
+    use crate::collectors::{CacheConfigLabels, VllmRawMetrics};
     use std::time::SystemTime;
 
     fn snap(
@@ -196,6 +214,16 @@ mod tests {
         max_num_seqs: u32,
         waiting: f64,
         kv_cache_usage_perc: Option<f64>,
+    ) -> RawSnapshot {
+        observed_snap(running, max_num_seqs, waiting, kv_cache_usage_perc, None)
+    }
+
+    fn observed_snap(
+        running: f64,
+        max_num_seqs: u32,
+        waiting: f64,
+        kv_cache_usage_perc: Option<f64>,
+        kv_cache_max_concurrency: Option<f64>,
     ) -> RawSnapshot {
         let t = SystemTime::UNIX_EPOCH;
         RawSnapshot {
@@ -209,6 +237,10 @@ mod tests {
                 kv_cache_usage_perc,
                 generation_tokens_per_sec: Some(100.0),
                 window_duration_secs: Some(2.0),
+                cache_config: CacheConfigLabels {
+                    kv_cache_max_concurrency,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             gpus: vec![],
@@ -216,109 +248,138 @@ mod tests {
     }
 
     #[test]
-    fn empirical_kv_max_basic() {
-        let kv = empirical_kv_max(20.0, Some(3.3)).expect("kv");
-        assert!((kv - (20.0 / 0.033)).abs() < 1.0);
+    fn ridge_binds_below_empirical_kv() {
+        // ridge 153 < empirical ~606; ridge binds, no empirical cap, target 122.
         let s = snap(20.0, 32, 0.0, Some(3.3));
-        let d = rule7_config_headroom(&s, None, Some(153.0)).expect("fired");
+        let d = rule7_config_headroom(&s, None, Some(153.0), None, false).expect("fired");
         assert_eq!(d.recommended_seqs, 122);
-        assert_eq!(d.empirical_kv_seqs, Some(606));
         assert_eq!(d.ridge_batch_size, Some(153.0));
     }
 
     #[test]
-    fn empirical_kv_max_below_ridge() {
-        let kv = empirical_kv_max(50.0, Some(80.0)).expect("kv");
-        assert!((kv - 62.5).abs() < 0.01);
+    fn empirical_memory_binder_is_step_capped() {
+        // empirical 62.5 < ridge 153; memory (empirical) binds; margin 50 capped to 2x20=40.
         let s = snap(50.0, 20, 0.0, Some(80.0));
-        let d = rule7_config_headroom(&s, None, Some(153.0)).expect("fired");
-        assert_eq!(d.recommended_seqs, 50);
+        let d = rule7_config_headroom(&s, None, Some(153.0), None, false).expect("fired");
+        assert_eq!(d.recommended_seqs, 40);
     }
 
     #[test]
-    fn empirical_kv_max_noise_floor() {
-        assert!(empirical_kv_max(20.0, Some(0.5)).is_none());
+    fn empirical_noise_floor_no_kv_bound() {
+        // KV 0.5% is below the 1% noise floor; only ridge remains.
+        let s = snap(20.0, 32, 0.0, Some(0.5));
+        let d = rule7_config_headroom(&s, None, Some(153.0), None, false).expect("fired");
+        assert_eq!(d.recommended_seqs, 122);
     }
 
     #[test]
-    fn safety_margin_applied() {
+    fn observed_first_uses_reported_concurrency() {
+        // Observed 120 present, beats derived and empirical. min(153, 120) = 120, target 96.
+        let s = observed_snap(20.0, 32, 0.0, Some(3.3), Some(120.0));
+        let d = rule7_config_headroom(&s, None, Some(153.0), Some(240), false).expect("fired");
+        assert_eq!(d.recommended_seqs, 96);
+    }
+
+    #[test]
+    fn derived_used_when_observed_absent() {
+        // No observed; derived 120 beats empirical. min(153, 120) = 120, target 96.
         let s = snap(20.0, 32, 0.0, Some(3.3));
-        let d = rule7_config_headroom(&s, None, Some(153.0)).expect("fired");
-        let raw = 153.0_f64.min(20.0 / 0.033);
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let expected = (raw * RECOMMENDED_SEQS_SAFETY_MARGIN).floor() as u32;
-        assert_eq!(d.recommended_seqs, expected);
+        let d = rule7_config_headroom(&s, None, Some(153.0), Some(120), false).expect("fired");
+        assert_eq!(d.recommended_seqs, 96);
     }
 
     #[test]
     fn kv_unavailable_uses_ridge_only() {
         let s = snap(20.0, 32, 0.0, None);
-        let d = rule7_config_headroom(&s, None, Some(153.0)).expect("fired");
+        let d = rule7_config_headroom(&s, None, Some(153.0), None, false).expect("fired");
         assert_eq!(d.recommended_seqs, 122);
-        assert!(d.empirical_kv_seqs.is_none());
     }
 
     #[test]
     fn fires_when_config_well_below_recommended() {
         let s = snap(20.0, 32, 0.0, Some(3.3));
-        let d = rule7_config_headroom(&s, None, Some(153.0)).expect("fired");
+        let d = rule7_config_headroom(&s, None, Some(153.0), None, false).expect("fired");
         assert_eq!(d.max_num_seqs, 32);
         assert_eq!(d.recommended_seqs, 122);
     }
 
     #[test]
     fn fires_when_config_at_80_pct_of_recommended() {
-        // max_num_seqs=98, ridge=153, empirical_kv large
-        // recommended = min(153, large) * 0.80 = 122
-        // 98 < 122 * 0.90 = 109.8 → fires
+        // ridge 153 binds, target 122; 98 < 122 * 0.90 = 109.8 → fires.
         let s = snap(95.0, 98, 0.0, Some(15.6));
-        let d = rule7_config_headroom(&s, None, Some(153.0)).expect("fired");
+        let d = rule7_config_headroom(&s, None, Some(153.0), None, false).expect("fired");
         assert_eq!(d.recommended_seqs, 122);
     }
 
     #[test]
     fn does_not_fire_when_config_near_recommended() {
         let s = snap(20.0, 115, 0.0, Some(3.3));
-        assert!(rule7_config_headroom(&s, None, Some(153.0)).is_none());
+        assert!(rule7_config_headroom(&s, None, Some(153.0), None, false).is_none());
     }
 
     #[test]
     fn does_not_fire_when_waiting_nonzero() {
         let s = snap(20.0, 32, 5.0, Some(3.3));
-        assert!(rule7_config_headroom(&s, None, Some(153.0)).is_none());
+        assert!(rule7_config_headroom(&s, None, Some(153.0), None, false).is_none());
     }
 
     #[test]
     fn does_not_fire_when_occupancy_low() {
         let s = snap(2.0, 32, 0.0, Some(3.3));
-        assert!(rule7_config_headroom(&s, None, Some(153.0)).is_none());
+        assert!(rule7_config_headroom(&s, None, Some(153.0), None, false).is_none());
     }
 
     #[test]
-    fn does_not_fire_when_ridge_unavailable() {
+    fn does_not_fire_when_no_wall_known() {
+        // Spec pin: no wall resolved → R7 does not fire.
         let s = snap(20.0, 32, 0.0, None);
-        assert!(rule7_config_headroom(&s, None, None).is_none());
-    }
-
-    #[test]
-    fn uses_min_of_ridge_and_empirical_kv() {
-        let s = snap(50.0, 20, 0.0, Some(80.0));
-        let d = rule7_config_headroom(&s, None, Some(200.0)).expect("fired");
-        assert_eq!(d.recommended_seqs, 50);
+        assert!(rule7_config_headroom(&s, None, None, None, false).is_none());
     }
 
     #[test]
     fn ridge_stored_as_none_when_only_kv_drives_recommendation() {
+        // No ridge; empirical 62.5 binds, target min(50, 2x20=40) = 40.
         let s = snap(50.0, 20, 0.0, Some(80.0));
-        let d = rule7_config_headroom(&s, None, None).expect("fired on kv only");
+        let d = rule7_config_headroom(&s, None, None, None, false).expect("fired on kv only");
         assert!(d.ridge_batch_size.is_none());
-        assert_eq!(d.recommended_seqs, 50);
+        assert_eq!(d.recommended_seqs, 40);
     }
 
     #[test]
     fn fractional_waiting_below_ceiling_does_not_suppress() {
         let s = snap(20.0, 32, 0.5, Some(3.3));
-        assert!(rule7_config_headroom(&s, None, Some(153.0)).is_some());
+        assert!(rule7_config_headroom(&s, None, Some(153.0), None, false).is_some());
+    }
+
+    #[test]
+    fn confidence_keyed_to_source() {
+        use crate::engine::rules::{BindingWall, KvBoundSource, RecommendedSeqs};
+        let observed = RecommendedSeqs {
+            target: 96,
+            wall: 120.0,
+            binder: BindingWall::Memory { cap: 120 },
+            source: Some(KvBoundSource::Observed),
+            empirical: false,
+        };
+        let derived = RecommendedSeqs {
+            source: Some(KvBoundSource::Derived),
+            ..observed
+        };
+        let empirical = RecommendedSeqs {
+            source: Some(KvBoundSource::Empirical),
+            empirical: true,
+            ..observed
+        };
+        let ridge = RecommendedSeqs {
+            binder: BindingWall::Ridge,
+            source: None,
+            ..observed
+        };
+        assert_eq!(r7_confidence(Some(&observed)), 0.8);
+        assert_eq!(r7_confidence(Some(&derived)), 0.6);
+        assert_eq!(r7_confidence(Some(&empirical)), 0.5);
+        assert_eq!(r7_confidence(Some(&ridge)), 0.8);
+        assert_eq!(r7_confidence(None), 0.6);
     }
 
     #[test]
@@ -327,20 +388,116 @@ mod tests {
             max_num_seqs: 32,
             recommended_seqs: 122,
             ridge_batch_size: None,
-            empirical_kv_seqs: Some(606),
             occupancy_pct: 62.5,
             running: 20.0,
         };
-        let text = format_config_headroom_window_issue(&d, 100, 0.6).join("\n");
+        let text = format_config_headroom_window_issue(&d, 100, 0.6, None).join("\n");
         assert!(text.contains("Ridge batch   -"));
         assert!(text.contains("Confidence: Medium"));
         assert!(text.contains("Watch: Higher concurrency increases prefill load"));
     }
 
     #[test]
+    fn format_ridge_binds_names_binder_without_repeating_number() {
+        let d = ConfigHeadroomDetail {
+            max_num_seqs: 32,
+            recommended_seqs: 122,
+            ridge_batch_size: Some(153.0),
+            occupancy_pct: 62.5,
+            running: 20.0,
+        };
+        let rec = RecommendedSeqs {
+            target: 122,
+            wall: 153.0,
+            binder: BindingWall::Ridge,
+            source: None,
+            empirical: false,
+        };
+        let text = format_config_headroom_window_issue(&d, 100, 0.8, Some(&rec)).join("\n");
+        assert!(text.contains("Recommended   122 (bound by compute ridge)"));
+        assert!(!text.contains("bound by compute ridge ~"));
+        assert!(!text.contains("bound by compute ridge 153"));
+        assert!(text.contains("Raise --max-num-seqs to 122."));
+        assert!(!text.contains("at least"));
+        assert!(!text.contains("Monitor KV cache"));
+    }
+
+    #[test]
+    fn format_memory_observed_names_cap_vllm_reported() {
+        let d = ConfigHeadroomDetail {
+            max_num_seqs: 32,
+            recommended_seqs: 96,
+            ridge_batch_size: Some(153.0),
+            occupancy_pct: 62.5,
+            running: 20.0,
+        };
+        let rec = RecommendedSeqs {
+            target: 96,
+            wall: 120.0,
+            binder: BindingWall::Memory { cap: 120 },
+            source: Some(KvBoundSource::Observed),
+            empirical: false,
+        };
+        let text = format_config_headroom_window_issue(&d, 100, 0.8, Some(&rec)).join("\n");
+        assert!(text.contains("Recommended   96 (bound by memory limit 120, vLLM-reported)"));
+        assert!(!text.contains("~120"));
+        assert!(!text.contains("(est)"));
+        assert!(text.contains("Raise --max-num-seqs to 96."));
+        assert!(!text.contains("at least"));
+    }
+
+    #[test]
+    fn format_memory_derived_tilde_and_est() {
+        let d = ConfigHeadroomDetail {
+            max_num_seqs: 32,
+            recommended_seqs: 96,
+            ridge_batch_size: Some(153.0),
+            occupancy_pct: 62.5,
+            running: 20.0,
+        };
+        let rec = RecommendedSeqs {
+            target: 96,
+            wall: 120.0,
+            binder: BindingWall::Memory { cap: 120 },
+            source: Some(KvBoundSource::Derived),
+            empirical: false,
+        };
+        let text = format_config_headroom_window_issue(&d, 100, 0.6, Some(&rec)).join("\n");
+        assert!(text.contains("Recommended   96 (bound by memory limit ~120, est)"));
+        assert!(!text.contains("vLLM-reported"));
+        assert!(text.contains("Raise --max-num-seqs to 96."));
+    }
+
+    #[test]
+    fn format_empirical_est_only_with_monitor_and_low() {
+        let d = ConfigHeadroomDetail {
+            max_num_seqs: 32,
+            recommended_seqs: 64,
+            ridge_batch_size: None,
+            occupancy_pct: 100.0,
+            running: 32.0,
+        };
+        let rec = RecommendedSeqs {
+            target: 64,
+            wall: 400.0,
+            binder: BindingWall::Memory { cap: 400 },
+            source: Some(KvBoundSource::Empirical),
+            empirical: true,
+        };
+        let text = format_config_headroom_window_issue(&d, 100, 0.5, Some(&rec)).join("\n");
+        assert!(text.contains("Recommended   64 (est)"));
+        assert!(!text.contains("bound by"));
+        assert!(!text.contains("400"));
+        assert!(text.contains("Raise --max-num-seqs to 64."));
+        assert!(text.contains("Monitor KV cache when scaling up."));
+        assert!(text.contains("Confidence: Low"));
+        assert!(!text.contains("at least"));
+    }
+
+    #[test]
     fn occupancy_pct_computed_correctly() {
         let s = snap(20.0, 32, 0.0, Some(3.3));
-        let d = rule7_config_headroom(&s, None, Some(153.0)).expect("fired");
+        let d = rule7_config_headroom(&s, None, Some(153.0), None, false).expect("fired");
         assert!((d.occupancy_pct - (20.0 / 32.0 * 100.0)).abs() < 0.1);
     }
 }

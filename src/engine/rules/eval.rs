@@ -21,20 +21,20 @@ use super::r3_low_prefix_reuse::{
 use super::r4_oom_risk::r4_recommendation;
 use super::r5_concurrency_saturation::{
     ConcurrencySaturationDetail, aggregate_concurrency_saturation_detail,
-    format_concurrency_saturation_window_issue, rule5_concurrency_saturation,
+    format_concurrency_saturation_window_issue, r5_confidence, rule5_concurrency_saturation,
 };
 use super::r6_prefill_bound::{
     PrefillBoundDetail, PrefillBoundEvalInput, Rule6Outcome, aggregate_r6_detail,
-    confidence as r6_confidence, evaluate as r6_evaluate, format_prefill_bound_window_issue,
-    impact as r6_impact, severity as r6_severity,
+    confidence as r6_confidence, effective_prompt_tps, evaluate as r6_evaluate,
+    format_prefill_bound_window_issue, impact as r6_impact, severity as r6_severity,
 };
 use super::r7_config_headroom::{
-    ConfigHeadroomDetail, aggregate_r7_detail, format_config_headroom_window_issue,
+    ConfigHeadroomDetail, aggregate_r7_detail, format_config_headroom_window_issue, r7_confidence,
     rule7_config_headroom,
 };
 use super::{
-    Recommendation, catalog_state_pages_mismatch, compute_kv_max_seqs, rule_is_significant,
-    rule_names,
+    Recommendation, catalog_state_pages_mismatch, compute_kv_max_seqs, recommended_seqs,
+    resolve_kv_bound, rule_is_significant, rule_names,
 };
 
 const SUPPRESSION_TABLE: &[(&str, &str)] = &[
@@ -64,6 +64,29 @@ struct WindowRuleEval {
     r7_fired: usize,
     r7_details: Vec<ConfigHeadroomDetail>,
     session_kv_peak: Option<f64>,
+    // Run-level mean(running) across evaluable windows; feeds the empirical KV bound.
+    sum_running: f64,
+    count_running: usize,
+    // Run-level means for limiter evidence and prefill effective ratio.
+    sum_tpot_ms: f64,
+    count_tpot_ms: usize,
+    sum_effective_ratio: f64,
+    count_effective_ratio: usize,
+}
+
+impl WindowRuleEval {
+    fn mean_running(&self) -> Option<f64> {
+        (self.count_running > 0).then(|| self.sum_running / self.count_running as f64)
+    }
+
+    fn mean_tpot_ms(&self) -> Option<f64> {
+        (self.count_tpot_ms > 0).then(|| self.sum_tpot_ms / self.count_tpot_ms as f64)
+    }
+
+    fn mean_effective_ratio(&self) -> Option<f64> {
+        (self.count_effective_ratio > 0)
+            .then(|| self.sum_effective_ratio / self.count_effective_ratio as f64)
+    }
 }
 
 impl WindowRuleEval {
@@ -146,6 +169,12 @@ fn eval_window_rules(
         r7_fired: 0,
         r7_details: Vec::new(),
         session_kv_peak: None,
+        sum_running: 0.0,
+        count_running: 0,
+        sum_tpot_ms: 0.0,
+        count_tpot_ms: 0,
+        sum_effective_ratio: 0.0,
+        count_effective_ratio: 0,
     };
 
     for w in windows {
@@ -204,6 +233,34 @@ fn eval_window_rules(
             .filter(|v| v.is_finite())
         {
             eval.session_kv_peak = Some(eval.session_kv_peak.map_or(kv, |peak| peak.max(kv)));
+        }
+
+        if let Some(run) = snap
+            .vllm
+            .num_requests_running
+            .filter(|v| v.is_finite() && *v >= 0.0)
+        {
+            eval.sum_running += run;
+            eval.count_running += 1;
+        }
+        if let Some(tpot) = snap.vllm.tpot_ms.filter(|v| v.is_finite() && *v > 0.0) {
+            eval.sum_tpot_ms += tpot;
+            eval.count_tpot_ms += 1;
+        }
+        if let (Some(prompt), Some(gen_tps)) = (
+            snap.vllm
+                .prompt_tokens_per_sec
+                .filter(|v| v.is_finite() && *v >= 0.0),
+            snap.vllm
+                .generation_tokens_per_sec
+                .filter(|v| v.is_finite() && *v > 0.0),
+        ) {
+            let eff_prompt = effective_prompt_tps(prompt, snap.vllm.prefix_cache_hit_rate);
+            let ratio = eff_prompt / gen_tps;
+            if ratio.is_finite() {
+                eval.sum_effective_ratio += ratio;
+                eval.count_effective_ratio += 1;
+            }
         }
 
         // Per-window baseline: shared by R1 and R6.
@@ -274,6 +331,10 @@ fn eval_window_rules(
             snapshot: snap,
             chunked_prefill_enabled: summary.ctx.config.enable_chunked_prefill,
             ridge_batch_size: win_baseline.as_ref().map(|b| b.ridge_batch_size),
+            max_num_batched_tokens: snap
+                .vllm
+                .max_num_batched_tokens
+                .or(summary.ctx.config.max_num_batched_tokens),
             is_hybrid: model_is_hybrid(&summary.ctx.model),
         }) {
             Rule6Outcome::Fired(d) => {
@@ -284,7 +345,30 @@ fn eval_window_rules(
         }
 
         let ridge = win_baseline.as_ref().map(|b| b.ridge_batch_size);
-        if let Some(d) = rule7_config_headroom(snap, summary.ctx.config.max_num_seqs, ridge) {
+        // Per-window derived KV bound from this window's baseline headroom. Firing
+        // uses Observed else derived else this window's empirical; the displayed
+        // recommendation is overridden at report time with the run-level resolution.
+        let win_derived = compute_kv_max_seqs(
+            win_baseline.as_ref().and_then(|b| b.kv_headroom_gb),
+            summary.ctx.config.max_model_len,
+            &summary.ctx.model,
+            summary.ctx.config.kv_cache_dtype.as_deref(),
+            effective_tensor_parallel(
+                summary.ctx.config.tensor_parallel_size,
+                snap.collected_gpu_count(),
+            ),
+            win_baseline
+                .as_ref()
+                .map(|b| b.weight_bytes_per_param)
+                .unwrap_or(2),
+        );
+        if let Some(d) = rule7_config_headroom(
+            snap,
+            summary.ctx.config.max_num_seqs,
+            ridge,
+            win_derived,
+            model_is_hybrid(&summary.ctx.model),
+        ) {
             eval.r7_fired += 1;
             eval.r7_details.push(d);
         }
@@ -335,6 +419,7 @@ fn build_report_from_eval(
             skipped_idle: eval.skipped_idle,
             energy_skew_skipped: eval.energy_skew_skipped,
             gauge_missing: eval.gauge_missing.clone(),
+            limiter_evidence: None,
         };
     }
 
@@ -364,8 +449,34 @@ fn build_report_from_eval(
         kv_max_seqs,
         model_is_hybrid(&summary.ctx.model),
     );
+    // Resolve the KV bound and margined recommendation once for the run: Observed,
+    // else derived, else empirical (run-level mean(running) / peak(kv%)). R5 and R7
+    // both read this so they never print two different recommended values.
+    let ridge_run = baseline.as_ref().map(|b| b.ridge_batch_size);
+    let (run_kv_bound, run_kv_source) = resolve_kv_bound(
+        summary_snap.vllm.cache_config.kv_cache_max_concurrency,
+        kv_max_seqs,
+        model_is_hybrid(&summary.ctx.model),
+        eval.mean_running(),
+        eval.session_kv_peak,
+    );
+    let run_rec = recommended_seqs(
+        ridge_run,
+        run_kv_bound,
+        run_kv_source,
+        summary.ctx.config.max_num_seqs,
+    );
     let r2_significant = eval.r2_significant();
     let r2_backlog_significant = eval.r2_backlog_significant();
+    let limiter_evidence = Some(crate::engine::limiter::LimiterEvidence {
+        kv_cache_peak_perc: eval.session_kv_peak,
+        mean_running: eval.mean_running(),
+        ridge_batch_size: ridge_run.filter(|r| r.is_finite() && *r > 0.0),
+        mean_tpot_ms: eval.mean_tpot_ms(),
+        tpot_floor_ms: baseline.as_ref().map(|b| b.tpot_floor_ms),
+        effective_prompt_decode_ratio: eval.mean_effective_ratio(),
+        chunked_prefill_enabled: summary.ctx.config.enable_chunked_prefill,
+    });
 
     let mut recs: Vec<Recommendation> = Vec::new();
     let mut prescribed_kv_capacity: Option<u32> = None;
@@ -462,32 +573,36 @@ fn build_report_from_eval(
             &agg,
             pct(eval.r5_fired, eval.n_eval),
             max_model_len,
-            kv_max_seqs,
+            run_rec.as_ref(),
             summary_snap,
             Some(&hyp),
         );
+        let empirical = run_rec.is_some_and(|r| r.empirical);
         recs.push(Recommendation {
             rule_name: rule_names::CONCURRENCY_SATURATION,
             layer: 3,
             impact: 4,
-            confidence: match (agg.ttft_ms.or(agg.ttft_p99_ms), agg.kv_cache_usage_perc) {
-                (Some(_), Some(_)) => 0.9,
-                _ => 0.6,
-            },
+            confidence: r5_confidence(&agg, empirical),
             display_lines,
         });
     }
 
     if eval.r7_significant() {
         let d = aggregate_r7_detail(&eval.r7_details);
-        // Both ridge and empirical KV present = higher confidence in the recommendation.
-        let conf = if d.ridge_batch_size.is_some() && d.empirical_kv_seqs.is_some() {
-            0.8
-        } else {
-            0.6
+        // Override the displayed recommendation with the run-level resolution so R5
+        // and R7 print one number; confidence keyed to the binding wall's source.
+        let display = ConfigHeadroomDetail {
+            recommended_seqs: run_rec.map_or(d.recommended_seqs, |r| r.target),
+            ridge_batch_size: ridge_run.filter(|r| r.is_finite() && *r > 0.0),
+            ..d
         };
-        let display_lines =
-            format_config_headroom_window_issue(&d, pct(eval.r7_fired, eval.n_eval), conf);
+        let conf = r7_confidence(run_rec.as_ref());
+        let display_lines = format_config_headroom_window_issue(
+            &display,
+            pct(eval.r7_fired, eval.n_eval),
+            conf,
+            run_rec.as_ref(),
+        );
         recs.push(Recommendation {
             rule_name: rule_names::CONFIG_HEADROOM,
             layer: 6,
@@ -567,6 +682,7 @@ fn build_report_from_eval(
             skipped_idle: eval.skipped_idle,
             energy_skew_skipped: eval.energy_skew_skipped,
             gauge_missing: eval.gauge_missing.clone(),
+            limiter_evidence,
         },
     )
 }
@@ -594,6 +710,7 @@ pub(crate) fn finalize_report_groups(
             skipped_idle: skips.skipped_idle,
             energy_skew_skipped: skips.energy_skew_skipped,
             gauge_missing: skips.gauge_missing,
+            limiter_evidence: skips.limiter_evidence,
         };
     };
 
@@ -658,6 +775,7 @@ pub(crate) fn finalize_report_groups(
         skipped_idle: skips.skipped_idle,
         energy_skew_skipped: skips.energy_skew_skipped,
         gauge_missing: skips.gauge_missing,
+        limiter_evidence: skips.limiter_evidence,
     }
 }
 
@@ -678,6 +796,7 @@ pub fn build_report_for_windows(windows: &[RuntimeWindow], summary: AnalysisInpu
             skipped_idle: 0,
             energy_skew_skipped: 0,
             gauge_missing: Default::default(),
+            limiter_evidence: None,
         };
     };
     let session_hit_rate = aggregate_prefix_hit_rate_for_windows(windows);

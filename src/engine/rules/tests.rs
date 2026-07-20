@@ -402,6 +402,7 @@ fn model_len_suggestion_uses_p99_sum_when_count_sufficient() {
             150.0,
             "      ",
             None,
+            false,
         ),
     );
     let text = lines.join("\n");
@@ -423,6 +424,7 @@ fn model_len_suggestion_no_op_when_count_below_threshold() {
             50.0,
             "      ",
             None,
+            false,
         ),
     );
     let text = lines.join("\n");
@@ -435,7 +437,15 @@ fn model_len_suggestion_no_op_when_p99_missing() {
     let mut lines = Vec::new();
     extend_with_shrink_suggestion(
         &mut lines,
-        model_len_shrink_suggestion_lines(Some(8192), Some(6000.0), None, 150.0, "      ", None),
+        model_len_shrink_suggestion_lines(
+            Some(8192),
+            Some(6000.0),
+            None,
+            150.0,
+            "      ",
+            None,
+            false,
+        ),
     );
     let text = lines.join("\n");
     assert!(text.contains("to safely raise concurrency"));
@@ -454,6 +464,7 @@ fn model_len_suggestion_suppressed_when_delta_below_5pct() {
             150.0,
             "      ",
             None,
+            false,
         ),
     );
     assert!(lines.is_empty());
@@ -488,6 +499,7 @@ fn model_len_suggestion_projects_capacity_from_observed_geometry() {
             150.0,
             "      ",
             Some(&hyp),
+            false,
         ),
     );
     let text = lines.join("\n");
@@ -539,6 +551,7 @@ fn model_len_suggestion_live_run_projection_at_5465_is_39_not_observed_8() {
             150.0,
             "      ",
             Some(&hyp),
+            false,
         ),
     );
     let text = lines.join("\n");
@@ -1067,7 +1080,14 @@ fn format_diagnose_rules_no_fires_default_is_only_no_issues_line() {
     let ctx = StaticContext::from_snapshot(&s, cfg);
     let win = mk_win(s);
     let lines = format_diagnose_rules_test(&ctx, &win, false, "http://127.0.0.1:8000/metrics");
-    assert_eq!(lines, vec!["No issues detected.".to_string()]);
+    assert_eq!(
+        lines.first().map(String::as_str),
+        Some("No issues detected.")
+    );
+    assert!(
+        lines.get(1).is_some_and(|l| l.starts_with("Capped by ")),
+        "expected limiter line, got: {lines:?}"
+    );
 }
 
 #[test]
@@ -1275,6 +1295,7 @@ fn empty_run_stdout_and_format_sites_byte_identical() {
                     skipped_idle: if any_evaluable { windows.len() } else { 0 },
                     energy_skew_skipped: 0,
                     gauge_missing: Default::default(),
+                    limiter_evidence: None,
                 },
                 verbose,
                 metrics_url,
@@ -2157,7 +2178,70 @@ fn format_diagnose_rules_for_windows_no_fires_is_single_no_issues_line() {
         false,
         "http://127.0.0.1:8000/metrics",
     );
-    assert_eq!(lines, vec!["No issues detected.".to_string()]);
+    assert_eq!(
+        lines.first().map(String::as_str),
+        Some("No issues detected.")
+    );
+    assert!(
+        lines.get(1).is_some_and(|l| l.starts_with("Capped by ")),
+        "expected limiter line, got: {lines:?}"
+    );
+}
+
+#[test]
+fn no_rules_limiter_uses_aggregates_not_last_idle_snapshot() {
+    let t = SystemTime::UNIX_EPOCH;
+    let mut g = gpu_busy();
+    g.gpu_util_pct = Some(80.0);
+    g.gpu_name = Some("NVIDIA H100 80GB HBM3".to_string());
+    g.vram_total_mb = Some(80 * 1024);
+
+    let mut busy = vllm_base();
+    busy.model_name = Some("meta-llama/Llama-3.1-8B-Instruct".to_string());
+    busy.num_requests_running = Some(128.0);
+    busy.num_requests_waiting = Some(0.0);
+    busy.generation_tokens_per_sec = Some(180.0);
+    busy.prompt_tokens_per_sec = Some(30.0);
+    busy.window_duration_secs = Some(2.0);
+    busy.tpot_ms = Some(20.0);
+
+    let mut idle = busy.clone();
+    idle.num_requests_running = Some(0.0);
+    idle.generation_tokens_per_sec = Some(0.0);
+
+    let windows = vec![
+        mk_win(snap(t, t, busy.clone(), g.clone())),
+        mk_win(snap(t, t, busy.clone(), g.clone())),
+        mk_win(snap(t, t, busy, g.clone())),
+        mk_win(snap(t, t, idle, g)),
+    ];
+    let cfg = VllmConfig {
+        dtype: Some("bf16".to_string()),
+        max_model_len: Some(2048),
+        ..Default::default()
+    };
+    let ctx = StaticContext::from_snapshot(&windows[0].snapshot, cfg);
+    let summary = ai(&ctx, windows.last().expect("windows"));
+    let lines = format_diagnose_rules_for_windows_test(
+        &windows,
+        summary,
+        false,
+        "http://127.0.0.1:8000/metrics",
+    );
+    assert_eq!(
+        lines.first().map(String::as_str),
+        Some("No issues detected.")
+    );
+    assert!(
+        lines.get(1).is_some_and(|l| l.starts_with("Capped by ")),
+        "expected limiter line, got: {lines:?}"
+    );
+    assert!(
+        !lines
+            .get(1)
+            .is_some_and(|l| l.starts_with("Capped by traffic")),
+        "must not use last idle snapshot as traffic evidence: {lines:?}"
+    );
 }
 
 #[test]
@@ -2212,10 +2296,11 @@ fn r5_uses_session_kv_peak_from_non_r5_window() {
         text.contains("[!] Concurrency Saturation"),
         "expected r5: {text}"
     );
-    // Fix line uses summary snapshot KV (50%) for branch selection - scale-out, not session peak.
+    // Fix line uses summary snapshot KV (50%) for branch selection: A-path raise, not
+    // the session-peak scale-out. The raise is bounded by the resolved wall.
     assert!(
-        text.contains("Raise --max-num-seqs above 32"),
-        "expected raise-cap fix from summary KV: {text}"
+        text.contains("Raise --max-num-seqs to"),
+        "expected bounded raise-cap fix from summary KV: {text}"
     );
     assert!(!text.contains("KV at 95%: scheduler at cap, pool full."));
     assert!(!text.contains("Add a replica"));
@@ -2249,7 +2334,7 @@ fn session_kv_peak_from_non_r5_window_reaches_build_report_from_eval() {
         .expect("r5 group");
     let text = r5.display_lines.join("\n");
     assert!(
-        text.contains("Raise --max-num-seqs above 32"),
+        text.contains("Raise --max-num-seqs to"),
         "display fix line must use summary snapshot KV branch: {text}"
     );
     assert!(!text.contains("KV at 95%: scheduler at cap, pool full."));

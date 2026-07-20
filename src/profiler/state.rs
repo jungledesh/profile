@@ -139,6 +139,7 @@ mod tests {
             skipped_idle: 0,
             energy_skew_skipped: 0,
             gauge_missing: Default::default(),
+            limiter_evidence: None,
         }
     }
 
@@ -186,6 +187,7 @@ mod tests {
             skipped_idle: 0,
             energy_skew_skipped: 0,
             gauge_missing: Default::default(),
+            limiter_evidence: None,
         };
         let mut s = LoopState::new(r, rep);
         s.record_recommendation("under_batching");
@@ -209,6 +211,7 @@ mod tests {
             skipped_idle: 0,
             energy_skew_skipped: 0,
             gauge_missing: Default::default(),
+            limiter_evidence: None,
         };
         let mut s = LoopState::new(r, rep);
         s.record_recommendation("under_batching");

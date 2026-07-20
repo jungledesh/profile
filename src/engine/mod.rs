@@ -33,6 +33,7 @@ pub struct EvalSkipStats {
     pub energy_skew_skipped: usize,
     /// Evaluable windows where a required gauge was absent (could not judge).
     pub gauge_missing: GaugeMissingCounts,
+    pub limiter_evidence: Option<limiter::LimiterEvidence>,
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +61,8 @@ pub struct Report {
     pub energy_skew_skipped: usize,
     /// Evaluable windows where a required gauge was absent (could not judge).
     pub gauge_missing: GaugeMissingCounts,
+    /// Run-level limiter evidence for no-rules "capped by" line.
+    pub limiter_evidence: Option<limiter::LimiterEvidence>,
 }
 
 /// Multi-window diagnose report. Production always collects >= 15 windows (min duration 30s).

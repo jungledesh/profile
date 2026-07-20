@@ -29,6 +29,11 @@ fn r6_metric_line(label: &str, value: &str) -> String {
 /// Fallback when prompt mean or running count unavailable for budget derivation.
 const DEFAULT_BATCH_TOKEN_BUDGET: u64 = 2048;
 
+/// Relative band around the recommended `--max-num-batched-tokens` where we
+/// treat the knob as already set and name the FLOPs wall instead.
+/// Provisional; calibrate on RunPod (same posture as limiter thresholds).
+const R6_BUDGET_BAND: f64 = 0.20;
+
 /// Wall-clock policy: how much decode-step stretch we accept when prefill
 /// shares the step. Judgment constant, operator-arguable. Not physics coupling.
 const DECODE_STRETCH_TARGET: f64 = 0.25;
@@ -63,15 +68,25 @@ fn recommended_batch_token_budget(prompt_mean: f64, running: f64) -> u64 {
     round_up_128(raw)
 }
 
-fn batch_token_budget(d: &PrefillBoundDetail) -> u64 {
+/// Which tier produced `batch_token_budget`. Default is a hardcoded fallback;
+/// wall claims require a derived (ridge or workload) recommendation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchBudgetTier {
+    Ridge,
+    Workload,
+    Default,
+}
+
+fn batch_token_budget(d: &PrefillBoundDetail) -> (u64, BatchBudgetTier) {
     if let Some(ridge) = d.ridge_batch_size.filter(|r| r.is_finite() && *r > 0.0) {
-        return ridge_batch_token_budget(ridge);
+        return (ridge_batch_token_budget(ridge), BatchBudgetTier::Ridge);
     }
     match (d.prompt_tokens_mean, d.running_count) {
-        (Some(pm), Some(rc)) if pm.is_finite() && pm > 0.0 && rc.is_finite() && rc >= 0.0 => {
-            recommended_batch_token_budget(pm, rc)
-        }
-        _ => DEFAULT_BATCH_TOKEN_BUDGET,
+        (Some(pm), Some(rc)) if pm.is_finite() && pm > 0.0 && rc.is_finite() && rc >= 0.0 => (
+            recommended_batch_token_budget(pm, rc),
+            BatchBudgetTier::Workload,
+        ),
+        _ => (DEFAULT_BATCH_TOKEN_BUDGET, BatchBudgetTier::Default),
     }
 }
 
@@ -88,7 +103,7 @@ fn batch_budget_paren(d: &PrefillBoundDetail) -> Option<&'static str> {
 }
 
 fn batch_budget_fix_bullet(d: &PrefillBoundDetail, verb: &str) -> String {
-    let budget = batch_token_budget(d);
+    let (budget, _) = batch_token_budget(d);
     match batch_budget_paren(d) {
         Some(paren) => {
             format!(
@@ -101,6 +116,47 @@ fn batch_budget_fix_bullet(d: &PrefillBoundDetail, verb: &str) -> String {
             )
         }
     }
+}
+
+/// Knob already sits within the band of a derived recommendation: no single-GPU
+/// retune adds FLOPs. Gauge missing or default-tier budget → never claim the wall.
+fn on_compute_wall(d: &PrefillBoundDetail) -> bool {
+    let Some(configured) = d.max_num_batched_tokens else {
+        return false;
+    };
+    let (recommended, tier) = batch_token_budget(d);
+    if tier == BatchBudgetTier::Default || recommended == 0 {
+        return false;
+    }
+    let rec = recommended as f64;
+    let cfg = f64::from(configured);
+    (cfg - rec).abs() / rec <= R6_BUDGET_BAND
+}
+
+fn compute_wall_fix_lines(d: &PrefillBoundDetail) -> (Vec<String>, String) {
+    let mut bullets = vec![
+        "      • Prefill is compute-bound for this prompt mix; no single-GPU knob adds FLOPs."
+            .to_string(),
+        "      • Disaggregate prefill and decode onto separate workers (vLLM disaggregated serving, requires 2+ nodes).".to_string(),
+        "      • Add a replica to scale out.".to_string(),
+    ];
+    if d.prefix_caching_enabled.is_none() {
+        bullets.push(
+            "      • Enable --enable-prefix-caching if not already on; cached prefixes skip prefill."
+                .to_string(),
+        );
+    }
+    (
+        bullets,
+        "Scale out prefill compute; single-GPU retunes cannot add FLOPs.".to_string(),
+    )
+}
+
+fn knob_fix_lines(d: &PrefillBoundDetail) -> (Vec<String>, String) {
+    (
+        vec![batch_budget_fix_bullet(d, "Set")],
+        "Lower TTFT variance, steadier decode throughput.".to_string(),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -117,6 +173,8 @@ pub struct PrefillBoundDetail {
     pub running_count: Option<f64>,
     /// Decode ridge batch size (tokens). When set, drives the primary budget.
     pub ridge_batch_size: Option<f64>,
+    /// Configured `--max-num-batched-tokens` (gauge, else config). Unknown → no wall claim.
+    pub max_num_batched_tokens: Option<u32>,
     /// Hybrid/linear catalog model: ridge budget is optimistic on long prompts.
     pub is_hybrid: bool,
 }
@@ -149,6 +207,8 @@ pub struct PrefillBoundEvalInput<'a> {
     pub snapshot: &'a RawSnapshot,
     pub chunked_prefill_enabled: Option<bool>,
     pub ridge_batch_size: Option<f64>,
+    /// Gauge else config; resolved by the caller before evaluate.
+    pub max_num_batched_tokens: Option<u32>,
     pub is_hybrid: bool,
 }
 
@@ -222,6 +282,7 @@ pub fn evaluate(input: PrefillBoundEvalInput<'_>) -> Rule6Outcome {
         snapshot,
         chunked_prefill_enabled,
         ridge_batch_size,
+        max_num_batched_tokens,
         is_hybrid,
     } = input;
     let Some(raw_prompt_tps) = prompt_tokens_per_sec.filter(|v| v.is_finite() && *v > 0.0) else {
@@ -283,6 +344,7 @@ pub fn evaluate(input: PrefillBoundEvalInput<'_>) -> Rule6Outcome {
         prompt_skew_ratio,
         running_count: snapshot.vllm.num_requests_running,
         ridge_batch_size,
+        max_num_batched_tokens,
         is_hybrid,
     })
 }
@@ -307,9 +369,9 @@ pub(super) fn aggregate_r6_detail(details: &[PrefillBoundDetail]) -> PrefillBoun
             .iter()
             .filter_map(|d| d.tpot_ms)
             .fold(None, |acc, v| Some(acc.map_or(v, |a: f64| a.max(v)))),
-        tpot_floor_ms: details.last().and_then(|d| d.tpot_floor_ms),
-        prefix_caching_enabled: details.last().and_then(|d| d.prefix_caching_enabled),
-        chunked_prefill_enabled: details.last().and_then(|d| d.chunked_prefill_enabled),
+        tpot_floor_ms: details.first().and_then(|d| d.tpot_floor_ms),
+        prefix_caching_enabled: details.first().and_then(|d| d.prefix_caching_enabled),
+        chunked_prefill_enabled: details.first().and_then(|d| d.chunked_prefill_enabled),
         prompt_tokens_mean: super::mean_of_present(
             details.iter().filter_map(|d| d.prompt_tokens_mean),
         ),
@@ -322,8 +384,9 @@ pub(super) fn aggregate_r6_detail(details: &[PrefillBoundDetail]) -> PrefillBoun
             .filter_map(|d| d.prompt_skew_ratio)
             .fold(None, |acc, v| Some(acc.map_or(v, |a: f64| a.max(v)))),
         running_count: super::mean_of_present(details.iter().filter_map(|d| d.running_count)),
-        ridge_batch_size: details.last().and_then(|d| d.ridge_batch_size),
-        is_hybrid: details.last().is_some_and(|d| d.is_hybrid),
+        ridge_batch_size: details.first().and_then(|d| d.ridge_batch_size),
+        max_num_batched_tokens: details.first().and_then(|d| d.max_num_batched_tokens),
+        is_hybrid: details.first().is_some_and(|d| d.is_hybrid),
     }
 }
 
@@ -377,17 +440,15 @@ pub(super) fn prefill_fix_lines(d: &PrefillBoundDetail, sev: Severity) -> (Vec<S
             "Full separation of prefill and decode compute paths.".to_string(),
         )
     } else if chunked_on {
-        (
-            vec![batch_budget_fix_bullet(d, "Set")],
-            "Lower TTFT variance, steadier decode throughput.".to_string(),
-        )
+        if on_compute_wall(d) {
+            compute_wall_fix_lines(d)
+        } else {
+            knob_fix_lines(d)
+        }
     } else {
         // Logically unreachable: branch 2 forces chunked_on=true, branch 4 catches it.
         // Safe fallback instead of panic in library code.
-        (
-            vec![batch_budget_fix_bullet(d, "Set")],
-            "Lower TTFT variance, steadier decode throughput.".to_string(),
-        )
+        knob_fix_lines(d)
     }
 }
 
@@ -547,6 +608,7 @@ mod tests {
             snapshot,
             chunked_prefill_enabled: None,
             ridge_batch_size: None,
+            max_num_batched_tokens: None,
             is_hybrid: false,
         })
     }
@@ -566,6 +628,7 @@ mod tests {
             snapshot: &s,
             chunked_prefill_enabled: None,
             ridge_batch_size: None,
+            max_num_batched_tokens: None,
             is_hybrid: false,
         });
         assert!(matches!(result, Rule6Outcome::NotFired));
@@ -760,6 +823,7 @@ mod tests {
             snapshot: &s,
             chunked_prefill_enabled: None,
             ridge_batch_size: None,
+            max_num_batched_tokens: None,
             is_hybrid: false,
         });
         assert!(matches!(result, Rule6Outcome::NotFired));
@@ -789,6 +853,7 @@ mod tests {
             prompt_skew_ratio: Some(2.0),
             running_count: None,
             ridge_batch_size: None,
+            max_num_batched_tokens: None,
             is_hybrid: false,
         };
         let inf_window = PrefillBoundDetail {
@@ -818,6 +883,7 @@ mod tests {
             prompt_skew_ratio: None,
             running_count: None,
             ridge_batch_size: None,
+            max_num_batched_tokens: None,
             is_hybrid: false,
         };
         let agg = aggregate_r6_detail(&[d.clone(), d]);
@@ -844,6 +910,7 @@ mod tests {
             prompt_skew_ratio: Some(25.0),
             running_count: None,
             ridge_batch_size: None,
+            max_num_batched_tokens: None,
             is_hybrid: false,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
@@ -880,6 +947,7 @@ mod tests {
             prompt_skew_ratio: Some(25.0),
             running_count: None,
             ridge_batch_size: None,
+            max_num_batched_tokens: None,
             is_hybrid: false,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
@@ -906,6 +974,7 @@ mod tests {
             prompt_skew_ratio: Some(1.46),
             running_count: None,
             ridge_batch_size: None,
+            max_num_batched_tokens: None,
             is_hybrid: false,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
@@ -926,6 +995,7 @@ mod tests {
             prompt_skew_ratio: Some(1.46),
             running_count: None,
             ridge_batch_size: None,
+            max_num_batched_tokens: None,
             is_hybrid: false,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
@@ -947,6 +1017,7 @@ mod tests {
             prompt_skew_ratio: Some(1.46),
             running_count: None,
             ridge_batch_size: None,
+            max_num_batched_tokens: None,
             is_hybrid: false,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
@@ -969,6 +1040,7 @@ mod tests {
             prompt_skew_ratio: Some(1.46),
             running_count: None,
             ridge_batch_size: None,
+            max_num_batched_tokens: None,
             is_hybrid: false,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
@@ -989,6 +1061,7 @@ mod tests {
             prompt_skew_ratio: Some(1.46),
             running_count: None,
             ridge_batch_size: None,
+            max_num_batched_tokens: None,
             is_hybrid: false,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
@@ -1010,6 +1083,7 @@ mod tests {
             prompt_skew_ratio: Some(1.46),
             running_count: None,
             ridge_batch_size: None,
+            max_num_batched_tokens: None,
             is_hybrid: false,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
@@ -1030,6 +1104,7 @@ mod tests {
             prompt_skew_ratio: Some(25.0),
             running_count: None,
             ridge_batch_size: None,
+            max_num_batched_tokens: None,
             is_hybrid: false,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
@@ -1051,6 +1126,7 @@ mod tests {
             prompt_skew_ratio: Some(25.0),
             running_count: None,
             ridge_batch_size: None,
+            max_num_batched_tokens: None,
             is_hybrid: false,
         };
         assert!(skewed_mode(&d));
@@ -1076,6 +1152,7 @@ mod tests {
             prompt_skew_ratio: Some(25.0),
             running_count: None,
             ridge_batch_size: None,
+            max_num_batched_tokens: None,
             is_hybrid: false,
         };
         let skewed_lines = format_prefill_bound_window_issue(&skewed, 40);
@@ -1105,6 +1182,7 @@ mod tests {
             prompt_skew_ratio: Some(1.46),
             running_count: None,
             ridge_batch_size: None,
+            max_num_batched_tokens: None,
             is_hybrid: false,
         };
         let uniform_lines = format_prefill_bound_window_issue(&uniform, 100);
@@ -1140,6 +1218,7 @@ mod tests {
             prompt_skew_ratio: Some(1.46),
             running_count: Some(161.0),
             ridge_batch_size: None,
+            max_num_batched_tokens: None,
             is_hybrid: false,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
@@ -1170,9 +1249,10 @@ mod tests {
             prompt_skew_ratio: Some(1.46),
             running_count: Some(161.0),
             ridge_batch_size: Some(153.0),
+            max_num_batched_tokens: None,
             is_hybrid: false,
         };
-        assert_eq!(batch_token_budget(&d), 256);
+        assert_eq!(batch_token_budget(&d).0, 256);
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
         assert!(
             text.contains(
@@ -1197,6 +1277,7 @@ mod tests {
             prompt_skew_ratio: Some(1.46),
             running_count: None,
             ridge_batch_size: Some(153.0),
+            max_num_batched_tokens: None,
             is_hybrid: false,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
@@ -1220,6 +1301,7 @@ mod tests {
             prompt_skew_ratio: Some(1.46),
             running_count: Some(161.0),
             ridge_batch_size: Some(153.0),
+            max_num_batched_tokens: None,
             is_hybrid: true,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
@@ -1243,11 +1325,132 @@ mod tests {
             prompt_skew_ratio: None,
             running_count: None,
             ridge_batch_size: None,
+            max_num_batched_tokens: None,
             is_hybrid: false,
         };
-        assert_eq!(batch_token_budget(&d), DEFAULT_BATCH_TOKEN_BUDGET);
+        assert_eq!(batch_token_budget(&d).0, DEFAULT_BATCH_TOKEN_BUDGET);
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
         assert!(text.contains("Set --max-num-batched-tokens to 2048"));
         assert!(!text.contains("decode stretch"));
+    }
+
+    fn wall_path_base(
+        configured: Option<u32>,
+        ridge: Option<f64>,
+        prefix: Option<bool>,
+        ratio: f64,
+    ) -> PrefillBoundDetail {
+        PrefillBoundDetail {
+            prompt_gen_ratio: ratio,
+            decode_efficiency_pct: 8.0,
+            tpot_ms: Some(80.0),
+            tpot_floor_ms: Some(7.85),
+            prefix_caching_enabled: prefix,
+            chunked_prefill_enabled: Some(true),
+            prompt_tokens_mean: Some(4096.0),
+            prompt_tokens_p99: Some(6000.0),
+            prompt_skew_ratio: Some(1.46),
+            running_count: None,
+            ridge_batch_size: ridge,
+            max_num_batched_tokens: configured,
+            is_hybrid: false,
+        }
+    }
+
+    #[test]
+    fn compute_wall_when_configured_within_band_of_ridge_budget() {
+        // ridge 1638.4 → budget 2048; configured 2048 within band.
+        let d = wall_path_base(Some(2048), Some(1638.4), Some(true), 12.0);
+        assert_eq!(batch_token_budget(&d), (2048, BatchBudgetTier::Ridge));
+        let text = format_prefill_bound_window_issue(&d, 100).join("\n");
+        assert!(text.contains(
+            "Prefill is compute-bound for this prompt mix; no single-GPU knob adds FLOPs."
+        ));
+        assert!(text.contains("Disaggregate prefill and decode onto separate workers"));
+        assert!(text.contains("Add a replica to scale out."));
+        assert!(!text.contains("--max-num-batched-tokens"));
+    }
+
+    #[test]
+    fn knob_when_configured_below_band() {
+        let d = wall_path_base(Some(1024), Some(1638.4), Some(true), 12.0);
+        let text = format_prefill_bound_window_issue(&d, 100).join("\n");
+        assert!(text.contains("Set --max-num-batched-tokens to 2048"));
+        assert!(!text.contains("no single-GPU knob adds FLOPs"));
+    }
+
+    #[test]
+    fn knob_when_configured_above_band() {
+        let d = wall_path_base(Some(4096), Some(1638.4), Some(true), 12.0);
+        let text = format_prefill_bound_window_issue(&d, 100).join("\n");
+        assert!(text.contains("Set --max-num-batched-tokens to 2048"));
+        assert!(!text.contains("no single-GPU knob adds FLOPs"));
+    }
+
+    #[test]
+    fn knob_when_configured_unknown() {
+        let d = wall_path_base(None, Some(1638.4), Some(true), 12.0);
+        let text = format_prefill_bound_window_issue(&d, 100).join("\n");
+        assert!(text.contains("Set --max-num-batched-tokens to 2048"));
+        assert!(!text.contains("no single-GPU knob adds FLOPs"));
+    }
+
+    #[test]
+    fn knob_when_budget_is_default_tier_even_if_exact_match() {
+        let d = PrefillBoundDetail {
+            prompt_gen_ratio: 12.0,
+            decode_efficiency_pct: 8.0,
+            tpot_ms: Some(80.0),
+            tpot_floor_ms: Some(7.85),
+            prefix_caching_enabled: Some(true),
+            chunked_prefill_enabled: Some(true),
+            prompt_tokens_mean: None,
+            prompt_tokens_p99: None,
+            prompt_skew_ratio: None,
+            running_count: None,
+            ridge_batch_size: None,
+            max_num_batched_tokens: Some(2048),
+            is_hybrid: false,
+        };
+        assert_eq!(batch_token_budget(&d), (2048, BatchBudgetTier::Default));
+        let text = format_prefill_bound_window_issue(&d, 100).join("\n");
+        assert!(text.contains("Set --max-num-batched-tokens to 2048"));
+        assert!(!text.contains("no single-GPU knob adds FLOPs"));
+    }
+
+    #[test]
+    fn wall_path_prefix_unknown_adds_conditional_bullet() {
+        let d = wall_path_base(Some(2048), Some(1638.4), None, 12.0);
+        let text = format_prefill_bound_window_issue(&d, 100).join("\n");
+        assert!(text.contains(
+            "Enable --enable-prefix-caching if not already on; cached prefixes skip prefill."
+        ));
+        let d_on = wall_path_base(Some(2048), Some(1638.4), Some(true), 12.0);
+        let text_on = format_prefill_bound_window_issue(&d_on, 100).join("\n");
+        assert!(!text_on.contains("Enable --enable-prefix-caching if not already on"));
+    }
+
+    #[test]
+    fn severe_prefix_on_chunked_disagg_unchanged_when_within_band() {
+        // Severe branch stays above the wall gate; byte-identical single disagg bullet.
+        let d = wall_path_base(Some(2048), Some(1638.4), Some(true), 22.0);
+        let text = format_prefill_bound_window_issue(&d, 100).join("\n");
+        assert!(text.contains("Disaggregate prefill and decode onto separate workers"));
+        assert!(!text.contains("no single-GPU knob adds FLOPs"));
+        assert!(!text.contains("Add a replica to scale out."));
+        assert!(!text.contains("--max-num-batched-tokens"));
+    }
+
+    #[test]
+    fn compute_wall_at_exact_band_boundary() {
+        // ridge 2048 → budget 2560; configured 3072 is exactly +20%.
+        let d = wall_path_base(Some(3072), Some(2048.0), Some(true), 12.0);
+        assert_eq!(batch_token_budget(&d), (2560, BatchBudgetTier::Ridge));
+        let (budget, _) = batch_token_budget(&d);
+        let rel = (f64::from(3072) - budget as f64).abs() / budget as f64;
+        assert!((rel - R6_BUDGET_BAND).abs() < 1e-12);
+        let text = format_prefill_bound_window_issue(&d, 100).join("\n");
+        assert!(text.contains("no single-GPU knob adds FLOPs"));
+        assert!(!text.contains("--max-num-batched-tokens"));
     }
 }

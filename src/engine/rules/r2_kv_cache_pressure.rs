@@ -479,6 +479,18 @@ pub(super) fn format_kv_cache_pressure_fired(
     let total_count = snapshot.vllm.generation_tokens_completed.unwrap_or(0.0);
     let prompt_p99 = snapshot.vllm.prompt_tokens_p99;
     let generation_p99 = snapshot.vllm.generation_tokens_p99;
+    // Cap-leads with Observed/Derived + m already name current max_model_len; use "to N".
+    // Crisis, shrink-leads, DerivedHybrid, and no-capacity keep the arrow form.
+    let would_lead_if_shrink = max_model_len
+        .is_some_and(|m| super::p99_sum_below_half_max_model_len(m, prompt_p99, generation_p99));
+    let shrink_current_shown = !d.preemptions_active
+        && !would_lead_if_shrink
+        && kv_max_seqs.is_some()
+        && max_model_len.is_some()
+        && matches!(
+            capacity_label,
+            KvCapacityLabel::Observed | KvCapacityLabel::Derived
+        );
     let shrink_lines = super::model_len_shrink_suggestion_lines(
         max_model_len,
         prompt_p99,
@@ -486,24 +498,20 @@ pub(super) fn format_kv_cache_pressure_fired(
         total_count,
         "      ",
         Some(&hyp),
+        shrink_current_shown,
     );
     // Lead with model-len when observed traffic fits in half the window: the
     // full-context concurrency floor is then a secondary bound, not the primary fix.
-    let lead_with_shrink = !shrink_lines.is_empty()
-        && max_model_len.is_some_and(|m| {
-            super::p99_sum_below_half_max_model_len(m, prompt_p99, generation_p99)
-        });
+    let lead_with_shrink = !shrink_lines.is_empty() && would_lead_if_shrink;
 
     let mut safe = Vec::new();
     if let Some(bullet) = prefix_caching_fix_bullet(snapshot) {
         safe.push(bullet);
     }
     if d.preemptions_active {
+        // Same raise string as non-crisis; omit when headroom is missing or < 2GB.
         if kv_headroom_gb.is_some_and(|h| h >= KV_HEADROOM_SAFE_MIN_GB) {
-            safe.push(
-                "      • Once stable, raise --gpu-memory-utilization (check vRAM header) to expand KV pool"
-                    .to_string(),
-            );
+            safe.push(kv_headroom_gpu_mem_bullet(kv_headroom_gb));
         }
     } else {
         safe.push(kv_headroom_gpu_mem_bullet(kv_headroom_gb));
@@ -517,7 +525,7 @@ pub(super) fn format_kv_cache_pressure_fired(
     }
 
     if d.preemptions_active {
-        // D2 crisis: throttle first under Fix with revert sub-line; no Cuts header for it.
+        // Crisis: one flat Fix list. Throttle subline marks risk; no Cuts header.
         let crisis_throttle = max_num_seqs_bullet(kv_max_seqs, max_model_len, capacity_label, true);
         out.push("    Fix:".to_string());
         super::push_bullet_with_subline(
@@ -526,20 +534,8 @@ pub(super) fn format_kv_cache_pressure_fired(
             Some("Cuts throughput. Revert after pressure clears."),
         );
         out.extend(safe);
-        let mut cuts = Vec::new();
-        super::extend_with_shrink_suggestion(&mut cuts, shrink_lines);
-        if cuts.is_empty() {
-            // D5: no blank after crisis sub-line when it is last under Fix.
-            while out.last().is_some_and(|l| l.is_empty()) {
-                out.pop();
-            }
-        } else {
-            if !out.last().is_some_and(|l| l.is_empty()) {
-                out.push(String::new());
-            }
-            out.push("    Cuts throughput:".to_string());
-            out.extend(cuts);
-        }
+        // No-op when shrink_lines is empty.
+        super::extend_with_shrink_suggestion(&mut out, shrink_lines);
     } else {
         let mut cuts = Vec::new();
         let seqs_bullet = if lead_with_shrink {
@@ -565,6 +561,8 @@ pub(super) fn format_kv_cache_pressure_fired(
     } else {
         "    Expected: Wait queue drains, TTFT recovers once KV pool has capacity."
     };
+    // Exactly one blank before Expected, regardless of what the last group left.
+    super::trim_group_trailing_blanks(&mut out);
     out.push(String::new());
     out.push(expected.to_string());
     if super::rule_is_significant(windows_fired, total_evaluable) {
@@ -608,6 +606,7 @@ pub(super) fn format_kv_admission_backlog_issue(
         total_count,
         "      ",
         Some(&hyp),
+        false,
     );
 
     let mut safe = Vec::new();
@@ -1334,8 +1333,28 @@ mod tests {
         )
         .join("\n");
         assert!(text.contains(
-            "Once stable, raise --gpu-memory-utilization (check vRAM header) to expand KV pool"
+            "Raise --gpu-memory-utilization (check vRAM header for avail mem) to expand KV pool"
         ));
+        assert!(!text.contains("Once stable"));
+    }
+
+    #[test]
+    fn evictions_path_omits_gpu_mem_when_headroom_below_safe() {
+        let v = VllmRawMetrics {
+            kv_cache_usage_perc: Some(90.0),
+            num_preemptions_per_sec: Some(0.05),
+            ..Default::default()
+        };
+        let text = format_kv_cache_pressure_fired(
+            &detail(90.0, true),
+            &kv_ctx(&snap(v), None, Some(1.0), None),
+            1,
+            1,
+        )
+        .join("\n");
+        assert!(!text.contains("Raise --gpu-memory-utilization"));
+        assert!(!text.contains("GPU at VRAM capacity"));
+        assert!(!text.contains("Once stable"));
     }
 
     #[test]
@@ -1638,13 +1657,83 @@ mod tests {
             .find("Lower --max-num-seqs")
             .expect("max-num-seqs bullet");
         let shrink_pos = text
-            .find("Lower --max-model-len 8192 → 6450")
-            .expect("shrink line");
+            .find("Lower --max-model-len to 6450")
+            .expect("shrink line uses to-form when cap names max_model_len");
         assert!(
             cuts_pos < seqs_pos && seqs_pos < shrink_pos,
             "max-num-seqs must lead shrink under Cuts throughput when p99 >= half"
         );
         assert!(!text.contains("guaranteed at full"));
+        assert!(
+            !text.contains("8192 → 6450"),
+            "current already shown on cap bullet"
+        );
+        assert_eq!(
+            text.matches("max_model_len=8192").count(),
+            1,
+            "current max_model_len once per block"
+        );
+    }
+
+    #[test]
+    fn queue_only_observed_shrink_uses_to_form() {
+        let v = VllmRawMetrics {
+            kv_cache_usage_perc: Some(90.0),
+            num_requests_waiting: Some(5.0),
+            prompt_tokens_p99: Some(6000.0),
+            generation_tokens_p99: Some(800.0),
+            generation_tokens_completed: Some(150.0),
+            ..Default::default()
+        };
+        // 6800 >= 8192/2 → cap leads; Observed names max_model_len → "to 6800".
+        let snap = snap(v);
+        let mut ctx = kv_ctx(&snap, Some(8192), Some(30.0), Some(120));
+        ctx.capacity_label = KvCapacityLabel::Observed;
+        let text = format_kv_cache_pressure_fired(
+            &KvCachePressureDetail {
+                kv_cache_usage_perc: 90.0,
+                kv_peak_pct: Some(90.0),
+                preemptions_active: false,
+                queue_backpressure: true,
+            },
+            &ctx,
+            3,
+            4,
+        )
+        .join("\n");
+        assert!(text.contains("Lower --max-model-len to 6800"));
+        assert!(!text.contains('→'));
+        assert_eq!(text.matches("max_model_len=8192").count(), 1);
+        assert!(text.contains("    Cuts throughput:"));
+    }
+
+    #[test]
+    fn queue_only_derived_hybrid_keeps_arrow_form() {
+        let v = VllmRawMetrics {
+            kv_cache_usage_perc: Some(90.0),
+            num_requests_waiting: Some(5.0),
+            prompt_tokens_p99: Some(6000.0),
+            generation_tokens_p99: Some(800.0),
+            generation_tokens_completed: Some(150.0),
+            ..Default::default()
+        };
+        let snap = snap(v);
+        let mut ctx = kv_ctx(&snap, Some(8192), Some(30.0), Some(120));
+        ctx.capacity_label = KvCapacityLabel::DerivedHybrid;
+        let text = format_kv_cache_pressure_fired(
+            &KvCachePressureDetail {
+                kv_cache_usage_perc: 90.0,
+                kv_peak_pct: Some(90.0),
+                preemptions_active: false,
+                queue_backpressure: true,
+            },
+            &ctx,
+            3,
+            4,
+        )
+        .join("\n");
+        assert!(text.contains("Lower --max-model-len 8192 → 6800"));
+        assert!(!text.contains("max_model_len=8192"));
     }
 
     #[test]
@@ -1677,7 +1766,10 @@ mod tests {
             !text.contains("    Cuts throughput:"),
             "no Cuts throughput header when only crisis throttle (no shrink)"
         );
-        assert!(text.contains("Once stable, raise --gpu-memory-utilization"));
+        assert!(text.contains(
+            "Raise --gpu-memory-utilization (check vRAM header for avail mem) to expand KV pool"
+        ));
+        assert!(!text.contains("Once stable"));
     }
 
     #[test]
@@ -1718,13 +1810,8 @@ mod tests {
     }
 
     #[test]
-    fn safe_group_empty_cuts_follows_fix_directly() {
-        // Prefix gated off (caching on), headroom unknown → raise gpu-mem is still safe.
-        // Force empty safe: caching on + already fp8 + headroom absent... gpu-mem still prints.
-        // Construct: caching on, fp8 dtype, headroom < 2GB wall still prints (safe).
-        // True empty safe: caching on, already fp8, and... gpu-mem always prints for non-crisis.
-        // Crisis path with headroom < 2GB and caching on and fp8: safe empty.
-        let mut v = VllmRawMetrics {
+    fn crisis_flat_fix_includes_shrink_without_cuts_header() {
+        let v = VllmRawMetrics {
             kv_cache_usage_perc: Some(90.0),
             num_preemptions_per_sec: Some(0.05),
             prompt_tokens_p99: Some(6000.0),
@@ -1737,7 +1824,59 @@ mod tests {
             },
             ..Default::default()
         };
-        let _ = &mut v;
+        let lines = format_kv_cache_pressure_fired(
+            &detail(90.0, true),
+            &kv_ctx(&snap(v), Some(8192), Some(1.0), Some(16)),
+            3,
+            4,
+        );
+        let text = lines.join("\n");
+        let fix_idx = lines.iter().position(|l| l == "    Fix:").expect("Fix");
+        assert!(
+            !text.contains("    Cuts throughput:"),
+            "crisis must not use Cuts throughput header"
+        );
+        assert!(
+            lines[fix_idx + 1].contains("Lower --max-num-seqs"),
+            "throttle first"
+        );
+        assert_eq!(
+            lines[fix_idx + 2].trim(),
+            "Cuts throughput. Revert after pressure clears."
+        );
+        assert!(lines[fix_idx + 3].is_empty(), "blank after revert subline");
+        let shrink = text
+            .find("Lower --max-model-len 8192 → 6450")
+            .expect("arrow-form shrink in Fix");
+        assert!(text.find("    Fix:").unwrap() < shrink);
+        assert!(text.contains("Truncation risk"));
+        let warn = lines
+            .iter()
+            .position(|l| l.contains("Truncation risk"))
+            .expect("warning subline");
+        assert!(lines[warn].contains("Warning") || lines[warn].contains("Truncation"));
+        assert!(
+            !lines.windows(2).any(|w| w[0].is_empty() && w[1].is_empty()),
+            "no consecutive blank lines in block"
+        );
+    }
+
+    #[test]
+    fn safe_group_empty_crisis_shrink_stays_under_fix() {
+        // Crisis, safe empty (caching on, fp8, headroom < 2GB), shrink present.
+        let v = VllmRawMetrics {
+            kv_cache_usage_perc: Some(90.0),
+            num_preemptions_per_sec: Some(0.05),
+            prompt_tokens_p99: Some(6000.0),
+            generation_tokens_p99: Some(450.0),
+            generation_tokens_completed: Some(150.0),
+            cache_config: CacheConfigLabels {
+                enable_prefix_caching: Some(true),
+                cache_dtype: Some("fp8".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         let lines = format_kv_cache_pressure_fired(
             &detail(90.0, true),
             &kv_ctx(&snap(v), Some(8192), Some(1.0), Some(16)),
@@ -1745,21 +1884,21 @@ mod tests {
             4,
         );
         let fix_idx = lines.iter().position(|l| l == "    Fix:").expect("Fix");
-        // Crisis throttle + subline + blank, then Cuts for shrink (safe empty after crisis).
-        assert!(lines.iter().any(|l| l == "    Cuts throughput:"));
-        let cuts_idx = lines
+        assert!(!lines.iter().any(|l| l == "    Cuts throughput:"));
+        let shrink_idx = lines
             .iter()
-            .position(|l| l == "    Cuts throughput:")
-            .unwrap();
-        // Between Fix and Cuts: crisis throttle block only (no safe bullets).
-        let between = &lines[fix_idx + 1..cuts_idx];
+            .position(|l| l.contains("Lower --max-model-len 8192 → 6450"))
+            .expect("shrink under Fix");
+        assert!(fix_idx < shrink_idx);
+        // Between Fix and shrink: crisis throttle block only.
+        let between = &lines[fix_idx + 1..shrink_idx];
         assert!(
             between.iter().all(|l| {
                 l.contains("Lower --max-num-seqs")
                     || l.contains("Cuts throughput. Revert")
                     || l.is_empty()
             }),
-            "safe group empty: only crisis throttle before Cuts: {between:?}"
+            "safe empty: only crisis throttle before shrink: {between:?}"
         );
     }
 

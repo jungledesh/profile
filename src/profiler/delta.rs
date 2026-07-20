@@ -269,6 +269,7 @@ mod tests {
             skipped_idle: 0,
             energy_skew_skipped: 0,
             gauge_missing: Default::default(),
+            limiter_evidence: None,
         }
     }
 
