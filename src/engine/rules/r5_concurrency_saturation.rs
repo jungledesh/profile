@@ -81,10 +81,153 @@ pub fn rule5_concurrency_saturation(
     })
 }
 
+/// Confidence value for the R5 recommendation. Low (0.5) when the binding wall is
+/// empirical; else the existing High/Medium from TTFT+KV evidence.
+pub(super) fn r5_confidence(d: &ConcurrencySaturationDetail, empirical: bool) -> f64 {
+    if empirical {
+        return 0.5;
+    }
+    match (d.ttft_ms.or(d.ttft_p99_ms), d.kv_cache_usage_perc) {
+        (Some(_), Some(_)) => 0.9,
+        _ => 0.6,
+    }
+}
+
+fn r5_confidence_label(empirical: bool, d: &ConcurrencySaturationDetail) -> &'static str {
+    if empirical {
+        return "Low";
+    }
+    match (d.ttft_ms.or(d.ttft_p99_ms), d.kv_cache_usage_perc) {
+        (Some(_), Some(_)) => "High",
+        _ => "Medium",
+    }
+}
+
+/// Build the safe + cuts fix bullets from the resolved walls. `kv_usage` is the
+/// known KV usage percent (A path) or `None` when KV usage is unavailable.
+fn walls_fix_lines(
+    d: &ConcurrencySaturationDetail,
+    rec: Option<&super::RecommendedSeqs>,
+    kv_usage: Option<f64>,
+    max_model_len: Option<u32>,
+    snapshot: &RawSnapshot,
+    hyp: Option<&super::HypCapacityCtx<'_>>,
+) -> (Vec<String>, Vec<String>) {
+    use super::{BindingWall, KvBoundSource};
+
+    let mut safe = Vec::new();
+    let mut cuts = Vec::new();
+
+    let cur = d.max_num_seqs;
+    // No wall known: honest conditional line, never invent a ceiling number.
+    let Some(rec) = rec else {
+        match (cur, kv_usage) {
+            (Some(c), Some(pct)) => safe.push(format!(
+                "      • Raise --max-num-seqs above {c} (KV cache {pct:.0}% used, pool has room; no ceiling known)"
+            )),
+            (Some(c), None) => safe.push(format!(
+                "      • Raise --max-num-seqs above {c} if KV headroom confirmed (no ceiling known)"
+            )),
+            (None, Some(pct)) => safe.push(format!(
+                "      • Raise --max-num-seqs (KV cache {pct:.0}% used, pool has room; no ceiling known)"
+            )),
+            (None, None) => safe.push(
+                "      • Raise --max-num-seqs if KV headroom confirmed (no ceiling known)".to_string(),
+            ),
+        }
+        return (safe, cuts);
+    };
+    let Some(cur) = cur else {
+        safe.push(
+            "      • Raise --max-num-seqs if KV headroom confirmed (no ceiling known)".to_string(),
+        );
+        return (safe, cuts);
+    };
+
+    if rec.target > cur {
+        // Bounded raise. Empirical: "(est)" only; step cap is silent.
+        let reason = match rec.binder {
+            BindingWall::Ridge | BindingWall::Config => {
+                format!("80% of compute ridge ~{:.0}", rec.wall)
+            }
+            BindingWall::Memory { cap } => match rec.source {
+                Some(KvBoundSource::Observed) => {
+                    format!("80% of memory limit {cap}, vLLM-reported")
+                }
+                Some(KvBoundSource::Derived) | Some(KvBoundSource::DerivedHybrid) => {
+                    format!("80% of memory limit ~{cap}, est")
+                }
+                Some(KvBoundSource::Empirical) => "est".to_string(),
+                None => format!("80% of memory limit {cap}"),
+            },
+        };
+        safe.push(format!(
+            "      • Raise --max-num-seqs to {} ({reason})",
+            rec.target
+        ));
+        if rec.empirical {
+            safe.push("      • Monitor KV cache when scaling up.".to_string());
+        }
+        return (safe, cuts);
+    }
+
+    // target <= current: no knob. "at" only when current >= wall.
+    let at_wall = f64::from(cur) >= rec.wall;
+    match rec.binder {
+        BindingWall::Ridge | BindingWall::Config => {
+            let zone = if at_wall {
+                format!("at compute ridge (~{:.0})", rec.wall)
+            } else {
+                format!("within safety margin of compute ridge (~{:.0})", rec.wall)
+            };
+            safe.push(format!(
+                "      • --max-num-seqs {cur} is {zone}. Raising adds TPOT, not throughput."
+            ));
+            safe.push("      • Add a replica to scale out.".to_string());
+        }
+        BindingWall::Memory { cap } => {
+            let limit = match rec.source {
+                Some(KvBoundSource::Observed) => format!("memory limit ({cap}, vLLM-reported)"),
+                Some(KvBoundSource::Derived) | Some(KvBoundSource::DerivedHybrid) => {
+                    format!("memory limit (~{cap}, est)")
+                }
+                Some(KvBoundSource::Empirical) => format!("memory limit (~{cap}, est)"),
+                None => format!("memory limit ({cap})"),
+            };
+            let zone = if at_wall {
+                format!("at {limit}")
+            } else {
+                format!("within safety margin of {limit}")
+            };
+            let prefix = match kv_usage {
+                Some(pct) => format!("KV pool has room ({pct:.0}%), but"),
+                None => "KV unknown, but".to_string(),
+            };
+            if at_wall {
+                safe.push(format!("      • {prefix} --max-num-seqs {cur} is {zone}."));
+            } else {
+                // Current stays in the cause line; within-margin memory omits it here.
+                safe.push(format!("      • {prefix} --max-num-seqs is {zone}."));
+            }
+            let shrink = super::model_len_shrink_suggestion_lines(
+                max_model_len,
+                snapshot.vllm.prompt_tokens_p99,
+                snapshot.vllm.generation_tokens_p99,
+                snapshot.vllm.generation_tokens_completed.unwrap_or(0.0),
+                "      ",
+                hyp,
+                false,
+            );
+            super::extend_with_shrink_suggestion(&mut cuts, shrink);
+        }
+    }
+    (safe, cuts)
+}
+
 pub(super) fn format_concurrency_saturation_issue(
     d: &ConcurrencySaturationDetail,
     max_model_len: Option<u32>,
-    kv_max_seqs: Option<u32>,
+    rec: Option<&super::RecommendedSeqs>,
     snapshot: &RawSnapshot,
     hyp: Option<&super::HypCapacityCtx<'_>>,
 ) -> Vec<String> {
@@ -92,10 +235,7 @@ pub(super) fn format_concurrency_saturation_issue(
         .max_num_seqs
         .map(|n| n.to_string())
         .unwrap_or_else(|| "?".to_string());
-    let confidence = match (d.ttft_ms.or(d.ttft_p99_ms), d.kv_cache_usage_perc) {
-        (Some(_), Some(_)) => "High",
-        _ => "Medium",
-    };
+    let empirical = rec.is_some_and(|r| r.empirical);
 
     // Prefer snapshot for display; header reads the same source.
     let display_run = snapshot
@@ -157,39 +297,11 @@ pub(super) fn format_concurrency_saturation_issue(
     lines.push(String::new());
     match display_kv {
         Some(pct) if pct < KV_CACHE_SAFE_TO_SCALE_PCT => {
-            let mut safe = Vec::new();
-            let mut cuts = Vec::new();
-            if kv_max_seqs
-                .is_some_and(|ceiling| d.max_num_seqs.is_some_and(|current| current >= ceiling))
-            {
-                let m = max_model_len
-                    .map(|n| format!("max_model_len={n}"))
-                    .unwrap_or_else(|| "max_model_len=unknown".to_string());
-                safe.push(format!(
-                    "      • KV pool has room ({pct:.0}%), but --max-num-seqs is at the physics ceiling for {m}."
-                ));
-                let shrink = super::model_len_shrink_suggestion_lines(
-                    max_model_len,
-                    snapshot.vllm.prompt_tokens_p99,
-                    snapshot.vllm.generation_tokens_p99,
-                    snapshot.vllm.generation_tokens_completed.unwrap_or(0.0),
-                    "      ",
-                    hyp,
-                );
-                super::extend_with_shrink_suggestion(&mut cuts, shrink);
-            } else {
-                match kv_max_seqs {
-                    Some(_) => safe.push(format!(
-                        "      • Raise --max-num-seqs above {max_str} (KV cache {pct:.0}% used, pool has room)"
-                    )),
-                    None => safe.push(format!(
-                        "      • Raise --max-num-seqs above {max_str} if KV headroom confirmed (ceiling unknown)"
-                    )),
-                }
-            }
+            let (safe, cuts) = walls_fix_lines(d, rec, Some(pct), max_model_len, snapshot, hyp);
             super::push_grouped_fixes(&mut lines, safe, cuts, Vec::new());
         }
         Some(pct) => {
+            // KV >= safe-to-scale gate: pool full, no config change helps. Scale out.
             super::push_grouped_fixes(
                 &mut lines,
                 vec![
@@ -203,37 +315,16 @@ pub(super) fn format_concurrency_saturation_issue(
             );
         }
         None => {
-            let mut safe = Vec::new();
-            let mut cuts = Vec::new();
-            if kv_max_seqs
-                .is_some_and(|ceiling| d.max_num_seqs.is_some_and(|current| current >= ceiling))
-            {
-                let m = max_model_len
-                    .map(|n| format!("max_model_len={n}"))
-                    .unwrap_or_else(|| "max_model_len=unknown".to_string());
-                safe.push(format!(
-                    "      • KV unknown, but --max-num-seqs is at the physics ceiling for {m}."
-                ));
-                let shrink = super::model_len_shrink_suggestion_lines(
-                    max_model_len,
-                    snapshot.vllm.prompt_tokens_p99,
-                    snapshot.vllm.generation_tokens_p99,
-                    snapshot.vllm.generation_tokens_completed.unwrap_or(0.0),
-                    "      ",
-                    hyp,
-                );
-                super::extend_with_shrink_suggestion(&mut cuts, shrink);
-            } else {
-                safe.push(format!(
-                    "      • Raise --max-num-seqs above {max_str} if KV cache has headroom"
-                ));
-            }
+            let (safe, cuts) = walls_fix_lines(d, rec, None, max_model_len, snapshot, hyp);
             super::push_grouped_fixes(&mut lines, safe, cuts, Vec::new());
         }
     }
     lines.push(String::new());
     lines.push("    Expected: Queue drains, TTFT recovers.".to_string());
-    lines.push(format!("    Confidence: {confidence}"));
+    lines.push(format!(
+        "    Confidence: {}",
+        r5_confidence_label(empirical, d)
+    ));
     lines
 }
 
@@ -241,12 +332,12 @@ pub(super) fn format_concurrency_saturation_window_issue(
     d: &ConcurrencySaturationDetail,
     seen_pct: u32,
     max_model_len: Option<u32>,
-    kv_max_seqs: Option<u32>,
+    rec: Option<&super::RecommendedSeqs>,
     snapshot: &RawSnapshot,
     hyp: Option<&super::HypCapacityCtx<'_>>,
 ) -> Vec<String> {
     super::with_seen_pct(
-        format_concurrency_saturation_issue(d, max_model_len, kv_max_seqs, snapshot, hyp),
+        format_concurrency_saturation_issue(d, max_model_len, rec, snapshot, hyp),
         seen_pct,
     )
 }
@@ -257,21 +348,19 @@ pub fn r5_recommendation(
     kv_cache_usage_perc: Option<f64>,
     config_max_num_seqs: Option<u32>,
     max_model_len: Option<u32>,
-    kv_max_seqs: Option<u32>,
+    rec: Option<super::RecommendedSeqs>,
 ) -> Option<Recommendation> {
     let d = rule5_concurrency_saturation(snapshot, kv_cache_usage_perc, config_max_num_seqs)?;
+    let empirical = rec.is_some_and(|r| r.empirical);
     Some(Recommendation {
         rule_name: rule_names::CONCURRENCY_SATURATION,
         layer: 3,
         impact: 4,
-        confidence: match (d.ttft_ms.or(d.ttft_p99_ms), d.kv_cache_usage_perc) {
-            (Some(_), Some(_)) => 0.9,
-            _ => 0.6,
-        },
+        confidence: r5_confidence(&d, empirical),
         display_lines: format_concurrency_saturation_issue(
             &d,
             max_model_len,
-            kv_max_seqs,
+            rec.as_ref(),
             snapshot,
             None,
         ),
@@ -327,9 +416,41 @@ pub(super) fn aggregate_concurrency_saturation_detail(
 mod tests {
     use super::*;
     use crate::collectors::VllmRawMetrics;
+    use crate::engine::rules::{
+        KvBoundSource, RecommendedSeqs, empirical_kv_max, recommended_seqs, resolve_kv_bound,
+    };
 
     fn snap(vllm: VllmRawMetrics) -> RawSnapshot {
         crate::collectors::snap_vllm(vllm)
+    }
+
+    /// Build a margined recommendation from the two physical walls via the shared helper.
+    fn rec_for(
+        ridge: Option<f64>,
+        kv_bound: Option<f64>,
+        source: Option<KvBoundSource>,
+        current: u32,
+    ) -> RecommendedSeqs {
+        recommended_seqs(ridge, kv_bound, source, Some(current)).expect("rec")
+    }
+
+    /// A fired R5 detail with an explicit current cap, KV usage, and TTFT.
+    fn detail_at(
+        max_num_seqs: u32,
+        kv_cache_usage_perc: Option<f64>,
+        ttft_ms: Option<f64>,
+    ) -> ConcurrencySaturationDetail {
+        let cur = f64::from(max_num_seqs);
+        ConcurrencySaturationDetail {
+            requests_running: cur,
+            requests_waiting: 15.0,
+            max_num_seqs: Some(max_num_seqs),
+            queue_ratio: 15.0 / (15.0 + cur),
+            ttft_ms,
+            ttft_p99_ms: None,
+            ttft_p99_buckets: vec![],
+            kv_cache_usage_perc,
+        }
     }
 
     fn blank_snap() -> RawSnapshot {
@@ -444,6 +565,7 @@ mod tests {
 
     #[test]
     fn fix_raises_cap_when_kv_below_safe_threshold() {
+        // No wall known: honest conditional line naming current + KV usage.
         let text = format_concurrency_saturation_issue(
             &fired_detail(None, Some(70.0)),
             None,
@@ -452,23 +574,25 @@ mod tests {
             None,
         )
         .join("\n");
-        assert!(text.contains("ceiling unknown"));
-        assert!(!text.contains("pool has room"));
+        assert!(text.contains(
+            "Raise --max-num-seqs above 32 (KV cache 70% used, pool has room; no ceiling known)"
+        ));
     }
 
     #[test]
     fn fix_shows_physics_ceiling_when_kv_low_and_cap_at_ceiling() {
-        let mut d = fired_detail(None, Some(8.0));
-        d.max_num_seqs = Some(13);
+        // Derived memory wall, current at the wall: shrink pivot + memory limit (est).
+        let d = detail_at(13, Some(8.0), None);
+        let rec = rec_for(None, Some(13.0), Some(KvBoundSource::Derived), 13);
         let text = format_concurrency_saturation_issue(
             &d,
             Some(8192),
-            Some(13),
+            Some(&rec),
             &model_len_snap(6000.0, 450.0, 150.0),
             None,
         )
         .join("\n");
-        assert!(text.contains("physics ceiling for max_model_len=8192"));
+        assert!(text.contains("at memory limit (~13, est)"));
         assert!(text.contains("Lower --max-model-len 8192 → 6450"));
         assert!(text.contains("Truncation risk"));
         assert!(!text.contains("free KV blocks"));
@@ -501,7 +625,7 @@ mod tests {
             None,
         )
         .join("\n");
-        assert!(text.contains("if KV cache has headroom"));
+        assert!(text.contains("if KV headroom confirmed (no ceiling known)"));
         assert!(!text.contains("Add a replica"));
     }
 
@@ -752,7 +876,9 @@ mod tests {
         )
         .expect("fired");
         let text = r.display_lines.join("\n");
-        assert!(text.contains("Raise --max-num-seqs above 32"));
+        assert!(text.contains(
+            "Raise --max-num-seqs above 32 (KV cache 70% used, pool has room; no ceiling known)"
+        ));
     }
 
     #[test]
@@ -771,31 +897,34 @@ mod tests {
 
     #[test]
     fn display_at_physics_ceiling_when_kv_has_room_but_max_num_seqs_at_cap() {
+        let rec = rec_for(None, Some(15.0), Some(KvBoundSource::Derived), 15);
         let r = r5_recommendation(
             &snap(sat_vllm(15.0, 10.0, Some(15))),
             Some(50.0),
             None,
             Some(8192),
-            Some(15),
+            Some(rec),
         )
         .expect("fired");
         let text = r.display_lines.join("\n");
-        assert!(text.contains("physics ceiling for max_model_len=8192"));
-        assert!(!text.contains("Raise --max-num-seqs"));
+        assert!(text.contains("at memory limit (~15, est)"));
+        assert!(!text.contains("Raise --max-num-seqs to"));
     }
 
     #[test]
     fn display_raises_max_num_seqs_when_headroom_below_ceiling() {
+        // Derived memory wall 15, current 10: target 12 > 10, bounded raise.
+        let rec = rec_for(None, Some(15.0), Some(KvBoundSource::Derived), 10);
         let r = r5_recommendation(
             &snap(sat_vllm(10.0, 10.0, Some(10))),
             Some(50.0),
             None,
             None,
-            Some(15),
+            Some(rec),
         )
         .expect("fired");
         let text = r.display_lines.join("\n");
-        assert!(text.contains("Raise --max-num-seqs"));
+        assert!(text.contains("Raise --max-num-seqs to 12 (80% of memory limit ~15, est)"));
     }
 
     #[test]
@@ -810,11 +939,12 @@ mod tests {
             ttft_p99_buckets: vec![],
             kv_cache_usage_perc: None,
         };
+        let rec = rec_for(None, Some(15.0), Some(KvBoundSource::Derived), 15);
         let text =
-            format_concurrency_saturation_issue(&d, Some(8192), Some(15), &blank_snap(), None)
+            format_concurrency_saturation_issue(&d, Some(8192), Some(&rec), &blank_snap(), None)
                 .join("\n");
-        assert!(text.contains("max_model_len=8192"));
-        assert!(!text.contains("Raise --max-num-seqs"));
+        assert!(text.contains("at memory limit (~15, est)"));
+        assert!(!text.contains("Raise --max-num-seqs to"));
     }
 
     #[test]
@@ -829,16 +959,17 @@ mod tests {
             ttft_p99_buckets: vec![],
             kv_cache_usage_perc: Some(50.0),
         };
+        let rec = rec_for(None, Some(15.0), Some(KvBoundSource::Derived), 15);
         let text =
-            format_concurrency_saturation_issue(&d, Some(8192), Some(15), &blank_snap(), None)
+            format_concurrency_saturation_issue(&d, Some(8192), Some(&rec), &blank_snap(), None)
                 .join("\n");
         assert!(
-            text.contains("max_model_len=8192"),
-            "display must name physics ceiling when at cap"
+            text.contains("at memory limit (~15, est)"),
+            "display must name memory limit when at cap"
         );
         assert!(
-            !text.contains("Raise --max-num-seqs"),
-            "must not raise max-num-seqs at physics ceiling"
+            !text.contains("Raise --max-num-seqs to"),
+            "must not raise max-num-seqs at memory wall"
         );
     }
 
@@ -854,25 +985,26 @@ mod tests {
             ttft_p99_buckets: vec![],
             kv_cache_usage_perc: Some(50.0),
         };
+        let rec = rec_for(None, Some(15.0), Some(KvBoundSource::Derived), 10);
         let text =
-            format_concurrency_saturation_issue(&d, Some(8192), Some(15), &blank_snap(), None)
+            format_concurrency_saturation_issue(&d, Some(8192), Some(&rec), &blank_snap(), None)
                 .join("\n");
-        assert!(text.contains("Raise --max-num-seqs above 10"));
+        assert!(text.contains("Raise --max-num-seqs to 12 (80% of memory limit ~15, est)"));
     }
 
     #[test]
     fn ceiling_path_shows_shrink_suggestion_with_truncation_warning() {
-        let mut d = fired_detail(None, Some(50.0));
-        d.max_num_seqs = Some(15);
+        let d = detail_at(15, Some(50.0), None);
+        let rec = rec_for(None, Some(15.0), Some(KvBoundSource::Derived), 15);
         let lines = format_concurrency_saturation_issue(
             &d,
             Some(8192),
-            Some(15),
+            Some(&rec),
             &model_len_snap(6000.0, 450.0, 150.0),
             None,
         );
         let text = lines.join("\n");
-        assert!(text.contains("physics ceiling for max_model_len=8192"));
+        assert!(text.contains("at memory limit (~15, est)"));
         assert!(text.contains("    Cuts throughput:"));
         let cuts = text.find("    Cuts throughput:").unwrap();
         let shrink = text.find("Lower --max-model-len 8192 → 6450").unwrap();
@@ -900,5 +1032,238 @@ mod tests {
         assert!(text.contains("Add a replica to scale out"));
         assert!(!text.contains("truncation risk"));
         assert!(!text.contains("free KV blocks"));
+    }
+
+    // --- Spec tests: three walls (specs/r5_three_walls.md) ---
+
+    // 1. ridge 153 < kv 240: target 122, ridge phrasing.
+    #[test]
+    fn spec_ridge_binds_below_kv() {
+        let rec = rec_for(Some(153.0), Some(240.0), Some(KvBoundSource::Observed), 32);
+        assert_eq!(rec.target, 122);
+        let text = format_concurrency_saturation_issue(
+            &detail_at(32, Some(70.0), None),
+            None,
+            Some(&rec),
+            &blank_snap(),
+            None,
+        )
+        .join("\n");
+        assert!(text.contains("Raise --max-num-seqs to 122 (80% of compute ridge ~153)"));
+    }
+
+    // 2. Observed kv 120 < ridge 153: target 96, "vLLM-reported", no tilde, no est.
+    #[test]
+    fn spec_memory_observed_no_tilde() {
+        let rec = rec_for(Some(153.0), Some(120.0), Some(KvBoundSource::Observed), 32);
+        assert_eq!(rec.target, 96);
+        let text = format_concurrency_saturation_issue(
+            &detail_at(32, Some(70.0), None),
+            None,
+            Some(&rec),
+            &blank_snap(),
+            None,
+        )
+        .join("\n");
+        assert!(
+            text.contains("Raise --max-num-seqs to 96 (80% of memory limit 120, vLLM-reported)")
+        );
+        assert!(!text.contains("~120"));
+    }
+
+    // 3. Derived kv 120 < ridge: target 96, "~120", "(est)".
+    #[test]
+    fn spec_memory_derived_tilde_and_est() {
+        let rec = rec_for(Some(153.0), Some(120.0), Some(KvBoundSource::Derived), 32);
+        assert_eq!(rec.target, 96);
+        let text = format_concurrency_saturation_issue(
+            &detail_at(32, Some(70.0), None),
+            None,
+            Some(&rec),
+            &blank_snap(),
+            None,
+        )
+        .join("\n");
+        assert!(text.contains("Raise --max-num-seqs to 96 (80% of memory limit ~120, est)"));
+    }
+
+    // 4. current 130, ridge 153, target 122: margin zone, replica, no raise, no shrink.
+    #[test]
+    fn spec_ridge_margin_zone() {
+        let rec = rec_for(Some(153.0), None, None, 130);
+        assert_eq!(rec.target, 122);
+        let text = format_concurrency_saturation_issue(
+            &detail_at(130, Some(50.0), None),
+            Some(8192),
+            Some(&rec),
+            &blank_snap(),
+            None,
+        )
+        .join("\n");
+        assert!(text.contains(
+            "--max-num-seqs 130 is within safety margin of compute ridge (~153). Raising adds TPOT, not throughput."
+        ));
+        assert!(text.contains("Add a replica to scale out."));
+        assert!(!text.contains("Raise --max-num-seqs to"));
+        assert!(!text.contains("Lower --max-model-len"));
+        assert!(!text.contains("the safety margin"));
+    }
+
+    // 5. current 153 == ridge: "at compute ridge", replica.
+    #[test]
+    fn spec_ridge_at_wall() {
+        let rec = rec_for(Some(153.0), None, None, 153);
+        let text = format_concurrency_saturation_issue(
+            &detail_at(153, Some(50.0), None),
+            None,
+            Some(&rec),
+            &blank_snap(),
+            None,
+        )
+        .join("\n");
+        assert!(text.contains(
+            "--max-num-seqs 153 is at compute ridge (~153). Raising adds TPOT, not throughput."
+        ));
+        assert!(text.contains("Add a replica to scale out."));
+        assert!(!text.contains("at the compute"));
+    }
+
+    // 6. memory margin Observed / derived labels; shrink under Cuts.
+    #[test]
+    fn spec_memory_margin_labels() {
+        let snapshot = model_len_snap(6000.0, 450.0, 150.0);
+        let observed = rec_for(Some(153.0), Some(120.0), Some(KvBoundSource::Observed), 110);
+        let text = format_concurrency_saturation_issue(
+            &detail_at(110, Some(50.0), None),
+            Some(8192),
+            Some(&observed),
+            &snapshot,
+            None,
+        )
+        .join("\n");
+        assert!(text.contains(
+            "KV pool has room (50%), but --max-num-seqs is within safety margin of memory limit (120, vLLM-reported)."
+        ));
+        assert!(!text.contains("physics ceiling"));
+        assert!(text.contains("Lower --max-model-len 8192"));
+
+        let derived = rec_for(Some(153.0), Some(120.0), Some(KvBoundSource::Derived), 110);
+        let text2 = format_concurrency_saturation_issue(
+            &detail_at(110, Some(50.0), None),
+            Some(8192),
+            Some(&derived),
+            &snapshot,
+            None,
+        )
+        .join("\n");
+        assert!(text2.contains("within safety margin of memory limit (~120, est)."));
+        assert!(!text2.contains("vLLM-reported"));
+    }
+
+    // 7. No ridge, no kv_bound: conditional fallback with current, no invented ceiling.
+    #[test]
+    fn spec_no_wall_conditional() {
+        assert!(recommended_seqs(None, None, None, Some(32)).is_none());
+        let text = format_concurrency_saturation_issue(
+            &detail_at(32, None, None),
+            None,
+            None,
+            &blank_snap(),
+            None,
+        )
+        .join("\n");
+        assert!(
+            text.contains(
+                "Raise --max-num-seqs above 32 if KV headroom confirmed (no ceiling known)"
+            )
+        );
+    }
+
+    // 8. Same inputs through R5 and R7 produce the same target (shared function).
+    #[test]
+    fn spec_r5_and_r7_same_target() {
+        use crate::collectors::CacheConfigLabels;
+        use crate::engine::rules::r7_config_headroom::rule7_config_headroom;
+
+        let r5_rec = rec_for(Some(153.0), Some(120.0), Some(KvBoundSource::Observed), 32);
+        let mut v = sat_vllm(20.0, 0.0, Some(32));
+        v.kv_cache_usage_perc = Some(3.3);
+        v.cache_config = CacheConfigLabels {
+            kv_cache_max_concurrency: Some(120.0),
+            ..Default::default()
+        };
+        let d = rule7_config_headroom(&snap(v), None, Some(153.0), Some(240), false).expect("r7");
+        assert_eq!(r5_rec.target, d.recommended_seqs);
+        assert_eq!(r5_rec.target, 96);
+    }
+
+    // 9. Empirical used only when Observed and derived are both absent.
+    #[test]
+    fn spec_empirical_last_resort() {
+        let (_, s_obs) = resolve_kv_bound(Some(120.0), Some(200), false, Some(32.0), Some(8.0));
+        assert_eq!(s_obs, Some(KvBoundSource::Observed));
+        let (_, s_der) = resolve_kv_bound(None, Some(200), false, Some(32.0), Some(8.0));
+        assert_eq!(s_der, Some(KvBoundSource::Derived));
+        let (v_emp, s_emp) = resolve_kv_bound(None, None, false, Some(32.0), Some(8.0));
+        assert_eq!(s_emp, Some(KvBoundSource::Empirical));
+        assert!((v_emp.expect("emp") - 400.0).abs() < 1.0);
+    }
+
+    // 10. KV >= 80% scale-out path byte-identical regardless of resolved wall.
+    #[test]
+    fn spec_scale_out_ignores_wall() {
+        let d = fired_detail(None, Some(85.0));
+        let rec = rec_for(Some(153.0), Some(120.0), Some(KvBoundSource::Observed), 32);
+        let with_rec =
+            format_concurrency_saturation_issue(&d, Some(8192), Some(&rec), &blank_snap(), None);
+        let without_rec =
+            format_concurrency_saturation_issue(&d, Some(8192), None, &blank_snap(), None);
+        assert_eq!(with_rec, without_rec);
+        assert!(with_rec.join("\n").contains("KV at 85%"));
+    }
+
+    // 11. Empirical-bound: "(est)" only; step cap silent; Low + Monitor.
+    #[test]
+    fn spec_empirical_step_cap() {
+        let kv_bound = empirical_kv_max(32.0, Some(8.0)).expect("empirical");
+        assert!((kv_bound - 400.0).abs() < 1.0);
+        let rec = rec_for(None, Some(kv_bound), Some(KvBoundSource::Empirical), 32);
+        assert!(rec.empirical);
+        assert_eq!(rec.target, 64);
+        let d = detail_at(32, Some(8.0), Some(5000.0));
+        let text = format_concurrency_saturation_issue(&d, None, Some(&rec), &blank_snap(), None)
+            .join("\n");
+        assert!(text.contains("Raise --max-num-seqs to 64 (est)"));
+        assert!(!text.contains("bounded step"));
+        assert!(!text.contains("2x"));
+        assert!(text.contains("Monitor KV cache when scaling up."));
+        assert!(text.contains("Confidence: Low"));
+    }
+
+    // 12. Empirical denominator is run-level peak KV fraction, not the mean.
+    #[test]
+    fn spec_empirical_uses_peak_not_mean() {
+        // Peak 24% (not mean of 8% and 24% = 16%): 32 / 0.24 ~= 133, not 200.
+        let (v, src) = resolve_kv_bound(None, None, false, Some(32.0), Some(24.0));
+        assert_eq!(src, Some(KvBoundSource::Empirical));
+        let bound = v.expect("bound");
+        assert!((bound - 133.33).abs() < 1.0);
+        assert!((bound - 200.0).abs() > 10.0);
+    }
+
+    // 13. Observed-bound target uncapped; normal confidence; no monitor line.
+    #[test]
+    fn spec_observed_uncapped() {
+        let rec = rec_for(None, Some(120.0), Some(KvBoundSource::Observed), 32);
+        assert!(!rec.empirical);
+        assert_eq!(rec.target, 96); // > 2 x 32, uncapped
+        let d = detail_at(32, Some(50.0), Some(5000.0));
+        let text = format_concurrency_saturation_issue(&d, None, Some(&rec), &blank_snap(), None)
+            .join("\n");
+        assert!(
+            text.contains("Raise --max-num-seqs to 96 (80% of memory limit 120, vLLM-reported)")
+        );
+        assert!(!text.contains("Monitor KV cache"));
+        assert!(text.contains("Confidence: High"));
     }
 }

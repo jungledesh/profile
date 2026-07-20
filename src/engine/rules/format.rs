@@ -533,7 +533,7 @@ pub fn format_diagnose_rules_for_windows(
             "[!] Insufficient Sustained Load".to_string(),
             String::new(),
             format!(
-                "    Traffic detected but too brief for reliable diagnosis. \
+                "    Load too brief for reliable diagnosis. \
                  Required: {} evaluable windows. {}",
                 ENGINE_MIN_PERSISTENT_WINDOWS,
                 format_captured_windows(report.n_eval, report.skipped_broken, report.skipped_idle)
@@ -575,6 +575,12 @@ pub fn format_diagnose_rules_for_windows(
         }
         if !any_advisory && !verbose_rules {
             out.push(NO_ISSUES_LINE.to_string());
+            if report.n_eval > 0
+                && let Some(ev) = report.limiter_evidence.as_ref()
+                && let Some(line) = crate::engine::limiter::limiter_line(ev)
+            {
+                out.push(line);
+            }
         }
         append_report_skip_notes(&mut out, report, false);
         trim_trailing_blank_lines(&mut out);

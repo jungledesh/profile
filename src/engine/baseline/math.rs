@@ -409,16 +409,18 @@ mod tests {
 
     #[test]
     fn ridge_batch_size_h100_sxm_bf16() {
-        // (67e12 × 16) / (3350e9 × 16) = 20.0
-        let r = ridge_batch_size(67.0, 3350.0, 16);
-        assert!((r - 20.0).abs() < 0.05);
+        // Catalog H100 SXM BF16 TC: 989 TFLOPS, 3350 GB/s (gpu_catalog.rs).
+        // (989e12 × 16) / (3350e9 × 16) = 295.223…
+        let r = ridge_batch_size(989.0, 3350.0, 16);
+        assert!((r - 295.223).abs() < 0.05);
     }
 
     #[test]
     fn ridge_batch_size_a100_80gb_bf16() {
-        // (19.5e12 × 16) / (2039e9 × 16) = 9.564
-        let r = ridge_batch_size(19.5, 2039.0, 16);
-        assert!((r - 9.564).abs() < 0.05);
+        // Catalog A100 80GB BF16 TC: 312 TFLOPS, 2039 GB/s (gpu_catalog.rs).
+        // (312e12 × 16) / (2039e9 × 16) = 153.016…
+        let r = ridge_batch_size(312.0, 2039.0, 16);
+        assert!((r - 153.016).abs() < 0.05);
     }
 
     #[test]

@@ -2,6 +2,7 @@ use crate::collectors::RawSnapshot;
 
 #[cfg(test)]
 use super::Recommendation;
+use super::effective_max_and_binder;
 use super::r6_prefill_bound::{PROMPT_GEN_RATIO_MILD, effective_prompt_tps};
 #[cfg(test)]
 use super::rule_names;
@@ -22,16 +23,10 @@ const UNDER_BATCHING_WAITING_LT: f64 = 2.0;
 /// 75% sits below R5's 80% safe-to-scale gate and well below R2's 88% threshold.
 pub(super) const KV_MONITOR_WARNING_PCT: f64 = 75.0;
 
-/// Which wall set `effective_max`. Tie-break priority: memory > ridge > config.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum R1BindingWall {
-    Config,
-    Ridge,
-    /// Floored Observed `kv_cache_max_concurrency`.
-    Memory {
-        cap: u32,
-    },
-}
+/// Alias for the shared binding-wall enum. R1 measures occupancy across all three
+/// walls (config, ridge, memory) raw, with no safety margin: margining a measurement
+/// fabricates. R5/R7 reuse the same enum for their margined recommendations.
+pub(super) type R1BindingWall = super::BindingWall;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnderBatchingDetail {
@@ -63,39 +58,6 @@ pub struct R1EvalInput<'a> {
     pub generation_tokens_per_sec: Option<f64>,
     pub prefix_cache_hit_rate: Option<f64>,
     pub ridge_batch_size: Option<f64>,
-}
-
-/// Three-wall headroom: `min(max_num_seqs, ridge?, kv_capacity?)`.
-/// `kv_capacity` is Observed `kv_cache_max_concurrency.floor()` when present and finite.
-/// Absent → two-way min; never claim memory.
-/// Ties: memory > ridge > config (memory hurts fastest).
-fn effective_max_and_binder(
-    max_n: u32,
-    ridge_batch_size: Option<f64>,
-    kv_cache_max_concurrency: Option<f64>,
-) -> (f64, R1BindingWall) {
-    let mut value = f64::from(max_n);
-    let mut wall = R1BindingWall::Config;
-
-    // Order + `<=` encodes tie-break: ridge beats config, memory beats both.
-    if let Some(ridge) = ridge_batch_size.filter(|r| r.is_finite() && *r > 0.0)
-        && ridge <= value
-    {
-        value = ridge;
-        wall = R1BindingWall::Ridge;
-    }
-
-    if let Some(raw) = kv_cache_max_concurrency.filter(|c| c.is_finite() && *c > 0.0) {
-        let cap = raw.floor();
-        if cap > 0.0 && cap <= f64::from(u32::MAX) && cap <= value {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let cap_u = cap as u32;
-            value = cap;
-            wall = R1BindingWall::Memory { cap: cap_u };
-        }
-    }
-
-    (value, wall)
 }
 
 pub(super) fn rule1_under_batching_with_efficiency(input: R1EvalInput<'_>) -> Rule1Outcome {
@@ -232,7 +194,7 @@ fn r1_fix_line(idle: f64, binding_wall: R1BindingWall) -> String {
             "      • Batch more requests or increase client concurrency ({idle:.0} slots idle before hardware degrades TPOT)"
         ),
         R1BindingWall::Memory { cap } => format!(
-            "      • Batch more requests or increase client concurrency ({idle:.0} slots idle; memory fits ~{cap} concurrent, worst case)"
+            "      • Batch more requests or increase client concurrency ({idle:.0} slots idle; memory fits {cap} concurrent, worst case)"
         ),
     }
 }
@@ -310,14 +272,30 @@ pub(super) fn aggregate_r1_detail(details: &[UnderBatchingDetail]) -> UnderBatch
     let n = details.len() as f64;
     let running = details.iter().map(|d| d.running).sum::<f64>() / n;
     let waiting = details.iter().map(|d| d.waiting).sum::<f64>() / n;
-    let occupancy_pct = details.iter().map(|d| d.occupancy_pct).sum::<f64>() / n;
-    // binding_wall / effective_max: static walls; mean effective_max, keep first binder.
+    // Walls are knowledge, not samples: keep the tightest known (effective_max, binder)
+    // pair. If effective_max is tied, take the harsher wall (memory > ridge > config).
+    let tightest = details.iter().fold(&details[0], |best, d| {
+        if d.effective_max < best.effective_max
+            || (d.effective_max == best.effective_max && d.binding_wall > best.binding_wall)
+        {
+            d
+        } else {
+            best
+        }
+    });
+    let effective_max = tightest.effective_max;
+    let binding_wall = tightest.binding_wall;
+    let occupancy_pct = if effective_max > 0.0 && effective_max.is_finite() {
+        (running / effective_max) * 100.0
+    } else {
+        0.0
+    };
     UnderBatchingDetail {
         running,
         waiting,
         max_num_seqs: details.first().and_then(|d| d.max_num_seqs),
-        effective_max: details.iter().map(|d| d.effective_max).sum::<f64>() / n,
-        binding_wall: details[0].binding_wall,
+        effective_max,
+        binding_wall,
         occupancy_pct,
         efficiency_pct: super::mean_of_present(details.iter().filter_map(|d| d.efficiency_pct)),
         config_relative_efficiency_pct: super::mean_of_present(
@@ -794,7 +772,7 @@ mod tests {
                 let idle = (d.effective_max - d.running).max(0.0);
                 assert!((idle - 29.0).abs() < 1e-9);
                 let text = format_under_batching_fired(&d, 0.8, false).join("\n");
-                assert!(text.contains("29 slots idle; memory fits ~35 concurrent, worst case"));
+                assert!(text.contains("29 slots idle; memory fits 35 concurrent, worst case"));
                 assert!(!text.contains("before hardware degrades TPOT"));
             }
             Rule1Outcome::NotFired => panic!("expected memory-bound under-batching"),
@@ -856,6 +834,172 @@ mod tests {
         ))
         .expect("fired");
         assert!((r.confidence - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn aggregate_picks_tightest_wall_not_first_binder() {
+        let ridge = UnderBatchingDetail {
+            running: 10.0,
+            waiting: 0.0,
+            max_num_seqs: Some(256),
+            effective_max: 153.0,
+            binding_wall: R1BindingWall::Ridge,
+            occupancy_pct: (10.0 / 153.0) * 100.0,
+            efficiency_pct: Some(12.0),
+            config_relative_efficiency_pct: Some(15.0),
+            known_gpu: true,
+        };
+        let mem = UnderBatchingDetail {
+            running: 8.0,
+            waiting: 0.0,
+            max_num_seqs: Some(256),
+            effective_max: 35.0,
+            binding_wall: R1BindingWall::Memory { cap: 35 },
+            occupancy_pct: (8.0 / 35.0) * 100.0,
+            efficiency_pct: Some(12.0),
+            config_relative_efficiency_pct: Some(15.0),
+            known_gpu: true,
+        };
+        let agg = aggregate_r1_detail(&[ridge.clone(), ridge, mem.clone(), mem]);
+        assert!((agg.effective_max - 35.0).abs() < 1e-9);
+        assert_eq!(agg.binding_wall, R1BindingWall::Memory { cap: 35 });
+        let text = format_under_batching_fired(&agg, 0.8, false).join("\n");
+        assert!(text.contains("memory fits"));
+        assert!(!text.contains("before hardware degrades TPOT"));
+    }
+
+    #[test]
+    fn aggregate_all_ridge_keeps_ridge() {
+        let d = UnderBatchingDetail {
+            running: 10.0,
+            waiting: 0.0,
+            max_num_seqs: Some(256),
+            effective_max: 153.0,
+            binding_wall: R1BindingWall::Ridge,
+            occupancy_pct: (10.0 / 153.0) * 100.0,
+            efficiency_pct: Some(12.0),
+            config_relative_efficiency_pct: Some(15.0),
+            known_gpu: true,
+        };
+        let agg = aggregate_r1_detail(&[d.clone(), d]);
+        assert!((agg.effective_max - 153.0).abs() < 1e-9);
+        assert_eq!(agg.binding_wall, R1BindingWall::Ridge);
+        let text = format_under_batching_fired(&agg, 0.8, false).join("\n");
+        assert!(text.contains("before hardware degrades TPOT"));
+        assert!(!text.contains("memory fits"));
+    }
+
+    #[test]
+    fn aggregate_mem_absent_no_memory_claim() {
+        let d = UnderBatchingDetail {
+            running: 6.0,
+            waiting: 0.0,
+            max_num_seqs: Some(256),
+            effective_max: 153.0,
+            binding_wall: R1BindingWall::Ridge,
+            occupancy_pct: (6.0 / 153.0) * 100.0,
+            efficiency_pct: None,
+            config_relative_efficiency_pct: Some(15.0),
+            known_gpu: true,
+        };
+        let agg = aggregate_r1_detail(&[d.clone(), d]);
+        assert_eq!(agg.binding_wall, R1BindingWall::Ridge);
+        let text = format_under_batching_fired(&agg, 0.8, false).join("\n");
+        assert!(!text.contains("memory fits"));
+    }
+
+    #[test]
+    fn aggregate_occupancy_uses_run_effective_max() {
+        let a = UnderBatchingDetail {
+            running: 10.0,
+            waiting: 0.0,
+            max_num_seqs: Some(256),
+            effective_max: 153.0,
+            binding_wall: R1BindingWall::Ridge,
+            occupancy_pct: (10.0 / 153.0) * 100.0,
+            efficiency_pct: None,
+            config_relative_efficiency_pct: Some(15.0),
+            known_gpu: true,
+        };
+        let b = UnderBatchingDetail {
+            running: 8.0,
+            waiting: 0.0,
+            max_num_seqs: Some(256),
+            effective_max: 35.0,
+            binding_wall: R1BindingWall::Memory { cap: 35 },
+            occupancy_pct: (8.0 / 35.0) * 100.0,
+            efficiency_pct: None,
+            config_relative_efficiency_pct: Some(15.0),
+            known_gpu: true,
+        };
+        let agg = aggregate_r1_detail(&[a, b]);
+        let mean_running = (10.0 + 8.0) / 2.0;
+        let expected = (mean_running / 35.0) * 100.0;
+        assert!((agg.occupancy_pct - expected).abs() < 1e-9);
+        // Must not be the mean of per-window occupancies.
+        let mean_occ = ((10.0 / 153.0) * 100.0 + (8.0 / 35.0) * 100.0) / 2.0;
+        assert!((agg.occupancy_pct - mean_occ).abs() > 1.0);
+    }
+
+    #[test]
+    fn aggregate_equal_min_keeps_first_window() {
+        let first = UnderBatchingDetail {
+            running: 5.0,
+            waiting: 0.0,
+            max_num_seqs: Some(256),
+            effective_max: 35.0,
+            binding_wall: R1BindingWall::Memory { cap: 35 },
+            occupancy_pct: (5.0 / 35.0) * 100.0,
+            efficiency_pct: None,
+            config_relative_efficiency_pct: Some(15.0),
+            known_gpu: true,
+        };
+        let second = UnderBatchingDetail {
+            running: 7.0,
+            waiting: 0.0,
+            max_num_seqs: Some(256),
+            effective_max: 35.0,
+            binding_wall: R1BindingWall::Memory { cap: 35 },
+            occupancy_pct: (7.0 / 35.0) * 100.0,
+            efficiency_pct: None,
+            config_relative_efficiency_pct: Some(15.0),
+            known_gpu: true,
+        };
+        let agg = aggregate_r1_detail(&[first, second]);
+        assert!((agg.effective_max - 35.0).abs() < 1e-9);
+        assert_eq!(agg.binding_wall, R1BindingWall::Memory { cap: 35 });
+    }
+
+    #[test]
+    fn aggregate_equal_value_prefers_harsher_wall_either_order() {
+        let ridge = UnderBatchingDetail {
+            running: 5.0,
+            waiting: 0.0,
+            max_num_seqs: Some(256),
+            effective_max: 35.0,
+            binding_wall: R1BindingWall::Ridge,
+            occupancy_pct: (5.0 / 35.0) * 100.0,
+            efficiency_pct: None,
+            config_relative_efficiency_pct: Some(15.0),
+            known_gpu: true,
+        };
+        let mem = UnderBatchingDetail {
+            running: 7.0,
+            waiting: 0.0,
+            max_num_seqs: Some(256),
+            effective_max: 35.0,
+            binding_wall: R1BindingWall::Memory { cap: 35 },
+            occupancy_pct: (7.0 / 35.0) * 100.0,
+            efficiency_pct: None,
+            config_relative_efficiency_pct: Some(15.0),
+            known_gpu: true,
+        };
+        let forward = aggregate_r1_detail(&[ridge.clone(), mem.clone()]);
+        assert!((forward.effective_max - 35.0).abs() < 1e-9);
+        assert_eq!(forward.binding_wall, R1BindingWall::Memory { cap: 35 });
+        let reversed = aggregate_r1_detail(&[mem, ridge]);
+        assert!((reversed.effective_max - 35.0).abs() < 1e-9);
+        assert_eq!(reversed.binding_wall, R1BindingWall::Memory { cap: 35 });
     }
 
     #[test]
