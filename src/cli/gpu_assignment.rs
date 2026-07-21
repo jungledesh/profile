@@ -151,7 +151,20 @@ fn resolve_launch_single_gpu(
     detected_vllm_gpus: Option<Vec<u32>>,
 ) -> anyhow::Result<GpuAssignment> {
     match host_count {
-        None => anyhow::bail!("GPU driver unavailable. Is the driver installed?"),
+        None => {
+            if let Some(tp) = cli_tp {
+                if tp > 1 {
+                    anyhow::bail!(multi_gpu_serving_refusal(tp));
+                }
+                // Honor explicit --tensor-parallel-size 1 when the driver is down,
+                // same fallback the multi-GPU branch keeps for cli_tp <= 1.
+                return Ok(GpuAssignment {
+                    tp: 1,
+                    indices: vec![0],
+                });
+            }
+            anyhow::bail!("GPU driver unavailable. Is the driver installed?")
+        }
         Some(0) => anyhow::bail!("No GPUs detected."),
         Some(_) => {
             if let Some(tp) = cli_tp
@@ -425,7 +438,19 @@ fn detect_vllm_gpu_indices(snapshots: &[GpuSnapshot]) -> Option<Vec<u32>> {
         .ok()?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let known_pids: HashSet<u32> = pid_to_gpus.keys().copied().collect();
+    let vllm_pids = collect_vllm_pids_from_ps_stdout(&stdout, &known_pids);
+    if vllm_pids.is_empty() {
+        return None;
+    }
+    let indices = gpu_indices_holding_pids(snapshots, &vllm_pids);
+    (!indices.is_empty()).then_some(indices)
+}
 
+/// Parse `ps -f` stdout for vLLM PIDs. Skips unparseable lines so one garbled
+/// row cannot abort detection of the rest.
+#[cfg(any(test, target_os = "linux"))]
+fn collect_vllm_pids_from_ps_stdout(stdout: &str, known_pids: &HashSet<u32>) -> HashSet<u32> {
     // ps -f columns: UID PID PPID C STIME TTY TIME CMD...
     // Skip header; match lines where the full command contains "vllm".
     let mut vllm_pids = HashSet::new();
@@ -435,16 +460,14 @@ fn detect_vllm_gpu_indices(snapshots: &[GpuSnapshot]) -> Option<Vec<u32>> {
         }
         let mut fields = line.split_whitespace();
         let _uid = fields.next();
-        let pid: u32 = fields.next().and_then(|s| s.parse().ok())?;
-        if pid_to_gpus.contains_key(&pid) {
+        let Some(pid) = fields.next().and_then(|s| s.parse().ok()) else {
+            continue;
+        };
+        if known_pids.contains(&pid) {
             vllm_pids.insert(pid);
         }
     }
-    if vllm_pids.is_empty() {
-        return None;
-    }
-    let indices = gpu_indices_holding_pids(snapshots, &vllm_pids);
-    (!indices.is_empty()).then_some(indices)
+    vllm_pids
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -764,6 +787,43 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("serving across 2 GPUs"));
         assert_eq!(msg, multi_gpu_serving_refusal(2));
+    }
+
+    #[test]
+    fn launch_honors_cli_tp_one_when_driver_unavailable() {
+        let assignment =
+            resolve_launch_single_gpu(None, None, Some(1), None).expect("explicit tp=1");
+        assert_eq!(
+            assignment,
+            GpuAssignment {
+                tp: 1,
+                indices: vec![0],
+            }
+        );
+    }
+
+    #[test]
+    fn launch_refuses_cli_tp_two_when_driver_unavailable() {
+        let err = resolve_launch_single_gpu(None, None, Some(2), None).unwrap_err();
+        assert_eq!(err.to_string(), multi_gpu_serving_refusal(2));
+    }
+
+    #[test]
+    fn launch_bails_when_driver_unavailable_and_no_cli_tp() {
+        let err = resolve_launch_single_gpu(None, None, None, None).unwrap_err();
+        assert!(err.to_string().contains("GPU driver unavailable"));
+    }
+
+    #[test]
+    fn ps_parse_skips_malformed_vllm_line() {
+        let stdout = "\
+UID        PID  PPID  C STIME TTY          TIME CMD
+root     badpid     1  0 12:00 ?        00:00:00 python -m vllm.entrypoints.openai.api_server
+root      4242     1  0 12:00 ?        00:00:01 python -m vllm.entrypoints.openai.api_server
+";
+        let known: HashSet<u32> = [4242].into_iter().collect();
+        let pids = collect_vllm_pids_from_ps_stdout(stdout, &known);
+        assert_eq!(pids, known);
     }
 
     #[test]
