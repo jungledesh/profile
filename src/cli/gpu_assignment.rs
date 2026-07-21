@@ -204,6 +204,9 @@ fn resolve_gpu_assignment_inner_with_mode(
     url: &str,
     multi_gpu_tp: bool,
 ) -> anyhow::Result<GpuAssignment> {
+    if cli_tp == Some(0) {
+        anyhow::bail!("--tensor-parallel-size must be at least 1.");
+    }
     if !multi_gpu_tp {
         let snapshots = scan.as_ref().map(|entries| snapshots_from_scan(entries));
         let detected = snapshots
@@ -870,6 +873,32 @@ root      4242     1  0 12:00 ?        00:00:01 python -m vllm.entrypoints.opena
         )
         .unwrap_err();
         assert!(err.to_string().contains("exceeds detected GPU count"));
+    }
+
+    #[test]
+    fn resolve_rejects_cli_tp_zero_launch_mode() {
+        let err = resolve_gpu_assignment_inner_with_mode(
+            None,
+            None,
+            Some(0),
+            "http://localhost:8000/metrics",
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("must be at least 1"));
+    }
+
+    #[test]
+    fn resolve_rejects_cli_tp_zero_multi_gpu_mode() {
+        let err = resolve_gpu_assignment_inner_with_mode(
+            None,
+            None,
+            Some(0),
+            "http://localhost:8000/metrics",
+            true,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("must be at least 1"));
     }
 
     #[test]
