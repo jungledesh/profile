@@ -351,12 +351,16 @@ fn r2_capacity_phrase(n: u32, max_model_len: Option<u32>, label: KvCapacityLabel
                  (est); at least {n} worst-case requests fit"
             ),
         },
-        KvCapacityLabel::DerivedHybrid => {
-            format!(
+        KvCapacityLabel::DerivedHybrid => match max_model_len {
+            Some(m) => format!(
+                "Lower --max-num-seqs to ≤{n} concurrent requests \
+                 (est); at least {n} worst-case requests fit at max_model_len={m}, including hybrid state"
+            ),
+            None => format!(
                 "Lower --max-num-seqs to ≤{n} concurrent requests \
                  (est); at least {n} worst-case requests fit, including hybrid state"
-            )
-        }
+            ),
+        },
     }
 }
 
@@ -1551,6 +1555,7 @@ mod tests {
         assert!(phrase.contains("at least 18 worst-case requests fit"));
         assert!(phrase.contains("including hybrid state"));
         assert!(phrase.contains("concurrent requests"));
+        assert!(phrase.contains("max_model_len=8192"));
     }
 
     #[test]
@@ -1737,7 +1742,11 @@ mod tests {
         )
         .join("\n");
         assert!(text.contains("Lower --max-model-len 8192 → 6800"));
-        assert!(!text.contains("max_model_len=8192"));
+        assert!(
+            text.contains("max_model_len=8192"),
+            "DerivedHybrid capacity phrase names max_model_len like Derived"
+        );
+        assert_eq!(text.matches("max_model_len=8192").count(), 1);
     }
 
     #[test]

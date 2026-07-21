@@ -5,7 +5,7 @@ use crate::collectors::{
 };
 use crate::context::{AnalysisInput, RuntimeWindow};
 use crate::engine::Report;
-use crate::engine::baseline::WeightDtypeSource;
+use crate::engine::baseline::{ACTIVATION_KV_BUFFER_GB, WeightDtypeSource};
 
 use super::r4_oom_risk::r4_advisory;
 use super::{ENGINE_MIN_PERSISTENT_WINDOWS, NO_ISSUES_LINE, Recommendation, rule_names};
@@ -186,7 +186,7 @@ fn memory_budget_self_grade_verbose_line(
     let gap_gb = observed_gb - estimated_gb;
     Some(format!(
         "Note: Request-memory budget {observed_gb:.1}GB vLLM-reported, \
-         {estimated_gb:.1}GB estimated (3GB allowance), gap {gap_gb:+.1}GB."
+         {estimated_gb:.1}GB estimated ({ACTIVATION_KV_BUFFER_GB:.0}GB allowance), gap {gap_gb:+.1}GB."
     ))
 }
 

@@ -450,6 +450,26 @@ fn compute_kv_max_seqs_declines_tp2_when_launch_flag_off() {
 }
 
 #[test]
+fn compute_kv_max_seqs_zero_kv_heads_declines_under_tp() {
+    let model = ModelArch {
+        num_kv_heads: Some(0),
+        head_dim: Some(128),
+        num_layers: Some(32),
+        ..Default::default()
+    };
+    let derived = compute_kv_max_seqs_with_mode::<true>(
+        Some(20.0),
+        Some(4096),
+        &model,
+        None,
+        Some(2),
+        2,
+        None,
+    );
+    assert_eq!(derived, DerivedCapacity::default());
+}
+
+#[test]
 fn compute_kv_max_seqs_tp_none_uses_full_heads() {
     let model = ModelArch {
         num_kv_heads: Some(8),
