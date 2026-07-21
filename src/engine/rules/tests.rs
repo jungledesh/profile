@@ -79,7 +79,7 @@ fn input_r4_suppresses_r2() -> (StaticContext, RuntimeWindow) {
         vllm_observed_at: t,
         timestamp: t,
         vllm: VllmRawMetrics {
-            model_name: Some("meta-llama/Llama-3.1-70B-Instruct".to_string()),
+            model_name: Some("test/oversized-70b".to_string()),
             num_requests_running: Some(3.0),
             num_requests_waiting: Some(0.0),
             max_num_seqs: Some(256),
@@ -102,7 +102,10 @@ fn input_r4_suppresses_r2() -> (StaticContext, RuntimeWindow) {
         max_model_len: Some(2048),
         ..Default::default()
     };
-    let ctx = StaticContext::from_snapshot(&snap, cfg);
+    let mut ctx = StaticContext::from_snapshot(&snap, cfg);
+    // Synthetic oversized model keeps this suppression test independent of
+    // which models the single-GPU launch catalog supports.
+    ctx.model.param_count = Some(70_000_000_000);
     let win = RuntimeWindow::from_snapshot(snap);
     (ctx, win)
 }
@@ -301,14 +304,31 @@ fn compute_kv_max_seqs_uses_kv_layers_over_total_layers() {
     };
     #[allow(clippy::cast_precision_loss)]
     let headroom_gb = (1u64 << 34) as f64 / 1e9;
-    let with_kv_layers = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &hybrid, None, None, 2);
+    let with_kv_layers = compute_kv_max_seqs_for_cache(
+        Some(headroom_gb),
+        Some(4096),
+        &hybrid,
+        None,
+        None,
+        2,
+        &crate::collectors::CacheConfigLabels::default(),
+    )
+    .max_seqs;
 
     let dense = ModelArch {
         num_kv_layers: None,
         ..hybrid
     };
-    let without_kv_layers =
-        compute_kv_max_seqs(Some(headroom_gb), Some(4096), &dense, None, None, 2);
+    let without_kv_layers = compute_kv_max_seqs_for_cache(
+        Some(headroom_gb),
+        Some(4096),
+        &dense,
+        None,
+        None,
+        2,
+        &crate::collectors::CacheConfigLabels::default(),
+    )
+    .max_seqs;
 
     assert!(with_kv_layers.is_some() && without_kv_layers.is_some());
     assert_eq!(with_kv_layers.unwrap(), without_kv_layers.unwrap() * 4);
@@ -323,9 +343,55 @@ fn compute_kv_max_seqs_tp2_doubles_capacity() {
         ..Default::default()
     };
     let headroom_gb = 20.0;
-    let tp1 = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &model, None, Some(1), 2);
-    let tp2 = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &model, None, Some(2), 2);
+    let tp1 = compute_kv_max_seqs_with_mode::<true>(
+        Some(headroom_gb),
+        Some(4096),
+        &model,
+        None,
+        Some(1),
+        2,
+        None,
+    )
+    .max_seqs;
+    let tp2 = compute_kv_max_seqs_with_mode::<true>(
+        Some(headroom_gb),
+        Some(4096),
+        &model,
+        None,
+        Some(2),
+        2,
+        None,
+    )
+    .max_seqs;
     assert_eq!(tp2.unwrap(), tp1.unwrap() * 2);
+}
+
+#[test]
+fn compute_kv_max_seqs_tp2_uses_one_model_view_for_budget_and_cost() {
+    let model = ModelArch {
+        num_kv_heads: Some(8),
+        head_dim: Some(128),
+        num_layers: Some(32),
+        ..Default::default()
+    };
+    let cache = crate::collectors::CacheConfigLabels {
+        num_gpu_blocks: Some(1024),
+        block_size: Some(16),
+        ..Default::default()
+    };
+    let result = compute_kv_max_seqs_with_mode::<true>(
+        None,
+        Some(4096),
+        &model,
+        None,
+        Some(2),
+        2,
+        Some(&cache),
+    );
+
+    // Shared sharding cancels from budget / request cost:
+    // 1024 blocks × 16 tokens / 4096 tokens per request = 4.
+    assert_eq!(result.max_seqs, Some(4));
 }
 
 #[test]
@@ -337,9 +403,50 @@ fn compute_kv_max_seqs_tp_greater_than_kv_heads_no_benefit() {
         ..Default::default()
     };
     let headroom_gb = 20.0;
-    let tp2 = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &model, None, Some(2), 2);
-    let tp4 = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &model, None, Some(4), 2);
+    let tp2 = compute_kv_max_seqs_with_mode::<true>(
+        Some(headroom_gb),
+        Some(4096),
+        &model,
+        None,
+        Some(2),
+        2,
+        None,
+    )
+    .max_seqs;
+    let tp4 = compute_kv_max_seqs_with_mode::<true>(
+        Some(headroom_gb),
+        Some(4096),
+        &model,
+        None,
+        Some(4),
+        2,
+        None,
+    )
+    .max_seqs;
     assert_eq!(tp2, tp4);
+}
+
+#[test]
+fn compute_kv_max_seqs_declines_tp2_when_launch_flag_off() {
+    let model = ModelArch {
+        num_kv_heads: Some(8),
+        head_dim: Some(128),
+        num_layers: Some(32),
+        ..Default::default()
+    };
+    let derived = compute_kv_max_seqs_with_mode::<false>(
+        Some(20.0),
+        Some(4096),
+        &model,
+        None,
+        Some(2),
+        2,
+        None,
+    );
+    assert_eq!(derived.max_seqs, None);
+    let (bound, source) = resolve_kv_bound(None, derived.max_seqs, false, Some(4.0), Some(50.0));
+    assert_eq!(bound, Some(8.0));
+    assert_eq!(source, Some(KvBoundSource::Empirical));
 }
 
 #[test]
@@ -351,8 +458,26 @@ fn compute_kv_max_seqs_tp_none_uses_full_heads() {
         ..Default::default()
     };
     let headroom_gb = 20.0;
-    let none = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &model, None, None, 2);
-    let one = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &model, None, Some(1), 2);
+    let none = compute_kv_max_seqs_for_cache(
+        Some(headroom_gb),
+        Some(4096),
+        &model,
+        None,
+        None,
+        2,
+        &crate::collectors::CacheConfigLabels::default(),
+    )
+    .max_seqs;
+    let one = compute_kv_max_seqs_for_cache(
+        Some(headroom_gb),
+        Some(4096),
+        &model,
+        None,
+        Some(1),
+        2,
+        &crate::collectors::CacheConfigLabels::default(),
+    )
+    .max_seqs;
     assert_eq!(none, one);
 }
 
@@ -365,9 +490,209 @@ fn compute_kv_max_seqs_auto_kv_inherits_weight_bytes() {
         ..Default::default()
     };
     let headroom_gb = 20.0;
-    let bf16 = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &model, Some("auto"), None, 2);
-    let fp8_w = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &model, Some("auto"), None, 1);
+    let bf16 = compute_kv_max_seqs_for_cache(
+        Some(headroom_gb),
+        Some(4096),
+        &model,
+        Some("auto"),
+        None,
+        2,
+        &crate::collectors::CacheConfigLabels::default(),
+    )
+    .max_seqs;
+    let fp8_w = compute_kv_max_seqs_for_cache(
+        Some(headroom_gb),
+        Some(4096),
+        &model,
+        Some("auto"),
+        None,
+        1,
+        &crate::collectors::CacheConfigLabels::default(),
+    )
+    .max_seqs;
     assert_eq!(fp8_w.unwrap(), bf16.unwrap() * 2);
+}
+
+#[test]
+fn compute_kv_max_seqs_whiteboard_reduces_hybrid_capacity() {
+    let hybrid = qwen36_hybrid_model_with_attention();
+    let attention_only = ModelArch {
+        linear_num_layers: None,
+        linear_key_heads: None,
+        linear_value_heads: None,
+        linear_key_head_dim: None,
+        linear_value_head_dim: None,
+        linear_conv_kernel_dim: None,
+        state_dtype: None,
+        ..hybrid.clone()
+    };
+    let with_state = compute_kv_max_seqs_for_cache(
+        Some(2.0),
+        Some(4096),
+        &hybrid,
+        None,
+        None,
+        2,
+        &crate::collectors::CacheConfigLabels::default(),
+    )
+    .max_seqs;
+    let without_state = compute_kv_max_seqs_for_cache(
+        Some(2.0),
+        Some(4096),
+        &attention_only,
+        None,
+        None,
+        2,
+        &crate::collectors::CacheConfigLabels::default(),
+    )
+    .max_seqs;
+    assert_eq!(with_state, Some(6));
+    assert_eq!(without_state, Some(7));
+}
+
+#[test]
+fn compute_kv_max_seqs_windowed_gemma_uses_capped_price() {
+    let gemma = ModelArch {
+        num_layers: Some(62),
+        num_kv_heads: Some(16),
+        head_dim: Some(128),
+        swa_window: Some(1024),
+        num_swa_layers: Some(52),
+        ..Default::default()
+    };
+    let all_full = ModelArch {
+        swa_window: None,
+        num_swa_layers: None,
+        ..gemma.clone()
+    };
+    assert_eq!(
+        compute_kv_max_seqs_for_cache(
+            Some(20.0),
+            Some(8192),
+            &gemma,
+            None,
+            None,
+            2,
+            &crate::collectors::CacheConfigLabels::default(),
+        )
+        .max_seqs,
+        Some(18)
+    );
+    assert_eq!(
+        compute_kv_max_seqs_for_cache(
+            Some(20.0),
+            Some(8192),
+            &all_full,
+            None,
+            None,
+            2,
+            &crate::collectors::CacheConfigLabels::default(),
+        )
+        .max_seqs,
+        Some(4)
+    );
+}
+
+#[test]
+fn capacity_budget_rungs_prefer_observed_and_refuse_windowed_blocks() {
+    let dense = ModelArch {
+        num_layers: Some(32),
+        num_kv_heads: Some(8),
+        head_dim: Some(128),
+        ..Default::default()
+    };
+    let dense_cache = crate::collectors::CacheConfigLabels {
+        num_gpu_blocks: Some(10_000),
+        block_size: Some(16),
+        ..Default::default()
+    };
+    let dense_result =
+        compute_kv_max_seqs_for_cache(Some(20.0), Some(4096), &dense, None, None, 2, &dense_cache);
+    assert_eq!(dense_result.max_seqs, Some(39));
+    assert!(dense_result.budget_self_grade.is_some());
+
+    let hybrid = qwen36_hybrid_model_with_attention();
+    let hybrid_cache = crate::collectors::CacheConfigLabels {
+        num_gpu_blocks: Some(390),
+        mamba_page_size_padded: Some(25_690_112),
+        ..Default::default()
+    };
+    let hybrid_result = compute_kv_max_seqs_for_cache(
+        Some(20.0),
+        Some(4096),
+        &hybrid,
+        None,
+        None,
+        2,
+        &hybrid_cache,
+    );
+    assert_eq!(hybrid_result.max_seqs, Some(30));
+    assert!(hybrid_result.budget_self_grade.is_some());
+
+    let windowed = ModelArch {
+        swa_window: Some(1024),
+        num_swa_layers: Some(26),
+        ..dense.clone()
+    };
+    let windowed_result = compute_kv_max_seqs_for_cache(
+        Some(20.0),
+        Some(4096),
+        &windowed,
+        None,
+        None,
+        2,
+        &dense_cache,
+    );
+    assert_eq!(windowed_result.max_seqs, Some(95));
+    assert_eq!(windowed_result.budget_self_grade, None);
+
+    let no_labels = compute_kv_max_seqs_for_cache(
+        Some(20.0),
+        Some(4096),
+        &dense,
+        None,
+        None,
+        2,
+        &crate::collectors::CacheConfigLabels::default(),
+    );
+    assert_eq!(no_labels.max_seqs, Some(37));
+
+    let no_budget = compute_kv_max_seqs_for_cache(
+        None,
+        Some(4096),
+        &dense,
+        None,
+        None,
+        2,
+        &crate::collectors::CacheConfigLabels::default(),
+    );
+    assert_eq!(no_budget.max_seqs, None);
+}
+
+#[test]
+fn unpriced_currency_declines_to_empirical_low_confidence() {
+    let unpriced = ModelArch {
+        num_layers: Some(32),
+        num_kv_heads: Some(8),
+        head_dim: Some(128),
+        linear_num_layers: Some(1),
+        ..Default::default()
+    };
+    let derived = compute_kv_max_seqs_for_cache(
+        Some(20.0),
+        Some(4096),
+        &unpriced,
+        None,
+        None,
+        2,
+        &crate::collectors::CacheConfigLabels::default(),
+    )
+    .max_seqs;
+    assert_eq!(derived, None);
+    let (bound, source) = resolve_kv_bound(None, derived, true, Some(4.0), Some(50.0));
+    let rec = recommended_seqs(None, bound, source, Some(4)).expect("empirical fallback");
+    assert_eq!(source, Some(KvBoundSource::Empirical));
+    assert!(rec.empirical);
 }
 
 #[test]
@@ -508,7 +833,7 @@ fn model_len_suggestion_projects_capacity_from_observed_geometry() {
         "got: {text}"
     );
     assert!(
-        text.contains("fits 16 concurrent requests (est)"),
+        text.contains("fits at least 16 worst-case requests (est)"),
         "got: {text}"
     );
     assert!(
@@ -560,7 +885,7 @@ fn model_len_suggestion_live_run_projection_at_5465_is_39_not_observed_8() {
         "got: {text}"
     );
     assert!(
-        text.contains("fits 39 concurrent requests (est)"),
+        text.contains("fits at least 39 worst-case requests (est)"),
         "got: {text}"
     );
     assert!(
@@ -579,7 +904,16 @@ fn capacity_at_hypothetical_falls_to_catalog_when_labels_absent() {
         num_layers: Some(32),
         ..Default::default()
     };
-    let catalog = compute_kv_max_seqs(Some(20.0), Some(4096), &model, None, None, 2);
+    let catalog = compute_kv_max_seqs_for_cache(
+        Some(20.0),
+        Some(4096),
+        &model,
+        None,
+        None,
+        2,
+        &crate::collectors::CacheConfigLabels::default(),
+    )
+    .max_seqs;
     assert!(catalog.is_some());
     let hyp = HypCapacityCtx {
         cache: &cache,
@@ -610,7 +944,16 @@ fn capacity_at_hypothetical_falls_to_catalog_when_num_gpu_blocks_absent() {
         num_layers: Some(32),
         ..Default::default()
     };
-    let catalog = compute_kv_max_seqs(Some(20.0), Some(4096), &model, None, None, 2);
+    let catalog = compute_kv_max_seqs_for_cache(
+        Some(20.0),
+        Some(4096),
+        &model,
+        None,
+        None,
+        2,
+        &crate::collectors::CacheConfigLabels::default(),
+    )
+    .max_seqs;
     assert!(catalog.is_some());
     let hyp = HypCapacityCtx {
         cache: &cache,
@@ -650,7 +993,17 @@ fn capacity_at_hypothetical_gate_suppresses_both_tiers() {
         weight_bytes: 2,
     };
     assert!(
-        compute_kv_max_seqs(Some(20.0), Some(4096), &model, None, None, 2).is_some(),
+        compute_kv_max_seqs_for_cache(
+            Some(20.0),
+            Some(4096),
+            &model,
+            None,
+            None,
+            2,
+            &crate::collectors::CacheConfigLabels::default(),
+        )
+        .max_seqs
+        .is_some(),
         "catalog tier must be viable so the test proves it was suppressed"
     );
     assert_eq!(
@@ -696,7 +1049,17 @@ fn capacity_at_hypothetical_fits_none_does_not_fall_to_catalog() {
         weight_bytes: 2,
     };
     assert!(
-        compute_kv_max_seqs(Some(20.0), Some(2048), &model, None, None, 2).is_some(),
+        compute_kv_max_seqs_for_cache(
+            Some(20.0),
+            Some(2048),
+            &model,
+            None,
+            None,
+            2,
+            &crate::collectors::CacheConfigLabels::default(),
+        )
+        .max_seqs
+        .is_some(),
         "catalog tier must be viable so the test proves geometry overruled it"
     );
     assert!(
@@ -771,6 +1134,16 @@ fn qwen36_hybrid_model() -> ModelArch {
         linear_conv_kernel_dim: Some(4),
         state_dtype: Some("fp32".to_string()),
         ..Default::default()
+    }
+}
+
+fn qwen36_hybrid_model_with_attention() -> ModelArch {
+    ModelArch {
+        num_layers: Some(64),
+        num_kv_layers: Some(16),
+        num_kv_heads: Some(4),
+        head_dim: Some(256),
+        ..qwen36_hybrid_model()
     }
 }
 
@@ -1427,6 +1800,7 @@ fn empty_run_stdout_and_format_sites_byte_identical() {
                     kv_max_seqs: None,
                     prescribed_kv_capacity: None,
                     catalog_state_mismatch: None,
+                    memory_budget_self_grade: None,
                     n_eval: 0,
                     skipped_broken: if any_evaluable { 0 } else { windows.len() },
                     skipped_idle: if any_evaluable { windows.len() } else { 0 },

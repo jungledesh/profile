@@ -58,9 +58,9 @@ pub(super) struct HypCapacityCtx<'a> {
 
 /// Capacity at a hypothetical `max_model_len`. Both derived tiers are `(est)`.
 ///
-/// Formatter vocabulary: counts of simultaneous work are always
-/// "N concurrent requests"; never bare "capacity". Bounds name their source
-/// and condition.
+/// Formatter vocabulary: never bare "capacity"; bounds name their source and
+/// condition. Observed counts read as "N concurrent requests"; a derived floor
+/// reads as "at least N worst-case requests" (every request priced worst-case).
 pub(super) fn capacity_at_hypothetical_max_len(
     target_max_len: u32,
     current_max_len: Option<u32>,
@@ -90,14 +90,16 @@ pub(super) fn capacity_at_hypothetical_max_len(
         }
     }
     let model = ctx.model?;
-    compute_kv_max_seqs(
+    compute_kv_max_seqs_for_cache(
         ctx.kv_headroom_gb,
         Some(target_max_len),
         model,
         ctx.kv_cache_dtype,
         ctx.tp,
         ctx.weight_bytes,
+        ctx.cache,
     )
+    .max_seqs
 }
 
 /// True when observed p99 prompt+output is below half of `max_model_len`.
@@ -163,7 +165,7 @@ pub(super) fn model_len_shrink_suggestion_lines(
         // Projection at the *suggested* length only — not current observed concurrency.
         let fits = hyp
             .and_then(|h| capacity_at_hypothetical_max_len(suggested, Some(m), h))
-            .map(|n| format!("; fits {n} concurrent requests (est)"))
+            .map(|n| format!("; fits at least {n} worst-case requests (est)"))
             .unwrap_or_default();
         let len_clause = if current_shown {
             format!("to {suggested}")
@@ -230,33 +232,118 @@ pub(super) fn catalog_state_pages_mismatch(
     (catalog != observed).then_some((catalog, observed))
 }
 
-pub(super) fn compute_kv_max_seqs(
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct DerivedCapacity {
+    pub max_seqs: Option<u32>,
+    /// `(observed_budget_bytes, estimated_budget_bytes)` when both are available.
+    pub budget_self_grade: Option<(u64, u64)>,
+}
+
+pub(super) fn compute_kv_max_seqs_for_cache(
     kv_headroom_gb: Option<f64>,
     max_model_len: Option<u32>,
     model: &crate::context::ModelArch,
     kv_cache_dtype: Option<&str>,
     tp: Option<u32>,
     weight_bytes: u8,
-) -> Option<u32> {
-    use crate::engine::baseline::{kv_bytes_per_element, kv_max_concurrent_seqs};
-    let headroom = kv_headroom_gb?;
-    let max_len = max_model_len?;
-    let num_layers = model.num_kv_layers.or(model.num_layers)?;
-    let num_kv_heads = model.num_kv_heads?;
-    let head_dim = model.head_dim?;
-    let sharded_kv_heads = tp
-        .map(|t| num_kv_heads / num_kv_heads.min(t))
-        .unwrap_or(num_kv_heads);
-    // "auto"/absent KV dtype inherits weight bytes (fp8 weights → 1, bf16 → 2).
-    let kv_bpp = kv_bytes_per_element(kv_cache_dtype, weight_bytes.max(1));
-    kv_max_concurrent_seqs(
-        headroom,
-        max_len,
-        num_layers,
-        sharded_kv_heads,
-        head_dim,
-        kv_bpp,
+    cache: &crate::collectors::CacheConfigLabels,
+) -> DerivedCapacity {
+    compute_kv_max_seqs_with_mode::<{ crate::engine::MULTI_GPU_TP }>(
+        kv_headroom_gb,
+        max_model_len,
+        model,
+        kv_cache_dtype,
+        tp,
+        weight_bytes,
+        Some(cache),
     )
+}
+
+fn compute_kv_max_seqs_with_mode<const MULTI_GPU: bool>(
+    kv_headroom_gb: Option<f64>,
+    max_model_len: Option<u32>,
+    model: &crate::context::ModelArch,
+    kv_cache_dtype: Option<&str>,
+    tp: Option<u32>,
+    weight_bytes: u8,
+    cache: Option<&crate::collectors::CacheConfigLabels>,
+) -> DerivedCapacity {
+    use crate::engine::baseline::{bytes_per_seq, kv_bytes_per_element};
+
+    let Some(max_len) = max_model_len.filter(|&v| v > 0) else {
+        return DerivedCapacity::default();
+    };
+    let tp = tp.unwrap_or(1);
+    if tp == 0 || (!MULTI_GPU && tp > 1) {
+        return DerivedCapacity::default();
+    }
+    if tp > 1 && r2_kv_cache_pressure::model_is_hybrid(model) {
+        return DerivedCapacity::default();
+    }
+
+    // Resharding heads needs a mutated copy; the tp=1 launch path borrows directly.
+    let sharded_model = if tp > 1 {
+        let mut priced_model = model.clone();
+        let Some(heads) = priced_model.num_kv_heads else {
+            return DerivedCapacity::default();
+        };
+        priced_model.num_kv_heads = Some(heads / heads.min(tp));
+        Some(priced_model)
+    } else {
+        None
+    };
+    let model_view = sharded_model.as_ref().unwrap_or(model);
+
+    let kv_bpp = kv_bytes_per_element(kv_cache_dtype, weight_bytes.max(1));
+    let Some(request_bytes) = bytes_per_seq(model_view, max_len, kv_bpp) else {
+        return DerivedCapacity::default();
+    };
+    let observed = cache.and_then(|c| observed_budget_bytes(c, model_view, kv_bpp));
+    let estimated = derived_budget_bytes(kv_headroom_gb);
+    let budget = observed.or(estimated);
+    let max_seqs = budget
+        .and_then(|bytes| bytes.checked_div(request_bytes))
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|&n| n > 0);
+
+    DerivedCapacity {
+        max_seqs,
+        budget_self_grade: observed.zip(estimated),
+    }
+}
+
+fn derived_budget_bytes(kv_headroom_gb: Option<f64>) -> Option<u64> {
+    let gb = kv_headroom_gb.filter(|v| v.is_finite() && *v > 0.0)?;
+    let bytes = gb * 1e9;
+    (bytes.is_finite() && bytes <= u64::MAX as f64).then_some(bytes as u64)
+}
+
+/// Takes the same (possibly TP-sharded) view used to price requests. Budget and
+/// cost must share one view; per-GPU blocks priced with whole-model heads
+/// overstates the budget.
+fn observed_budget_bytes(
+    cache: &crate::collectors::CacheConfigLabels,
+    model: &crate::context::ModelArch,
+    kv_dtype_bytes: u8,
+) -> Option<u64> {
+    if model.swa_window.is_some() || model.num_swa_layers.is_some() {
+        return None;
+    }
+    let blocks = u64::from(cache.num_gpu_blocks?);
+    if r2_kv_cache_pressure::model_is_hybrid(model) {
+        return blocks.checked_mul(cache.mamba_page_size_padded?);
+    }
+
+    let block_size = u64::from(cache.block_size?);
+    let layers = u64::from(model.num_kv_layers.or(model.num_layers)?);
+    let per_token_per_layer = 2u64
+        .checked_mul(u64::from(model.num_kv_heads?))?
+        .checked_mul(u64::from(model.head_dim?))?
+        .checked_mul(u64::from(kv_dtype_bytes))?;
+    blocks
+        .checked_mul(block_size)?
+        .checked_mul(per_token_per_layer)?
+        .checked_mul(layers)
 }
 
 /// Safety margin on a recommended `--max-num-seqs`. Shared by R5 and R7 so two
@@ -287,9 +374,9 @@ pub(crate) enum BindingWall {
 pub(super) enum KvBoundSource {
     /// vLLM-reported `kv_cache_max_concurrency`. No "(est)".
     Observed,
-    /// `compute_kv_max_seqs` on a dense/attention model.
+    /// `compute_kv_max_seqs_for_cache` on a dense/attention model.
     Derived,
-    /// `compute_kv_max_seqs` on a hybrid model (linear_* fields set).
+    /// `compute_kv_max_seqs_for_cache` on a hybrid model (linear_* fields set).
     DerivedHybrid,
     /// `mean(running) / peak(kv_fraction)` extrapolation, last resort.
     Empirical,

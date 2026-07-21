@@ -117,6 +117,23 @@ mod tests {
     }
 
     #[test]
+    fn launch_gpus_have_on_demand_and_spot_prices() {
+        for name in [
+            "NVIDIA A100-SXM4-80GB",
+            "NVIDIA H100 80GB HBM3",
+            "NVIDIA L40S",
+            "NVIDIA A10G",
+            "NVIDIA GeForce RTX 4090",
+            "NVIDIA GeForce RTX 3090",
+        ] {
+            let price =
+                lookup_gpu_price(name).unwrap_or_else(|| panic!("missing price for {name}"));
+            assert!(price.on_demand_per_hr > 0.0, "{name} on-demand price");
+            assert!(price.spot_per_hr > 0.0, "{name} spot price");
+        }
+    }
+
+    #[test]
     fn unknown_gpu_returns_none() {
         assert!(lookup_gpu_price("NVIDIA Tesla V100").is_none());
     }

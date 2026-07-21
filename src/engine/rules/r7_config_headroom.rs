@@ -142,7 +142,7 @@ fn recommended_binder_suffix(rec: &RecommendedSeqs) -> String {
                 format!(" (bound by memory limit {cap}, vLLM-reported)")
             }
             Some(KvBoundSource::Derived) | Some(KvBoundSource::DerivedHybrid) => {
-                format!(" (bound by memory limit ~{cap}, est)")
+                format!(" (at least {cap} worst-case requests fit (est))")
             }
             // Empirical handled above; None on a memory binder is a defensive fallback.
             Some(KvBoundSource::Empirical) | None => {
@@ -463,7 +463,7 @@ mod tests {
             empirical: false,
         };
         let text = format_config_headroom_window_issue(&d, 100, 0.6, Some(&rec)).join("\n");
-        assert!(text.contains("Recommended   96 (bound by memory limit ~120, est)"));
+        assert!(text.contains("Recommended   96 (at least 120 worst-case requests fit (est))"));
         assert!(!text.contains("vLLM-reported"));
         assert!(text.contains("Raise --max-num-seqs to 96."));
     }
