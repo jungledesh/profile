@@ -45,6 +45,10 @@ pub struct CatalogEntry {
     pub linear_value_head_dim: Option<u32>,
     pub linear_conv_kernel_dim: Option<u32>,
     pub state_dtype: Option<&'static str>,
+    /// Sliding-window size in tokens. `None` means no windowed layers.
+    pub swa_window: Option<u32>,
+    /// Number of layers whose transcript is capped by `swa_window`.
+    pub num_swa_layers: Option<u32>,
 }
 
 /// Pure-attention catalog row. Named fields are transposition-proof; hybrid/linear
@@ -60,7 +64,9 @@ macro_rules! catalog_dense {
         num_kv_heads: $num_kv_heads:expr,
         head_dim: $head_dim:expr,
         num_kv_layers: $num_kv_layers:expr,
-        attn_flops_coeff: $attn_flops_coeff:expr $(,)?
+        attn_flops_coeff: $attn_flops_coeff:expr
+        $(, swa_window: $swa_window:expr, num_swa_layers: $num_swa_layers:expr)?
+        $(,)?
     ) => {
         CatalogEntry {
             family: $family,
@@ -80,7 +86,15 @@ macro_rules! catalog_dense {
             linear_value_head_dim: None,
             linear_conv_kernel_dim: None,
             state_dtype: None,
+            swa_window: catalog_dense!(@optional $($swa_window)?),
+            num_swa_layers: catalog_dense!(@optional $($num_swa_layers)?),
         }
+    };
+    (@optional) => {
+        None
+    };
+    (@optional $value:expr) => {
+        Some($value)
     };
 }
 
@@ -123,6 +137,8 @@ macro_rules! catalog_hybrid {
             linear_value_head_dim: $linear_value_head_dim,
             linear_conv_kernel_dim: $linear_conv_kernel_dim,
             state_dtype: $state_dtype,
+            swa_window: None,
+            num_swa_layers: None,
         }
     };
 }
@@ -136,61 +152,9 @@ struct ModelEntry {
 const B: u64 = 1_000_000_000;
 
 static CATALOG: &[ModelEntry] = &[
-    // ── Llama 4 ──────────────────────────────────────────────────────────────
-    // Interleaved attention architecture: standard KV formula doesn't apply.
-    // Maverick: 17B active / 400B total MoE (model card; not confirmed from config.json here).
-    // Source: https://huggingface.co/meta-llama/Llama-4-Maverick-17B-128E-Instruct/raw/main/config.json (fetch timed out — gated; unverified)
-    // config.json gated from this environment; layer/hidden dims unverified — do not trust for physics.
-    ModelEntry {
-        tokens: &["llama", "4", "maverick"],
-        entry: catalog_dense! {
-            family: "llama4",
-            param_count: 400 * B,
-            active_param_count: Some(17 * B),
-            num_layers: 48,
-            hidden_dim: 5120,
-            default_weight_dtype: "bf16",
-            num_kv_heads: None,
-            head_dim: None,
-            num_kv_layers: None,
-            attn_flops_coeff: Some(0),
-        },
-    },
-    // Scout: 17B active / 109B total MoE (model card; not confirmed from config.json here).
-    // Source: https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct/raw/main/config.json (fetch timed out — gated; unverified)
-    // config.json gated from this environment; layer/hidden dims unverified — do not trust for physics.
-    ModelEntry {
-        tokens: &["llama", "4", "scout"],
-        entry: catalog_dense! {
-            family: "llama4",
-            param_count: 109 * B,
-            active_param_count: Some(17 * B),
-            num_layers: 48,
-            hidden_dim: 5120,
-            default_weight_dtype: "bf16",
-            num_kv_heads: None,
-            head_dim: None,
-            num_kv_layers: None,
-            attn_flops_coeff: Some(0),
-        },
-    },
+    // Single-GPU launch: models whose resident bf16 weights exceed every
+    // supported card are intentionally omitted from this catalog.
     // ── Nemotron (before generic llama entries, names contain "llama" + size) ─
-    // Source: https://huggingface.co/nvidia/Llama-3.1-Nemotron-70B-Instruct/raw/main/config.json (accessed 2026-07-16)
-    ModelEntry {
-        tokens: &["nemotron", "70b"],
-        entry: catalog_dense! {
-            family: "nemotron",
-            param_count: 70 * B,
-            active_param_count: None,
-            num_layers: 80,
-            hidden_dim: 8192,
-            default_weight_dtype: "bf16",
-            num_kv_heads: Some(8),
-            head_dim: Some(128),
-            num_kv_layers: None,
-            attn_flops_coeff: None,
-        },
-    },
     // Source: https://huggingface.co/nvidia/Llama-3.1-Nemotron-8B-Instruct/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["nemotron", "8b"],
@@ -208,40 +172,6 @@ static CATALOG: &[ModelEntry] = &[
         },
     },
     // ── Llama 3.x ────────────────────────────────────────────────────────────
-    // "3" token required: "3.1" contains "3"; guards against a hypothetical
-    // "Llama-4-70B" (no version tag) matching as llama3.
-    // Source: https://huggingface.co/meta-llama/Meta-Llama-3.1-405B-Instruct/raw/main/config.json (accessed 2026-07-16)
-    ModelEntry {
-        tokens: &["llama", "3", "405b"],
-        entry: catalog_dense! {
-            family: "llama3",
-            param_count: 405 * B,
-            active_param_count: None,
-            num_layers: 126,
-            hidden_dim: 16384,
-            default_weight_dtype: "bf16",
-            num_kv_heads: Some(8),
-            head_dim: Some(128),
-            num_kv_layers: None,
-            attn_flops_coeff: None,
-        },
-    },
-    // Source: https://huggingface.co/meta-llama/Meta-Llama-3.1-70B-Instruct/raw/main/config.json (accessed 2026-07-16)
-    ModelEntry {
-        tokens: &["llama", "3", "70b"],
-        entry: catalog_dense! {
-            family: "llama3",
-            param_count: 70 * B,
-            active_param_count: None,
-            num_layers: 80,
-            hidden_dim: 8192,
-            default_weight_dtype: "bf16",
-            num_kv_heads: Some(8),
-            head_dim: Some(128),
-            num_kv_layers: None,
-            attn_flops_coeff: None,
-        },
-    },
     // Source: https://huggingface.co/meta-llama/Meta-Llama-3.1-8B-Instruct/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["llama", "3", "8b"],
@@ -259,22 +189,6 @@ static CATALOG: &[ModelEntry] = &[
         },
     },
     // ── Qwen 3 MoE ───────────────────────────────────────────────────────────
-    // Source: https://huggingface.co/Qwen/Qwen3-235B-A22B/raw/main/config.json (accessed 2026-07-16)
-    ModelEntry {
-        tokens: &["qwen3", "235b"],
-        entry: catalog_dense! {
-            family: "qwen3",
-            param_count: 235 * B,
-            active_param_count: Some(22 * B),
-            num_layers: 94,
-            hidden_dim: 7168,
-            default_weight_dtype: "bf16",
-            num_kv_heads: Some(4),
-            head_dim: Some(128),
-            num_kv_layers: None,
-            attn_flops_coeff: None,
-        },
-    },
     // Qwen3-30B-A3B MoE.
     // num_key_value_heads=4, head_dim=128, hidden_size=2048, num_hidden_layers=48.
     // Source: https://huggingface.co/Qwen/Qwen3-30B-A3B/raw/main/config.json (accessed 2026-07-16)
@@ -426,22 +340,6 @@ static CATALOG: &[ModelEntry] = &[
         },
     },
     // ── Qwen 2.5 dense ───────────────────────────────────────────────────────
-    // Source: https://huggingface.co/Qwen/Qwen2.5-72B-Instruct/raw/main/config.json (accessed 2026-07-16)
-    ModelEntry {
-        tokens: &["qwen2.5", "72b"],
-        entry: catalog_dense! {
-            family: "qwen2.5",
-            param_count: 72 * B,
-            active_param_count: None,
-            num_layers: 80,
-            hidden_dim: 8192,
-            default_weight_dtype: "bf16",
-            num_kv_heads: Some(8),
-            head_dim: Some(128),
-            num_kv_layers: None,
-            attn_flops_coeff: None,
-        },
-    },
     // Source: https://huggingface.co/Qwen/Qwen2.5-32B-Instruct/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["qwen2.5", "32b"],
@@ -490,45 +388,7 @@ static CATALOG: &[ModelEntry] = &[
             attn_flops_coeff: None,
         },
     },
-    // ── DeepSeek V3 / R1 ─────────────────────────────────────────────────────
-    // Uses MLA (Multi-head Latent Attention): KV cache is a compressed latent,
-    // not num_kv_heads × head_dim. Standard formula doesn't apply.
-    // 671B MoE (37B active)
-    // Source: https://huggingface.co/deepseek-ai/DeepSeek-V3/raw/main/config.json (accessed 2026-07-16)
-    ModelEntry {
-        tokens: &["deepseek", "671b"],
-        entry: catalog_dense! {
-            family: "deepseek",
-            param_count: 671 * B,
-            active_param_count: Some(37 * B),
-            num_layers: 61,
-            hidden_dim: 7168,
-            default_weight_dtype: "bf16",
-            num_kv_heads: None,
-            head_dim: None,
-            num_kv_layers: None,
-            attn_flops_coeff: Some(139_264),
-        },
-    },
-    // R1 distills are Llama/Qwen dense arches (NOT MLA). Place before generic
-    // ["deepseek","r1"] so "DeepSeek-R1-Distill-*" never inherits 671B MLA params.
-    // Source: https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Llama-70B/raw/main/config.json (accessed 2026-07-16)
-    ModelEntry {
-        // https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Llama-70B/raw/main/config.json
-        tokens: &["deepseek", "r1", "distill", "70b"],
-        entry: catalog_dense! {
-            family: "deepseek",
-            param_count: 70 * B,
-            active_param_count: None,
-            num_layers: 80,
-            hidden_dim: 8192,
-            default_weight_dtype: "bf16",
-            num_kv_heads: Some(8),
-            head_dim: Some(128),
-            num_kv_layers: None,
-            attn_flops_coeff: None,
-        },
-    },
+    // ── DeepSeek R1 distills / dense ──────────────────────────────────────────
     // Source: https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-32B/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         // https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-32B/raw/main/config.json
@@ -614,56 +474,6 @@ static CATALOG: &[ModelEntry] = &[
             attn_flops_coeff: None,
         },
     },
-    // R1 without size token defaults to 671B MLA
-    // Source: https://huggingface.co/deepseek-ai/DeepSeek-R1/raw/main/config.json (accessed 2026-07-16)
-    ModelEntry {
-        tokens: &["deepseek", "r1"],
-        entry: catalog_dense! {
-            family: "deepseek",
-            param_count: 671 * B,
-            active_param_count: Some(37 * B),
-            num_layers: 61,
-            hidden_dim: 7168,
-            default_weight_dtype: "bf16",
-            num_kv_heads: None,
-            head_dim: None,
-            num_kv_layers: None,
-            attn_flops_coeff: Some(139_264),
-        },
-    },
-    // V3 without size token defaults to 671B
-    // Source: https://huggingface.co/deepseek-ai/DeepSeek-V3/raw/main/config.json (accessed 2026-07-16)
-    ModelEntry {
-        tokens: &["deepseek", "v3"],
-        entry: catalog_dense! {
-            family: "deepseek",
-            param_count: 671 * B,
-            active_param_count: Some(37 * B),
-            num_layers: 61,
-            hidden_dim: 7168,
-            default_weight_dtype: "bf16",
-            num_kv_heads: None,
-            head_dim: None,
-            num_kv_layers: None,
-            attn_flops_coeff: Some(139_264),
-        },
-    },
-    // Source: https://huggingface.co/deepseek-ai/deepseek-llm-70b-chat/raw/main/config.json (accessed 2026-07-16)
-    ModelEntry {
-        tokens: &["deepseek", "70b"],
-        entry: catalog_dense! {
-            family: "deepseek",
-            param_count: 70 * B,
-            active_param_count: None,
-            num_layers: 80,
-            hidden_dim: 8192,
-            default_weight_dtype: "bf16",
-            num_kv_heads: None,
-            head_dim: None,
-            num_kv_layers: None,
-            attn_flops_coeff: Some(69_632),
-        },
-    },
     // Source: https://huggingface.co/deepseek-ai/deepseek-llm-7b-chat/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["deepseek", "7b"],
@@ -678,94 +488,6 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: None,
             num_kv_layers: None,
             attn_flops_coeff: Some(34_816),
-        },
-    },
-    // ── Mistral Large 3 ──────────────────────────────────────────────────────
-    // MLA (kv_lora_rank in params.json): standard KV formula doesn't apply.
-    // 675B total / 41B active from model card. dim=7168, n_layers=61 from params.json.
-    // Source: https://huggingface.co/mistralai/Mistral-Large-3-675B-Instruct-2512/raw/main/params.json (accessed 2026-07-16)
-    ModelEntry {
-        tokens: &["mistral", "large", "675b"],
-        entry: catalog_dense! {
-            family: "mistral",
-            param_count: 675 * B,
-            active_param_count: Some(41 * B),
-            num_layers: 61,
-            hidden_dim: 7168,
-            default_weight_dtype: "bf16",
-            num_kv_heads: None,
-            head_dim: None,
-            num_kv_layers: None,
-            attn_flops_coeff: None,
-        },
-    },
-    // 123B dense
-    // Source: https://huggingface.co/mistralai/Mistral-Large-Instruct-2407/raw/main/config.json (accessed 2026-07-16)
-    ModelEntry {
-        tokens: &["mistral", "large", "123b"],
-        entry: catalog_dense! {
-            family: "mistral",
-            param_count: 123 * B,
-            active_param_count: None,
-            num_layers: 88,
-            hidden_dim: 8192,
-            default_weight_dtype: "bf16",
-            num_kv_heads: Some(8),
-            head_dim: Some(128),
-            num_kv_layers: None,
-            attn_flops_coeff: None,
-        },
-    },
-    // Mistral Large without explicit size, 123B default
-    // Source: https://huggingface.co/mistralai/Mistral-Large-Instruct-2407/raw/main/config.json (accessed 2026-07-16)
-    ModelEntry {
-        tokens: &["mistral", "large"],
-        entry: catalog_dense! {
-            family: "mistral",
-            param_count: 123 * B,
-            active_param_count: None,
-            num_layers: 88,
-            hidden_dim: 8192,
-            default_weight_dtype: "bf16",
-            num_kv_heads: Some(8),
-            head_dim: Some(128),
-            num_kv_layers: None,
-            attn_flops_coeff: None,
-        },
-    },
-    // ── Mixtral MoE ──────────────────────────────────────────────────────────
-    // 8x22B: 141B total, ~39B active
-    // Source: https://huggingface.co/mistralai/Mixtral-8x22B-Instruct-v0.1/raw/main/config.json (accessed 2026-07-16)
-    ModelEntry {
-        tokens: &["mixtral", "8x22b"],
-        entry: catalog_dense! {
-            family: "mistral",
-            param_count: 141 * B,
-            active_param_count: Some(39 * B),
-            num_layers: 56,
-            hidden_dim: 6144,
-            default_weight_dtype: "bf16",
-            num_kv_heads: Some(8),
-            head_dim: Some(128),
-            num_kv_layers: None,
-            attn_flops_coeff: None,
-        },
-    },
-    // 8x7B: 47B total, ~13B active
-    // Source: https://huggingface.co/mistralai/Mixtral-8x7B-Instruct-v0.1/raw/main/config.json (accessed 2026-07-16)
-    ModelEntry {
-        tokens: &["mixtral", "8x7b"],
-        entry: catalog_dense! {
-            family: "mistral",
-            param_count: 47 * B,
-            active_param_count: Some(13 * B),
-            num_layers: 32,
-            hidden_dim: 4096,
-            default_weight_dtype: "bf16",
-            num_kv_heads: Some(8),
-            head_dim: Some(128),
-            num_kv_layers: None,
-            attn_flops_coeff: None,
         },
     },
     // ── Mistral 7B dense ─────────────────────────────────────────────────────
@@ -791,7 +513,9 @@ static CATALOG: &[ModelEntry] = &[
     // quantized GGUFs ("gemma-4-31b-it-bf16.gguf"). Both must appear before
     // the Gemma 2 27B entry, otherwise "gemma-4-27b-it" falls through and
     // matches Gemma 2 27B (wrong arch params).
-    // KV architecture non-standard (per-token head quantization): num_kv_heads = None.
+    // Local and global layers have different KV geometry. The current model
+    // cannot represent per-layer-group heads and dimensions, so KV fields stay
+    // None and bytes_per_seq intentionally declines instead of guessing.
     // Source: https://huggingface.co/google/gemma-4-27b-it/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["gemma", "4", "27b"],
@@ -824,7 +548,8 @@ static CATALOG: &[ModelEntry] = &[
             attn_flops_coeff: None,
         },
     },
-    // Gemma 4 26B-A4B MoE
+    // Gemma 4 26B-A4B MoE. Its local/global KV geometry also cannot be
+    // represented by the current model, so KV fields stay None.
     // Source: https://huggingface.co/google/gemma-4-26b-it/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["gemma", "4", "26b"],
@@ -860,6 +585,8 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            swa_window: 1024,
+            num_swa_layers: 52,
         },
     },
     // Source: https://huggingface.co/google/gemma-3-27b-it/raw/main/config.json (accessed 2026-07-16)
@@ -876,6 +603,8 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            swa_window: 1024,
+            num_swa_layers: 52,
         },
     },
     // Source: https://huggingface.co/google/gemma-3-12b-it/raw/main/config.json (accessed 2026-07-16)
@@ -894,6 +623,8 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(256),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            swa_window: 1024,
+            num_swa_layers: 40,
         },
     },
     // Source: https://huggingface.co/google/gemma-3-12b-it/raw/main/config.json (accessed 2026-07-16)
@@ -910,6 +641,8 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(256),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            swa_window: 1024,
+            num_swa_layers: 40,
         },
     },
     // Source: https://huggingface.co/google/gemma-3-4b-it/raw/main/config.json (accessed 2026-07-16)
@@ -929,6 +662,8 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(256),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            swa_window: 1024,
+            num_swa_layers: 29,
         },
     },
     // Source: https://huggingface.co/google/gemma-3-4b-it/raw/main/config.json (accessed 2026-07-16)
@@ -945,9 +680,13 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(256),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            swa_window: 1024,
+            num_swa_layers: 29,
         },
     },
-    // Source: https://huggingface.co/google/gemma-3-1b-it/raw/main/config.json (accessed 2026-07-16)
+    // Source: https://huggingface.co/google/gemma-3-1b-it/raw/main/config.json (gated).
+    // sliding_window=512 (1B differs from the rest of the family); verified against
+    // https://huggingface.co/unsloth/gemma-3-1b-it-GGUF/raw/main/config.json (2026-07-21).
     ModelEntry {
         // https://huggingface.co/google/gemma-3-1b-it/raw/main/config.json
         tokens: &["gemma 3", "1b"],
@@ -962,9 +701,13 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(256),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            swa_window: 512,
+            num_swa_layers: 22,
         },
     },
-    // Source: https://huggingface.co/google/gemma-3-1b-it/raw/main/config.json (accessed 2026-07-16)
+    // Source: https://huggingface.co/google/gemma-3-1b-it/raw/main/config.json (gated).
+    // sliding_window=512 (1B differs from the rest of the family); verified against
+    // https://huggingface.co/unsloth/gemma-3-1b-it-GGUF/raw/main/config.json (2026-07-21).
     ModelEntry {
         tokens: &["gemma3", "1b"],
         entry: catalog_dense! {
@@ -978,10 +721,17 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(256),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            swa_window: 512,
+            num_swa_layers: 22,
         },
     },
     // Gemma 2 27B: head_dim=128, 32 attn heads, 16 KV heads.
+    // sliding_window=4096 from config.json. Gemma 2 alternates local and global
+    // attention, so 23 of 46 layers are windowed.
     // Source: https://huggingface.co/google/gemma-2-27b-it/raw/main/config.json (accessed 2026-07-16)
+    // Alternation sources:
+    // https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma2/modeling_gemma2.py
+    // https://arxiv.org/html/2408.00118
     ModelEntry {
         tokens: &["gemma", "27b"],
         entry: catalog_dense! {
@@ -995,10 +745,17 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            swa_window: 4096,
+            num_swa_layers: 23,
         },
     },
     // Gemma 2 9B: head_dim=256 (larger than typical), 16 attn heads, 8 KV heads.
+    // sliding_window=4096 from config.json. Gemma 2 alternates local and global
+    // attention, so 21 of 42 layers are windowed.
     // Source: https://huggingface.co/google/gemma-2-9b-it/raw/main/config.json (accessed 2026-07-16)
+    // Alternation sources:
+    // https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma2/modeling_gemma2.py
+    // https://arxiv.org/html/2408.00118
     ModelEntry {
         tokens: &["gemma", "9b"],
         entry: catalog_dense! {
@@ -1012,61 +769,11 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(256),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            swa_window: 4096,
+            num_swa_layers: 21,
         },
     },
-    // ── Kimi K2 ──────────────────────────────────────────────────────────────
-    // MLA (kv_lora_rank in config): standard KV formula doesn't apply.
-    // Source: https://huggingface.co/moonshotai/Kimi-K2-Instruct/raw/main/config.json (accessed 2026-07-16)
-    ModelEntry {
-        tokens: &["kimi", "k2"],
-        entry: catalog_dense! {
-            family: "kimi",
-            param_count: 1_000 * B,
-            active_param_count: Some(32 * B),
-            num_layers: 61,
-            hidden_dim: 7168,
-            default_weight_dtype: "bf16",
-            num_kv_heads: None,
-            head_dim: None,
-            num_kv_layers: None,
-            attn_flops_coeff: None,
-        },
-    },
-    // ── GLM-5.2 MoE ───────────────────────────────────────────────────────────
-    // glm_moe_dsa + sparse/index attention (kv_lora_rank in config): standard KV formula doesn't apply.
-    // Total/active params from https://huggingface.co/zai-org/GLM-5.2 model card (753B / 40B).
-    // Source: https://huggingface.co/zai-org/GLM-5.2/raw/main/config.json (accessed 2026-07-16)
-    ModelEntry {
-        tokens: &["glm", "5.2"],
-        entry: catalog_dense! {
-            family: "glm",
-            param_count: 753 * B,
-            active_param_count: Some(40 * B),
-            num_layers: 78,
-            hidden_dim: 6144,
-            default_weight_dtype: "bf16",
-            num_kv_heads: None,
-            head_dim: None,
-            num_kv_layers: None,
-            attn_flops_coeff: None,
-        },
-    },
-    // Source: https://huggingface.co/zai-org/GLM-5.2/raw/main/config.json (accessed 2026-07-16)
-    ModelEntry {
-        tokens: &["glm", "744b"],
-        entry: catalog_dense! {
-            family: "glm",
-            param_count: 753 * B,
-            active_param_count: Some(40 * B),
-            num_layers: 78,
-            hidden_dim: 6144,
-            default_weight_dtype: "bf16",
-            num_kv_heads: None,
-            head_dim: None,
-            num_kv_layers: None,
-            attn_flops_coeff: None,
-        },
-    },
+    // ── GLM ───────────────────────────────────────────────────────────────────
     // Source: https://huggingface.co/zai-org/GLM-4-32B-0414/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["glm", "32b"],
@@ -1079,25 +786,6 @@ static CATALOG: &[ModelEntry] = &[
             default_weight_dtype: "bf16",
             num_kv_heads: Some(2),
             head_dim: Some(128),
-            num_kv_layers: None,
-            attn_flops_coeff: None,
-        },
-    },
-    // ── Inkling (Thinking Machines) ───────────────────────────────────────────
-    // Hybrid sliding-window + global attention; separate SWA/GQA KV fields in text_config.
-    // Total/active params from https://huggingface.co/thinkingmachines/Inkling model card (975B / 41B).
-    // Source: https://huggingface.co/thinkingmachines/Inkling/raw/main/config.json (accessed 2026-07-16)
-    ModelEntry {
-        tokens: &["inkling"],
-        entry: catalog_dense! {
-            family: "inkling",
-            param_count: 975 * B,
-            active_param_count: Some(41 * B),
-            num_layers: 66,
-            hidden_dim: 6144,
-            default_weight_dtype: "bf16",
-            num_kv_heads: None,
-            head_dim: None,
             num_kv_layers: None,
             attn_flops_coeff: None,
         },
@@ -1159,6 +847,11 @@ fn normalize(name: &str) -> String {
 /// the normalized model name, or `None` if no entry matches.
 pub fn lookup_model(name: &str) -> Option<&'static CatalogEntry> {
     let norm = normalize(name);
+    // Mixtral is excluded from single-GPU launch. Without this guard, the
+    // "mistralai" publisher token plus "7b" in "8x7b" matches Mistral 7B.
+    if norm.contains("mixtral") {
+        return None;
+    }
     CATALOG.iter().find_map(|e| {
         if e.tokens.iter().all(|t| norm.contains(*t)) {
             Some(&e.entry)
@@ -1171,128 +864,67 @@ pub fn lookup_model(name: &str) -> Option<&'static CatalogEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::ModelArch;
+    use crate::engine::baseline::bytes_per_seq;
 
-    #[test]
-    fn llama3_70b_variants() {
-        for name in &[
-            "meta-llama/Llama-3.1-70B-Instruct",
-            "meta-llama/Meta-Llama-3-70B",
-            "llama-3.3-70b-instruct",
-        ] {
-            let e = lookup_model(name).unwrap_or_else(|| panic!("no match for {name}"));
-            assert_eq!(e.family, "llama3");
-            assert_eq!(e.param_count, 70 * B);
-            assert!(e.active_param_count.is_none());
+    fn model_arch(entry: &CatalogEntry) -> ModelArch {
+        ModelArch {
+            param_count: Some(entry.param_count),
+            active_param_count: entry.active_param_count,
+            num_layers: Some(entry.num_layers),
+            hidden_dim: Some(entry.hidden_dim),
+            default_weight_dtype: Some(entry.default_weight_dtype.to_string()),
+            num_kv_heads: entry.num_kv_heads,
+            head_dim: entry.head_dim,
+            num_kv_layers: entry.num_kv_layers,
+            attn_flops_coeff: entry.attn_flops_coeff,
+            linear_num_layers: entry.linear_num_layers,
+            linear_key_heads: entry.linear_key_heads,
+            linear_value_heads: entry.linear_value_heads,
+            linear_key_head_dim: entry.linear_key_head_dim,
+            linear_value_head_dim: entry.linear_value_head_dim,
+            linear_conv_kernel_dim: entry.linear_conv_kernel_dim,
+            state_dtype: entry.state_dtype.map(str::to_string),
+            swa_window: entry.swa_window,
+            num_swa_layers: entry.num_swa_layers,
         }
     }
 
     #[test]
-    fn llama4_maverick() {
-        let e = lookup_model("meta-llama/Llama-4-Maverick-17B-128E-Instruct")
-            .expect("should match maverick");
-        assert_eq!(e.family, "llama4");
-        assert_eq!(e.active_param_count, Some(17 * B));
-        assert!(e.active_param_count.is_some());
+    fn launch_catalog_has_expected_entry_count() {
+        assert_eq!(CATALOG.len(), 36);
     }
 
     #[test]
-    fn llama4_scout() {
-        let e =
-            lookup_model("meta-llama/Llama-4-Scout-17B-16E-Instruct").expect("should match scout");
-        assert_eq!(e.family, "llama4");
-        assert!(e.active_param_count.is_some());
-    }
-
-    #[test]
-    fn qwen3_moe_235b() {
-        let e = lookup_model("Qwen/Qwen3-235B-A22B").expect("should match qwen3 235b moe");
-        assert_eq!(e.family, "qwen3");
-        assert_eq!(e.param_count, 235 * B);
-        assert_eq!(e.active_param_count, Some(22 * B));
-        assert!(e.active_param_count.is_some());
-    }
-
-    #[test]
-    fn qwen25_72b() {
-        let e = lookup_model("Qwen/Qwen2.5-72B-Instruct").expect("no match");
-        assert_eq!(e.family, "qwen2.5");
-        assert_eq!(e.param_count, 72 * B);
-        assert!(e.active_param_count.is_none());
-    }
-
-    #[test]
-    fn deepseek_r1_671b() {
-        let e = lookup_model("deepseek-ai/DeepSeek-R1").expect("no match");
-        assert_eq!(e.family, "deepseek");
-        assert_eq!(e.param_count, 671 * B);
-        assert_eq!(e.active_param_count, Some(37 * B));
-        assert!(e.num_kv_heads.is_none());
-        assert!(e.head_dim.is_none());
-    }
-
-    #[test]
-    fn deepseek_v3_671b() {
-        let e = lookup_model("deepseek-ai/DeepSeek-V3").expect("no match");
-        assert_eq!(e.family, "deepseek");
-        assert_eq!(e.param_count, 671 * B);
-        assert_eq!(e.active_param_count, Some(37 * B));
-        assert!(e.num_kv_heads.is_none());
-        assert!(e.head_dim.is_none());
-    }
-
-    #[test]
-    fn mixtral_8x7b() {
-        let e = lookup_model("mistralai/Mixtral-8x7B-Instruct-v0.1").expect("no match");
-        assert_eq!(e.family, "mistral");
-        assert_eq!(e.param_count, 47 * B);
-        assert!(e.active_param_count.is_some());
-    }
-
-    #[test]
-    fn mixtral_8x22b() {
-        let e = lookup_model("mistralai/Mixtral-8x22B-Instruct-v0.1").expect("no match");
-        assert_eq!(e.family, "mistral");
-        assert_eq!(e.param_count, 141 * B);
-        assert!(e.active_param_count.is_some());
-    }
-
-    #[test]
-    fn mistral_large_675b() {
-        let e = lookup_model("mistralai/Mistral-Large-3-675B-Instruct-2512").expect("no match");
-        assert_eq!(e.family, "mistral");
-        assert_eq!(e.param_count, 675 * B);
-        assert_eq!(e.active_param_count, Some(41 * B));
-        assert_eq!(e.num_layers, 61);
-        assert_eq!(e.hidden_dim, 7168);
-        assert!(e.num_kv_heads.is_none());
-        assert!(e.head_dim.is_none());
-    }
-
-    #[test]
-    fn mistral_large_123b() {
-        let e = lookup_model("mistralai/Mistral-Large-Instruct-2411").expect("no match");
-        assert_eq!(e.family, "mistral");
-        assert_eq!(e.param_count, 123 * B);
-        assert!(e.active_param_count.is_none());
-    }
-
-    #[test]
-    fn nemotron_70b() {
-        let e = lookup_model("nvidia/Llama-3.1-Nemotron-70B-Instruct").expect("no match");
-        assert_eq!(e.family, "nemotron");
-        assert_eq!(e.param_count, 70 * B);
-    }
-
-    #[test]
-    fn kimi_k2() {
-        let e = lookup_model("moonshotai/Kimi-K2-Instruct").expect("no match");
-        assert_eq!(e.family, "kimi");
-        assert_eq!(e.param_count, 1_000 * B);
-        assert_eq!(e.active_param_count, Some(32 * B));
-        assert_eq!(e.num_layers, 61);
-        assert_eq!(e.hidden_dim, 7168);
-        assert!(e.num_kv_heads.is_none());
-        assert!(e.head_dim.is_none());
+    fn models_too_large_for_supported_single_gpus_are_absent() {
+        for name in [
+            "moonshotai/Kimi-K2-Instruct",
+            "thinkingmachines/Inkling",
+            "zai-org/GLM-5.2",
+            "zai-org/GLM-744B",
+            "mistralai/Mistral-Large-3-675B-Instruct-2512",
+            "mistralai/Mistral-Large-Instruct-2407",
+            "mistralai/Mistral-Large-Instruct-2411",
+            "deepseek-ai/DeepSeek-671B",
+            "deepseek-ai/DeepSeek-R1",
+            "deepseek-ai/DeepSeek-V3",
+            "meta-llama/Meta-Llama-3.1-405B-Instruct",
+            "meta-llama/Llama-4-Maverick-17B-128E-Instruct",
+            "meta-llama/Llama-4-Scout-17B-16E-Instruct",
+            "Qwen/Qwen3-235B-A22B",
+            "mistralai/Mixtral-8x22B-Instruct-v0.1",
+            "mistralai/Mixtral-8x7B-Instruct-v0.1",
+            "Qwen/Qwen2.5-72B-Instruct",
+            "nvidia/Llama-3.1-Nemotron-70B-Instruct",
+            "meta-llama/Llama-3.1-70B-Instruct",
+            "deepseek-ai/DeepSeek-R1-Distill-Llama-70B",
+            "deepseek-ai/deepseek-llm-70b-chat",
+        ] {
+            assert!(
+                lookup_model(name).is_none(),
+                "{name} must stay outside the single-GPU launch catalog"
+            );
+        }
     }
 
     #[test]
@@ -1300,17 +932,6 @@ mod tests {
         let e = lookup_model("microsoft/phi-4").expect("no match");
         assert_eq!(e.family, "phi4");
         assert_eq!(e.param_count, 14 * B);
-    }
-
-    #[test]
-    fn glm_52_token_matches() {
-        let e = lookup_model("zai-org/GLM-5.2").expect("no match");
-        assert_eq!(e.family, "glm");
-        assert_eq!(e.param_count, 753 * B);
-        assert_eq!(e.active_param_count, Some(40 * B));
-        assert_eq!(e.num_layers, 78);
-        assert_eq!(e.hidden_dim, 6144);
-        assert!(e.num_kv_heads.is_none());
     }
 
     #[test]
@@ -1322,17 +943,6 @@ mod tests {
         assert_eq!(e.hidden_dim, 6144);
         assert_eq!(e.num_kv_heads, Some(2));
         assert_eq!(e.head_dim, Some(128));
-    }
-
-    #[test]
-    fn inkling_hf_name() {
-        let e = lookup_model("thinkingmachines/Inkling").expect("no match");
-        assert_eq!(e.family, "inkling");
-        assert_eq!(e.param_count, 975 * B);
-        assert_eq!(e.active_param_count, Some(41 * B));
-        assert_eq!(e.num_layers, 66);
-        assert_eq!(e.hidden_dim, 6144);
-        assert!(e.num_kv_heads.is_none());
     }
 
     /// Ground truth from vllm.log (H100 80GB, gpu-mem-util 0.9, max-model-len 32768, 2026-07-16):
@@ -1388,6 +998,7 @@ mod tests {
         assert_eq!(e.family, "gemma4");
         assert_eq!(e.param_count, 31 * B);
         assert!(e.active_param_count.is_none());
+        assert_eq!(bytes_per_seq(&model_arch(e), 8192, 2), None);
     }
 
     #[test]
@@ -1405,13 +1016,6 @@ mod tests {
     }
 
     #[test]
-    fn llama_70b_does_not_match_llama4() {
-        // "llama-3.1-70B" must NOT match the llama4 entries
-        let e = lookup_model("meta-llama/Llama-3.1-70B-Instruct").expect("no match");
-        assert_eq!(e.family, "llama3", "should be llama3, got {}", e.family);
-    }
-
-    #[test]
     fn llama4_untagged_70b_returns_none() {
         // A hypothetical "Llama-4-70B" (no Scout/Maverick) must NOT match as
         // llama3. Before the "3" token guard this would have returned llama3.
@@ -1422,7 +1026,7 @@ mod tests {
     fn standard_models_have_no_attn_flops_coeff() {
         for name in [
             "meta-llama/Llama-3-8B",
-            "Qwen/Qwen2.5-72B",
+            "Qwen/Qwen2.5-32B",
             "mistralai/Mistral-7B",
         ] {
             let e = lookup_model(name).expect("catalog hit");
@@ -1431,18 +1035,6 @@ mod tests {
                 "{name} should use standard hidden_dim path"
             );
         }
-    }
-
-    #[test]
-    fn deepseek_v3_has_mla_coeff() {
-        let e = lookup_model("deepseek-ai/DeepSeek-V3").expect("catalog hit");
-        assert_eq!(e.attn_flops_coeff, Some(139_264));
-    }
-
-    #[test]
-    fn deepseek_r1_has_mla_coeff() {
-        let e = lookup_model("deepseek-ai/DeepSeek-R1").expect("catalog hit");
-        assert_eq!(e.attn_flops_coeff, Some(139_264));
     }
 
     #[test]
@@ -1464,14 +1056,6 @@ mod tests {
     }
 
     #[test]
-    fn r1_distill_llama_70b() {
-        let e = lookup_model("deepseek-ai/DeepSeek-R1-Distill-Llama-70B").expect("no match");
-        assert_eq!(e.param_count, 70 * B);
-        assert_eq!(e.num_layers, 80);
-        assert_eq!(e.num_kv_heads, Some(8));
-    }
-
-    #[test]
     fn r1_distill_qwen_1_5b() {
         let e = lookup_model("deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B").expect("no match");
         assert_eq!(e.param_count, 1_500_000_000);
@@ -1488,6 +1072,8 @@ mod tests {
         assert_eq!(e.hidden_dim, 5376);
         assert_eq!(e.num_kv_heads, Some(16));
         assert_eq!(e.head_dim, Some(128));
+        assert_eq!(e.swa_window, Some(1024));
+        assert_eq!(e.num_swa_layers, Some(52));
     }
 
     #[test]
@@ -1519,10 +1105,22 @@ mod tests {
         assert_eq!(e4.family, "gemma3");
         assert_eq!(e4.num_layers, 34);
         assert_eq!(e4.num_kv_heads, Some(4));
+        assert_eq!(e4.swa_window, Some(1024));
+        assert_eq!(e4.num_swa_layers, Some(29));
         let e1 = lookup_model("google/gemma-3-1b-it").expect("1b");
         assert_eq!(e1.family, "gemma3");
         assert_eq!(e1.num_layers, 26);
         assert_eq!(e1.num_kv_heads, Some(1));
+        assert_eq!(e1.swa_window, Some(512));
+        assert_eq!(e1.num_swa_layers, Some(22));
+    }
+
+    #[test]
+    fn gemma3_window_split_is_pinned() {
+        let e1 = lookup_model("google/gemma-3-1b-it").expect("1b");
+        let e27 = lookup_model("google/gemma-3-27b-it").expect("27b");
+        assert_eq!(e1.swa_window, Some(512));
+        assert_eq!(e27.swa_window, Some(1024));
     }
 
     #[test]
@@ -1538,6 +1136,16 @@ mod tests {
         assert_eq!(e.family, "gemma");
         assert_eq!(e.num_layers, 46);
         assert_eq!(e.hidden_dim, 4608);
+        assert_eq!(e.swa_window, Some(4096));
+        assert_eq!(e.num_swa_layers, Some(23));
+    }
+
+    #[test]
+    fn gemma2_9b_window_split_is_pinned() {
+        let e = lookup_model("google/gemma-2-9b-it").expect("gemma2");
+        assert_eq!(e.num_layers, 42);
+        assert_eq!(e.swa_window, Some(4096));
+        assert_eq!(e.num_swa_layers, Some(21));
     }
 
     #[test]
@@ -1571,14 +1179,8 @@ mod tests {
         let e = lookup_model("Qwen/Qwen3-30B-A3B").expect("a3b");
         assert_eq!(e.num_kv_heads, Some(4));
         assert_eq!(e.head_dim, Some(128));
-        // Catalog fields alone are the gate for kv_max_concurrent_seqs (engine).
+        // Catalog fields alone are the gate for per-request memory pricing.
         // Previously both were None and KV math short-circuited.
         assert!(e.num_kv_heads.is_some() && e.head_dim.is_some());
-    }
-
-    #[test]
-    fn llama4_has_zero_coeff() {
-        let e = lookup_model("meta-llama/Llama-4-Maverick-17B-128E-Instruct").expect("catalog hit");
-        assert_eq!(e.attn_flops_coeff, Some(0));
     }
 }

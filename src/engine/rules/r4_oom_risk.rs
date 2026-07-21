@@ -38,6 +38,26 @@ pub fn r4_recommendation(
     gpu_memory_utilization: Option<f64>,
     weight_dtype_source: WeightDtypeSource,
 ) -> Option<Recommendation> {
+    r4_recommendation_with_request_floor(
+        kv_headroom_gb,
+        tensor_parallel_size,
+        weight_gb,
+        vram_gb,
+        gpu_memory_utilization,
+        weight_dtype_source,
+        None,
+    )
+}
+
+pub(super) fn r4_recommendation_with_request_floor(
+    kv_headroom_gb: Option<f64>,
+    tensor_parallel_size: Option<u32>,
+    weight_gb: Option<f64>,
+    vram_gb: Option<f64>,
+    gpu_memory_utilization: Option<f64>,
+    weight_dtype_source: WeightDtypeSource,
+    request_bytes: Option<u64>,
+) -> Option<Recommendation> {
     let h = kv_headroom_gb?;
     if !h.is_finite() {
         return None;
@@ -46,7 +66,46 @@ pub fn r4_recommendation(
         return None;
     }
     if h >= 0.0 {
-        return None;
+        let request_bytes = request_bytes?;
+        let free_bytes = (h * 1e9) as u64;
+        if free_bytes >= request_bytes {
+            return None;
+        }
+        let confidence = confidence_for_source(weight_dtype_source);
+        let gpu_util = gpu_memory_utilization.unwrap_or(DEFAULT_GPU_MEMORY_UTILIZATION);
+        let can_raise_utilization = vram_gb.is_some_and(|vram| {
+            gpu_util < 1.0 && (h + vram * (1.0 - gpu_util)) * 1e9 >= request_bytes as f64
+        });
+        let fix_line = if can_raise_utilization {
+            "      • Raise --gpu-memory-utilization enough to hold one worst-case request"
+                .to_string()
+        } else {
+            "      • Use a smaller model or a GPU with more VRAM".to_string()
+        };
+        return Some(Recommendation {
+            rule_name: rule_names::OOM_RISK,
+            layer: 2,
+            impact: 5,
+            confidence,
+            display_lines: vec![
+                "[!] OOM Risk".to_string(),
+                String::new(),
+                "    Cause:".to_string(),
+                "      • Free VRAM after weights and the activation allowance cannot hold a single request's KV + state."
+                    .to_string(),
+                format!(
+                    "      • {:.1}GB free; one worst-case request needs {:.1}GB (est).",
+                    h,
+                    request_bytes as f64 / 1e9
+                ),
+                String::new(),
+                "    Fix:".to_string(),
+                fix_line,
+                String::new(),
+                "    Expected: Model and one request fit in VRAM.".to_string(),
+                format!("    Confidence: {}", confidence_label(confidence)),
+            ],
+        });
     }
     let overflow = h.abs();
     let confidence = confidence_for_source(weight_dtype_source);
@@ -191,6 +250,35 @@ mod tests {
         let text = r.display_lines.join("\n");
         assert!(text.contains("TP=4 should fit weights"));
         assert!(text.contains("KV cache or activation memory is exhausted"));
+    }
+
+    #[test]
+    fn request_floor_fires_only_when_one_request_exceeds_free_vram() {
+        let with_whiteboard = r4_recommendation_with_request_floor(
+            Some(0.05),
+            Some(1),
+            Some(20.0),
+            Some(24.0),
+            Some(0.9),
+            WeightDtypeSource::Catalog,
+            Some(60_000_000),
+        )
+        .expect("one request should not fit");
+        let text = with_whiteboard.display_lines.join("\n");
+        assert!(text.contains("cannot hold a single request's KV + state"));
+        assert!(text.contains("Raise --gpu-memory-utilization"));
+        assert!(!text.contains("tensor-parallel"));
+
+        let without_whiteboard = r4_recommendation_with_request_floor(
+            Some(0.05),
+            Some(1),
+            Some(20.0),
+            Some(24.0),
+            Some(0.9),
+            WeightDtypeSource::Catalog,
+            Some(40_000_000),
+        );
+        assert!(without_whiteboard.is_none());
     }
 
     #[test]

@@ -18,7 +18,7 @@ use super::r3_low_prefix_reuse::{
     LowPrefixReuseDetail, Rule3Outcome, aggregate_r3_detail, format_low_prefix_window_issue,
     rule3_low_prefix_reuse,
 };
-use super::r4_oom_risk::r4_recommendation;
+use super::r4_oom_risk::r4_recommendation_with_request_floor;
 use super::r5_concurrency_saturation::{
     ConcurrencySaturationDetail, aggregate_concurrency_saturation_detail,
     format_concurrency_saturation_window_issue, r5_confidence, rule5_concurrency_saturation,
@@ -33,7 +33,7 @@ use super::r7_config_headroom::{
     rule7_config_headroom,
 };
 use super::{
-    Recommendation, catalog_state_pages_mismatch, compute_kv_max_seqs, recommended_seqs,
+    Recommendation, catalog_state_pages_mismatch, compute_kv_max_seqs_for_cache, recommended_seqs,
     resolve_kv_bound, rule_is_significant, rule_names,
 };
 
@@ -348,7 +348,7 @@ fn eval_window_rules(
         // Per-window derived KV bound from this window's baseline headroom. Firing
         // uses Observed else derived else this window's empirical; the displayed
         // recommendation is overridden at report time with the run-level resolution.
-        let win_derived = compute_kv_max_seqs(
+        let win_derived = compute_kv_max_seqs_for_cache(
             win_baseline.as_ref().and_then(|b| b.kv_headroom_gb),
             summary.ctx.config.max_model_len,
             &summary.ctx.model,
@@ -361,7 +361,9 @@ fn eval_window_rules(
                 .as_ref()
                 .map(|b| b.weight_bytes_per_param)
                 .unwrap_or(2),
-        );
+            &snap.vllm.cache_config,
+        )
+        .max_seqs;
         if let Some(d) = rule7_config_headroom(
             snap,
             summary.ctx.config.max_num_seqs,
@@ -389,7 +391,7 @@ fn build_report_from_eval(
     baseline: Option<baseline::PhysicsBaseline>,
 ) -> Report {
     if eval.n_eval == 0 {
-        let kv_max_seqs = compute_kv_max_seqs(
+        let derived = compute_kv_max_seqs_for_cache(
             baseline.as_ref().and_then(|b| b.kv_headroom_gb),
             summary.ctx.config.max_model_len,
             &summary.ctx.model,
@@ -402,18 +404,20 @@ fn build_report_from_eval(
                 .as_ref()
                 .map(|b| b.weight_bytes_per_param)
                 .unwrap_or(2),
+            &summary.window.snapshot.vllm.cache_config,
         );
         return Report {
             baseline,
             recommendations: Vec::new(),
             suppressed_rules: Vec::new(),
-            kv_max_seqs,
+            kv_max_seqs: derived.max_seqs,
             prescribed_kv_capacity: None,
             catalog_state_mismatch: catalog_state_pages_mismatch(
                 &summary.window.snapshot.vllm.cache_config,
                 summary.ctx.config.max_model_len,
                 &summary.ctx.model,
             ),
+            memory_budget_self_grade: derived.budget_self_grade,
             n_eval: 0,
             skipped_broken: eval.skipped_broken,
             skipped_idle: eval.skipped_idle,
@@ -436,14 +440,16 @@ fn build_report_from_eval(
         summary.window.snapshot.collected_gpu_count(),
     );
     // Derived ceiling for R5 / verbose / Report.kv_max_seqs. R2 prefers observed.
-    let kv_max_seqs: Option<u32> = compute_kv_max_seqs(
+    let derived_capacity = compute_kv_max_seqs_for_cache(
         kv_headroom_gb,
         max_model_len,
         &summary.ctx.model,
         summary.ctx.config.kv_cache_dtype.as_deref(),
         tp,
         weight_bytes_per_param,
+        &summary_snap.vllm.cache_config,
     );
+    let kv_max_seqs = derived_capacity.max_seqs;
     let (r2_kv_max_seqs, r2_capacity_label) = resolve_r2_kv_capacity(
         summary_snap.vllm.cache_config.kv_cache_max_concurrency,
         kv_max_seqs,
@@ -649,12 +655,18 @@ fn build_report_from_eval(
         });
     }
 
-    if let Some(r4) = r4_recommendation(
+    let request_bytes = if tp.is_none_or(|value| value <= 1) {
+        let kv_bpp = baseline::kv_bytes_per_element(
+            summary.ctx.config.kv_cache_dtype.as_deref(),
+            weight_bytes_per_param,
+        );
+        max_model_len.and_then(|len| baseline::bytes_per_seq(&summary.ctx.model, len, kv_bpp))
+    } else {
+        None
+    };
+    if let Some(r4) = r4_recommendation_with_request_floor(
         baseline.as_ref().and_then(|b| b.kv_headroom_gb),
-        effective_tensor_parallel(
-            summary.ctx.config.tensor_parallel_size,
-            summary.window.snapshot.collected_gpu_count(),
-        ),
+        tp,
         baseline.as_ref().map(|b| b.weight_gb),
         summary.ctx.gpu.vram_gb,
         summary.ctx.config.gpu_memory_utilization,
@@ -662,6 +674,7 @@ fn build_report_from_eval(
             .as_ref()
             .map(|b| b.weight_dtype_source)
             .unwrap_or(WeightDtypeSource::Fallback),
+        request_bytes,
     ) {
         recs.push(r4);
     }
@@ -669,13 +682,16 @@ fn build_report_from_eval(
     finalize_report_groups(
         recs,
         baseline,
-        kv_max_seqs,
-        prescribed_kv_capacity,
-        catalog_state_pages_mismatch(
-            &summary_snap.vllm.cache_config,
-            max_model_len,
-            &summary.ctx.model,
-        ),
+        ReportCapacityMetadata {
+            kv_max_seqs,
+            prescribed_kv_capacity,
+            catalog_state_mismatch: catalog_state_pages_mismatch(
+                &summary_snap.vllm.cache_config,
+                max_model_len,
+                &summary.ctx.model,
+            ),
+            memory_budget_self_grade: derived_capacity.budget_self_grade,
+        },
         eval.n_eval,
         crate::engine::EvalSkipStats {
             skipped_broken: eval.skipped_broken,
@@ -687,15 +703,26 @@ fn build_report_from_eval(
     )
 }
 
-pub(crate) fn finalize_report_groups(
-    recs: Vec<Recommendation>,
-    baseline: Option<baseline::PhysicsBaseline>,
+struct ReportCapacityMetadata {
     kv_max_seqs: Option<u32>,
     prescribed_kv_capacity: Option<u32>,
     catalog_state_mismatch: Option<(u64, u64)>,
+    memory_budget_self_grade: Option<(u64, u64)>,
+}
+
+fn finalize_report_groups(
+    recs: Vec<Recommendation>,
+    baseline: Option<baseline::PhysicsBaseline>,
+    capacity: ReportCapacityMetadata,
     n_eval: usize,
     skips: crate::engine::EvalSkipStats,
 ) -> Report {
+    let ReportCapacityMetadata {
+        kv_max_seqs,
+        prescribed_kv_capacity,
+        catalog_state_mismatch,
+        memory_budget_self_grade,
+    } = capacity;
     let mut suppressed_rules = Vec::new();
     let Some(min_layer) = recs.iter().map(|r| r.layer).min() else {
         return Report {
@@ -705,6 +732,7 @@ pub(crate) fn finalize_report_groups(
             kv_max_seqs,
             prescribed_kv_capacity: None,
             catalog_state_mismatch,
+            memory_budget_self_grade,
             n_eval,
             skipped_broken: skips.skipped_broken,
             skipped_idle: skips.skipped_idle,
@@ -770,6 +798,7 @@ pub(crate) fn finalize_report_groups(
         kv_max_seqs,
         prescribed_kv_capacity,
         catalog_state_mismatch,
+        memory_budget_self_grade,
         n_eval,
         skipped_broken: skips.skipped_broken,
         skipped_idle: skips.skipped_idle,
@@ -791,6 +820,7 @@ pub fn build_report_for_windows(windows: &[RuntimeWindow], summary: AnalysisInpu
             kv_max_seqs: None,
             prescribed_kv_capacity: None,
             catalog_state_mismatch: None,
+            memory_budget_self_grade: None,
             n_eval: 0,
             skipped_broken: windows.len(),
             skipped_idle: 0,

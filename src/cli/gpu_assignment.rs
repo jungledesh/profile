@@ -110,6 +110,95 @@ fn resolve_gpu_assignment_inner(
     cli_tp: Option<u32>,
     url: &str,
 ) -> anyhow::Result<GpuAssignment> {
+    resolve_gpu_assignment_inner_with_mode(
+        host_count,
+        scan,
+        cli_tp,
+        url,
+        crate::engine::MULTI_GPU_TP,
+    )
+}
+
+fn multi_gpu_serving_refusal(n: u32) -> String {
+    format!(
+        "Profile v2 measures single-GPU deployments. vLLM is serving across {n} GPUs \
+         (tensor parallelism). Multi-GPU support is planned; run Profile against a \
+         single-GPU deployment."
+    )
+}
+
+fn unidentified_vllm_gpu_note(idx: u32) -> String {
+    format!("Could not identify vLLM's GPU; measuring GPU {idx}.")
+}
+
+/// GPUs that hold any of `pids`, sorted unique.
+#[cfg(any(test, target_os = "linux"))]
+fn gpu_indices_holding_pids(snapshots: &[GpuSnapshot], pids: &HashSet<u32>) -> Vec<u32> {
+    let mut found = BTreeSet::new();
+    for snap in snapshots {
+        if snap.pids.iter().any(|p| pids.contains(p)) {
+            found.insert(snap.idx);
+        }
+    }
+    found.into_iter().collect()
+}
+
+/// Launch-scope assignment: one GPU, TP=1. Prefers the GPU vLLM is on.
+fn resolve_launch_single_gpu(
+    host_count: Option<u32>,
+    scan: Option<Vec<GpuScanEntry>>,
+    cli_tp: Option<u32>,
+    detected_vllm_gpus: Option<Vec<u32>>,
+) -> anyhow::Result<GpuAssignment> {
+    match host_count {
+        None => anyhow::bail!("GPU driver unavailable. Is the driver installed?"),
+        Some(0) => anyhow::bail!("No GPUs detected."),
+        Some(_) => {
+            if let Some(tp) = cli_tp
+                && tp > 1
+            {
+                anyhow::bail!(multi_gpu_serving_refusal(tp));
+            }
+            let fallback_idx = scan
+                .as_ref()
+                .and_then(|entries| entries.first())
+                .map(|entry| entry.idx)
+                .unwrap_or(0);
+            match detected_vllm_gpus.as_deref() {
+                Some([idx]) => Ok(GpuAssignment {
+                    tp: 1,
+                    indices: vec![*idx],
+                }),
+                Some(many) if many.len() > 1 => {
+                    anyhow::bail!(multi_gpu_serving_refusal(many.len() as u32));
+                }
+                _ => {
+                    eprintln!("{}", unidentified_vllm_gpu_note(fallback_idx));
+                    Ok(GpuAssignment {
+                        tp: 1,
+                        indices: vec![fallback_idx],
+                    })
+                }
+            }
+        }
+    }
+}
+
+fn resolve_gpu_assignment_inner_with_mode(
+    host_count: Option<u32>,
+    scan: Option<Vec<GpuScanEntry>>,
+    cli_tp: Option<u32>,
+    url: &str,
+    multi_gpu_tp: bool,
+) -> anyhow::Result<GpuAssignment> {
+    if !multi_gpu_tp {
+        let snapshots = scan.as_ref().map(|entries| snapshots_from_scan(entries));
+        let detected = snapshots
+            .as_ref()
+            .and_then(|rows| detect_vllm_gpu_indices(rows));
+        return resolve_launch_single_gpu(host_count, scan, cli_tp, detected);
+    }
+
     match host_count {
         None => {
             if let Some(tp) = cli_tp {
@@ -166,7 +255,13 @@ pub(crate) fn resolve_gpu_assignment_for_host(
     cli_tp: Option<u32>,
     url: &str,
 ) -> anyhow::Result<GpuAssignment> {
-    resolve_gpu_assignment_inner(host_count, None, cli_tp, url)
+    resolve_gpu_assignment_inner_with_mode(
+        host_count,
+        None,
+        cli_tp,
+        url,
+        crate::engine::MULTI_GPU_TP,
+    )
 }
 
 fn run_pipeline(
@@ -305,8 +400,7 @@ fn vram_heuristic_from_fracs_inner(
 /// More reliable than /proc socket walking - /proc/{pid}/cmdline is world-readable
 /// even when /proc/{pid}/fd/ is not.
 #[cfg(target_os = "linux")]
-fn ps_tiebreaker(snapshots: &[GpuSnapshot], known_tp: Option<u32>) -> Option<GpuAssignment> {
-    // Build pid → [gpu_indices] map from GPU snapshots.
+fn detect_vllm_gpu_indices(snapshots: &[GpuSnapshot]) -> Option<Vec<u32>> {
     let mut pid_to_gpus: HashMap<u32, Vec<u32>> = HashMap::new();
     for snap in snapshots {
         for &pid in &snap.pids {
@@ -334,7 +428,7 @@ fn ps_tiebreaker(snapshots: &[GpuSnapshot], known_tp: Option<u32>) -> Option<Gpu
 
     // ps -f columns: UID PID PPID C STIME TTY TIME CMD...
     // Skip header; match lines where the full command contains "vllm".
-    let mut gpu_indices: BTreeSet<u32> = BTreeSet::new();
+    let mut vllm_pids = HashSet::new();
     for line in stdout.lines().skip(1) {
         if !line.contains("vllm") {
             continue;
@@ -342,16 +436,25 @@ fn ps_tiebreaker(snapshots: &[GpuSnapshot], known_tp: Option<u32>) -> Option<Gpu
         let mut fields = line.split_whitespace();
         let _uid = fields.next();
         let pid: u32 = fields.next().and_then(|s| s.parse().ok())?;
-        if let Some(gpus) = pid_to_gpus.get(&pid) {
-            gpu_indices.extend(gpus);
+        if pid_to_gpus.contains_key(&pid) {
+            vllm_pids.insert(pid);
         }
     }
-
-    if gpu_indices.is_empty() {
+    if vllm_pids.is_empty() {
         return None;
     }
+    let indices = gpu_indices_holding_pids(snapshots, &vllm_pids);
+    (!indices.is_empty()).then_some(indices)
+}
 
-    let indices: Vec<u32> = gpu_indices.into_iter().collect();
+#[cfg(not(target_os = "linux"))]
+fn detect_vllm_gpu_indices(_snapshots: &[GpuSnapshot]) -> Option<Vec<u32>> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn ps_tiebreaker(snapshots: &[GpuSnapshot], known_tp: Option<u32>) -> Option<GpuAssignment> {
+    let indices = detect_vllm_gpu_indices(snapshots)?;
     let tp = indices.len() as u32;
 
     if let Some(expected) = known_tp
@@ -566,17 +669,159 @@ mod tests {
     }
 
     #[test]
+    fn gpu_indices_holding_pids_maps_vllm_pids_to_gpus() {
+        let snapshots = snapshots_from_scan(&[
+            GpuScanEntry {
+                idx: 0,
+                name: "GPU0".into(),
+                vram_used_mb: 0,
+                vram_total_mb: 1024,
+                pids: vec![10],
+            },
+            GpuScanEntry {
+                idx: 2,
+                name: "GPU2".into(),
+                vram_used_mb: 0,
+                vram_total_mb: 1024,
+                pids: vec![20, 21],
+            },
+        ]);
+        let mut pids = HashSet::new();
+        pids.insert(20);
+        assert_eq!(gpu_indices_holding_pids(&snapshots, &pids), vec![2]);
+        pids.insert(10);
+        assert_eq!(gpu_indices_holding_pids(&snapshots, &pids), vec![0, 2]);
+    }
+
+    #[test]
+    fn launch_picks_single_gpu_with_vllm_pids() {
+        let scan = Some(vec![
+            GpuScanEntry {
+                idx: 0,
+                name: "NVIDIA H100".into(),
+                vram_used_mb: 100,
+                vram_total_mb: 80 * 1024,
+                pids: vec![],
+            },
+            GpuScanEntry {
+                idx: 1,
+                name: "NVIDIA H100".into(),
+                vram_used_mb: 100,
+                vram_total_mb: 80 * 1024,
+                pids: vec![],
+            },
+            GpuScanEntry {
+                idx: 2,
+                name: "NVIDIA H100".into(),
+                vram_used_mb: 40_000,
+                vram_total_mb: 80 * 1024,
+                pids: vec![4242],
+            },
+        ]);
+        let assignment = resolve_launch_single_gpu(Some(3), scan, None, Some(vec![2]))
+            .expect("single-GPU launch");
+        assert_eq!(
+            assignment,
+            GpuAssignment {
+                tp: 1,
+                indices: vec![2],
+            }
+        );
+    }
+
+    #[test]
+    fn launch_refuses_vllm_on_multiple_gpus() {
+        let err = resolve_launch_single_gpu(
+            Some(2),
+            Some(vec![
+                GpuScanEntry {
+                    idx: 0,
+                    name: "NVIDIA H100".into(),
+                    vram_used_mb: 40_000,
+                    vram_total_mb: 80 * 1024,
+                    pids: vec![100],
+                },
+                GpuScanEntry {
+                    idx: 1,
+                    name: "NVIDIA H100".into(),
+                    vram_used_mb: 40_000,
+                    vram_total_mb: 80 * 1024,
+                    pids: vec![100],
+                },
+            ]),
+            None,
+            Some(vec![0, 1]),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("serving across 2 GPUs"));
+        assert!(msg.contains("single-GPU deployments"));
+    }
+
+    #[test]
+    fn launch_refuses_cli_tp_above_one() {
+        let err = resolve_launch_single_gpu(Some(2), None, Some(2), None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("serving across 2 GPUs"));
+        assert_eq!(msg, multi_gpu_serving_refusal(2));
+    }
+
+    #[test]
+    fn launch_falls_back_to_first_gpu_when_vllm_unidentified() {
+        let scan = Some(vec![
+            GpuScanEntry {
+                idx: 3,
+                name: "NVIDIA H100".into(),
+                vram_used_mb: 100,
+                vram_total_mb: 80 * 1024,
+                pids: vec![],
+            },
+            GpuScanEntry {
+                idx: 5,
+                name: "NVIDIA H100".into(),
+                vram_used_mb: 100,
+                vram_total_mb: 80 * 1024,
+                pids: vec![],
+            },
+        ]);
+        let assignment =
+            resolve_launch_single_gpu(Some(2), scan, None, None).expect("fallback single-GPU");
+        assert_eq!(
+            assignment,
+            GpuAssignment {
+                tp: 1,
+                indices: vec![3],
+            }
+        );
+        assert_eq!(
+            unidentified_vllm_gpu_note(3),
+            "Could not identify vLLM's GPU; measuring GPU 3."
+        );
+    }
+
+    #[test]
     fn resolve_cli_tp_exceeds_host_bails() {
-        let err =
-            resolve_gpu_assignment_for_host(Some(2), Some(4), "http://localhost:8000/metrics")
-                .unwrap_err();
+        let err = resolve_gpu_assignment_inner_with_mode(
+            Some(2),
+            None,
+            Some(4),
+            "http://localhost:8000/metrics",
+            true,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("exceeds detected GPU count"));
     }
 
     #[test]
     fn resolve_cli_tp_without_driver_uses_flag() {
-        let a = resolve_gpu_assignment_for_host(None, Some(1), "http://localhost:8000/metrics")
-            .unwrap();
+        let a = resolve_gpu_assignment_inner_with_mode(
+            None,
+            None,
+            Some(1),
+            "http://localhost:8000/metrics",
+            true,
+        )
+        .unwrap();
         assert_eq!(a.tp, 1);
         assert_eq!(a.indices, vec![0]);
     }
@@ -597,9 +842,14 @@ mod tests {
 
     #[test]
     fn resolve_single_gpu_rejects_cli_tp_above_one() {
-        let err =
-            resolve_gpu_assignment_for_host(Some(1), Some(2), "http://localhost:8000/metrics")
-                .unwrap_err();
+        let err = resolve_gpu_assignment_inner_with_mode(
+            Some(1),
+            None,
+            Some(2),
+            "http://localhost:8000/metrics",
+            true,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("exceeds detected GPU count (1)"));
     }
 

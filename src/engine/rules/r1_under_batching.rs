@@ -194,7 +194,7 @@ fn r1_fix_line(idle: f64, binding_wall: R1BindingWall) -> String {
             "      • Batch more requests or increase client concurrency ({idle:.0} slots idle before hardware degrades TPOT)"
         ),
         R1BindingWall::Memory { cap } => format!(
-            "      • Batch more requests or increase client concurrency ({idle:.0} slots idle; memory fits {cap} concurrent, worst case)"
+            "      • Batch more requests or increase client concurrency ({idle:.0} slots idle; memory fits {cap} worst-case requests)"
         ),
     }
 }
@@ -772,7 +772,7 @@ mod tests {
                 let idle = (d.effective_max - d.running).max(0.0);
                 assert!((idle - 29.0).abs() < 1e-9);
                 let text = format_under_batching_fired(&d, 0.8, false).join("\n");
-                assert!(text.contains("29 slots idle; memory fits 35 concurrent, worst case"));
+                assert!(text.contains("29 slots idle; memory fits 35 worst-case requests"));
                 assert!(!text.contains("before hardware degrades TPOT"));
             }
             Rule1Outcome::NotFired => panic!("expected memory-bound under-batching"),

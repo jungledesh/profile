@@ -264,6 +264,7 @@ mod tests {
             kv_max_seqs: None,
             prescribed_kv_capacity: None,
             catalog_state_mismatch: None,
+            memory_budget_self_grade: None,
             n_eval: 0,
             skipped_broken: 0,
             skipped_idle: 0,

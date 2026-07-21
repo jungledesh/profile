@@ -173,6 +173,23 @@ fn catalog_state_mismatch_verbose_line(
     ))
 }
 
+fn memory_budget_self_grade_verbose_line(
+    grade: Option<(u64, u64)>,
+    verbose_rules: bool,
+) -> Option<String> {
+    if !verbose_rules {
+        return None;
+    }
+    let (observed, estimated) = grade?;
+    let observed_gb = observed as f64 / 1e9;
+    let estimated_gb = estimated as f64 / 1e9;
+    let gap_gb = observed_gb - estimated_gb;
+    Some(format!(
+        "Note: Request-memory budget {observed_gb:.1}GB vLLM-reported, \
+         {estimated_gb:.1}GB estimated (3GB allowance), gap {gap_gb:+.1}GB."
+    ))
+}
+
 /// Parameters for the idle-state load generation hint.
 pub struct LoadHintParams<'a> {
     pub model_name: Option<&'a str>,
@@ -617,6 +634,11 @@ pub fn format_diagnose_rules_for_windows(
     {
         append_display_block(&mut out, vec![line]);
     }
+    if let Some(line) =
+        memory_budget_self_grade_verbose_line(report.memory_budget_self_grade, verbose_rules)
+    {
+        append_display_block(&mut out, vec![line]);
+    }
 
     let not_fired = not_triggered_from_fired_names(
         &fired_names,
@@ -999,7 +1021,7 @@ mod load_hint_tests {
 
 #[cfg(test)]
 mod catalog_mismatch_note_tests {
-    use super::catalog_state_mismatch_verbose_line;
+    use super::{catalog_state_mismatch_verbose_line, memory_budget_self_grade_verbose_line};
 
     #[test]
     fn verbose_only_on_mismatch() {
@@ -1010,5 +1032,16 @@ mod catalog_mismatch_note_tests {
             line,
             "Note: Catalog state 7 pages, observed 3; entry may be stale."
         );
+    }
+
+    #[test]
+    fn memory_budget_self_grade_names_both_sources_and_gap() {
+        assert!(memory_budget_self_grade_verbose_line(Some((12, 10)), false).is_none());
+        let line =
+            memory_budget_self_grade_verbose_line(Some((12_000_000_000, 10_000_000_000)), true)
+                .expect("verbose self-grade");
+        assert!(line.contains("12.0GB vLLM-reported"));
+        assert!(line.contains("10.0GB estimated (3GB allowance)"));
+        assert!(line.contains("gap +2.0GB"));
     }
 }

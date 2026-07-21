@@ -2,7 +2,7 @@ use std::time::SystemTime;
 
 use profile::{
     collectors::{GpuRawMetrics, RawSnapshot, VllmConfig, VllmRawMetrics},
-    context::{AnalysisInput, RuntimeWindow, StaticContext},
+    context::{AnalysisInput, ModelArch, RuntimeWindow, StaticContext},
     engine::baseline::compute,
 };
 
@@ -30,21 +30,32 @@ fn build_input(
             ..Default::default()
         }],
     };
-    let ctx = StaticContext::from_snapshot(&snap, cfg);
+    let mut ctx = StaticContext::from_snapshot(&snap, cfg);
+    if model_name == "test/Llama-3.1-70B" {
+        ctx.model = ModelArch {
+            param_count: Some(70_000_000_000),
+            num_layers: Some(80),
+            hidden_dim: Some(8192),
+            default_weight_dtype: Some("bf16".to_string()),
+            num_kv_heads: Some(8),
+            head_dim: Some(128),
+            ..Default::default()
+        };
+    }
     let win = RuntimeWindow::from_snapshot(snap);
     (ctx, win)
 }
 
 #[test]
 fn h100_sxm_llama3_70b_decode_ceiling_is_about_23_9_tok_s() {
-    // Assumes catalog: H100 SXM bandwidth = 3350 GB/s, Llama-3 70B params, bf16 = 2 bytes.
+    // H100 SXM bandwidth = 3350 GB/s; synthetic Llama-3 70B geometry; bf16 = 2 bytes.
     let cfg = VllmConfig {
         dtype: Some("bf16".to_string()),
         max_model_len: Some(2048),
         ..Default::default()
     };
     let (ctx, win) = build_input(
-        "meta-llama/Llama-3.1-70B-Instruct",
+        "test/Llama-3.1-70B",
         "NVIDIA H100 80GB HBM3",
         cfg,
         Some(2048.0),
@@ -100,14 +111,14 @@ fn h100_sxm_llama3_8b_decode_ceiling_is_about_209_tok_s() {
 
 #[test]
 fn a100_80gb_llama3_70b_decode_ceiling_is_about_14_6_tok_s() {
-    // Assumes catalog: A100 80GB bandwidth = 2039 GB/s, Llama-3 70B params, bf16 = 2 bytes.
+    // A100 80GB bandwidth = 2039 GB/s; synthetic Llama-3 70B geometry; bf16 = 2 bytes.
     let cfg = VllmConfig {
         dtype: Some("bf16".to_string()),
         max_model_len: Some(2048),
         ..Default::default()
     };
     let (ctx, win) = build_input(
-        "meta-llama/Llama-3.1-70B-Instruct",
+        "test/Llama-3.1-70B",
         "NVIDIA A100-SXM4-80GB",
         cfg,
         Some(2048.0),
@@ -134,7 +145,7 @@ fn compute_returns_none_when_gpu_not_in_catalog() {
         ..Default::default()
     };
     let (ctx, win) = build_input(
-        "meta-llama/Llama-3.1-70B-Instruct",
+        "test/Llama-3.1-70B",
         "NVIDIA Tesla V100",
         cfg,
         Some(2048.0),
@@ -172,7 +183,7 @@ fn prefill_is_none_when_seq_len_unavailable() {
         ..Default::default()
     };
     let (ctx, win) = build_input(
-        "meta-llama/Llama-3.1-70B-Instruct",
+        "test/Llama-3.1-70B",
         "NVIDIA H100 80GB HBM3",
         cfg,
         None,
@@ -197,7 +208,7 @@ fn efficiency_is_none_when_actual_tps_missing() {
         ..Default::default()
     };
     let (ctx, win) = build_input(
-        "meta-llama/Llama-3.1-70B-Instruct",
+        "test/Llama-3.1-70B",
         "NVIDIA H100 80GB HBM3",
         cfg,
         Some(2048.0),
@@ -223,7 +234,7 @@ fn efficiency_clamped_at_100_when_above_hardware_ceiling() {
         ..Default::default()
     };
     let (ctx, win) = build_input(
-        "meta-llama/Llama-3.1-70B-Instruct",
+        "test/Llama-3.1-70B",
         "NVIDIA H100 80GB HBM3",
         cfg,
         Some(2048.0),
@@ -255,7 +266,7 @@ fn efficiency_some_in_zero_to_100_when_below_ceiling() {
         ..Default::default()
     };
     let (ctx, win) = build_input(
-        "meta-llama/Llama-3.1-70B-Instruct",
+        "test/Llama-3.1-70B",
         "NVIDIA H100 80GB HBM3",
         cfg,
         Some(2048.0),

@@ -33,6 +33,10 @@ pub struct ModelArch {
     pub linear_value_head_dim: Option<u32>,
     pub linear_conv_kernel_dim: Option<u32>,
     pub state_dtype: Option<String>,
+    /// Sliding-window size in tokens. `None` means no windowed layers.
+    pub swa_window: Option<u32>,
+    /// Number of layers whose transcript is capped by `swa_window`.
+    pub num_swa_layers: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -108,6 +112,8 @@ impl StaticContext {
                 linear_value_head_dim: e.linear_value_head_dim,
                 linear_conv_kernel_dim: e.linear_conv_kernel_dim,
                 state_dtype: e.state_dtype.map(str::to_string),
+                swa_window: e.swa_window,
+                num_swa_layers: e.num_swa_layers,
             },
             None => ModelArch::default(),
         };

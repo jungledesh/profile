@@ -19,6 +19,18 @@ Profile is not a passive dashboard. It is an interactive optimization loop. It a
 - vLLM running with `/metrics` reachable (default `http://localhost:8000/metrics`).
 - Active production-like load during the `--duration` window. Idle servers produce no signal.
 
+### Launch support
+
+Profile launch supports single-GPU deployments only. Multi-GPU support is on the roadmap.
+
+| GPU memory | Supported models |
+| --- | --- |
+| 80 GB | Qwen3 32B; Qwen2.5 32B; DeepSeek-R1-Distill 32B; GLM 32B; Gemma 4 31B/27B/26B; Qwen3 30B-A3B; Qwen3.6 27B; Gemma 3 27B; Gemma 2 27B |
+| 48 GB | Qwen3 14B; Qwen2.5 14B; DeepSeek-R1-Distill 14B; Phi-4 14B; Gemma 3 12B; Gemma 2 9B |
+| 24 GB | Llama 3 8B; Qwen3 8B/4B/1.7B/0.6B; Nemotron 8B; DeepSeek-R1-Distill 8B/7B/1.5B; Qwen2.5 7B; DeepSeek 7B; Mistral 7B; Gemma 3 4B/1B |
+
+Context limits depend on KV dtype and runtime configuration. With bf16 KV, the 32B dense models on 80 GB support about 18K tokens for one request, and Llama 3 8B on 24 GB supports about 19K tokens.
+
 ### Install & Run
 ```bash
 # Download

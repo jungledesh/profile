@@ -155,7 +155,7 @@ fn walls_fix_lines(
                     format!("80% of memory limit {cap}, vLLM-reported")
                 }
                 Some(KvBoundSource::Derived) | Some(KvBoundSource::DerivedHybrid) => {
-                    format!("80% of memory limit ~{cap}, est")
+                    format!("80% margin below {cap} worst-case requests that fit (est)")
                 }
                 Some(KvBoundSource::Empirical) => "est".to_string(),
                 None => format!("80% of memory limit {cap}"),
@@ -189,7 +189,7 @@ fn walls_fix_lines(
             let limit = match rec.source {
                 Some(KvBoundSource::Observed) => format!("memory limit ({cap}, vLLM-reported)"),
                 Some(KvBoundSource::Derived) | Some(KvBoundSource::DerivedHybrid) => {
-                    format!("memory limit (~{cap}, est)")
+                    format!("point where {cap} worst-case requests fit (est)")
                 }
                 Some(KvBoundSource::Empirical) => format!("memory limit (~{cap}, est)"),
                 None => format!("memory limit ({cap})"),
@@ -592,7 +592,7 @@ mod tests {
             None,
         )
         .join("\n");
-        assert!(text.contains("at memory limit (~13, est)"));
+        assert!(text.contains("at point where 13 worst-case requests fit (est)"));
         assert!(text.contains("Lower --max-model-len 8192 → 6450"));
         assert!(text.contains("Truncation risk"));
         assert!(!text.contains("free KV blocks"));
@@ -907,7 +907,7 @@ mod tests {
         )
         .expect("fired");
         let text = r.display_lines.join("\n");
-        assert!(text.contains("at memory limit (~15, est)"));
+        assert!(text.contains("at point where 15 worst-case requests fit (est)"));
         assert!(!text.contains("Raise --max-num-seqs to"));
     }
 
@@ -924,7 +924,9 @@ mod tests {
         )
         .expect("fired");
         let text = r.display_lines.join("\n");
-        assert!(text.contains("Raise --max-num-seqs to 12 (80% of memory limit ~15, est)"));
+        assert!(text.contains(
+            "Raise --max-num-seqs to 12 (80% margin below 15 worst-case requests that fit (est))"
+        ));
     }
 
     #[test]
@@ -943,7 +945,7 @@ mod tests {
         let text =
             format_concurrency_saturation_issue(&d, Some(8192), Some(&rec), &blank_snap(), None)
                 .join("\n");
-        assert!(text.contains("at memory limit (~15, est)"));
+        assert!(text.contains("at point where 15 worst-case requests fit (est)"));
         assert!(!text.contains("Raise --max-num-seqs to"));
     }
 
@@ -964,7 +966,7 @@ mod tests {
             format_concurrency_saturation_issue(&d, Some(8192), Some(&rec), &blank_snap(), None)
                 .join("\n");
         assert!(
-            text.contains("at memory limit (~15, est)"),
+            text.contains("at point where 15 worst-case requests fit (est)"),
             "display must name memory limit when at cap"
         );
         assert!(
@@ -989,7 +991,9 @@ mod tests {
         let text =
             format_concurrency_saturation_issue(&d, Some(8192), Some(&rec), &blank_snap(), None)
                 .join("\n");
-        assert!(text.contains("Raise --max-num-seqs to 12 (80% of memory limit ~15, est)"));
+        assert!(text.contains(
+            "Raise --max-num-seqs to 12 (80% margin below 15 worst-case requests that fit (est))"
+        ));
     }
 
     #[test]
@@ -1004,7 +1008,7 @@ mod tests {
             None,
         );
         let text = lines.join("\n");
-        assert!(text.contains("at memory limit (~15, est)"));
+        assert!(text.contains("at point where 15 worst-case requests fit (est)"));
         assert!(text.contains("    Cuts throughput:"));
         let cuts = text.find("    Cuts throughput:").unwrap();
         let shrink = text.find("Lower --max-model-len 8192 → 6450").unwrap();
@@ -1084,7 +1088,9 @@ mod tests {
             None,
         )
         .join("\n");
-        assert!(text.contains("Raise --max-num-seqs to 96 (80% of memory limit ~120, est)"));
+        assert!(text.contains(
+            "Raise --max-num-seqs to 96 (80% margin below 120 worst-case requests that fit (est))"
+        ));
     }
 
     // 4. current 130, ridge 153, target 122: margin zone, replica, no raise, no shrink.
@@ -1156,7 +1162,10 @@ mod tests {
             None,
         )
         .join("\n");
-        assert!(text2.contains("within safety margin of memory limit (~120, est)."));
+        assert!(
+            text2
+                .contains("within safety margin of point where 120 worst-case requests fit (est).")
+        );
         assert!(!text2.contains("vLLM-reported"));
     }
 
