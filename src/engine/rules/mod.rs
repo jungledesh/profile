@@ -35,9 +35,13 @@ pub(super) const ENGINE_MIN_WINDOW_PCT: f64 = 0.25;
 /// Inputs for projecting capacity at a hypothetical `max_model_len`.
 ///
 /// Preference order (see [`capacity_at_hypothetical_max_len`]):
-/// 1. observed-geometry page model when labels present
-/// 2. attention-only catalog math when labels absent
-/// 3. no number (caller stays directional)
+/// 1. labels present, page model plausible → observed-geometry projection; a
+///    fits-none projection returns no number, catalog math never overrules geometry
+/// 2. labels present, gate tripped (state_pages >= transcript pages) →
+///    no number, both tiers falsified. Catalog math shares the assumption
+///    the gate disproved.
+/// 3. labels absent or degenerate → attention-only catalog math
+/// 4. otherwise → no number (caller stays directional)
 ///
 /// Assumptions: block geometry constant across `max_model_len` (ladder-proven);
 /// NOT proven constant across `gpu-memory-utilization` or vLLM versions.
@@ -62,7 +66,9 @@ pub(super) fn capacity_at_hypothetical_max_len(
     current_max_len: Option<u32>,
     ctx: &HypCapacityCtx<'_>,
 ) -> Option<u32> {
-    use crate::engine::baseline::counterfactual_concurrency;
+    use crate::engine::baseline::{
+        attn_pages, counterfactual_concurrency, observed_state_pages, page_model_fits,
+    };
 
     // Hybrid ladder geometry uses mamba_block_size when present; dense uses block_size.
     let block_size = ctx.cache.mamba_block_size.or(ctx.cache.block_size);
@@ -71,12 +77,16 @@ pub(super) fn capacity_at_hypothetical_max_len(
         ctx.cache.num_gpu_blocks,
         ctx.cache.kv_cache_max_concurrency,
         current_max_len,
-    ) && let Some(c) = counterfactual_concurrency(target_max_len, bs, blocks, obs, cur)
+    ) && let Some(state_pages) = observed_state_pages(bs, blocks, obs, cur)
     {
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let n = c.floor() as u32;
-        if n > 0 {
-            return Some(n);
+        let attn_pages_current = attn_pages(cur, bs)?;
+        if !page_model_fits(state_pages, attn_pages_current) {
+            return None;
+        }
+        if let Some(c) = counterfactual_concurrency(target_max_len, bs, blocks, obs, cur) {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let n = c.floor() as u32;
+            return (n > 0).then_some(n);
         }
     }
     let model = ctx.model?;

@@ -189,7 +189,7 @@ pub fn counterfactual_concurrency(
         observed_concurrency,
         current_max_len,
     )?;
-    let attn_pages_target = u64::from(target_max_len.div_ceil(block_size));
+    let attn_pages_target = attn_pages(target_max_len, block_size)?;
     let denom = attn_pages_target.saturating_add(state_pages);
     if denom == 0 {
         return None;
@@ -217,8 +217,26 @@ pub fn observed_state_pages(
         return None;
     }
     let pages_per_seq = (f64::from(num_gpu_blocks) / observed_concurrency).round() as i64;
-    let attn_pages_current = i64::from(current_max_len.div_ceil(block_size));
+    let attn_pages_current = i64::try_from(attn_pages(current_max_len, block_size)?).ok()?;
     Some((pages_per_seq - attn_pages_current).max(0) as u64)
+}
+
+/// Transcript page cost: `ceil(max_len / block_size)`. `None` when `block_size == 0`.
+pub fn attn_pages(max_len: u32, block_size: u32) -> Option<u64> {
+    (block_size > 0).then(|| u64::from(max_len.div_ceil(block_size)))
+}
+
+/// Two-currency plausibility: fixed state must be smaller than the transcript
+/// it rides beside. `state_pages >= attn_pages_current` means the deduction is
+/// absorbing a structural mismatch (e.g. sliding-window attention), not
+/// measuring state. `state_pages` derives from `vllm:cache_config_info` labels;
+/// `attn_pages` joins the label block size with `max_model_len` from server
+/// config. No external inputs. Known conservative edge: hybrid models at short
+/// `max_model_len` (transcript <= state pages, e.g. `mamba_block_size` 784 with
+/// `max_model_len` <= ~2400) trip the gate and stay directional; designed, not
+/// a bug.
+pub fn page_model_fits(state_pages: u64, attn_pages_current: u64) -> bool {
+    state_pages < attn_pages_current
 }
 
 /// Fixed per-sequence hybrid (GDN / mamba-class) state bytes from catalog facts.
@@ -586,6 +604,31 @@ mod tests {
     fn observed_state_pages_ladder_none_and_align() {
         assert_eq!(observed_state_pages(784, 390, 8.667, 32768), Some(3));
         assert_eq!(observed_state_pages(784, 390, 8.125, 32768), Some(6));
+    }
+
+    #[test]
+    fn attn_pages_ceil_divides_and_rejects_zero_block_size() {
+        assert_eq!(attn_pages(4096, 16), Some(256));
+        assert_eq!(attn_pages(1, 784), Some(1));
+        assert_eq!(attn_pages(4096, 0), None);
+    }
+
+    #[test]
+    fn page_model_gate_rejects_state_as_large_as_transcript() {
+        assert!(!page_model_fits(42, 42));
+        assert!(!page_model_fits(1862, 512));
+    }
+
+    #[test]
+    fn page_model_gate_rejects_short_context_hybrid_edge() {
+        // Short-context hybrid: three transcript pages cannot distinguish three state pages.
+        assert!(!page_model_fits(3, 3));
+    }
+
+    #[test]
+    fn page_model_gate_accepts_ladder_and_dense_geometry() {
+        assert!(page_model_fits(3, 42));
+        assert!(page_model_fits(0, 256));
     }
 
     #[test]

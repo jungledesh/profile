@@ -571,6 +571,7 @@ fn model_len_suggestion_live_run_projection_at_5465_is_39_not_observed_8() {
 
 #[test]
 fn capacity_at_hypothetical_falls_to_catalog_when_labels_absent() {
+    // All labels absent: older vLLM with no cache_config_info scrape.
     let cache = crate::collectors::CacheConfigLabels::default();
     let model = ModelArch {
         num_kv_heads: Some(8),
@@ -591,6 +592,142 @@ fn capacity_at_hypothetical_falls_to_catalog_when_labels_absent() {
     assert_eq!(
         capacity_at_hypothetical_max_len(4096, Some(8192), &hyp),
         catalog
+    );
+}
+
+#[test]
+fn capacity_at_hypothetical_falls_to_catalog_when_num_gpu_blocks_absent() {
+    // Incomplete scrape: other labels present, num_gpu_blocks missing.
+    // Must route to tier 2 without consulting the gate.
+    let cache = crate::collectors::CacheConfigLabels {
+        block_size: Some(16),
+        kv_cache_max_concurrency: Some(10.0),
+        ..Default::default()
+    };
+    let model = ModelArch {
+        num_kv_heads: Some(8),
+        head_dim: Some(128),
+        num_layers: Some(32),
+        ..Default::default()
+    };
+    let catalog = compute_kv_max_seqs(Some(20.0), Some(4096), &model, None, None, 2);
+    assert!(catalog.is_some());
+    let hyp = HypCapacityCtx {
+        cache: &cache,
+        kv_headroom_gb: Some(20.0),
+        model: Some(&model),
+        kv_cache_dtype: None,
+        tp: None,
+        weight_bytes: 2,
+    };
+    assert_eq!(
+        capacity_at_hypothetical_max_len(4096, Some(8192), &hyp),
+        catalog
+    );
+}
+
+#[test]
+fn capacity_at_hypothetical_gate_suppresses_both_tiers() {
+    let cache = crate::collectors::CacheConfigLabels {
+        block_size: Some(16),
+        num_gpu_blocks: Some(2000),
+        // round(2000 / obs) = 2374 pages; transcript = 512; state = 1862.
+        kv_cache_max_concurrency: Some(2000.0 / 2374.0),
+        ..Default::default()
+    };
+    let model = ModelArch {
+        num_kv_heads: Some(8),
+        head_dim: Some(128),
+        num_layers: Some(32),
+        ..Default::default()
+    };
+    let hyp = HypCapacityCtx {
+        cache: &cache,
+        kv_headroom_gb: Some(20.0),
+        model: Some(&model),
+        kv_cache_dtype: None,
+        tp: None,
+        weight_bytes: 2,
+    };
+    assert!(
+        compute_kv_max_seqs(Some(20.0), Some(4096), &model, None, None, 2).is_some(),
+        "catalog tier must be viable so the test proves it was suppressed"
+    );
+    assert_eq!(
+        capacity_at_hypothetical_max_len(4096, Some(8192), &hyp),
+        None
+    );
+
+    let text = model_len_shrink_suggestion_lines(
+        Some(8192),
+        Some(3500.0),
+        Some(596.0),
+        150.0,
+        "      ",
+        Some(&hyp),
+        false,
+    )
+    .join("\n");
+    assert!(text.contains("Lower --max-model-len"), "got: {text}");
+    assert!(!text.contains("; fits"), "got: {text}");
+    assert!(!text.contains("concurrent requests (est)"), "got: {text}");
+}
+
+#[test]
+fn capacity_at_hypothetical_fits_none_does_not_fall_to_catalog() {
+    let cache = crate::collectors::CacheConfigLabels {
+        block_size: Some(16),
+        num_gpu_blocks: Some(100),
+        kv_cache_max_concurrency: Some(1.0),
+        ..Default::default()
+    };
+    let model = ModelArch {
+        num_kv_heads: Some(8),
+        head_dim: Some(128),
+        num_layers: Some(32),
+        ..Default::default()
+    };
+    let hyp = HypCapacityCtx {
+        cache: &cache,
+        kv_headroom_gb: Some(20.0),
+        model: Some(&model),
+        kv_cache_dtype: None,
+        tp: None,
+        weight_bytes: 2,
+    };
+    assert!(
+        compute_kv_max_seqs(Some(20.0), Some(2048), &model, None, None, 2).is_some(),
+        "catalog tier must be viable so the test proves geometry overruled it"
+    );
+    assert!(
+        crate::engine::baseline::counterfactual_concurrency(2048, 16, 100, 1.0, 1600)
+            .is_some_and(|c| (c - 100.0 / 128.0).abs() < f64::EPSILON)
+    );
+    assert_eq!(
+        capacity_at_hypothetical_max_len(2048, Some(1600), &hyp),
+        None
+    );
+}
+
+#[test]
+fn capacity_at_hypothetical_dense_zero_state_projects_as_before() {
+    let cache = crate::collectors::CacheConfigLabels {
+        block_size: Some(16),
+        num_gpu_blocks: Some(2560),
+        kv_cache_max_concurrency: Some(10.0),
+        ..Default::default()
+    };
+    let hyp = HypCapacityCtx {
+        cache: &cache,
+        kv_headroom_gb: None,
+        model: None,
+        kv_cache_dtype: None,
+        tp: None,
+        weight_bytes: 2,
+    };
+    assert_eq!(
+        capacity_at_hypothetical_max_len(2048, Some(4096), &hyp),
+        Some(20)
     );
 }
 
