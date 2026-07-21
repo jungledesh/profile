@@ -110,6 +110,38 @@ fn resolve_gpu_assignment_inner(
     cli_tp: Option<u32>,
     url: &str,
 ) -> anyhow::Result<GpuAssignment> {
+    resolve_gpu_assignment_inner_with_mode(
+        host_count,
+        scan,
+        cli_tp,
+        url,
+        crate::engine::MULTI_GPU_TP,
+    )
+}
+
+fn resolve_gpu_assignment_inner_with_mode(
+    host_count: Option<u32>,
+    scan: Option<Vec<GpuScanEntry>>,
+    cli_tp: Option<u32>,
+    url: &str,
+    multi_gpu_tp: bool,
+) -> anyhow::Result<GpuAssignment> {
+    if !multi_gpu_tp {
+        return match host_count {
+            None => anyhow::bail!("GPU driver unavailable. Is the driver installed?"),
+            Some(0) => anyhow::bail!("No GPUs detected."),
+            Some(_) => Ok(GpuAssignment {
+                tp: 1,
+                indices: vec![
+                    scan.as_ref()
+                        .and_then(|entries| entries.first())
+                        .map(|entry| entry.idx)
+                        .unwrap_or(0),
+                ],
+            }),
+        };
+    }
+
     match host_count {
         None => {
             if let Some(tp) = cli_tp {
@@ -166,7 +198,13 @@ pub(crate) fn resolve_gpu_assignment_for_host(
     cli_tp: Option<u32>,
     url: &str,
 ) -> anyhow::Result<GpuAssignment> {
-    resolve_gpu_assignment_inner(host_count, None, cli_tp, url)
+    resolve_gpu_assignment_inner_with_mode(
+        host_count,
+        None,
+        cli_tp,
+        url,
+        crate::engine::MULTI_GPU_TP,
+    )
 }
 
 fn run_pipeline(
@@ -566,17 +604,42 @@ mod tests {
     }
 
     #[test]
+    fn resolve_for_host_honors_single_gpu_launch_pin() {
+        let assignment =
+            resolve_gpu_assignment_for_host(Some(2), Some(2), "http://localhost:8000/metrics")
+                .expect("single-GPU launch assignment");
+        assert_eq!(
+            assignment,
+            GpuAssignment {
+                tp: 1,
+                indices: vec![0],
+            }
+        );
+    }
+
+    #[test]
     fn resolve_cli_tp_exceeds_host_bails() {
-        let err =
-            resolve_gpu_assignment_for_host(Some(2), Some(4), "http://localhost:8000/metrics")
-                .unwrap_err();
+        let err = resolve_gpu_assignment_inner_with_mode(
+            Some(2),
+            None,
+            Some(4),
+            "http://localhost:8000/metrics",
+            true,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("exceeds detected GPU count"));
     }
 
     #[test]
     fn resolve_cli_tp_without_driver_uses_flag() {
-        let a = resolve_gpu_assignment_for_host(None, Some(1), "http://localhost:8000/metrics")
-            .unwrap();
+        let a = resolve_gpu_assignment_inner_with_mode(
+            None,
+            None,
+            Some(1),
+            "http://localhost:8000/metrics",
+            true,
+        )
+        .unwrap();
         assert_eq!(a.tp, 1);
         assert_eq!(a.indices, vec![0]);
     }
@@ -597,9 +660,14 @@ mod tests {
 
     #[test]
     fn resolve_single_gpu_rejects_cli_tp_above_one() {
-        let err =
-            resolve_gpu_assignment_for_host(Some(1), Some(2), "http://localhost:8000/metrics")
-                .unwrap_err();
+        let err = resolve_gpu_assignment_inner_with_mode(
+            Some(1),
+            None,
+            Some(2),
+            "http://localhost:8000/metrics",
+            true,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("exceeds detected GPU count (1)"));
     }
 

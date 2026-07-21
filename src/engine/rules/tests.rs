@@ -323,8 +323,26 @@ fn compute_kv_max_seqs_tp2_doubles_capacity() {
         ..Default::default()
     };
     let headroom_gb = 20.0;
-    let tp1 = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &model, None, Some(1), 2);
-    let tp2 = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &model, None, Some(2), 2);
+    let tp1 = compute_kv_max_seqs_with_mode::<true>(
+        Some(headroom_gb),
+        Some(4096),
+        &model,
+        None,
+        Some(1),
+        2,
+        None,
+    )
+    .max_seqs;
+    let tp2 = compute_kv_max_seqs_with_mode::<true>(
+        Some(headroom_gb),
+        Some(4096),
+        &model,
+        None,
+        Some(2),
+        2,
+        None,
+    )
+    .max_seqs;
     assert_eq!(tp2.unwrap(), tp1.unwrap() * 2);
 }
 
@@ -337,9 +355,50 @@ fn compute_kv_max_seqs_tp_greater_than_kv_heads_no_benefit() {
         ..Default::default()
     };
     let headroom_gb = 20.0;
-    let tp2 = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &model, None, Some(2), 2);
-    let tp4 = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &model, None, Some(4), 2);
+    let tp2 = compute_kv_max_seqs_with_mode::<true>(
+        Some(headroom_gb),
+        Some(4096),
+        &model,
+        None,
+        Some(2),
+        2,
+        None,
+    )
+    .max_seqs;
+    let tp4 = compute_kv_max_seqs_with_mode::<true>(
+        Some(headroom_gb),
+        Some(4096),
+        &model,
+        None,
+        Some(4),
+        2,
+        None,
+    )
+    .max_seqs;
     assert_eq!(tp2, tp4);
+}
+
+#[test]
+fn compute_kv_max_seqs_declines_tp2_when_launch_flag_off() {
+    let model = ModelArch {
+        num_kv_heads: Some(8),
+        head_dim: Some(128),
+        num_layers: Some(32),
+        ..Default::default()
+    };
+    let derived = compute_kv_max_seqs_with_mode::<false>(
+        Some(20.0),
+        Some(4096),
+        &model,
+        None,
+        Some(2),
+        2,
+        None,
+    );
+    assert_eq!(derived.max_seqs, None);
+    let (bound, source) = resolve_kv_bound(None, derived.max_seqs, false, Some(4.0), Some(50.0));
+    assert_eq!(bound, Some(8.0));
+    assert_eq!(source, Some(KvBoundSource::Empirical));
 }
 
 #[test]
@@ -368,6 +427,143 @@ fn compute_kv_max_seqs_auto_kv_inherits_weight_bytes() {
     let bf16 = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &model, Some("auto"), None, 2);
     let fp8_w = compute_kv_max_seqs(Some(headroom_gb), Some(4096), &model, Some("auto"), None, 1);
     assert_eq!(fp8_w.unwrap(), bf16.unwrap() * 2);
+}
+
+#[test]
+fn compute_kv_max_seqs_whiteboard_reduces_hybrid_capacity() {
+    let hybrid = qwen36_hybrid_model_with_attention();
+    let attention_only = ModelArch {
+        linear_num_layers: None,
+        linear_key_heads: None,
+        linear_value_heads: None,
+        linear_key_head_dim: None,
+        linear_value_head_dim: None,
+        linear_conv_kernel_dim: None,
+        state_dtype: None,
+        ..hybrid.clone()
+    };
+    let with_state = compute_kv_max_seqs(Some(2.0), Some(4096), &hybrid, None, None, 2);
+    let without_state = compute_kv_max_seqs(Some(2.0), Some(4096), &attention_only, None, None, 2);
+    assert_eq!(with_state, Some(6));
+    assert_eq!(without_state, Some(7));
+}
+
+#[test]
+fn compute_kv_max_seqs_windowed_gemma_uses_capped_price() {
+    let gemma = ModelArch {
+        num_layers: Some(62),
+        num_kv_heads: Some(16),
+        head_dim: Some(128),
+        swa_window: Some(1024),
+        num_swa_layers: Some(52),
+        ..Default::default()
+    };
+    let all_full = ModelArch {
+        swa_window: None,
+        num_swa_layers: None,
+        ..gemma.clone()
+    };
+    assert_eq!(
+        compute_kv_max_seqs(Some(20.0), Some(8192), &gemma, None, None, 2),
+        Some(18)
+    );
+    assert_eq!(
+        compute_kv_max_seqs(Some(20.0), Some(8192), &all_full, None, None, 2),
+        Some(4)
+    );
+}
+
+#[test]
+fn capacity_budget_rungs_prefer_observed_and_refuse_windowed_blocks() {
+    let dense = ModelArch {
+        num_layers: Some(32),
+        num_kv_heads: Some(8),
+        head_dim: Some(128),
+        ..Default::default()
+    };
+    let dense_cache = crate::collectors::CacheConfigLabels {
+        num_gpu_blocks: Some(10_000),
+        block_size: Some(16),
+        ..Default::default()
+    };
+    let dense_result =
+        compute_kv_max_seqs_for_cache(Some(20.0), Some(4096), &dense, None, None, 2, &dense_cache);
+    assert_eq!(dense_result.max_seqs, Some(39));
+    assert!(dense_result.budget_self_grade.is_some());
+
+    let hybrid = qwen36_hybrid_model_with_attention();
+    let hybrid_cache = crate::collectors::CacheConfigLabels {
+        num_gpu_blocks: Some(390),
+        mamba_page_size_padded: Some(25_690_112),
+        ..Default::default()
+    };
+    let hybrid_result = compute_kv_max_seqs_for_cache(
+        Some(20.0),
+        Some(4096),
+        &hybrid,
+        None,
+        None,
+        2,
+        &hybrid_cache,
+    );
+    assert_eq!(hybrid_result.max_seqs, Some(30));
+    assert!(hybrid_result.budget_self_grade.is_some());
+
+    let windowed = ModelArch {
+        swa_window: Some(1024),
+        num_swa_layers: Some(26),
+        ..dense.clone()
+    };
+    let windowed_result = compute_kv_max_seqs_for_cache(
+        Some(20.0),
+        Some(4096),
+        &windowed,
+        None,
+        None,
+        2,
+        &dense_cache,
+    );
+    assert_eq!(windowed_result.max_seqs, Some(95));
+    assert_eq!(windowed_result.budget_self_grade, None);
+
+    let no_labels = compute_kv_max_seqs_for_cache(
+        Some(20.0),
+        Some(4096),
+        &dense,
+        None,
+        None,
+        2,
+        &crate::collectors::CacheConfigLabels::default(),
+    );
+    assert_eq!(no_labels.max_seqs, Some(37));
+
+    let no_budget = compute_kv_max_seqs_for_cache(
+        None,
+        Some(4096),
+        &dense,
+        None,
+        None,
+        2,
+        &crate::collectors::CacheConfigLabels::default(),
+    );
+    assert_eq!(no_budget.max_seqs, None);
+}
+
+#[test]
+fn unpriced_currency_declines_to_empirical_low_confidence() {
+    let unpriced = ModelArch {
+        num_layers: Some(32),
+        num_kv_heads: Some(8),
+        head_dim: Some(128),
+        linear_num_layers: Some(1),
+        ..Default::default()
+    };
+    let derived = compute_kv_max_seqs(Some(20.0), Some(4096), &unpriced, None, None, 2);
+    assert_eq!(derived, None);
+    let (bound, source) = resolve_kv_bound(None, derived, true, Some(4.0), Some(50.0));
+    let rec = recommended_seqs(None, bound, source, Some(4)).expect("empirical fallback");
+    assert_eq!(source, Some(KvBoundSource::Empirical));
+    assert!(rec.empirical);
 }
 
 #[test]
@@ -508,7 +704,7 @@ fn model_len_suggestion_projects_capacity_from_observed_geometry() {
         "got: {text}"
     );
     assert!(
-        text.contains("fits 16 concurrent requests (est)"),
+        text.contains("fits at least 16 worst-case requests (est)"),
         "got: {text}"
     );
     assert!(
@@ -560,7 +756,7 @@ fn model_len_suggestion_live_run_projection_at_5465_is_39_not_observed_8() {
         "got: {text}"
     );
     assert!(
-        text.contains("fits 39 concurrent requests (est)"),
+        text.contains("fits at least 39 worst-case requests (est)"),
         "got: {text}"
     );
     assert!(
@@ -771,6 +967,16 @@ fn qwen36_hybrid_model() -> ModelArch {
         linear_conv_kernel_dim: Some(4),
         state_dtype: Some("fp32".to_string()),
         ..Default::default()
+    }
+}
+
+fn qwen36_hybrid_model_with_attention() -> ModelArch {
+    ModelArch {
+        num_layers: Some(64),
+        num_kv_layers: Some(16),
+        num_kv_heads: Some(4),
+        head_dim: Some(256),
+        ..qwen36_hybrid_model()
     }
 }
 
@@ -1427,6 +1633,7 @@ fn empty_run_stdout_and_format_sites_byte_identical() {
                     kv_max_seqs: None,
                     prescribed_kv_capacity: None,
                     catalog_state_mismatch: None,
+                    memory_budget_self_grade: None,
                     n_eval: 0,
                     skipped_broken: if any_evaluable { 0 } else { windows.len() },
                     skipped_idle: if any_evaluable { windows.len() } else { 0 },

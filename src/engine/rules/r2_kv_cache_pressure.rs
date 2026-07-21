@@ -343,15 +343,18 @@ fn r2_capacity_phrase(n: u32, max_model_len: Option<u32>, label: KvCapacityLabel
             Some(m) => {
                 format!(
                     "Lower --max-num-seqs to ≤{n} concurrent requests \
-                     (est; physics ceiling for max_model_len={m})"
+                     (est); at least {n} worst-case requests fit at max_model_len={m}"
                 )
             }
-            None => format!("Lower --max-num-seqs to ≤{n} concurrent requests (est)"),
+            None => format!(
+                "Lower --max-num-seqs to ≤{n} concurrent requests \
+                 (est); at least {n} worst-case requests fit"
+            ),
         },
         KvCapacityLabel::DerivedHybrid => {
             format!(
                 "Lower --max-num-seqs to ≤{n} concurrent requests \
-                 (attention-KV est; hybrid state overhead lowers the true limit)"
+                 (est); at least {n} worst-case requests fit, including hybrid state"
             )
         }
     }
@@ -1544,8 +1547,9 @@ mod tests {
         assert_eq!(n, Some(18));
         assert_eq!(label, KvCapacityLabel::DerivedHybrid);
         let phrase = r2_capacity_phrase(18, Some(8192), label);
-        assert!(phrase.contains("attention-KV est"));
-        assert!(phrase.contains("hybrid state overhead"));
+        assert!(phrase.contains("(est)"));
+        assert!(phrase.contains("at least 18 worst-case requests fit"));
+        assert!(phrase.contains("including hybrid state"));
         assert!(phrase.contains("concurrent requests"));
     }
 
@@ -1616,7 +1620,7 @@ mod tests {
                 .count(),
             1
         );
-        assert!(text.contains("fits 39 concurrent requests (est)"));
+        assert!(text.contains("fits at least 39 worst-case requests (est)"));
         assert!(text.contains("Or cap --max-num-seqs at 8"));
         assert!(text.contains("guaranteed at full 32768-token contexts"));
         assert!(!text.contains("fits 8 concurrent"));

@@ -377,6 +377,8 @@ mod tests {
                 linear_value_head_dim: None,
                 linear_conv_kernel_dim: None,
                 state_dtype: None,
+                swa_window: None,
+                num_swa_layers: None,
             },
             gpu: crate::context::GPUModel {
                 name: Some("gpu".to_string()),
@@ -1491,6 +1493,8 @@ mod tests {
                 linear_value_head_dim: None,
                 linear_conv_kernel_dim: None,
                 state_dtype: None,
+                swa_window: None,
+                num_swa_layers: None,
             },
             gpu: crate::context::GPUModel {
                 name: Some("NVIDIA H100 80GB HBM3".to_string()),

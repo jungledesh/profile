@@ -45,6 +45,10 @@ pub struct CatalogEntry {
     pub linear_value_head_dim: Option<u32>,
     pub linear_conv_kernel_dim: Option<u32>,
     pub state_dtype: Option<&'static str>,
+    /// Sliding-window size in tokens. `None` means no windowed layers.
+    pub swa_window: Option<u32>,
+    /// Number of layers whose transcript is capped by `swa_window`.
+    pub num_swa_layers: Option<u32>,
 }
 
 /// Pure-attention catalog row. Named fields are transposition-proof; hybrid/linear
@@ -60,7 +64,9 @@ macro_rules! catalog_dense {
         num_kv_heads: $num_kv_heads:expr,
         head_dim: $head_dim:expr,
         num_kv_layers: $num_kv_layers:expr,
-        attn_flops_coeff: $attn_flops_coeff:expr $(,)?
+        attn_flops_coeff: $attn_flops_coeff:expr
+        $(, swa_window: $swa_window:expr, num_swa_layers: $num_swa_layers:expr)?
+        $(,)?
     ) => {
         CatalogEntry {
             family: $family,
@@ -80,7 +86,15 @@ macro_rules! catalog_dense {
             linear_value_head_dim: None,
             linear_conv_kernel_dim: None,
             state_dtype: None,
+            swa_window: catalog_dense!(@optional $($swa_window)?),
+            num_swa_layers: catalog_dense!(@optional $($num_swa_layers)?),
         }
+    };
+    (@optional) => {
+        None
+    };
+    (@optional $value:expr) => {
+        Some($value)
     };
 }
 
@@ -123,6 +137,8 @@ macro_rules! catalog_hybrid {
             linear_value_head_dim: $linear_value_head_dim,
             linear_conv_kernel_dim: $linear_conv_kernel_dim,
             state_dtype: $state_dtype,
+            swa_window: None,
+            num_swa_layers: None,
         }
     };
 }
@@ -860,6 +876,8 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            swa_window: 1024,
+            num_swa_layers: 52,
         },
     },
     // Source: https://huggingface.co/google/gemma-3-27b-it/raw/main/config.json (accessed 2026-07-16)
@@ -876,6 +894,8 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            swa_window: 1024,
+            num_swa_layers: 52,
         },
     },
     // Source: https://huggingface.co/google/gemma-3-12b-it/raw/main/config.json (accessed 2026-07-16)
@@ -894,6 +914,8 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(256),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            swa_window: 1024,
+            num_swa_layers: 40,
         },
     },
     // Source: https://huggingface.co/google/gemma-3-12b-it/raw/main/config.json (accessed 2026-07-16)
@@ -910,6 +932,8 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(256),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            swa_window: 1024,
+            num_swa_layers: 40,
         },
     },
     // Source: https://huggingface.co/google/gemma-3-4b-it/raw/main/config.json (accessed 2026-07-16)
@@ -929,6 +953,8 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(256),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            swa_window: 1024,
+            num_swa_layers: 29,
         },
     },
     // Source: https://huggingface.co/google/gemma-3-4b-it/raw/main/config.json (accessed 2026-07-16)
@@ -945,9 +971,13 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(256),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            swa_window: 1024,
+            num_swa_layers: 29,
         },
     },
-    // Source: https://huggingface.co/google/gemma-3-1b-it/raw/main/config.json (accessed 2026-07-16)
+    // Source: https://huggingface.co/google/gemma-3-1b-it/raw/main/config.json (gated).
+    // sliding_window=512 (1B differs from the rest of the family); verified against
+    // https://huggingface.co/unsloth/gemma-3-1b-it-GGUF/raw/main/config.json (2026-07-21).
     ModelEntry {
         // https://huggingface.co/google/gemma-3-1b-it/raw/main/config.json
         tokens: &["gemma 3", "1b"],
@@ -962,9 +992,13 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(256),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            swa_window: 512,
+            num_swa_layers: 22,
         },
     },
-    // Source: https://huggingface.co/google/gemma-3-1b-it/raw/main/config.json (accessed 2026-07-16)
+    // Source: https://huggingface.co/google/gemma-3-1b-it/raw/main/config.json (gated).
+    // sliding_window=512 (1B differs from the rest of the family); verified against
+    // https://huggingface.co/unsloth/gemma-3-1b-it-GGUF/raw/main/config.json (2026-07-21).
     ModelEntry {
         tokens: &["gemma3", "1b"],
         entry: catalog_dense! {
@@ -978,6 +1012,8 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(256),
             num_kv_layers: None,
             attn_flops_coeff: None,
+            swa_window: 512,
+            num_swa_layers: 22,
         },
     },
     // Gemma 2 27B: head_dim=128, 32 attn heads, 16 KV heads.
@@ -1488,6 +1524,8 @@ mod tests {
         assert_eq!(e.hidden_dim, 5376);
         assert_eq!(e.num_kv_heads, Some(16));
         assert_eq!(e.head_dim, Some(128));
+        assert_eq!(e.swa_window, Some(1024));
+        assert_eq!(e.num_swa_layers, Some(52));
     }
 
     #[test]
@@ -1519,10 +1557,22 @@ mod tests {
         assert_eq!(e4.family, "gemma3");
         assert_eq!(e4.num_layers, 34);
         assert_eq!(e4.num_kv_heads, Some(4));
+        assert_eq!(e4.swa_window, Some(1024));
+        assert_eq!(e4.num_swa_layers, Some(29));
         let e1 = lookup_model("google/gemma-3-1b-it").expect("1b");
         assert_eq!(e1.family, "gemma3");
         assert_eq!(e1.num_layers, 26);
         assert_eq!(e1.num_kv_heads, Some(1));
+        assert_eq!(e1.swa_window, Some(512));
+        assert_eq!(e1.num_swa_layers, Some(22));
+    }
+
+    #[test]
+    fn gemma3_window_split_is_pinned() {
+        let e1 = lookup_model("google/gemma-3-1b-it").expect("1b");
+        let e27 = lookup_model("google/gemma-3-27b-it").expect("27b");
+        assert_eq!(e1.swa_window, Some(512));
+        assert_eq!(e27.swa_window, Some(1024));
     }
 
     #[test]
@@ -1571,7 +1621,7 @@ mod tests {
         let e = lookup_model("Qwen/Qwen3-30B-A3B").expect("a3b");
         assert_eq!(e.num_kv_heads, Some(4));
         assert_eq!(e.head_dim, Some(128));
-        // Catalog fields alone are the gate for kv_max_concurrent_seqs (engine).
+        // Catalog fields alone are the gate for per-request memory pricing.
         // Previously both were None and KV math short-circuited.
         assert!(e.num_kv_heads.is_some() && e.head_dim.is_some());
     }

@@ -1,3 +1,5 @@
+use crate::context::ModelArch;
+
 /// Conservative activation memory buffer vLLM reserves inside the allocated VRAM block.
 pub const ACTIVATION_KV_BUFFER_GB: f64 = 3.0;
 
@@ -113,40 +115,55 @@ pub fn kv_bytes_per_element(kv_cache_dtype: Option<&str>, weight_bytes: u8) -> u
     }
 }
 
-/// Maximum concurrent sequences the KV budget supports at the given context length.
-///
-/// Formula: `kv_budget_bytes / (max_model_len × 2 × num_layers × num_kv_heads × head_dim × bytes_per_elem)`
-///
-/// Returns `None` if any input is zero or the budget is too small for even one sequence.
-/// This is an upper bound - vLLM block fragmentation may reduce it slightly in practice.
-pub fn kv_max_concurrent_seqs(
-    kv_headroom_gb: f64,
-    max_model_len: u32,
-    num_layers: u32,
-    num_kv_heads: u32,
-    head_dim: u32,
-    bytes_per_elem: u8,
-) -> Option<u32> {
-    if max_model_len == 0
-        || num_layers == 0
-        || num_kv_heads == 0
-        || head_dim == 0
-        || bytes_per_elem == 0
-        || kv_headroom_gb <= 0.0
-    {
+/// Bytes one worst-case request costs in GPU memory. Three currencies:
+/// full-attention transcript, window-capped transcript, fixed whiteboard.
+/// `None` means a currency this model uses cannot be priced.
+pub fn bytes_per_seq(arch: &ModelArch, max_model_len: u32, kv_dtype_bytes: u8) -> Option<u64> {
+    if max_model_len == 0 || kv_dtype_bytes == 0 {
         return None;
     }
-    // 2× for K and V tensors separately
-    let bytes_per_token = 2u64
-        .checked_mul(num_layers as u64)?
-        .checked_mul(num_kv_heads as u64)?
-        .checked_mul(head_dim as u64)?
-        .checked_mul(bytes_per_elem as u64)?;
-    let kv_budget_bytes = (kv_headroom_gb * 1e9) as u64;
-    let max_seqs = kv_budget_bytes
-        .checked_div(bytes_per_token)?
-        .checked_div(max_model_len as u64)?;
-    u32::try_from(max_seqs).ok().filter(|&n| n > 0)
+
+    let kv_layers = arch.num_kv_layers.or(arch.num_layers)?;
+    let num_kv_heads = arch.num_kv_heads?;
+    let head_dim = arch.head_dim?;
+    let (swa_layers, swa_window) = match (arch.num_swa_layers, arch.swa_window) {
+        (None, None) => (0, 0),
+        (Some(layers), Some(window)) => (layers, window),
+        _ => return None,
+    };
+    let full_layers = kv_layers.checked_sub(swa_layers)?;
+    let per_token_per_layer = 2u64
+        .checked_mul(u64::from(num_kv_heads))?
+        .checked_mul(u64::from(head_dim))?
+        .checked_mul(u64::from(kv_dtype_bytes))?;
+    let transcript = u64::from(full_layers)
+        .checked_mul(per_token_per_layer)?
+        .checked_mul(u64::from(max_model_len))?;
+    let window_part = u64::from(swa_layers)
+        .checked_mul(per_token_per_layer)?
+        .checked_mul(u64::from(max_model_len.min(swa_window)))?;
+
+    let has_linear_state = arch.linear_num_layers.is_some()
+        || arch.linear_key_heads.is_some()
+        || arch.linear_value_heads.is_some()
+        || arch.linear_key_head_dim.is_some()
+        || arch.linear_value_head_dim.is_some()
+        || arch.linear_conv_kernel_dim.is_some();
+    let whiteboard = if has_linear_state {
+        catalog_hybrid_state_bytes(
+            arch.linear_num_layers?,
+            arch.linear_key_heads?,
+            arch.linear_value_heads?,
+            arch.linear_key_head_dim?,
+            arch.linear_value_head_dim?,
+            arch.linear_conv_kernel_dim?,
+            state_dtype_bytes(arch.state_dtype.as_deref())?,
+        )?
+    } else {
+        0
+    };
+
+    transcript.checked_add(window_part)?.checked_add(whiteboard)
 }
 
 /// Batch size at which decode transitions from memory-BW-bound to compute-bound.
@@ -472,46 +489,76 @@ mod tests {
     }
 
     #[test]
-    fn kv_max_concurrent_seqs_a100_llama3_70b() {
-        // A100 80GB, Llama-3 70B BF16: ~18GB KV, 8192 tokens, 80 layers, 8 KV heads, head_dim=128
-        // bytes_per_token = 2×80×8×128×2 = 327680 = 320KB
-        // max_seqs = 18e9 / 320KB / 8192 ≈ 6.8 → 6
-        let result = kv_max_concurrent_seqs(18.0, 8192, 80, 8, 128, 2);
-        assert!(result.is_some());
-        let n = result.unwrap();
-        // Llama 70B at 8192 tokens fits only a handful of seqs - expect 5–8 range
-        assert!((5..=8).contains(&n), "expected 5–8, got {n}");
+    fn bytes_per_seq_dense_matches_existing_arithmetic() {
+        let arch = ModelArch {
+            num_layers: Some(32),
+            num_kv_heads: Some(8),
+            head_dim: Some(128),
+            ..Default::default()
+        };
+        let got = bytes_per_seq(&arch, 4096, 2);
+        let expected = 4096u64 * 2 * 32 * 8 * 128 * 2;
+        assert_eq!(got, Some(expected));
     }
 
     #[test]
-    fn kv_max_concurrent_seqs_fp8_doubles_capacity() {
-        let bf16 = kv_max_concurrent_seqs(20.0, 4096, 32, 8, 128, 2).unwrap();
-        let fp8 = kv_max_concurrent_seqs(20.0, 4096, 32, 8, 128, 1).unwrap();
-        assert_eq!(fp8, bf16 * 2);
+    fn bytes_per_seq_qwen36_adds_fixed_whiteboard() {
+        let arch = ModelArch {
+            num_layers: Some(64),
+            num_kv_layers: Some(16),
+            num_kv_heads: Some(4),
+            head_dim: Some(256),
+            linear_num_layers: Some(48),
+            linear_key_heads: Some(16),
+            linear_value_heads: Some(48),
+            linear_key_head_dim: Some(128),
+            linear_value_head_dim: Some(128),
+            linear_conv_kernel_dim: Some(4),
+            state_dtype: Some("fp32".to_string()),
+            ..Default::default()
+        };
+        let transcript = 16u64 * 2 * 4 * 256 * 2 * 4096;
+        let whiteboard = 58_195_968;
+        assert_eq!(bytes_per_seq(&arch, 4096, 2), Some(transcript + whiteboard));
     }
 
     #[test]
-    fn kv_max_concurrent_seqs_qwen3_30b_a3b_catalog_fields() {
-        let e = crate::context::model_catalog::lookup_model("Qwen/Qwen3-30B-A3B").expect("a3b");
-        let n = kv_max_concurrent_seqs(
-            40.0,
-            40960,
-            e.num_layers,
-            e.num_kv_heads.expect("kv heads"),
-            e.head_dim.expect("head dim"),
-            2,
-        );
-        assert!(n.is_some_and(|v| v > 0));
+    fn bytes_per_seq_gemma3_caps_windowed_layers() {
+        let arch = ModelArch {
+            num_layers: Some(62),
+            num_kv_heads: Some(16),
+            head_dim: Some(128),
+            swa_window: Some(1024),
+            num_swa_layers: Some(52),
+            ..Default::default()
+        };
+        let per_token = 2u64 * 16 * 128 * 2;
+        let expected = 10 * per_token * 8192 + 52 * per_token * 1024;
+        assert_eq!(bytes_per_seq(&arch, 8192, 2), Some(expected));
+
+        let short_expected = 62 * per_token * 512;
+        assert_eq!(bytes_per_seq(&arch, 512, 2), Some(short_expected));
     }
 
     #[test]
-    fn kv_max_concurrent_seqs_none_on_zero_inputs() {
-        assert!(kv_max_concurrent_seqs(0.0, 4096, 32, 8, 128, 2).is_none());
-        assert!(kv_max_concurrent_seqs(20.0, 0, 32, 8, 128, 2).is_none());
-        assert!(kv_max_concurrent_seqs(20.0, 4096, 0, 8, 128, 2).is_none());
-        assert!(kv_max_concurrent_seqs(20.0, 4096, 32, 0, 128, 2).is_none());
-        assert!(kv_max_concurrent_seqs(20.0, 4096, 32, 8, 0, 2).is_none());
-        assert!(kv_max_concurrent_seqs(20.0, 4096, 32, 8, 128, 0).is_none());
+    fn bytes_per_seq_declines_unpriced_currency() {
+        let linear_without_dtype = ModelArch {
+            num_layers: Some(16),
+            num_kv_heads: Some(4),
+            head_dim: Some(128),
+            linear_num_layers: Some(1),
+            ..Default::default()
+        };
+        assert!(bytes_per_seq(&linear_without_dtype, 4096, 2).is_none());
+
+        let half_window = ModelArch {
+            num_layers: Some(16),
+            num_kv_heads: Some(4),
+            head_dim: Some(128),
+            swa_window: Some(1024),
+            ..Default::default()
+        };
+        assert!(bytes_per_seq(&half_window, 4096, 2).is_none());
     }
 
     #[test]

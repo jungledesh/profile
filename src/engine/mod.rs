@@ -10,6 +10,9 @@ pub use baseline::{
 };
 pub use rules::*;
 
+/// Launch scope: single GPU, no tensor parallelism. TP machinery stays behind this.
+pub const MULTI_GPU_TP: bool = false;
+
 pub(crate) const MASSIVE_UNDERUTIL_THRESHOLD_PCT: f64 = 60.0;
 /// Occupancy at or above this: server is config-capped, not traffic-starved. Skip traffic fallback.
 const MASSIVE_UNDERUTIL_OCCUPANCY_CEILING: f64 = 0.75;
@@ -50,6 +53,9 @@ pub struct Report {
     /// output is unaffected. Label uncertainty tracks the printed number's
     /// source, not the existence of disagreement between sources.
     pub catalog_state_mismatch: Option<(u64, u64)>,
+    /// When allocator bytes and the 3 GB estimate both exist:
+    /// `(observed_budget_bytes, estimated_budget_bytes)`. Verbose only.
+    pub memory_budget_self_grade: Option<(u64, u64)>,
     /// Evaluable window count. `engine::build_report_for_diagnose` gates MU
     /// inject on `ENGINE_MIN_PERSISTENT_WINDOWS`; stdout gates only the journey
     /// footer on the same threshold. `--json` (when emitted) should keep raw
