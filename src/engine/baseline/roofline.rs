@@ -2,7 +2,7 @@ use crate::collectors::config::DEFAULT_GPU_MEMORY_UTILIZATION;
 use crate::collectors::effective_tensor_parallel;
 use crate::context::{AnalysisInput, gpu_prices};
 
-use super::math;
+use super::math::{self, KvCacheDtypeSource};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CostEstimate {
@@ -53,8 +53,11 @@ pub struct PhysicsBaseline {
     pub weight_dtype_source: WeightDtypeSource,
     /// Model weight memory footprint in GB. Derived from bits_per_param (quantization chain or dtype chain).
     pub weight_gb: f64,
-    /// Bytes per weight parameter (`bits_per_param / 8`). Used when KV dtype is `auto`/absent.
+    /// Bytes per weight parameter (`bits_per_param / 8`). Used for weight footprint only.
     pub weight_bytes_per_param: u8,
+    /// KV element width from kv_cache_dtype resolution (never weight width).
+    pub kv_bytes_per_element: u8,
+    pub kv_cache_dtype_source: KvCacheDtypeSource,
     /// VRAM remaining after weights, if total VRAM is known. Negative means weights alone exceed VRAM.
     pub kv_headroom_gb: Option<f64>,
     /// Theoretical minimum time-per-output-token at decode ceiling (ms).
@@ -158,6 +161,12 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
 
     let weight_gb = math::weight_gb(weight_params, bits_per_param);
     let weight_bytes_per_param = (bits_per_param / 8).max(1);
+    let snap = &input.window.snapshot;
+    let kv_dtype = math::effective_kv_cache_dtype(
+        snap.vllm.cache_config.cache_dtype.as_deref(),
+        ctx.config.kv_cache_dtype.as_deref(),
+    );
+    let (kv_bytes_per_element, kv_cache_dtype_source) = math::resolve_kv_cache_element(kv_dtype);
     let kv_headroom_gb = ctx.gpu.vram_gb.map(|vram| {
         let gpu_util = ctx
             .config
@@ -168,7 +177,6 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
     let tpot_floor_ms = math::latency_floor_ms(decode.expected);
     let prefill_latency_floor_ms = prefill.map(|p| math::latency_floor_ms(p.expected));
 
-    let snap = &input.window.snapshot;
     let tps = snap
         .vllm
         .generation_tokens_per_sec
@@ -222,6 +230,8 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
         weight_dtype_source,
         weight_gb,
         weight_bytes_per_param,
+        kv_bytes_per_element,
+        kv_cache_dtype_source,
         kv_headroom_gb,
         tpot_floor_ms,
         prefill_latency_floor_ms,
@@ -441,6 +451,9 @@ mod tests {
         assert!(out.is_some());
         let b = out.expect("expected baseline");
         assert_eq!(b.weight_dtype_source, WeightDtypeSource::EnvVar);
+        // No runtime cache_dtype → config fp8 fallback.
+        assert_eq!(b.kv_bytes_per_element, 1);
+        assert_eq!(b.kv_cache_dtype_source, KvCacheDtypeSource::ExplicitFp8);
         let expected_decode = math::decode_ceiling_tps(3350.0, 10_000_000_000, 32);
         assert!((b.decode.expected - expected_decode).abs() < 1e-9);
         assert!(
@@ -448,6 +461,44 @@ mod tests {
             "weight_gb uses total param_count (100B × 32 bits / 8), got {}",
             b.weight_gb
         );
+    }
+
+    #[test]
+    fn baseline_kv_dtype_prefers_runtime_label_over_config() {
+        let mk = |runtime: Option<&str>, config: Option<&str>| {
+            let cfg = VllmConfig {
+                dtype: Some("bf16".to_string()),
+                kv_cache_dtype: config.map(str::to_string),
+                max_model_len: Some(2048),
+                ..Default::default()
+            };
+            let snap = VllmRawMetrics {
+                generation_tokens_per_sec: Some(50.0),
+                cache_config: crate::collectors::CacheConfigLabels {
+                    cache_dtype: runtime.map(str::to_string),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let (ctx, win) = baseline_input(
+                Some(7_000_000_000),
+                None,
+                Some("bf16"),
+                Some(312.0),
+                Some(2039.0),
+                cfg,
+                snap,
+            );
+            let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+            (b.kv_bytes_per_element, b.kv_cache_dtype_source)
+        };
+        assert_eq!(mk(Some("fp8"), None), (1, KvCacheDtypeSource::ExplicitFp8));
+        assert_eq!(mk(None, Some("fp8")), (1, KvCacheDtypeSource::ExplicitFp8));
+        assert_eq!(
+            mk(Some("bf16"), Some("fp8")),
+            (2, KvCacheDtypeSource::ExplicitActivation)
+        );
+        assert_eq!(mk(None, None), (2, KvCacheDtypeSource::Auto));
     }
 
     #[test]

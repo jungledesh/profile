@@ -1,9 +1,18 @@
 use crate::collectors::config::DEFAULT_GPU_MEMORY_UTILIZATION;
 use crate::engine::WeightDtypeSource;
-use crate::engine::baseline::ACTIVATION_KV_BUFFER_GB;
+use crate::engine::baseline::{ACTIVATION_KV_BUFFER_GB, KvCacheDtypeSource};
 
 use super::Recommendation;
 use super::rule_names;
+
+/// Cap when the one-request floor is priced on an unrecognized KV dtype string.
+const UNKNOWN_KV_DTYPE_CONFIDENCE_CAP: f64 = 0.5;
+
+/// One-request KV+state floor inputs. Weights-overflow ignores these.
+pub(super) struct R4FloorEvidence {
+    pub request_bytes: Option<u64>,
+    pub kv_cache_dtype_source: KvCacheDtypeSource,
+}
 
 fn min_tp(weight_gb: f64, vram_gb: f64, gpu_memory_utilization: f64) -> Option<u32> {
     let usable = (vram_gb * gpu_memory_utilization) - ACTIVATION_KV_BUFFER_GB;
@@ -26,7 +35,13 @@ fn confidence_for_source(weight_dtype_source: WeightDtypeSource) -> f64 {
 }
 
 fn confidence_label(confidence: f64) -> &'static str {
-    if confidence >= 0.9 { "High" } else { "Medium" }
+    if confidence >= 0.9 {
+        "High"
+    } else if confidence >= 0.7 {
+        "Medium"
+    } else {
+        "Low"
+    }
 }
 
 /// r4: weights exceed GPU VRAM budget (`kv_headroom_gb < 0`).
@@ -45,7 +60,10 @@ pub fn r4_recommendation(
         vram_gb,
         gpu_memory_utilization,
         weight_dtype_source,
-        None,
+        R4FloorEvidence {
+            request_bytes: None,
+            kv_cache_dtype_source: KvCacheDtypeSource::Auto,
+        },
     )
 }
 
@@ -56,22 +74,30 @@ pub(super) fn r4_recommendation_with_request_floor(
     vram_gb: Option<f64>,
     gpu_memory_utilization: Option<f64>,
     weight_dtype_source: WeightDtypeSource,
-    request_bytes: Option<u64>,
+    floor: R4FloorEvidence,
 ) -> Option<Recommendation> {
     let h = kv_headroom_gb?;
     if !h.is_finite() {
         return None;
     }
-    if weight_dtype_source == WeightDtypeSource::Fallback && h < 0.0 {
+    if weight_dtype_source == WeightDtypeSource::Fallback {
         return None;
     }
     if h >= 0.0 {
-        let request_bytes = request_bytes?;
+        let request_bytes = floor.request_bytes?;
         let free_bytes = (h * 1e9) as u64;
         if free_bytes >= request_bytes {
             return None;
         }
-        let confidence = confidence_for_source(weight_dtype_source);
+        // Unknown dtype: floor still fires (never suppress uncertainty), but the
+        // guess is named inline and confidence capped, matching R6's
+        // TPOT-unavailable and R7's Unknown-dtype precedents.
+        let unknown_kv = floor.kv_cache_dtype_source == KvCacheDtypeSource::Unknown;
+        let confidence = if unknown_kv {
+            confidence_for_source(weight_dtype_source).min(UNKNOWN_KV_DTYPE_CONFIDENCE_CAP)
+        } else {
+            confidence_for_source(weight_dtype_source)
+        };
         let gpu_util = gpu_memory_utilization.unwrap_or(DEFAULT_GPU_MEMORY_UTILIZATION);
         let can_raise_utilization = vram_gb.is_some_and(|vram| {
             gpu_util < 1.0 && (h + vram * (1.0 - gpu_util)) * 1e9 >= request_bytes as f64
@@ -82,29 +108,36 @@ pub(super) fn r4_recommendation_with_request_floor(
         } else {
             "      • Use a smaller model or a GPU with more VRAM".to_string()
         };
+        let mut display_lines = vec![
+            "[!] OOM Risk".to_string(),
+            String::new(),
+            "    Cause:".to_string(),
+            "      • Free VRAM after weights and the activation allowance cannot hold a single request's KV + state."
+                .to_string(),
+            format!(
+                "      • {:.1}GB free; one worst-case request needs {:.1}GB (est).",
+                h,
+                request_bytes as f64 / 1e9
+            ),
+        ];
+        if unknown_kv {
+            display_lines
+                .push("      KV cache dtype unrecognized; sized at 2 bytes/element.".to_string());
+        }
+        display_lines.extend([
+            String::new(),
+            "    Fix:".to_string(),
+            fix_line,
+            String::new(),
+            "    Expected: Model and one request fit in VRAM.".to_string(),
+            format!("    Confidence: {}", confidence_label(confidence)),
+        ]);
         return Some(Recommendation {
             rule_name: rule_names::OOM_RISK,
             layer: 2,
             impact: 5,
             confidence,
-            display_lines: vec![
-                "[!] OOM Risk".to_string(),
-                String::new(),
-                "    Cause:".to_string(),
-                "      • Free VRAM after weights and the activation allowance cannot hold a single request's KV + state."
-                    .to_string(),
-                format!(
-                    "      • {:.1}GB free; one worst-case request needs {:.1}GB (est).",
-                    h,
-                    request_bytes as f64 / 1e9
-                ),
-                String::new(),
-                "    Fix:".to_string(),
-                fix_line,
-                String::new(),
-                "    Expected: Model and one request fit in VRAM.".to_string(),
-                format!("    Confidence: {}", confidence_label(confidence)),
-            ],
+            display_lines,
         });
     }
     let overflow = h.abs();
@@ -261,13 +294,17 @@ mod tests {
             Some(24.0),
             Some(0.9),
             WeightDtypeSource::Catalog,
-            Some(60_000_000),
+            R4FloorEvidence {
+                request_bytes: Some(60_000_000),
+                kv_cache_dtype_source: KvCacheDtypeSource::Auto,
+            },
         )
         .expect("one request should not fit");
         let text = with_whiteboard.display_lines.join("\n");
         assert!(text.contains("cannot hold a single request's KV + state"));
         assert!(text.contains("Raise --gpu-memory-utilization"));
         assert!(!text.contains("tensor-parallel"));
+        assert!(!text.contains("KV cache dtype unrecognized"));
 
         let without_whiteboard = r4_recommendation_with_request_floor(
             Some(0.05),
@@ -276,7 +313,10 @@ mod tests {
             Some(24.0),
             Some(0.9),
             WeightDtypeSource::Catalog,
-            Some(40_000_000),
+            R4FloorEvidence {
+                request_bytes: Some(40_000_000),
+                kv_cache_dtype_source: KvCacheDtypeSource::Auto,
+            },
         );
         assert!(without_whiteboard.is_none());
     }
@@ -426,6 +466,116 @@ mod tests {
         assert!(text.contains("      • Model weights exceed GPU VRAM by ~12GB"));
         assert!(text.contains("Server may OOM without tensor parallelism"));
         assert!(text.contains("weights overflow by ~12GB"));
+    }
+
+    #[test]
+    fn r4_request_floor_declines_on_fallback_dtype() {
+        // Same numbers as request_floor_fires_on_known_dtype; only dtype source differs.
+        assert!(
+            r4_recommendation_with_request_floor(
+                Some(0.05),
+                Some(1),
+                Some(20.0),
+                Some(24.0),
+                Some(0.9),
+                WeightDtypeSource::Fallback,
+                R4FloorEvidence {
+                    request_bytes: Some(60_000_000),
+                    kv_cache_dtype_source: KvCacheDtypeSource::Auto,
+                },
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn r4_request_floor_fires_on_known_dtype() {
+        let r = r4_recommendation_with_request_floor(
+            Some(0.05),
+            Some(1),
+            Some(20.0),
+            Some(24.0),
+            Some(0.9),
+            WeightDtypeSource::EnvVar,
+            R4FloorEvidence {
+                request_bytes: Some(60_000_000),
+                kv_cache_dtype_source: KvCacheDtypeSource::ExplicitActivation,
+            },
+        )
+        .expect("known dtype should fire on identical numbers");
+        let text = r.display_lines.join("\n");
+        assert!(text.contains("cannot hold a single request's KV + state"));
+        assert!(text.contains("Raise --gpu-memory-utilization"));
+        assert!(!text.contains("KV cache dtype unrecognized"));
+        assert!(text.contains("Confidence: High"));
+        assert!((r.confidence - 0.95).abs() < 1e-9);
+    }
+
+    #[test]
+    fn r4_request_floor_unknown_kv_fires_hedged() {
+        let r = r4_recommendation_with_request_floor(
+            Some(0.05),
+            Some(1),
+            Some(20.0),
+            Some(24.0),
+            Some(0.9),
+            WeightDtypeSource::EnvVar,
+            R4FloorEvidence {
+                request_bytes: Some(60_000_000),
+                kv_cache_dtype_source: KvCacheDtypeSource::Unknown,
+            },
+        )
+        .expect("Unknown KV dtype still fires the floor");
+        let text = r.display_lines.join("\n");
+        assert!(text.contains("(est)"));
+        assert!(text.contains("KV cache dtype unrecognized; sized at 2 bytes/element."));
+        assert!(text.contains("Confidence: Low"));
+        assert!((r.confidence - 0.5).abs() < 1e-9);
+        assert!(text.contains("Raise --gpu-memory-utilization"));
+    }
+
+    #[test]
+    fn r4_request_floor_auto_kv_matches_known_confidence() {
+        let r = r4_recommendation_with_request_floor(
+            Some(0.05),
+            Some(1),
+            Some(20.0),
+            Some(24.0),
+            Some(0.9),
+            WeightDtypeSource::EnvVar,
+            R4FloorEvidence {
+                request_bytes: Some(60_000_000),
+                kv_cache_dtype_source: KvCacheDtypeSource::Auto,
+            },
+        )
+        .expect("Auto fires like Explicit");
+        let text = r.display_lines.join("\n");
+        assert!(!text.contains("KV cache dtype unrecognized"));
+        assert!(text.contains("Confidence: High"));
+        assert!((r.confidence - 0.95).abs() < 1e-9);
+    }
+
+    #[test]
+    fn r4_weights_overflow_unaffected_by_unknown_kv_dtype() {
+        let r = r4_recommendation_with_request_floor(
+            Some(-12.5),
+            None,
+            Some(140.0),
+            Some(80.0),
+            Some(0.9),
+            WeightDtypeSource::EnvVar,
+            R4FloorEvidence {
+                request_bytes: None,
+                kv_cache_dtype_source: KvCacheDtypeSource::Unknown,
+            },
+        )
+        .expect("weights overflow ignores KV dtype source");
+        let text = r.display_lines.join("\n");
+        assert!(text.contains("Model weights exceed GPU VRAM"));
+        assert!(!text.contains("cannot hold a single request"));
+        assert!(!text.contains("KV cache dtype unrecognized"));
+        assert!(text.contains("Confidence: High"));
+        assert!((r.confidence - 0.95).abs() < 1e-9);
     }
 
     #[test]

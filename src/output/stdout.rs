@@ -127,6 +127,7 @@ fn build_diagnose_lines(
     }
 
     if !verbose_rules {
+        lines.extend(quiet_efficiency_fallback_lines(report.baseline.as_ref()));
         lines.push(String::new());
     }
     lines.push(format!(
@@ -291,6 +292,29 @@ fn duration_short(duration: Duration) -> String {
     }
 }
 
+fn quiet_efficiency_fallback_lines(baseline: Option<&engine::PhysicsBaseline>) -> Vec<String> {
+    let Some(b) = baseline else {
+        return Vec::new();
+    };
+    if b.weight_dtype_source != engine::WeightDtypeSource::Fallback {
+        return Vec::new();
+    }
+    let Some(e) = b.efficiency_pct.filter(|e| e.is_finite()) else {
+        return Vec::new();
+    };
+    vec![
+        vllm_label_row("Efficiency", &format!("~{e:.1}% of ceiling (est)")),
+        format!(
+            "{:<width$}{}{}",
+            "",
+            VLLM_LABEL_METRICS_GAP,
+            "Note: weight dtype not reported; ceiling assumes bf16.",
+            width = GPU_LABEL_W
+        ),
+        String::new(),
+    ]
+}
+
 fn weight_dtype_display(source: engine::WeightDtypeSource, weight_gb: f64) -> String {
     let suffix = match source {
         engine::WeightDtypeSource::VllmInfoQuantization => "vLLM /info (quant)",
@@ -380,6 +404,15 @@ fn baseline_lines(
             "",
             VLLM_LABEL_METRICS_GAP,
             "weight dtype assumed bf16. Confirm via vLLM metrics or DTYPE env var",
+            width = GPU_LABEL_W
+        ));
+    }
+    if b.kv_cache_dtype_source == engine::KvCacheDtypeSource::Unknown {
+        out.push(format!(
+            "{:<width$}{}{}",
+            "",
+            VLLM_LABEL_METRICS_GAP,
+            "kv_cache_dtype unrecognized; priced as bf16 activation (2 bytes/element)",
             width = GPU_LABEL_W
         ));
     }
@@ -772,6 +805,12 @@ fn config_model_value(cfg: &VllmConfig) -> String {
 
 fn config_kv_value(cfg: &VllmConfig) -> String {
     let kv_dtype = cfg.kv_cache_dtype.as_deref().unwrap_or("-");
+    let (_, kv_source) = engine::baseline::resolve_kv_cache_element(cfg.kv_cache_dtype.as_deref());
+    let kv_suffix = if kv_source == engine::KvCacheDtypeSource::Unknown {
+        " (priced as bf16)"
+    } else {
+        ""
+    };
     let block = cfg
         .block_size
         .map(|b| format!("block {b}"))
@@ -796,7 +835,7 @@ fn config_kv_value(cfg: &VllmConfig) -> String {
             }
         })
         .unwrap_or("chunked_prefill unknown");
-    format!("dtype {kv_dtype} | {block} | {prefix} | {chunked}")
+    format!("dtype {kv_dtype}{kv_suffix} | {block} | {prefix} | {chunked}")
 }
 
 #[cfg(test)]
@@ -878,6 +917,8 @@ mod tests {
             weight_dtype_source: engine::WeightDtypeSource::EnvVar,
             weight_gb: 16.0,
             weight_bytes_per_param: 2,
+            kv_bytes_per_element: 2,
+            kv_cache_dtype_source: engine::KvCacheDtypeSource::Auto,
             kv_headroom_gb: Some(8.0),
             tpot_floor_ms: 10.0,
             prefill_latency_floor_ms: Some(20.0),
@@ -921,6 +962,8 @@ mod tests {
             weight_dtype_source: engine::WeightDtypeSource::EnvVar,
             weight_gb: 16.0,
             weight_bytes_per_param: 2,
+            kv_bytes_per_element: 2,
+            kv_cache_dtype_source: engine::KvCacheDtypeSource::Auto,
             kv_headroom_gb: Some(8.0),
             tpot_floor_ms: 10.0,
             prefill_latency_floor_ms: Some(42.0),
@@ -965,6 +1008,8 @@ mod tests {
             weight_dtype_source: engine::WeightDtypeSource::EnvVar,
             weight_gb: 16.0,
             weight_bytes_per_param: 2,
+            kv_bytes_per_element: 2,
+            kv_cache_dtype_source: engine::KvCacheDtypeSource::Auto,
             kv_headroom_gb: Some(8.0),
             tpot_floor_ms: 10.0,
             prefill_latency_floor_ms: Some(200.0),
@@ -1003,6 +1048,8 @@ mod tests {
             weight_dtype_source: engine::WeightDtypeSource::EnvVar,
             weight_gb: 16.0,
             weight_bytes_per_param: 2,
+            kv_bytes_per_element: 2,
+            kv_cache_dtype_source: engine::KvCacheDtypeSource::Auto,
             kv_headroom_gb: Some(8.0),
             tpot_floor_ms: 10.0,
             prefill_latency_floor_ms: Some(20.0),
@@ -1044,6 +1091,8 @@ mod tests {
             weight_dtype_source: WeightDtypeSource::Fallback,
             weight_gb: 1.0,
             weight_bytes_per_param: 2,
+            kv_bytes_per_element: 2,
+            kv_cache_dtype_source: engine::KvCacheDtypeSource::Auto,
             kv_headroom_gb: None,
             tpot_floor_ms: 10.0,
             prefill_latency_floor_ms: None,
@@ -1075,6 +1124,8 @@ mod tests {
             weight_dtype_source: WeightDtypeSource::Fallback,
             weight_gb: 1.0,
             weight_bytes_per_param: 2,
+            kv_bytes_per_element: 2,
+            kv_cache_dtype_source: engine::KvCacheDtypeSource::Auto,
             kv_headroom_gb: None,
             tpot_floor_ms: 10.0,
             prefill_latency_floor_ms: None,
@@ -1139,6 +1190,43 @@ mod tests {
         assert!(s.contains("$2.50/1M tok"));
         assert!(!s.contains("(est)"));
         assert!(!s.contains("tok/W"));
+    }
+
+    #[test]
+    fn quiet_efficiency_fallback_disclaimer_when_dtype_unknown() {
+        let lines = quiet_efficiency_fallback_lines(Some(&baseline_efficiency(6.7)));
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("Efficiency"));
+        assert!(lines[0].contains("~6.7% of ceiling (est)"));
+        assert!(lines[1].contains("Note: weight dtype not reported; ceiling assumes bf16."));
+        assert!(lines[2].is_empty());
+    }
+
+    #[test]
+    fn quiet_efficiency_fallback_absent_when_dtype_known() {
+        use crate::engine::baseline::{CeilingEstimate, PhysicsBaseline, WeightDtypeSource};
+        let b = PhysicsBaseline {
+            decode: CeilingEstimate {
+                lower: 100.0,
+                expected: 100.0,
+                upper: 100.0,
+            },
+            prefill: None,
+            efficiency_pct: Some(50.0),
+            headroom_pct: None,
+            weight_dtype_source: WeightDtypeSource::EnvVar,
+            weight_gb: 1.0,
+            weight_bytes_per_param: 2,
+            kv_bytes_per_element: 2,
+            kv_cache_dtype_source: engine::KvCacheDtypeSource::Auto,
+            kv_headroom_gb: None,
+            tpot_floor_ms: 10.0,
+            prefill_latency_floor_ms: None,
+            ridge_batch_size: 1.0,
+            config_relative_efficiency_pct: None,
+            cost: None,
+        };
+        assert!(quiet_efficiency_fallback_lines(Some(&b)).is_empty());
     }
 
     #[test]

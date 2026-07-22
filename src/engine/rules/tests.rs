@@ -311,7 +311,6 @@ fn compute_kv_max_seqs_uses_kv_layers_over_total_layers() {
         &hybrid,
         None,
         None,
-        2,
         &crate::collectors::CacheConfigLabels::default(),
     )
     .max_seqs;
@@ -326,7 +325,6 @@ fn compute_kv_max_seqs_uses_kv_layers_over_total_layers() {
         &dense,
         None,
         None,
-        2,
         &crate::collectors::CacheConfigLabels::default(),
     )
     .max_seqs;
@@ -350,7 +348,6 @@ fn compute_kv_max_seqs_tp2_doubles_capacity() {
         &model,
         None,
         Some(1),
-        2,
         None,
     )
     .max_seqs;
@@ -360,7 +357,6 @@ fn compute_kv_max_seqs_tp2_doubles_capacity() {
         &model,
         None,
         Some(2),
-        2,
         None,
     )
     .max_seqs;
@@ -386,7 +382,6 @@ fn compute_kv_max_seqs_tp2_uses_one_model_view_for_budget_and_cost() {
         &model,
         None,
         Some(2),
-        2,
         Some(&cache),
     );
 
@@ -411,7 +406,6 @@ fn compute_kv_max_seqs_non_divisible_tp_declines() {
         &model,
         None,
         Some(3),
-        2,
         None,
     )
     .max_seqs;
@@ -430,7 +424,6 @@ fn compute_kv_max_seqs_non_divisible_tp_declines() {
         &few_heads,
         None,
         Some(4),
-        2,
         None,
     )
     .max_seqs;
@@ -443,7 +436,6 @@ fn compute_kv_max_seqs_non_divisible_tp_declines() {
         &few_heads,
         None,
         Some(2),
-        2,
         None,
     )
     .max_seqs;
@@ -458,15 +450,8 @@ fn compute_kv_max_seqs_declines_tp2_when_launch_flag_off() {
         num_layers: Some(32),
         ..Default::default()
     };
-    let derived = compute_kv_max_seqs_with_mode::<false>(
-        Some(20.0),
-        Some(4096),
-        &model,
-        None,
-        Some(2),
-        2,
-        None,
-    );
+    let derived =
+        compute_kv_max_seqs_with_mode::<false>(Some(20.0), Some(4096), &model, None, Some(2), None);
     assert_eq!(derived.max_seqs, None);
     let (bound, source) = resolve_kv_bound(None, derived.max_seqs, false, Some(4.0), Some(50.0));
     assert_eq!(bound, Some(8.0));
@@ -481,15 +466,8 @@ fn compute_kv_max_seqs_zero_kv_heads_declines_under_tp() {
         num_layers: Some(32),
         ..Default::default()
     };
-    let derived = compute_kv_max_seqs_with_mode::<true>(
-        Some(20.0),
-        Some(4096),
-        &model,
-        None,
-        Some(2),
-        2,
-        None,
-    );
+    let derived =
+        compute_kv_max_seqs_with_mode::<true>(Some(20.0), Some(4096), &model, None, Some(2), None);
     assert_eq!(derived, DerivedCapacity::default());
 }
 
@@ -508,7 +486,6 @@ fn compute_kv_max_seqs_tp_none_uses_full_heads() {
         &model,
         None,
         None,
-        2,
         &crate::collectors::CacheConfigLabels::default(),
     )
     .max_seqs;
@@ -518,7 +495,6 @@ fn compute_kv_max_seqs_tp_none_uses_full_heads() {
         &model,
         None,
         Some(1),
-        2,
         &crate::collectors::CacheConfigLabels::default(),
     )
     .max_seqs;
@@ -526,7 +502,7 @@ fn compute_kv_max_seqs_tp_none_uses_full_heads() {
 }
 
 #[test]
-fn compute_kv_max_seqs_auto_kv_inherits_weight_bytes() {
+fn compute_kv_max_seqs_auto_kv_uses_activation_dtype_not_weight_width() {
     let model = ModelArch {
         num_kv_heads: Some(8),
         head_dim: Some(128),
@@ -534,27 +510,231 @@ fn compute_kv_max_seqs_auto_kv_inherits_weight_bytes() {
         ..Default::default()
     };
     let headroom_gb = 20.0;
-    let bf16 = compute_kv_max_seqs_for_cache(
+    let bf16_weights = compute_kv_max_seqs_for_cache(
         Some(headroom_gb),
         Some(4096),
         &model,
         Some("auto"),
         None,
-        2,
         &crate::collectors::CacheConfigLabels::default(),
     )
     .max_seqs;
-    let fp8_w = compute_kv_max_seqs_for_cache(
+    let quantized_weights = compute_kv_max_seqs_for_cache(
         Some(headroom_gb),
         Some(4096),
         &model,
         Some("auto"),
         None,
-        1,
         &crate::collectors::CacheConfigLabels::default(),
     )
     .max_seqs;
-    assert_eq!(fp8_w.unwrap(), bf16.unwrap() * 2);
+    assert_eq!(quantized_weights, bf16_weights);
+}
+
+#[test]
+fn effective_kv_dtype_baseline_capacity_and_r2_agree() {
+    use crate::engine::baseline::{
+        KvCacheDtypeSource, compute, effective_kv_cache_dtype, kv_bytes_per_element,
+    };
+    use crate::engine::rules::r2_kv_cache_pressure::fp8_kv_cache_fix_bullet;
+
+    let model = ModelArch {
+        num_kv_heads: Some(8),
+        head_dim: Some(128),
+        num_layers: Some(32),
+        param_count: Some(7_000_000_000),
+        default_weight_dtype: Some("bf16".to_string()),
+        ..Default::default()
+    };
+    let headroom_gb = 20.0;
+
+    // runtime fp8 + config None → 1 byte at capacity; no fp8-switch advice
+    let runtime_fp8 = effective_kv_cache_dtype(Some("fp8"), None);
+    assert_eq!(kv_bytes_per_element(runtime_fp8), 1);
+    let cap_fp8 = compute_kv_max_seqs_for_cache(
+        Some(headroom_gb),
+        Some(4096),
+        &model,
+        runtime_fp8,
+        None,
+        &crate::collectors::CacheConfigLabels::default(),
+    )
+    .max_seqs;
+    let cap_bf16 = compute_kv_max_seqs_for_cache(
+        Some(headroom_gb),
+        Some(4096),
+        &model,
+        Some("bf16"),
+        None,
+        &crate::collectors::CacheConfigLabels::default(),
+    )
+    .max_seqs;
+    assert_eq!(cap_fp8.unwrap(), cap_bf16.unwrap() * 2);
+    assert!(
+        fp8_kv_cache_fix_bullet(runtime_fp8, true).is_none(),
+        "already-fp8 runtime must not advise switching to fp8"
+    );
+
+    // config fp8 + runtime None → 1 byte (fallback)
+    assert_eq!(
+        kv_bytes_per_element(effective_kv_cache_dtype(None, Some("fp8"))),
+        1
+    );
+
+    // runtime bf16 + config fp8 → runtime wins, 2 bytes
+    assert_eq!(
+        kv_bytes_per_element(effective_kv_cache_dtype(Some("bf16"), Some("fp8"))),
+        2
+    );
+
+    // both None → Auto, 2 bytes
+    let both_none = effective_kv_cache_dtype(None, None);
+    assert_eq!(kv_bytes_per_element(both_none), 2);
+
+    // Seam: baseline and R2 price the same snapshot's runtime fp8 the same way.
+    let t = SystemTime::UNIX_EPOCH;
+    let snap = RawSnapshot {
+        gpu_observed_at: t,
+        vllm_observed_at: t,
+        timestamp: t,
+        vllm: VllmRawMetrics {
+            model_name: Some("meta-llama/Llama-3.1-8B-Instruct".to_string()),
+            generation_tokens_per_sec: Some(50.0),
+            num_requests_running: Some(4.0),
+            window_duration_secs: Some(2.0),
+            cache_config: crate::collectors::CacheConfigLabels {
+                cache_dtype: Some("fp8".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        gpus: vec![GpuRawMetrics {
+            gpu_name: Some("NVIDIA A100-SXM4-80GB".to_string()),
+            vram_total_mb: Some(80 * 1024),
+            ..Default::default()
+        }],
+    };
+    let cfg = VllmConfig {
+        dtype: Some("bf16".to_string()),
+        kv_cache_dtype: None,
+        max_model_len: Some(4096),
+        ..Default::default()
+    };
+    let ctx = StaticContext::from_snapshot(&snap, cfg);
+    let win = RuntimeWindow::from_snapshot(snap);
+    let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+    assert_eq!(b.kv_bytes_per_element, 1);
+    assert_eq!(b.kv_cache_dtype_source, KvCacheDtypeSource::ExplicitFp8);
+    let runtime = win.snapshot.vllm.cache_config.cache_dtype.as_deref();
+    assert_eq!(kv_bytes_per_element(runtime), b.kv_bytes_per_element);
+    assert!(fp8_kv_cache_fix_bullet(runtime, true).is_none());
+}
+
+#[test]
+fn unknown_kv_dtype_request_floor_fires_hedged_weights_overflow_unaffected() {
+    use crate::engine::baseline::{KvCacheDtypeSource, compute};
+
+    let t = SystemTime::UNIX_EPOCH;
+    // Tiny weights + huge KV geometry → positive headroom but one request won't fit.
+    let snap = RawSnapshot {
+        gpu_observed_at: t,
+        vllm_observed_at: t,
+        timestamp: t,
+        vllm: VllmRawMetrics {
+            model_name: Some("meta-llama/Llama-3.1-8B-Instruct".to_string()),
+            generation_tokens_per_sec: Some(50.0),
+            num_requests_running: Some(4.0),
+            window_duration_secs: Some(2.0),
+            cache_config: crate::collectors::CacheConfigLabels {
+                cache_dtype: Some("mystery_dtype".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        gpus: vec![GpuRawMetrics {
+            gpu_name: Some("NVIDIA A100-SXM4-80GB".to_string()),
+            vram_total_mb: Some(80 * 1024),
+            ..Default::default()
+        }],
+    };
+    let cfg = VllmConfig {
+        dtype: Some("bf16".to_string()),
+        kv_cache_dtype: None,
+        max_model_len: Some(131072),
+        gpu_memory_utilization: Some(0.9),
+        ..Default::default()
+    };
+    let mut ctx = StaticContext::from_snapshot(&snap, cfg);
+    ctx.model.param_count = Some(1_000_000_000);
+    ctx.model.num_layers = Some(128);
+    ctx.model.num_kv_heads = Some(64);
+    ctx.model.head_dim = Some(256);
+    ctx.model.default_weight_dtype = Some("bf16".to_string());
+    let win = RuntimeWindow::from_snapshot(snap);
+    let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+    assert_eq!(b.kv_cache_dtype_source, KvCacheDtypeSource::Unknown);
+    assert!(b.kv_headroom_gb.expect("headroom") > 0.0);
+
+    let windows: Vec<_> = (0..ENGINE_MIN_PERSISTENT_WINDOWS)
+        .map(|_| win.clone())
+        .collect();
+    let summary = ai(&ctx, &windows[0]);
+    let report = build_report_for_windows(&windows, summary);
+    let floor = report
+        .recommendations
+        .iter()
+        .find(|r| r.rule_name == rule_names::OOM_RISK)
+        .expect("Unknown KV dtype still fires one-request floor");
+    let text = floor.display_lines.join("\n");
+    assert!(text.contains("(est)"));
+    assert!(text.contains("KV cache dtype unrecognized; sized at 2 bytes/element."));
+    assert!(text.contains("Confidence: Low"));
+    assert!(text.contains("cannot hold a single request"));
+
+    // Explicit bf16: same floor, no provenance hedge, High confidence.
+    let snap_known = RawSnapshot {
+        vllm: VllmRawMetrics {
+            cache_config: crate::collectors::CacheConfigLabels {
+                cache_dtype: Some("bf16".to_string()),
+                ..Default::default()
+            },
+            ..windows[0].snapshot.vllm.clone()
+        },
+        ..windows[0].snapshot.clone()
+    };
+    let win_known = RuntimeWindow::from_snapshot(snap_known);
+    let windows_known: Vec<_> = (0..ENGINE_MIN_PERSISTENT_WINDOWS)
+        .map(|_| win_known.clone())
+        .collect();
+    let summary_known = ai(&ctx, &windows_known[0]);
+    let report_known = build_report_for_windows(&windows_known, summary_known);
+    let known = report_known
+        .recommendations
+        .iter()
+        .find(|r| r.rule_name == rule_names::OOM_RISK)
+        .expect("explicit bf16 fires floor");
+    let known_text = known.display_lines.join("\n");
+    assert!(known_text.contains("cannot hold a single request"));
+    assert!(!known_text.contains("KV cache dtype unrecognized"));
+    assert!(known_text.contains("Confidence: High"));
+
+    // Weights overflow path ignores KV Unknown: oversized weights still fire.
+    let mut ctx_overflow = ctx.clone();
+    ctx_overflow.model.param_count = Some(200_000_000_000);
+    let report_overflow = build_report_for_windows(&windows, ai(&ctx_overflow, &windows[0]));
+    assert!(
+        report_overflow.recommendations.iter().any(|r| {
+            r.rule_name == rule_names::OOM_RISK
+                && r.display_lines
+                    .iter()
+                    .any(|l| l.contains("Model weights exceed GPU VRAM"))
+                && !r
+                    .display_lines
+                    .iter()
+                    .any(|l| l.contains("KV cache dtype unrecognized"))
+        }),
+        "weights-overflow must fire unchanged when KV dtype is Unknown"
+    );
 }
 
 #[test]
@@ -576,7 +756,6 @@ fn compute_kv_max_seqs_whiteboard_reduces_hybrid_capacity() {
         &hybrid,
         None,
         None,
-        2,
         &crate::collectors::CacheConfigLabels::default(),
     )
     .max_seqs;
@@ -586,7 +765,6 @@ fn compute_kv_max_seqs_whiteboard_reduces_hybrid_capacity() {
         &attention_only,
         None,
         None,
-        2,
         &crate::collectors::CacheConfigLabels::default(),
     )
     .max_seqs;
@@ -616,7 +794,6 @@ fn compute_kv_max_seqs_windowed_gemma_uses_capped_price() {
             &gemma,
             None,
             None,
-            2,
             &crate::collectors::CacheConfigLabels::default(),
         )
         .max_seqs,
@@ -629,7 +806,6 @@ fn compute_kv_max_seqs_windowed_gemma_uses_capped_price() {
             &all_full,
             None,
             None,
-            2,
             &crate::collectors::CacheConfigLabels::default(),
         )
         .max_seqs,
@@ -651,7 +827,7 @@ fn capacity_budget_rungs_prefer_observed_and_refuse_windowed_blocks() {
         ..Default::default()
     };
     let dense_result =
-        compute_kv_max_seqs_for_cache(Some(20.0), Some(4096), &dense, None, None, 2, &dense_cache);
+        compute_kv_max_seqs_for_cache(Some(20.0), Some(4096), &dense, None, None, &dense_cache);
     assert_eq!(dense_result.max_seqs, Some(39));
     assert!(dense_result.budget_self_grade.is_some());
 
@@ -661,15 +837,8 @@ fn capacity_budget_rungs_prefer_observed_and_refuse_windowed_blocks() {
         mamba_page_size_padded: Some(25_690_112),
         ..Default::default()
     };
-    let hybrid_result = compute_kv_max_seqs_for_cache(
-        Some(20.0),
-        Some(4096),
-        &hybrid,
-        None,
-        None,
-        2,
-        &hybrid_cache,
-    );
+    let hybrid_result =
+        compute_kv_max_seqs_for_cache(Some(20.0), Some(4096), &hybrid, None, None, &hybrid_cache);
     assert_eq!(hybrid_result.max_seqs, Some(30));
     assert!(hybrid_result.budget_self_grade.is_some());
 
@@ -678,15 +847,8 @@ fn capacity_budget_rungs_prefer_observed_and_refuse_windowed_blocks() {
         num_swa_layers: Some(26),
         ..dense.clone()
     };
-    let windowed_result = compute_kv_max_seqs_for_cache(
-        Some(20.0),
-        Some(4096),
-        &windowed,
-        None,
-        None,
-        2,
-        &dense_cache,
-    );
+    let windowed_result =
+        compute_kv_max_seqs_for_cache(Some(20.0), Some(4096), &windowed, None, None, &dense_cache);
     assert_eq!(windowed_result.max_seqs, Some(95));
     assert_eq!(windowed_result.budget_self_grade, None);
 
@@ -696,7 +858,6 @@ fn capacity_budget_rungs_prefer_observed_and_refuse_windowed_blocks() {
         &dense,
         None,
         None,
-        2,
         &crate::collectors::CacheConfigLabels::default(),
     );
     assert_eq!(no_labels.max_seqs, Some(37));
@@ -707,7 +868,6 @@ fn capacity_budget_rungs_prefer_observed_and_refuse_windowed_blocks() {
         &dense,
         None,
         None,
-        2,
         &crate::collectors::CacheConfigLabels::default(),
     );
     assert_eq!(no_budget.max_seqs, None);
@@ -728,13 +888,12 @@ fn unpriced_currency_declines_to_empirical_low_confidence() {
         &unpriced,
         None,
         None,
-        2,
         &crate::collectors::CacheConfigLabels::default(),
     )
     .max_seqs;
     assert_eq!(derived, None);
     let (bound, source) = resolve_kv_bound(None, derived, true, Some(4.0), Some(50.0));
-    let rec = recommended_seqs(None, bound, source, Some(4)).expect("empirical fallback");
+    let rec = recommended_seqs(None, bound, source, Some(4), None).expect("empirical fallback");
     assert_eq!(source, Some(KvBoundSource::Empirical));
     assert!(rec.empirical);
 }
@@ -856,7 +1015,6 @@ fn model_len_suggestion_projects_capacity_from_observed_geometry() {
         model: None,
         kv_cache_dtype: None,
         tp: None,
-        weight_bytes: 2,
     };
     let mut lines = Vec::new();
     extend_with_shrink_suggestion(
@@ -904,7 +1062,6 @@ fn model_len_suggestion_live_run_projection_at_5465_is_39_not_observed_8() {
         model: None,
         kv_cache_dtype: None,
         tp: None,
-        weight_bytes: 2,
     };
     assert_eq!(
         capacity_at_hypothetical_max_len(5465, Some(32768), &hyp),
@@ -954,7 +1111,6 @@ fn capacity_at_hypothetical_falls_to_catalog_when_labels_absent() {
         &model,
         None,
         None,
-        2,
         &crate::collectors::CacheConfigLabels::default(),
     )
     .max_seqs;
@@ -965,7 +1121,6 @@ fn capacity_at_hypothetical_falls_to_catalog_when_labels_absent() {
         model: Some(&model),
         kv_cache_dtype: None,
         tp: None,
-        weight_bytes: 2,
     };
     assert_eq!(
         capacity_at_hypothetical_max_len(4096, Some(8192), &hyp),
@@ -994,7 +1149,6 @@ fn capacity_at_hypothetical_falls_to_catalog_when_num_gpu_blocks_absent() {
         &model,
         None,
         None,
-        2,
         &crate::collectors::CacheConfigLabels::default(),
     )
     .max_seqs;
@@ -1005,7 +1159,6 @@ fn capacity_at_hypothetical_falls_to_catalog_when_num_gpu_blocks_absent() {
         model: Some(&model),
         kv_cache_dtype: None,
         tp: None,
-        weight_bytes: 2,
     };
     assert_eq!(
         capacity_at_hypothetical_max_len(4096, Some(8192), &hyp),
@@ -1034,7 +1187,6 @@ fn capacity_at_hypothetical_gate_suppresses_both_tiers() {
         model: Some(&model),
         kv_cache_dtype: None,
         tp: None,
-        weight_bytes: 2,
     };
     assert!(
         compute_kv_max_seqs_for_cache(
@@ -1043,7 +1195,6 @@ fn capacity_at_hypothetical_gate_suppresses_both_tiers() {
             &model,
             None,
             None,
-            2,
             &crate::collectors::CacheConfigLabels::default(),
         )
         .max_seqs
@@ -1090,7 +1241,6 @@ fn capacity_at_hypothetical_fits_none_does_not_fall_to_catalog() {
         model: Some(&model),
         kv_cache_dtype: None,
         tp: None,
-        weight_bytes: 2,
     };
     assert!(
         compute_kv_max_seqs_for_cache(
@@ -1099,7 +1249,6 @@ fn capacity_at_hypothetical_fits_none_does_not_fall_to_catalog() {
             &model,
             None,
             None,
-            2,
             &crate::collectors::CacheConfigLabels::default(),
         )
         .max_seqs
@@ -1130,7 +1279,6 @@ fn capacity_at_hypothetical_dense_zero_state_projects_as_before() {
         model: None,
         kv_cache_dtype: None,
         tp: None,
-        weight_bytes: 2,
     };
     assert_eq!(
         capacity_at_hypothetical_max_len(2048, Some(4096), &hyp),
@@ -1160,7 +1308,6 @@ fn capacity_at_hypothetical_prefers_geometry_over_catalog() {
         model: Some(&model),
         kv_cache_dtype: None,
         tp: None,
-        weight_bytes: 2,
     };
     assert_eq!(
         capacity_at_hypothetical_max_len(16384, Some(32768), &hyp),
@@ -2085,6 +2232,7 @@ fn kv_warning_requires_significance() {
     let report = build_report_for_windows(&windows, summary);
     let text = report.recommendations[0].display_lines.join("\n");
     assert!(!text.contains("Monitor KV cache when scaling up."));
+    assert!(!text.contains("• Monitor"));
 }
 
 #[test]
@@ -2097,7 +2245,8 @@ fn kv_warning_fires_when_significant() {
     let summary = ai(&ctx, windows.last().expect("windows"));
     let report = build_report_for_windows(&windows, summary);
     let text = report.recommendations[0].display_lines.join("\n");
-    assert!(text.contains("Monitor KV cache when scaling up."));
+    assert!(text.contains("        Monitor KV cache when scaling up."));
+    assert!(!text.contains("• Monitor"));
 }
 
 #[test]

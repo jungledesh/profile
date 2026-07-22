@@ -1,7 +1,7 @@
 use crate::collectors::{effective_tensor_parallel, window_is_evaluable, window_is_idle};
 use crate::context::{AnalysisInput, RuntimeWindow};
 use crate::engine::Report;
-use crate::engine::baseline::{self, WeightDtypeSource};
+use crate::engine::baseline::{self, WeightDtypeSource, effective_kv_cache_dtype};
 
 use super::r1_under_batching::{
     KV_MONITOR_WARNING_PCT, R1EvalInput, Rule1Outcome, UnderBatchingDetail, aggregate_r1_detail,
@@ -18,7 +18,7 @@ use super::r3_low_prefix_reuse::{
     LowPrefixReuseDetail, Rule3Outcome, aggregate_r3_detail, format_low_prefix_window_issue,
     rule3_low_prefix_reuse,
 };
-use super::r4_oom_risk::r4_recommendation_with_request_floor;
+use super::r4_oom_risk::{R4FloorEvidence, r4_recommendation_with_request_floor};
 use super::r5_concurrency_saturation::{
     ConcurrencySaturationDetail, aggregate_concurrency_saturation_detail,
     format_concurrency_saturation_window_issue, r5_confidence, rule5_concurrency_saturation,
@@ -34,8 +34,8 @@ use super::r7_config_headroom::{
     rule7_config_headroom,
 };
 use super::{
-    Recommendation, catalog_state_pages_mismatch, compute_kv_max_seqs_for_cache, recommended_seqs,
-    resolve_kv_bound, rule_is_significant, rule_names,
+    KvBoundSource, Recommendation, catalog_state_pages_mismatch, compute_kv_max_seqs_for_cache,
+    recommended_seqs, resolve_kv_bound, rule_is_significant, rule_names,
 };
 
 const SUPPRESSION_TABLE: &[(&str, &str)] = &[
@@ -360,15 +360,14 @@ fn eval_window_rules(
             win_baseline.as_ref().and_then(|b| b.kv_headroom_gb),
             summary.ctx.config.max_model_len,
             &summary.ctx.model,
-            summary.ctx.config.kv_cache_dtype.as_deref(),
+            effective_kv_cache_dtype(
+                snap.vllm.cache_config.cache_dtype.as_deref(),
+                summary.ctx.config.kv_cache_dtype.as_deref(),
+            ),
             effective_tensor_parallel(
                 summary.ctx.config.tensor_parallel_size,
                 snap.collected_gpu_count(),
             ),
-            win_baseline
-                .as_ref()
-                .map(|b| b.weight_bytes_per_param)
-                .unwrap_or(2),
             &snap.vllm.cache_config,
         )
         .max_seqs;
@@ -398,21 +397,24 @@ fn build_report_from_eval(
     session_hit_rate: Option<f64>,
     baseline: Option<baseline::PhysicsBaseline>,
 ) -> Report {
+    let summary_snap = &summary.window.snapshot;
+    let tp = effective_tensor_parallel(
+        summary.ctx.config.tensor_parallel_size,
+        summary_snap.collected_gpu_count(),
+    );
+    let kv_cache_dtype = effective_kv_cache_dtype(
+        summary_snap.vllm.cache_config.cache_dtype.as_deref(),
+        summary.ctx.config.kv_cache_dtype.as_deref(),
+    );
+
     if eval.n_eval == 0 {
         let derived = compute_kv_max_seqs_for_cache(
             baseline.as_ref().and_then(|b| b.kv_headroom_gb),
             summary.ctx.config.max_model_len,
             &summary.ctx.model,
-            summary.ctx.config.kv_cache_dtype.as_deref(),
-            effective_tensor_parallel(
-                summary.ctx.config.tensor_parallel_size,
-                summary.window.snapshot.collected_gpu_count(),
-            ),
-            baseline
-                .as_ref()
-                .map(|b| b.weight_bytes_per_param)
-                .unwrap_or(2),
-            &summary.window.snapshot.vllm.cache_config,
+            kv_cache_dtype,
+            tp,
+            &summary_snap.vllm.cache_config,
         );
         return Report {
             baseline,
@@ -421,7 +423,7 @@ fn build_report_from_eval(
             kv_max_seqs: derived.max_seqs,
             prescribed_kv_capacity: None,
             catalog_state_mismatch: catalog_state_pages_mismatch(
-                &summary.window.snapshot.vllm.cache_config,
+                &summary_snap.vllm.cache_config,
                 summary.ctx.config.max_model_len,
                 &summary.ctx.model,
             ),
@@ -435,26 +437,16 @@ fn build_report_from_eval(
         };
     }
 
-    let summary_snap = &summary.window.snapshot;
     let max_model_len = summary.ctx.config.max_model_len;
     let kv_headroom_gb = baseline.as_ref().and_then(|b| b.kv_headroom_gb);
     let fp8_compiler_available = summary.ctx.fp8_compiler_available;
-    let weight_bytes_per_param = baseline
-        .as_ref()
-        .map(|b| b.weight_bytes_per_param)
-        .unwrap_or(2);
-    let tp = effective_tensor_parallel(
-        summary.ctx.config.tensor_parallel_size,
-        summary.window.snapshot.collected_gpu_count(),
-    );
     // Derived ceiling for R5 / verbose / Report.kv_max_seqs. R2 prefers observed.
     let derived_capacity = compute_kv_max_seqs_for_cache(
         kv_headroom_gb,
         max_model_len,
         &summary.ctx.model,
-        summary.ctx.config.kv_cache_dtype.as_deref(),
+        kv_cache_dtype,
         tp,
-        weight_bytes_per_param,
         &summary_snap.vllm.cache_config,
     );
     let kv_max_seqs = derived_capacity.max_seqs;
@@ -479,6 +471,7 @@ fn build_report_from_eval(
         run_kv_bound,
         run_kv_source,
         summary.ctx.config.max_num_seqs,
+        baseline.as_ref().map(|b| b.kv_cache_dtype_source),
     );
     let r2_significant = eval.r2_significant();
     let r2_backlog_significant = eval.r2_backlog_significant();
@@ -528,10 +521,10 @@ fn build_report_from_eval(
                 kv_headroom_gb,
                 kv_max_seqs: r2_kv_max_seqs,
                 capacity_label: r2_capacity_label,
-                weight_bytes_per_param,
                 fp8_compiler_available,
                 model: Some(&summary.ctx.model),
                 tp,
+                kv_cache_dtype,
             },
             eval.r2_fired,
             eval.n_eval,
@@ -555,10 +548,10 @@ fn build_report_from_eval(
                 kv_headroom_gb,
                 kv_max_seqs: r2_kv_max_seqs,
                 capacity_label: r2_capacity_label,
-                weight_bytes_per_param,
                 fp8_compiler_available,
                 model: Some(&summary.ctx.model),
                 tp,
+                kv_cache_dtype,
             },
             eval.r2_backlog_fired,
             eval.n_eval,
@@ -580,9 +573,8 @@ fn build_report_from_eval(
             cache: &summary_snap.vllm.cache_config,
             kv_headroom_gb,
             model: Some(&summary.ctx.model),
-            kv_cache_dtype: summary.ctx.config.kv_cache_dtype.as_deref(),
+            kv_cache_dtype,
             tp,
-            weight_bytes: weight_bytes_per_param,
         };
         let display_lines = format_concurrency_saturation_window_issue(
             &agg,
@@ -615,11 +607,25 @@ fn build_report_from_eval(
                 ..d
             };
             let conf = r7_confidence(run_rec.as_ref());
+            // A derived bound inherits its KV pricing's provenance. Unknown dtype =
+            // priced on assumption = not a measured claim. Auto is vLLM-defined
+            // semantics, not a guess. Observed is allocator-reported, independent
+            // of our pricing.
+            let memory_bound_resolved = match run_kv_source {
+                Some(KvBoundSource::Observed) => true,
+                Some(KvBoundSource::Derived | KvBoundSource::DerivedHybrid) => {
+                    baseline.as_ref().is_some_and(|b| {
+                        b.kv_cache_dtype_source != baseline::KvCacheDtypeSource::Unknown
+                    })
+                }
+                Some(KvBoundSource::Empirical) | None => false,
+            };
             let display_lines = format_config_headroom_window_issue(
                 &display,
                 pct(eval.r7_fired, eval.n_eval),
                 conf,
                 run_rec.as_ref(),
+                memory_bound_resolved,
             );
             recs.push(Recommendation {
                 rule_name: rule_names::CONFIG_HEADROOM,
@@ -672,11 +678,13 @@ fn build_report_from_eval(
         });
     }
 
+    // Always resolve KV pricing provenance; Unknown still prices the floor but
+    // R4 names the guess and caps confidence (see r4_recommendation_with_request_floor).
+    let (kv_bpp, kv_src) = match baseline.as_ref() {
+        Some(b) => (b.kv_bytes_per_element, b.kv_cache_dtype_source),
+        None => baseline::resolve_kv_cache_element(kv_cache_dtype),
+    };
     let request_bytes = if tp.is_none_or(|value| value <= 1) {
-        let kv_bpp = baseline::kv_bytes_per_element(
-            summary.ctx.config.kv_cache_dtype.as_deref(),
-            weight_bytes_per_param,
-        );
         max_model_len.and_then(|len| baseline::bytes_per_seq(&summary.ctx.model, len, kv_bpp))
     } else {
         None
@@ -691,7 +699,10 @@ fn build_report_from_eval(
             .as_ref()
             .map(|b| b.weight_dtype_source)
             .unwrap_or(WeightDtypeSource::Fallback),
-        request_bytes,
+        R4FloorEvidence {
+            request_bytes,
+            kv_cache_dtype_source: kv_src,
+        },
     ) {
         recs.push(r4);
     }
@@ -727,6 +738,13 @@ struct ReportCapacityMetadata {
     memory_budget_self_grade: Option<(u64, u64)>,
 }
 
+/// Suppressing live R2 evidence requires the strongest claim: weights alone overflow VRAM.
+/// h in (-3, 0) can be buffer squeeze with weights fitting, and a running server disproves
+/// "cannot fit". R4's own firing is unchanged, only the right to hide R2 is gated harder.
+fn oom_weights_alone_overflow(kv_headroom_gb: Option<f64>) -> bool {
+    kv_headroom_gb.is_some_and(|h| h.is_finite() && h < -baseline::ACTIVATION_KV_BUFFER_GB)
+}
+
 fn finalize_report_groups(
     recs: Vec<Recommendation>,
     baseline: Option<baseline::PhysicsBaseline>,
@@ -746,8 +764,13 @@ fn finalize_report_groups(
     // Same-layer rows (OOM→KV) are unchanged: both survive until ME, then KV drops.
     let mut recs = recs;
     let fired_names: Vec<&str> = recs.iter().map(|r| r.rule_name).collect();
+    let oom_weights_alone_overflow =
+        oom_weights_alone_overflow(baseline.as_ref().and_then(|b| b.kv_headroom_gb));
     for &(suppressor, suppressed) in SUPPRESSION_TABLE {
         if fired_names.contains(&suppressor) {
+            if suppressor == rule_names::OOM_RISK && !oom_weights_alone_overflow {
+                continue;
+            }
             let before = recs.len();
             recs.retain(|r| r.rule_name != suppressed);
             if recs.len() < before {
@@ -859,4 +882,117 @@ fn pct(fired: usize, total: usize) -> u32 {
         return 0;
     }
     ((fired as f64 / total as f64) * 100.0).round() as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::KvCacheDtypeSource;
+    use crate::engine::baseline::{CeilingEstimate, PhysicsBaseline, WeightDtypeSource};
+
+    fn stub_rec(rule_name: &'static str, layer: u8) -> Recommendation {
+        Recommendation {
+            rule_name,
+            layer,
+            impact: 5,
+            confidence: 0.9,
+            display_lines: vec![rule_name.to_string()],
+        }
+    }
+
+    fn baseline_with_headroom(h: f64) -> PhysicsBaseline {
+        PhysicsBaseline {
+            decode: CeilingEstimate {
+                lower: 1.0,
+                expected: 1.0,
+                upper: 1.0,
+            },
+            prefill: None,
+            efficiency_pct: None,
+            headroom_pct: None,
+            weight_dtype_source: WeightDtypeSource::EnvVar,
+            weight_gb: 70.0,
+            weight_bytes_per_param: 2,
+            kv_bytes_per_element: 2,
+            kv_cache_dtype_source: KvCacheDtypeSource::Auto,
+            kv_headroom_gb: Some(h),
+            tpot_floor_ms: 1.0,
+            prefill_latency_floor_ms: None,
+            ridge_batch_size: 1.0,
+            config_relative_efficiency_pct: None,
+            cost: None,
+        }
+    }
+
+    fn finalize_oom_kv(h: f64) -> Report {
+        finalize_report_groups(
+            vec![
+                stub_rec(rule_names::OOM_RISK, 2),
+                stub_rec(rule_names::KV_CACHE_PRESSURE, 2),
+            ],
+            Some(baseline_with_headroom(h)),
+            ReportCapacityMetadata {
+                kv_max_seqs: None,
+                prescribed_kv_capacity: None,
+                catalog_state_mismatch: None,
+                memory_budget_self_grade: None,
+            },
+            15,
+            crate::engine::EvalSkipStats {
+                skipped_broken: 0,
+                skipped_idle: 0,
+                energy_skew_skipped: 0,
+                gauge_missing: Default::default(),
+                limiter_evidence: None,
+            },
+        )
+    }
+
+    #[test]
+    fn buffer_squeeze_oom_keeps_kv_pressure() {
+        // h = -1.0 is inside the 3GB activation buffer: R4 may fire, R2 survives.
+        let report = finalize_oom_kv(-1.0);
+        let names: Vec<_> = report.recommendations.iter().map(|r| r.rule_name).collect();
+        assert!(names.contains(&rule_names::OOM_RISK));
+        assert!(names.contains(&rule_names::KV_CACHE_PRESSURE));
+        assert!(
+            report.suppressed_rules.is_empty(),
+            "buffer squeeze must not suppress R2: {:?}",
+            report.suppressed_rules
+        );
+    }
+
+    #[test]
+    fn weights_alone_overflow_suppresses_kv_pressure() {
+        // h = -4.0 is past the 3GB buffer: weights alone overflow → R2 suppressed.
+        let report = finalize_oom_kv(-4.0);
+        assert!(
+            report
+                .recommendations
+                .iter()
+                .any(|r| r.rule_name == rule_names::OOM_RISK)
+        );
+        assert!(
+            !report
+                .recommendations
+                .iter()
+                .any(|r| r.rule_name == rule_names::KV_CACHE_PRESSURE)
+        );
+        assert!(
+            report
+                .suppressed_rules
+                .iter()
+                .any(|(s, by)| *s == rule_names::KV_CACHE_PRESSURE && *by == rule_names::OOM_RISK)
+        );
+    }
+
+    #[test]
+    fn oom_weights_alone_overflow_gate() {
+        assert!(!oom_weights_alone_overflow(Some(-1.0)));
+        assert!(!oom_weights_alone_overflow(Some(
+            -baseline::ACTIVATION_KV_BUFFER_GB
+        )));
+        assert!(oom_weights_alone_overflow(Some(-4.0)));
+        assert!(!oom_weights_alone_overflow(None));
+    }
 }

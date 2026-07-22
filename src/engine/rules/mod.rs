@@ -53,7 +53,6 @@ pub(super) struct HypCapacityCtx<'a> {
     pub model: Option<&'a crate::context::ModelArch>,
     pub kv_cache_dtype: Option<&'a str>,
     pub tp: Option<u32>,
-    pub weight_bytes: u8,
 }
 
 /// Capacity at a hypothetical `max_model_len`. Both derived tiers are `(est)`.
@@ -96,7 +95,6 @@ pub(super) fn capacity_at_hypothetical_max_len(
         model,
         ctx.kv_cache_dtype,
         ctx.tp,
-        ctx.weight_bytes,
         ctx.cache,
     )
     .max_seqs
@@ -245,7 +243,6 @@ pub(super) fn compute_kv_max_seqs_for_cache(
     model: &crate::context::ModelArch,
     kv_cache_dtype: Option<&str>,
     tp: Option<u32>,
-    weight_bytes: u8,
     cache: &crate::collectors::CacheConfigLabels,
 ) -> DerivedCapacity {
     compute_kv_max_seqs_with_mode::<{ crate::engine::MULTI_GPU_TP }>(
@@ -254,7 +251,6 @@ pub(super) fn compute_kv_max_seqs_for_cache(
         model,
         kv_cache_dtype,
         tp,
-        weight_bytes,
         Some(cache),
     )
 }
@@ -265,7 +261,6 @@ fn compute_kv_max_seqs_with_mode<const MULTI_GPU: bool>(
     model: &crate::context::ModelArch,
     kv_cache_dtype: Option<&str>,
     tp: Option<u32>,
-    weight_bytes: u8,
     cache: Option<&crate::collectors::CacheConfigLabels>,
 ) -> DerivedCapacity {
     use crate::engine::baseline::{bytes_per_seq, kv_bytes_per_element};
@@ -298,7 +293,7 @@ fn compute_kv_max_seqs_with_mode<const MULTI_GPU: bool>(
     };
     let model_view = sharded_model.as_ref().unwrap_or(model);
 
-    let kv_bpp = kv_bytes_per_element(kv_cache_dtype, weight_bytes.max(1));
+    let kv_bpp = kv_bytes_per_element(kv_cache_dtype);
     let Some(request_bytes) = bytes_per_seq(model_view, max_len, kv_bpp) else {
         return DerivedCapacity::default();
     };
@@ -358,6 +353,10 @@ pub(super) const RECOMMENDED_SEQS_SAFETY_MARGIN: f64 = 0.80;
 /// request's life; the estimator sees them young). Cap each prescription at a
 /// bounded step; the loop re-raises after re-measure.
 pub(super) const EMPIRICAL_STEP_CAP_MULT: f64 = 2.0;
+
+/// Action-attached cautions render at 8-space, no bullet, blank line after.
+/// Bullets are operator actions only.
+pub(super) const KV_SCALE_CAUTION: &str = "        Monitor KV cache when scaling up.";
 
 /// Which wall bound a concurrency estimate. Tie-break ordering: memory > ridge > config.
 /// R1 uses all three (occupancy). R5/R7 use only the two physical walls; config is a
@@ -505,15 +504,29 @@ pub(super) struct RecommendedSeqs {
 
 /// One margined recommendation from the two physical walls. `None` when neither
 /// ridge nor `kv_bound` is known (never invent a number).
+///
+/// `kv_dtype_source`: when the binding wall is Derived/DerivedHybrid and the KV
+/// element width was priced as [`KvCacheDtypeSource::Unknown`], the bound is
+/// demoted to empirical-grade (step cap, Low confidence, monitor caution).
 pub(super) fn recommended_seqs(
     ridge: Option<f64>,
     kv_bound: Option<f64>,
     kv_source: Option<KvBoundSource>,
     current_max_num_seqs: Option<u32>,
+    kv_dtype_source: Option<crate::engine::baseline::KvCacheDtypeSource>,
 ) -> Option<RecommendedSeqs> {
+    use crate::engine::baseline::KvCacheDtypeSource;
+
     let (wall, binder) = physical_wall_and_binder(ridge, kv_bound)?;
     let binder_is_memory = matches!(binder, BindingWall::Memory { .. });
-    let empirical = binder_is_memory && kv_source == Some(KvBoundSource::Empirical);
+    let derived_unknown = binder_is_memory
+        && matches!(
+            kv_source,
+            Some(KvBoundSource::Derived | KvBoundSource::DerivedHybrid)
+        )
+        && kv_dtype_source == Some(KvCacheDtypeSource::Unknown);
+    let empirical =
+        (binder_is_memory && kv_source == Some(KvBoundSource::Empirical)) || derived_unknown;
 
     let mut target = (wall * RECOMMENDED_SEQS_SAFETY_MARGIN).floor();
     if empirical && let Some(cur) = current_max_num_seqs {
