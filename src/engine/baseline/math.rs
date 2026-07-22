@@ -103,6 +103,17 @@ pub enum KvCacheDtypeSource {
     Unknown,
 }
 
+/// Runtime allocator label first (first-hand), launch config fallback (second-hand).
+pub fn effective_kv_cache_dtype<'a>(
+    runtime: Option<&'a str>,
+    config: Option<&'a str>,
+) -> Option<&'a str> {
+    fn nonempty(s: Option<&str>) -> Option<&str> {
+        s.map(str::trim).filter(|s| !s.is_empty())
+    }
+    nonempty(runtime).or_else(|| nonempty(config))
+}
+
 /// KV cache bytes per element from kv_cache_dtype.
 /// Explicit fp8 → 1; bf16/fp16 → 2; "auto"/None/unknown → 2 (activation default).
 /// Weight width never flows into KV pricing.
@@ -497,6 +508,47 @@ mod tests {
             resolve_kv_cache_element(Some("fp8")).1,
             KvCacheDtypeSource::ExplicitFp8
         );
+    }
+
+    #[test]
+    fn effective_kv_cache_dtype_runtime_first_then_config() {
+        assert_eq!(effective_kv_cache_dtype(Some("fp8"), None), Some("fp8"));
+        assert_eq!(effective_kv_cache_dtype(None, Some("fp8")), Some("fp8"));
+        assert_eq!(
+            effective_kv_cache_dtype(Some("bf16"), Some("fp8")),
+            Some("bf16")
+        );
+        assert_eq!(effective_kv_cache_dtype(None, None), None);
+        assert_eq!(
+            effective_kv_cache_dtype(Some("  "), Some("fp8")),
+            Some("fp8")
+        );
+        assert_eq!(effective_kv_cache_dtype(Some(""), Some("fp8")), Some("fp8"));
+    }
+
+    #[test]
+    fn effective_kv_cache_dtype_pricing_matrix() {
+        // runtime fp8 + config None → 1 byte
+        let d = effective_kv_cache_dtype(Some("fp8"), None);
+        assert_eq!(kv_bytes_per_element(d), 1);
+        assert_eq!(
+            resolve_kv_cache_element(d).1,
+            KvCacheDtypeSource::ExplicitFp8
+        );
+        // config fp8 + runtime None → 1 byte (fallback)
+        let d = effective_kv_cache_dtype(None, Some("fp8"));
+        assert_eq!(kv_bytes_per_element(d), 1);
+        // runtime bf16 + config fp8 → runtime wins, 2 bytes
+        let d = effective_kv_cache_dtype(Some("bf16"), Some("fp8"));
+        assert_eq!(kv_bytes_per_element(d), 2);
+        assert_eq!(
+            resolve_kv_cache_element(d).1,
+            KvCacheDtypeSource::ExplicitActivation
+        );
+        // both None → Auto, 2 bytes
+        let d = effective_kv_cache_dtype(None, None);
+        assert_eq!(kv_bytes_per_element(d), 2);
+        assert_eq!(resolve_kv_cache_element(d).1, KvCacheDtypeSource::Auto);
     }
 
     #[test]

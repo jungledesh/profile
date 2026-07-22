@@ -532,6 +532,105 @@ fn compute_kv_max_seqs_auto_kv_uses_activation_dtype_not_weight_width() {
 }
 
 #[test]
+fn effective_kv_dtype_baseline_capacity_and_r2_agree() {
+    use crate::engine::baseline::{
+        KvCacheDtypeSource, compute, effective_kv_cache_dtype, kv_bytes_per_element,
+    };
+    use crate::engine::rules::r2_kv_cache_pressure::fp8_kv_cache_fix_bullet;
+
+    let model = ModelArch {
+        num_kv_heads: Some(8),
+        head_dim: Some(128),
+        num_layers: Some(32),
+        param_count: Some(7_000_000_000),
+        default_weight_dtype: Some("bf16".to_string()),
+        ..Default::default()
+    };
+    let headroom_gb = 20.0;
+
+    // runtime fp8 + config None → 1 byte at capacity; no fp8-switch advice
+    let runtime_fp8 = effective_kv_cache_dtype(Some("fp8"), None);
+    assert_eq!(kv_bytes_per_element(runtime_fp8), 1);
+    let cap_fp8 = compute_kv_max_seqs_for_cache(
+        Some(headroom_gb),
+        Some(4096),
+        &model,
+        runtime_fp8,
+        None,
+        &crate::collectors::CacheConfigLabels::default(),
+    )
+    .max_seqs;
+    let cap_bf16 = compute_kv_max_seqs_for_cache(
+        Some(headroom_gb),
+        Some(4096),
+        &model,
+        Some("bf16"),
+        None,
+        &crate::collectors::CacheConfigLabels::default(),
+    )
+    .max_seqs;
+    assert_eq!(cap_fp8.unwrap(), cap_bf16.unwrap() * 2);
+    assert!(
+        fp8_kv_cache_fix_bullet(runtime_fp8, true).is_none(),
+        "already-fp8 runtime must not advise switching to fp8"
+    );
+
+    // config fp8 + runtime None → 1 byte (fallback)
+    assert_eq!(
+        kv_bytes_per_element(effective_kv_cache_dtype(None, Some("fp8"))),
+        1
+    );
+
+    // runtime bf16 + config fp8 → runtime wins, 2 bytes
+    assert_eq!(
+        kv_bytes_per_element(effective_kv_cache_dtype(Some("bf16"), Some("fp8"))),
+        2
+    );
+
+    // both None → Auto, 2 bytes
+    let both_none = effective_kv_cache_dtype(None, None);
+    assert_eq!(kv_bytes_per_element(both_none), 2);
+
+    // Seam: baseline and R2 price the same snapshot's runtime fp8 the same way.
+    let t = SystemTime::UNIX_EPOCH;
+    let snap = RawSnapshot {
+        gpu_observed_at: t,
+        vllm_observed_at: t,
+        timestamp: t,
+        vllm: VllmRawMetrics {
+            model_name: Some("meta-llama/Llama-3.1-8B-Instruct".to_string()),
+            generation_tokens_per_sec: Some(50.0),
+            num_requests_running: Some(4.0),
+            window_duration_secs: Some(2.0),
+            cache_config: crate::collectors::CacheConfigLabels {
+                cache_dtype: Some("fp8".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        gpus: vec![GpuRawMetrics {
+            gpu_name: Some("NVIDIA A100-SXM4-80GB".to_string()),
+            vram_total_mb: Some(80 * 1024),
+            ..Default::default()
+        }],
+    };
+    let cfg = VllmConfig {
+        dtype: Some("bf16".to_string()),
+        kv_cache_dtype: None,
+        max_model_len: Some(4096),
+        ..Default::default()
+    };
+    let ctx = StaticContext::from_snapshot(&snap, cfg);
+    let win = RuntimeWindow::from_snapshot(snap);
+    let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+    assert_eq!(b.kv_bytes_per_element, 1);
+    assert_eq!(b.kv_cache_dtype_source, KvCacheDtypeSource::ExplicitFp8);
+    let runtime = win.snapshot.vllm.cache_config.cache_dtype.as_deref();
+    assert_eq!(kv_bytes_per_element(runtime), b.kv_bytes_per_element);
+    assert!(fp8_kv_cache_fix_bullet(runtime, true).is_none());
+}
+
+#[test]
 fn compute_kv_max_seqs_whiteboard_reduces_hybrid_capacity() {
     let hybrid = qwen36_hybrid_model_with_attention();
     let attention_only = ModelArch {
@@ -687,7 +786,7 @@ fn unpriced_currency_declines_to_empirical_low_confidence() {
     .max_seqs;
     assert_eq!(derived, None);
     let (bound, source) = resolve_kv_bound(None, derived, true, Some(4.0), Some(50.0));
-    let rec = recommended_seqs(None, bound, source, Some(4)).expect("empirical fallback");
+    let rec = recommended_seqs(None, bound, source, Some(4), None).expect("empirical fallback");
     assert_eq!(source, Some(KvBoundSource::Empirical));
     assert!(rec.empirical);
 }
@@ -2026,6 +2125,7 @@ fn kv_warning_requires_significance() {
     let report = build_report_for_windows(&windows, summary);
     let text = report.recommendations[0].display_lines.join("\n");
     assert!(!text.contains("Monitor KV cache when scaling up."));
+    assert!(!text.contains("• Monitor"));
 }
 
 #[test]
@@ -2038,7 +2138,8 @@ fn kv_warning_fires_when_significant() {
     let summary = ai(&ctx, windows.last().expect("windows"));
     let report = build_report_for_windows(&windows, summary);
     let text = report.recommendations[0].display_lines.join("\n");
-    assert!(text.contains("Monitor KV cache when scaling up."));
+    assert!(text.contains("        Monitor KV cache when scaling up."));
+    assert!(!text.contains("• Monitor"));
 }
 
 #[test]

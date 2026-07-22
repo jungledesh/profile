@@ -243,7 +243,7 @@ pub(super) fn format_under_batching_fired(
         fix_line,
     ];
     if kv_warning {
-        lines.push("      • Monitor KV cache when scaling up.".to_string());
+        lines.push(super::KV_SCALE_CAUTION.to_string());
     }
     lines.push(String::new());
     lines.push(
@@ -533,7 +533,8 @@ mod tests {
         s.vllm.kv_cache_usage_perc = Some(75.0);
         let r = r1_recommendation(r1_input(&s, R1InputOpts::default())).expect("fired");
         let text = r.display_lines.join("\n");
-        assert!(text.contains("Monitor KV cache when scaling up."));
+        assert!(text.contains("        Monitor KV cache when scaling up."));
+        assert!(!text.contains("• Monitor"));
     }
 
     #[test]
@@ -593,7 +594,8 @@ mod tests {
         match rule1_under_batching_with_efficiency(r1_input(&s, R1InputOpts::default())) {
             Rule1Outcome::Fired(d) => {
                 let text = format_under_batching_fired(&d, 0.5, true).join("\n");
-                assert!(text.contains("Monitor KV cache when scaling up."));
+                assert!(text.contains("        Monitor KV cache when scaling up."));
+                assert!(!text.contains("• Monitor"));
             }
             Rule1Outcome::NotFired => panic!("expected fired"),
         }
@@ -606,6 +608,7 @@ mod tests {
             Rule1Outcome::Fired(d) => {
                 let text = format_under_batching_fired(&d, 0.5, false).join("\n");
                 assert!(!text.contains("Monitor KV cache when scaling up."));
+                assert!(!text.contains("• Monitor"));
             }
             Rule1Outcome::NotFired => panic!("expected fired"),
         }

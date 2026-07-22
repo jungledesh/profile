@@ -1,7 +1,7 @@
 use crate::collectors::{effective_tensor_parallel, window_is_evaluable, window_is_idle};
 use crate::context::{AnalysisInput, RuntimeWindow};
 use crate::engine::Report;
-use crate::engine::baseline::{self, WeightDtypeSource};
+use crate::engine::baseline::{self, WeightDtypeSource, effective_kv_cache_dtype};
 
 use super::r1_under_batching::{
     KV_MONITOR_WARNING_PCT, R1EvalInput, Rule1Outcome, UnderBatchingDetail, aggregate_r1_detail,
@@ -360,7 +360,10 @@ fn eval_window_rules(
             win_baseline.as_ref().and_then(|b| b.kv_headroom_gb),
             summary.ctx.config.max_model_len,
             &summary.ctx.model,
-            summary.ctx.config.kv_cache_dtype.as_deref(),
+            effective_kv_cache_dtype(
+                snap.vllm.cache_config.cache_dtype.as_deref(),
+                summary.ctx.config.kv_cache_dtype.as_deref(),
+            ),
             effective_tensor_parallel(
                 summary.ctx.config.tensor_parallel_size,
                 snap.collected_gpu_count(),
@@ -399,7 +402,16 @@ fn build_report_from_eval(
             baseline.as_ref().and_then(|b| b.kv_headroom_gb),
             summary.ctx.config.max_model_len,
             &summary.ctx.model,
-            summary.ctx.config.kv_cache_dtype.as_deref(),
+            effective_kv_cache_dtype(
+                summary
+                    .window
+                    .snapshot
+                    .vllm
+                    .cache_config
+                    .cache_dtype
+                    .as_deref(),
+                summary.ctx.config.kv_cache_dtype.as_deref(),
+            ),
             effective_tensor_parallel(
                 summary.ctx.config.tensor_parallel_size,
                 summary.window.snapshot.collected_gpu_count(),
@@ -440,7 +452,10 @@ fn build_report_from_eval(
         kv_headroom_gb,
         max_model_len,
         &summary.ctx.model,
-        summary.ctx.config.kv_cache_dtype.as_deref(),
+        effective_kv_cache_dtype(
+            summary_snap.vllm.cache_config.cache_dtype.as_deref(),
+            summary.ctx.config.kv_cache_dtype.as_deref(),
+        ),
         tp,
         &summary_snap.vllm.cache_config,
     );
@@ -466,6 +481,7 @@ fn build_report_from_eval(
         run_kv_bound,
         run_kv_source,
         summary.ctx.config.max_num_seqs,
+        baseline.as_ref().map(|b| b.kv_cache_dtype_source),
     );
     let r2_significant = eval.r2_significant();
     let r2_backlog_significant = eval.r2_backlog_significant();
@@ -565,7 +581,10 @@ fn build_report_from_eval(
             cache: &summary_snap.vllm.cache_config,
             kv_headroom_gb,
             model: Some(&summary.ctx.model),
-            kv_cache_dtype: summary.ctx.config.kv_cache_dtype.as_deref(),
+            kv_cache_dtype: effective_kv_cache_dtype(
+                summary_snap.vllm.cache_config.cache_dtype.as_deref(),
+                summary.ctx.config.kv_cache_dtype.as_deref(),
+            ),
             tp,
         };
         let display_lines = format_concurrency_saturation_window_issue(
@@ -599,14 +618,19 @@ fn build_report_from_eval(
                 ..d
             };
             let conf = r7_confidence(run_rec.as_ref());
-            // Observed/Derived(/Hybrid) are measured or physics-derived walls.
-            // Empirical is a traffic guess: do not claim "KV memory headroom available."
-            let memory_bound_resolved = matches!(
-                run_kv_source,
-                Some(
-                    KvBoundSource::Observed | KvBoundSource::Derived | KvBoundSource::DerivedHybrid
-                )
-            );
+            // A derived bound inherits its KV pricing's provenance. Unknown dtype =
+            // priced on assumption = not a measured claim. Auto is vLLM-defined
+            // semantics, not a guess. Observed is allocator-reported, independent
+            // of our pricing.
+            let memory_bound_resolved = match run_kv_source {
+                Some(KvBoundSource::Observed) => true,
+                Some(KvBoundSource::Derived | KvBoundSource::DerivedHybrid) => {
+                    baseline.as_ref().is_some_and(|b| {
+                        b.kv_cache_dtype_source != baseline::KvCacheDtypeSource::Unknown
+                    })
+                }
+                Some(KvBoundSource::Empirical) | None => false,
+            };
             let display_lines = format_config_headroom_window_issue(
                 &display,
                 pct(eval.r7_fired, eval.n_eval),
@@ -670,7 +694,10 @@ fn build_report_from_eval(
             .as_ref()
             .map(|b| b.kv_bytes_per_element)
             .unwrap_or_else(|| {
-                baseline::kv_bytes_per_element(summary.ctx.config.kv_cache_dtype.as_deref())
+                baseline::kv_bytes_per_element(effective_kv_cache_dtype(
+                    summary_snap.vllm.cache_config.cache_dtype.as_deref(),
+                    summary.ctx.config.kv_cache_dtype.as_deref(),
+                ))
             });
         max_model_len.and_then(|len| baseline::bytes_per_seq(&summary.ctx.model, len, kv_bpp))
     } else {

@@ -169,7 +169,7 @@ fn walls_fix_lines(
             rec.target
         ));
         if rec.empirical {
-            safe.push("      • Monitor KV cache when scaling up.".to_string());
+            safe.push(super::KV_SCALE_CAUTION.to_string());
         }
         return (safe, cuts);
     }
@@ -441,7 +441,10 @@ mod tests {
         source: Option<KvBoundSource>,
         current: u32,
     ) -> RecommendedSeqs {
-        recommended_seqs(ridge, kv_bound, source, Some(current)).expect("rec")
+        // Dtype provenance intentionally None per-window: demotion (step cap, Low,
+        // caution) is applied once at run level, which owns every displayed number.
+        // Per-window recs only gate firing, and firing is not a claim.
+        recommended_seqs(ridge, kv_bound, source, Some(current), None).expect("rec")
     }
 
     /// A fired R5 detail with an explicit current cap, KV usage, and TTFT.
@@ -1187,7 +1190,7 @@ mod tests {
     // 7. No ridge, no kv_bound: conditional fallback with current, no invented ceiling.
     #[test]
     fn spec_no_wall_conditional() {
-        assert!(recommended_seqs(None, None, None, Some(32)).is_none());
+        assert!(recommended_seqs(None, None, None, Some(32), None).is_none());
         let text = format_concurrency_saturation_issue(
             &detail_at(32, None, None),
             None,
@@ -1260,7 +1263,8 @@ mod tests {
         assert!(text.contains("Raise --max-num-seqs to 64 (est)"));
         assert!(!text.contains("bounded step"));
         assert!(!text.contains("2x"));
-        assert!(text.contains("Monitor KV cache when scaling up."));
+        assert!(text.contains("        Monitor KV cache when scaling up."));
+        assert!(!text.contains("• Monitor"));
         assert!(text.contains("Confidence: Low"));
     }
 
@@ -1288,6 +1292,7 @@ mod tests {
             text.contains("Raise --max-num-seqs to 96 (80% of memory limit 120, vLLM-reported)")
         );
         assert!(!text.contains("Monitor KV cache"));
+        assert!(!text.contains("• Monitor"));
         assert!(text.contains("Confidence: High"));
     }
 }

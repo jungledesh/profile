@@ -354,6 +354,10 @@ pub(super) const RECOMMENDED_SEQS_SAFETY_MARGIN: f64 = 0.80;
 /// bounded step; the loop re-raises after re-measure.
 pub(super) const EMPIRICAL_STEP_CAP_MULT: f64 = 2.0;
 
+/// Action-attached cautions render at 8-space, no bullet, blank line after.
+/// Bullets are operator actions only.
+pub(super) const KV_SCALE_CAUTION: &str = "        Monitor KV cache when scaling up.";
+
 /// Which wall bound a concurrency estimate. Tie-break ordering: memory > ridge > config.
 /// R1 uses all three (occupancy). R5/R7 use only the two physical walls; config is a
 /// knob, not a wall (you cannot cap a knob by its own current value).
@@ -500,15 +504,29 @@ pub(super) struct RecommendedSeqs {
 
 /// One margined recommendation from the two physical walls. `None` when neither
 /// ridge nor `kv_bound` is known (never invent a number).
+///
+/// `kv_dtype_source`: when the binding wall is Derived/DerivedHybrid and the KV
+/// element width was priced as [`KvCacheDtypeSource::Unknown`], the bound is
+/// demoted to empirical-grade (step cap, Low confidence, monitor caution).
 pub(super) fn recommended_seqs(
     ridge: Option<f64>,
     kv_bound: Option<f64>,
     kv_source: Option<KvBoundSource>,
     current_max_num_seqs: Option<u32>,
+    kv_dtype_source: Option<crate::engine::baseline::KvCacheDtypeSource>,
 ) -> Option<RecommendedSeqs> {
+    use crate::engine::baseline::KvCacheDtypeSource;
+
     let (wall, binder) = physical_wall_and_binder(ridge, kv_bound)?;
     let binder_is_memory = matches!(binder, BindingWall::Memory { .. });
-    let empirical = binder_is_memory && kv_source == Some(KvBoundSource::Empirical);
+    let derived_unknown = binder_is_memory
+        && matches!(
+            kv_source,
+            Some(KvBoundSource::Derived | KvBoundSource::DerivedHybrid)
+        )
+        && kv_dtype_source == Some(KvCacheDtypeSource::Unknown);
+    let empirical =
+        (binder_is_memory && kv_source == Some(KvBoundSource::Empirical)) || derived_unknown;
 
     let mut target = (wall * RECOMMENDED_SEQS_SAFETY_MARGIN).floor();
     if empirical && let Some(cur) = current_max_num_seqs {

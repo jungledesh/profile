@@ -66,7 +66,10 @@ pub fn rule7_config_headroom(
         Some(run),
         snapshot.vllm.kv_cache_usage_perc,
     );
-    let rec = recommended_seqs(ridge_batch_size, kv_bound, kv_source, Some(max_n))?;
+    // Dtype provenance intentionally None per-window: demotion (step cap, Low,
+    // caution) is applied once at run level, which owns every displayed number.
+    // Per-window recs only gate firing, and firing is not a claim.
+    let rec = recommended_seqs(ridge_batch_size, kv_bound, kv_source, Some(max_n), None)?;
     if f64::from(max_n) >= f64::from(rec.target) * CONFIG_HEADROOM_RATIO {
         return None;
     }
@@ -201,7 +204,7 @@ pub(super) fn format_config_headroom_window_issue(
         format!("      • Raise --max-num-seqs to {}.", d.recommended_seqs),
     ];
     if empirical {
-        lines.push("      • Monitor KV cache when scaling up.".to_string());
+        lines.push(super::KV_SCALE_CAUTION.to_string());
     }
     lines.extend([
         String::new(),
@@ -209,6 +212,7 @@ pub(super) fn format_config_headroom_window_issue(
             .to_string(),
         "    Watch: Higher concurrency increases prefill load. Monitor decode latency after applying."
             .to_string(),
+        String::new(),
         format!("    Confidence: {}", confidence_label(confidence)),
     ]);
     super::with_seen_pct(lines, seen_pct)
@@ -509,9 +513,105 @@ mod tests {
         assert!(!text.contains("bound by"));
         assert!(!text.contains("400"));
         assert!(text.contains("Raise --max-num-seqs to 64."));
-        assert!(text.contains("Monitor KV cache when scaling up."));
+        assert!(text.contains("        Monitor KV cache when scaling up."));
+        assert!(!text.contains("• Monitor"));
         assert!(text.contains("Confidence: Low"));
         assert!(!text.contains("at least"));
+        assert!(
+            text.contains("Watch: Higher concurrency increases prefill load")
+                && text.contains("\n\n    Confidence:"),
+            "blank line between Watch and Confidence"
+        );
+    }
+
+    #[test]
+    fn derived_unknown_dtype_demotes_to_empirical_grade() {
+        use crate::engine::baseline::KvCacheDtypeSource;
+        // Memory binds (400 < ridge 500). Uncapped target 320; Unknown demotes: 2x32=64.
+        let rec = recommended_seqs(
+            Some(500.0),
+            Some(400.0),
+            Some(KvBoundSource::Derived),
+            Some(32),
+            Some(KvCacheDtypeSource::Unknown),
+        )
+        .expect("rec");
+        assert!(rec.empirical);
+        assert_eq!(rec.target, 64);
+        assert_eq!(r7_confidence(Some(&rec)), 0.5);
+
+        let d = ConfigHeadroomDetail {
+            max_num_seqs: 32,
+            recommended_seqs: rec.target,
+            ridge_batch_size: Some(500.0),
+            occupancy_pct: 100.0,
+            running: 32.0,
+        };
+        // memory_bound_resolved false for Derived+Unknown
+        let text = format_config_headroom_window_issue(&d, 100, 0.5, Some(&rec), false).join("\n");
+        assert!(text.contains("Compute headroom available; memory bound unmeasured."));
+        assert!(!text.contains("Compute and KV memory headroom available."));
+        assert!(text.contains("Recommended   64 (est)"));
+        assert!(text.contains("        Monitor KV cache when scaling up."));
+        assert!(!text.contains("• Monitor"));
+        assert!(text.contains("Confidence: Low"));
+    }
+
+    #[test]
+    fn derived_auto_dtype_keeps_full_memory_claim() {
+        use crate::engine::baseline::KvCacheDtypeSource;
+        let rec = recommended_seqs(
+            Some(153.0),
+            Some(120.0),
+            Some(KvBoundSource::Derived),
+            Some(32),
+            Some(KvCacheDtypeSource::Auto),
+        )
+        .expect("rec");
+        assert!(!rec.empirical);
+        assert_eq!(rec.target, 96);
+        assert_eq!(r7_confidence(Some(&rec)), 0.6);
+
+        let d = ConfigHeadroomDetail {
+            max_num_seqs: 32,
+            recommended_seqs: rec.target,
+            ridge_batch_size: Some(153.0),
+            occupancy_pct: 62.5,
+            running: 20.0,
+        };
+        let text = format_config_headroom_window_issue(&d, 100, 0.6, Some(&rec), true).join("\n");
+        assert!(text.contains("Compute and KV memory headroom available."));
+        assert!(!text.contains("memory bound unmeasured"));
+        assert!(!text.contains("Monitor KV cache"));
+    }
+
+    #[test]
+    fn observed_unknown_dtype_keeps_full_memory_claim() {
+        use crate::engine::baseline::KvCacheDtypeSource;
+        // Allocator-reported bound is independent of our KV pricing provenance.
+        let rec = recommended_seqs(
+            Some(153.0),
+            Some(120.0),
+            Some(KvBoundSource::Observed),
+            Some(32),
+            Some(KvCacheDtypeSource::Unknown),
+        )
+        .expect("rec");
+        assert!(!rec.empirical);
+        assert_eq!(rec.target, 96);
+        assert_eq!(r7_confidence(Some(&rec)), 0.8);
+
+        let d = ConfigHeadroomDetail {
+            max_num_seqs: 32,
+            recommended_seqs: rec.target,
+            ridge_batch_size: Some(153.0),
+            occupancy_pct: 62.5,
+            running: 20.0,
+        };
+        let text = format_config_headroom_window_issue(&d, 100, 0.8, Some(&rec), true).join("\n");
+        assert!(text.contains("Compute and KV memory headroom available."));
+        assert!(text.contains("Recommended   96 (bound by memory limit 120, vLLM-reported)"));
+        assert!(!text.contains("Monitor KV cache"));
     }
 
     #[test]

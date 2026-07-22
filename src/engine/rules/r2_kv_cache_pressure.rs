@@ -27,7 +27,7 @@ const FP8_KV_CACHE_FIX: &str =
 /// Suggest prefix caching when mean prompt length exceeds this (tokens).
 const PREFIX_CACHING_LONG_PROMPT_MIN_TOKENS: f64 = 200.0;
 
-fn fp8_kv_cache_fix_bullet(
+pub(super) fn fp8_kv_cache_fix_bullet(
     kv_cache_dtype: Option<&str>,
     fp8_compiler_available: bool,
 ) -> Option<String> {
