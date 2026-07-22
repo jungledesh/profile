@@ -46,19 +46,36 @@ pub enum LimiterVerdict {
     CeilingUnknown(CeilingUnknown),
 }
 
+/// Outcome of the limiter cascade, including which earlier stages lacked evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdentifyResult {
+    pub verdict: Option<LimiterVerdict>,
+    /// KV peak was None (capacity stage could not run).
+    pub capacity_skipped: bool,
+    /// Running or ridge was None (traffic stage could not run).
+    pub traffic_skipped: bool,
+}
+
 /// Identify the primary constraint when all rules pass.
 ///
-/// Returns `None` if insufficient data to determine any limiter
+/// Returns `verdict: None` if insufficient data to determine any limiter
 /// (missing baseline or metrics). Caller shows generic message.
 ///
 /// Cascade order: hardest physical limits first. Each stage is only
 /// reached if the stage above it did not fire.
-pub fn identify(e: &LimiterEvidence) -> Option<LimiterVerdict> {
+pub fn identify(e: &LimiterEvidence) -> IdentifyResult {
+    let capacity_skipped = e.kv_cache_peak_perc.is_none();
+    let traffic_skipped = e.mean_running.is_none() || e.ridge_batch_size.is_none();
+
     // 1. Capacity - KV cache full enough to cap concurrency growth.
     if e.kv_cache_peak_perc
         .is_some_and(|kv| kv.is_finite() && kv >= KV_CAPACITY_LIMITER_PERC)
     {
-        return Some(LimiterVerdict::Known(PrimaryLimiter::Capacity));
+        return IdentifyResult {
+            verdict: Some(LimiterVerdict::Known(PrimaryLimiter::Capacity)),
+            capacity_skipped,
+            traffic_skipped,
+        };
     }
 
     // 2. Traffic - VRAM available but not enough concurrent requests to
@@ -66,7 +83,11 @@ pub fn identify(e: &LimiterEvidence) -> Option<LimiterVerdict> {
     if let (Some(running), Some(ridge)) = (e.mean_running, e.ridge_batch_size) {
         let threshold = (ridge * TRAFFIC_LIMITER_RIDGE_FRACTION).max(TRAFFIC_LIMITER_MIN_RUNNING);
         if running < threshold {
-            return Some(LimiterVerdict::Known(PrimaryLimiter::Traffic));
+            return IdentifyResult {
+                verdict: Some(LimiterVerdict::Known(PrimaryLimiter::Traffic)),
+                capacity_skipped,
+                traffic_skipped,
+            };
         }
     }
 
@@ -77,12 +98,20 @@ pub fn identify(e: &LimiterEvidence) -> Option<LimiterVerdict> {
         && e.tpot_floor_ms
             .is_none_or(|floor| !floor.is_finite() || floor <= 0.0)
     {
-        return Some(LimiterVerdict::CeilingUnknown(CeilingUnknown));
+        return IdentifyResult {
+            verdict: Some(LimiterVerdict::CeilingUnknown(CeilingUnknown)),
+            capacity_skipped,
+            traffic_skipped,
+        };
     }
     if let (Some(tpot), Some(floor)) = (e.mean_tpot_ms, e.tpot_floor_ms)
         && tpot <= floor * PHYSICS_LIMITER_FLOOR_MARGIN
     {
-        return Some(LimiterVerdict::Known(PrimaryLimiter::Physics));
+        return IdentifyResult {
+            verdict: Some(LimiterVerdict::Known(PrimaryLimiter::Physics)),
+            capacity_skipped,
+            traffic_skipped,
+        };
     }
 
     // 4. Prefill interference - measured prefill signal with chunked prefill as precondition.
@@ -90,20 +119,32 @@ pub fn identify(e: &LimiterEvidence) -> Option<LimiterVerdict> {
         && e.effective_prompt_decode_ratio
             .is_some_and(|ratio| ratio.is_finite() && ratio >= LIMITER_PREFILL_RATIO_MIN)
     {
-        return Some(LimiterVerdict::Known(PrimaryLimiter::PrefillInterference));
+        return IdentifyResult {
+            verdict: Some(LimiterVerdict::Known(PrimaryLimiter::PrefillInterference)),
+            capacity_skipped,
+            traffic_skipped,
+        };
     }
 
-    // 5. Framework overhead - batch healthy, VRAM free, not at physics ceiling.
-    //    Only fire if we have enough signal to rule out data absence.
+    // 5. Framework overhead - only fire if we have enough signal to rule out data absence.
     if e.mean_running.is_some() && e.mean_tpot_ms.is_some() {
-        return Some(LimiterVerdict::Known(PrimaryLimiter::FrameworkOverhead));
+        return IdentifyResult {
+            verdict: Some(LimiterVerdict::Known(PrimaryLimiter::FrameworkOverhead)),
+            capacity_skipped,
+            traffic_skipped,
+        };
     }
 
-    None
+    IdentifyResult {
+        verdict: None,
+        capacity_skipped,
+        traffic_skipped,
+    }
 }
 
 pub fn limiter_line(e: &LimiterEvidence) -> Option<String> {
-    match identify(e)? {
+    let result = identify(e);
+    match result.verdict? {
         LimiterVerdict::CeilingUnknown(_) => {
             Some("Hardware ceiling unknown (GPU not in catalog).".to_string())
         }
@@ -116,10 +157,14 @@ pub fn limiter_line(e: &LimiterEvidence) -> Option<String> {
         LimiterVerdict::Known(PrimaryLimiter::Traffic) => {
             let running = e.mean_running?;
             let ridge = e.ridge_batch_size?;
-            Some(format!(
+            let mut line = format!(
                 "Capped by traffic: {:.0} requests running, hardware has room for ~{ridge:.0}. More concurrent requests raises throughput.",
                 running.trunc()
-            ))
+            );
+            if result.capacity_skipped {
+                line.push_str(" Memory unmeasured.");
+            }
+            Some(line)
         }
         LimiterVerdict::Known(PrimaryLimiter::Physics) => {
             let tpot = e.mean_tpot_ms?;
@@ -134,9 +179,28 @@ pub fn limiter_line(e: &LimiterEvidence) -> Option<String> {
                 "Capped by prefill: prompt work at {ratio:.1}x of decode (effective). Prefill shares bandwidth with decode on every step."
             ))
         }
-        LimiterVerdict::Known(PrimaryLimiter::FrameworkOverhead) => Some(
-            "Capped by framework: batch healthy, memory free, hardware unsaturated. GPU is waiting on vLLM/CPU overhead.".to_string(),
-        ),
+        LimiterVerdict::Known(PrimaryLimiter::FrameworkOverhead) => {
+            let mut line = String::from("Capped by framework: ");
+            let mut cleared = Vec::new();
+            if !result.traffic_skipped {
+                cleared.push("batch healthy");
+            }
+            if !result.capacity_skipped {
+                cleared.push("memory free");
+            }
+            if !cleared.is_empty() {
+                line.push_str(&cleared.join(", "));
+                line.push_str(". ");
+            }
+            line.push_str("GPU is waiting on vLLM/CPU overhead.");
+            if result.capacity_skipped {
+                line.push_str(" KV unmeasured.");
+            }
+            if result.traffic_skipped {
+                line.push_str(" hardware ceiling unknown.");
+            }
+            Some(line)
+        }
     }
 }
 
@@ -175,7 +239,8 @@ mod tests {
                 Some(5.0),
                 Some(0.2),
                 Some(false)
-            )),
+            ))
+            .verdict,
             Some(LimiterVerdict::Known(PrimaryLimiter::Capacity))
         );
     }
@@ -191,7 +256,8 @@ mod tests {
                 Some(5.0),
                 Some(0.2),
                 Some(false)
-            )),
+            ))
+            .verdict,
             Some(LimiterVerdict::Known(PrimaryLimiter::Traffic))
         );
     }
@@ -207,7 +273,8 @@ mod tests {
                 Some(10.0),
                 Some(0.2),
                 Some(false)
-            )),
+            ))
+            .verdict,
             Some(LimiterVerdict::Known(PrimaryLimiter::Physics))
         );
     }
@@ -224,7 +291,8 @@ mod tests {
             Some(10.0),
             Some(0.2),
             Some(false),
-        ));
+        ))
+        .verdict;
         assert_ne!(result, Some(LimiterVerdict::Known(PrimaryLimiter::Physics)));
     }
 
@@ -239,7 +307,8 @@ mod tests {
                 Some(10.0),
                 Some(0.6),
                 Some(true)
-            )),
+            ))
+            .verdict,
             Some(LimiterVerdict::Known(PrimaryLimiter::PrefillInterference))
         );
     }
@@ -255,7 +324,8 @@ mod tests {
                 Some(10.0),
                 Some(0.1),
                 Some(false)
-            )),
+            ))
+            .verdict,
             Some(LimiterVerdict::Known(PrimaryLimiter::FrameworkOverhead))
         );
     }
@@ -263,7 +333,7 @@ mod tests {
     #[test]
     fn none_returned_when_data_missing() {
         assert_eq!(
-            identify(&ev(None, None, None, None, None, None, None)),
+            identify(&ev(None, None, None, None, None, None, None)).verdict,
             None
         );
         assert_eq!(
@@ -275,7 +345,8 @@ mod tests {
                 Some(10.0),
                 None,
                 Some(false)
-            )),
+            ))
+            .verdict,
             None
         );
     }
@@ -291,7 +362,8 @@ mod tests {
                 Some(5.0),
                 Some(0.6),
                 Some(false)
-            )),
+            ))
+            .verdict,
             Some(LimiterVerdict::Known(PrimaryLimiter::Capacity))
         );
     }
@@ -307,7 +379,8 @@ mod tests {
                 Some(10.0),
                 Some(0.6),
                 Some(false)
-            )),
+            ))
+            .verdict,
             Some(LimiterVerdict::Known(PrimaryLimiter::Traffic))
         );
     }
@@ -323,7 +396,8 @@ mod tests {
                 None,
                 Some(0.7),
                 Some(true)
-            )),
+            ))
+            .verdict,
             Some(LimiterVerdict::CeilingUnknown(CeilingUnknown))
         );
     }
@@ -339,7 +413,8 @@ mod tests {
                 Some(10.0),
                 Some(0.6),
                 Some(false)
-            )),
+            ))
+            .verdict,
             Some(LimiterVerdict::Known(PrimaryLimiter::FrameworkOverhead))
         );
     }
@@ -355,7 +430,8 @@ mod tests {
                 Some(10.0),
                 Some(0.3),
                 Some(true)
-            )),
+            ))
+            .verdict,
             Some(LimiterVerdict::Known(PrimaryLimiter::FrameworkOverhead))
         );
     }
@@ -405,8 +481,71 @@ mod tests {
                 Some(10.0),
                 Some(0.3),
                 Some(true)
-            )),
+            ))
+            .verdict,
             Some(LimiterVerdict::Known(PrimaryLimiter::FrameworkOverhead))
         );
+    }
+
+    #[test]
+    fn framework_line_claims_only_cleared_stages() {
+        let both_cleared = limiter_line(&ev(
+            Some(20.0),
+            Some(50.0),
+            Some(100.0),
+            Some(50.0),
+            Some(10.0),
+            Some(0.2),
+            Some(false),
+        ))
+        .expect("line");
+        assert!(both_cleared.contains("batch healthy"));
+        assert!(both_cleared.contains("memory free"));
+        assert!(!both_cleared.contains("KV unmeasured"));
+        assert!(!both_cleared.contains("hardware ceiling unknown"));
+
+        let kv_skipped = limiter_line(&ev(
+            None,
+            Some(50.0),
+            Some(100.0),
+            Some(50.0),
+            Some(10.0),
+            Some(0.2),
+            Some(false),
+        ))
+        .expect("line");
+        assert!(kv_skipped.contains("KV unmeasured"));
+        assert!(kv_skipped.contains("batch healthy"));
+        assert!(!kv_skipped.contains("memory free"));
+
+        let traffic_skipped = limiter_line(&ev(
+            Some(20.0),
+            Some(50.0),
+            None,
+            Some(50.0),
+            Some(10.0),
+            Some(0.2),
+            Some(false),
+        ))
+        .expect("line");
+        assert!(traffic_skipped.contains("memory free"));
+        assert!(traffic_skipped.contains("hardware ceiling unknown"));
+        assert!(!traffic_skipped.contains("batch healthy"));
+    }
+
+    #[test]
+    fn traffic_line_notes_memory_unmeasured_when_capacity_skipped() {
+        let line = limiter_line(&ev(
+            None,
+            Some(5.0),
+            Some(100.0),
+            Some(20.0),
+            Some(5.0),
+            Some(0.2),
+            Some(false),
+        ))
+        .expect("line");
+        assert!(line.contains("Capped by traffic"));
+        assert!(line.contains("Memory unmeasured"));
     }
 }

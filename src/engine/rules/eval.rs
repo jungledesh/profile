@@ -24,9 +24,10 @@ use super::r5_concurrency_saturation::{
     format_concurrency_saturation_window_issue, r5_confidence, rule5_concurrency_saturation,
 };
 use super::r6_prefill_bound::{
-    PrefillBoundDetail, PrefillBoundEvalInput, Rule6Outcome, aggregate_r6_detail,
-    confidence as r6_confidence, effective_prompt_tps, evaluate as r6_evaluate,
-    format_prefill_bound_window_issue, impact as r6_impact, severity as r6_severity,
+    PrefillBoundDetail, PrefillBoundEvalInput, Rule6Outcome, TPOT_UNVERIFIED_CONFIDENCE_CAP,
+    aggregate_r6_detail, confidence as r6_confidence, effective_prompt_tps,
+    evaluate as r6_evaluate, format_prefill_bound_window_issue, impact as r6_impact,
+    severity as r6_severity,
 };
 use super::r7_config_headroom::{
     ConfigHeadroomDetail, aggregate_r7_detail, format_config_headroom_window_issue, r7_confidence,
@@ -40,6 +41,9 @@ use super::{
 const SUPPRESSION_TABLE: &[(&str, &str)] = &[
     (rule_names::OOM_RISK, rule_names::KV_CACHE_PRESSURE),
     (rule_names::OOM_RISK, rule_names::KV_ADMISSION_BACKLOG),
+    // Must run before the min-layer filter: R6 (L5) would otherwise be dropped
+    // when R1 (L4) is present, making this entry a no-op.
+    (rule_names::PREFILL_BOUND, rule_names::UNDER_BATCHING),
 ];
 
 struct WindowRuleEval {
@@ -278,6 +282,11 @@ fn eval_window_rules(
             generation_tokens_per_sec: snap.vllm.generation_tokens_per_sec,
             prefix_cache_hit_rate: snap.vllm.prefix_cache_hit_rate,
             ridge_batch_size: win_baseline.as_ref().map(|b| b.ridge_batch_size),
+            // Defer to R6 only when R6 can fire (needs decode efficiency).
+            baseline_present: win_baseline
+                .as_ref()
+                .and_then(|b| b.efficiency_pct)
+                .is_some_and(|e| e.is_finite()),
         }) {
             Rule1Outcome::Fired(d) => {
                 eval.r1_fired += 1;
@@ -643,7 +652,11 @@ fn build_report_from_eval(
     if eval.r6_significant() {
         let d = aggregate_r6_detail(&eval.r6_details);
         let sev = r6_severity(d.prompt_gen_ratio);
-        let conf = r6_confidence(sev);
+        let conf = if d.tpot_unverified {
+            r6_confidence(sev).min(TPOT_UNVERIFIED_CONFIDENCE_CAP)
+        } else {
+            r6_confidence(sev)
+        };
         let imp = r6_impact(sev);
         let display_lines = format_prefill_bound_window_issue(&d, pct(eval.r6_fired, eval.n_eval));
         recs.push(Recommendation {
@@ -724,6 +737,21 @@ fn finalize_report_groups(
         memory_budget_self_grade,
     } = capacity;
     let mut suppressed_rules = Vec::new();
+
+    // ME table BEFORE min-layer filter so cross-layer suppressions (R6→R1) land.
+    // Same-layer rows (OOM→KV) are unchanged: both survive until ME, then KV drops.
+    let mut recs = recs;
+    let fired_names: Vec<&str> = recs.iter().map(|r| r.rule_name).collect();
+    for &(suppressor, suppressed) in SUPPRESSION_TABLE {
+        if fired_names.contains(&suppressor) {
+            let before = recs.len();
+            recs.retain(|r| r.rule_name != suppressed);
+            if recs.len() < before {
+                suppressed_rules.push((suppressed, suppressor));
+            }
+        }
+    }
+
     let Some(min_layer) = recs.iter().map(|r| r.layer).min() else {
         return Report {
             baseline,
@@ -764,17 +792,6 @@ fn finalize_report_groups(
             }
         })
         .collect();
-
-    let fired_names: Vec<&str> = recs.iter().map(|r| r.rule_name).collect();
-    for (suppressor, suppressed) in SUPPRESSION_TABLE {
-        if fired_names.contains(suppressor) {
-            let before = recs.len();
-            recs.retain(|r| r.rule_name != *suppressed);
-            if recs.len() < before {
-                suppressed_rules.push((suppressed, suppressor));
-            }
-        }
-    }
 
     recs.sort_by(|a, b| {
         let sa = a.impact as f64 * a.confidence;

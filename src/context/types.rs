@@ -124,7 +124,7 @@ impl StaticContext {
         let gpu_name = bottleneck_gpu.and_then(|g| g.gpu_name.clone());
         let vram_gb = bottleneck_gpu
             .and_then(|g| g.vram_total_mb)
-            .map(|m| m as f64 / 1024.0);
+            .map(crate::collectors::mib_to_decimal_gb);
         let gpu_entry = gpu_name.as_deref().and_then(gpu_catalog::lookup_gpu);
         let gpu = match gpu_entry {
             Some(e) => GPUModel {
@@ -174,7 +174,8 @@ impl<'a> AnalysisInput<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::catalog_path_basename;
+    use super::*;
+    use crate::collectors::{GpuRawMetrics, RawSnapshot, VllmConfig, mib_to_decimal_gb};
 
     #[test]
     fn catalog_path_basename_hf_repo() {
@@ -201,5 +202,22 @@ mod tests {
     fn catalog_path_basename_empty() {
         assert_eq!(catalog_path_basename(""), None);
         assert_eq!(catalog_path_basename("   "), None);
+    }
+
+    #[test]
+    fn from_snapshot_vram_gb_is_decimal_not_gib() {
+        let snap = RawSnapshot {
+            gpus: vec![GpuRawMetrics {
+                vram_total_mb: Some(80 * 1024),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let ctx = StaticContext::from_snapshot(&snap, VllmConfig::default());
+        let expected = mib_to_decimal_gb(80 * 1024);
+        let got = ctx.gpu.vram_gb.expect("vram");
+        assert!((got - expected).abs() < 1e-9);
+        // Must not silently use MiB/1024 (GiB).
+        assert!((got - 80.0).abs() > 5.0);
     }
 }

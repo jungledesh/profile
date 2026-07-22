@@ -391,6 +391,19 @@ pub fn snapshot_uses_index_only(gpus: &[GpuRawMetrics]) -> bool {
         && gpus.iter().any(GpuRawMetrics::uses_index_only)
 }
 
+/// MiB → decimal GB (SI, 1e9 bytes). Matches `weight_gb` / `kv_headroom_gb`.
+///
+/// NVML and ROCm report bytes; collectors store MiB (`bytes / 1024²`). Physics
+/// subtracts decimal-GB weights, so this conversion is mandatory at the
+/// MiB→GB boundary. Do not use `mib / 1024` (that yields GiB and understates
+/// headroom by ~7%).
+///
+/// Operator-facing VRAM lines may still show binary GB (`mib / 1024`) so an
+/// 80 GiB card reads as 80GB; that display path must not feed headroom math.
+pub fn mib_to_decimal_gb(mib: u64) -> f64 {
+    (mib as f64) * ((1024.0 * 1024.0) / 1_000_000_000.0)
+}
+
 /// Tensor-parallel degree for roofline, cost, and R4.
 /// Config/CLI wins when set; otherwise infer from collected GPU count.
 /// When config exceeds collected GPUs, clamp to collected - physics must not assume
@@ -440,7 +453,14 @@ pub fn window_is_idle(s: &RawSnapshot) -> bool {
         .generation_tokens_per_sec
         .filter(|t| t.is_finite())
         .is_none_or(|t| t < 1.0);
-    no_running && no_throughput
+    // None waiting preserves idle (same convention as running/gen). Some(waiting>=1)
+    // means admission backlog: not idle even if nothing is decoding yet.
+    let no_waiting = s
+        .vllm
+        .num_requests_waiting
+        .filter(|w| w.is_finite())
+        .is_none_or(|w| w < 1.0);
+    no_running && no_throughput && no_waiting
 }
 
 /// True when the window is evaluable and not idle.
@@ -519,6 +539,37 @@ mod window_evaluable_tests {
             ..Default::default()
         };
         assert!(window_is_idle(&s));
+    }
+
+    #[test]
+    fn window_is_idle_when_waiting_none() {
+        let s = RawSnapshot {
+            vllm: VllmRawMetrics {
+                num_requests_running: Some(0.0),
+                generation_tokens_per_sec: Some(0.0),
+                num_requests_waiting: None,
+                window_duration_secs: Some(2.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(window_is_idle(&s));
+    }
+
+    #[test]
+    fn window_is_not_idle_with_admission_backlog() {
+        let s = RawSnapshot {
+            vllm: VllmRawMetrics {
+                num_requests_running: Some(0.0),
+                generation_tokens_per_sec: Some(0.0),
+                num_requests_waiting: Some(5.0),
+                window_duration_secs: Some(2.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(!window_is_idle(&s));
+        assert!(window_is_active(&s));
     }
 
     #[test]
@@ -643,6 +694,20 @@ mod effective_tensor_parallel_tests {
     #[test]
     fn none_when_no_gpus_collected() {
         assert_eq!(effective_tensor_parallel(Some(4), 0), None);
+    }
+}
+
+#[cfg(test)]
+mod mib_to_decimal_gb_tests {
+    use super::mib_to_decimal_gb;
+
+    #[test]
+    fn h100_80gib_is_decimal_not_binary() {
+        let mib = 80 * 1024;
+        let gb = mib_to_decimal_gb(mib);
+        // 81920 MiB × 1.048576e-3 ≈ 85.90 decimal GB, not 80 GiB.
+        assert!((gb - 85.89934592).abs() < 1e-6);
+        assert!((gb - (mib as f64 / 1024.0)).abs() > 5.0);
     }
 }
 

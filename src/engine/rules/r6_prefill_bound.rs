@@ -6,13 +6,17 @@ use crate::collectors::RawSnapshot;
 /// false-positiving on agent workloads (~4:1 ratio). Calibrate with production data.
 /// Prompt-to-generation token ratio above which prefill dominates decode.
 /// Shared by R1 (defer to R6) and R6 (mild fire gate). Calibrate in one place.
-pub(super) const PROMPT_GEN_RATIO_MILD: f64 = 5.0;
+pub const PROMPT_GEN_RATIO_MILD: f64 = 5.0;
 const PROMPT_GEN_RATIO_MODERATE: f64 = 10.0;
 const PROMPT_GEN_RATIO_SEVERE: f64 = 20.0;
 
 /// TPOT must be inflated above this multiple of the physics floor for R6 to fire.
 /// Prefill ratio alone isn't a problem if TPOT isn't inflated (server is handling it).
 const TPOT_INFLATION_GATE: f64 = 4.0;
+
+/// Confidence cap when TPOT evidence could not be checked (missing tpot or floor).
+/// Below Medium threshold (0.7) so the label renders Low.
+pub(super) const TPOT_UNVERIFIED_CONFIDENCE_CAP: f64 = 0.5;
 
 /// Decode efficiency below this indicates underperformance that prefill might explain.
 const DECODE_EFFICIENCY_GATE: f64 = 40.0;
@@ -165,6 +169,8 @@ pub struct PrefillBoundDetail {
     pub decode_efficiency_pct: f64,
     pub tpot_ms: Option<f64>,
     pub tpot_floor_ms: Option<f64>,
+    /// True when the TPOT-inflation mute could not run (tpot or floor missing).
+    pub tpot_unverified: bool,
     pub prefix_caching_enabled: Option<bool>,
     pub chunked_prefill_enabled: Option<bool>,
     pub prompt_tokens_mean: Option<f64>,
@@ -321,6 +327,8 @@ pub fn evaluate(input: PrefillBoundEvalInput<'_>) -> Rule6Outcome {
     {
         return Rule6Outcome::NotFired;
     }
+    let tpot_unverified = !(tpot_ms.is_some_and(|v| v.is_finite() && v > 0.0)
+        && tpot_floor_ms.is_some_and(|v| v.is_finite() && v > 0.0));
 
     let prompt_skew_ratio = match (
         snapshot.vllm.prompt_tokens_p99,
@@ -337,6 +345,7 @@ pub fn evaluate(input: PrefillBoundEvalInput<'_>) -> Rule6Outcome {
         decode_efficiency_pct: eff,
         tpot_ms,
         tpot_floor_ms,
+        tpot_unverified,
         prefix_caching_enabled: snapshot.vllm.cache_config.enable_prefix_caching,
         chunked_prefill_enabled,
         prompt_tokens_mean: snapshot.vllm.prompt_tokens_mean,
@@ -370,6 +379,7 @@ pub(super) fn aggregate_r6_detail(details: &[PrefillBoundDetail]) -> PrefillBoun
             .filter_map(|d| d.tpot_ms)
             .fold(None, |acc, v| Some(acc.map_or(v, |a: f64| a.max(v)))),
         tpot_floor_ms: details.first().and_then(|d| d.tpot_floor_ms),
+        tpot_unverified: details.iter().any(|d| d.tpot_unverified),
         prefix_caching_enabled: details.first().and_then(|d| d.prefix_caching_enabled),
         chunked_prefill_enabled: details.first().and_then(|d| d.chunked_prefill_enabled),
         prompt_tokens_mean: super::mean_of_present(
@@ -457,7 +467,11 @@ pub(super) fn format_prefill_bound_window_issue(
     seen_pct: u32,
 ) -> Vec<String> {
     let sev = severity(d.prompt_gen_ratio);
-    let conf = confidence(sev);
+    let conf = if d.tpot_unverified {
+        confidence(sev).min(TPOT_UNVERIFIED_CONFIDENCE_CAP)
+    } else {
+        confidence(sev)
+    };
     let (fix_bullets, expected_normal) = prefill_fix_lines(d, sev);
     let skewed = skewed_mode(d);
 
@@ -535,6 +549,17 @@ pub(super) fn format_prefill_bound_window_issue(
         if let Some(line) = cause_tpot_line(d) {
             lines.push(line);
         }
+    }
+    if d.tpot_unverified {
+        let note = match (
+            d.tpot_ms.filter(|v| v.is_finite() && *v > 0.0),
+            d.tpot_floor_ms.filter(|v| v.is_finite() && *v > 0.0),
+        ) {
+            (None, _) => "(low confidence, TPOT unavailable)",
+            (Some(_), None) => "(low confidence, TPOT floor unavailable)",
+            (Some(_), Some(_)) => "(low confidence, TPOT check unavailable)",
+        };
+        lines.push(format!("      {note}"));
     }
 
     lines.push(String::new());
@@ -787,8 +812,26 @@ mod tests {
             Some(32.0),
             Some(7.85),
         ) {
-            Rule6Outcome::Fired(_) => {}
+            Rule6Outcome::Fired(d) => {
+                assert!(!d.tpot_unverified);
+                let conf = confidence(severity(d.prompt_gen_ratio));
+                assert!(conf > TPOT_UNVERIFIED_CONFIDENCE_CAP);
+            }
             Rule6Outcome::NotFired => panic!("should fire when TPOT exceeds 4x floor"),
+        }
+    }
+
+    #[test]
+    fn fires_low_confidence_when_tpot_missing() {
+        let s = test_snapshot();
+        match eval_r6_default(&s, Some(600.0), Some(100.0), Some(10.0), None, Some(7.85)) {
+            Rule6Outcome::Fired(d) => {
+                assert!(d.tpot_unverified);
+                let text = format_prefill_bound_window_issue(&d, 100).join("\n");
+                assert!(text.contains("(low confidence, TPOT unavailable)"));
+                assert!(text.contains("Confidence: Low"));
+            }
+            Rule6Outcome::NotFired => panic!("should fire with TPOT unverified"),
         }
     }
 
@@ -846,6 +889,7 @@ mod tests {
             decode_efficiency_pct: 10.0,
             tpot_ms: Some(50.0),
             tpot_floor_ms: Some(7.85),
+            tpot_unverified: false,
             prefix_caching_enabled: Some(true),
             chunked_prefill_enabled: Some(true),
             prompt_tokens_mean: Some(2048.0),
@@ -876,6 +920,7 @@ mod tests {
             decode_efficiency_pct: 10.0,
             tpot_ms: None,
             tpot_floor_ms: None,
+            tpot_unverified: false,
             prefix_caching_enabled: None,
             chunked_prefill_enabled: None,
             prompt_tokens_mean: None,
@@ -903,6 +948,7 @@ mod tests {
             decode_efficiency_pct: 6.7,
             tpot_ms: Some(130.0),
             tpot_floor_ms: Some(7.85),
+            tpot_unverified: false,
             prefix_caching_enabled: Some(true),
             chunked_prefill_enabled: Some(false),
             prompt_tokens_mean: Some(2048.0),
@@ -940,6 +986,7 @@ mod tests {
             decode_efficiency_pct: 6.7,
             tpot_ms: Some(130.0),
             tpot_floor_ms: Some(7.85),
+            tpot_unverified: false,
             prefix_caching_enabled: Some(true),
             chunked_prefill_enabled: Some(true),
             prompt_tokens_mean: Some(2048.0),
@@ -967,6 +1014,7 @@ mod tests {
             decode_efficiency_pct: 8.2,
             tpot_ms: Some(80.0),
             tpot_floor_ms: Some(7.85),
+            tpot_unverified: false,
             prefix_caching_enabled: Some(false),
             chunked_prefill_enabled: Some(true),
             prompt_tokens_mean: Some(4096.0),
@@ -988,6 +1036,7 @@ mod tests {
             decode_efficiency_pct: 8.0,
             tpot_ms: Some(80.0),
             tpot_floor_ms: Some(7.85),
+            tpot_unverified: false,
             prefix_caching_enabled: Some(true),
             chunked_prefill_enabled: Some(false),
             prompt_tokens_mean: Some(4096.0),
@@ -1010,6 +1059,7 @@ mod tests {
             decode_efficiency_pct: 8.0,
             tpot_ms: Some(80.0),
             tpot_floor_ms: Some(7.85),
+            tpot_unverified: false,
             prefix_caching_enabled: Some(true),
             chunked_prefill_enabled: Some(true),
             prompt_tokens_mean: Some(4096.0),
@@ -1033,6 +1083,7 @@ mod tests {
             decode_efficiency_pct: 5.0,
             tpot_ms: Some(130.0),
             tpot_floor_ms: Some(7.85),
+            tpot_unverified: false,
             prefix_caching_enabled: Some(true),
             chunked_prefill_enabled: Some(true),
             prompt_tokens_mean: Some(4096.0),
@@ -1054,6 +1105,7 @@ mod tests {
             decode_efficiency_pct: 5.1,
             tpot_ms: Some(80.0),
             tpot_floor_ms: Some(7.85),
+            tpot_unverified: false,
             prefix_caching_enabled: Some(true),
             chunked_prefill_enabled: Some(true),
             prompt_tokens_mean: Some(4096.0),
@@ -1076,6 +1128,7 @@ mod tests {
             decode_efficiency_pct: 8.0,
             tpot_ms: Some(80.0),
             tpot_floor_ms: Some(7.85),
+            tpot_unverified: false,
             prefix_caching_enabled: Some(true),
             chunked_prefill_enabled: Some(true),
             prompt_tokens_mean: Some(4096.0),
@@ -1097,6 +1150,7 @@ mod tests {
             decode_efficiency_pct: 6.7,
             tpot_ms: Some(130.0),
             tpot_floor_ms: Some(7.85),
+            tpot_unverified: false,
             prefix_caching_enabled: Some(true),
             chunked_prefill_enabled: Some(true),
             prompt_tokens_mean: Some(2048.0),
@@ -1119,6 +1173,7 @@ mod tests {
             decode_efficiency_pct: 6.7,
             tpot_ms: Some(130.0),
             tpot_floor_ms: Some(7.85),
+            tpot_unverified: false,
             prefix_caching_enabled: Some(true),
             chunked_prefill_enabled: Some(true),
             prompt_tokens_mean: Some(2048.0),
@@ -1145,6 +1200,7 @@ mod tests {
             decode_efficiency_pct: 6.7,
             tpot_ms: Some(130.0),
             tpot_floor_ms: Some(7.85),
+            tpot_unverified: false,
             prefix_caching_enabled: Some(true),
             chunked_prefill_enabled: Some(true),
             prompt_tokens_mean: Some(2048.0),
@@ -1175,6 +1231,7 @@ mod tests {
             decode_efficiency_pct: 5.1,
             tpot_ms: Some(80.0),
             tpot_floor_ms: Some(7.85),
+            tpot_unverified: false,
             prefix_caching_enabled: Some(true),
             chunked_prefill_enabled: Some(true),
             prompt_tokens_mean: Some(4096.0),
@@ -1211,6 +1268,7 @@ mod tests {
             decode_efficiency_pct: 8.0,
             tpot_ms: Some(80.0),
             tpot_floor_ms: Some(7.85),
+            tpot_unverified: false,
             prefix_caching_enabled: Some(true),
             chunked_prefill_enabled: Some(true),
             prompt_tokens_mean: Some(1333.0),
@@ -1242,6 +1300,7 @@ mod tests {
             decode_efficiency_pct: 8.0,
             tpot_ms: Some(80.0),
             tpot_floor_ms: Some(7.85),
+            tpot_unverified: false,
             prefix_caching_enabled: Some(true),
             chunked_prefill_enabled: Some(true),
             prompt_tokens_mean: Some(1333.0),
@@ -1270,6 +1329,7 @@ mod tests {
             decode_efficiency_pct: 8.0,
             tpot_ms: Some(80.0),
             tpot_floor_ms: Some(7.85),
+            tpot_unverified: false,
             prefix_caching_enabled: Some(true),
             chunked_prefill_enabled: Some(true),
             prompt_tokens_mean: Some(4096.0),
@@ -1294,6 +1354,7 @@ mod tests {
             decode_efficiency_pct: 8.0,
             tpot_ms: Some(80.0),
             tpot_floor_ms: Some(7.85),
+            tpot_unverified: false,
             prefix_caching_enabled: Some(true),
             chunked_prefill_enabled: Some(true),
             prompt_tokens_mean: Some(1333.0),
@@ -1318,6 +1379,7 @@ mod tests {
             decode_efficiency_pct: 8.0,
             tpot_ms: Some(80.0),
             tpot_floor_ms: Some(7.85),
+            tpot_unverified: false,
             prefix_caching_enabled: Some(true),
             chunked_prefill_enabled: Some(true),
             prompt_tokens_mean: None,
@@ -1345,6 +1407,7 @@ mod tests {
             decode_efficiency_pct: 8.0,
             tpot_ms: Some(80.0),
             tpot_floor_ms: Some(7.85),
+            tpot_unverified: false,
             prefix_caching_enabled: prefix,
             chunked_prefill_enabled: Some(true),
             prompt_tokens_mean: Some(4096.0),
@@ -1402,6 +1465,7 @@ mod tests {
             decode_efficiency_pct: 8.0,
             tpot_ms: Some(80.0),
             tpot_floor_ms: Some(7.85),
+            tpot_unverified: false,
             prefix_caching_enabled: Some(true),
             chunked_prefill_enabled: Some(true),
             prompt_tokens_mean: None,

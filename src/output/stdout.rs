@@ -464,6 +464,9 @@ fn gpu_gauges_line(
 fn format_vram(g: &GpuRawMetrics) -> String {
     match (g.vram_used_mb, g.vram_total_mb) {
         (Some(used), Some(total)) if total > 0 => {
+            // Binary GB (MiB/1024) for operator display so an 80 GiB card reads
+            // 80GB. Physics headroom uses mib_to_decimal_gb; do not feed this
+            // display path into weight/headroom math.
             let u_gb = used as f64 / 1024.0;
             let t_gb = total as f64 / 1024.0;
             let mut s = format!("vRAM {:.0}/{:.0}GB", u_gb, t_gb);

@@ -58,6 +58,9 @@ pub struct R1EvalInput<'a> {
     pub generation_tokens_per_sec: Option<f64>,
     pub prefix_cache_hit_rate: Option<f64>,
     pub ridge_batch_size: Option<f64>,
+    /// True when decode efficiency is available so R6 can fire. When false,
+    /// skip the prompt/gen defer (unknown-GPU path must still work).
+    pub baseline_present: bool,
 }
 
 pub(super) fn rule1_under_batching_with_efficiency(input: R1EvalInput<'_>) -> Rule1Outcome {
@@ -70,6 +73,7 @@ pub(super) fn rule1_under_batching_with_efficiency(input: R1EvalInput<'_>) -> Ru
         generation_tokens_per_sec,
         prefix_cache_hit_rate,
         ridge_batch_size,
+        baseline_present,
     } = input;
     let running = snapshot.vllm.num_requests_running;
 
@@ -114,10 +118,14 @@ pub(super) fn rule1_under_batching_with_efficiency(input: R1EvalInput<'_>) -> Ru
     let efficiency_pct = efficiency_pct.filter(|e| e.is_finite());
 
     // Physics-level prefill gate: if prefill dominates, R6 handles it, not R1.
-    if let (Some(p_tps), Some(g_tps)) = (
-        prompt_tokens_per_sec.filter(|v| v.is_finite() && *v > 0.0),
-        generation_tokens_per_sec.filter(|v| v.is_finite() && *v >= 0.0),
-    ) {
+    // Only defer when R6 can fire (decode efficiency present). Otherwise unknown-GPU
+    // occupancy path would mute itself against a rule that never runs.
+    if baseline_present
+        && let (Some(p_tps), Some(g_tps)) = (
+            prompt_tokens_per_sec.filter(|v| v.is_finite() && *v > 0.0),
+            generation_tokens_per_sec.filter(|v| v.is_finite() && *v >= 0.0),
+        )
+    {
         let p_tps = effective_prompt_tps(p_tps, prefix_cache_hit_rate);
         let ratio = if g_tps > 0.0 {
             p_tps / g_tps
@@ -352,6 +360,8 @@ mod tests {
         generation_tokens_per_sec: Option<f64>,
         prefix_cache_hit_rate: Option<f64>,
         ridge_batch_size: Option<f64>,
+        /// Defaults false via Default; set true in tests that exercise R6 defer.
+        baseline_present: bool,
     }
 
     fn r1_input(snapshot: &RawSnapshot, opts: R1InputOpts) -> R1EvalInput<'_> {
@@ -364,6 +374,7 @@ mod tests {
             generation_tokens_per_sec: opts.generation_tokens_per_sec,
             prefix_cache_hit_rate: opts.prefix_cache_hit_rate,
             ridge_batch_size: opts.ridge_batch_size,
+            baseline_present: opts.baseline_present,
         }
     }
 
@@ -677,6 +688,7 @@ mod tests {
                 config_relative_efficiency_pct: Some(15.0),
                 prompt_tokens_per_sec: Some(600.0),
                 generation_tokens_per_sec: Some(100.0),
+                baseline_present: true,
                 ..Default::default()
             },
         )) {
@@ -696,6 +708,7 @@ mod tests {
                 prompt_tokens_per_sec: Some(600.0),
                 generation_tokens_per_sec: Some(100.0),
                 prefix_cache_hit_rate: Some(0.90),
+                baseline_present: true,
                 ..Default::default()
             },
         )) {
@@ -713,11 +726,30 @@ mod tests {
                 config_relative_efficiency_pct: Some(15.0),
                 prompt_tokens_per_sec: Some(600.0),
                 generation_tokens_per_sec: Some(0.0),
+                baseline_present: true,
                 ..Default::default()
             },
         )) {
             Rule1Outcome::NotFired => {}
             Rule1Outcome::Fired(_) => panic!("R1 should suppress on pure prefill"),
+        }
+    }
+
+    #[test]
+    fn unknown_gpu_high_ratio_still_fires_when_baseline_absent() {
+        // No decode efficiency → R6 cannot fire; R1 must not defer into silence.
+        let s = snap(Some(5.0), Some(256), Some(0.0));
+        match rule1_under_batching_with_efficiency(r1_input(
+            &s,
+            R1InputOpts {
+                prompt_tokens_per_sec: Some(600.0),
+                generation_tokens_per_sec: Some(100.0),
+                baseline_present: false,
+                ..Default::default()
+            },
+        )) {
+            Rule1Outcome::Fired(d) => assert!(!d.known_gpu),
+            Rule1Outcome::NotFired => panic!("expected R1 fire on unknown-GPU occupancy path"),
         }
     }
 

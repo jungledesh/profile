@@ -92,7 +92,7 @@ pub struct KvAdmissionBacklogDetail {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct KvCachePressureDetail {
-    pub kv_cache_usage_perc: f64,
+    pub kv_cache_usage_perc: Option<f64>,
     pub kv_peak_pct: Option<f64>,
     pub preemptions_active: bool,
     pub queue_backpressure: bool,
@@ -198,12 +198,15 @@ pub fn rule2_kv_cache_pressure(snapshot: &RawSnapshot) -> Rule2Outcome {
         return Rule2Outcome::NotFired;
     }
 
-    let kv_p = kv.unwrap_or(0.0);
+    let kv_p = kv;
     let peak = snapshot
         .vllm
         .kv_cache_peak_perc
         .filter(|v| v.is_finite())
-        .map(|peak| peak.max(kv_p));
+        .map(|peak| match kv_p {
+            Some(avg) => peak.max(avg),
+            None => peak,
+        });
 
     Rule2Outcome::Fired(KvCachePressureDetail {
         kv_cache_usage_perc: kv_p,
@@ -450,19 +453,28 @@ pub(super) fn format_kv_cache_pressure_fired(
     let fp8_compiler_available = ctx.fp8_compiler_available;
     let kv_cache_dtype = snapshot.vllm.cache_config.cache_dtype.as_deref();
     let kv_avg = d.kv_cache_usage_perc;
-    let peak = d.kv_peak_pct.unwrap_or(kv_avg);
+    let peak = d.kv_peak_pct;
     let mut out = vec![
         "[!] KV Cache Pressure".to_string(),
         "    Cause:".to_string(),
     ];
-    if kv_avg >= KV_CACHE_PRESSURE_MIN_PERC {
+    let avg_s = kv_avg
+        .filter(|v| v.is_finite())
+        .map(|v| format!("{v:.0}%"))
+        .unwrap_or_else(|| "-".to_string());
+    let peak_s = peak
+        .filter(|v| v.is_finite())
+        .map(|v| format!("{v:.0}%"))
+        .unwrap_or_else(|| "-".to_string());
+    let burst = kv_avg.is_none_or(|avg| avg < KV_CACHE_PRESSURE_MIN_PERC);
+    if burst {
         out.push(format!(
-            "      KV cache {kv_avg:.0}% avg, {peak:.0}% peak (threshold: {:.0}%).",
+            "      KV cache {avg_s} avg, {peak_s} peak (burst pressure, threshold: {:.0}%).",
             KV_CACHE_PRESSURE_MIN_PERC
         ));
     } else {
         out.push(format!(
-            "      KV cache {kv_avg:.0}% avg, {peak:.0}% peak (burst pressure, threshold: {:.0}%).",
+            "      KV cache {avg_s} avg, {peak_s} peak (threshold: {:.0}%).",
             KV_CACHE_PRESSURE_MIN_PERC
         ));
     }
@@ -684,19 +696,15 @@ pub(super) fn aggregate_r2_detail(details: &[KvCachePressureDetail]) -> KvCacheP
         !details.is_empty(),
         "aggregate_r2_detail called with no fired windows - caller should gate on r2_significant"
     );
-    let kv = details.iter().map(|d| d.kv_cache_usage_perc).sum::<f64>() / details.len() as f64;
+    let kv = super::mean_of_present(details.iter().filter_map(|d| d.kv_cache_usage_perc));
     let peak = details
         .iter()
         .filter_map(|d| d.kv_peak_pct)
-        .chain(details.iter().map(|d| d.kv_cache_usage_perc))
-        .fold(f64::NEG_INFINITY, f64::max);
-    debug_assert!(
-        peak.is_finite(),
-        "kv_cache_usage_perc must be finite when R2 fired"
-    );
+        .chain(details.iter().filter_map(|d| d.kv_cache_usage_perc))
+        .fold(None, |acc, v| Some(acc.map_or(v, |a: f64| a.max(v))));
     KvCachePressureDetail {
         kv_cache_usage_perc: kv,
-        kv_peak_pct: Some(peak),
+        kv_peak_pct: peak,
         preemptions_active: details.iter().any(|d| d.preemptions_active),
         queue_backpressure: details.iter().any(|d| d.queue_backpressure),
     }
@@ -842,7 +850,7 @@ mod tests {
 
     fn detail(kv: f64, preemptions: bool) -> KvCachePressureDetail {
         KvCachePressureDetail {
-            kv_cache_usage_perc: kv,
+            kv_cache_usage_perc: Some(kv),
             kv_peak_pct: Some(kv),
             preemptions_active: preemptions,
             queue_backpressure: false,
@@ -1110,7 +1118,7 @@ mod tests {
             ..Default::default()
         };
         let d = KvCachePressureDetail {
-            kv_cache_usage_perc: 90.0,
+            kv_cache_usage_perc: Some(90.0),
             kv_peak_pct: Some(90.0),
             preemptions_active: false,
             queue_backpressure: true,
@@ -1268,7 +1276,7 @@ mod tests {
     #[test]
     fn queue_backpressure_only_expected_does_not_mention_evictions() {
         let d = KvCachePressureDetail {
-            kv_cache_usage_perc: 90.0,
+            kv_cache_usage_perc: Some(90.0),
             kv_peak_pct: Some(90.0),
             preemptions_active: false,
             queue_backpressure: true,
@@ -1287,7 +1295,7 @@ mod tests {
     #[test]
     fn queue_backpressure_suggests_max_num_seqs_from_running_count() {
         let d = KvCachePressureDetail {
-            kv_cache_usage_perc: 90.0,
+            kv_cache_usage_perc: Some(90.0),
             kv_peak_pct: Some(90.0),
             preemptions_active: false,
             queue_backpressure: true,
@@ -1306,7 +1314,7 @@ mod tests {
     #[test]
     fn queue_backpressure_warns_when_vram_full() {
         let d = KvCachePressureDetail {
-            kv_cache_usage_perc: 90.0,
+            kv_cache_usage_perc: Some(90.0),
             kv_peak_pct: Some(90.0),
             preemptions_active: false,
             queue_backpressure: true,
@@ -1367,7 +1375,7 @@ mod tests {
     #[test]
     fn queue_backpressure_shows_raise_gpu_mem_bullet_when_headroom_unknown() {
         let d = KvCachePressureDetail {
-            kv_cache_usage_perc: 90.0,
+            kv_cache_usage_perc: Some(90.0),
             kv_peak_pct: Some(90.0),
             preemptions_active: false,
             queue_backpressure: true,
@@ -1456,7 +1464,7 @@ mod tests {
         };
         match rule2_kv_cache_pressure(&snap(v)) {
             Rule2Outcome::Fired(d) => {
-                assert!((d.kv_cache_usage_perc - 58.0).abs() < 1e-9);
+                assert!((d.kv_cache_usage_perc.unwrap() - 58.0).abs() < 1e-9);
                 assert_eq!(d.kv_peak_pct, Some(93.0));
             }
             Rule2Outcome::NotFired => panic!("expected fired on peak >= 88%"),
@@ -1479,7 +1487,7 @@ mod tests {
     #[test]
     fn display_shows_burst_pressure_when_peak_triggered() {
         let d = KvCachePressureDetail {
-            kv_cache_usage_perc: 58.0,
+            kv_cache_usage_perc: Some(58.0),
             kv_peak_pct: Some(93.0),
             preemptions_active: true,
             queue_backpressure: false,
@@ -1498,9 +1506,50 @@ mod tests {
     }
 
     #[test]
+    fn display_peak_only_renders_dash_avg() {
+        let d = KvCachePressureDetail {
+            kv_cache_usage_perc: None,
+            kv_peak_pct: Some(93.0),
+            preemptions_active: true,
+            queue_backpressure: false,
+        };
+        let v = VllmRawMetrics {
+            kv_cache_usage_perc: None,
+            kv_cache_peak_perc: Some(93.0),
+            num_preemptions_per_sec: Some(0.05),
+            ..Default::default()
+        };
+        let text = format_kv_cache_pressure_fired(&d, &kv_ctx(&snap(v), None, None, None), 1, 1)
+            .join("\n");
+        assert!(text.contains("- avg, 93% peak"));
+        assert!(!text.contains("0% avg"));
+    }
+
+    #[test]
+    fn aggregate_excludes_missing_avg() {
+        let details = [
+            KvCachePressureDetail {
+                kv_cache_usage_perc: None,
+                kv_peak_pct: Some(95.0),
+                preemptions_active: true,
+                queue_backpressure: false,
+            },
+            KvCachePressureDetail {
+                kv_cache_usage_perc: Some(90.0),
+                kv_peak_pct: Some(92.0),
+                preemptions_active: true,
+                queue_backpressure: false,
+            },
+        ];
+        let agg = aggregate_r2_detail(&details);
+        assert_eq!(agg.kv_cache_usage_perc, Some(90.0));
+        assert_eq!(agg.kv_peak_pct, Some(95.0));
+    }
+
+    #[test]
     fn display_shows_normal_when_avg_triggered() {
         let d = KvCachePressureDetail {
-            kv_cache_usage_perc: 92.0,
+            kv_cache_usage_perc: Some(92.0),
             kv_peak_pct: Some(97.0),
             preemptions_active: true,
             queue_backpressure: false,
@@ -1590,7 +1639,7 @@ mod tests {
             tp: None,
         };
         let d = KvCachePressureDetail {
-            kv_cache_usage_perc: 90.0,
+            kv_cache_usage_perc: Some(90.0),
             kv_peak_pct: Some(90.0),
             preemptions_active: false,
             queue_backpressure: true,
@@ -1651,7 +1700,7 @@ mod tests {
         };
         let text = format_kv_cache_pressure_fired(
             &KvCachePressureDetail {
-                kv_cache_usage_perc: 90.0,
+                kv_cache_usage_perc: Some(90.0),
                 kv_peak_pct: Some(90.0),
                 preemptions_active: false,
                 queue_backpressure: true,
@@ -1700,7 +1749,7 @@ mod tests {
         ctx.capacity_label = KvCapacityLabel::Observed;
         let text = format_kv_cache_pressure_fired(
             &KvCachePressureDetail {
-                kv_cache_usage_perc: 90.0,
+                kv_cache_usage_perc: Some(90.0),
                 kv_peak_pct: Some(90.0),
                 preemptions_active: false,
                 queue_backpressure: true,
@@ -1731,7 +1780,7 @@ mod tests {
         ctx.capacity_label = KvCapacityLabel::DerivedHybrid;
         let text = format_kv_cache_pressure_fired(
             &KvCachePressureDetail {
-                kv_cache_usage_perc: 90.0,
+                kv_cache_usage_perc: Some(90.0),
                 kv_peak_pct: Some(90.0),
                 preemptions_active: false,
                 queue_backpressure: true,
@@ -1799,7 +1848,7 @@ mod tests {
         };
         let text = format_kv_cache_pressure_fired(
             &KvCachePressureDetail {
-                kv_cache_usage_perc: 90.0,
+                kv_cache_usage_perc: Some(90.0),
                 kv_peak_pct: Some(90.0),
                 preemptions_active: false,
                 queue_backpressure: true,
@@ -1939,7 +1988,7 @@ mod tests {
     #[test]
     fn vram_capacity_bullet_has_no_max_context_fragment() {
         let d = KvCachePressureDetail {
-            kv_cache_usage_perc: 90.0,
+            kv_cache_usage_perc: Some(90.0),
             kv_peak_pct: Some(90.0),
             preemptions_active: false,
             queue_backpressure: true,

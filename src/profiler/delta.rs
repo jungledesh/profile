@@ -41,6 +41,9 @@ pub struct Delta {
     pub non_baseline_drifted: bool,
     /// Relative move in running concurrency or QPS past [`LOAD_CHANGE_MIN_REL`].
     pub load_changed: bool,
+    /// Running concurrency before/after (for the load status line).
+    pub running_before: Option<f64>,
+    pub running_after: Option<f64>,
     /// Absolute move in prefix hit rate past [`PREFIX_HIT_CHANGE_MIN_PP`] pp.
     pub prefix_hit_changed: bool,
     /// Self-grade after R2 prescribed a capacity and fresh observed concurrency exists.
@@ -125,6 +128,9 @@ pub fn compute(
         curr_result.snapshot.vllm.request_success_per_sec,
     );
 
+    let running_before = prev_result.snapshot.vllm.num_requests_running;
+    let running_after = curr_result.snapshot.vllm.num_requests_running;
+
     let prefix_hit_changed = prefix_hit_rate_changed(
         prev_result.snapshot.vllm.prefix_cache_hit_rate,
         curr_result.snapshot.vllm.prefix_cache_hit_rate,
@@ -152,6 +158,8 @@ pub fn compute(
         config_drifted,
         non_baseline_drifted,
         load_changed,
+        running_before,
+        running_after,
         prefix_hit_changed,
         capacity_self_grade,
     }

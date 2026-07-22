@@ -249,11 +249,12 @@ pub(super) fn format_concurrency_saturation_issue(
         .filter(|v| v.is_finite())
         .unwrap_or(d.requests_waiting);
     let display_queue_pct = d.queue_ratio * 100.0;
-    let display_kv = snapshot
-        .vllm
+    // Raise-vs-wall gate uses session/detail peak (d.kv_cache_usage_perc after
+    // aggregate), never the landing-window snapshot. A spike that filled the pool
+    // must block raise even if the last scrape cooled off (do-no-harm).
+    let gate_kv = d
         .kv_cache_usage_perc
-        .filter(|v| v.is_finite())
-        .or(d.kv_cache_usage_perc);
+        .or_else(|| snapshot.vllm.kv_cache_usage_perc.filter(|v| v.is_finite()));
     // p95 from snapshot (matches header label); fall back to p99 from d if absent.
     let display_p_x = snapshot
         .vllm
@@ -295,7 +296,7 @@ pub(super) fn format_concurrency_saturation_issue(
         (None, None) => {}
     }
     lines.push(String::new());
-    match display_kv {
+    match gate_kv {
         Some(pct) if pct < KV_CACHE_SAFE_TO_SCALE_PCT => {
             let (safe, cuts) = walls_fix_lines(d, rec, Some(pct), max_model_len, snapshot, hyp);
             super::push_grouped_fixes(&mut lines, safe, cuts, Vec::new());
@@ -741,9 +742,9 @@ mod tests {
     }
 
     #[test]
-    fn fix_uses_snapshot_kv_not_aggregate_peak() {
-        // d has KV 85% (>= safe threshold) → would say "Add a replica"
-        // snapshot has KV 70% (< safe threshold) → snapshot wins, should say "Raise --max-num-seqs"
+    fn fix_uses_session_peak_not_landing_kv() {
+        // d has KV 85% (session peak, >= safe gate) → pool full, add replica.
+        // Landing snapshot has KV 70% (< gate) → must NOT unlock a raise (do-no-harm).
         let d = fired_detail(None, Some(85.0));
         let s = snap(VllmRawMetrics {
             kv_cache_usage_perc: Some(70.0),
@@ -751,12 +752,12 @@ mod tests {
         });
         let text = format_concurrency_saturation_issue(&d, None, None, &s, None).join("\n");
         assert!(
-            text.contains("Raise --max-num-seqs"),
-            "snapshot KV (70%) should flip fix to raise cap"
+            text.contains("Add a replica"),
+            "session peak 85% must block raise: {text}"
         );
         assert!(
-            !text.contains("Add a replica"),
-            "aggregate KV (85%) must not override snapshot"
+            !text.contains("Raise --max-num-seqs"),
+            "landing KV 70% must not override session peak"
         );
     }
 
