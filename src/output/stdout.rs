@@ -10,7 +10,7 @@ use crate::collectors::{
 };
 use crate::context::{AnalysisInput, RuntimeWindow};
 use crate::engine;
-use crate::fmt::fmt_seconds_from_ms;
+use crate::fmt::{fmt_seconds_from_ms, fmt_seconds_from_ms_maybe_floor};
 use crate::profiler::DiagnoseResult;
 
 const VLLM_LABEL_W: usize = 20;
@@ -545,11 +545,21 @@ fn vllm_latency_value(v: &VllmRawMetrics, verbose: bool) -> String {
         .unwrap_or_else(|| "-".to_string());
     let ttft_p95 = v
         .ttft_p95_ms
-        .map(|p| format!(" (p95 {})", fmt_seconds_from_ms(p)))
+        .map(|p| {
+            format!(
+                " (p95 {})",
+                fmt_seconds_from_ms_maybe_floor(p, v.ttft_p95_clamped)
+            )
+        })
         .unwrap_or_default();
     let tpot_p95 = v
         .tpot_p95_ms
-        .map(|p| format!(" (p95 {})", fmt_seconds_from_ms(p)))
+        .map(|p| {
+            format!(
+                " (p95 {})",
+                fmt_seconds_from_ms_maybe_floor(p, v.tpot_p95_clamped)
+            )
+        })
         .unwrap_or_default();
 
     if !verbose {
@@ -1412,6 +1422,35 @@ mod tests {
             vllm_latency_value(&v, false),
             "ttft 120ms (p95 892ms) | tpot 50ms (p95 180ms)"
         );
+    }
+
+    #[test]
+    fn vllm_latency_value_shows_floor_when_p95_clamped() {
+        let v = VllmRawMetrics {
+            ttft_ms: Some(120.0),
+            tpot_ms: Some(50.0),
+            ttft_p95_ms: Some(40_000.0),
+            ttft_p95_clamped: true,
+            tpot_p95_ms: Some(40_000.0),
+            tpot_p95_clamped: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            vllm_latency_value(&v, false),
+            "ttft 120ms (p95 >= 40.0s) | tpot 50ms (p95 >= 40.0s)"
+        );
+        let normal = VllmRawMetrics {
+            ttft_ms: Some(120.0),
+            tpot_ms: Some(50.0),
+            ttft_p95_ms: Some(40_000.0),
+            tpot_p95_ms: Some(180.0),
+            ..Default::default()
+        };
+        assert_eq!(
+            vllm_latency_value(&normal, false),
+            "ttft 120ms (p95 40.0s) | tpot 50ms (p95 180ms)"
+        );
+        assert!(!vllm_latency_value(&normal, false).contains(">="));
     }
 
     #[test]

@@ -489,7 +489,9 @@ pub(super) fn format_kv_cache_pressure_fired(
         (true, None) => "      Scheduler evicting sequences to free KV blocks.".to_string(),
         (false, Some(w)) => format!("      {w:.0} requests queued on KV admission."),
         (false, None) => {
-            unreachable!("R2 requires preemptions or queue backpressure to fire")
+            // Aggregate can keep queue_backpressure from earlier windows while the
+            // landing snapshot's waiting gauge is gone. Never panic in display.
+            "      Scheduler queueing requests; waiting count unavailable this window.".to_string()
         }
     };
     out.push(evidence);
@@ -1290,6 +1292,27 @@ mod tests {
             .join("\n");
         assert!(text.contains("Wait queue drains"));
         assert!(!text.contains("evictions stop"));
+    }
+
+    #[test]
+    fn queue_backpressure_missing_waiting_on_landing_does_not_panic() {
+        // Fired windows had queue pressure; landing snapshot lost the waiting gauge.
+        let d = KvCachePressureDetail {
+            kv_cache_usage_perc: Some(90.0),
+            kv_peak_pct: Some(92.0),
+            preemptions_active: false,
+            queue_backpressure: true,
+        };
+        let v = VllmRawMetrics {
+            kv_cache_usage_perc: Some(90.0),
+            num_requests_waiting: None,
+            ..Default::default()
+        };
+        let text = format_kv_cache_pressure_fired(&d, &kv_ctx(&snap(v), None, None, None), 1, 1)
+            .join("\n");
+        assert!(
+            text.contains("Scheduler queueing requests; waiting count unavailable this window.")
+        );
     }
 
     #[test]

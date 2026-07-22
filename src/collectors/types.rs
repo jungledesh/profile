@@ -79,6 +79,11 @@ pub struct VllmRawMetrics {
     pub ttft_p95_ms: Option<f64>,
     /// p95 TPOT from histogram bucket delta. None if no traffic or counter reset.
     pub tpot_p95_ms: Option<f64>,
+    /// True when the corresponding quantile landed in the +Inf bucket (`*_ms` is a floor).
+    pub ttft_p99_clamped: bool,
+    pub tpot_p99_clamped: bool,
+    pub ttft_p95_clamped: bool,
+    pub tpot_p95_clamped: bool,
     pub prefill_latency_ms: Option<f64>,
     pub queue_delay_ms: Option<f64>,
     /// `request_prompt_tokens` histogram: mean tokens (Δ window or last-scrape fallback).

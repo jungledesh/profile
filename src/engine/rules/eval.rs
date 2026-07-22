@@ -490,6 +490,7 @@ fn build_report_from_eval(
         tpot_floor_ms: baseline.as_ref().map(|b| b.tpot_floor_ms),
         effective_prompt_decode_ratio: eval.mean_effective_ratio(),
         chunked_prefill_enabled: summary.ctx.config.enable_chunked_prefill,
+        n_eval: eval.n_eval,
     });
 
     let mut recs: Vec<Recommendation> = Vec::new();
@@ -603,27 +604,31 @@ fn build_report_from_eval(
 
     if eval.r7_significant() {
         let d = aggregate_r7_detail(&eval.r7_details);
-        // Override the displayed recommendation with the run-level resolution so R5
-        // and R7 print one number; confidence keyed to the binding wall's source.
-        let display = ConfigHeadroomDetail {
-            recommended_seqs: run_rec.map_or(d.recommended_seqs, |r| r.target),
-            ridge_batch_size: ridge_run.filter(|r| r.is_finite() && *r > 0.0),
-            ..d
-        };
-        let conf = r7_confidence(run_rec.as_ref());
-        let display_lines = format_config_headroom_window_issue(
-            &display,
-            pct(eval.r7_fired, eval.n_eval),
-            conf,
-            run_rec.as_ref(),
-        );
-        recs.push(Recommendation {
-            rule_name: rule_names::CONFIG_HEADROOM,
-            layer: 6,
-            impact: 3,
-            confidence: conf,
-            display_lines,
-        });
+        // Run-level target can tighten below the per-window median that fired R7.
+        // No headroom left → premise failed; drop the recommendation.
+        let target = run_rec.map_or(d.recommended_seqs, |r| r.target);
+        let still_headroom = target > d.max_num_seqs;
+        if still_headroom {
+            let display = ConfigHeadroomDetail {
+                recommended_seqs: target,
+                ridge_batch_size: ridge_run.filter(|r| r.is_finite() && *r > 0.0),
+                ..d
+            };
+            let conf = r7_confidence(run_rec.as_ref());
+            let display_lines = format_config_headroom_window_issue(
+                &display,
+                pct(eval.r7_fired, eval.n_eval),
+                conf,
+                run_rec.as_ref(),
+            );
+            recs.push(Recommendation {
+                rule_name: rule_names::CONFIG_HEADROOM,
+                layer: 6,
+                impact: 3,
+                confidence: conf,
+                display_lines,
+            });
+        }
     }
 
     if eval.r3_significant() {

@@ -98,34 +98,40 @@ pub(super) fn aggregate_windows(
             .map(|(w, _)| w.vllm.ttft_p99_buckets.as_slice())
             .collect();
         let merged_ttft = collectors::merge_p99_bucket_vecs(&ttft_vecs);
-        agg_v.ttft_p99_ms =
-            collectors::vllm::histogram_quantile(0.99, &merged_ttft).map(|s| s * 1000.0);
-        agg_v.ttft_p95_ms =
-            collectors::vllm::histogram_quantile(0.95, &merged_ttft).map(|s| s * 1000.0);
+        let ttft_p99 = collectors::vllm::histogram_quantile(0.99, &merged_ttft);
+        agg_v.ttft_p99_ms = ttft_p99.map(|q| q.value * 1000.0);
+        agg_v.ttft_p99_clamped = ttft_p99.map(|q| q.clamped).unwrap_or(false);
+        let ttft_p95 = collectors::vllm::histogram_quantile(0.95, &merged_ttft);
+        agg_v.ttft_p95_ms = ttft_p95.map(|q| q.value * 1000.0);
+        agg_v.ttft_p95_clamped = ttft_p95.map(|q| q.clamped).unwrap_or(false);
 
         let tpot_vecs: Vec<&[collectors::HistogramCount]> = active_pairs
             .iter()
             .map(|(w, _)| w.vllm.tpot_p99_buckets.as_slice())
             .collect();
         let merged_tpot = collectors::merge_p99_bucket_vecs(&tpot_vecs);
-        agg_v.tpot_p99_ms =
-            collectors::vllm::histogram_quantile(0.99, &merged_tpot).map(|s| s * 1000.0);
-        agg_v.tpot_p95_ms =
-            collectors::vllm::histogram_quantile(0.95, &merged_tpot).map(|s| s * 1000.0);
+        let tpot_p99 = collectors::vllm::histogram_quantile(0.99, &merged_tpot);
+        agg_v.tpot_p99_ms = tpot_p99.map(|q| q.value * 1000.0);
+        agg_v.tpot_p99_clamped = tpot_p99.map(|q| q.clamped).unwrap_or(false);
+        let tpot_p95 = collectors::vllm::histogram_quantile(0.95, &merged_tpot);
+        agg_v.tpot_p95_ms = tpot_p95.map(|q| q.value * 1000.0);
+        agg_v.tpot_p95_clamped = tpot_p95.map(|q| q.clamped).unwrap_or(false);
 
         let prompt_tok_vecs: Vec<&[collectors::HistogramCount]> = evaluable_pairs
             .iter()
             .map(|(w, _)| w.vllm.prompt_tokens_p99_buckets.as_slice())
             .collect();
         let merged_prompt_tok = collectors::merge_p99_bucket_vecs(&prompt_tok_vecs);
-        agg_v.prompt_tokens_p99 = collectors::vllm::histogram_quantile(0.99, &merged_prompt_tok);
+        agg_v.prompt_tokens_p99 =
+            collectors::vllm::histogram_quantile(0.99, &merged_prompt_tok).map(|q| q.value);
 
         let gen_tok_vecs: Vec<&[collectors::HistogramCount]> = evaluable_pairs
             .iter()
             .map(|(w, _)| w.vllm.generation_tokens_p99_buckets.as_slice())
             .collect();
         let merged_gen_tok = collectors::merge_p99_bucket_vecs(&gen_tok_vecs);
-        agg_v.generation_tokens_p99 = collectors::vllm::histogram_quantile(0.99, &merged_gen_tok);
+        agg_v.generation_tokens_p99 =
+            collectors::vllm::histogram_quantile(0.99, &merged_gen_tok).map(|q| q.value);
         agg_v.generation_tokens_completed =
             merged_gen_tok.last().map(|b| b.count).filter(|c| *c > 0.0);
     }
@@ -462,6 +468,48 @@ mod tests {
         let tpot_p99 = agg.vllm.tpot_p99_ms.expect("tpot p99");
         assert!(ttft_p95 <= ttft_p99);
         assert!(tpot_p95 <= tpot_p99);
+        assert!(!agg.vllm.ttft_p95_clamped);
+        assert!(!agg.vllm.ttft_p99_clamped);
+        assert!(!agg.vllm.tpot_p95_clamped);
+        assert!(!agg.vllm.tpot_p99_clamped);
+    }
+
+    #[test]
+    fn aggregate_windows_overflow_sets_clamped_floor() {
+        fn overflow_buckets() -> Vec<HistogramCount> {
+            vec![
+                HistogramCount {
+                    less_than: 1.0,
+                    count: 0.0,
+                },
+                HistogramCount {
+                    less_than: 40.0,
+                    count: 0.0,
+                },
+                HistogramCount {
+                    less_than: f64::INFINITY,
+                    count: 100.0,
+                },
+            ]
+        }
+        let g = GpuRawMetrics::default();
+        let mut w1 = mk_snap(Some(5.0), Some(100.0), None, None, None, g.clone(), None);
+        w1.vllm.ttft_p99_buckets = overflow_buckets();
+        w1.vllm.tpot_p99_buckets = overflow_buckets();
+        let mut w2 = mk_snap(Some(5.0), Some(200.0), None, None, None, g, None);
+        w2.vllm.ttft_p99_buckets = overflow_buckets();
+        w2.vllm.tpot_p99_buckets = overflow_buckets();
+        let agg = aggregate_windows(
+            &[w1, w2],
+            &[Duration::from_secs(2), Duration::from_secs(2)],
+            SystemTime::UNIX_EPOCH,
+        );
+        assert_eq!(agg.vllm.ttft_p99_ms, Some(40_000.0));
+        assert_eq!(agg.vllm.ttft_p95_ms, Some(40_000.0));
+        assert!(agg.vllm.ttft_p99_clamped);
+        assert!(agg.vllm.ttft_p95_clamped);
+        assert!(agg.vllm.tpot_p99_clamped);
+        assert!(agg.vllm.tpot_p95_clamped);
     }
 
     #[test]

@@ -3018,6 +3018,37 @@ fn r7_fires_as_primary_when_alone() {
 }
 
 #[test]
+fn r7_dropped_when_run_level_target_at_or_below_current() {
+    // Per-window R7 fires on ridge (no Observed). Landing snapshot reports a tight
+    // Observed concurrency so run-level target is 18 while current max is 20.
+    let mut windows: Vec<_> = (0..10)
+        .map(|_| mk_r7_headroom_window(15.0, 20, 0.0, 50.0))
+        .collect();
+    windows
+        .last_mut()
+        .expect("windows")
+        .snapshot
+        .vllm
+        .cache_config
+        .kv_cache_max_concurrency = Some(22.5);
+    let ctx = mk_r7_ctx(20);
+    let summary = ai(&ctx, windows.last().expect("windows"));
+    let report = build_report_for_windows(&windows, summary);
+    assert!(
+        !report
+            .recommendations
+            .iter()
+            .any(|g| g.rule_name == rule_names::CONFIG_HEADROOM),
+        "run-level target <= current must drop R7; got {:?}",
+        report
+            .recommendations
+            .iter()
+            .map(|g| g.rule_name)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn dag_layer2_suppresses_layer3_when_r2_fires() {
     let mut windows: Vec<_> = (0..15)
         .map(|_| mk_evaluable_concurrency_saturation_window(32.0, 15.0, 32))

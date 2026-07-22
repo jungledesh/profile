@@ -109,14 +109,14 @@ static CATALOG: &[GpuEntry] = &[
     },
     // ── B300 SXM (Blackwell Ultra) ───────────────────────────────────────────
     // Source: https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/blackwell-ultra/blackwell-datasheet-ultra-blackwell-4169750.pdf (accessed 2026-07-16)
-    // peak_flops_tc 4500: datasheet p.5 per-GPU "FP16/BF16 Tensor Core" dense column 4.5 PFLOPS;
-    //   footnote 2: "Dense is ½ sparse spec shown" (sparse headline 5 PFLOPS on same row).
+    // Dense BF16 per datasheet footnote (half of 5 PF sparse); secondary sources conflict
+    // (3500 seen); revisit against official datasheet.
     // peak_bw 8000: datasheet p.5 per-GPU GPU Memory row "288 GB HBM3E | 8 TB/s".
     GpuEntry {
         tokens: &["b300"],
         entry: GpuCatalogEntry {
             arch: "blackwell",
-            peak_flops_tc_tflops: 4500.0,
+            peak_flops_tc_tflops: 2500.0,
             peak_bw_gbps: 8000.0,
         },
     },
@@ -134,11 +134,13 @@ static CATALOG: &[GpuEntry] = &[
     },
     // ── L40S ─────────────────────────────────────────────────────────────────
     // Source: https://www.nvidia.com/en-us/data-center/l40s/ (accessed 2026-07-16)
+    // Dense, FP32 accumulate (matches RTX 4090 entry convention; inference uses FP32 acc).
+    // Datasheet's 362.05 is FP16-accumulate dense, 733 sparse.
     GpuEntry {
         tokens: &["l40s"],
         entry: GpuCatalogEntry {
             arch: "ada",
-            peak_flops_tc_tflops: 362.05,
+            peak_flops_tc_tflops: 181.03,
             peak_bw_gbps: 864.0,
         },
     },
@@ -284,7 +286,8 @@ static CATALOG: &[GpuEntry] = &[
     },
     // ── AMD Instinct MI250 (CDNA2) ──────────────────────────────────────────
     // Dual-GCD OAM like MI250X but 208 CUs (104 per GCD) vs 220.
-    // Values are per-GCD (half of full-OAM: 362.1 / 2 = 181.0, 3200 / 2 = 1600).
+    // Values are per-GCD (half of full-OAM: 362.1 / 2 = 181.0 FLOPS).
+    // peak_bw: 3276.8 GB/s aggregate / 2 per GCD (AMD spec 3.2 TB/s).
     // Must be after MI250X: "mi250" is a substring of "mi250x".
     // Source: https://www.amd.com/en/products/accelerators/instinct/mi200/mi250.html (accessed 2026-07-16)
     GpuEntry {
@@ -292,7 +295,7 @@ static CATALOG: &[GpuEntry] = &[
         entry: GpuCatalogEntry {
             arch: "cdna2",
             peak_flops_tc_tflops: 181.0,
-            peak_bw_gbps: 1600.0,
+            peak_bw_gbps: 1638.4,
         },
     },
     // ── AMD Instinct MI210 (CDNA2, PCIe) ────────────────────────────────────
@@ -541,7 +544,7 @@ mod tests {
     fn b300() {
         let e = lookup_gpu("NVIDIA B300 SXM").expect("no match");
         assert_eq!(e.arch, "blackwell");
-        assert_eq!(e.peak_flops_tc_tflops, 4500.0);
+        assert_eq!(e.peak_flops_tc_tflops, 2500.0);
         assert_eq!(e.peak_bw_gbps, 8000.0);
     }
 
@@ -557,7 +560,7 @@ mod tests {
     fn l40s() {
         let e = lookup_gpu("NVIDIA L40S").expect("no match");
         assert_eq!(e.arch, "ada");
-        assert_eq!(e.peak_flops_tc_tflops, 362.05);
+        assert_eq!(e.peak_flops_tc_tflops, 181.03);
     }
 
     #[test]
@@ -721,7 +724,7 @@ mod tests {
         let e = lookup_gpu("AMD Instinct MI250").expect("no match");
         assert_eq!(e.arch, "cdna2");
         assert_eq!(e.peak_flops_tc_tflops, 181.0);
-        assert_eq!(e.peak_bw_gbps, 1600.0);
+        assert_eq!(e.peak_bw_gbps, 1638.4);
     }
 
     #[test]

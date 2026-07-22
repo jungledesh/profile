@@ -145,10 +145,7 @@ pub fn run(input: LoopRunnerInput<'_>) -> anyhow::Result<()> {
         }
 
         if state.iteration_count() >= super::state::MAX_LOOP_ITERATIONS {
-            println!(
-                "\nNo further improvement found after {} iterations. Stopping.",
-                super::state::MAX_LOOP_ITERATIONS
-            );
+            println!("{}", iteration_limit_message());
             break;
         }
 
@@ -261,6 +258,13 @@ pub(crate) fn mid_loop_abort_message(
     None
 }
 
+fn iteration_limit_message() -> String {
+    format!(
+        "\nIteration limit ({}) reached.",
+        super::state::MAX_LOOP_ITERATIONS
+    )
+}
+
 fn at_hardware_ceiling(headroom_pct: Option<f64>) -> bool {
     headroom_pct.is_some_and(|h| h < CEILING_HEADROOM_THRESHOLD_PCT)
 }
@@ -307,17 +311,15 @@ struct HealthyExitInput {
 fn healthy_exit_message(input: HealthyExitInput) -> String {
     let HealthyExitInput {
         efficiency,
-        limiter_evidence,
+        mut limiter_evidence,
         n_eval,
         enforce_eager,
         enable_prefix_caching,
         quantization,
     } = input;
-    let limiter_line = if n_eval > 0 {
-        engine::limiter::limiter_line(&limiter_evidence)
-    } else {
-        None
-    };
+    // Single source of truth for the window trust bar (identify reads evidence.n_eval).
+    limiter_evidence.n_eval = n_eval;
+    let limiter_line = engine::limiter::limiter_line(&limiter_evidence);
     let limiter = engine::limiter::identify(&limiter_evidence).verdict;
 
     let eff_str = efficiency
@@ -388,6 +390,12 @@ fn healthy_exit_message(input: HealthyExitInput) -> String {
         None => "Rules clear.",
     };
     format!("{prefix}\n\n{limiter_block}")
+}
+
+/// Efficiency is throughput/ceiling. After baseline reset the ceiling may have
+/// moved; the pp delta would compare two rulers. Skip it when config drifted.
+fn include_efficiency_delta(config_drifted: bool) -> bool {
+    !config_drifted
 }
 
 fn format_efficiency_delta_line(delta_pp: Option<f64>) -> Option<String> {
@@ -542,7 +550,11 @@ fn print_delta(d: &delta::Delta) {
     {
         println!("{line}");
     }
-    if let Some(line) = format_efficiency_delta_line(d.efficiency_delta_pp) {
+    // Efficiency is throughput/ceiling. Baseline reset means the ceiling may have
+    // moved (e.g. quantize); the pp delta would compare two rulers. Skip it.
+    if include_efficiency_delta(d.config_drifted)
+        && let Some(line) = format_efficiency_delta_line(d.efficiency_delta_pp)
+    {
         println!("{line}");
     }
     if let Some((x, y)) = d.capacity_self_grade {
@@ -602,6 +614,13 @@ mod tests {
     }
 
     #[test]
+    fn iteration_limit_message_states_cap_not_outcome() {
+        let msg = iteration_limit_message();
+        assert!(msg.contains("Iteration limit (20) reached."));
+        assert!(!msg.contains("No further improvement"));
+    }
+
+    #[test]
     fn at_hardware_ceiling_at_threshold_not_reached() {
         assert!(!at_hardware_ceiling(Some(10.0)));
     }
@@ -622,8 +641,9 @@ mod tests {
                 tpot_floor_ms: Some(10.0),
                 effective_prompt_decode_ratio: None,
                 chunked_prefill_enabled: Some(false),
+                n_eval: 0,
             },
-            n_eval: 1,
+            n_eval: 3,
             enforce_eager,
             enable_prefix_caching: None,
             quantization: None,
@@ -641,8 +661,9 @@ mod tests {
                 tpot_floor_ms: Some(5.0),
                 effective_prompt_decode_ratio: None,
                 chunked_prefill_enabled: Some(false),
+                n_eval: 0,
             },
-            n_eval: 1,
+            n_eval: 3,
             enforce_eager: None,
             enable_prefix_caching,
             quantization: None,
@@ -660,8 +681,9 @@ mod tests {
                 tpot_floor_ms: Some(10.0),
                 effective_prompt_decode_ratio: None,
                 chunked_prefill_enabled: Some(false),
+                n_eval: 0,
             },
-            n_eval: 1,
+            n_eval: 3,
             enforce_eager: None,
             enable_prefix_caching: None,
             quantization,
@@ -689,8 +711,9 @@ mod tests {
                 tpot_floor_ms: Some(5.0),
                 effective_prompt_decode_ratio: None,
                 chunked_prefill_enabled: Some(false),
+                n_eval: 0,
             },
-            n_eval: 1,
+            n_eval: 3,
             enforce_eager: None,
             enable_prefix_caching: None,
             quantization: None,
@@ -714,8 +737,9 @@ mod tests {
                 tpot_floor_ms: Some(5.0),
                 effective_prompt_decode_ratio: None,
                 chunked_prefill_enabled: Some(false),
+                n_eval: 0,
             },
-            n_eval: 1,
+            n_eval: 3,
             enforce_eager: None,
             enable_prefix_caching: None,
             quantization: None,
@@ -737,8 +761,9 @@ mod tests {
                 tpot_floor_ms: Some(5.0),
                 effective_prompt_decode_ratio: None,
                 chunked_prefill_enabled: Some(false),
+                n_eval: 0,
             },
-            n_eval: 1,
+            n_eval: 3,
             enforce_eager: None,
             enable_prefix_caching: None,
             quantization: None,
@@ -767,8 +792,9 @@ mod tests {
                 tpot_floor_ms: Some(10.0),
                 effective_prompt_decode_ratio: Some(0.6),
                 chunked_prefill_enabled: Some(true),
+                n_eval: 0,
             },
-            n_eval: 1,
+            n_eval: 3,
             enforce_eager: None,
             enable_prefix_caching: None,
             quantization: None,
@@ -795,6 +821,7 @@ mod tests {
             tpot_floor_ms: Some(10.0),
             effective_prompt_decode_ratio: Some(0.2),
             chunked_prefill_enabled: Some(false),
+            n_eval: 3,
         };
         let line = engine::limiter::limiter_line(&ev).expect("limiter line");
         let msg = healthy_exit_message(HealthyExitInput {
@@ -842,6 +869,22 @@ mod tests {
         assert!(msg.contains("Efficiency: unavailable"));
         assert!(!msg.contains("No actionable config fix identified."));
         assert_eq!(msg.matches("Rules clear.").count(), 1);
+    }
+
+    #[test]
+    fn healthy_exit_sparse_n_eval_prints_no_limiter_verdict() {
+        // Same evidence that would name Capacity at n_eval>=3; one window must decline.
+        let msg = healthy_exit_message(HealthyExitInput {
+            efficiency: Some(42.5),
+            limiter_evidence: capacity_input(None).limiter_evidence,
+            n_eval: 1,
+            enforce_eager: None,
+            enable_prefix_caching: None,
+            quantization: None,
+        });
+        assert!(!msg.contains("Primary Limiter:"));
+        assert!(!msg.contains("Capped by"));
+        assert!(msg.contains("insufficient data to identify primary limiter"));
     }
 
     #[test]
@@ -964,6 +1007,12 @@ mod tests {
     fn efficiency_delta_near_zero_suppressed() {
         assert!(format_efficiency_delta_line(Some(-0.04)).is_none());
         assert!(format_efficiency_delta_line(Some(0.03)).is_none());
+    }
+
+    #[test]
+    fn efficiency_delta_skipped_when_baseline_reset() {
+        assert!(!include_efficiency_delta(true));
+        assert!(include_efficiency_delta(false));
     }
 
     #[test]

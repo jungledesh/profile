@@ -332,11 +332,25 @@ pub fn format_captured_windows(
 }
 
 /// Evidence state for the post-DAG MU safety net. Engine selects; this module renders.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum MuVariant {
     Starved,
-    BlockedAdmission { kv_measured: bool },
+    /// `kv_pct` is Some when the usage gauge was present (and below R2's 88% gate).
+    BlockedAdmission {
+        kv_pct: Option<f64>,
+    },
     GaugeMissing,
+}
+
+/// KV below this: the cause line may say "low". At or above: state the number only.
+const MU_KV_LOW_PCT: f64 = 50.0;
+
+fn blocked_admission_kv_clause(kv_pct: f64) -> String {
+    if kv_pct < MU_KV_LOW_PCT {
+        format!("KV cache at {kv_pct:.0}% (low)")
+    } else {
+        format!("KV cache at {kv_pct:.0}%")
+    }
 }
 
 /// Post-DAG traffic/admission safety net (massive under-utilization).
@@ -377,28 +391,38 @@ pub(crate) fn mu_diagnose_lines(
     };
     let (cause, fix, expected, confidence) = match variant {
         MuVariant::Starved => (
-            "      Server is under-fed. No config bottleneck detected - client traffic is too low to utilize the hardware.",
-            "      • Batch more requests or increase client concurrency until a wait queue forms.",
-            "    Expected: Efficiency climbs as the GPU is fed more work.",
-            "    Confidence: Medium",
+            "      Server is under-fed. No config bottleneck detected - client traffic is too low to utilize the hardware."
+                .to_string(),
+            "      • Batch more requests or increase client concurrency until a wait queue forms."
+                .to_string(),
+            "    Expected: Efficiency climbs as the GPU is fed more work.".to_string(),
+            "    Confidence: Medium".to_string(),
         ),
-        MuVariant::BlockedAdmission { kv_measured: true } => (
-            "      Requests queue while seats are free and KV cache is low. Scheduler admission is blocked - likely the prefill token budget.",
-            "      • Raise --max-num-batched-tokens or enable chunked prefill.",
-            "    Expected: Queue drains as admission unblocks.",
-            "    Confidence: Low (cause inferred, token budget not observed)",
+        MuVariant::BlockedAdmission {
+            kv_pct: Some(pct),
+        } => (
+            format!(
+                "      Requests queue while seats are free and {}. Scheduler admission is blocked - likely the prefill token budget.",
+                blocked_admission_kv_clause(pct)
+            ),
+            "      • Raise --max-num-batched-tokens or enable chunked prefill.".to_string(),
+            "    Expected: Queue drains as admission unblocks.".to_string(),
+            "    Confidence: Low (cause inferred, token budget not observed)".to_string(),
         ),
-        MuVariant::BlockedAdmission { kv_measured: false } => (
-            "      Requests queue while seats are free. Scheduler admission is blocked - likely the prefill token budget.",
-            "      • Raise --max-num-batched-tokens or enable chunked prefill.",
-            "    Expected: Queue drains as admission unblocks.",
-            "    Confidence: Low (cause inferred; KV gauge unavailable)",
+        MuVariant::BlockedAdmission { kv_pct: None } => (
+            "      Requests queue while seats are free. Scheduler admission is blocked - likely the prefill token budget."
+                .to_string(),
+            "      • Raise --max-num-batched-tokens or enable chunked prefill.".to_string(),
+            "    Expected: Queue drains as admission unblocks.".to_string(),
+            "    Confidence: Low (cause inferred; KV gauge unavailable)".to_string(),
         ),
         MuVariant::GaugeMissing => (
-            "      Server is under-fed. No config bottleneck detected - client traffic is too low to utilize the hardware.",
-            "      • Batch more requests or increase client concurrency until a wait queue forms.",
-            "    Expected: Efficiency climbs as the GPU is fed more work.",
-            "    Confidence: Low (waiting gauge unavailable)",
+            "      Server is under-fed. No config bottleneck detected - client traffic is too low to utilize the hardware."
+                .to_string(),
+            "      • Batch more requests or increase client concurrency until a wait queue forms."
+                .to_string(),
+            "    Expected: Efficiency climbs as the GPU is fed more work.".to_string(),
+            "    Confidence: Low (waiting gauge unavailable)".to_string(),
         ),
     };
     vec![
@@ -411,13 +435,13 @@ pub(crate) fn mu_diagnose_lines(
         requests_line,
         String::new(),
         "    Cause:".to_string(),
-        cause.to_string(),
+        cause,
         String::new(),
         "    Fix:".to_string(),
-        fix.to_string(),
+        fix,
         String::new(),
-        expected.to_string(),
-        confidence.to_string(),
+        expected,
+        confidence,
     ]
 }
 
@@ -592,8 +616,7 @@ pub fn format_diagnose_rules_for_windows(
         }
         if !any_advisory && !verbose_rules {
             out.push(NO_ISSUES_LINE.to_string());
-            if report.n_eval > 0
-                && let Some(ev) = report.limiter_evidence.as_ref()
+            if let Some(ev) = report.limiter_evidence.as_ref()
                 && let Some(line) = crate::engine::limiter::limiter_line(ev)
             {
                 out.push(line);
@@ -938,33 +961,57 @@ mod load_hint_tests {
 
     #[test]
     fn mu_diagnose_lines_blocked_admission_variant() {
-        let measured = mu_diagnose_lines(
+        let measured_low = mu_diagnose_lines(
             12.0,
             Some(10.0),
             Some(5.0),
             Some(256),
-            MuVariant::BlockedAdmission { kv_measured: true },
+            MuVariant::BlockedAdmission { kv_pct: Some(10.0) },
         )
         .join("\n");
-        assert!(measured.contains("Requests  10 running, 5 waiting  (246 of 256 seats free)"));
-        assert!(measured.contains("seats are free and KV cache is low"));
-        assert!(measured.contains("Scheduler admission is blocked"));
-        assert!(measured.contains("Raise --max-num-batched-tokens"));
-        assert!(measured.contains("Confidence: Low (cause inferred, token budget not observed)"));
-        assert!(!measured.contains("server not saturated"));
-        assert!(!measured.contains("KV gauge unavailable"));
+        assert!(measured_low.contains("Requests  10 running, 5 waiting  (246 of 256 seats free)"));
+        assert!(measured_low.contains("seats are free and KV cache at 10% (low)"));
+        assert!(measured_low.contains("Scheduler admission is blocked"));
+        assert!(measured_low.contains("Raise --max-num-batched-tokens"));
+        assert!(
+            measured_low.contains("Confidence: Low (cause inferred, token budget not observed)")
+        );
+        assert!(!measured_low.contains("server not saturated"));
+        assert!(!measured_low.contains("KV gauge unavailable"));
+
+        let measured_mid_low = mu_diagnose_lines(
+            12.0,
+            Some(10.0),
+            Some(5.0),
+            Some(256),
+            MuVariant::BlockedAdmission { kv_pct: Some(30.0) },
+        )
+        .join("\n");
+        assert!(measured_mid_low.contains("KV cache at 30% (low)"));
+
+        let measured_near_full = mu_diagnose_lines(
+            12.0,
+            Some(10.0),
+            Some(5.0),
+            Some(256),
+            MuVariant::BlockedAdmission { kv_pct: Some(85.0) },
+        )
+        .join("\n");
+        assert!(measured_near_full.contains("KV cache at 85%"));
+        assert!(!measured_near_full.contains("(low)"));
+        assert!(!measured_near_full.contains("KV cache is low"));
 
         let unmeasured = mu_diagnose_lines(
             12.0,
             Some(10.0),
             Some(5.0),
             Some(256),
-            MuVariant::BlockedAdmission { kv_measured: false },
+            MuVariant::BlockedAdmission { kv_pct: None },
         )
         .join("\n");
         assert!(unmeasured.contains("Requests  10 running, 5 waiting  (246 of 256 seats free)"));
         assert!(unmeasured.contains("Requests queue while seats are free."));
-        assert!(!unmeasured.contains("KV cache is low"));
+        assert!(!unmeasured.contains("KV cache"));
         assert!(unmeasured.contains("Scheduler admission is blocked"));
         assert!(unmeasured.contains("Raise --max-num-batched-tokens"));
         assert!(unmeasured.contains("Confidence: Low (cause inferred; KV gauge unavailable)"));
@@ -974,7 +1021,7 @@ mod load_hint_tests {
             Some(10.0),
             Some(5.0),
             None,
-            MuVariant::BlockedAdmission { kv_measured: true },
+            MuVariant::BlockedAdmission { kv_pct: Some(10.0) },
         )
         .join("\n");
         assert!(no_max.contains("(seats free unknown)"));

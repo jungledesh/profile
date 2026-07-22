@@ -302,11 +302,20 @@ fn merge_histogram_buckets(scrape: &Scrape, base: &str) -> Vec<HistogramCount> {
         .collect()
 }
 
+/// Quantile from a Prometheus histogram; `clamped` when the mass landed in +Inf.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct QuantileEstimate {
+    pub value: f64,
+    /// True when the quantile fell in the +Inf bucket; `value` is the last finite bound (a floor).
+    pub clamped: bool,
+}
+
 /// Standard linear interpolation quantile from cumulative histogram buckets.
 /// Buckets must be sorted by less_than ascending (prometheus_parse guarantees this).
-/// If the target quantile falls in the +Inf bucket, returns the last finite bucket's upper bound.
+/// If the target quantile falls in the +Inf bucket, returns the last finite bucket's upper bound
+/// with `clamped: true`.
 /// Returns None if total == 0 or buckets empty.
-pub(crate) fn histogram_quantile(q: f64, buckets: &[HistogramCount]) -> Option<f64> {
+pub(crate) fn histogram_quantile(q: f64, buckets: &[HistogramCount]) -> Option<QuantileEstimate> {
     let total = buckets
         .iter()
         .find(|b| b.less_than.is_infinite() && b.less_than > 0.0)
@@ -324,33 +333,47 @@ pub(crate) fn histogram_quantile(q: f64, buckets: &[HistogramCount]) -> Option<f
         if b.count >= target {
             let width = b.less_than - prev_upper;
             let span = b.count - prev_count;
-            return Some(if span <= 0.0 {
+            let value = if span <= 0.0 {
                 b.less_than
             } else {
                 prev_upper + (target - prev_count) / span * width
+            };
+            return Some(QuantileEstimate {
+                value,
+                clamped: false,
             });
         }
         prev_upper = b.less_than;
         prev_count = b.count;
     }
-    // All observations in +Inf bucket - return last finite bound
+    // All observations in +Inf bucket - return last finite bound as a floor.
     buckets
         .iter()
         .rfind(|b| b.less_than.is_finite())
-        .map(|b| b.less_than)
+        .map(|b| QuantileEstimate {
+            value: b.less_than,
+            clamped: true,
+        })
 }
 
 /// p99 of requests completed in this window (delta buckets between first and last scrape).
 /// Returns None on counter reset (any bucket delta < 0), bucket count mismatch, or zero traffic.
 /// No fallback to cumulative - stale historical p99 is worse than no value.
-fn histogram_window_p99_ms(first: &Scrape, last: &Scrape, base: &str) -> Option<f64> {
+/// `value` is in milliseconds; `clamped` preserved from the quantile.
+fn histogram_window_p99_ms(first: &Scrape, last: &Scrape, base: &str) -> Option<QuantileEstimate> {
     let delta = histogram_window_delta_buckets(first, last, base);
-    histogram_quantile(0.99, &delta).map(|s| s * 1000.0)
+    histogram_quantile(0.99, &delta).map(|q| QuantileEstimate {
+        value: q.value * 1000.0,
+        clamped: q.clamped,
+    })
 }
 
-fn histogram_window_p95_ms(first: &Scrape, last: &Scrape, base: &str) -> Option<f64> {
+fn histogram_window_p95_ms(first: &Scrape, last: &Scrape, base: &str) -> Option<QuantileEstimate> {
     let delta = histogram_window_delta_buckets(first, last, base);
-    histogram_quantile(0.95, &delta).map(|s| s * 1000.0)
+    histogram_quantile(0.95, &delta).map(|q| QuantileEstimate {
+        value: q.value * 1000.0,
+        clamped: q.clamped,
+    })
 }
 
 /// Returns the per-window delta bucket vector (last − first) for `base` metric.
@@ -444,21 +467,29 @@ fn apply_histogram_window(first: &Scrape, last: &Scrape, m: &mut VllmRawMetrics)
     m.prompt_tokens_mean = histogram_window_mean(first, last, "vllm_request_prompt_tokens")
         .or_else(|| histogram_mean_from_scrape(last, "vllm_request_prompt_tokens"));
     let prompt_delta = histogram_window_delta_buckets(first, last, "vllm_request_prompt_tokens");
-    m.prompt_tokens_p99 = histogram_quantile(0.99, &prompt_delta);
+    m.prompt_tokens_p99 = histogram_quantile(0.99, &prompt_delta).map(|q| q.value);
     m.prompt_tokens_p99_buckets = prompt_delta;
 
     let gen_delta = histogram_window_delta_buckets(first, last, "vllm_request_generation_tokens");
-    m.generation_tokens_p99 = histogram_quantile(0.99, &gen_delta);
+    m.generation_tokens_p99 = histogram_quantile(0.99, &gen_delta).map(|q| q.value);
     m.generation_tokens_completed = gen_delta.last().map(|b| b.count).filter(|c| *c > 0.0);
     m.generation_tokens_p99_buckets = gen_delta;
-    m.ttft_p99_ms = histogram_window_p99_ms(first, last, "vllm_time_to_first_token_seconds");
-    m.tpot_p99_ms =
+    let ttft_p99 = histogram_window_p99_ms(first, last, "vllm_time_to_first_token_seconds");
+    m.ttft_p99_ms = ttft_p99.map(|q| q.value);
+    m.ttft_p99_clamped = ttft_p99.map(|q| q.clamped).unwrap_or(false);
+    let tpot_p99 =
         histogram_window_p99_ms(first, last, "vllm_request_time_per_output_token_seconds")
             .or_else(|| histogram_window_p99_ms(first, last, "vllm_time_per_output_token_seconds"));
-    m.ttft_p95_ms = histogram_window_p95_ms(first, last, "vllm_time_to_first_token_seconds");
-    m.tpot_p95_ms =
+    m.tpot_p99_ms = tpot_p99.map(|q| q.value);
+    m.tpot_p99_clamped = tpot_p99.map(|q| q.clamped).unwrap_or(false);
+    let ttft_p95 = histogram_window_p95_ms(first, last, "vllm_time_to_first_token_seconds");
+    m.ttft_p95_ms = ttft_p95.map(|q| q.value);
+    m.ttft_p95_clamped = ttft_p95.map(|q| q.clamped).unwrap_or(false);
+    let tpot_p95 =
         histogram_window_p95_ms(first, last, "vllm_request_time_per_output_token_seconds")
             .or_else(|| histogram_window_p95_ms(first, last, "vllm_time_per_output_token_seconds"));
+    m.tpot_p95_ms = tpot_p95.map(|q| q.value);
+    m.tpot_p95_clamped = tpot_p95.map(|q| q.clamped).unwrap_or(false);
     m.ttft_p99_buckets =
         histogram_window_delta_buckets(first, last, "vllm_time_to_first_token_seconds");
     m.tpot_p99_buckets =
@@ -683,6 +714,10 @@ fn parse_vllm_metrics(scrape: &Scrape) -> Result<VllmRawMetrics> {
         tpot_p99_ms: None,
         ttft_p95_ms: None,
         tpot_p95_ms: None,
+        ttft_p99_clamped: false,
+        tpot_p99_clamped: false,
+        ttft_p95_clamped: false,
+        tpot_p95_clamped: false,
         ttft_p99_buckets: vec![],
         tpot_p99_buckets: vec![],
         prefill_latency_ms,
@@ -1097,12 +1132,15 @@ vllm_prefix_cache_queries 20
 
         assert!(p95.is_some(), "p95 must be Some when traffic exists");
         assert!(p99.is_some(), "p99 must be Some when traffic exists");
+        let p95 = p95.unwrap();
+        let p99 = p99.unwrap();
         assert!(
-            p95.unwrap() < p99.unwrap(),
+            p95.value < p99.value,
             "p95 ({:.1}ms) must be strictly less than p99 ({:.1}ms)",
-            p95.unwrap(),
-            p99.unwrap()
+            p95.value,
+            p99.value
         );
+        assert!(!p95.clamped);
     }
 
     #[test]
@@ -1348,7 +1386,8 @@ vllm:info{dtype="half",model_name="mistral"} 1.0
             ];
             let p99 = histogram_quantile(0.99, &buckets).unwrap();
             // target=99; in second bucket: 0.1 + (99-50)/50 * 0.1 = 0.198
-            assert!((p99 - 0.198).abs() < 1e-9);
+            assert!((p99.value - 0.198).abs() < 1e-9);
+            assert!(!p99.clamped);
         }
 
         #[test]
@@ -1383,7 +1422,8 @@ vllm:info{dtype="half",model_name="mistral"} 1.0
                 },
             ];
             let p99 = histogram_quantile(0.99, &buckets).unwrap();
-            assert!((p99 - 5.0).abs() < 1e-9);
+            assert!((p99.value - 5.0).abs() < 1e-9);
+            assert!(p99.clamped);
         }
 
         #[test]
@@ -1407,7 +1447,8 @@ vllm:info{dtype="half",model_name="mistral"} 1.0
             assert_eq!(merged[1].count, 200.0);
             assert_eq!(merged[2].count, 200.0);
             let p99 = histogram_quantile(0.99, &merged).unwrap();
-            assert!((p99 - 0.198).abs() < 1e-9);
+            assert!((p99.value - 0.198).abs() < 1e-9);
+            assert!(!p99.clamped);
         }
 
         #[test]

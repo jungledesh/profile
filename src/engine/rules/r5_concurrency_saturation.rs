@@ -1,5 +1,5 @@
 use crate::collectors::RawSnapshot;
-use crate::fmt::fmt_seconds_from_ms;
+use crate::fmt::{fmt_seconds_from_ms, fmt_seconds_from_ms_maybe_floor};
 
 #[cfg(test)]
 use super::Recommendation;
@@ -28,6 +28,8 @@ pub struct ConcurrencySaturationDetail {
     pub queue_ratio: f64,
     pub ttft_ms: Option<f64>,
     pub ttft_p99_ms: Option<f64>,
+    /// True when `ttft_p99_ms` is a +Inf-bucket floor.
+    pub ttft_p99_clamped: bool,
     pub ttft_p99_buckets: Vec<crate::collectors::HistogramCount>,
     pub kv_cache_usage_perc: Option<f64>,
 }
@@ -76,6 +78,7 @@ pub fn rule5_concurrency_saturation(
         queue_ratio: ratio,
         ttft_ms: snapshot.vllm.ttft_ms,
         ttft_p99_ms: snapshot.vllm.ttft_p99_ms,
+        ttft_p99_clamped: snapshot.vllm.ttft_p99_clamped,
         ttft_p99_buckets: snapshot.vllm.ttft_p99_buckets.clone(),
         kv_cache_usage_perc,
     })
@@ -260,8 +263,12 @@ pub(super) fn format_concurrency_saturation_issue(
         .vllm
         .ttft_p95_ms
         .filter(|t| t.is_finite())
-        .map(|v| (v, "p95"))
-        .or_else(|| d.ttft_p99_ms.filter(|t| t.is_finite()).map(|v| (v, "p99")));
+        .map(|v| (v, "p95", snapshot.vllm.ttft_p95_clamped))
+        .or_else(|| {
+            d.ttft_p99_ms
+                .filter(|t| t.is_finite())
+                .map(|v| (v, "p99", d.ttft_p99_clamped))
+        });
     let display_avg = snapshot
         .vllm
         .ttft_ms
@@ -279,17 +286,17 @@ pub(super) fn format_concurrency_saturation_issue(
         ),
     ];
     match (display_p_x, display_avg) {
-        (Some((px, label)), Some(avg)) => lines.push(format!(
+        (Some((px, label, clamped)), Some(avg)) => lines.push(format!(
             "      • TTFT ({} {}) ({} avg)",
             label,
-            fmt_seconds_from_ms(px),
+            fmt_seconds_from_ms_maybe_floor(px, clamped),
             fmt_seconds_from_ms(avg)
         )),
-        (Some((px, label)), None) => {
+        (Some((px, label, clamped)), None) => {
             lines.push(format!(
                 "      • TTFT ({} {})",
                 label,
-                fmt_seconds_from_ms(px)
+                fmt_seconds_from_ms_maybe_floor(px, clamped)
             ));
         }
         (None, Some(avg)) => lines.push(format!("      • TTFT {}", fmt_seconds_from_ms(avg))),
@@ -390,8 +397,9 @@ pub(super) fn aggregate_concurrency_saturation_detail(
         .map(|d| d.ttft_p99_buckets.as_slice())
         .collect();
     let merged_ttft = crate::collectors::merge_p99_bucket_vecs(&ttft_p99_vecs);
-    let ttft_p99_ms =
-        crate::collectors::vllm::histogram_quantile(0.99, &merged_ttft).map(|s| s * 1000.0);
+    let ttft_p99 = crate::collectors::vllm::histogram_quantile(0.99, &merged_ttft);
+    let ttft_p99_ms = ttft_p99.map(|q| q.value * 1000.0);
+    let ttft_p99_clamped = ttft_p99.map(|q| q.clamped).unwrap_or(false);
     // session_kv_peak: global peak across all evaluable windows (kv_cache_peak_perc preferred).
     // Supersedes the per-detail values which are bounded to r5-firing windows only.
     // Falls back to the r5-window peak if caller has no session data (e.g. single-window path).
@@ -408,6 +416,7 @@ pub(super) fn aggregate_concurrency_saturation_detail(
         queue_ratio: ratio,
         ttft_ms,
         ttft_p99_ms,
+        ttft_p99_clamped,
         ttft_p99_buckets: merged_ttft,
         kv_cache_usage_perc,
     })
@@ -449,6 +458,7 @@ mod tests {
             queue_ratio: 15.0 / (15.0 + cur),
             ttft_ms,
             ttft_p99_ms: None,
+            ttft_p99_clamped: false,
             ttft_p99_buckets: vec![],
             kv_cache_usage_perc,
         }
@@ -488,6 +498,7 @@ mod tests {
             queue_ratio: 15.0 / 47.0,
             ttft_ms,
             ttft_p99_ms: None,
+            ttft_p99_clamped: false,
             ttft_p99_buckets: vec![],
             kv_cache_usage_perc,
         }
@@ -939,6 +950,7 @@ mod tests {
             queue_ratio: 10.0 / 25.0,
             ttft_ms: None,
             ttft_p99_ms: None,
+            ttft_p99_clamped: false,
             ttft_p99_buckets: vec![],
             kv_cache_usage_perc: None,
         };
@@ -959,6 +971,7 @@ mod tests {
             queue_ratio: 10.0 / 25.0,
             ttft_ms: None,
             ttft_p99_ms: None,
+            ttft_p99_clamped: false,
             ttft_p99_buckets: vec![],
             kv_cache_usage_perc: Some(50.0),
         };
@@ -985,6 +998,7 @@ mod tests {
             queue_ratio: 0.5,
             ttft_ms: None,
             ttft_p99_ms: None,
+            ttft_p99_clamped: false,
             ttft_p99_buckets: vec![],
             kv_cache_usage_perc: Some(50.0),
         };

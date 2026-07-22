@@ -1,5 +1,7 @@
 # Profile [ Under Construction ]
 
+`Note: Profile's core engine is under construction since the last version launch; some parts of this file is stale`
+
 A physics-grounded, cost-aware optimization loop for vLLM inference servers.
 
 **The Problem:** Inference servers run below hardware capacity. Operators cannot see why.
@@ -10,28 +12,36 @@ A physics-grounded, cost-aware optimization loop for vLLM inference servers.
 
 ---
 
+
+
 ## How to use Profile
 
 Profile is not a passive dashboard. It is an interactive optimization loop. It analyzes your vLLM `/metrics`, pinpoints the primary bottleneck, and prescribes specific vLLM startup flags to fix it.
 
 ### Prerequisites
+
 - NVIDIA GPU with NVML (for hardware metrics).
 - vLLM running with `/metrics` reachable (default `http://localhost:8000/metrics`).
 - Active production-like load during the `--duration` window. Idle servers produce no signal.
+
+
 
 ### Launch support
 
 Profile launch supports single-GPU deployments only. Multi-GPU support is on the roadmap.
 
-| GPU memory | Supported models |
-| --- | --- |
-| 80 GB | Qwen3 32B; Qwen2.5 32B; DeepSeek-R1-Distill 32B; GLM 32B; Gemma 4 31B/27B/26B; Qwen3 30B-A3B; Qwen3.6 27B; Gemma 3 27B; Gemma 2 27B |
-| 48 GB | Qwen3 14B; Qwen2.5 14B; DeepSeek-R1-Distill 14B; Phi-4 14B; Gemma 3 12B; Gemma 2 9B |
-| 24 GB | Llama 3 8B; Qwen3 8B/4B/1.7B/0.6B; Nemotron 8B; DeepSeek-R1-Distill 8B/7B/1.5B; Qwen2.5 7B; DeepSeek 7B; Mistral 7B; Gemma 3 4B/1B |
+
+| GPU memory | Supported models                                                                                                                    |
+| ---------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| 80 GB      | Qwen3 32B; Qwen2.5 32B; DeepSeek-R1-Distill 32B; GLM 32B; Gemma 4 31B/27B/26B; Qwen3 30B-A3B; Qwen3.6 27B; Gemma 3 27B; Gemma 2 27B |
+| 48 GB      | Qwen3 14B; Qwen2.5 14B; DeepSeek-R1-Distill 14B; Phi-4 14B; Gemma 3 12B; Gemma 2 9B                                                 |
+| 24 GB      | Llama 3 8B; Qwen3 8B/4B/1.7B/0.6B; Nemotron 8B; DeepSeek-R1-Distill 8B/7B/1.5B; Qwen2.5 7B; DeepSeek 7B; Mistral 7B; Gemma 3 4B/1B  |
+
 
 Context limits depend on KV dtype and runtime configuration. With bf16 KV, the 32B dense models on 80 GB support about 18K tokens for one request, and Llama 3 8B on 24 GB supports about 19K tokens.
 
 ### Install & Run
+
 ```bash
 # Download
 curl --proto '=https' --tlsv1.2 -LsSf \
@@ -41,13 +51,15 @@ curl --proto '=https' --tlsv1.2 -LsSf \
 profile diagnose --url http://localhost:8000/metrics --duration 2m
 ```
 
-*Or build from source: `cargo install --git https://github.com/jungledesh/profile`*
+*Or build from source:* `cargo install --git https://github.com/jungledesh/profile`
 
 ### The Optimization Loop
+
 When sampling ends, Profile prints a summary block. Look at `ISSUES`. The `Fix:` tells you what to change in your vLLM startup command.
 
 *Read*
 Profile prints a performance snapshot followed by an `ISSUES` block. Here is an example issue. Do exactly what the `Fix:` section recommends.
+
 ```text
 +----------------------------------------------------------------------------------------------------+
 |PROFILE v2.1.4 [Qwen3.6-27B] [NVIDIA A100-SXM4-80GB] (1m from 2026-06-18 21:57:54 UTC)              |
@@ -81,7 +93,7 @@ Profile prints a performance snapshot followed by an `ISSUES` block. Here is an 
 +----------------------------------------------------------------------------------------------------+
 ```
 
-> *Note: `[!] KV Cache Pressure` corresponds directly to rule **R2** in the Flag Recommendations Map below.*
+> *Note:* `[!] KV Cache Pressure` *corresponds directly to rule **R2** in the Flag Recommendations Map below.*
 
 *Restart & Measure*
 Apply primary and secondary fixes together in one restart. One flag per restart wastes time. Restart vLLM. Profile resumes on vLLM re-start and measures the new baseline. Repeat this process until the bottleneck clears or you reach hardware saturation.
@@ -112,6 +124,7 @@ Notice the throughput dropped? Profile reports regressions honestly. Fixing one 
 
 *Scale Out*
 Eventually, no config change will help. You have hit hardware saturation. Time to scale out.
+
 ```text
 +----------------------------------------------------------------------------------------------------+
 |PROFILE v2.1.4 [Qwen3.6-27B] [NVIDIA A100-SXM4-80GB] (1m from 2026-06-18 22:08:40 UTC)              |
@@ -137,21 +150,30 @@ Eventually, no config change will help. You have hit hardware saturation. Time t
 +----------------------------------------------------------------------------------------------------+
 ```
 
+
+
 ### vLLM Flag Recommendations Map
+
 Profile detects these bottlenecks and recommends the following vLLM flag changes:
 
-| Diagnosis                     | When it fires                                      | vLLM flags to change                                                                                                              |
-| ----------------------------- | -------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| **R1 Under-batching**         | GPU efficiency <60%, no queue                      | Increase client concurrency (not a vLLM flag)                                                                                     |
-| **R2 KV cache pressure**      | KV ≥88%, preemptions, or admission backlog         | Lower `--max-num-seqs` or `--max-model-len`; or raise `--gpu-memory-utilization`, switch to fp8 KV cache                          |
-| **R3 Low prefix reuse**       | Prefix hit rate <35%                               | Add `--enable-prefix-caching`; restructure prompts if already enabled                                                             |
-| **R4 OOM risk**               | Weights exceed VRAM                                | Set `--tensor-parallel-size` (Profile computes the value)                                                                         |
-| **R5 Concurrency saturation** | Queueing, running at `--max-num-seqs` cap            | Raise `--max-num-seqs` if KV <80%; otherwise add a replica or lower `--max-model-len`                                             |
+
+| Diagnosis                     | When it fires                              | vLLM flags to change                                                                                     |
+| ----------------------------- | ------------------------------------------ | -------------------------------------------------------------------------------------------------------- |
+| **R1 Under-batching**         | GPU efficiency <60%, no queue              | Increase client concurrency (not a vLLM flag)                                                            |
+| **R2 KV cache pressure**      | KV ≥88%, preemptions, or admission backlog | Lower `--max-num-seqs` or `--max-model-len`; or raise `--gpu-memory-utilization`, switch to fp8 KV cache |
+| **R3 Low prefix reuse**       | Prefix hit rate <35%                       | Add `--enable-prefix-caching`; restructure prompts if already enabled                                    |
+| **R4 OOM risk**               | Weights exceed VRAM                        | Set `--tensor-parallel-size` (Profile computes the value)                                                |
+| **R5 Concurrency saturation** | Queueing, running at `--max-num-seqs` cap  | Raise `--max-num-seqs` if KV <80%; otherwise add a replica or lower `--max-model-len`                    |
+
 
 > *Note: Profile may list several fixes in one Fix: block. Apply them together when relevant. See [Rules](https://jungledesh.github.io/profile/docs.html#rules) for thresholds and edge cases.*
 
+
+
 ### Profile CLI Configuration
+
 These are flags for the `profile` CLI itself, *not* vLLM.
+
 
 | Flag                     | Default                         | Description                                                  |
 | ------------------------ | ------------------------------- | ------------------------------------------------------------ |
@@ -162,7 +184,10 @@ These are flags for the `profile` CLI itself, *not* vLLM.
 | `--cost-per-hour`        | Catalog estimate                | GPU cost in USD/hr (overrides catalog estimate)              |
 | `-v`                     | Off                             | Show non-triggered rules and physics limits                  |
 
+
 ---
+
+
 
 ## Proof: Qwen3.6-27B on A100-SXM4-80GB
 
@@ -175,9 +200,12 @@ These are flags for the `profile` CLI itself, *not* vLLM.
 
 ---
 
+
+
 ## Why Profile?
 
 Profile provides actionable intelligence grounded in hardware physics to maximize compute utilization, replacing passive metric alerts.
+
 
 | Feature                                | Profile | Others |
 | -------------------------------------- | ------- | ------ |
@@ -188,7 +216,10 @@ Profile provides actionable intelligence grounded in hardware physics to maximiz
 | Cost per 1M tokens + recoverable waste | ✓       | ✗      |
 | Prescriptive fixes, not just alerts    | ✓       | ✗      |
 
+
 ---
+
+
 
 ## Documentation
 
@@ -204,6 +235,8 @@ Start with the Workflow, then Rules. The rest is reference material.
 
 ---
 
+
+
 ## Engineering Principles
 
 - Actionable UI: Elements without direct utility are excluded.
@@ -212,6 +245,8 @@ Start with the Workflow, then Rules. The rest is reference material.
 - Honest. Unavailable metrics show `-`. No fabricated values.
 
 ---
+
+
 
 ## License
 

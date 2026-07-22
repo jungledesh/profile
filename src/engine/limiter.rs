@@ -35,6 +35,9 @@ pub struct LimiterEvidence {
     pub tpot_floor_ms: Option<f64>,
     pub effective_prompt_decode_ratio: Option<f64>,
     pub chunked_prefill_enabled: Option<bool>,
+    /// Evaluable windows in the run. Below `ENGINE_MIN_PERSISTENT_WINDOWS`,
+    /// identify declines (same trust bar as rules).
+    pub n_eval: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +69,16 @@ pub struct IdentifyResult {
 pub fn identify(e: &LimiterEvidence) -> IdentifyResult {
     let capacity_skipped = e.kv_cache_peak_perc.is_none();
     let traffic_skipped = e.mean_running.is_none() || e.ridge_batch_size.is_none();
+
+    // Sparse runs: decline before naming a boundary (healthy-exit and quiet report
+    // share this gate; callers must not invent their own window thresholds).
+    if e.n_eval < super::ENGINE_MIN_PERSISTENT_WINDOWS {
+        return IdentifyResult {
+            verdict: None,
+            capacity_skipped,
+            traffic_skipped,
+        };
+    }
 
     // 1. Capacity - KV cache full enough to cap concurrency growth.
     if e.kv_cache_peak_perc
@@ -227,7 +240,29 @@ mod tests {
             tpot_floor_ms: floor,
             effective_prompt_decode_ratio: ratio,
             chunked_prefill_enabled: chunked,
+            n_eval: crate::engine::ENGINE_MIN_PERSISTENT_WINDOWS,
         }
+    }
+
+    #[test]
+    fn identify_declines_below_min_persistent_windows() {
+        let mut e = ev(
+            Some(85.0),
+            Some(50.0),
+            Some(40.0),
+            Some(20.0),
+            Some(5.0),
+            None,
+            Some(false),
+        );
+        e.n_eval = 1;
+        assert_eq!(identify(&e).verdict, None);
+        assert!(limiter_line(&e).is_none());
+        e.n_eval = crate::engine::ENGINE_MIN_PERSISTENT_WINDOWS;
+        assert_eq!(
+            identify(&e).verdict,
+            Some(LimiterVerdict::Known(PrimaryLimiter::Capacity))
+        );
     }
 
     #[test]
