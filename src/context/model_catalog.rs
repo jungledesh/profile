@@ -792,6 +792,25 @@ static CATALOG: &[ModelEntry] = &[
     },
     // ── Phi-4 ────────────────────────────────────────────────────────────────
     // (Phi-4 32B phantom entry removed, no official release at this size)
+    // Phi-4-mini 3.8B: 24 attn heads, 8 KV heads, head_dim=128 (3072/24).
+    // Must precede ["phi","4"] so "Phi-4-mini-…" does not inherit 14B geometry.
+    // Source: https://huggingface.co/microsoft/Phi-4-mini-instruct/raw/main/config.json
+    // (accessed 2026-07-21)
+    ModelEntry {
+        tokens: &["phi", "4", "mini"],
+        entry: catalog_dense! {
+            family: "phi4mini",
+            param_count: 3_800_000_000,
+            active_param_count: None,
+            num_layers: 32,
+            hidden_dim: 3072,
+            default_weight_dtype: "bf16",
+            num_kv_heads: Some(8),
+            head_dim: Some(128),
+            num_kv_layers: None,
+            attn_flops_coeff: None,
+        },
+    },
     // Phi-4 14B: 40 attn heads, 10 KV heads (GQA 4:1), head_dim=128.
     // Source: https://huggingface.co/microsoft/phi-4/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
@@ -892,7 +911,7 @@ mod tests {
 
     #[test]
     fn launch_catalog_has_expected_entry_count() {
-        assert_eq!(CATALOG.len(), 36);
+        assert_eq!(CATALOG.len(), 37);
     }
 
     #[test]
@@ -932,6 +951,18 @@ mod tests {
         let e = lookup_model("microsoft/phi-4").expect("no match");
         assert_eq!(e.family, "phi4");
         assert_eq!(e.param_count, 14 * B);
+    }
+
+    #[test]
+    fn phi4_mini_instruct_resolves_to_3_8b() {
+        let e = lookup_model("microsoft/Phi-4-mini-instruct").expect("no match");
+        assert_eq!(e.family, "phi4mini");
+        assert_eq!(e.param_count, 3_800_000_000);
+        assert_eq!(e.num_layers, 32);
+        assert_eq!(e.hidden_dim, 3072);
+        assert_eq!(e.num_kv_heads, Some(8));
+        assert_eq!(e.head_dim, Some(128));
+        assert_eq!(e.default_weight_dtype, "bf16");
     }
 
     #[test]

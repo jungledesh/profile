@@ -282,12 +282,16 @@ fn compute_kv_max_seqs_with_mode<const MULTI_GPU: bool>(
     }
 
     // Resharding heads needs a mutated copy; the tp=1 launch path borrows directly.
+    // Non-divisible TP is refused (vLLM refuses it too). Never truncate a shard.
     let sharded_model = if tp > 1 {
         let mut priced_model = model.clone();
         let Some(heads) = priced_model.num_kv_heads.filter(|&h| h > 0) else {
             return DerivedCapacity::default();
         };
-        priced_model.num_kv_heads = Some(heads / heads.min(tp));
+        if heads % tp != 0 {
+            return DerivedCapacity::default();
+        }
+        priced_model.num_kv_heads = Some(heads / tp);
         Some(priced_model)
     } else {
         None

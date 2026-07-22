@@ -147,6 +147,7 @@ fn r1_test_input(snapshot: &RawSnapshot) -> R1EvalInput<'_> {
         generation_tokens_per_sec: None,
         prefix_cache_hit_rate: None,
         ridge_batch_size: None,
+        r6_fired: false,
     }
 }
 
@@ -395,35 +396,58 @@ fn compute_kv_max_seqs_tp2_uses_one_model_view_for_budget_and_cost() {
 }
 
 #[test]
-fn compute_kv_max_seqs_tp_greater_than_kv_heads_no_benefit() {
+fn compute_kv_max_seqs_non_divisible_tp_declines() {
     let model = ModelArch {
-        num_kv_heads: Some(2),
+        num_kv_heads: Some(8),
         head_dim: Some(128),
         num_layers: Some(32),
         ..Default::default()
     };
     let headroom_gb = 20.0;
-    let tp2 = compute_kv_max_seqs_with_mode::<true>(
+    // 8 % 3 != 0: must not truncate to 2 heads/GPU.
+    let tp3 = compute_kv_max_seqs_with_mode::<true>(
         Some(headroom_gb),
         Some(4096),
         &model,
         None,
-        Some(2),
+        Some(3),
         2,
         None,
     )
     .max_seqs;
+    assert!(tp3.is_none());
+
+    // tp > heads is also non-divisible (2 % 4 != 0).
+    let few_heads = ModelArch {
+        num_kv_heads: Some(2),
+        head_dim: Some(128),
+        num_layers: Some(32),
+        ..Default::default()
+    };
     let tp4 = compute_kv_max_seqs_with_mode::<true>(
         Some(headroom_gb),
         Some(4096),
-        &model,
+        &few_heads,
         None,
         Some(4),
         2,
         None,
     )
     .max_seqs;
-    assert_eq!(tp2, tp4);
+    assert!(tp4.is_none());
+
+    // Divisible case still prices: 2 heads / tp 2 → 1 head/GPU.
+    let tp2 = compute_kv_max_seqs_with_mode::<true>(
+        Some(headroom_gb),
+        Some(4096),
+        &few_heads,
+        None,
+        Some(2),
+        2,
+        None,
+    )
+    .max_seqs;
+    assert!(tp2.is_some());
 }
 
 #[test]
@@ -1464,11 +1488,14 @@ fn format_diagnose_verbose_shows_kv_pressure_suppressed_when_r4_fires() {
 fn not_triggered_shows_plain_label() {
     let t = SystemTime::UNIX_EPOCH;
     let mut v = vllm_base();
+    v.model_name = Some("meta-llama/Llama-3.1-8B-Instruct".to_string());
     v.prompt_tokens_per_sec = Some(600.0);
     v.generation_tokens_per_sec = Some(100.0);
     v.prefix_cache_hit_rate = None;
-    let s = snap(t, t, v, gpu_busy());
-    let ctx = mk_ctx();
+    let mut g = gpu_busy();
+    g.gpu_name = Some("NVIDIA H100 80GB HBM3".to_string());
+    let s = snap(t, t, v, g);
+    let ctx = mk_llama8b_h100_ctx(&s);
     let win = mk_win(s);
     let text =
         format_diagnose_rules_test(&ctx, &win, true, "http://127.0.0.1:8000/metrics").join("\n");
@@ -1478,6 +1505,7 @@ fn not_triggered_shows_plain_label() {
 
 #[test]
 fn suppressed_rule_shows_suppressor_in_verbose() {
+    // Mixed run: both R1 and R6 significant → ME puts R6 over R1.
     let mut windows: Vec<_> = (0..10)
         .map(|_| mk_r6_prefill_window(2.5, 10.0, 5.0, Some(50.0)))
         .collect();
@@ -1493,7 +1521,7 @@ fn suppressed_rule_shows_suppressor_in_verbose() {
         "http://127.0.0.1:8000/metrics",
     )
     .join("\n");
-    assert!(text.contains("Prefill-Bound: suppressed by Under-batching"));
+    assert!(text.contains("Under-batching: suppressed by Prefill-Bound"));
 }
 
 #[test]
@@ -1520,11 +1548,14 @@ fn suppression_table_shows_suppressor_in_verbose() {
 fn format_diagnose_verbose_r1_shows_plain_not_triggered_when_gate_suppresses() {
     let t = SystemTime::UNIX_EPOCH;
     let mut v = vllm_base();
+    v.model_name = Some("meta-llama/Llama-3.1-8B-Instruct".to_string());
     v.prompt_tokens_per_sec = Some(600.0);
     v.generation_tokens_per_sec = Some(100.0);
     v.prefix_cache_hit_rate = None;
-    let s = snap(t, t, v, gpu_busy());
-    let ctx = mk_ctx();
+    let mut g = gpu_busy();
+    g.gpu_name = Some("NVIDIA H100 80GB HBM3".to_string());
+    let s = snap(t, t, v, g);
+    let ctx = mk_llama8b_h100_ctx(&s);
     let win = mk_win(s);
     let text =
         format_diagnose_rules_test(&ctx, &win, true, "http://127.0.0.1:8000/metrics").join("\n");
@@ -2117,9 +2148,47 @@ fn r7_silent_when_waiting_nonzero_r5_territory() {
 }
 
 #[test]
-fn r6_suppressed_when_r1_fires() {
-    let windows: Vec<_> = (0..10)
+fn mixed_run_r6_suppresses_r1() {
+    // Half under-batched (R1), half prefill-bound (R6). Both significant;
+    // ME before layer filter → R6 primary, R1 suppressed.
+    let mut windows: Vec<_> = (0..10)
         .map(|_| mk_r6_prefill_window(2.5, 10.0, 5.0, Some(50.0)))
+        .collect();
+    for w in windows.iter_mut().skip(5) {
+        *w = mk_r6_prefill_window(12.0, 10.0, 5.0, Some(80.0));
+    }
+    let ctx = mk_llama8b_h100_ctx(&windows[0].snapshot);
+    let summary = ai(&ctx, windows.last().expect("windows"));
+    let report = build_report_for_windows(&windows, summary);
+    assert!(
+        report
+            .recommendations
+            .iter()
+            .any(|g| g.rule_name == rule_names::PREFILL_BOUND)
+    );
+    assert!(
+        !report
+            .recommendations
+            .iter()
+            .any(|g| g.rule_name == rule_names::UNDER_BATCHING)
+    );
+    assert!(
+        report
+            .suppressed_rules
+            .iter()
+            .any(|(suppressed, suppressor)| {
+                *suppressed == rule_names::UNDER_BATCHING
+                    && *suppressor == rule_names::PREFILL_BOUND
+            })
+    );
+}
+
+#[test]
+fn r1_fires_when_r6_muted_by_tpot() {
+    // High prompt/gen + low occupancy, but TPOT near floor so R6 declines.
+    // Must not leave the window silent: R1 owns under-batching.
+    let windows: Vec<_> = (0..10)
+        .map(|_| mk_r6_prefill_window(12.0, 10.0, 5.0, Some(5.0)))
         .collect();
     let ctx = mk_llama8b_h100_ctx(&windows[0].snapshot);
     let summary = ai(&ctx, windows.last().expect("windows"));
@@ -2128,7 +2197,13 @@ fn r6_suppressed_when_r1_fires() {
         report
             .recommendations
             .iter()
-            .any(|g| g.rule_name == rule_names::UNDER_BATCHING)
+            .any(|g| g.rule_name == rule_names::UNDER_BATCHING),
+        "expected R1 when R6 TPOT-muted; got {:?}",
+        report
+            .recommendations
+            .iter()
+            .map(|g| g.rule_name)
+            .collect::<Vec<_>>()
     );
     assert!(
         !report
@@ -2304,7 +2379,7 @@ fn kv_cache_pressure_fires_at_88_boundary_with_stress() {
     let s = snap(t, t, v, gpu_low());
     match rule2_kv_cache_pressure(&s) {
         Rule2Outcome::Fired(d) => {
-            assert!((d.kv_cache_usage_perc - 88.0).abs() < 1e-9);
+            assert!((d.kv_cache_usage_perc.unwrap() - 88.0).abs() < 1e-9);
             assert!(d.preemptions_active);
         }
         Rule2Outcome::NotFired => panic!("expected fired at 88% with stress"),
@@ -2827,15 +2902,13 @@ fn r5_uses_session_kv_peak_from_non_r5_window() {
         text.contains("[!] Concurrency Saturation"),
         "expected r5: {text}"
     );
-    // Fix line uses summary snapshot KV (50%) for branch selection: A-path raise, not
-    // the session-peak scale-out. The raise is bounded by the resolved wall.
+    // Session peak 95% (from non-r5 window) blocks raise even though landing KV is low.
     assert!(
-        text.contains("Raise --max-num-seqs to"),
-        "expected bounded raise-cap fix from summary KV: {text}"
+        text.contains("KV at 95%: scheduler at cap, pool full."),
+        "session peak must gate the fix: {text}"
     );
-    assert!(!text.contains("KV at 95%: scheduler at cap, pool full."));
-    assert!(!text.contains("Add a replica"));
-    assert!(!text.contains("KV pool has room (70%)"));
+    assert!(text.contains("Add a replica"));
+    assert!(!text.contains("Raise --max-num-seqs"));
 }
 
 #[test]
@@ -2865,12 +2938,11 @@ fn session_kv_peak_from_non_r5_window_reaches_build_report_from_eval() {
         .expect("r5 group");
     let text = r5.display_lines.join("\n");
     assert!(
-        text.contains("Raise --max-num-seqs to"),
-        "display fix line must use summary snapshot KV branch: {text}"
+        text.contains("KV at 95%: scheduler at cap, pool full."),
+        "display fix line must use session peak: {text}"
     );
-    assert!(!text.contains("KV at 95%: scheduler at cap, pool full."));
-    assert!(!text.contains("Add a replica"));
-    assert!(!text.contains("KV pool has room (70%)"));
+    assert!(text.contains("Add a replica"));
+    assert!(!text.contains("Raise --max-num-seqs"));
 }
 
 #[test]
@@ -2942,6 +3014,37 @@ fn r7_fires_as_primary_when_alone() {
     assert_eq!(
         report.recommendations[0].rule_name,
         rule_names::CONFIG_HEADROOM
+    );
+}
+
+#[test]
+fn r7_dropped_when_run_level_target_at_or_below_current() {
+    // Per-window R7 fires on ridge (no Observed). Landing snapshot reports a tight
+    // Observed concurrency so run-level target is 18 while current max is 20.
+    let mut windows: Vec<_> = (0..10)
+        .map(|_| mk_r7_headroom_window(15.0, 20, 0.0, 50.0))
+        .collect();
+    windows
+        .last_mut()
+        .expect("windows")
+        .snapshot
+        .vllm
+        .cache_config
+        .kv_cache_max_concurrency = Some(22.5);
+    let ctx = mk_r7_ctx(20);
+    let summary = ai(&ctx, windows.last().expect("windows"));
+    let report = build_report_for_windows(&windows, summary);
+    assert!(
+        !report
+            .recommendations
+            .iter()
+            .any(|g| g.rule_name == rule_names::CONFIG_HEADROOM),
+        "run-level target <= current must drop R7; got {:?}",
+        report
+            .recommendations
+            .iter()
+            .map(|g| g.rule_name)
+            .collect::<Vec<_>>()
     );
 }
 

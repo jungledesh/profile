@@ -293,7 +293,7 @@ fn run_pipeline(
     let model_weight_gb = preflight_model_weight_gb(url);
     let vram_total_gb: Vec<f64> = snapshots
         .iter()
-        .map(|s| s.vram_total_mb as f64 / 1024.0)
+        .map(|s| crate::collectors::mib_to_decimal_gb(s.vram_total_mb))
         .collect();
 
     if let Some(a) = vram_heuristic_from_fracs_inner(

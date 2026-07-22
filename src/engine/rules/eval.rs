@@ -24,9 +24,10 @@ use super::r5_concurrency_saturation::{
     format_concurrency_saturation_window_issue, r5_confidence, rule5_concurrency_saturation,
 };
 use super::r6_prefill_bound::{
-    PrefillBoundDetail, PrefillBoundEvalInput, Rule6Outcome, aggregate_r6_detail,
-    confidence as r6_confidence, effective_prompt_tps, evaluate as r6_evaluate,
-    format_prefill_bound_window_issue, impact as r6_impact, severity as r6_severity,
+    PrefillBoundDetail, PrefillBoundEvalInput, Rule6Outcome, TPOT_UNVERIFIED_CONFIDENCE_CAP,
+    aggregate_r6_detail, confidence as r6_confidence, effective_prompt_tps,
+    evaluate as r6_evaluate, format_prefill_bound_window_issue, impact as r6_impact,
+    severity as r6_severity,
 };
 use super::r7_config_headroom::{
     ConfigHeadroomDetail, aggregate_r7_detail, format_config_headroom_window_issue, r7_confidence,
@@ -40,6 +41,9 @@ use super::{
 const SUPPRESSION_TABLE: &[(&str, &str)] = &[
     (rule_names::OOM_RISK, rule_names::KV_CACHE_PRESSURE),
     (rule_names::OOM_RISK, rule_names::KV_ADMISSION_BACKLOG),
+    // Must run before the min-layer filter: R6 (L5) would otherwise be dropped
+    // when R1 (L4) is present, making this entry a no-op.
+    (rule_names::PREFILL_BOUND, rule_names::UNDER_BATCHING),
 ];
 
 struct WindowRuleEval {
@@ -267,6 +271,32 @@ fn eval_window_rules(
         let win_input = AnalysisInput::new(summary.ctx, w);
         let win_baseline = baseline::compute(&win_input);
 
+        // R6 before R1 so R1 can defer only when R6 actually fired this window.
+        let r6_outcome = r6_evaluate(PrefillBoundEvalInput {
+            prompt_tokens_per_sec: snap.vllm.prompt_tokens_per_sec,
+            generation_tokens_per_sec: snap.vllm.generation_tokens_per_sec,
+            decode_efficiency_pct: win_baseline.as_ref().and_then(|b| b.efficiency_pct),
+            tpot_ms: snap.vllm.tpot_ms,
+            tpot_floor_ms: win_baseline.as_ref().map(|b| b.tpot_floor_ms),
+            prefix_cache_hit_rate: snap.vllm.prefix_cache_hit_rate,
+            snapshot: snap,
+            chunked_prefill_enabled: summary.ctx.config.enable_chunked_prefill,
+            ridge_batch_size: win_baseline.as_ref().map(|b| b.ridge_batch_size),
+            max_num_batched_tokens: snap
+                .vllm
+                .max_num_batched_tokens
+                .or(summary.ctx.config.max_num_batched_tokens),
+            is_hybrid: model_is_hybrid(&summary.ctx.model),
+        });
+        let r6_fired = matches!(r6_outcome, Rule6Outcome::Fired(_));
+        match r6_outcome {
+            Rule6Outcome::Fired(d) => {
+                eval.r6_fired += 1;
+                eval.r6_details.push(d);
+            }
+            Rule6Outcome::NotFired => {}
+        }
+
         match rule1_under_batching_with_efficiency(R1EvalInput {
             snapshot: snap,
             config_max_num_seqs: summary.ctx.config.max_num_seqs,
@@ -278,6 +308,7 @@ fn eval_window_rules(
             generation_tokens_per_sec: snap.vllm.generation_tokens_per_sec,
             prefix_cache_hit_rate: snap.vllm.prefix_cache_hit_rate,
             ridge_batch_size: win_baseline.as_ref().map(|b| b.ridge_batch_size),
+            r6_fired,
         }) {
             Rule1Outcome::Fired(d) => {
                 eval.r1_fired += 1;
@@ -319,29 +350,6 @@ fn eval_window_rules(
         ) {
             eval.r5_fired += 1;
             eval.r5_details.push(d);
-        }
-
-        match r6_evaluate(PrefillBoundEvalInput {
-            prompt_tokens_per_sec: snap.vllm.prompt_tokens_per_sec,
-            generation_tokens_per_sec: snap.vllm.generation_tokens_per_sec,
-            decode_efficiency_pct: win_baseline.as_ref().and_then(|b| b.efficiency_pct),
-            tpot_ms: snap.vllm.tpot_ms,
-            tpot_floor_ms: win_baseline.as_ref().map(|b| b.tpot_floor_ms),
-            prefix_cache_hit_rate: snap.vllm.prefix_cache_hit_rate,
-            snapshot: snap,
-            chunked_prefill_enabled: summary.ctx.config.enable_chunked_prefill,
-            ridge_batch_size: win_baseline.as_ref().map(|b| b.ridge_batch_size),
-            max_num_batched_tokens: snap
-                .vllm
-                .max_num_batched_tokens
-                .or(summary.ctx.config.max_num_batched_tokens),
-            is_hybrid: model_is_hybrid(&summary.ctx.model),
-        }) {
-            Rule6Outcome::Fired(d) => {
-                eval.r6_fired += 1;
-                eval.r6_details.push(d);
-            }
-            Rule6Outcome::NotFired => {}
         }
 
         let ridge = win_baseline.as_ref().map(|b| b.ridge_batch_size);
@@ -482,6 +490,7 @@ fn build_report_from_eval(
         tpot_floor_ms: baseline.as_ref().map(|b| b.tpot_floor_ms),
         effective_prompt_decode_ratio: eval.mean_effective_ratio(),
         chunked_prefill_enabled: summary.ctx.config.enable_chunked_prefill,
+        n_eval: eval.n_eval,
     });
 
     let mut recs: Vec<Recommendation> = Vec::new();
@@ -595,27 +604,31 @@ fn build_report_from_eval(
 
     if eval.r7_significant() {
         let d = aggregate_r7_detail(&eval.r7_details);
-        // Override the displayed recommendation with the run-level resolution so R5
-        // and R7 print one number; confidence keyed to the binding wall's source.
-        let display = ConfigHeadroomDetail {
-            recommended_seqs: run_rec.map_or(d.recommended_seqs, |r| r.target),
-            ridge_batch_size: ridge_run.filter(|r| r.is_finite() && *r > 0.0),
-            ..d
-        };
-        let conf = r7_confidence(run_rec.as_ref());
-        let display_lines = format_config_headroom_window_issue(
-            &display,
-            pct(eval.r7_fired, eval.n_eval),
-            conf,
-            run_rec.as_ref(),
-        );
-        recs.push(Recommendation {
-            rule_name: rule_names::CONFIG_HEADROOM,
-            layer: 6,
-            impact: 3,
-            confidence: conf,
-            display_lines,
-        });
+        // Run-level target can tighten below the per-window median that fired R7.
+        // No headroom left → premise failed; drop the recommendation.
+        let target = run_rec.map_or(d.recommended_seqs, |r| r.target);
+        let still_headroom = target > d.max_num_seqs;
+        if still_headroom {
+            let display = ConfigHeadroomDetail {
+                recommended_seqs: target,
+                ridge_batch_size: ridge_run.filter(|r| r.is_finite() && *r > 0.0),
+                ..d
+            };
+            let conf = r7_confidence(run_rec.as_ref());
+            let display_lines = format_config_headroom_window_issue(
+                &display,
+                pct(eval.r7_fired, eval.n_eval),
+                conf,
+                run_rec.as_ref(),
+            );
+            recs.push(Recommendation {
+                rule_name: rule_names::CONFIG_HEADROOM,
+                layer: 6,
+                impact: 3,
+                confidence: conf,
+                display_lines,
+            });
+        }
     }
 
     if eval.r3_significant() {
@@ -643,7 +656,11 @@ fn build_report_from_eval(
     if eval.r6_significant() {
         let d = aggregate_r6_detail(&eval.r6_details);
         let sev = r6_severity(d.prompt_gen_ratio);
-        let conf = r6_confidence(sev);
+        let conf = if d.tpot_unverified {
+            r6_confidence(sev).min(TPOT_UNVERIFIED_CONFIDENCE_CAP)
+        } else {
+            r6_confidence(sev)
+        };
         let imp = r6_impact(sev);
         let display_lines = format_prefill_bound_window_issue(&d, pct(eval.r6_fired, eval.n_eval));
         recs.push(Recommendation {
@@ -724,6 +741,21 @@ fn finalize_report_groups(
         memory_budget_self_grade,
     } = capacity;
     let mut suppressed_rules = Vec::new();
+
+    // ME table BEFORE min-layer filter so cross-layer suppressions (R6→R1) land.
+    // Same-layer rows (OOM→KV) are unchanged: both survive until ME, then KV drops.
+    let mut recs = recs;
+    let fired_names: Vec<&str> = recs.iter().map(|r| r.rule_name).collect();
+    for &(suppressor, suppressed) in SUPPRESSION_TABLE {
+        if fired_names.contains(&suppressor) {
+            let before = recs.len();
+            recs.retain(|r| r.rule_name != suppressed);
+            if recs.len() < before {
+                suppressed_rules.push((suppressed, suppressor));
+            }
+        }
+    }
+
     let Some(min_layer) = recs.iter().map(|r| r.layer).min() else {
         return Report {
             baseline,
@@ -764,17 +796,6 @@ fn finalize_report_groups(
             }
         })
         .collect();
-
-    let fired_names: Vec<&str> = recs.iter().map(|r| r.rule_name).collect();
-    for (suppressor, suppressed) in SUPPRESSION_TABLE {
-        if fired_names.contains(suppressor) {
-            let before = recs.len();
-            recs.retain(|r| r.rule_name != *suppressed);
-            if recs.len() < before {
-                suppressed_rules.push((suppressed, suppressor));
-            }
-        }
-    }
 
     recs.sort_by(|a, b| {
         let sa = a.impact as f64 * a.confidence;

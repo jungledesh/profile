@@ -145,10 +145,7 @@ pub fn run(input: LoopRunnerInput<'_>) -> anyhow::Result<()> {
         }
 
         if state.iteration_count() >= super::state::MAX_LOOP_ITERATIONS {
-            println!(
-                "\nNo further improvement found after {} iterations. Stopping.",
-                super::state::MAX_LOOP_ITERATIONS
-            );
+            println!("{}", iteration_limit_message());
             break;
         }
 
@@ -197,7 +194,7 @@ pub fn run(input: LoopRunnerInput<'_>) -> anyhow::Result<()> {
         );
         let current_eff = new_report.baseline.as_ref().and_then(|b| b.efficiency_pct);
         let plateau_count = state.update_efficiency_plateau(current_eff, EFFICIENCY_PLATEAU_DELTA);
-        print_delta(&d, Some(rule_name));
+        print_delta(&d);
         println!();
         output::stdout::print_diagnose_table_with_report(
             &new_result,
@@ -261,6 +258,13 @@ pub(crate) fn mid_loop_abort_message(
     None
 }
 
+fn iteration_limit_message() -> String {
+    format!(
+        "\nIteration limit ({}) reached.",
+        super::state::MAX_LOOP_ITERATIONS
+    )
+}
+
 fn at_hardware_ceiling(headroom_pct: Option<f64>) -> bool {
     headroom_pct.is_some_and(|h| h < CEILING_HEADROOM_THRESHOLD_PCT)
 }
@@ -270,7 +274,7 @@ fn capacity_levers(enable_prefix_caching: Option<bool>) -> String {
     if enable_prefix_caching != Some(true) {
         levers.push("enable prefix caching");
     }
-    levers.push("apply KV quantization (FP8)");
+    levers.push("apply KV quantization (FP8; affects output quality)");
     levers.push("add TP to split KV cache");
     format!("Levers: {}", levers.join(", "))
 }
@@ -307,18 +311,16 @@ struct HealthyExitInput {
 fn healthy_exit_message(input: HealthyExitInput) -> String {
     let HealthyExitInput {
         efficiency,
-        limiter_evidence,
+        mut limiter_evidence,
         n_eval,
         enforce_eager,
         enable_prefix_caching,
         quantization,
     } = input;
-    let limiter_line = if n_eval > 0 {
-        engine::limiter::limiter_line(&limiter_evidence)
-    } else {
-        None
-    };
-    let limiter = engine::limiter::identify(&limiter_evidence);
+    // Single source of truth for the window trust bar (identify reads evidence.n_eval).
+    limiter_evidence.n_eval = n_eval;
+    let limiter_line = engine::limiter::limiter_line(&limiter_evidence);
+    let limiter = engine::limiter::identify(&limiter_evidence).verdict;
 
     let eff_str = efficiency
         .map(|e| format!("Efficiency: {e:.1}%"))
@@ -388,6 +390,12 @@ fn healthy_exit_message(input: HealthyExitInput) -> String {
         None => "Rules clear.",
     };
     format!("{prefix}\n\n{limiter_block}")
+}
+
+/// Efficiency is throughput/ceiling. After baseline reset the ceiling may have
+/// moved; the pp delta would compare two rulers. Skip it when config drifted.
+fn include_efficiency_delta(config_drifted: bool) -> bool {
+    !config_drifted
 }
 
 fn format_efficiency_delta_line(delta_pp: Option<f64>) -> Option<String> {
@@ -477,39 +485,46 @@ fn format_cost_delta_line(before: f64, after: f64, est_suffix: &str) -> String {
 /// One status line for the remesure delta header.
 ///
 /// Precedence (first match wins): baseline drift → non-baseline drift → load
-/// witness (R1 primary only) → prefix-hit witness (R3 primary only) → no change.
-///
-/// R6 (and any other primary whose fix has no dedicated witness) intentionally
-/// falls through to "No change detected." when config did not drift — do not
-/// invent attribution from metric moves for those rules.
+/// Status header for the delta block.
+/// Precedence: drifted → non_baseline → load → prefix → no change.
+/// Load line applies for any primary (not R1-only).
 fn config_status_lines(
     config_drifted: bool,
     non_baseline_drifted: bool,
     load_changed: bool,
     prefix_hit_changed: bool,
-    prev_primary: Option<&str>,
+    running_before: Option<f64>,
+    running_after: Option<f64>,
 ) -> Vec<String> {
     let line = if config_drifted {
-        "  Config changed. Baseline reset."
+        "  Config changed. Baseline reset.".to_string()
     } else if non_baseline_drifted {
-        "  Config changed."
-    } else if prev_primary == Some(engine::rule_names::UNDER_BATCHING) && load_changed {
-        "  Load changed."
-    } else if prev_primary == Some(engine::rule_names::LOW_PREFIX_REUSE) && prefix_hit_changed {
-        "  Prefix cache hit rate changed."
+        "  Config changed.".to_string()
+    } else if load_changed {
+        // QPS-only load moves leave running equal; never print "N -> N".
+        // Compare rounded display values so 50.2 → 50.4 does not claim "50 -> 50".
+        match (running_before, running_after) {
+            (Some(n), Some(m)) if n.is_finite() && m.is_finite() && n.round() != m.round() => {
+                format!("  Load changed (running {n:.0} -> {m:.0}).")
+            }
+            _ => "  Load changed.".to_string(),
+        }
+    } else if prefix_hit_changed {
+        "  Prefix cache hit rate changed.".to_string()
     } else {
-        "  No change detected."
+        "  No change detected.".to_string()
     };
-    vec![line.to_string(), String::new()]
+    vec![line, String::new()]
 }
 
-fn print_delta(d: &delta::Delta, prev_primary: Option<&str>) {
+fn print_delta(d: &delta::Delta) {
     for line in config_status_lines(
         d.config_drifted,
         d.non_baseline_drifted,
         d.load_changed,
         d.prefix_hit_changed,
-        prev_primary,
+        d.running_before,
+        d.running_after,
     ) {
         println!("{line}");
     }
@@ -535,7 +550,11 @@ fn print_delta(d: &delta::Delta, prev_primary: Option<&str>) {
     {
         println!("{line}");
     }
-    if let Some(line) = format_efficiency_delta_line(d.efficiency_delta_pp) {
+    // Efficiency is throughput/ceiling. Baseline reset means the ceiling may have
+    // moved (e.g. quantize); the pp delta would compare two rulers. Skip it.
+    if include_efficiency_delta(d.config_drifted)
+        && let Some(line) = format_efficiency_delta_line(d.efficiency_delta_pp)
+    {
         println!("{line}");
     }
     if let Some((x, y)) = d.capacity_self_grade {
@@ -595,6 +614,13 @@ mod tests {
     }
 
     #[test]
+    fn iteration_limit_message_states_cap_not_outcome() {
+        let msg = iteration_limit_message();
+        assert!(msg.contains("Iteration limit (20) reached."));
+        assert!(!msg.contains("No further improvement"));
+    }
+
+    #[test]
     fn at_hardware_ceiling_at_threshold_not_reached() {
         assert!(!at_hardware_ceiling(Some(10.0)));
     }
@@ -615,8 +641,9 @@ mod tests {
                 tpot_floor_ms: Some(10.0),
                 effective_prompt_decode_ratio: None,
                 chunked_prefill_enabled: Some(false),
+                n_eval: 0,
             },
-            n_eval: 1,
+            n_eval: 3,
             enforce_eager,
             enable_prefix_caching: None,
             quantization: None,
@@ -634,8 +661,9 @@ mod tests {
                 tpot_floor_ms: Some(5.0),
                 effective_prompt_decode_ratio: None,
                 chunked_prefill_enabled: Some(false),
+                n_eval: 0,
             },
-            n_eval: 1,
+            n_eval: 3,
             enforce_eager: None,
             enable_prefix_caching,
             quantization: None,
@@ -653,8 +681,9 @@ mod tests {
                 tpot_floor_ms: Some(10.0),
                 effective_prompt_decode_ratio: None,
                 chunked_prefill_enabled: Some(false),
+                n_eval: 0,
             },
-            n_eval: 1,
+            n_eval: 3,
             enforce_eager: None,
             enable_prefix_caching: None,
             quantization,
@@ -682,8 +711,9 @@ mod tests {
                 tpot_floor_ms: Some(5.0),
                 effective_prompt_decode_ratio: None,
                 chunked_prefill_enabled: Some(false),
+                n_eval: 0,
             },
-            n_eval: 1,
+            n_eval: 3,
             enforce_eager: None,
             enable_prefix_caching: None,
             quantization: None,
@@ -707,8 +737,9 @@ mod tests {
                 tpot_floor_ms: Some(5.0),
                 effective_prompt_decode_ratio: None,
                 chunked_prefill_enabled: Some(false),
+                n_eval: 0,
             },
-            n_eval: 1,
+            n_eval: 3,
             enforce_eager: None,
             enable_prefix_caching: None,
             quantization: None,
@@ -730,8 +761,9 @@ mod tests {
                 tpot_floor_ms: Some(5.0),
                 effective_prompt_decode_ratio: None,
                 chunked_prefill_enabled: Some(false),
+                n_eval: 0,
             },
-            n_eval: 1,
+            n_eval: 3,
             enforce_eager: None,
             enable_prefix_caching: None,
             quantization: None,
@@ -760,8 +792,9 @@ mod tests {
                 tpot_floor_ms: Some(10.0),
                 effective_prompt_decode_ratio: Some(0.6),
                 chunked_prefill_enabled: Some(true),
+                n_eval: 0,
             },
-            n_eval: 1,
+            n_eval: 3,
             enforce_eager: None,
             enable_prefix_caching: None,
             quantization: None,
@@ -788,6 +821,7 @@ mod tests {
             tpot_floor_ms: Some(10.0),
             effective_prompt_decode_ratio: Some(0.2),
             chunked_prefill_enabled: Some(false),
+            n_eval: 3,
         };
         let line = engine::limiter::limiter_line(&ev).expect("limiter line");
         let msg = healthy_exit_message(HealthyExitInput {
@@ -838,11 +872,27 @@ mod tests {
     }
 
     #[test]
+    fn healthy_exit_sparse_n_eval_prints_no_limiter_verdict() {
+        // Same evidence that would name Capacity at n_eval>=3; one window must decline.
+        let msg = healthy_exit_message(HealthyExitInput {
+            efficiency: Some(42.5),
+            limiter_evidence: capacity_input(None).limiter_evidence,
+            n_eval: 1,
+            enforce_eager: None,
+            enable_prefix_caching: None,
+            quantization: None,
+        });
+        assert!(!msg.contains("Primary Limiter:"));
+        assert!(!msg.contains("Capped by"));
+        assert!(msg.contains("insufficient data to identify primary limiter"));
+    }
+
+    #[test]
     fn capacity_levers_hide_prefix_caching_when_on() {
         let msg = healthy_exit_message(capacity_input(Some(true)));
         assert!(msg.contains("KV Cache Capacity"));
         assert!(!msg.contains("enable prefix caching"));
-        assert!(msg.contains("KV quantization"));
+        assert!(msg.contains("KV quantization (FP8; affects output quality)"));
         assert!(msg.contains("add TP"));
     }
 
@@ -893,79 +943,63 @@ mod tests {
 
     #[test]
     fn config_status_lines_baseline_beats_non_baseline() {
-        let lines = config_status_lines(
-            true,
-            true,
-            true,
-            true,
-            Some(engine::rule_names::UNDER_BATCHING),
-        );
+        let lines = config_status_lines(true, true, true, true, Some(10.0), Some(20.0));
         assert_eq!(lines[0], "  Config changed. Baseline reset.");
     }
 
     #[test]
     fn config_status_lines_non_baseline_beats_witness() {
-        let lines = config_status_lines(
-            false,
-            true,
-            true,
-            true,
-            Some(engine::rule_names::UNDER_BATCHING),
-        );
+        let lines = config_status_lines(false, true, true, true, Some(10.0), Some(20.0));
         assert_eq!(lines[0], "  Config changed.");
     }
 
     #[test]
-    fn config_status_lines_r1_load_witness() {
-        let lines = config_status_lines(
-            false,
-            false,
-            true,
-            false,
-            Some(engine::rule_names::UNDER_BATCHING),
-        );
-        assert_eq!(lines[0], "  Load changed.");
+    fn config_status_lines_load_for_any_primary() {
+        let lines = config_status_lines(false, false, true, false, Some(10.0), Some(40.0));
+        assert_eq!(lines[0], "  Load changed (running 10 -> 40).");
     }
 
     #[test]
-    fn config_status_lines_r1_without_load_is_no_change() {
-        let lines = config_status_lines(
-            false,
-            false,
-            false,
-            true,
-            Some(engine::rule_names::UNDER_BATCHING),
-        );
+    fn config_status_lines_without_load_is_no_change() {
+        let lines = config_status_lines(false, false, false, false, Some(10.0), Some(10.0));
         assert_eq!(lines[0], "  No change detected.");
     }
 
     #[test]
-    fn config_status_lines_r3_prefix_witness() {
-        let lines = config_status_lines(
-            false,
-            false,
-            false,
-            true,
-            Some(engine::rule_names::LOW_PREFIX_REUSE),
-        );
+    fn config_status_lines_prefix_witness() {
+        let lines = config_status_lines(false, false, false, true, Some(10.0), Some(10.0));
         assert_eq!(lines[0], "  Prefix cache hit rate changed.");
     }
 
     #[test]
-    fn config_status_lines_non_r1_r3_load_move_is_no_change() {
-        let lines = config_status_lines(
-            false,
-            false,
-            true,
-            false,
-            Some(engine::rule_names::PREFILL_BOUND),
-        );
-        assert_eq!(lines[0], "  No change detected.");
+    fn config_status_lines_non_r1_load_move_shows_load() {
+        let lines = config_status_lines(false, false, true, false, Some(5.0), Some(25.0));
+        assert_eq!(lines[0], "  Load changed (running 5 -> 25).");
+    }
+
+    #[test]
+    fn config_status_lines_equal_running_falls_back_to_generic() {
+        // load_changed can fire from QPS alone while running stays flat.
+        let lines = config_status_lines(false, false, true, false, Some(50.0), Some(50.0));
+        assert_eq!(lines[0], "  Load changed.");
+    }
+
+    #[test]
+    fn config_status_lines_same_rounded_running_falls_back_to_generic() {
+        // Display uses {:.0}; raw inequality that rounds equal must not print "50 -> 50".
+        let lines = config_status_lines(false, false, true, false, Some(50.2), Some(50.4));
+        assert_eq!(lines[0], "  Load changed.");
+    }
+
+    #[test]
+    fn config_status_lines_config_beats_load() {
+        let lines = config_status_lines(false, true, true, false, Some(5.0), Some(25.0));
+        assert_eq!(lines[0], "  Config changed.");
     }
 
     #[test]
     fn config_status_lines_no_changes() {
-        let lines = config_status_lines(false, false, false, false, None);
+        let lines = config_status_lines(false, false, false, false, None, None);
         assert_eq!(lines[0], "  No change detected.");
     }
 
@@ -973,6 +1007,12 @@ mod tests {
     fn efficiency_delta_near_zero_suppressed() {
         assert!(format_efficiency_delta_line(Some(-0.04)).is_none());
         assert!(format_efficiency_delta_line(Some(0.03)).is_none());
+    }
+
+    #[test]
+    fn efficiency_delta_skipped_when_baseline_reset() {
+        assert!(!include_efficiency_delta(true));
+        assert!(include_efficiency_delta(false));
     }
 
     #[test]
@@ -1071,6 +1111,8 @@ mod tests {
             config_drifted: false,
             non_baseline_drifted: false,
             load_changed: false,
+            running_before: None,
+            running_after: None,
             prefix_hit_changed: false,
             capacity_self_grade: None,
         };

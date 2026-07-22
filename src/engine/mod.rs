@@ -135,9 +135,7 @@ fn maybe_add_massive_underutilization(
             // r2's shape; it did not sustain significance, don't mislabel as MU.
             return;
         }
-        Some(_) => rules::MuVariant::BlockedAdmission {
-            kv_measured: kv.is_some(),
-        },
+        Some(_) => rules::MuVariant::BlockedAdmission { kv_pct: kv },
     };
 
     let confidence = match &variant {
@@ -448,7 +446,8 @@ mod build_report_tests {
         assert!((mu.confidence - MU_INFERRED_CONFIDENCE).abs() < 1e-9);
         let text = mu.display_lines.join("\n");
         assert!(text.contains("Requests  10 running, 5 waiting  (246 of 256 seats free)"));
-        assert!(text.contains("seats are free and KV cache is low"));
+        assert!(text.contains("seats are free and KV cache at 10% (low)"));
+        assert!(!text.contains("KV cache is low."));
         assert!(text.contains("Scheduler admission is blocked"));
         assert!(text.contains("Raise --max-num-batched-tokens"));
         assert!(!text.contains("server not saturated"));
