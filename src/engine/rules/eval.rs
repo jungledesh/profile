@@ -397,26 +397,24 @@ fn build_report_from_eval(
     session_hit_rate: Option<f64>,
     baseline: Option<baseline::PhysicsBaseline>,
 ) -> Report {
+    let summary_snap = &summary.window.snapshot;
+    let tp = effective_tensor_parallel(
+        summary.ctx.config.tensor_parallel_size,
+        summary_snap.collected_gpu_count(),
+    );
+    let kv_cache_dtype = effective_kv_cache_dtype(
+        summary_snap.vllm.cache_config.cache_dtype.as_deref(),
+        summary.ctx.config.kv_cache_dtype.as_deref(),
+    );
+
     if eval.n_eval == 0 {
         let derived = compute_kv_max_seqs_for_cache(
             baseline.as_ref().and_then(|b| b.kv_headroom_gb),
             summary.ctx.config.max_model_len,
             &summary.ctx.model,
-            effective_kv_cache_dtype(
-                summary
-                    .window
-                    .snapshot
-                    .vllm
-                    .cache_config
-                    .cache_dtype
-                    .as_deref(),
-                summary.ctx.config.kv_cache_dtype.as_deref(),
-            ),
-            effective_tensor_parallel(
-                summary.ctx.config.tensor_parallel_size,
-                summary.window.snapshot.collected_gpu_count(),
-            ),
-            &summary.window.snapshot.vllm.cache_config,
+            kv_cache_dtype,
+            tp,
+            &summary_snap.vllm.cache_config,
         );
         return Report {
             baseline,
@@ -425,7 +423,7 @@ fn build_report_from_eval(
             kv_max_seqs: derived.max_seqs,
             prescribed_kv_capacity: None,
             catalog_state_mismatch: catalog_state_pages_mismatch(
-                &summary.window.snapshot.vllm.cache_config,
+                &summary_snap.vllm.cache_config,
                 summary.ctx.config.max_model_len,
                 &summary.ctx.model,
             ),
@@ -439,23 +437,15 @@ fn build_report_from_eval(
         };
     }
 
-    let summary_snap = &summary.window.snapshot;
     let max_model_len = summary.ctx.config.max_model_len;
     let kv_headroom_gb = baseline.as_ref().and_then(|b| b.kv_headroom_gb);
     let fp8_compiler_available = summary.ctx.fp8_compiler_available;
-    let tp = effective_tensor_parallel(
-        summary.ctx.config.tensor_parallel_size,
-        summary.window.snapshot.collected_gpu_count(),
-    );
     // Derived ceiling for R5 / verbose / Report.kv_max_seqs. R2 prefers observed.
     let derived_capacity = compute_kv_max_seqs_for_cache(
         kv_headroom_gb,
         max_model_len,
         &summary.ctx.model,
-        effective_kv_cache_dtype(
-            summary_snap.vllm.cache_config.cache_dtype.as_deref(),
-            summary.ctx.config.kv_cache_dtype.as_deref(),
-        ),
+        kv_cache_dtype,
         tp,
         &summary_snap.vllm.cache_config,
     );
@@ -522,10 +512,6 @@ fn build_report_from_eval(
         let r2_agg = aggregate_r2_detail(&eval.r2_details);
         let conf = kv_pressure_confidence(eval.r2_fired, eval.n_eval);
         prescribed_kv_capacity = prescribed_for_self_grade(r2_kv_max_seqs, r2_capacity_label);
-        let kv_dtype = effective_kv_cache_dtype(
-            summary_snap.vllm.cache_config.cache_dtype.as_deref(),
-            summary.ctx.config.kv_cache_dtype.as_deref(),
-        );
         let display_lines = format_kv_cache_window_issue(
             &r2_agg,
             pct(eval.r2_fired, eval.n_eval),
@@ -538,7 +524,7 @@ fn build_report_from_eval(
                 fp8_compiler_available,
                 model: Some(&summary.ctx.model),
                 tp,
-                kv_cache_dtype: kv_dtype,
+                kv_cache_dtype,
             },
             eval.r2_fired,
             eval.n_eval,
@@ -553,10 +539,6 @@ fn build_report_from_eval(
     } else if r2_backlog_significant {
         let agg = aggregate_backlog_detail(&eval.r2_backlog_details);
         prescribed_kv_capacity = prescribed_for_self_grade(r2_kv_max_seqs, r2_capacity_label);
-        let kv_dtype = effective_kv_cache_dtype(
-            summary_snap.vllm.cache_config.cache_dtype.as_deref(),
-            summary.ctx.config.kv_cache_dtype.as_deref(),
-        );
         let display_lines = format_kv_admission_backlog_issue(
             &agg,
             pct(eval.r2_backlog_fired, eval.n_eval),
@@ -569,7 +551,7 @@ fn build_report_from_eval(
                 fp8_compiler_available,
                 model: Some(&summary.ctx.model),
                 tp,
-                kv_cache_dtype: kv_dtype,
+                kv_cache_dtype,
             },
             eval.r2_backlog_fired,
             eval.n_eval,
@@ -591,10 +573,7 @@ fn build_report_from_eval(
             cache: &summary_snap.vllm.cache_config,
             kv_headroom_gb,
             model: Some(&summary.ctx.model),
-            kv_cache_dtype: effective_kv_cache_dtype(
-                summary_snap.vllm.cache_config.cache_dtype.as_deref(),
-                summary.ctx.config.kv_cache_dtype.as_deref(),
-            ),
+            kv_cache_dtype,
             tp,
         };
         let display_lines = format_concurrency_saturation_window_issue(
@@ -703,10 +682,7 @@ fn build_report_from_eval(
     // R4 names the guess and caps confidence (see r4_recommendation_with_request_floor).
     let (kv_bpp, kv_src) = match baseline.as_ref() {
         Some(b) => (b.kv_bytes_per_element, b.kv_cache_dtype_source),
-        None => baseline::resolve_kv_cache_element(effective_kv_cache_dtype(
-            summary_snap.vllm.cache_config.cache_dtype.as_deref(),
-            summary.ctx.config.kv_cache_dtype.as_deref(),
-        )),
+        None => baseline::resolve_kv_cache_element(kv_cache_dtype),
     };
     let request_bytes = if tp.is_none_or(|value| value <= 1) {
         max_model_len.and_then(|len| baseline::bytes_per_seq(&summary.ctx.model, len, kv_bpp))
