@@ -365,10 +365,6 @@ fn eval_window_rules(
                 summary.ctx.config.tensor_parallel_size,
                 snap.collected_gpu_count(),
             ),
-            win_baseline
-                .as_ref()
-                .map(|b| b.weight_bytes_per_param)
-                .unwrap_or(2),
             &snap.vllm.cache_config,
         )
         .max_seqs;
@@ -408,10 +404,6 @@ fn build_report_from_eval(
                 summary.ctx.config.tensor_parallel_size,
                 summary.window.snapshot.collected_gpu_count(),
             ),
-            baseline
-                .as_ref()
-                .map(|b| b.weight_bytes_per_param)
-                .unwrap_or(2),
             &summary.window.snapshot.vllm.cache_config,
         );
         return Report {
@@ -439,10 +431,6 @@ fn build_report_from_eval(
     let max_model_len = summary.ctx.config.max_model_len;
     let kv_headroom_gb = baseline.as_ref().and_then(|b| b.kv_headroom_gb);
     let fp8_compiler_available = summary.ctx.fp8_compiler_available;
-    let weight_bytes_per_param = baseline
-        .as_ref()
-        .map(|b| b.weight_bytes_per_param)
-        .unwrap_or(2);
     let tp = effective_tensor_parallel(
         summary.ctx.config.tensor_parallel_size,
         summary.window.snapshot.collected_gpu_count(),
@@ -454,7 +442,6 @@ fn build_report_from_eval(
         &summary.ctx.model,
         summary.ctx.config.kv_cache_dtype.as_deref(),
         tp,
-        weight_bytes_per_param,
         &summary_snap.vllm.cache_config,
     );
     let kv_max_seqs = derived_capacity.max_seqs;
@@ -528,7 +515,6 @@ fn build_report_from_eval(
                 kv_headroom_gb,
                 kv_max_seqs: r2_kv_max_seqs,
                 capacity_label: r2_capacity_label,
-                weight_bytes_per_param,
                 fp8_compiler_available,
                 model: Some(&summary.ctx.model),
                 tp,
@@ -555,7 +541,6 @@ fn build_report_from_eval(
                 kv_headroom_gb,
                 kv_max_seqs: r2_kv_max_seqs,
                 capacity_label: r2_capacity_label,
-                weight_bytes_per_param,
                 fp8_compiler_available,
                 model: Some(&summary.ctx.model),
                 tp,
@@ -582,7 +567,6 @@ fn build_report_from_eval(
             model: Some(&summary.ctx.model),
             kv_cache_dtype: summary.ctx.config.kv_cache_dtype.as_deref(),
             tp,
-            weight_bytes: weight_bytes_per_param,
         };
         let display_lines = format_concurrency_saturation_window_issue(
             &agg,
@@ -620,6 +604,7 @@ fn build_report_from_eval(
                 pct(eval.r7_fired, eval.n_eval),
                 conf,
                 run_rec.as_ref(),
+                run_kv_bound.is_some(),
             );
             recs.push(Recommendation {
                 rule_name: rule_names::CONFIG_HEADROOM,
@@ -673,10 +658,12 @@ fn build_report_from_eval(
     }
 
     let request_bytes = if tp.is_none_or(|value| value <= 1) {
-        let kv_bpp = baseline::kv_bytes_per_element(
-            summary.ctx.config.kv_cache_dtype.as_deref(),
-            weight_bytes_per_param,
-        );
+        let kv_bpp = baseline
+            .as_ref()
+            .map(|b| b.kv_bytes_per_element)
+            .unwrap_or_else(|| {
+                baseline::kv_bytes_per_element(summary.ctx.config.kv_cache_dtype.as_deref())
+            });
         max_model_len.and_then(|len| baseline::bytes_per_seq(&summary.ctx.model, len, kv_bpp))
     } else {
         None
@@ -746,8 +733,15 @@ fn finalize_report_groups(
     // Same-layer rows (OOM→KV) are unchanged: both survive until ME, then KV drops.
     let mut recs = recs;
     let fired_names: Vec<&str> = recs.iter().map(|r| r.rule_name).collect();
+    let oom_weights_dont_fit = baseline
+        .as_ref()
+        .and_then(|b| b.kv_headroom_gb)
+        .is_some_and(|h| h.is_finite() && h < 0.0);
     for &(suppressor, suppressed) in SUPPRESSION_TABLE {
         if fired_names.contains(&suppressor) {
+            if suppressor == rule_names::OOM_RISK && !oom_weights_dont_fit {
+                continue;
+            }
             let before = recs.len();
             recs.retain(|r| r.rule_name != suppressed);
             if recs.len() < before {

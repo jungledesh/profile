@@ -53,7 +53,6 @@ pub(super) struct HypCapacityCtx<'a> {
     pub model: Option<&'a crate::context::ModelArch>,
     pub kv_cache_dtype: Option<&'a str>,
     pub tp: Option<u32>,
-    pub weight_bytes: u8,
 }
 
 /// Capacity at a hypothetical `max_model_len`. Both derived tiers are `(est)`.
@@ -96,7 +95,6 @@ pub(super) fn capacity_at_hypothetical_max_len(
         model,
         ctx.kv_cache_dtype,
         ctx.tp,
-        ctx.weight_bytes,
         ctx.cache,
     )
     .max_seqs
@@ -245,7 +243,6 @@ pub(super) fn compute_kv_max_seqs_for_cache(
     model: &crate::context::ModelArch,
     kv_cache_dtype: Option<&str>,
     tp: Option<u32>,
-    weight_bytes: u8,
     cache: &crate::collectors::CacheConfigLabels,
 ) -> DerivedCapacity {
     compute_kv_max_seqs_with_mode::<{ crate::engine::MULTI_GPU_TP }>(
@@ -254,7 +251,6 @@ pub(super) fn compute_kv_max_seqs_for_cache(
         model,
         kv_cache_dtype,
         tp,
-        weight_bytes,
         Some(cache),
     )
 }
@@ -265,7 +261,6 @@ fn compute_kv_max_seqs_with_mode<const MULTI_GPU: bool>(
     model: &crate::context::ModelArch,
     kv_cache_dtype: Option<&str>,
     tp: Option<u32>,
-    weight_bytes: u8,
     cache: Option<&crate::collectors::CacheConfigLabels>,
 ) -> DerivedCapacity {
     use crate::engine::baseline::{bytes_per_seq, kv_bytes_per_element};
@@ -298,7 +293,7 @@ fn compute_kv_max_seqs_with_mode<const MULTI_GPU: bool>(
     };
     let model_view = sharded_model.as_ref().unwrap_or(model);
 
-    let kv_bpp = kv_bytes_per_element(kv_cache_dtype, weight_bytes.max(1));
+    let kv_bpp = kv_bytes_per_element(kv_cache_dtype);
     let Some(request_bytes) = bytes_per_seq(model_view, max_len, kv_bpp) else {
         return DerivedCapacity::default();
     };

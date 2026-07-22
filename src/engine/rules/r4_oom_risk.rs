@@ -62,7 +62,7 @@ pub(super) fn r4_recommendation_with_request_floor(
     if !h.is_finite() {
         return None;
     }
-    if weight_dtype_source == WeightDtypeSource::Fallback && h < 0.0 {
+    if weight_dtype_source == WeightDtypeSource::Fallback {
         return None;
     }
     if h >= 0.0 {
@@ -426,6 +426,40 @@ mod tests {
         assert!(text.contains("      • Model weights exceed GPU VRAM by ~12GB"));
         assert!(text.contains("Server may OOM without tensor parallelism"));
         assert!(text.contains("weights overflow by ~12GB"));
+    }
+
+    #[test]
+    fn r4_request_floor_declines_on_fallback_dtype() {
+        // Same numbers as request_floor_fires_on_known_dtype; only dtype source differs.
+        assert!(
+            r4_recommendation_with_request_floor(
+                Some(0.05),
+                Some(1),
+                Some(20.0),
+                Some(24.0),
+                Some(0.9),
+                WeightDtypeSource::Fallback,
+                Some(60_000_000),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn r4_request_floor_fires_on_known_dtype() {
+        let r = r4_recommendation_with_request_floor(
+            Some(0.05),
+            Some(1),
+            Some(20.0),
+            Some(24.0),
+            Some(0.9),
+            WeightDtypeSource::EnvVar,
+            Some(60_000_000),
+        )
+        .expect("known dtype should fire on identical numbers");
+        let text = r.display_lines.join("\n");
+        assert!(text.contains("cannot hold a single request's KV + state"));
+        assert!(text.contains("Raise --gpu-memory-utilization"));
     }
 
     #[test]

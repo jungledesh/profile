@@ -90,29 +90,45 @@ pub fn latency_floor_ms(ceiling_tps: f64) -> f64 {
     1000.0 / ceiling_tps
 }
 
+/// How `kv_cache_dtype` was interpreted for KV byte width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvCacheDtypeSource {
+    /// Explicit fp8 / e4m3 / e5m2 in kv_cache_dtype.
+    ExplicitFp8,
+    /// Explicit bf16/fp16/half in kv_cache_dtype.
+    ExplicitActivation,
+    /// "auto" or absent: vLLM uses activation dtype (bf16/fp16).
+    Auto,
+    /// Unrecognized kv_cache_dtype string; priced at 2 bytes until known.
+    Unknown,
+}
+
 /// KV cache bytes per element from kv_cache_dtype.
-/// "fp8" → 1; bf16/fp16 → 2; "auto"/None → falls back to weight_bytes.
-/// vLLM does not support fp32 KV cache, so 2 is the correct non-fp8 default.
-pub fn kv_bytes_per_element(kv_cache_dtype: Option<&str>, weight_bytes: u8) -> u8 {
-    match kv_cache_dtype {
-        Some(d)
-            if {
-                let d = d.trim().to_ascii_lowercase();
-                d.contains("fp8") || d.contains("e4m3") || d.contains("e5m2")
-            } =>
-        {
-            1
-        }
-        Some(d)
-            if {
-                let d = d.trim().to_ascii_lowercase();
-                d.contains("fp16") || d.contains("bf16") || d.contains("float16") || d == "half"
-            } =>
-        {
-            2
-        }
-        _ => weight_bytes,
+/// Explicit fp8 → 1; bf16/fp16 → 2; "auto"/None/unknown → 2 (activation default).
+/// Weight width never flows into KV pricing.
+pub fn resolve_kv_cache_element(kv_cache_dtype: Option<&str>) -> (u8, KvCacheDtypeSource) {
+    let Some(raw) = kv_cache_dtype.map(str::trim).filter(|s| !s.is_empty()) else {
+        return (2, KvCacheDtypeSource::Auto);
+    };
+    let lower = raw.to_ascii_lowercase();
+    if lower == "auto" {
+        return (2, KvCacheDtypeSource::Auto);
     }
+    if lower.contains("fp8") || lower.contains("e4m3") || lower.contains("e5m2") {
+        return (1, KvCacheDtypeSource::ExplicitFp8);
+    }
+    if lower.contains("fp16")
+        || lower.contains("bf16")
+        || lower.contains("float16")
+        || lower == "half"
+    {
+        return (2, KvCacheDtypeSource::ExplicitActivation);
+    }
+    (2, KvCacheDtypeSource::Unknown)
+}
+
+pub fn kv_bytes_per_element(kv_cache_dtype: Option<&str>) -> u8 {
+    resolve_kv_cache_element(kv_cache_dtype).0
 }
 
 /// Bytes one worst-case request costs in GPU memory. Three currencies:
@@ -471,25 +487,65 @@ mod tests {
 
     #[test]
     fn kv_bytes_per_element_fp8() {
-        assert_eq!(kv_bytes_per_element(Some("fp8"), 2), 1);
-        assert_eq!(kv_bytes_per_element(Some("FP8"), 2), 1);
-        assert_eq!(kv_bytes_per_element(Some("e4m3fnuz"), 2), 1);
-        assert_eq!(kv_bytes_per_element(Some("e5m2"), 2), 1);
+        assert_eq!(kv_bytes_per_element(Some("fp8")), 1);
+        assert_eq!(kv_bytes_per_element(Some("FP8")), 1);
+        assert_eq!(kv_bytes_per_element(Some("fp8_e4m3")), 1);
+        assert_eq!(kv_bytes_per_element(Some("fp8_e5m2")), 1);
+        assert_eq!(kv_bytes_per_element(Some("e4m3fnuz")), 1);
+        assert_eq!(kv_bytes_per_element(Some("e5m2")), 1);
+        assert_eq!(
+            resolve_kv_cache_element(Some("fp8")).1,
+            KvCacheDtypeSource::ExplicitFp8
+        );
     }
 
     #[test]
     fn kv_bytes_per_element_bf16() {
-        assert_eq!(kv_bytes_per_element(Some("bf16"), 2), 2);
-        assert_eq!(kv_bytes_per_element(Some("fp16"), 2), 2);
-        assert_eq!(kv_bytes_per_element(Some("half"), 2), 2);
+        assert_eq!(kv_bytes_per_element(Some("bf16")), 2);
+        assert_eq!(kv_bytes_per_element(Some("fp16")), 2);
+        assert_eq!(kv_bytes_per_element(Some("half")), 2);
+        assert_eq!(
+            resolve_kv_cache_element(Some("bf16")).1,
+            KvCacheDtypeSource::ExplicitActivation
+        );
     }
 
     #[test]
-    fn kv_bytes_per_element_auto_falls_back_to_weight_bytes() {
-        assert_eq!(kv_bytes_per_element(Some("auto"), 2), 2);
-        assert_eq!(kv_bytes_per_element(None, 2), 2);
-        // fp8 weights → fp8 KV fallback
-        assert_eq!(kv_bytes_per_element(None, 1), 1);
+    fn kv_bytes_per_element_auto_uses_activation_dtype_not_weight_width() {
+        assert_eq!(kv_bytes_per_element(Some("auto")), 2);
+        assert_eq!(kv_bytes_per_element(None), 2);
+        assert_eq!(resolve_kv_cache_element(None).1, KvCacheDtypeSource::Auto);
+        assert_eq!(
+            resolve_kv_cache_element(Some("auto")).1,
+            KvCacheDtypeSource::Auto
+        );
+    }
+
+    #[test]
+    fn kv_bytes_per_element_awq_auto_kv_is_two_bytes_not_quant_weight_width() {
+        // AWQ 4-bit weights are 0.5 bytes/param; auto KV stays activation dtype (2).
+        assert_eq!(kv_bytes_per_element(None), 2);
+        assert_eq!(kv_bytes_per_element(Some("auto")), 2);
+    }
+
+    #[test]
+    fn bytes_per_seq_auto_kv_doubles_vs_one_byte_weight_width_mistake() {
+        let arch = ModelArch {
+            num_layers: Some(32),
+            num_kv_heads: Some(8),
+            head_dim: Some(128),
+            ..Default::default()
+        };
+        let mistaken_one_byte = bytes_per_seq(&arch, 4096, 1);
+        let activation_two_byte = bytes_per_seq(&arch, 4096, 2);
+        assert_eq!(activation_two_byte, mistaken_one_byte.map(|b| b * 2));
+    }
+
+    #[test]
+    fn kv_bytes_per_element_unknown_string_falls_back_to_two_with_source() {
+        let (bytes, source) = resolve_kv_cache_element(Some("future_dtype"));
+        assert_eq!(bytes, 2);
+        assert_eq!(source, KvCacheDtypeSource::Unknown);
     }
 
     #[test]

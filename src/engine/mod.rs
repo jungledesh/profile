@@ -5,8 +5,8 @@ mod rules;
 use crate::context::{AnalysisInput, RuntimeWindow};
 
 pub use baseline::{
-    CeilingEstimate, CostEstimate, CostSource, PhysicsBaseline, WeightDtypeSource,
-    catalog_model_weight_gb,
+    CeilingEstimate, CostEstimate, CostSource, KvCacheDtypeSource, PhysicsBaseline,
+    WeightDtypeSource, catalog_model_weight_gb,
 };
 pub use rules::*;
 

@@ -29,12 +29,11 @@ const PREFIX_CACHING_LONG_PROMPT_MIN_TOKENS: f64 = 200.0;
 
 fn fp8_kv_cache_fix_bullet(
     kv_cache_dtype: Option<&str>,
-    weight_bytes_per_param: u8,
     fp8_compiler_available: bool,
 ) -> Option<String> {
     // Advising a switch to the dtype already in use costs operator trust;
     // dtype is observable, so observe it.
-    if kv_bytes_per_element(kv_cache_dtype, weight_bytes_per_param.max(1)) == 1 {
+    if kv_bytes_per_element(kv_cache_dtype) == 1 {
         return None;
     }
     // --kv-cache-dtype fp8 stores KV activations in fp8 via software cast - works on all GPUs
@@ -261,7 +260,6 @@ pub fn r2_recommendation(input: R2RecommendationInput<'_>) -> Option<Recommendat
                 kv_headroom_gb,
                 kv_max_seqs,
                 capacity_label,
-                weight_bytes_per_param: 2,
                 fp8_compiler_available,
                 model: None,
                 tp: None,
@@ -418,7 +416,6 @@ pub(super) struct KvFormatCtx<'a> {
     pub kv_headroom_gb: Option<f64>,
     pub kv_max_seqs: Option<u32>,
     pub capacity_label: KvCapacityLabel,
-    pub weight_bytes_per_param: u8,
     pub fp8_compiler_available: bool,
     pub model: Option<&'a crate::context::ModelArch>,
     pub tp: Option<u32>,
@@ -432,7 +429,6 @@ impl<'a> KvFormatCtx<'a> {
             model: self.model,
             kv_cache_dtype: self.snapshot.vllm.cache_config.cache_dtype.as_deref(),
             tp: self.tp,
-            weight_bytes: self.weight_bytes_per_param,
         }
     }
 }
@@ -449,7 +445,6 @@ pub(super) fn format_kv_cache_pressure_fired(
     let kv_headroom_gb = ctx.kv_headroom_gb;
     let kv_max_seqs = ctx.kv_max_seqs;
     let capacity_label = ctx.capacity_label;
-    let weight_bytes_per_param = ctx.weight_bytes_per_param;
     let fp8_compiler_available = ctx.fp8_compiler_available;
     let kv_cache_dtype = snapshot.vllm.cache_config.cache_dtype.as_deref();
     let kv_avg = d.kv_cache_usage_perc;
@@ -537,11 +532,7 @@ pub(super) fn format_kv_cache_pressure_fired(
     } else {
         safe.push(kv_headroom_gpu_mem_bullet(kv_headroom_gb));
     }
-    if let Some(bullet) = fp8_kv_cache_fix_bullet(
-        kv_cache_dtype,
-        weight_bytes_per_param,
-        fp8_compiler_available,
-    ) {
+    if let Some(bullet) = fp8_kv_cache_fix_bullet(kv_cache_dtype, fp8_compiler_available) {
         safe.push(bullet);
     }
 
@@ -635,11 +626,7 @@ pub(super) fn format_kv_admission_backlog_issue(
         safe.push(bullet);
     }
     safe.push(kv_headroom_gpu_mem_bullet(ctx.kv_headroom_gb));
-    if let Some(bullet) = fp8_kv_cache_fix_bullet(
-        kv_cache_dtype,
-        ctx.weight_bytes_per_param,
-        ctx.fp8_compiler_available,
-    ) {
+    if let Some(bullet) = fp8_kv_cache_fix_bullet(kv_cache_dtype, ctx.fp8_compiler_available) {
         safe.push(bullet);
     }
 
@@ -733,7 +720,6 @@ mod tests {
             kv_headroom_gb,
             kv_max_seqs,
             capacity_label: KvCapacityLabel::Derived,
-            weight_bytes_per_param: 2,
             fp8_compiler_available: false,
             model: None,
             tp: None,
@@ -1447,33 +1433,29 @@ mod tests {
     #[test]
     fn fp8_kv_cache_bullet_reflects_compiler_availability() {
         let with_compiler =
-            fp8_kv_cache_fix_bullet(None, 2, true).expect("bf16/auto should suggest fp8");
+            fp8_kv_cache_fix_bullet(None, true).expect("bf16/auto should suggest fp8");
         assert!(with_compiler.contains("Switch --kv-cache-dtype fp8"));
         assert!(with_compiler.contains("(affects output quality)"));
         assert!(!with_compiler.contains("FP8 compiler not found"));
         let without_compiler =
-            fp8_kv_cache_fix_bullet(None, 2, false).expect("bf16/auto should suggest fp8");
+            fp8_kv_cache_fix_bullet(None, false).expect("bf16/auto should suggest fp8");
         assert!(without_compiler.contains("(affects output quality; FP8 compiler not found)"));
     }
 
     #[test]
     fn fp8_kv_cache_bullet_suppressed_when_already_fp8() {
-        assert!(fp8_kv_cache_fix_bullet(Some("fp8"), 2, true).is_none());
-        assert!(fp8_kv_cache_fix_bullet(Some("FP8"), 2, true).is_none());
-        assert!(fp8_kv_cache_fix_bullet(Some("e4m3fnuz"), 2, true).is_none());
-        assert!(fp8_kv_cache_fix_bullet(Some("e5m2"), 2, true).is_none());
-        assert!(fp8_kv_cache_fix_bullet(Some("auto"), 2, true).is_some());
+        assert!(fp8_kv_cache_fix_bullet(Some("fp8"), true).is_none());
+        assert!(fp8_kv_cache_fix_bullet(Some("FP8"), true).is_none());
+        assert!(fp8_kv_cache_fix_bullet(Some("e4m3fnuz"), true).is_none());
+        assert!(fp8_kv_cache_fix_bullet(Some("e5m2"), true).is_none());
+        assert!(fp8_kv_cache_fix_bullet(Some("auto"), true).is_some());
     }
 
     #[test]
     fn fp8_kv_cache_bullet_uses_resolved_kv_bytes() {
         assert!(
-            fp8_kv_cache_fix_bullet(Some("auto"), 2, true).is_some(),
-            "auto + bf16 weights should still suggest fp8 KV"
-        );
-        assert!(
-            fp8_kv_cache_fix_bullet(Some("auto"), 1, true).is_none(),
-            "auto + fp8 weights resolves to one-byte KV, so no switch is needed"
+            fp8_kv_cache_fix_bullet(Some("auto"), true).is_some(),
+            "auto uses activation dtype (2 bytes); fp8 KV still helps"
         );
     }
 
@@ -1656,7 +1638,6 @@ mod tests {
             kv_headroom_gb: None,
             kv_max_seqs: Some(8),
             capacity_label: KvCapacityLabel::Observed,
-            weight_bytes_per_param: 2,
             fp8_compiler_available: false,
             model: None,
             tp: None,

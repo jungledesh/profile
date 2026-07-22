@@ -204,7 +204,7 @@ mod tests {
 
     use super::*;
     use crate::engine::baseline::{CostEstimate, CostSource};
-    use crate::engine::{CeilingEstimate, PhysicsBaseline, WeightDtypeSource};
+    use crate::engine::{CeilingEstimate, KvCacheDtypeSource, PhysicsBaseline, WeightDtypeSource};
     use crate::{
         collectors::{RawSnapshot, VllmRawMetrics},
         context::{RuntimeWindow, StaticContext},
@@ -260,6 +260,8 @@ mod tests {
                 weight_dtype_source: WeightDtypeSource::Fallback,
                 weight_gb: 1.0,
                 weight_bytes_per_param: 2,
+                kv_bytes_per_element: 2,
+                kv_cache_dtype_source: KvCacheDtypeSource::Auto,
                 kv_headroom_gb: None,
                 tpot_floor_ms: 1.0,
                 prefill_latency_floor_ms: None,
