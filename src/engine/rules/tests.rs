@@ -631,6 +631,113 @@ fn effective_kv_dtype_baseline_capacity_and_r2_agree() {
 }
 
 #[test]
+fn unknown_kv_dtype_request_floor_fires_hedged_weights_overflow_unaffected() {
+    use crate::engine::baseline::{KvCacheDtypeSource, compute};
+
+    let t = SystemTime::UNIX_EPOCH;
+    // Tiny weights + huge KV geometry → positive headroom but one request won't fit.
+    let snap = RawSnapshot {
+        gpu_observed_at: t,
+        vllm_observed_at: t,
+        timestamp: t,
+        vllm: VllmRawMetrics {
+            model_name: Some("meta-llama/Llama-3.1-8B-Instruct".to_string()),
+            generation_tokens_per_sec: Some(50.0),
+            num_requests_running: Some(4.0),
+            window_duration_secs: Some(2.0),
+            cache_config: crate::collectors::CacheConfigLabels {
+                cache_dtype: Some("mystery_dtype".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        gpus: vec![GpuRawMetrics {
+            gpu_name: Some("NVIDIA A100-SXM4-80GB".to_string()),
+            vram_total_mb: Some(80 * 1024),
+            ..Default::default()
+        }],
+    };
+    let cfg = VllmConfig {
+        dtype: Some("bf16".to_string()),
+        kv_cache_dtype: None,
+        max_model_len: Some(131072),
+        gpu_memory_utilization: Some(0.9),
+        ..Default::default()
+    };
+    let mut ctx = StaticContext::from_snapshot(&snap, cfg);
+    ctx.model.param_count = Some(1_000_000_000);
+    ctx.model.num_layers = Some(128);
+    ctx.model.num_kv_heads = Some(64);
+    ctx.model.head_dim = Some(256);
+    ctx.model.default_weight_dtype = Some("bf16".to_string());
+    let win = RuntimeWindow::from_snapshot(snap);
+    let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+    assert_eq!(b.kv_cache_dtype_source, KvCacheDtypeSource::Unknown);
+    assert!(b.kv_headroom_gb.expect("headroom") > 0.0);
+
+    let windows: Vec<_> = (0..ENGINE_MIN_PERSISTENT_WINDOWS)
+        .map(|_| win.clone())
+        .collect();
+    let summary = ai(&ctx, &windows[0]);
+    let report = build_report_for_windows(&windows, summary);
+    let floor = report
+        .recommendations
+        .iter()
+        .find(|r| r.rule_name == rule_names::OOM_RISK)
+        .expect("Unknown KV dtype still fires one-request floor");
+    let text = floor.display_lines.join("\n");
+    assert!(text.contains("(est)"));
+    assert!(text.contains("KV cache dtype unrecognized; sized at 2 bytes/element."));
+    assert!(text.contains("Confidence: Low"));
+    assert!(text.contains("cannot hold a single request"));
+
+    // Explicit bf16: same floor, no provenance hedge, High confidence.
+    let snap_known = RawSnapshot {
+        vllm: VllmRawMetrics {
+            cache_config: crate::collectors::CacheConfigLabels {
+                cache_dtype: Some("bf16".to_string()),
+                ..Default::default()
+            },
+            ..windows[0].snapshot.vllm.clone()
+        },
+        ..windows[0].snapshot.clone()
+    };
+    let win_known = RuntimeWindow::from_snapshot(snap_known);
+    let windows_known: Vec<_> = (0..ENGINE_MIN_PERSISTENT_WINDOWS)
+        .map(|_| win_known.clone())
+        .collect();
+    let summary_known = ai(&ctx, &windows_known[0]);
+    let report_known = build_report_for_windows(&windows_known, summary_known);
+    let known = report_known
+        .recommendations
+        .iter()
+        .find(|r| r.rule_name == rule_names::OOM_RISK)
+        .expect("explicit bf16 fires floor");
+    let known_text = known.display_lines.join("\n");
+    assert!(known_text.contains("cannot hold a single request"));
+    assert!(!known_text.contains("KV cache dtype unrecognized"));
+    assert!(known_text.contains("Confidence: High"));
+
+    // Weights overflow path ignores KV Unknown: oversized weights still fire.
+    let mut ctx_overflow = ctx.clone();
+    ctx_overflow.model.param_count = Some(200_000_000_000);
+    let report_overflow = build_report_for_windows(&windows, ai(&ctx_overflow, &windows[0]));
+    assert!(
+        report_overflow.recommendations.iter().any(|r| {
+            r.rule_name == rule_names::OOM_RISK
+                && r.display_lines
+                    .iter()
+                    .any(|l| l.contains("Model weights exceed GPU VRAM"))
+                && !r
+                    .display_lines
+                    .iter()
+                    .any(|l| l.contains("KV cache dtype unrecognized"))
+        }),
+        "weights-overflow must fire unchanged when KV dtype is Unknown"
+    );
+}
+
+#[test]
 fn compute_kv_max_seqs_whiteboard_reduces_hybrid_capacity() {
     let hybrid = qwen36_hybrid_model_with_attention();
     let attention_only = ModelArch {

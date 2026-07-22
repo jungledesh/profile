@@ -263,6 +263,7 @@ pub fn r2_recommendation(input: R2RecommendationInput<'_>) -> Option<Recommendat
                 fp8_compiler_available,
                 model: None,
                 tp: None,
+                kv_cache_dtype: snapshot.vllm.cache_config.cache_dtype.as_deref(),
             },
             windows_fired,
             total_evaluable,
@@ -419,6 +420,9 @@ pub(super) struct KvFormatCtx<'a> {
     pub fp8_compiler_available: bool,
     pub model: Option<&'a crate::context::ModelArch>,
     pub tp: Option<u32>,
+    /// Effective KV dtype (runtime label, else launch config). Single source for
+    /// fp8-switch advice and hypothesis capacity pricing; never re-read snapshot.
+    pub kv_cache_dtype: Option<&'a str>,
 }
 
 impl<'a> KvFormatCtx<'a> {
@@ -427,7 +431,7 @@ impl<'a> KvFormatCtx<'a> {
             cache: &self.snapshot.vllm.cache_config,
             kv_headroom_gb: self.kv_headroom_gb,
             model: self.model,
-            kv_cache_dtype: self.snapshot.vllm.cache_config.cache_dtype.as_deref(),
+            kv_cache_dtype: self.kv_cache_dtype,
             tp: self.tp,
         }
     }
@@ -446,7 +450,7 @@ pub(super) fn format_kv_cache_pressure_fired(
     let kv_max_seqs = ctx.kv_max_seqs;
     let capacity_label = ctx.capacity_label;
     let fp8_compiler_available = ctx.fp8_compiler_available;
-    let kv_cache_dtype = snapshot.vllm.cache_config.cache_dtype.as_deref();
+    let kv_cache_dtype = ctx.kv_cache_dtype;
     let kv_avg = d.kv_cache_usage_perc;
     let peak = d.kv_peak_pct;
     let mut out = vec![
@@ -591,7 +595,7 @@ pub(super) fn format_kv_admission_backlog_issue(
     windows_fired: usize,
     total_evaluable: usize,
 ) -> Vec<String> {
-    let kv_cache_dtype = ctx.snapshot.vllm.cache_config.cache_dtype.as_deref();
+    let kv_cache_dtype = ctx.kv_cache_dtype;
     let mut out = vec![
         "[!] KV Cache Pressure: Admission Backlog".to_string(),
         "    Cause:".to_string(),
@@ -723,6 +727,7 @@ mod tests {
             fp8_compiler_available: false,
             model: None,
             tp: None,
+            kv_cache_dtype: snapshot.vllm.cache_config.cache_dtype.as_deref(),
         }
     }
 
@@ -1460,6 +1465,131 @@ mod tests {
     }
 
     #[test]
+    fn effective_fp8_suppresses_switch_bullet_pressure_and_backlog() {
+        use super::super::{HypCapacityCtx, capacity_at_hypothetical_max_len};
+        use crate::context::ModelArch;
+
+        let model = ModelArch {
+            num_kv_heads: Some(8),
+            head_dim: Some(128),
+            num_layers: Some(32),
+            param_count: Some(7_000_000_000),
+            default_weight_dtype: Some("bf16".to_string()),
+            ..Default::default()
+        };
+        let pressure = KvCachePressureDetail {
+            kv_cache_usage_perc: Some(90.0),
+            kv_peak_pct: Some(90.0),
+            preemptions_active: false,
+            queue_backpressure: true,
+        };
+        let backlog = sample_backlog_detail();
+        let headroom = Some(20.0_f64);
+        let max_len = Some(8192_u32);
+
+        // config fp8 + runtime None (eval fills effective dtype onto ctx)
+        let snap_config = snap(VllmRawMetrics {
+            kv_cache_usage_perc: Some(90.0),
+            num_requests_waiting: Some(5.0),
+            ..Default::default()
+        });
+        let mut ctx_config = kv_ctx(&snap_config, max_len, headroom, None);
+        ctx_config.kv_cache_dtype = Some("fp8");
+        ctx_config.fp8_compiler_available = true;
+        ctx_config.model = Some(&model);
+        let pressure_config =
+            format_kv_cache_pressure_fired(&pressure, &ctx_config, 3, 4).join("\n");
+        let backlog_config =
+            format_kv_admission_backlog_issue(&backlog, 75, &ctx_config, 3, 4).join("\n");
+        assert!(
+            !pressure_config.contains("Switch --kv-cache-dtype fp8"),
+            "config-only fp8 must suppress pressure bullet"
+        );
+        assert!(
+            !backlog_config.contains("Switch --kv-cache-dtype fp8"),
+            "config-only fp8 must suppress backlog bullet"
+        );
+        let hyp_fp8 = ctx_config.hyp_capacity();
+        let cap_fp8 = capacity_at_hypothetical_max_len(4096, max_len, &hyp_fp8);
+        let hyp_bf16 = HypCapacityCtx {
+            cache: hyp_fp8.cache,
+            kv_headroom_gb: hyp_fp8.kv_headroom_gb,
+            model: hyp_fp8.model,
+            kv_cache_dtype: Some("bf16"),
+            tp: hyp_fp8.tp,
+        };
+        let cap_bf16 = capacity_at_hypothetical_max_len(4096, max_len, &hyp_bf16);
+        let cap_fp8 = cap_fp8.expect("fp8 capacity");
+        assert_eq!(
+            cap_fp8,
+            cap_bf16.expect("bf16 capacity") * 2,
+            "hypothesis capacity must price config fp8 at 1 byte"
+        );
+
+        // runtime fp8 alone (regression)
+        let snap_runtime = snap(VllmRawMetrics {
+            kv_cache_usage_perc: Some(90.0),
+            num_requests_waiting: Some(5.0),
+            cache_config: CacheConfigLabels {
+                cache_dtype: Some("fp8".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let mut ctx_runtime = kv_ctx(&snap_runtime, max_len, headroom, None);
+        ctx_runtime.fp8_compiler_available = true;
+        ctx_runtime.model = Some(&model);
+        assert_eq!(ctx_runtime.kv_cache_dtype, Some("fp8"));
+        let pressure_runtime =
+            format_kv_cache_pressure_fired(&pressure, &ctx_runtime, 3, 4).join("\n");
+        let backlog_runtime =
+            format_kv_admission_backlog_issue(&backlog, 75, &ctx_runtime, 3, 4).join("\n");
+        assert!(
+            !pressure_runtime.contains("Switch --kv-cache-dtype fp8"),
+            "runtime fp8 must suppress pressure bullet"
+        );
+        assert!(
+            !backlog_runtime.contains("Switch --kv-cache-dtype fp8"),
+            "runtime fp8 must suppress backlog bullet"
+        );
+        let hyp_rt = ctx_runtime.hyp_capacity();
+        assert_eq!(
+            capacity_at_hypothetical_max_len(4096, max_len, &hyp_rt).expect("runtime fp8 cap"),
+            cap_fp8
+        );
+
+        // runtime bf16 + config fp8 → runtime wins; switch-to-fp8 bullet offered
+        let snap_runtime_bf16 = snap(VllmRawMetrics {
+            kv_cache_usage_perc: Some(90.0),
+            num_requests_waiting: Some(5.0),
+            cache_config: CacheConfigLabels {
+                cache_dtype: Some("bf16".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let mut ctx_rt_bf16 = kv_ctx(&snap_runtime_bf16, max_len, headroom, None);
+        // eval would set effective_kv_cache_dtype(Some("bf16"), Some("fp8")) → bf16
+        ctx_rt_bf16.kv_cache_dtype =
+            crate::engine::baseline::effective_kv_cache_dtype(Some("bf16"), Some("fp8"));
+        ctx_rt_bf16.fp8_compiler_available = true;
+        ctx_rt_bf16.model = Some(&model);
+        assert_eq!(ctx_rt_bf16.kv_cache_dtype, Some("bf16"));
+        let pressure_bf16 =
+            format_kv_cache_pressure_fired(&pressure, &ctx_rt_bf16, 3, 4).join("\n");
+        let backlog_bf16 =
+            format_kv_admission_backlog_issue(&backlog, 75, &ctx_rt_bf16, 3, 4).join("\n");
+        assert!(
+            pressure_bf16.contains("Switch --kv-cache-dtype fp8"),
+            "runtime bf16 must still offer fp8 switch on pressure"
+        );
+        assert!(
+            backlog_bf16.contains("Switch --kv-cache-dtype fp8"),
+            "runtime bf16 must still offer fp8 switch on backlog"
+        );
+    }
+
+    #[test]
     fn peak_fires_when_avg_below_threshold() {
         let v = VllmRawMetrics {
             kv_cache_usage_perc: Some(58.0),
@@ -1641,6 +1771,7 @@ mod tests {
             fp8_compiler_available: false,
             model: None,
             tp: None,
+            kv_cache_dtype: snap.vllm.cache_config.cache_dtype.as_deref(),
         };
         let d = KvCachePressureDetail {
             kv_cache_usage_perc: Some(90.0),

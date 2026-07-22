@@ -18,7 +18,7 @@ use super::r3_low_prefix_reuse::{
     LowPrefixReuseDetail, Rule3Outcome, aggregate_r3_detail, format_low_prefix_window_issue,
     rule3_low_prefix_reuse,
 };
-use super::r4_oom_risk::r4_recommendation_with_request_floor;
+use super::r4_oom_risk::{R4FloorEvidence, r4_recommendation_with_request_floor};
 use super::r5_concurrency_saturation::{
     ConcurrencySaturationDetail, aggregate_concurrency_saturation_detail,
     format_concurrency_saturation_window_issue, r5_confidence, rule5_concurrency_saturation,
@@ -522,6 +522,10 @@ fn build_report_from_eval(
         let r2_agg = aggregate_r2_detail(&eval.r2_details);
         let conf = kv_pressure_confidence(eval.r2_fired, eval.n_eval);
         prescribed_kv_capacity = prescribed_for_self_grade(r2_kv_max_seqs, r2_capacity_label);
+        let kv_dtype = effective_kv_cache_dtype(
+            summary_snap.vllm.cache_config.cache_dtype.as_deref(),
+            summary.ctx.config.kv_cache_dtype.as_deref(),
+        );
         let display_lines = format_kv_cache_window_issue(
             &r2_agg,
             pct(eval.r2_fired, eval.n_eval),
@@ -534,6 +538,7 @@ fn build_report_from_eval(
                 fp8_compiler_available,
                 model: Some(&summary.ctx.model),
                 tp,
+                kv_cache_dtype: kv_dtype,
             },
             eval.r2_fired,
             eval.n_eval,
@@ -548,6 +553,10 @@ fn build_report_from_eval(
     } else if r2_backlog_significant {
         let agg = aggregate_backlog_detail(&eval.r2_backlog_details);
         prescribed_kv_capacity = prescribed_for_self_grade(r2_kv_max_seqs, r2_capacity_label);
+        let kv_dtype = effective_kv_cache_dtype(
+            summary_snap.vllm.cache_config.cache_dtype.as_deref(),
+            summary.ctx.config.kv_cache_dtype.as_deref(),
+        );
         let display_lines = format_kv_admission_backlog_issue(
             &agg,
             pct(eval.r2_backlog_fired, eval.n_eval),
@@ -560,6 +569,7 @@ fn build_report_from_eval(
                 fp8_compiler_available,
                 model: Some(&summary.ctx.model),
                 tp,
+                kv_cache_dtype: kv_dtype,
             },
             eval.r2_backlog_fired,
             eval.n_eval,
@@ -689,16 +699,16 @@ fn build_report_from_eval(
         });
     }
 
+    // Always resolve KV pricing provenance; Unknown still prices the floor but
+    // R4 names the guess and caps confidence (see r4_recommendation_with_request_floor).
+    let (kv_bpp, kv_src) = match baseline.as_ref() {
+        Some(b) => (b.kv_bytes_per_element, b.kv_cache_dtype_source),
+        None => baseline::resolve_kv_cache_element(effective_kv_cache_dtype(
+            summary_snap.vllm.cache_config.cache_dtype.as_deref(),
+            summary.ctx.config.kv_cache_dtype.as_deref(),
+        )),
+    };
     let request_bytes = if tp.is_none_or(|value| value <= 1) {
-        let kv_bpp = baseline
-            .as_ref()
-            .map(|b| b.kv_bytes_per_element)
-            .unwrap_or_else(|| {
-                baseline::kv_bytes_per_element(effective_kv_cache_dtype(
-                    summary_snap.vllm.cache_config.cache_dtype.as_deref(),
-                    summary.ctx.config.kv_cache_dtype.as_deref(),
-                ))
-            });
         max_model_len.and_then(|len| baseline::bytes_per_seq(&summary.ctx.model, len, kv_bpp))
     } else {
         None
@@ -713,7 +723,10 @@ fn build_report_from_eval(
             .as_ref()
             .map(|b| b.weight_dtype_source)
             .unwrap_or(WeightDtypeSource::Fallback),
-        request_bytes,
+        R4FloorEvidence {
+            request_bytes,
+            kv_cache_dtype_source: kv_src,
+        },
     ) {
         recs.push(r4);
     }
