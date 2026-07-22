@@ -197,7 +197,9 @@ pub fn limiter_line(e: &LimiterEvidence) -> Option<String> {
                 line.push_str(" KV unmeasured.");
             }
             if result.traffic_skipped {
-                line.push_str(" hardware ceiling unknown.");
+                // traffic_skipped = missing running or ridge; FrameworkOverhead
+                // already requires running, so this is ridge (batch saturation target).
+                line.push_str(" Ridge unmeasured.");
             }
             Some(line)
         }
@@ -502,7 +504,7 @@ mod tests {
         assert!(both_cleared.contains("batch healthy"));
         assert!(both_cleared.contains("memory free"));
         assert!(!both_cleared.contains("KV unmeasured"));
-        assert!(!both_cleared.contains("hardware ceiling unknown"));
+        assert!(!both_cleared.contains("Ridge unmeasured"));
 
         let kv_skipped = limiter_line(&ev(
             None,
@@ -529,7 +531,7 @@ mod tests {
         ))
         .expect("line");
         assert!(traffic_skipped.contains("memory free"));
-        assert!(traffic_skipped.contains("hardware ceiling unknown"));
+        assert!(traffic_skipped.contains("Ridge unmeasured"));
         assert!(!traffic_skipped.contains("batch healthy"));
     }
 

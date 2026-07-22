@@ -493,8 +493,10 @@ fn config_status_lines(
     } else if non_baseline_drifted {
         "  Config changed.".to_string()
     } else if load_changed {
+        // QPS-only load moves leave running equal; never print "N -> N".
+        // Compare rounded display values so 50.2 → 50.4 does not claim "50 -> 50".
         match (running_before, running_after) {
-            (Some(n), Some(m)) if n.is_finite() && m.is_finite() => {
+            (Some(n), Some(m)) if n.is_finite() && m.is_finite() && n.round() != m.round() => {
                 format!("  Load changed (running {n:.0} -> {m:.0}).")
             }
             _ => "  Load changed.".to_string(),
@@ -930,6 +932,20 @@ mod tests {
     fn config_status_lines_non_r1_load_move_shows_load() {
         let lines = config_status_lines(false, false, true, false, Some(5.0), Some(25.0));
         assert_eq!(lines[0], "  Load changed (running 5 -> 25).");
+    }
+
+    #[test]
+    fn config_status_lines_equal_running_falls_back_to_generic() {
+        // load_changed can fire from QPS alone while running stays flat.
+        let lines = config_status_lines(false, false, true, false, Some(50.0), Some(50.0));
+        assert_eq!(lines[0], "  Load changed.");
+    }
+
+    #[test]
+    fn config_status_lines_same_rounded_running_falls_back_to_generic() {
+        // Display uses {:.0}; raw inequality that rounds equal must not print "50 -> 50".
+        let lines = config_status_lines(false, false, true, false, Some(50.2), Some(50.4));
+        assert_eq!(lines[0], "  Load changed.");
     }
 
     #[test]

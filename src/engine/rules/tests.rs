@@ -147,7 +147,7 @@ fn r1_test_input(snapshot: &RawSnapshot) -> R1EvalInput<'_> {
         generation_tokens_per_sec: None,
         prefix_cache_hit_rate: None,
         ridge_batch_size: None,
-        baseline_present: false,
+        r6_fired: false,
     }
 }
 
@@ -2180,6 +2180,36 @@ fn mixed_run_r6_suppresses_r1() {
                 *suppressed == rule_names::UNDER_BATCHING
                     && *suppressor == rule_names::PREFILL_BOUND
             })
+    );
+}
+
+#[test]
+fn r1_fires_when_r6_muted_by_tpot() {
+    // High prompt/gen + low occupancy, but TPOT near floor so R6 declines.
+    // Must not leave the window silent: R1 owns under-batching.
+    let windows: Vec<_> = (0..10)
+        .map(|_| mk_r6_prefill_window(12.0, 10.0, 5.0, Some(5.0)))
+        .collect();
+    let ctx = mk_llama8b_h100_ctx(&windows[0].snapshot);
+    let summary = ai(&ctx, windows.last().expect("windows"));
+    let report = build_report_for_windows(&windows, summary);
+    assert!(
+        report
+            .recommendations
+            .iter()
+            .any(|g| g.rule_name == rule_names::UNDER_BATCHING),
+        "expected R1 when R6 TPOT-muted; got {:?}",
+        report
+            .recommendations
+            .iter()
+            .map(|g| g.rule_name)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !report
+            .recommendations
+            .iter()
+            .any(|g| g.rule_name == rule_names::PREFILL_BOUND)
     );
 }
 

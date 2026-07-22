@@ -271,6 +271,32 @@ fn eval_window_rules(
         let win_input = AnalysisInput::new(summary.ctx, w);
         let win_baseline = baseline::compute(&win_input);
 
+        // R6 before R1 so R1 can defer only when R6 actually fired this window.
+        let r6_outcome = r6_evaluate(PrefillBoundEvalInput {
+            prompt_tokens_per_sec: snap.vllm.prompt_tokens_per_sec,
+            generation_tokens_per_sec: snap.vllm.generation_tokens_per_sec,
+            decode_efficiency_pct: win_baseline.as_ref().and_then(|b| b.efficiency_pct),
+            tpot_ms: snap.vllm.tpot_ms,
+            tpot_floor_ms: win_baseline.as_ref().map(|b| b.tpot_floor_ms),
+            prefix_cache_hit_rate: snap.vllm.prefix_cache_hit_rate,
+            snapshot: snap,
+            chunked_prefill_enabled: summary.ctx.config.enable_chunked_prefill,
+            ridge_batch_size: win_baseline.as_ref().map(|b| b.ridge_batch_size),
+            max_num_batched_tokens: snap
+                .vllm
+                .max_num_batched_tokens
+                .or(summary.ctx.config.max_num_batched_tokens),
+            is_hybrid: model_is_hybrid(&summary.ctx.model),
+        });
+        let r6_fired = matches!(r6_outcome, Rule6Outcome::Fired(_));
+        match r6_outcome {
+            Rule6Outcome::Fired(d) => {
+                eval.r6_fired += 1;
+                eval.r6_details.push(d);
+            }
+            Rule6Outcome::NotFired => {}
+        }
+
         match rule1_under_batching_with_efficiency(R1EvalInput {
             snapshot: snap,
             config_max_num_seqs: summary.ctx.config.max_num_seqs,
@@ -282,11 +308,7 @@ fn eval_window_rules(
             generation_tokens_per_sec: snap.vllm.generation_tokens_per_sec,
             prefix_cache_hit_rate: snap.vllm.prefix_cache_hit_rate,
             ridge_batch_size: win_baseline.as_ref().map(|b| b.ridge_batch_size),
-            // Defer to R6 only when R6 can fire (needs decode efficiency).
-            baseline_present: win_baseline
-                .as_ref()
-                .and_then(|b| b.efficiency_pct)
-                .is_some_and(|e| e.is_finite()),
+            r6_fired,
         }) {
             Rule1Outcome::Fired(d) => {
                 eval.r1_fired += 1;
@@ -328,29 +350,6 @@ fn eval_window_rules(
         ) {
             eval.r5_fired += 1;
             eval.r5_details.push(d);
-        }
-
-        match r6_evaluate(PrefillBoundEvalInput {
-            prompt_tokens_per_sec: snap.vllm.prompt_tokens_per_sec,
-            generation_tokens_per_sec: snap.vllm.generation_tokens_per_sec,
-            decode_efficiency_pct: win_baseline.as_ref().and_then(|b| b.efficiency_pct),
-            tpot_ms: snap.vllm.tpot_ms,
-            tpot_floor_ms: win_baseline.as_ref().map(|b| b.tpot_floor_ms),
-            prefix_cache_hit_rate: snap.vllm.prefix_cache_hit_rate,
-            snapshot: snap,
-            chunked_prefill_enabled: summary.ctx.config.enable_chunked_prefill,
-            ridge_batch_size: win_baseline.as_ref().map(|b| b.ridge_batch_size),
-            max_num_batched_tokens: snap
-                .vllm
-                .max_num_batched_tokens
-                .or(summary.ctx.config.max_num_batched_tokens),
-            is_hybrid: model_is_hybrid(&summary.ctx.model),
-        }) {
-            Rule6Outcome::Fired(d) => {
-                eval.r6_fired += 1;
-                eval.r6_details.push(d);
-            }
-            Rule6Outcome::NotFired => {}
         }
 
         let ridge = win_baseline.as_ref().map(|b| b.ridge_batch_size);

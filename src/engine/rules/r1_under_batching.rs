@@ -58,9 +58,9 @@ pub struct R1EvalInput<'a> {
     pub generation_tokens_per_sec: Option<f64>,
     pub prefix_cache_hit_rate: Option<f64>,
     pub ridge_batch_size: Option<f64>,
-    /// True when decode efficiency is available so R6 can fire. When false,
-    /// skip the prompt/gen defer (unknown-GPU path must still work).
-    pub baseline_present: bool,
+    /// True when R6 already fired on this window. Defer prompt/gen only then;
+    /// TPOT-muted or unknown-GPU R6 must not silence under-batching.
+    pub r6_fired: bool,
 }
 
 pub(super) fn rule1_under_batching_with_efficiency(input: R1EvalInput<'_>) -> Rule1Outcome {
@@ -73,7 +73,7 @@ pub(super) fn rule1_under_batching_with_efficiency(input: R1EvalInput<'_>) -> Ru
         generation_tokens_per_sec,
         prefix_cache_hit_rate,
         ridge_batch_size,
-        baseline_present,
+        r6_fired,
     } = input;
     let running = snapshot.vllm.num_requests_running;
 
@@ -117,10 +117,10 @@ pub(super) fn rule1_under_batching_with_efficiency(input: R1EvalInput<'_>) -> Ru
     }
     let efficiency_pct = efficiency_pct.filter(|e| e.is_finite());
 
-    // Physics-level prefill gate: if prefill dominates, R6 handles it, not R1.
-    // Only defer when R6 can fire (decode efficiency present). Otherwise unknown-GPU
-    // occupancy path would mute itself against a rule that never runs.
-    if baseline_present
+    // Prefill gate: if R6 already owns this window, do not also fire under-batching.
+    // Defer only on actual R6 fire (not "R6 could fire"): a TPOT-muted prefill window
+    // with low occupancy is still under-batching.
+    if r6_fired
         && let (Some(p_tps), Some(g_tps)) = (
             prompt_tokens_per_sec.filter(|v| v.is_finite() && *v > 0.0),
             generation_tokens_per_sec.filter(|v| v.is_finite() && *v >= 0.0),
@@ -361,7 +361,7 @@ mod tests {
         prefix_cache_hit_rate: Option<f64>,
         ridge_batch_size: Option<f64>,
         /// Defaults false via Default; set true in tests that exercise R6 defer.
-        baseline_present: bool,
+        r6_fired: bool,
     }
 
     fn r1_input(snapshot: &RawSnapshot, opts: R1InputOpts) -> R1EvalInput<'_> {
@@ -374,7 +374,7 @@ mod tests {
             generation_tokens_per_sec: opts.generation_tokens_per_sec,
             prefix_cache_hit_rate: opts.prefix_cache_hit_rate,
             ridge_batch_size: opts.ridge_batch_size,
-            baseline_present: opts.baseline_present,
+            r6_fired: opts.r6_fired,
         }
     }
 
@@ -688,7 +688,7 @@ mod tests {
                 config_relative_efficiency_pct: Some(15.0),
                 prompt_tokens_per_sec: Some(600.0),
                 generation_tokens_per_sec: Some(100.0),
-                baseline_present: true,
+                r6_fired: true,
                 ..Default::default()
             },
         )) {
@@ -708,7 +708,7 @@ mod tests {
                 prompt_tokens_per_sec: Some(600.0),
                 generation_tokens_per_sec: Some(100.0),
                 prefix_cache_hit_rate: Some(0.90),
-                baseline_present: true,
+                r6_fired: true,
                 ..Default::default()
             },
         )) {
@@ -726,7 +726,7 @@ mod tests {
                 config_relative_efficiency_pct: Some(15.0),
                 prompt_tokens_per_sec: Some(600.0),
                 generation_tokens_per_sec: Some(0.0),
-                baseline_present: true,
+                r6_fired: true,
                 ..Default::default()
             },
         )) {
@@ -736,20 +736,39 @@ mod tests {
     }
 
     #[test]
-    fn unknown_gpu_high_ratio_still_fires_when_baseline_absent() {
-        // No decode efficiency → R6 cannot fire; R1 must not defer into silence.
+    fn high_ratio_still_fires_when_r6_did_not() {
+        // R6 muted (or never fired): R1 must not defer into silence.
         let s = snap(Some(5.0), Some(256), Some(0.0));
         match rule1_under_batching_with_efficiency(r1_input(
             &s,
             R1InputOpts {
                 prompt_tokens_per_sec: Some(600.0),
                 generation_tokens_per_sec: Some(100.0),
-                baseline_present: false,
+                r6_fired: false,
                 ..Default::default()
             },
         )) {
             Rule1Outcome::Fired(d) => assert!(!d.known_gpu),
-            Rule1Outcome::NotFired => panic!("expected R1 fire on unknown-GPU occupancy path"),
+            Rule1Outcome::NotFired => panic!("expected R1 fire when R6 did not"),
+        }
+    }
+
+    #[test]
+    fn known_gpu_high_ratio_fires_when_r6_muted() {
+        // TPOT-muted R6 leaves r6_fired=false; known-GPU under-batching must still surface.
+        let s = snap(Some(5.0), Some(256), Some(0.0));
+        match rule1_under_batching_with_efficiency(r1_input(
+            &s,
+            R1InputOpts {
+                config_relative_efficiency_pct: Some(15.0),
+                prompt_tokens_per_sec: Some(600.0),
+                generation_tokens_per_sec: Some(100.0),
+                r6_fired: false,
+                ..Default::default()
+            },
+        )) {
+            Rule1Outcome::Fired(d) => assert!(d.known_gpu),
+            Rule1Outcome::NotFired => panic!("expected R1 when R6 TPOT-muted"),
         }
     }
 
