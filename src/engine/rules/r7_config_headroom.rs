@@ -479,6 +479,7 @@ mod tests {
         };
         let text = format_config_headroom_window_issue(&d, 100, 0.6, Some(&rec), true).join("\n");
         assert!(text.contains("Recommended   96 (at least 120 worst-case requests fit (est))"));
+        assert!(text.contains("Compute and KV memory headroom available."));
         assert!(!text.contains("vLLM-reported"));
         assert!(text.contains("Raise --max-num-seqs to 96."));
     }
@@ -488,7 +489,7 @@ mod tests {
         let d = ConfigHeadroomDetail {
             max_num_seqs: 32,
             recommended_seqs: 64,
-            ridge_batch_size: None,
+            ridge_batch_size: Some(153.0),
             occupancy_pct: 100.0,
             running: 32.0,
         };
@@ -499,8 +500,11 @@ mod tests {
             source: Some(KvBoundSource::Empirical),
             empirical: true,
         };
-        let text = format_config_headroom_window_issue(&d, 100, 0.5, Some(&rec), true).join("\n");
-        assert!(text.contains("KV memory headroom available; compute ridge unknown."));
+        // Empirical is not a resolved wall for the cause line.
+        let text = format_config_headroom_window_issue(&d, 100, 0.5, Some(&rec), false).join("\n");
+        assert!(text.contains("Compute headroom available; memory bound unmeasured."));
+        assert!(!text.contains("Compute and KV memory headroom available."));
+        assert!(!text.contains("KV memory headroom available"));
         assert!(text.contains("Recommended   64 (est)"));
         assert!(!text.contains("bound by"));
         assert!(!text.contains("400"));

@@ -34,8 +34,8 @@ use super::r7_config_headroom::{
     rule7_config_headroom,
 };
 use super::{
-    Recommendation, catalog_state_pages_mismatch, compute_kv_max_seqs_for_cache, recommended_seqs,
-    resolve_kv_bound, rule_is_significant, rule_names,
+    KvBoundSource, Recommendation, catalog_state_pages_mismatch, compute_kv_max_seqs_for_cache,
+    recommended_seqs, resolve_kv_bound, rule_is_significant, rule_names,
 };
 
 const SUPPRESSION_TABLE: &[(&str, &str)] = &[
@@ -599,12 +599,20 @@ fn build_report_from_eval(
                 ..d
             };
             let conf = r7_confidence(run_rec.as_ref());
+            // Observed/Derived(/Hybrid) are measured or physics-derived walls.
+            // Empirical is a traffic guess: do not claim "KV memory headroom available."
+            let memory_bound_resolved = matches!(
+                run_kv_source,
+                Some(
+                    KvBoundSource::Observed | KvBoundSource::Derived | KvBoundSource::DerivedHybrid
+                )
+            );
             let display_lines = format_config_headroom_window_issue(
                 &display,
                 pct(eval.r7_fired, eval.n_eval),
                 conf,
                 run_rec.as_ref(),
-                run_kv_bound.is_some(),
+                memory_bound_resolved,
             );
             recs.push(Recommendation {
                 rule_name: rule_names::CONFIG_HEADROOM,
@@ -714,6 +722,13 @@ struct ReportCapacityMetadata {
     memory_budget_self_grade: Option<(u64, u64)>,
 }
 
+/// Suppressing live R2 evidence requires the strongest claim: weights alone overflow VRAM.
+/// h in (-3, 0) can be buffer squeeze with weights fitting, and a running server disproves
+/// "cannot fit". R4's own firing is unchanged, only the right to hide R2 is gated harder.
+fn oom_weights_alone_overflow(kv_headroom_gb: Option<f64>) -> bool {
+    kv_headroom_gb.is_some_and(|h| h.is_finite() && h < -baseline::ACTIVATION_KV_BUFFER_GB)
+}
+
 fn finalize_report_groups(
     recs: Vec<Recommendation>,
     baseline: Option<baseline::PhysicsBaseline>,
@@ -733,13 +748,11 @@ fn finalize_report_groups(
     // Same-layer rows (OOM→KV) are unchanged: both survive until ME, then KV drops.
     let mut recs = recs;
     let fired_names: Vec<&str> = recs.iter().map(|r| r.rule_name).collect();
-    let oom_weights_dont_fit = baseline
-        .as_ref()
-        .and_then(|b| b.kv_headroom_gb)
-        .is_some_and(|h| h.is_finite() && h < 0.0);
+    let oom_weights_alone_overflow =
+        oom_weights_alone_overflow(baseline.as_ref().and_then(|b| b.kv_headroom_gb));
     for &(suppressor, suppressed) in SUPPRESSION_TABLE {
         if fired_names.contains(&suppressor) {
-            if suppressor == rule_names::OOM_RISK && !oom_weights_dont_fit {
+            if suppressor == rule_names::OOM_RISK && !oom_weights_alone_overflow {
                 continue;
             }
             let before = recs.len();
@@ -853,4 +866,117 @@ fn pct(fired: usize, total: usize) -> u32 {
         return 0;
     }
     ((fired as f64 / total as f64) * 100.0).round() as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::KvCacheDtypeSource;
+    use crate::engine::baseline::{CeilingEstimate, PhysicsBaseline, WeightDtypeSource};
+
+    fn stub_rec(rule_name: &'static str, layer: u8) -> Recommendation {
+        Recommendation {
+            rule_name,
+            layer,
+            impact: 5,
+            confidence: 0.9,
+            display_lines: vec![rule_name.to_string()],
+        }
+    }
+
+    fn baseline_with_headroom(h: f64) -> PhysicsBaseline {
+        PhysicsBaseline {
+            decode: CeilingEstimate {
+                lower: 1.0,
+                expected: 1.0,
+                upper: 1.0,
+            },
+            prefill: None,
+            efficiency_pct: None,
+            headroom_pct: None,
+            weight_dtype_source: WeightDtypeSource::EnvVar,
+            weight_gb: 70.0,
+            weight_bytes_per_param: 2,
+            kv_bytes_per_element: 2,
+            kv_cache_dtype_source: KvCacheDtypeSource::Auto,
+            kv_headroom_gb: Some(h),
+            tpot_floor_ms: 1.0,
+            prefill_latency_floor_ms: None,
+            ridge_batch_size: 1.0,
+            config_relative_efficiency_pct: None,
+            cost: None,
+        }
+    }
+
+    fn finalize_oom_kv(h: f64) -> Report {
+        finalize_report_groups(
+            vec![
+                stub_rec(rule_names::OOM_RISK, 2),
+                stub_rec(rule_names::KV_CACHE_PRESSURE, 2),
+            ],
+            Some(baseline_with_headroom(h)),
+            ReportCapacityMetadata {
+                kv_max_seqs: None,
+                prescribed_kv_capacity: None,
+                catalog_state_mismatch: None,
+                memory_budget_self_grade: None,
+            },
+            15,
+            crate::engine::EvalSkipStats {
+                skipped_broken: 0,
+                skipped_idle: 0,
+                energy_skew_skipped: 0,
+                gauge_missing: Default::default(),
+                limiter_evidence: None,
+            },
+        )
+    }
+
+    #[test]
+    fn buffer_squeeze_oom_keeps_kv_pressure() {
+        // h = -1.0 is inside the 3GB activation buffer: R4 may fire, R2 survives.
+        let report = finalize_oom_kv(-1.0);
+        let names: Vec<_> = report.recommendations.iter().map(|r| r.rule_name).collect();
+        assert!(names.contains(&rule_names::OOM_RISK));
+        assert!(names.contains(&rule_names::KV_CACHE_PRESSURE));
+        assert!(
+            report.suppressed_rules.is_empty(),
+            "buffer squeeze must not suppress R2: {:?}",
+            report.suppressed_rules
+        );
+    }
+
+    #[test]
+    fn weights_alone_overflow_suppresses_kv_pressure() {
+        // h = -4.0 is past the 3GB buffer: weights alone overflow → R2 suppressed.
+        let report = finalize_oom_kv(-4.0);
+        assert!(
+            report
+                .recommendations
+                .iter()
+                .any(|r| r.rule_name == rule_names::OOM_RISK)
+        );
+        assert!(
+            !report
+                .recommendations
+                .iter()
+                .any(|r| r.rule_name == rule_names::KV_CACHE_PRESSURE)
+        );
+        assert!(
+            report
+                .suppressed_rules
+                .iter()
+                .any(|(s, by)| *s == rule_names::KV_CACHE_PRESSURE && *by == rule_names::OOM_RISK)
+        );
+    }
+
+    #[test]
+    fn oom_weights_alone_overflow_gate() {
+        assert!(!oom_weights_alone_overflow(Some(-1.0)));
+        assert!(!oom_weights_alone_overflow(Some(
+            -baseline::ACTIVATION_KV_BUFFER_GB
+        )));
+        assert!(oom_weights_alone_overflow(Some(-4.0)));
+        assert!(!oom_weights_alone_overflow(None));
+    }
 }
