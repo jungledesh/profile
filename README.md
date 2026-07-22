@@ -1,6 +1,6 @@
 # Profile [ Under Construction ]
 
-`Note: Profile's core engine is under construction since the last version launch; some parts of this file is stale`
+`Note: Profile's core engine is under construction since the last version launch; some parts of this file are stale`
 
 A physics-grounded, cost-aware optimization loop for vLLM inference servers.
 
