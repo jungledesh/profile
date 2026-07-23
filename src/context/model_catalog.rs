@@ -550,13 +550,17 @@ static CATALOG: &[ModelEntry] = &[
     },
     // Gemma 4 26B-A4B MoE. Its local/global KV geometry also cannot be
     // represented by the current model, so KV fields stay None.
-    // Source: https://huggingface.co/google/gemma-4-26b-it/raw/main/config.json (accessed 2026-07-16)
+    // Param counts from model card (25.2B total / 3.8B active), not marketing integers.
+    // Official repos: google/gemma-4-26B-A4B and google/gemma-4-26B-A4B-it
+    // (not google/gemma-4-26b-it). Tokens gemma+4+26b still match both.
+    // Source: https://huggingface.co/google/gemma-4-26B-A4B-it/raw/main/config.json
+    // (accessed 2026-07-23)
     ModelEntry {
         tokens: &["gemma", "4", "26b"],
         entry: catalog_dense! {
             family: "gemma4",
-            param_count: 26 * B,
-            active_param_count: Some(4 * B),
+            param_count: 25_200_000_000,
+            active_param_count: Some(3_800_000_000),
             num_layers: 30, // Verified from HF config
             hidden_dim: 2816, // Verified from HF config
             default_weight_dtype: "bf16",
@@ -1036,9 +1040,15 @@ mod tests {
     fn gemma_4_26b() {
         let e = lookup_model("gemma-4-26b-it-bf16.gguf").expect("no match");
         assert_eq!(e.family, "gemma4");
-        assert_eq!(e.param_count, 26 * B);
-        assert_eq!(e.active_param_count, Some(4 * B));
-        assert!(e.active_param_count.is_some());
+        assert_eq!(e.param_count, 25_200_000_000);
+        assert_eq!(e.active_param_count, Some(3_800_000_000));
+    }
+
+    #[test]
+    fn gemma_4_26b_a4b_official_name() {
+        let e = lookup_model("google/gemma-4-26B-A4B-it").expect("no match");
+        assert_eq!(e.param_count, 25_200_000_000);
+        assert_eq!(e.active_param_count, Some(3_800_000_000));
     }
 
     #[test]
