@@ -198,6 +198,7 @@ pythonpath_for() {
     case "$1" in
         psf/requests)      echo "" ;;      # package at checkout root
         pytest-dev/pytest) echo "src" ;;   # src layout
+        *) echo "unsupported repo in pythonpath_for: $1" >&2; return 1 ;;
     esac
 }
 
@@ -205,6 +206,7 @@ venv_for() {
     case "$1" in
         psf/requests)      echo "$SWARM_HOME/venv-requests" ;;
         pytest-dev/pytest) echo "$SWARM_HOME/venv-pytest" ;;
+        *) echo "unsupported repo in venv_for: $1" >&2; return 1 ;;
     esac
 }
 

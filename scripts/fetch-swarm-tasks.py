@@ -120,6 +120,11 @@ def main():
         extra = sorted(got_ids - EXPECTED)
         sys.exit(f"FAIL integrity check.\n missing: {missing}\n extra: {extra}")
 
+    # Keep ONLY the declared fields, whatever the server returned. The API's
+    # column filter is advisory; without this, extra fields leak in --
+    # including `patch`, the gold fix, which must NOT ship next to the tasks.
+    rows = [{f: r[f] for f in FIELDS} for r in rows]
+
     for r in rows:
         if not all(r.get(f) for f in FIELDS):
             sys.exit(f"FAIL empty field in {r['instance_id']}")
