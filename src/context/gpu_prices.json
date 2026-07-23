@@ -1,6 +1,6 @@
 {
-  "note": "on_demand_per_hr from https://www.runpod.io/pricing where the GPU is listed on the Pods page (as_of 2026-07-16). spot_per_hr is a market estimate unless spot_source says otherwise. Rows not on RunPod use market estimate for both.",
-  "updated": "2026-07-16",
+  "note": "on_demand_per_hr from https://www.runpod.io/pricing where the GPU is listed on the Pods page (see per-row as_of). spot_per_hr is a market estimate unless spot_source says otherwise. Rows not on RunPod use market estimate for both.",
+  "updated": "2026-07-23",
   "gpus": {
     "h100 pcie": {
       "name": "NVIDIA H100 PCIe",
