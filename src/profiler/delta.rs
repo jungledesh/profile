@@ -271,6 +271,7 @@ mod tests {
             }),
             recommendations: Vec::new(),
             suppressed_rules: Vec::new(),
+            suppressed_recs: Vec::new(),
             kv_max_seqs: None,
             prescribed_kv_capacity: None,
             catalog_state_mismatch: None,

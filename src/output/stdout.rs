@@ -45,8 +45,15 @@ pub fn print_diagnose_table_with_report(
     report: &engine::Report,
     aggregate_win: &RuntimeWindow,
     verbose_rules: bool,
+    reveal_suppressed: bool,
 ) {
-    let lines = build_diagnose_lines(result, aggregate_win, report, verbose_rules);
+    let lines = build_diagnose_lines(
+        result,
+        aggregate_win,
+        report,
+        verbose_rules,
+        reveal_suppressed,
+    );
     print_boxed(&lines);
     if let Some(j) = journey_line(report) {
         println!();
@@ -59,6 +66,7 @@ fn build_diagnose_lines(
     aggregate_win: &RuntimeWindow,
     report: &engine::Report,
     verbose_rules: bool,
+    reveal_suppressed: bool,
 ) -> Vec<String> {
     let snapshot = &result.snapshot;
     let v = &snapshot.vllm;
@@ -204,6 +212,7 @@ fn build_diagnose_lines(
         verbose_rules,
         &result.metrics_input,
         result.duration.as_secs(),
+        reveal_suppressed,
     );
     if !rule_lines.is_empty() {
         lines.push(String::new());
@@ -850,7 +859,7 @@ mod tests {
         let aggregate_win = RuntimeWindow::from_snapshot(result.snapshot.clone());
         let summary_input = AnalysisInput::new(&result.static_ctx, &aggregate_win);
         let report = engine::build_report_for_diagnose(&result.windows, summary_input);
-        build_diagnose_lines(result, &aggregate_win, &report, verbose_rules)
+        build_diagnose_lines(result, &aggregate_win, &report, verbose_rules, false)
     }
 
     #[test]
@@ -1760,6 +1769,7 @@ mod tests {
                 display_lines: vec!["[!] OOM".to_string()],
             }],
             suppressed_rules: Vec::new(),
+            suppressed_recs: Vec::new(),
             kv_max_seqs: None,
             prescribed_kv_capacity: None,
             catalog_state_mismatch: None,
