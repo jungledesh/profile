@@ -97,6 +97,20 @@ mod tests {
     }
 
     #[test]
+    fn h100_nvl_price() {
+        let p = lookup_gpu_price("NVIDIA H100 NVL").expect("h100 nvl price");
+        assert!((p.on_demand_per_hr - 3.19).abs() < 1e-9);
+        assert!((p.spot_per_hr - 1.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn h100_nvl_does_not_match_pcie_or_sxm_price() {
+        let p = lookup_gpu_price("NVIDIA H100 NVL").expect("h100 nvl price");
+        assert!((p.on_demand_per_hr - 2.89).abs() > 1e-9);
+        assert!((p.on_demand_per_hr - 2.99).abs() > 1e-9);
+    }
+
+    #[test]
     fn gb200_does_not_match_b200_price() {
         let p = lookup_gpu_price("NVIDIA GB200").expect("gb200 price");
         assert!((p.on_demand_per_hr - 8.50).abs() < 1e-9);

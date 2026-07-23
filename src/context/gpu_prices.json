@@ -26,6 +26,14 @@
       "spot_source": "market estimate",
       "as_of": "2026-07-16"
     },
+    "h100 nvl": {
+      "name": "NVIDIA H100 NVL",
+      "on_demand_per_hr": 3.19,
+      "spot_per_hr": 1.9,
+      "source": "https://www.runpod.io/pricing",
+      "spot_source": "market estimate",
+      "as_of": "2026-07-23"
+    },
     "h200": {
       "name": "NVIDIA H200",
       "on_demand_per_hr": 4.39,
