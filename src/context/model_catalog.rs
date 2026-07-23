@@ -553,7 +553,9 @@ static CATALOG: &[ModelEntry] = &[
     // Param counts from model card (25.2B total / 3.8B active), not marketing integers.
     // Official repos: google/gemma-4-26B-A4B and google/gemma-4-26B-A4B-it
     // (not google/gemma-4-26b-it). Tokens gemma+4+26b still match both.
-    // Source: https://huggingface.co/google/gemma-4-26B-A4B-it/raw/main/config.json
+    // Param counts: https://huggingface.co/google/gemma-4-26B-A4B-it
+    // (model card, accessed 2026-07-23). Architecture fields:
+    // https://huggingface.co/google/gemma-4-26B-A4B-it/raw/main/config.json
     // (accessed 2026-07-23)
     ModelEntry {
         tokens: &["gemma", "4", "26b"],
