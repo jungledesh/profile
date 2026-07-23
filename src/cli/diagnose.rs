@@ -43,6 +43,7 @@ pub fn execute(
         &report,
         &aggregate_win,
         verbose_rules,
+        false,
     );
 
     // Incomplete measurement: table already printed. Do not start the closed loop

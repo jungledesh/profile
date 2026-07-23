@@ -30,7 +30,7 @@ fn format_diagnose_rules_for_windows_test(
     metrics_url: &str,
 ) -> Vec<String> {
     let report = build_report_for_windows(windows, summary);
-    format_diagnose_rules_for_windows(windows, summary, &report, verbose, metrics_url, 30)
+    format_diagnose_rules_for_windows(windows, summary, &report, verbose, metrics_url, 30, false)
 }
 
 fn hint_for_empty<'a>(
@@ -1620,6 +1620,13 @@ fn format_diagnose_rules_for_windows_r4_suppresses_r2_when_both_significant() {
             .iter()
             .any(|(s, _)| *s == rule_names::KV_CACHE_PRESSURE)
     );
+    assert!(
+        report
+            .suppressed_recs
+            .iter()
+            .any(|r| r.rule_name == rule_names::KV_CACHE_PRESSURE && !r.display_lines.is_empty()),
+        "suppressed KV body must be retained for stuck-fix reveal"
+    );
 }
 
 #[test]
@@ -1995,6 +2002,7 @@ fn empty_run_stdout_and_format_sites_byte_identical() {
                     baseline: None,
                     recommendations: Vec::new(),
                     suppressed_rules: Vec::new(),
+                    suppressed_recs: Vec::new(),
                     kv_max_seqs: None,
                     prescribed_kv_capacity: None,
                     catalog_state_mismatch: None,
@@ -2009,6 +2017,7 @@ fn empty_run_stdout_and_format_sites_byte_identical() {
                 verbose,
                 metrics_url,
                 duration_secs,
+                false,
             );
             assert_eq!(
                 from_stdout_site, from_format_site,

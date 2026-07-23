@@ -27,6 +27,33 @@ fn worse_suffix(material_regression: bool) -> &'static str {
     if material_regression { "  worse" } else { "" }
 }
 
+/// True when efficiency or throughput moved up by at least the worse/plateau gates.
+/// Symmetric to the regression labels: plateau band for eff, worse % for throughput.
+pub(crate) fn delta_shows_material_improvement(d: &delta::Delta) -> bool {
+    let eff_improved = d
+        .efficiency_delta_pp
+        .is_some_and(|pp| pp.is_finite() && pp >= EFFICIENCY_PLATEAU_DELTA);
+    let tput_improved = match (d.throughput_before, d.throughput_after) {
+        (Some(before), Some(after)) if before.is_finite() && after.is_finite() && before > 0.0 => {
+            ((after - before) / before) * 100.0 >= THROUGHPUT_WORSE_MIN_PCT
+        }
+        _ => false,
+    };
+    eff_improved || tput_improved
+}
+
+/// Reveal suppressed alternatives when the same primary re-fires with a flat delta.
+pub(crate) fn should_reveal_suppressed(
+    previous_recommendation: &'static str,
+    new_primary: Option<&'static str>,
+    d: &delta::Delta,
+    suppressed_recs_non_empty: bool,
+) -> bool {
+    suppressed_recs_non_empty
+        && new_primary == Some(previous_recommendation)
+        && !delta_shows_material_improvement(d)
+}
+
 /// Inputs for the interactive diagnose closed loop.
 pub struct LoopRunnerInput<'a> {
     pub url: &'a str,
@@ -196,11 +223,19 @@ pub fn run(input: LoopRunnerInput<'_>) -> anyhow::Result<()> {
         let plateau_count = state.update_efficiency_plateau(current_eff, EFFICIENCY_PLATEAU_DELTA);
         print_delta(&d);
         println!();
+        let new_primary = new_report.recommendations.first().map(|r| r.rule_name);
+        let reveal_suppressed = should_reveal_suppressed(
+            rule_name,
+            new_primary,
+            &d,
+            !new_report.suppressed_recs.is_empty(),
+        );
         output::stdout::print_diagnose_table_with_report(
             &new_result,
             &new_report,
             &agg_win,
             verbose_rules,
+            reveal_suppressed,
         );
 
         let headroom = new_report.baseline.as_ref().and_then(|b| b.headroom_pct);
@@ -1148,5 +1183,97 @@ mod tests {
         assert!(sparse_msg.contains("Insufficient data to verify. Required: 3 windows."));
         assert!(sparse_msg.contains("Captured: 2 (3 dropped, 10 idle)."));
         assert_eq!(mid_loop_abort_message(true, false, 3, 0, 0), None);
+    }
+
+    fn flat_delta() -> delta::Delta {
+        delta::Delta {
+            throughput_before: Some(100.0),
+            throughput_after: Some(101.0),  // < 5%
+            efficiency_delta_pp: Some(0.5), // < plateau 2.0
+            efficiency_pct_before: Some(10.0),
+            efficiency_pct_after: Some(10.5),
+            cost_per_million_before: None,
+            cost_per_million_after: None,
+            joules_per_token_before: None,
+            joules_per_token_after: None,
+            cost_source_after: None,
+            ttft_before_ms: None,
+            ttft_after_ms: None,
+            tpot_before_ms: None,
+            tpot_after_ms: None,
+            ttft_p95_before_ms: None,
+            ttft_p95_after_ms: None,
+            tpot_p95_before_ms: None,
+            tpot_p95_after_ms: None,
+            config_drifted: false,
+            non_baseline_drifted: false,
+            load_changed: false,
+            running_before: None,
+            running_after: None,
+            prefix_hit_changed: false,
+            capacity_self_grade: None,
+        }
+    }
+
+    #[test]
+    fn material_improvement_false_on_flat_delta() {
+        assert!(!delta_shows_material_improvement(&flat_delta()));
+    }
+
+    #[test]
+    fn material_improvement_true_on_eff_plateau_exit() {
+        let mut d = flat_delta();
+        d.efficiency_delta_pp = Some(EFFICIENCY_PLATEAU_DELTA);
+        assert!(delta_shows_material_improvement(&d));
+    }
+
+    #[test]
+    fn material_improvement_true_on_throughput_gain() {
+        let mut d = flat_delta();
+        d.throughput_before = Some(100.0);
+        d.throughput_after = Some(106.0); // 6% >= 5%
+        assert!(delta_shows_material_improvement(&d));
+    }
+
+    #[test]
+    fn reveal_when_same_primary_flat_and_has_suppressed() {
+        assert!(should_reveal_suppressed(
+            "oom_risk",
+            Some("oom_risk"),
+            &flat_delta(),
+            true
+        ));
+    }
+
+    #[test]
+    fn no_reveal_when_improved() {
+        let mut d = flat_delta();
+        d.efficiency_delta_pp = Some(3.0);
+        assert!(!should_reveal_suppressed(
+            "oom_risk",
+            Some("oom_risk"),
+            &d,
+            true
+        ));
+    }
+
+    #[test]
+    fn no_reveal_when_primary_changed() {
+        assert!(!should_reveal_suppressed(
+            "oom_risk",
+            Some("kv_cache_pressure"),
+            &flat_delta(),
+            true
+        ));
+    }
+
+    #[test]
+    fn no_reveal_when_no_suppressed() {
+        assert!(!should_reveal_suppressed(
+            "oom_risk",
+            Some("oom_risk"),
+            &flat_delta(),
+            false
+        ));
     }
 }

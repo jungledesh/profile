@@ -45,6 +45,9 @@ pub struct Report {
     pub recommendations: Vec<rules::Recommendation>,
     /// Rules that fired but were removed by layer filtering or the suppression table.
     pub suppressed_rules: Vec<(&'static str, &'static str)>,
+    /// Full recommendation bodies removed by ME / layer filter, ranked like primaries.
+    /// Rendered only when the loop reveals alternatives after a stuck fix.
+    pub suppressed_recs: Vec<rules::Recommendation>,
     pub kv_max_seqs: Option<u32>,
     /// Capacity value R2 prescribed this iteration (`≤N`). Used for self-grade after restart.
     pub prescribed_kv_capacity: Option<u32>,

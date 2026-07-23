@@ -420,6 +420,7 @@ fn build_report_from_eval(
             baseline,
             recommendations: Vec::new(),
             suppressed_rules: Vec::new(),
+            suppressed_recs: Vec::new(),
             kv_max_seqs: derived.max_seqs,
             prescribed_kv_capacity: None,
             catalog_state_mismatch: catalog_state_pages_mismatch(
@@ -759,6 +760,7 @@ fn finalize_report_groups(
         memory_budget_self_grade,
     } = capacity;
     let mut suppressed_rules = Vec::new();
+    let mut suppressed_recs = Vec::new();
 
     // ME table BEFORE min-layer filter so cross-layer suppressions (R6→R1) land.
     // Same-layer rows (OOM→KV) are unchanged: both survive until ME, then KV drops.
@@ -771,11 +773,13 @@ fn finalize_report_groups(
             if suppressor == rule_names::OOM_RISK && !oom_weights_alone_overflow {
                 continue;
             }
-            let before = recs.len();
-            recs.retain(|r| r.rule_name != suppressed);
-            if recs.len() < before {
+            let (removed, kept): (Vec<_>, Vec<_>) =
+                recs.into_iter().partition(|r| r.rule_name == suppressed);
+            if !removed.is_empty() {
                 suppressed_rules.push((suppressed, suppressor));
+                suppressed_recs.extend(removed);
             }
+            recs = kept;
         }
     }
 
@@ -784,6 +788,7 @@ fn finalize_report_groups(
             baseline,
             recommendations: Vec::new(),
             suppressed_rules,
+            suppressed_recs,
             kv_max_seqs,
             prescribed_kv_capacity: None,
             catalog_state_mismatch,
@@ -808,25 +813,28 @@ fn finalize_report_groups(
         .map(|r| r.rule_name)
         .unwrap_or("higher-priority rule");
 
-    let mut recs: Vec<Recommendation> = recs
-        .into_iter()
-        .filter(|r| {
-            if r.layer == min_layer {
-                true
-            } else {
-                suppressed_rules.push((r.rule_name, primary_name));
-                false
-            }
-        })
-        .collect();
+    let mut primary_recs = Vec::new();
+    for r in recs {
+        if r.layer == min_layer {
+            primary_recs.push(r);
+        } else {
+            suppressed_rules.push((r.rule_name, primary_name));
+            suppressed_recs.push(r);
+        }
+    }
 
-    recs.sort_by(|a, b| {
+    primary_recs.sort_by(|a, b| {
+        let sa = a.impact as f64 * a.confidence;
+        let sb = b.impact as f64 * b.confidence;
+        sb.total_cmp(&sa)
+    });
+    suppressed_recs.sort_by(|a, b| {
         let sa = a.impact as f64 * a.confidence;
         let sb = b.impact as f64 * b.confidence;
         sb.total_cmp(&sa)
     });
 
-    let prescribed_kv_capacity = if recs.iter().any(|r| {
+    let prescribed_kv_capacity = if primary_recs.iter().any(|r| {
         r.rule_name == rule_names::KV_CACHE_PRESSURE
             || r.rule_name == rule_names::KV_ADMISSION_BACKLOG
     }) {
@@ -837,8 +845,9 @@ fn finalize_report_groups(
 
     Report {
         baseline,
-        recommendations: recs,
+        recommendations: primary_recs,
         suppressed_rules,
+        suppressed_recs,
         kv_max_seqs,
         prescribed_kv_capacity,
         catalog_state_mismatch,
@@ -861,6 +870,7 @@ pub fn build_report_for_windows(windows: &[RuntimeWindow], summary: AnalysisInpu
             baseline,
             recommendations: Vec::new(),
             suppressed_rules: Vec::new(),
+            suppressed_recs: Vec::new(),
             kv_max_seqs: None,
             prescribed_kv_capacity: None,
             catalog_state_mismatch: None,

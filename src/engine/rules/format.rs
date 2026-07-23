@@ -557,6 +557,7 @@ pub fn format_diagnose_rules_for_windows(
     verbose_rules: bool,
     metrics_url: &str,
     duration_secs: u64,
+    reveal_suppressed: bool,
 ) -> Vec<String> {
     if report.n_eval == 0 {
         let any_evaluable = windows.iter().any(|w| window_is_evaluable(&w.snapshot));
@@ -637,6 +638,23 @@ pub fn format_diagnose_rules_for_windows(
         }
         warnings.extend(rule_display_block(rec));
         warnings.push(String::new());
+    }
+
+    // Stuck-fix reveal: same primary as last iteration, no material improvement.
+    // Primary blocks print first; alternatives follow the column-0 warning.
+    if reveal_suppressed && !report.suppressed_recs.is_empty() {
+        if !warnings.last().is_some_and(|l| l.is_empty()) {
+            warnings.push(String::new());
+        }
+        warnings.push(
+            "Previous fix brought no material improvement. Other possible causes shown below."
+                .to_string(),
+        );
+        warnings.push(String::new());
+        for rec in &report.suppressed_recs {
+            warnings.extend(rule_display_block(rec));
+            warnings.push(String::new());
+        }
     }
 
     let advisories = collect_advisories(
@@ -1090,5 +1108,158 @@ mod catalog_mismatch_note_tests {
         assert!(line.contains("12.0GB vLLM-reported"));
         assert!(line.contains("10.0GB estimated (3GB allowance)"));
         assert!(line.contains("gap +2.0GB"));
+    }
+}
+
+#[cfg(test)]
+mod stuck_fix_reveal_tests {
+    use super::format_diagnose_rules_for_windows;
+    use crate::collectors::RawSnapshot;
+    use crate::collectors::{GpuRawMetrics, VllmRawMetrics};
+    use crate::context::{AnalysisInput, RuntimeWindow, StaticContext};
+    use crate::engine::rules::{ENGINE_MIN_PERSISTENT_WINDOWS, rule_names};
+    use crate::engine::{Recommendation, Report};
+    use std::time::SystemTime;
+
+    fn win() -> RuntimeWindow {
+        let t = SystemTime::UNIX_EPOCH;
+        RuntimeWindow::from_snapshot(RawSnapshot {
+            gpu_observed_at: t,
+            vllm_observed_at: t,
+            timestamp: t,
+            vllm: VllmRawMetrics {
+                num_requests_running: Some(4.0),
+                generation_tokens_per_sec: Some(50.0),
+                window_duration_secs: Some(2.0),
+                ..Default::default()
+            },
+            gpus: vec![GpuRawMetrics::default()],
+        })
+    }
+
+    fn rec(name: &'static str, impact: u8, confidence: f64, header: &str) -> Recommendation {
+        Recommendation {
+            rule_name: name,
+            layer: 2,
+            impact,
+            confidence,
+            display_lines: vec![header.to_string(), "    body".to_string()],
+        }
+    }
+
+    fn report_with(primary: Recommendation, suppressed: Vec<Recommendation>) -> Report {
+        Report {
+            baseline: None,
+            recommendations: vec![primary],
+            suppressed_rules: suppressed
+                .iter()
+                .map(|r| (r.rule_name, rule_names::OOM_RISK))
+                .collect(),
+            suppressed_recs: suppressed,
+            kv_max_seqs: None,
+            prescribed_kv_capacity: None,
+            catalog_state_mismatch: None,
+            memory_budget_self_grade: None,
+            n_eval: ENGINE_MIN_PERSISTENT_WINDOWS,
+            skipped_broken: 0,
+            skipped_idle: 0,
+            energy_skew_skipped: 0,
+            gauge_missing: Default::default(),
+            limiter_evidence: None,
+        }
+    }
+
+    fn render(report: &Report, reveal: bool) -> String {
+        let w = win();
+        let windows = vec![w.clone(); ENGINE_MIN_PERSISTENT_WINDOWS];
+        let ctx = StaticContext::default();
+        let summary = AnalysisInput::new(&ctx, &windows[0]);
+        format_diagnose_rules_for_windows(
+            &windows,
+            summary,
+            report,
+            false,
+            "http://127.0.0.1:8000/metrics",
+            30,
+            reveal,
+        )
+        .join("\n")
+    }
+
+    #[test]
+    fn triggered_warning_at_column_0_with_blanks_and_rank_order() {
+        let report = report_with(
+            rec(rule_names::OOM_RISK, 5, 0.9, "[!] OOM Risk"),
+            vec![
+                rec(
+                    rule_names::KV_CACHE_PRESSURE,
+                    5,
+                    0.9,
+                    "[!] KV Cache Pressure",
+                ),
+                rec(rule_names::UNDER_BATCHING, 3, 0.5, "[!] Under-batching"),
+            ],
+        );
+        let text = render(&report, true);
+        let warn =
+            "Previous fix brought no material improvement. Other possible causes shown below.";
+        assert!(
+            text.lines().any(|l| l == warn),
+            "warning must be at column 0; got:\n{text}"
+        );
+        let oom = text.find("[!] OOM Risk").expect("primary");
+        let warn_at = text.find(warn).expect("warning");
+        let kv = text.find("[!] KV Cache Pressure").expect("suppressed hi");
+        let ub = text.find("[!] Under-batching").expect("suppressed lo");
+        assert!(oom < warn_at && warn_at < kv && kv < ub);
+        // blank line before and after warning
+        let before = &text[..warn_at];
+        assert!(
+            before.ends_with("\n\n") || before.ends_with("body\n\n"),
+            "blank line before warning"
+        );
+        let after_warn = &text[warn_at + warn.len()..];
+        assert!(after_warn.starts_with("\n\n"), "blank line after warning");
+    }
+
+    #[test]
+    fn untriggered_identical_when_reveal_false() {
+        let report = report_with(
+            rec(rule_names::OOM_RISK, 5, 0.9, "[!] OOM Risk"),
+            vec![rec(
+                rule_names::KV_CACHE_PRESSURE,
+                5,
+                0.9,
+                "[!] KV Cache Pressure",
+            )],
+        );
+        let hidden = render(&report, false);
+        assert!(!hidden.contains("Previous fix brought no material improvement"));
+        assert!(!hidden.contains("[!] KV Cache Pressure"));
+        assert!(hidden.contains("[!] OOM Risk"));
+    }
+
+    #[test]
+    fn triggered_but_no_suppressed_prints_nothing_extra() {
+        let report = report_with(rec(rule_names::OOM_RISK, 5, 0.9, "[!] OOM Risk"), vec![]);
+        let text = render(&report, true);
+        assert!(!text.contains("Previous fix brought no material improvement"));
+    }
+
+    #[test]
+    fn first_iteration_reveal_false_hides_suppressed() {
+        // diagnose.rs always passes reveal=false on the initial print.
+        let report = report_with(
+            rec(rule_names::OOM_RISK, 5, 0.9, "[!] OOM Risk"),
+            vec![rec(
+                rule_names::KV_CACHE_PRESSURE,
+                5,
+                0.9,
+                "[!] KV Cache Pressure",
+            )],
+        );
+        let text = render(&report, false);
+        assert!(!text.contains("Previous fix brought no material improvement"));
+        assert!(!text.contains("[!] KV Cache Pressure"));
     }
 }
