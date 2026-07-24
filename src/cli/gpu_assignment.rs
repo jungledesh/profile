@@ -186,7 +186,10 @@ fn resolve_launch_single_gpu(
                     anyhow::bail!(multi_gpu_serving_refusal(many.len() as u32));
                 }
                 _ => {
-                    eprintln!("{}", unidentified_vllm_gpu_note(fallback_idx));
+                    // One GPU on the host: assignment is that GPU; no note.
+                    if host_count != Some(1) {
+                        eprintln!("{}", unidentified_vllm_gpu_note(fallback_idx));
+                    }
                     Ok(GpuAssignment {
                         tp: 1,
                         indices: vec![fallback_idx],
@@ -208,10 +211,15 @@ fn resolve_gpu_assignment_inner_with_mode(
         anyhow::bail!("--tensor-parallel-size must be at least 1.");
     }
     if !multi_gpu_tp {
-        let snapshots = scan.as_ref().map(|entries| snapshots_from_scan(entries));
-        let detected = snapshots
-            .as_ref()
-            .and_then(|rows| detect_vllm_gpu_indices(rows));
+        // Single-GPU host: no ambiguity, no detection, no output.
+        let detected = if host_count == Some(1) {
+            None
+        } else {
+            let snapshots = scan.as_ref().map(|entries| snapshots_from_scan(entries));
+            snapshots
+                .as_ref()
+                .and_then(|rows| detect_vllm_gpu_indices(rows))
+        };
         return resolve_launch_single_gpu(host_count, scan, cli_tp, detected);
     }
 
@@ -847,6 +855,7 @@ root      4242     1  0 12:00 ?        00:00:01 python -m vllm.entrypoints.opena
                 pids: vec![],
             },
         ]);
+        // Multi-GPU host, detection None: fallback assignment + note still apply.
         let assignment =
             resolve_launch_single_gpu(Some(2), scan, None, None).expect("fallback single-GPU");
         assert_eq!(
@@ -859,6 +868,54 @@ root      4242     1  0 12:00 ?        00:00:01 python -m vllm.entrypoints.opena
         assert_eq!(
             unidentified_vllm_gpu_note(3),
             "Could not identify vLLM's GPU; measuring GPU 3."
+        );
+    }
+
+    #[test]
+    fn launch_single_gpu_host_unidentified_assigns_only_gpu_silently() {
+        let scan = Some(vec![GpuScanEntry {
+            idx: 0,
+            name: "NVIDIA H100".into(),
+            vram_used_mb: 40_000,
+            vram_total_mb: 80 * 1024,
+            pids: vec![],
+        }]);
+        // Detection None on a 1-GPU host: assignment is that GPU; note gated off.
+        let assignment =
+            resolve_launch_single_gpu(Some(1), scan, None, None).expect("single-GPU host");
+        assert_eq!(
+            assignment,
+            GpuAssignment {
+                tp: 1,
+                indices: vec![0],
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_launch_mode_single_gpu_host_skips_ps_detection() {
+        let scan = Some(vec![GpuScanEntry {
+            idx: 7,
+            name: "NVIDIA H100".into(),
+            vram_used_mb: 40_000,
+            vram_total_mb: 80 * 1024,
+            // PIDs present would only matter if detection ran; it must not.
+            pids: vec![9999],
+        }]);
+        let a = resolve_gpu_assignment_inner_with_mode(
+            Some(1),
+            scan,
+            None,
+            "http://localhost:8000/metrics",
+            false,
+        )
+        .expect("launch-mode single GPU");
+        assert_eq!(
+            a,
+            GpuAssignment {
+                tp: 1,
+                indices: vec![7],
+            }
         );
     }
 

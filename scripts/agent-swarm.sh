@@ -48,14 +48,16 @@ CHECKOUTS_DIR="$SWARM_HOME/checkouts"
 AGENTS_DIR="$SWARM_HOME/agents"
 SWARM_LOG="$SWARM_HOME/swarm.log"
 
-export PATH="$HOME/.local/bin:$PATH"
+# .local/bin: uv. .grok/bin: grok installer target (installer edits .bashrc,
+# which this non-login script never re-reads).
+export PATH="$HOME/.local/bin:$HOME/.grok/bin:$PATH"
 
 # ── Grok Build binary ───────────────────────────────────────────────────────
 install_grok() {
     if ! command -v grok >/dev/null 2>&1; then
         echo "Installing Grok Build..."
         curl -fsSL https://x.ai/cli/install.sh | bash
-        export PATH="$HOME/.local/bin:$PATH"
+        export PATH="$HOME/.local/bin:$HOME/.grok/bin:$PATH"
     fi
     command -v grok >/dev/null 2>&1 || { echo "grok not on PATH after install" >&2; exit 1; }
 }
@@ -78,6 +80,15 @@ context_window = 32768
 # Redirect it locally. api_backend must be chat_completions: the built-in
 # defaults to the Responses API, which crashes on vLLM reasoning stream events.
 [model.grok-build]
+model = "Qwen3.6-27B"
+base_url = "http://localhost:8000/v1"
+api_key = "none"
+api_backend = "chat_completions"
+context_window = 32768
+
+# grok 0.2.111 also requests "grok-4.5" for auxiliary calls (observed 404 in
+# vLLM log, Jul 24). Same redirect.
+[model.grok-4.5]
 model = "Qwen3.6-27B"
 base_url = "http://localhost:8000/v1"
 api_key = "none"

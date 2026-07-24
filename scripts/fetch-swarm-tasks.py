@@ -3,7 +3,8 @@
 internet (laptop or pod), then commit the JSON. The swarm never fetches.
 
 Pulls the psf/requests (8) and pytest-dev/pytest (19) Verified instances
-verbatim via the Hugging Face datasets-server API. Zero non-stdlib deps.
+via the Hugging Face datasets-server API, then drops EXCLUDED import-failers
+so the shipped file matches setup. Zero non-stdlib deps.
 
 Usage: python3 fetch-swarm-tasks.py [out.json]
 Default output: swarm-tasks.json NEXT TO THIS SCRIPT (where agent-swarm.sh
@@ -28,8 +29,8 @@ FIELDS = [
     "problem_statement",
 ]
 
-# Integrity pin: the exact Verified instance ids for these repos.
-EXPECTED = {
+# Full Verified set for these repos (integrity of the HF pull).
+VERIFIED = {
     "psf__requests-1142", "psf__requests-1724", "psf__requests-1766",
     "psf__requests-1921", "psf__requests-2317", "psf__requests-2931",
     "psf__requests-5414", "psf__requests-6028",
@@ -44,6 +45,15 @@ EXPECTED = {
     "pytest-dev__pytest-10051", "pytest-dev__pytest-10081",
     "pytest-dev__pytest-10356",
 }
+
+# Dropped after pull: refuse to import under swarm PYTHONPATH/venvs (pod setup).
+# Must stay out of swarm-tasks.json or setup fails again on regenerate.
+EXCLUDED = {
+    "pytest-dev__pytest-5631",
+    "pytest-dev__pytest-5809",
+}
+
+SHIPPED = VERIFIED - EXCLUDED
 
 
 def get_json(endpoint, params, tries=4):
@@ -115,10 +125,12 @@ def main():
         print(f"full scan: {len(rows)} matching instances")
 
     got_ids = {r["instance_id"] for r in rows}
-    if got_ids != EXPECTED:
-        missing = sorted(EXPECTED - got_ids)
-        extra = sorted(got_ids - EXPECTED)
+    if got_ids != VERIFIED:
+        missing = sorted(VERIFIED - got_ids)
+        extra = sorted(got_ids - VERIFIED)
         sys.exit(f"FAIL integrity check.\n missing: {missing}\n extra: {extra}")
+
+    rows = [r for r in rows if r["instance_id"] not in EXCLUDED]
 
     # Keep ONLY the declared fields, whatever the server returned. The API's
     # column filter is advisory; without this, extra fields leak in --
@@ -129,10 +141,21 @@ def main():
         if not all(r.get(f) for f in FIELDS):
             sys.exit(f"FAIL empty field in {r['instance_id']}")
 
+    shipped_ids = {r["instance_id"] for r in rows}
+    if shipped_ids != SHIPPED:
+        sys.exit(
+            f"FAIL shipped set mismatch after EXCLUDED filter.\n"
+            f" missing: {sorted(SHIPPED - shipped_ids)}\n"
+            f" extra: {sorted(shipped_ids - SHIPPED)}"
+        )
+
     rows.sort(key=lambda r: r["instance_id"])
     with open(out_path, "w") as f:
         json.dump(rows, f, indent=1, ensure_ascii=False)
-    print(f"OK: {len(rows)} instances -> {out_path}")
+    print(
+        f"OK: {len(rows)} instances -> {out_path} "
+        f"(dropped {len(EXCLUDED)} EXCLUDED import-failers)"
+    )
 
 
 if __name__ == "__main__":
