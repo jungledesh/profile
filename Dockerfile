@@ -44,6 +44,7 @@ RUN export DEBIAN_FRONTEND=noninteractive \
     build-essential \
     curl \
     wget \
+    git \
     jq \
     gawk \
     tmux \
@@ -90,14 +91,17 @@ COPY --chown=appuser:appuser scripts/load.sh ./load.sh
 COPY --chown=appuser:appuser scripts/start.sh ./start.sh
 COPY --chown=appuser:appuser scripts/start-gemma.sh ./start-gemma.sh
 COPY --chown=appuser:appuser scripts/agent-swarm.sh ./agent-swarm.sh
+# Swarm task list: agent-swarm.sh reads swarm-tasks.json next to itself.
+# fetch-swarm-tasks.py regenerates it if needed (requires internet).
+COPY --chown=appuser:appuser scripts/swarm-tasks.json ./swarm-tasks.json
+COPY --chown=appuser:appuser scripts/fetch-swarm-tasks.py ./fetch-swarm-tasks.py
 COPY --from=profile-builder --chown=appuser:appuser /build/target/release/profile ./profile
 
 RUN chmod 0755 ./load.sh ./start.sh ./start-gemma.sh ./agent-swarm.sh ./profile
 
 USER appuser
 
-# Gemma 4 validation run (temporary). Swap back to start.sh for the demo record.
-CMD ["bash", "-lc", "/home/appuser/app/start-gemma.sh"]
+CMD ["bash", "-lc", "/home/appuser/app/start.sh"]
 
 # AMD runtime: official vLLM ROCm image (includes ROCm + Python 3.12 + vLLM + PyTorch).
 # Build: docker build --target amd -t profile:amd .
