@@ -58,10 +58,22 @@ export PATH="$HOME/.local/bin:$HOME/.grok/bin:$PATH"
 # local vLLM. x.ai install.sh accepts the version as bash -s <X.Y.Z>.
 GROK_VERSION="${GROK_VERSION:-0.2.111}"
 
+# Installer integrity: sha256 recorded at audit (Jul 24 2026). x.ai publishes
+# no signatures for the installer or the CLI binary it downloads, so this pin
+# protects against endpoint tampering after our audit, not a compromised
+# vendor. If upstream changes install.sh, setup fails closed: re-audit, bump.
+GROK_INSTALLER_SHA256="0465d810453bbf18608ccae310fa79f4c59ae4a0538bd8a3a374ebce749be952"
+
 install_grok() {
     if ! command -v grok >/dev/null 2>&1; then
         echo "Installing Grok Build ${GROK_VERSION}..."
-        curl -fsSL https://x.ai/cli/install.sh | bash -s "$GROK_VERSION"
+        local installer
+        installer=$(mktemp)
+        curl -fsSL https://x.ai/cli/install.sh -o "$installer"
+        echo "${GROK_INSTALLER_SHA256}  ${installer}" | sha256sum -c - >/dev/null 2>&1 \
+            || { echo "installer hash mismatch; upstream changed, re-audit before use" >&2; rm -f "$installer"; exit 1; }
+        bash "$installer" "$GROK_VERSION"
+        rm -f "$installer"
         export PATH="$HOME/.local/bin:$HOME/.grok/bin:$PATH"
     fi
     command -v grok >/dev/null 2>&1 || { echo "grok not on PATH after install" >&2; exit 1; }
