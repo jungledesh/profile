@@ -53,6 +53,10 @@ EXCLUDED = {
     "pytest-dev__pytest-5809",
 }
 
+bad = EXCLUDED - VERIFIED
+if bad:
+    sys.exit(f"FAIL EXCLUDED ids not in VERIFIED: {sorted(bad)}")
+
 SHIPPED = VERIFIED - EXCLUDED
 
 
@@ -125,6 +129,10 @@ def main():
         print(f"full scan: {len(rows)} matching instances")
 
     got_ids = {r["instance_id"] for r in rows}
+    if len(rows) != len(got_ids):
+        sys.exit(
+            f"FAIL duplicate instance rows: {len(rows)} rows, {len(got_ids)} unique ids"
+        )
     if got_ids != VERIFIED:
         missing = sorted(VERIFIED - got_ids)
         extra = sorted(got_ids - VERIFIED)
@@ -142,6 +150,10 @@ def main():
             sys.exit(f"FAIL empty field in {r['instance_id']}")
 
     shipped_ids = {r["instance_id"] for r in rows}
+    if len(rows) != len(shipped_ids):
+        sys.exit(
+            f"FAIL duplicate instance rows: {len(rows)} rows, {len(shipped_ids)} unique ids"
+        )
     if shipped_ids != SHIPPED:
         sys.exit(
             f"FAIL shipped set mismatch after EXCLUDED filter.\n"

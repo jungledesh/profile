@@ -53,10 +53,15 @@ SWARM_LOG="$SWARM_HOME/swarm.log"
 export PATH="$HOME/.local/bin:$HOME/.grok/bin:$PATH"
 
 # ── Grok Build binary ───────────────────────────────────────────────────────
+# Pin 0.2.111: that build requests the grok-4.5 model alias for auxiliary calls
+# (observed 404 in vLLM log Jul 24). write_grok_config redirects grok-4.5 to
+# local vLLM. x.ai install.sh accepts the version as bash -s <X.Y.Z>.
+GROK_VERSION="${GROK_VERSION:-0.2.111}"
+
 install_grok() {
     if ! command -v grok >/dev/null 2>&1; then
-        echo "Installing Grok Build..."
-        curl -fsSL https://x.ai/cli/install.sh | bash
+        echo "Installing Grok Build ${GROK_VERSION}..."
+        curl -fsSL https://x.ai/cli/install.sh | bash -s "$GROK_VERSION"
         export PATH="$HOME/.local/bin:$HOME/.grok/bin:$PATH"
     fi
     command -v grok >/dev/null 2>&1 || { echo "grok not on PATH after install" >&2; exit 1; }
@@ -88,7 +93,7 @@ context_window = 32768
 
 # grok 0.2.111 also requests "grok-4.5" for auxiliary calls (observed 404 in
 # vLLM log, Jul 24). Same redirect.
-[model.grok-4.5]
+[model."grok-4.5"]
 model = "Qwen3.6-27B"
 base_url = "http://localhost:8000/v1"
 api_key = "none"
