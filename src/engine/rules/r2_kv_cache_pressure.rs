@@ -596,7 +596,12 @@ pub(super) fn format_kv_cache_pressure_fired(
             cuts.push((fo, None));
         }
     } else if let Some(seat) = full_window_seat {
-        cuts.push((seat, Some(CRISIS_THROTTLE_SUBLINE)));
+        // Crisis is a flat list with no group header, so the subline is the only
+        // risk marker. Non-crisis sits under "Cuts throughput:", which already says it.
+        cuts.push((
+            seat,
+            d.preemptions_active.then_some(CRISIS_THROTTLE_SUBLINE),
+        ));
         super::extend_with_shrink_suggestion(&mut cuts, shrink);
     } else {
         super::extend_with_shrink_suggestion(&mut cuts, shrink);
@@ -2062,6 +2067,10 @@ mod tests {
         assert!(fp8_pos < cuts_pos && cuts_pos < seqs_pos);
         assert_eq!(text.matches("    Cuts throughput:").count(), 1);
         assert_eq!(text.matches("    Safe to apply:").count(), 1);
+        assert!(
+            !text.contains("Cuts throughput. Revert after pressure clears."),
+            "non-crisis seat under Cuts throughput: header needs no throttle subline"
+        );
         assert!(text.contains("(affects output quality; FP8 compiler not found)"));
     }
 

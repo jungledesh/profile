@@ -255,6 +255,7 @@ fn energy_metrics(snap: &crate::collectors::RawSnapshot) -> (Option<f64>, Option
             let tpw = t / p;
             (
                 tpw.is_finite().then_some(tpw),
+                // Some implies finite; delta/print consumers rely on it.
                 jtok.is_finite().then_some(jtok),
             )
         }
@@ -299,6 +300,7 @@ fn build_cost_estimate(
 ) -> CostEstimate {
     let cost_per_million_tokens = tps.filter(|t| *t > 0.0).and_then(|t| {
         let cpm = cost_per_hr * 1_000_000.0 / (t * 3600.0);
+        // Some implies finite; delta/print consumers rely on it.
         cpm.is_finite().then_some(cpm)
     });
     CostEstimate {

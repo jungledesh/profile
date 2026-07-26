@@ -596,21 +596,15 @@ fn print_delta(d: &delta::Delta) {
     if economics_section_active(d) {
         println!();
         println!("ECONOMICS:");
-        match (d.joules_per_token_before, d.joules_per_token_after) {
-            (Some(before), Some(after)) if before.is_finite() && after.is_finite() => {
-                println!("{}", format_jtok_delta_line(before, after));
-            }
-            _ => {}
+        if let (Some(before), Some(after)) = (d.joules_per_token_before, d.joules_per_token_after) {
+            println!("{}", format_jtok_delta_line(before, after));
         }
-        match (d.cost_per_million_before, d.cost_per_million_after) {
-            (Some(before), Some(after)) if before.is_finite() && after.is_finite() => {
-                let est = match d.cost_source_after {
-                    Some(engine::CostSource::Catalog) | None => " (est)",
-                    _ => "",
-                };
-                println!("{}", format_cost_delta_line(before, after, est));
-            }
-            _ => {}
+        if let (Some(before), Some(after)) = (d.cost_per_million_before, d.cost_per_million_after) {
+            let est = match d.cost_source_after {
+                Some(engine::CostSource::Catalog) | None => " (est)",
+                _ => "",
+            };
+            println!("{}", format_cost_delta_line(before, after, est));
         }
     }
 }

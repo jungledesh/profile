@@ -34,8 +34,11 @@ pub(super) fn kv_near_full(snapshot: &crate::collectors::RawSnapshot) -> bool {
         || peak.is_some_and(|p| p >= KV_CACHE_PRESSURE_MIN_PERC)
 }
 
-/// Floored Observed `kv_cache_max_concurrency`, if present and positive after floor.
-fn floored_kv_cap(snapshot: &crate::collectors::RawSnapshot) -> Option<f64> {
+/// Observed `kv_cache_max_concurrency` when it survives flooring, returned raw.
+/// Callers floor for their own use (`effective_max_and_binder`,
+/// `resolve_r2_kv_capacity`); returning raw keeps the fractional value for
+/// labelling and loses nothing, since floor is idempotent.
+fn kv_cap_positive_after_floor(snapshot: &crate::collectors::RawSnapshot) -> Option<f64> {
     let raw = snapshot
         .vllm
         .cache_config
@@ -59,7 +62,7 @@ fn floored_kv_cap(snapshot: &crate::collectors::RawSnapshot) -> Option<f64> {
 ///
 /// Absent peak running is not evidence of contradiction: return the cap.
 pub(super) fn usable_kv_concurrency(snapshot: &crate::collectors::RawSnapshot) -> Option<f64> {
-    let raw = floored_kv_cap(snapshot)?;
+    let raw = kv_cap_positive_after_floor(snapshot)?;
     let contradicted = snapshot
         .vllm
         .num_requests_running_peak
@@ -72,7 +75,7 @@ pub(super) fn usable_kv_concurrency(snapshot: &crate::collectors::RawSnapshot) -
 /// already exceeded `floor(cap)`. R2 uses this to omit the seat bullet entirely
 /// (not fall through to a numberless throttle or derived print).
 pub(super) fn observed_kv_cap_contradicted(snapshot: &crate::collectors::RawSnapshot) -> bool {
-    floored_kv_cap(snapshot).is_some() && usable_kv_concurrency(snapshot).is_none()
+    kv_cap_positive_after_floor(snapshot).is_some() && usable_kv_concurrency(snapshot).is_none()
 }
 
 /// Minimum active windows for a trustworthy verdict. Window size scales with run
