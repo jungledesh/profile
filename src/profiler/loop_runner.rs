@@ -20,19 +20,22 @@ const JTOK_WORSE_THRESHOLD: f64 = 0.02;
 const TTFT_WORSE_MIN_MS: f64 = 5.0;
 /// TPOT avg materiality gate (ms).
 const TPOT_WORSE_MIN_MS: f64 = 0.5;
-const EFFICIENCY_PLATEAU_DELTA: f64 = 2.0;
-const PLATEAU_CONSECUTIVE_ITERS: u32 = 3;
+/// Absolute efficiency rise (pp) that counts as material improvement (reveal gate).
+const EFFICIENCY_MATERIAL_MIN_PP: f64 = 2.0;
+/// Left label width for remesure before→after lines (excludes leading `"  "`).
+/// Sized for the longest label so Throughput, latency, and economics share one value column.
+const DELTA_LABEL_WIDTH: usize = 18; // "Cost/1M output tok"
 
 fn worse_suffix(material_regression: bool) -> &'static str {
     if material_regression { "  worse" } else { "" }
 }
 
-/// True when efficiency or throughput moved up by at least the worse/plateau gates.
-/// Symmetric to the regression labels: plateau band for eff, worse % for throughput.
+/// True when efficiency or throughput moved up by at least the material gates.
+/// Symmetric to the regression labels: material pp for eff, worse % for throughput.
 pub(crate) fn delta_shows_material_improvement(d: &delta::Delta) -> bool {
     let eff_improved = d
         .efficiency_delta_pp
-        .is_some_and(|pp| pp.is_finite() && pp >= EFFICIENCY_PLATEAU_DELTA);
+        .is_some_and(|pp| pp.is_finite() && pp >= EFFICIENCY_MATERIAL_MIN_PP);
     let tput_improved = match (d.throughput_before, d.throughput_after) {
         (Some(before), Some(after)) if before.is_finite() && after.is_finite() && before > 0.0 => {
             ((after - before) / before) * 100.0 >= THROUGHPUT_WORSE_MIN_PCT
@@ -219,8 +222,6 @@ pub fn run(input: LoopRunnerInput<'_>) -> anyhow::Result<()> {
             drifted,
             non_baseline,
         );
-        let current_eff = new_report.baseline.as_ref().and_then(|b| b.efficiency_pct);
-        let plateau_count = state.update_efficiency_plateau(current_eff, EFFICIENCY_PLATEAU_DELTA);
         print_delta(&d);
         println!();
         let new_primary = new_report.recommendations.first().map(|r| r.rule_name);
@@ -243,19 +244,6 @@ pub fn run(input: LoopRunnerInput<'_>) -> anyhow::Result<()> {
             println!(
                 "\nHardware ceiling reached. Headroom < {CEILING_HEADROOM_THRESHOLD_PCT:.0}%: further gains require scaling hardware."
             );
-            break;
-        }
-        if plateau_count >= PLATEAU_CONSECUTIVE_ITERS {
-            let eff_display = current_eff
-                .filter(|e| e.is_finite())
-                .map(|e| format!("{e:.1}%"))
-                .unwrap_or_else(|| "unknown".to_string());
-            println!(
-                "\nEfficiency plateaued at {eff_display} over {PLATEAU_CONSECUTIVE_ITERS} iterations."
-            );
-            println!("No further improvement from current config.");
-            println!("Either the workload has hit the hardware ceiling, or");
-            println!("a bottleneck exists that profile cannot yet identify.");
             break;
         }
 
@@ -452,7 +440,8 @@ fn format_throughput_delta_line(before: f64, after: f64) -> String {
     };
     let worse = after < before && drop_pct >= THROUGHPUT_WORSE_MIN_PCT;
     format!(
-        "  Throughput  {before:.0} → {after:.0} tok/s{}",
+        "  {:<DELTA_LABEL_WIDTH$}  {before:.0} → {after:.0} tok/s{}",
+        "Throughput",
         worse_suffix(worse)
     )
 }
@@ -474,7 +463,8 @@ fn format_ttft_delta_line(
         _ => String::new(),
     };
     Some(format!(
-        "  TTFT        {before:.0} → {after:.0}ms{p95_suffix}{}",
+        "  {:<DELTA_LABEL_WIDTH$}  {before:.0} → {after:.0}ms{p95_suffix}{}",
+        "TTFT",
         worse_suffix(delta > TTFT_WORSE_MIN_MS)
     ))
 }
@@ -496,7 +486,8 @@ fn format_tpot_delta_line(
         _ => String::new(),
     };
     Some(format!(
-        "  TPOT        {before:.1} → {after:.1}ms{p95_suffix}{}",
+        "  {:<DELTA_LABEL_WIDTH$}  {before:.1} → {after:.1}ms{p95_suffix}{}",
+        "TPOT",
         worse_suffix(delta > TPOT_WORSE_MIN_MS)
     ))
 }
@@ -504,7 +495,8 @@ fn format_tpot_delta_line(
 fn format_jtok_delta_line(before: f64, after: f64) -> String {
     let worse = after - before > JTOK_WORSE_THRESHOLD;
     format!(
-        "  J/tok         {before:.2} → {after:.2}{}",
+        "  {:<DELTA_LABEL_WIDTH$}  {before:.2} → {after:.2}{}",
+        "J/tok",
         worse_suffix(worse)
     )
 }
@@ -512,7 +504,8 @@ fn format_jtok_delta_line(before: f64, after: f64) -> String {
 fn format_cost_delta_line(before: f64, after: f64, est_suffix: &str) -> String {
     let worse = after - before > COST_WORSE_THRESHOLD_USD;
     format!(
-        "  Cost/1M tok   ${before:.2} → ${after:.2}{est_suffix}{}",
+        "  {:<DELTA_LABEL_WIDTH$}  ${before:.2} → ${after:.2}{est_suffix}{}",
+        "Cost/1M output tok",
         worse_suffix(worse)
     )
 }
@@ -603,28 +596,29 @@ fn print_delta(d: &delta::Delta) {
     if economics_section_active(d) {
         println!();
         println!("ECONOMICS:");
-    }
-    match (d.joules_per_token_before, d.joules_per_token_after) {
-        (Some(before), Some(after)) if before.is_finite() && after.is_finite() => {
-            println!("{}", format_jtok_delta_line(before, after));
+        match (d.joules_per_token_before, d.joules_per_token_after) {
+            (Some(before), Some(after)) if before.is_finite() && after.is_finite() => {
+                println!("{}", format_jtok_delta_line(before, after));
+            }
+            _ => {}
         }
-        _ => {}
-    }
-    match (d.cost_per_million_before, d.cost_per_million_after) {
-        (Some(before), Some(after)) if before.is_finite() && after.is_finite() => {
-            let est = match d.cost_source_after {
-                Some(engine::CostSource::Catalog) | None => " (est)",
-                _ => "",
-            };
-            println!("{}", format_cost_delta_line(before, after, est));
+        match (d.cost_per_million_before, d.cost_per_million_after) {
+            (Some(before), Some(after)) if before.is_finite() && after.is_finite() => {
+                let est = match d.cost_source_after {
+                    Some(engine::CostSource::Catalog) | None => " (est)",
+                    _ => "",
+                };
+                println!("{}", format_cost_delta_line(before, after, est));
+            }
+            _ => {}
         }
-        _ => {}
     }
 }
 
 fn economics_section_active(d: &delta::Delta) -> bool {
-    (d.cost_per_million_before.is_some() && d.cost_per_million_after.is_some())
-        || (d.joules_per_token_before.is_some() && d.joules_per_token_after.is_some())
+    let cost_line = d.cost_per_million_before.is_some() && d.cost_per_million_after.is_some();
+    let jtok_line = d.joules_per_token_before.is_some() && d.joules_per_token_after.is_some();
+    cost_line || jtok_line
 }
 
 /// Closed-loop pass gate: fingerprint must match the prior iteration.
@@ -1108,6 +1102,33 @@ mod tests {
     }
 
     #[test]
+    fn before_after_delta_labels_share_value_column() {
+        // "  " + label(18) + "  " → value starts at byte index 22.
+        const VALUE_COL: usize = 2 + DELTA_LABEL_WIDTH + 2;
+        let lines = [
+            format_throughput_delta_line(1000.0, 900.0),
+            format_ttft_delta_line(98.0, 5793.0, None, None).unwrap(),
+            format_tpot_delta_line(26.3, 47.8, None, None).unwrap(),
+            format_jtok_delta_line(1.19, 1.28),
+            format_cost_delta_line(2.04, 2.27, " (est)"),
+        ];
+        for line in &lines {
+            assert_eq!(
+                line.as_bytes().get(VALUE_COL - 1),
+                Some(&b' '),
+                "space before value: {line:?}"
+            );
+            assert_ne!(
+                line.as_bytes().get(VALUE_COL),
+                Some(&b' '),
+                "value starts at col {VALUE_COL}: {line:?}"
+            );
+        }
+        assert!(lines[3].as_bytes()[VALUE_COL].is_ascii_digit());
+        assert_eq!(lines[4].as_bytes()[VALUE_COL], b'$');
+    }
+
+    #[test]
     fn p95_has_no_own_label() {
         let line = format_ttft_delta_line(98.0, 5793.0, Some(228.0), Some(10556.0)).unwrap();
         assert!(line.contains("(p95 228 → 10556ms)"));
@@ -1124,7 +1145,32 @@ mod tests {
 
     #[test]
     fn economics_header_shown_when_only_jtok_available() {
-        let d = delta::Delta {
+        let mut d = economics_delta_base();
+        d.joules_per_token_before = Some(0.31);
+        d.joules_per_token_after = Some(0.28);
+        assert!(economics_section_active(&d));
+    }
+
+    #[test]
+    fn economics_header_shown_when_only_cost_available() {
+        let mut d = economics_delta_base();
+        d.cost_per_million_before = Some(2.50);
+        d.cost_per_million_after = Some(2.00);
+        assert!(economics_section_active(&d));
+    }
+
+    #[test]
+    fn economics_header_shown_when_both_metrics_available() {
+        let mut d = economics_delta_base();
+        d.joules_per_token_before = Some(0.31);
+        d.joules_per_token_after = Some(0.28);
+        d.cost_per_million_before = Some(2.50);
+        d.cost_per_million_after = Some(2.00);
+        assert!(economics_section_active(&d));
+    }
+
+    fn economics_delta_base() -> delta::Delta {
+        delta::Delta {
             throughput_before: None,
             throughput_after: None,
             efficiency_delta_pp: None,
@@ -1132,8 +1178,8 @@ mod tests {
             efficiency_pct_after: None,
             cost_per_million_before: None,
             cost_per_million_after: None,
-            joules_per_token_before: Some(0.31),
-            joules_per_token_after: Some(0.28),
+            joules_per_token_before: None,
+            joules_per_token_after: None,
             cost_source_after: None,
             ttft_before_ms: None,
             ttft_after_ms: None,
@@ -1150,8 +1196,7 @@ mod tests {
             running_after: None,
             prefix_hit_changed: false,
             capacity_self_grade: None,
-        };
-        assert!(economics_section_active(&d));
+        }
     }
 
     #[test]
@@ -1221,9 +1266,9 @@ mod tests {
     }
 
     #[test]
-    fn material_improvement_true_on_eff_plateau_exit() {
+    fn material_improvement_true_on_eff_gain() {
         let mut d = flat_delta();
-        d.efficiency_delta_pp = Some(EFFICIENCY_PLATEAU_DELTA);
+        d.efficiency_delta_pp = Some(EFFICIENCY_MATERIAL_MIN_PP);
         assert!(delta_shows_material_improvement(&d));
     }
 

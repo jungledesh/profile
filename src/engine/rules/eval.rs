@@ -35,7 +35,7 @@ use super::r7_config_headroom::{
 };
 use super::{
     KvBoundSource, Recommendation, catalog_state_pages_mismatch, compute_kv_max_seqs_for_cache,
-    recommended_seqs, resolve_kv_bound, rule_is_significant, rule_names,
+    recommended_seqs, resolve_kv_bound, rule_is_significant, rule_names, usable_kv_concurrency,
 };
 
 const SUPPRESSION_TABLE: &[(&str, &str)] = &[
@@ -452,7 +452,7 @@ fn build_report_from_eval(
     );
     let kv_max_seqs = derived_capacity.max_seqs;
     let (r2_kv_max_seqs, r2_capacity_label) = resolve_r2_kv_capacity(
-        summary_snap.vllm.cache_config.kv_cache_max_concurrency,
+        usable_kv_concurrency(summary_snap),
         kv_max_seqs,
         model_is_hybrid(&summary.ctx.model),
     );
@@ -461,7 +461,7 @@ fn build_report_from_eval(
     // both read this so they never print two different recommended values.
     let ridge_run = baseline.as_ref().map(|b| b.ridge_batch_size);
     let (run_kv_bound, run_kv_source) = resolve_kv_bound(
-        summary_snap.vllm.cache_config.kv_cache_max_concurrency,
+        usable_kv_concurrency(summary_snap),
         kv_max_seqs,
         model_is_hybrid(&summary.ctx.model),
         eval.mean_running(),

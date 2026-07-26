@@ -40,6 +40,7 @@ pub struct Delta {
     /// Non-baseline config knobs changed (max_num_seqs, batched tokens, caching, eager).
     pub non_baseline_drifted: bool,
     /// Relative move in running concurrency or QPS past [`LOAD_CHANGE_MIN_REL`].
+    /// Drives the "Load changed" status line.
     pub load_changed: bool,
     /// Running concurrency before/after (for the load status line).
     pub running_before: Option<f64>,
@@ -442,7 +443,27 @@ mod tests {
         assert_eq!(d.cost_per_million_before, Some(2.50));
         assert_eq!(d.cost_per_million_after, Some(2.00));
         assert_eq!(d.cost_source_after, Some(CostSource::Catalog));
+        assert!(!d.load_changed);
         assert!((d.efficiency_delta_pp.unwrap() - 15.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn load_changed_when_running_moves_25_pct() {
+        let mut prev = diagnose(Some(100.0));
+        prev.snapshot.vllm.num_requests_running = Some(10.0);
+        let mut curr = diagnose(Some(100.0));
+        curr.snapshot.vllm.num_requests_running = Some(16.0);
+        let d = compute(
+            &prev,
+            &report_eff(Some(40.0), Some(2.50), Some(0.31)),
+            &curr,
+            &report_eff(Some(40.0), Some(2.00), Some(0.28)),
+            false,
+            false,
+        );
+        assert!(d.load_changed);
+        assert_eq!(d.cost_per_million_before, Some(2.50));
+        assert_eq!(d.joules_per_token_before, Some(0.31));
     }
 
     #[test]

@@ -2,6 +2,23 @@ use std::time::SystemTime;
 
 pub use prometheus_parse::HistogramCount;
 
+/// Host KV offload buffer from `cache_config_info.kv_offloading_size`.
+///
+/// vLLM's docstring: size is the total summed across TP ranks. Irrelevant at
+/// launch (tp pinned to 1); matters when multi-GPU lands.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub enum KvOffloadState {
+    /// Label key absent: build predates the feature.
+    #[default]
+    Unsupported,
+    /// Literal `None` or `0`: offload not enabled.
+    Off,
+    /// Finite size > 0 GiB: already on.
+    Enabled(f64),
+    /// Label present but value was not `None` and not a finite number.
+    Unreadable,
+}
+
 /// Config fields extracted from the `vllm:cache_config_info` labeled gauge.
 /// All `Option<T>` - absent when the metric isn't present in the scrape.
 ///
@@ -28,6 +45,7 @@ pub struct CacheConfigLabels {
     pub kv_cache_max_concurrency: Option<f64>,
     pub mamba_block_size: Option<u32>,
     pub mamba_page_size_padded: Option<u64>,
+    pub kv_offloading: KvOffloadState,
 }
 
 /// One `/metrics` scrape: cumulative prefix cache counters (internal + external).
@@ -54,6 +72,9 @@ pub struct VllmRawMetrics {
     /// Queue-depth style gauges: **last** `/metrics` scrape in the collection window.
     /// Multi-window diagnose: **time-weighted mean** across evaluable windows (same as `gpu_util_pct`).
     pub num_requests_running: Option<f64>,
+    /// Max `num_requests_running` across scrapes in this window. Multi-window: max over
+    /// evaluable windows (not mean). Used to disprove full-context `kv_cache_max_concurrency`.
+    pub num_requests_running_peak: Option<f64>,
     pub num_requests_waiting: Option<f64>,
     /// KV cache usage %: last scrape in a single window; duration-weighted mean across evaluable windows in diagnose aggregate.
     pub kv_cache_usage_perc: Option<f64>,
@@ -92,12 +113,15 @@ pub struct VllmRawMetrics {
     pub prompt_tokens_p99: Option<f64>,
     /// Raw histogram delta buckets for prompt tokens (first→last scrape in window).
     pub prompt_tokens_p99_buckets: Vec<HistogramCount>,
+    /// `request_generation_tokens` histogram: mean tokens (Δ window or last-scrape fallback).
+    pub generation_tokens_mean: Option<f64>,
     /// `request_generation_tokens` histogram: p99 from first→last scrape bucket delta.
     pub generation_tokens_p99: Option<f64>,
     /// Raw histogram delta buckets for generation tokens (first→last scrape in window).
     pub generation_tokens_p99_buckets: Vec<HistogramCount>,
-    /// Total completed requests observed in this window (from generation tokens +Inf bucket delta).
-    /// Used to gate --max-model-len suggestions: only suggest a hard number when >= 100.
+    /// Completed-request count from the `request_generation_tokens` +Inf bucket delta.
+    /// Request count, not token count. Gates --max-model-len suggestions (>= 100) and
+    /// the $/1M output tok turnover check (completed >= mean running).
     pub generation_tokens_completed: Option<f64>,
 
     /// Wall-clock seconds from first→last `/metrics` scrape in this collection window.
@@ -109,12 +133,16 @@ pub struct VllmRawMetrics {
     pub prefill_window_mass: Option<HistogramWindowMass>,
     pub queue_window_mass: Option<HistogramWindowMass>,
     pub prompt_tokens_window_mass: Option<HistogramWindowMass>,
+    pub generation_tokens_window_mass: Option<HistogramWindowMass>,
 
     /// Cumulative generation tokens (last scrape per window), summed over label sets.
     /// Multi-window diagnose: from the **chronologically last** collected window (`docs/collection-policy.md`).
     pub generation_tokens_total: Option<f64>,
     /// Δ generation tokens / s over the first→last scrape window (output throughput).
     pub generation_tokens_per_sec: Option<f64>,
+    /// Duration-weighted mean generation tok/s over the energy-pair window set only.
+    /// Same windows as [`GpuRawMetrics::aligned_power_watts`]. Multi-window aggregate.
+    pub aligned_generation_tokens_per_sec: Option<f64>,
     /// Δ prompt tokens / s over the first→last scrape window (input throughput).
     pub prompt_tokens_per_sec: Option<f64>,
     /// Prefix cache hit rate. Single window: `(Δhits)/(Δqueries)` first→last scrape. Multi-window aggregate: sum of valid window deltas - see `docs/collection-policy.md`.
@@ -162,10 +190,12 @@ pub struct GpuRawMetrics {
     pub pcie_bus_id: Option<String>,
     pub gpu_util_pct: Option<f64>,
     pub mem_util_pct: Option<f64>,
+    /// Per-window raw power draw (W). Cleared on multi-window aggregate so unaligned
+    /// last-window power cannot leak into display or energy.
     pub power_watts: Option<f64>,
-    /// Duration-weighted mean power over active windows with GPU/vLLM clocks aligned
-    /// within `MAX_OBSERVATION_SKEW_SECS`. For energy/cost joins only. Display uses
-    /// `power_watts`. `None` when no aligned active windows contribute.
+    /// Duration-weighted mean power over the energy-pair window set (clocks aligned,
+    /// gen tok/s > 0, and sum power > 0). Display and J/tok use this only.
+    /// `None` when no energy-pair windows contribute.
     pub aligned_power_watts: Option<f64>,
     pub power_limit_watts: Option<f64>,
     pub vram_used_mb: Option<u64>,
@@ -241,7 +271,13 @@ impl GpuRawMetrics {
 pub struct AggregateGpuMetrics {
     pub gpu_util_pct: Option<f64>,
     pub mem_util_pct: Option<f64>,
-    pub power_watts: Option<f64>,
+    /// Sum of per-GPU [`GpuRawMetrics::aligned_power_watts`]. Display/energy only.
+    ///
+    /// Each per-GPU value is already a duration-weighted mean over that GPU's
+    /// energy-pair windows. Sum-of-means equals mean-of-sums only when every GPU
+    /// contributes on the same window set. At tp=1 that holds. Multi-GPU must not
+    /// inherit this field as Σenergy/Σtokens without a shared window mask.
+    pub aligned_power_watts: Option<f64>,
     pub vram_used_mb: Option<u64>,
     pub vram_peak_mb: Option<u64>,
     pub sum_vram_total_mb: Option<u64>,
@@ -306,7 +342,7 @@ impl RawSnapshot {
                 sum_mem += m;
                 n_mem += 1;
             }
-            if let Some(p) = g.power_watts {
+            if let Some(p) = g.aligned_power_watts {
                 sum_power += p;
                 n_power += 1;
             }
@@ -328,7 +364,7 @@ impl RawSnapshot {
         AggregateGpuMetrics {
             gpu_util_pct: (n_util > 0).then_some(sum_util / f64::from(n_util)),
             mem_util_pct: (n_mem > 0).then_some(sum_mem / f64::from(n_mem)),
-            power_watts: (n_power > 0).then_some(sum_power),
+            aligned_power_watts: (n_power > 0).then_some(sum_power),
             vram_used_mb: (n_vram > 0).then_some(sum_vram),
             vram_peak_mb: max_vram_peak,
             sum_vram_total_mb: sum_vram_total,

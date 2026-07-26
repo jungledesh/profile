@@ -1,6 +1,9 @@
 use crate::collectors::RawSnapshot;
 
-use super::{BindingWall, KvBoundSource, RecommendedSeqs, recommended_seqs, resolve_kv_bound};
+use super::{
+    BindingWall, KvBoundSource, RecommendedSeqs, recommended_seqs, resolve_kv_bound,
+    usable_kv_concurrency,
+};
 
 /// Fire when max_num_seqs is less than 90% of hardware-recommended capacity.
 const CONFIG_HEADROOM_RATIO: f64 = 0.90;
@@ -60,7 +63,7 @@ pub fn rule7_config_headroom(
         .filter(|v| v.is_finite())?;
 
     let (kv_bound, kv_source) = resolve_kv_bound(
-        snapshot.vllm.cache_config.kv_cache_max_concurrency,
+        usable_kv_concurrency(snapshot),
         derived_kv,
         is_hybrid,
         Some(run),

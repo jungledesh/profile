@@ -6,6 +6,7 @@ use super::effective_max_and_binder;
 use super::r6_prefill_bound::{PROMPT_GEN_RATIO_MILD, effective_prompt_tps};
 #[cfg(test)]
 use super::rule_names;
+use super::usable_kv_concurrency;
 
 /// Occupancy ceiling: R1 does not fire above this. Server is not starved.
 const OCCUPANCY_CEILING_PCT: f64 = 0.75;
@@ -96,11 +97,8 @@ pub(super) fn rule1_under_batching_with_efficiency(input: R1EvalInput<'_>) -> Ru
         return Rule1Outcome::NotFired;
     };
 
-    let (effective_max, binding_wall) = effective_max_and_binder(
-        max_n,
-        ridge_batch_size,
-        snapshot.vllm.cache_config.kv_cache_max_concurrency,
-    );
+    let (effective_max, binding_wall) =
+        effective_max_and_binder(max_n, ridge_batch_size, usable_kv_concurrency(snapshot));
 
     // 3. Hard abort - running required and > 0
     let Some(run) = running.filter(|v| v.is_finite() && *v > 0.0) else {

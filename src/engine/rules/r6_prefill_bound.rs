@@ -587,7 +587,7 @@ pub(super) fn format_prefill_bound_window_issue(
         let rejects = vec![
             "      • Cap --max-model-len at p99 prompt length to reject outlier prompts, or truncate them at app layer.".to_string(),
         ];
-        super::push_grouped_fixes(&mut lines, safe, Vec::new(), rejects);
+        super::push_grouped_fixes(&mut lines, safe, Vec::new(), rejects, false);
         SKEWED_EXPECTED.to_string()
     } else {
         lines.push("    Fix:".to_string());

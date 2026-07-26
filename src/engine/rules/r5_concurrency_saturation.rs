@@ -115,11 +115,11 @@ fn walls_fix_lines(
     max_model_len: Option<u32>,
     snapshot: &RawSnapshot,
     hyp: Option<&super::HypCapacityCtx<'_>>,
-) -> (Vec<String>, Vec<String>) {
+) -> (Vec<String>, Vec<super::CutBullet>) {
     use super::{BindingWall, KvBoundSource};
 
     let mut safe = Vec::new();
-    let mut cuts = Vec::new();
+    let mut cuts: Vec<super::CutBullet> = Vec::new();
 
     let cur = d.max_num_seqs;
     // No wall known: honest conditional line, never invent a ceiling number.
@@ -212,11 +212,10 @@ fn walls_fix_lines(
                 // Current stays in the cause line; within-margin memory omits it here.
                 safe.push(format!("      • {prefix} --max-num-seqs is {zone}."));
             }
+            let evidence = super::ShrinkEvidence::from_snapshot(snapshot);
             let shrink = super::model_len_shrink_suggestion_lines(
                 max_model_len,
-                snapshot.vllm.prompt_tokens_p99,
-                snapshot.vllm.generation_tokens_p99,
-                snapshot.vllm.generation_tokens_completed.unwrap_or(0.0),
+                &evidence,
                 "      ",
                 hyp,
                 false,
@@ -306,7 +305,7 @@ pub(super) fn format_concurrency_saturation_issue(
     match gate_kv {
         Some(pct) if pct < KV_CACHE_SAFE_TO_SCALE_PCT => {
             let (safe, cuts) = walls_fix_lines(d, rec, Some(pct), max_model_len, snapshot, hyp);
-            super::push_grouped_fixes(&mut lines, safe, cuts, Vec::new());
+            super::push_grouped_fixes(&mut lines, safe, cuts, Vec::new(), false);
         }
         Some(pct) => {
             // KV >= safe-to-scale gate: pool full, no config change helps. Scale out.
@@ -320,11 +319,12 @@ pub(super) fn format_concurrency_saturation_issue(
                 ],
                 Vec::new(),
                 Vec::new(),
+                false,
             );
         }
         None => {
             let (safe, cuts) = walls_fix_lines(d, rec, None, max_model_len, snapshot, hyp);
-            super::push_grouped_fixes(&mut lines, safe, cuts, Vec::new());
+            super::push_grouped_fixes(&mut lines, safe, cuts, Vec::new(), false);
         }
     }
     lines.push(String::new());

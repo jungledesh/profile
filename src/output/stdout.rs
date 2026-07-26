@@ -257,7 +257,7 @@ fn aggregate_to_display_gpu(agg: &crate::collectors::AggregateGpuMetrics) -> Gpu
         gpu_name: agg.gpu_name.clone(),
         gpu_util_pct: agg.gpu_util_pct,
         mem_util_pct: agg.mem_util_pct,
-        power_watts: agg.power_watts,
+        aligned_power_watts: agg.aligned_power_watts,
         vram_used_mb: agg.vram_used_mb,
         vram_peak_mb: agg.vram_peak_mb,
         vram_total_mb: agg.sum_vram_total_mb,
@@ -470,7 +470,7 @@ fn gpu_gauges_line(
     );
 
     let power = g
-        .power_watts
+        .aligned_power_watts
         .map(|draw| format!("power {:.0}W", draw))
         .unwrap_or_else(|| "power -".to_string());
 
@@ -483,17 +483,18 @@ fn gpu_gauges_line(
         if verbose && let Some(tpw) = cost.tok_per_watt.filter(|v| v.is_finite() && *v > 0.0) {
             segments.push(format!("{:.1} tok/W", tpw));
         }
-        if let Some(cpm) = cost
+        match cost
             .cost_per_million_tokens
             .filter(|v| v.is_finite() && *v > 0.0)
         {
-            let label = match cost.cost_source {
-                engine::CostSource::Catalog => format!("${:.2}/1M tok (est)", cpm),
-                engine::CostSource::UserProvided => format!("${:.2}/1M tok", cpm),
-            };
-            if !label.is_empty() {
+            Some(cpm) => {
+                let label = match cost.cost_source {
+                    engine::CostSource::Catalog => format!("${:.2}/1M output tok (est)", cpm),
+                    engine::CostSource::UserProvided => format!("${:.2}/1M output tok", cpm),
+                };
                 segments.push(label);
             }
+            None => segments.push("$/1M output tok -".to_string()),
         }
     }
 
@@ -676,7 +677,7 @@ fn gpu_detail_line(g: &GpuRawMetrics, verbose: bool, is_multi_gpu: bool) -> Stri
     if is_multi_gpu {
         let vram = format_vram(g);
         let power = g
-            .power_watts
+            .aligned_power_watts
             .map(|w| format!("power {:.0}W", w))
             .unwrap_or_else(|| "power -".to_string());
         let _ = write!(base, "{vram} | {power} | ");
@@ -1152,7 +1153,7 @@ mod tests {
     #[test]
     fn gpu_gauges_line_includes_jtok_and_catalog_cost_est() {
         let g = GpuRawMetrics {
-            power_watts: Some(421.0),
+            aligned_power_watts: Some(421.0),
             ..Default::default()
         };
         let b = baseline_with_cost(
@@ -1167,13 +1168,13 @@ mod tests {
         assert!(s.contains("power 421W"));
         assert!(s.contains("0.31 J/tok"));
         assert!(!s.contains("tok/W"));
-        assert!(s.contains("$1.84/1M tok (est)"));
+        assert!(s.contains("$1.84/1M output tok (est)"));
     }
 
     #[test]
     fn gpu_gauges_line_verbose_shows_both_jtok_and_tok_per_watt() {
         let g = GpuRawMetrics {
-            power_watts: Some(421.0),
+            aligned_power_watts: Some(421.0),
             ..Default::default()
         };
         let b = baseline_with_cost(
@@ -1191,14 +1192,29 @@ mod tests {
     #[test]
     fn gpu_gauges_line_user_cost_without_est_suffix() {
         let g = GpuRawMetrics {
-            power_watts: Some(100.0),
+            aligned_power_watts: Some(100.0),
             ..Default::default()
         };
         let b = baseline_with_cost(50.0, engine::CostSource::UserProvided, 2.50, None, None);
         let s = gpu_gauges_line(&g, Some(&b), None, false);
-        assert!(s.contains("$2.50/1M tok"));
+        assert!(s.contains("$2.50/1M output tok"));
         assert!(!s.contains("(est)"));
         assert!(!s.contains("tok/W"));
+    }
+
+    #[test]
+    fn gpu_gauges_line_shows_cost_dash_when_cpm_none() {
+        let g = GpuRawMetrics {
+            aligned_power_watts: Some(100.0),
+            ..Default::default()
+        };
+        let mut b = baseline_with_cost(50.0, engine::CostSource::UserProvided, 2.50, None, None);
+        if let Some(c) = b.cost.as_mut() {
+            c.cost_per_million_tokens = None;
+        }
+        let s = gpu_gauges_line(&g, Some(&b), None, false);
+        assert!(s.contains("$/1M output tok -"));
+        assert!(!s.contains("$2.50"));
     }
 
     #[test]
@@ -1242,7 +1258,7 @@ mod tests {
     fn gpu_gauges_line_formats_mem_gb() {
         let g = GpuRawMetrics {
             gpu_util_pct: Some(28.0),
-            power_watts: Some(310.0),
+            aligned_power_watts: Some(310.0),
             power_limit_watts: Some(400.0),
             vram_used_mb: Some(72 * 1024),
             vram_total_mb: Some(80 * 1024),
@@ -1252,9 +1268,19 @@ mod tests {
         assert!(s.contains("decode_eff ~28.0%"));
         assert!(s.contains("power 310W"));
         assert!(s.contains("vRAM 72/80GB"));
+        let g_unaligned_only = GpuRawMetrics {
+            gpu_util_pct: Some(28.0),
+            power_watts: Some(999.0),
+            vram_used_mb: Some(72 * 1024),
+            vram_total_mb: Some(80 * 1024),
+            ..Default::default()
+        };
+        let s_dash = gpu_gauges_line(&g_unaligned_only, None, None, false);
+        assert!(s_dash.contains("power -"));
+        assert!(!s_dash.contains("999"));
         let g_peak = GpuRawMetrics {
             gpu_util_pct: Some(28.0),
-            power_watts: Some(310.0),
+            aligned_power_watts: Some(310.0),
             vram_used_mb: Some(60 * 1024),
             vram_peak_mb: Some(78 * 1024),
             vram_total_mb: Some(80 * 1024),
@@ -1265,7 +1291,7 @@ mod tests {
         // 70/80 = 87.5% < 90% threshold - peak should be suppressed (noise, not signal)
         let g_peak_below_frac = GpuRawMetrics {
             gpu_util_pct: Some(28.0),
-            power_watts: Some(310.0),
+            aligned_power_watts: Some(310.0),
             vram_used_mb: Some(60 * 1024),
             vram_peak_mb: Some(70 * 1024),
             vram_total_mb: Some(80 * 1024),
@@ -1274,7 +1300,7 @@ mod tests {
         assert!(!gpu_gauges_line(&g_peak_below_frac, None, None, false).contains("peak 70GB"));
         let g_no_recovery = GpuRawMetrics {
             gpu_util_pct: Some(28.0),
-            power_watts: Some(310.0),
+            aligned_power_watts: Some(310.0),
             vram_used_mb: Some(78 * 1024),
             vram_peak_mb: Some(78 * 1024),
             vram_total_mb: Some(80 * 1024),
@@ -1328,7 +1354,7 @@ mod tests {
     fn gpu_detail_line_multi_gpu_includes_vram_and_power() {
         let g = GpuRawMetrics {
             mem_util_pct: Some(13.0),
-            power_watts: Some(171.0),
+            aligned_power_watts: Some(171.0),
             vram_used_mb: Some(49 * 1024),
             vram_total_mb: Some(80 * 1024),
             ..Default::default()
@@ -1724,7 +1750,7 @@ mod tests {
                     gpu_index: Some(0),
                     gpu_name: Some("NVIDIA H100 80GB HBM3".into()),
                     mem_util_pct: Some(40.0),
-                    power_watts: Some(300.0),
+                    aligned_power_watts: Some(300.0),
                     vram_used_mb: Some(40 * 1024),
                     vram_total_mb: Some(80 * 1024),
                     ..Default::default()
@@ -1733,7 +1759,7 @@ mod tests {
                     gpu_index: Some(1),
                     gpu_name: Some("NVIDIA H100 80GB HBM3".into()),
                     mem_util_pct: Some(42.0),
-                    power_watts: Some(310.0),
+                    aligned_power_watts: Some(310.0),
                     vram_used_mb: Some(41 * 1024),
                     vram_total_mb: Some(80 * 1024),
                     ..Default::default()

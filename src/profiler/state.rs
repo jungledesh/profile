@@ -19,14 +19,11 @@ pub struct LoopState {
     history: VecDeque<IterationRecord>,
     rec_history: VecDeque<&'static str>,
     midpoint_suggested: bool,
-    last_efficiency_pct: Option<f64>,
-    plateau_count: u32,
 }
 
 impl LoopState {
     pub fn new(result: DiagnoseResult, report: Report) -> Self {
         let mut history = VecDeque::with_capacity(MAX_LOOP_ITERATIONS);
-        let last_efficiency_pct = report.baseline.as_ref().and_then(|b| b.efficiency_pct);
         history.push_back(IterationRecord {
             result,
             report,
@@ -36,8 +33,6 @@ impl LoopState {
             history,
             rec_history: VecDeque::with_capacity(OSCILLATION_WINDOW + 1),
             midpoint_suggested: false,
-            last_efficiency_pct,
-            plateau_count: 0,
         }
     }
 
@@ -103,19 +98,6 @@ impl LoopState {
 
     pub fn iteration_count(&self) -> usize {
         self.history.len().saturating_sub(1)
-    }
-
-    pub fn update_efficiency_plateau(&mut self, current_eff: Option<f64>, delta: f64) -> u32 {
-        match (self.last_efficiency_pct, current_eff) {
-            (Some(prev), Some(cur)) if (cur - prev).abs() < delta => {
-                self.plateau_count += 1;
-            }
-            _ => {
-                self.plateau_count = 0;
-            }
-        }
-        self.last_efficiency_pct = current_eff;
-        self.plateau_count
     }
 }
 

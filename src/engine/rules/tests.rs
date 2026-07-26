@@ -925,19 +925,27 @@ fn model_len_suggestion_uses_p99_sum_when_count_sufficient() {
         &mut lines,
         model_len_shrink_suggestion_lines(
             Some(8192),
-            Some(6000.0),
-            Some(450.0),
-            150.0,
+            &ShrinkEvidence {
+                prompt_p99: Some(6000.0),
+                generation_p99: Some(450.0),
+                prompt_mean: None,
+                generation_mean: None,
+                total_count: 150.0,
+            },
             "      ",
             None,
             false,
         ),
     );
-    let text = lines.join("\n");
+    let text = lines
+        .iter()
+        .map(|(b, _)| b.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(text.contains("Lower --max-model-len 8192 → 6450"));
     assert!(text.contains("fits p99 of observed requests"));
     assert!(!text.contains("prompt p99"));
-    assert!(text.contains("Truncation risk"));
+    assert_eq!(lines[0].1, Some(SHRINK_TRUNCATION_WARNING));
 }
 
 #[test]
@@ -947,15 +955,23 @@ fn model_len_suggestion_no_op_when_count_below_threshold() {
         &mut lines,
         model_len_shrink_suggestion_lines(
             Some(8192),
-            Some(6000.0),
-            Some(450.0),
-            50.0,
+            &ShrinkEvidence {
+                prompt_p99: Some(6000.0),
+                generation_p99: Some(450.0),
+                prompt_mean: None,
+                generation_mean: None,
+                total_count: 50.0,
+            },
             "      ",
             None,
             false,
         ),
     );
-    let text = lines.join("\n");
+    let text = lines
+        .iter()
+        .map(|(b, _)| b.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(text.contains("to safely raise concurrency"));
     assert!(!text.contains('→'));
 }
@@ -967,15 +983,23 @@ fn model_len_suggestion_no_op_when_p99_missing() {
         &mut lines,
         model_len_shrink_suggestion_lines(
             Some(8192),
-            Some(6000.0),
-            None,
-            150.0,
+            &ShrinkEvidence {
+                prompt_p99: Some(6000.0),
+                generation_p99: None,
+                prompt_mean: None,
+                generation_mean: None,
+                total_count: 150.0,
+            },
             "      ",
             None,
             false,
         ),
     );
-    let text = lines.join("\n");
+    let text = lines
+        .iter()
+        .map(|(b, _)| b.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(text.contains("to safely raise concurrency"));
     assert!(!text.contains('→'));
 }
@@ -987,9 +1011,13 @@ fn model_len_suggestion_suppressed_when_delta_below_5pct() {
         &mut lines,
         model_len_shrink_suggestion_lines(
             Some(5464),
-            Some(5400.0),
-            Some(65.0),
-            150.0,
+            &ShrinkEvidence {
+                prompt_p99: Some(5400.0),
+                generation_p99: Some(65.0),
+                prompt_mean: None,
+                generation_mean: None,
+                total_count: 150.0,
+            },
             "      ",
             None,
             false,
@@ -1021,15 +1049,23 @@ fn model_len_suggestion_projects_capacity_from_observed_geometry() {
         &mut lines,
         model_len_shrink_suggestion_lines(
             Some(32768),
-            Some(15000.0),
-            Some(1384.0),
-            150.0,
+            &ShrinkEvidence {
+                prompt_p99: Some(15000.0),
+                generation_p99: Some(1384.0),
+                prompt_mean: None,
+                generation_mean: None,
+                total_count: 150.0,
+            },
             "      ",
             Some(&hyp),
             false,
         ),
     );
-    let text = lines.join("\n");
+    let text = lines
+        .iter()
+        .map(|(b, _)| b.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         text.contains("Lower --max-model-len 32768 → 16384"),
         "got: {text}"
@@ -1072,15 +1108,23 @@ fn model_len_suggestion_live_run_projection_at_5465_is_39_not_observed_8() {
         &mut lines,
         model_len_shrink_suggestion_lines(
             Some(32768),
-            Some(5000.0),
-            Some(465.0),
-            150.0,
+            &ShrinkEvidence {
+                prompt_p99: Some(5000.0),
+                generation_p99: Some(465.0),
+                prompt_mean: None,
+                generation_mean: None,
+                total_count: 150.0,
+            },
             "      ",
             Some(&hyp),
             false,
         ),
     );
-    let text = lines.join("\n");
+    let text = lines
+        .iter()
+        .map(|(b, _)| b.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         text.contains("Lower --max-model-len 32768 → 5465"),
         "got: {text}"
@@ -1208,13 +1252,18 @@ fn capacity_at_hypothetical_gate_suppresses_both_tiers() {
 
     let text = model_len_shrink_suggestion_lines(
         Some(8192),
-        Some(3500.0),
-        Some(596.0),
-        150.0,
+        &ShrinkEvidence {
+            prompt_p99: Some(3500.0),
+            generation_p99: Some(596.0),
+            prompt_mean: None,
+            generation_mean: None,
+            total_count: 150.0,
+        },
         "      ",
         Some(&hyp),
         false,
     )
+    .lines
     .join("\n");
     assert!(text.contains("Lower --max-model-len"), "got: {text}");
     assert!(!text.contains("; fits"), "got: {text}");

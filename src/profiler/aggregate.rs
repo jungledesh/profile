@@ -47,10 +47,10 @@ pub(super) fn aggregate_windows(
         .copied()
         .filter(|(w, _)| window_is_active(w))
         .collect();
-    let energy_aligned_pairs: Vec<(&collectors::RawSnapshot, Duration)> = active_pairs
+    let energy_pair_windows: Vec<(&collectors::RawSnapshot, Duration)> = active_pairs
         .iter()
         .copied()
-        .filter(|(w, _)| observations_aligned(w))
+        .filter(|(w, _)| window_is_energy_pair(w))
         .collect();
 
     // Cumulative Prometheus counters: chronologically last collection (idle tail included).
@@ -79,6 +79,7 @@ pub(super) fn aggregate_windows(
 
     // Running / waiting: duration-weighted mean over active windows. None if no active windows.
     agg_v.num_requests_running = weighted_mean(&active_pairs, |w| w.vllm.num_requests_running);
+    agg_v.num_requests_running_peak = num_requests_running_peak(&evaluable_pairs, last);
     agg_v.num_requests_waiting = weighted_mean(&active_pairs, |w| w.vllm.num_requests_waiting);
     let kv_avg = weighted_mean(&evaluable_pairs, |w| w.vllm.kv_cache_usage_perc);
     agg_v.kv_cache_usage_perc = kv_avg;
@@ -142,6 +143,9 @@ pub(super) fn aggregate_windows(
     agg_v.prompt_tokens_mean =
         histogram_mean(&evaluable_pairs, |v| v.prompt_tokens_window_mass, 1.0)
             .or_else(|| weighted_mean(&evaluable_pairs, |w| w.vllm.prompt_tokens_mean));
+    agg_v.generation_tokens_mean =
+        histogram_mean(&evaluable_pairs, |v| v.generation_tokens_window_mass, 1.0)
+            .or_else(|| weighted_mean(&evaluable_pairs, |w| w.vllm.generation_tokens_mean));
     let total_window_secs: f64 = evaluable_pairs.iter().map(|(_, d)| d.as_secs_f64()).sum();
     if total_window_secs.is_finite() && total_window_secs > f64::EPSILON {
         agg_v.window_duration_secs = Some(total_window_secs);
@@ -152,8 +156,14 @@ pub(super) fn aggregate_windows(
     agg_v.queue_window_mass = accumulate_histogram_mass(&active_pairs, |v| v.queue_window_mass);
     agg_v.prompt_tokens_window_mass =
         accumulate_histogram_mass(&evaluable_pairs, |v| v.prompt_tokens_window_mass);
+    agg_v.generation_tokens_window_mass =
+        accumulate_histogram_mass(&evaluable_pairs, |v| v.generation_tokens_window_mass);
     agg_v.generation_tokens_per_sec =
         weighted_mean(&active_pairs, |w| w.vllm.generation_tokens_per_sec);
+    // Energy pair set: same windows as aligned_power_watts. Pair or not at all.
+    agg_v.aligned_generation_tokens_per_sec =
+        weighted_mean(&energy_pair_windows, |w| w.vllm.generation_tokens_per_sec);
+    agg_v.prompt_tokens_per_sec = weighted_mean(&active_pairs, |w| w.vllm.prompt_tokens_per_sec);
     agg_v.request_success_per_sec =
         weighted_mean(&active_pairs, |w| w.vllm.request_success_per_sec);
     agg_v.num_preemptions_per_sec =
@@ -177,11 +187,10 @@ pub(super) fn aggregate_windows(
         agg_g.mem_util_pct = weighted_mean(&active_pairs, |w| {
             w.gpus.get(idx).and_then(|g| g.mem_util_pct)
         });
-        agg_g.power_watts = weighted_mean(&active_pairs, |w| {
-            w.gpus.get(idx).and_then(|g| g.power_watts)
-        });
-        // Energy/cost join: only windows whose GPU and vLLM clocks align.
-        agg_g.aligned_power_watts = weighted_mean(&energy_aligned_pairs, |w| {
+        // Cleared: unaligned active-window power must not reach display or energy.
+        agg_g.power_watts = None;
+        // Energy/display: only windows with clocks aligned, gen tok/s > 0, and power > 0.
+        agg_g.aligned_power_watts = weighted_mean(&energy_pair_windows, |w| {
             w.gpus.get(idx).and_then(|g| g.power_watts)
         });
         agg_g.temperature_c = last.gpus.get(idx).and_then(|g| g.temperature_c);
@@ -208,6 +217,39 @@ fn empty_aggregate(at: SystemTime) -> collectors::RawSnapshot {
         timestamp: at,
         ..Default::default()
     }
+}
+
+/// `max(per-window peaks, last-evaluable landing running)` - mean would hide the
+/// burst that disproves full-context concurrency.
+fn num_requests_running_peak(
+    pairs: &[(&collectors::RawSnapshot, Duration)],
+    last: &collectors::RawSnapshot,
+) -> Option<f64> {
+    let from_windows = pairs
+        .iter()
+        .filter_map(|(w, _)| w.vllm.num_requests_running_peak)
+        .filter(|r| r.is_finite())
+        .reduce(|a, b| a.max(b));
+    let landing = last.vllm.num_requests_running.filter(|x| x.is_finite());
+    max_option_f64(from_windows, landing)
+}
+
+/// Energy join window: clocks aligned, generation tok/s > 0, and sum GPU power > 0.
+/// Power-only or tok-only windows are excluded so they cannot inflate J/tok.
+fn window_is_energy_pair(w: &collectors::RawSnapshot) -> bool {
+    if !observations_aligned(w) {
+        return false;
+    }
+    let gen_ok = w
+        .vllm
+        .generation_tokens_per_sec
+        .filter(|t| t.is_finite() && *t > 0.0)
+        .is_some();
+    if !gen_ok {
+        return false;
+    }
+    let power_sum: f64 = w.gpus.iter().filter_map(|g| g.power_watts).sum();
+    power_sum > 0.0
 }
 
 /// `max(a, b)` for `Option<f64>` - `None` treated as absent, not zero.
@@ -1025,10 +1067,19 @@ mod tests {
         assert_eq!(agg.gpus.len(), 2);
         assert!((agg.gpus[0].gpu_util_pct.unwrap() - 60.0).abs() < 1e-9);
         assert!((agg.gpus[1].gpu_util_pct.unwrap() - 40.0).abs() < 1e-9);
-        assert!((agg.gpus[0].power_watts.unwrap() - 200.0).abs() < 1e-9);
-        assert!((agg.gpus[1].power_watts.unwrap() - 150.0).abs() < 1e-9);
+        assert!(agg.gpus[0].power_watts.is_none());
+        assert!(agg.gpus[1].power_watts.is_none());
         assert!((agg.gpus[0].aligned_power_watts.unwrap() - 200.0).abs() < 1e-9);
         assert!((agg.gpus[1].aligned_power_watts.unwrap() - 150.0).abs() < 1e-9);
+        assert!((agg.vllm.aligned_generation_tokens_per_sec.unwrap() - 100.0).abs() < 1e-9);
+        // mean_P / mean_tps over pair set: (200+150)/100 = 3.5 J/tok; tok/W reciprocal.
+        let sum_p =
+            agg.gpus[0].aligned_power_watts.unwrap() + agg.gpus[1].aligned_power_watts.unwrap();
+        let aligned_tps = agg.vllm.aligned_generation_tokens_per_sec.unwrap();
+        let jtok = sum_p / aligned_tps;
+        let tpw = aligned_tps / sum_p;
+        assert!((jtok - 3.5).abs() < 1e-9);
+        assert!((tpw * jtok - 1.0).abs() < 1e-9);
     }
 
     #[test]
@@ -1066,10 +1117,63 @@ mod tests {
             &[Duration::from_secs(2), Duration::from_secs(2)],
             SystemTime::UNIX_EPOCH,
         );
-        // Display power includes both active windows.
-        assert!((agg.gpus[0].power_watts.unwrap() - 200.0).abs() < 1e-9);
-        // Aligned energy power keeps only the in-skew window.
+        // Unaligned power cleared; display/energy use aligned pair set only.
+        assert!(agg.gpus[0].power_watts.is_none());
         assert!((agg.gpus[0].aligned_power_watts.unwrap() - 100.0).abs() < 1e-9);
+        assert!((agg.vllm.generation_tokens_per_sec.unwrap() - 100.0).abs() < 1e-9);
+        assert!((agg.vllm.aligned_generation_tokens_per_sec.unwrap() - 100.0).abs() < 1e-9);
+        let jtok = agg.gpus[0].aligned_power_watts.unwrap()
+            / agg.vllm.aligned_generation_tokens_per_sec.unwrap();
+        assert!((jtok - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn aggregate_energy_pair_excludes_power_only_windows() {
+        // Active + aligned + 450W but 0 tok/s must not inflate aligned power or J/tok.
+        let pair = RawSnapshot {
+            gpu_observed_at: SystemTime::UNIX_EPOCH,
+            vllm_observed_at: SystemTime::UNIX_EPOCH,
+            timestamp: SystemTime::UNIX_EPOCH,
+            vllm: VllmRawMetrics {
+                num_requests_running: Some(10.0),
+                generation_tokens_per_sec: Some(100.0),
+                window_duration_secs: Some(2.0),
+                ..Default::default()
+            },
+            gpus: vec![GpuRawMetrics {
+                gpu_index: Some(0),
+                power_watts: Some(100.0),
+                ..Default::default()
+            }],
+        };
+        let power_only = RawSnapshot {
+            gpu_observed_at: SystemTime::UNIX_EPOCH,
+            vllm_observed_at: SystemTime::UNIX_EPOCH,
+            timestamp: SystemTime::UNIX_EPOCH,
+            vllm: VllmRawMetrics {
+                num_requests_running: Some(10.0),
+                generation_tokens_per_sec: Some(0.0),
+                window_duration_secs: Some(2.0),
+                ..Default::default()
+            },
+            gpus: vec![GpuRawMetrics {
+                gpu_index: Some(0),
+                power_watts: Some(450.0),
+                ..Default::default()
+            }],
+        };
+        let agg = aggregate_windows(
+            &[pair, power_only],
+            &[Duration::from_secs(2), Duration::from_secs(2)],
+            SystemTime::UNIX_EPOCH,
+        );
+        assert!(agg.gpus[0].power_watts.is_none());
+        assert!((agg.gpus[0].aligned_power_watts.unwrap() - 100.0).abs() < 1e-9);
+        assert!((agg.vllm.aligned_generation_tokens_per_sec.unwrap() - 100.0).abs() < 1e-9);
+        // If power-only were included: (100+450)/2 = 275W → 2.75 J/tok. Pair-only: 1.0.
+        let jtok = agg.gpus[0].aligned_power_watts.unwrap()
+            / agg.vllm.aligned_generation_tokens_per_sec.unwrap();
+        assert!((jtok - 1.0).abs() < 1e-9);
     }
 
     #[test]
@@ -1096,8 +1200,11 @@ mod tests {
             &[Duration::from_secs(2), Duration::from_secs(2)],
             SystemTime::UNIX_EPOCH,
         );
-        assert!(agg.gpus[0].power_watts.is_some());
+        assert!(agg.gpus[0].power_watts.is_none());
         assert!(agg.gpus[0].aligned_power_watts.is_none());
+        assert!(agg.vllm.aligned_generation_tokens_per_sec.is_none());
+        // Unaligned raw power must not leak into AggregateGpuMetrics display path.
+        assert!(agg.aggregate_gpu().aligned_power_watts.is_none());
     }
 
     #[test]

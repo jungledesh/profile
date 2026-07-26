@@ -25,6 +25,56 @@ pub(crate) use r2_kv_cache_pressure::KV_CACHE_PRESSURE_MIN_PERC;
 pub(crate) use r3_low_prefix_reuse::{LowPrefixReuseDetail, Rule3Outcome, r3_recommendation};
 pub use r4_oom_risk::{r4_advisory, r4_recommendation};
 
+/// True when avg or peak KV usage is at/above the R2 pressure bar.
+/// Shared by R2's fire gate and MU's memory-wall veto so the threshold cannot drift.
+pub(super) fn kv_near_full(snapshot: &crate::collectors::RawSnapshot) -> bool {
+    let kv = snapshot.vllm.kv_cache_usage_perc.filter(|v| v.is_finite());
+    let peak = snapshot.vllm.kv_cache_peak_perc.filter(|v| v.is_finite());
+    kv.is_some_and(|k| k >= KV_CACHE_PRESSURE_MIN_PERC)
+        || peak.is_some_and(|p| p >= KV_CACHE_PRESSURE_MIN_PERC)
+}
+
+/// Floored Observed `kv_cache_max_concurrency`, if present and positive after floor.
+fn floored_kv_cap(snapshot: &crate::collectors::RawSnapshot) -> Option<f64> {
+    let raw = snapshot
+        .vllm
+        .cache_config
+        .kv_cache_max_concurrency
+        .filter(|c| c.is_finite() && *c > 0.0)?;
+    let cap = raw.floor();
+    (cap > 0.0).then_some(raw)
+}
+
+/// vLLM's `kv_cache_max_concurrency` is a guarantee at full `max_model_len`, not a
+/// prediction for observed traffic. When peak running exceeds it, the cap does
+/// not describe this workload: decline it rather than treat it as a wall.
+///
+/// Seat and occupancy use only. Page-model geometry keeps reading the raw label:
+/// backing out pages per sequence needs a full-context number precisely because
+/// it is one, and peak running says nothing about block arithmetic.
+///
+/// Uses peak running, not mean: one burst above `floor(cap)` already falsifies the
+/// full-context guarantee. Mean would hide that burst. (Cost turnover uses mean
+/// running for a different job: covering steady concurrent seats with completions.)
+///
+/// Absent peak running is not evidence of contradiction: return the cap.
+pub(super) fn usable_kv_concurrency(snapshot: &crate::collectors::RawSnapshot) -> Option<f64> {
+    let raw = floored_kv_cap(snapshot)?;
+    let contradicted = snapshot
+        .vllm
+        .num_requests_running_peak
+        .filter(|p| p.is_finite())
+        .is_some_and(|peak| peak > raw.floor());
+    (!contradicted).then_some(raw)
+}
+
+/// True when Observed full-context concurrency is present and peak running has
+/// already exceeded `floor(cap)`. R2 uses this to omit the seat bullet entirely
+/// (not fall through to a numberless throttle or derived print).
+pub(super) fn observed_kv_cap_contradicted(snapshot: &crate::collectors::RawSnapshot) -> bool {
+    floored_kv_cap(snapshot).is_some() && usable_kv_concurrency(snapshot).is_none()
+}
+
 /// Minimum active windows for a trustworthy verdict. Window size scales with run
 /// duration (2s for <= 30s runs, else 10s), so this enforces 6s to 30s of sustained
 /// traffic. See profiler::logical_window_size.
@@ -70,6 +120,8 @@ pub(super) fn capacity_at_hypothetical_max_len(
     };
 
     // Hybrid ladder geometry uses mamba_block_size when present; dense uses block_size.
+    // Raw kv_cache_max_concurrency: page-model geometry, not a seat wall. Do not route
+    // through usable_kv_concurrency — peak running says nothing about block arithmetic.
     let block_size = ctx.cache.mamba_block_size.or(ctx.cache.block_size);
     if let (Some(bs), Some(blocks), Some(obs), Some(cur)) = (
         block_size,
@@ -118,47 +170,107 @@ pub(super) fn p99_sum_below_half_max_model_len(
     }
 }
 
-/// Build max_model_len shrink suggestion lines (may be empty).
+/// Evidence for max_model_len shrink suggestions (p99 target path + sub-floor means).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ShrinkEvidence {
+    pub prompt_p99: Option<f64>,
+    pub generation_p99: Option<f64>,
+    pub prompt_mean: Option<f64>,
+    pub generation_mean: Option<f64>,
+    pub total_count: f64,
+}
+
+impl ShrinkEvidence {
+    pub(super) fn from_snapshot(snapshot: &crate::collectors::RawSnapshot) -> Self {
+        Self {
+            prompt_p99: snapshot.vllm.prompt_tokens_p99,
+            generation_p99: snapshot.vllm.generation_tokens_p99,
+            prompt_mean: snapshot.vllm.prompt_tokens_mean,
+            generation_mean: snapshot.vllm.generation_tokens_mean,
+            total_count: snapshot.vllm.generation_tokens_completed.unwrap_or(0.0),
+        }
+    }
+}
+
+/// Result of building shrink suggestion lines. `target` is set only when a
+/// concrete max_model_len was prescribed (>= 100 completions, both p99s, >=5% cut).
+/// `subline` is decided here and attached at render (truncation warning or verify).
+#[derive(Debug, Clone)]
+pub(super) struct ShrinkSuggestion {
+    pub lines: Vec<String>,
+    pub target: Option<u32>,
+    pub subline: Option<&'static str>,
+}
+
+/// Truncation caution for a named shrink target.
+pub(super) const SHRINK_TRUNCATION_WARNING: &str =
+    "Warning: max_model_len is total context (prompt + completion). Truncation risk!";
+
+/// When current max_model_len is unknown, tell the operator where to read it.
+pub(super) const MAX_MODEL_LEN_VERIFY_SUBLINE: &str =
+    "Verify: check the vLLM start command for the current value.";
+
+/// Build max_model_len shrink suggestion lines.
 /// Hard number only when `total_count >= 100` and both p99s are present.
-/// Empty when `max_model_len` is None or the shrink is < 5%.
+/// Empty only when a known `max_model_len` would shrink by < 5% (no-op).
+/// When `max_model_len` is None, still prescribe lowering it and attach the
+/// verify subline so Fix is never an empty promise.
 ///
 /// `current_shown`: when true, the block already names the current max_model_len
 /// above this bullet, so emit `to {suggested}`; otherwise `{current} → {suggested}`.
 ///
 /// Projected concurrency at `{suggested}` comes only from
-/// [`capacity_at_hypothetical_max_len`](suggested) — never from the current-config
+/// [`capacity_at_hypothetical_max_len`](suggested), never from the current-config
 /// R2 ceiling (`r2_kv_max_seqs` / observed concurrency at full `max_model_len`).
 pub(super) fn model_len_shrink_suggestion_lines(
     max_model_len: Option<u32>,
-    prompt_p99: Option<f64>,
-    generation_p99: Option<f64>,
-    total_count: f64,
+    evidence: &ShrinkEvidence,
     indent: &str,
     hyp: Option<&HypCapacityCtx<'_>>,
     current_shown: bool,
-) -> Vec<String> {
+) -> ShrinkSuggestion {
     let mut lines = Vec::new();
     let Some(m) = max_model_len else {
-        return lines;
+        lines.push(format!(
+            "{indent}• Lower --max-model-len to safely raise concurrency."
+        ));
+        return ShrinkSuggestion {
+            lines,
+            target: None,
+            subline: Some(MAX_MODEL_LEN_VERIFY_SUBLINE),
+        };
     };
 
-    if total_count >= 100.0 {
-        let Some(pp) = prompt_p99 else {
+    if evidence.total_count >= 100.0 {
+        let Some(pp) = evidence.prompt_p99 else {
             lines.push(format!(
                 "{indent}• Lower --max-model-len (current: {m}) to safely raise concurrency."
             ));
-            return lines;
+            return ShrinkSuggestion {
+                lines,
+                target: None,
+                subline: None,
+            };
         };
-        let Some(gp) = generation_p99 else {
+        let Some(gp) = evidence.generation_p99 else {
             lines.push(format!(
                 "{indent}• Lower --max-model-len (current: {m}) to safely raise concurrency."
             ));
-            return lines;
+            return ShrinkSuggestion {
+                lines,
+                target: None,
+                subline: None,
+            };
         };
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let suggested = (pp as u32).saturating_add(gp as u32);
         // Suppress if reduction is < 5% - not a meaningful change (avoids "5464 → 5465" no-ops)
         if suggested >= m.saturating_sub(m / 20) {
-            return lines;
+            return ShrinkSuggestion {
+                lines,
+                target: None,
+                subline: None,
+            };
         }
         // Projection at the *suggested* length only — not current observed concurrency.
         let fits = hyp
@@ -174,15 +286,68 @@ pub(super) fn model_len_shrink_suggestion_lines(
             "{indent}• Lower --max-model-len {len_clause} \
              (fits p99 of observed requests){fits}"
         ));
-        lines.push(format!(
-            "{indent}  Warning: max_model_len is total context (prompt + completion). Truncation risk!"
-        ));
-    } else {
-        lines.push(format!(
-            "{indent}• Lower --max-model-len (current: {m}) to safely raise concurrency."
-        ));
+        return ShrinkSuggestion {
+            lines,
+            target: Some(suggested),
+            subline: Some(SHRINK_TRUNCATION_WARNING),
+        };
     }
-    lines
+    lines.push(sub_floor_shrink_evidence_line(
+        indent,
+        m,
+        evidence.prompt_mean,
+        evidence.generation_mean,
+    ));
+    ShrinkSuggestion {
+        lines,
+        target: None,
+        subline: None,
+    }
+}
+
+fn format_observed_context_tokens(n: f64) -> String {
+    if n >= 1000.0 {
+        format!("{:.1}k", n / 1000.0)
+    } else {
+        format!("{:.0}", n.round())
+    }
+}
+
+/// Below the 100-completion floor: evidence only, no named target.
+fn sub_floor_shrink_evidence_line(
+    indent: &str,
+    max_model_len: u32,
+    prompt_mean: Option<f64>,
+    gen_mean: Option<f64>,
+) -> String {
+    let prompt = prompt_mean.filter(|v| v.is_finite() && *v >= 0.0);
+    let generation = gen_mean.filter(|v| v.is_finite() && *v >= 0.0);
+    match (prompt, generation) {
+        (Some(p), Some(g)) => {
+            let ctx = format_observed_context_tokens(p + g);
+            format!(
+                "{indent}• Lower --max-model-len (current: {max_model_len}). \
+                 Observed {ctx} tokens per request, prompt plus generation."
+            )
+        }
+        (Some(p), None) => {
+            let ctx = format_observed_context_tokens(p);
+            format!(
+                "{indent}• Lower --max-model-len (current: {max_model_len}). \
+                 Observed prompt {ctx} tokens per request."
+            )
+        }
+        (None, Some(g)) => {
+            let ctx = format_observed_context_tokens(g);
+            format!(
+                "{indent}• Lower --max-model-len (current: {max_model_len}). \
+                 Observed generation {ctx} tokens per request."
+            )
+        }
+        (None, None) => format!(
+            "{indent}• Lower --max-model-len (current: {max_model_len}) to safely raise concurrency."
+        ),
+    }
 }
 
 /// Compare observed geometry `state_pages` to catalog hybrid estimate.
@@ -205,6 +370,7 @@ pub(super) fn catalog_state_pages_mismatch(
 
     let block_size = cache.mamba_block_size.or(cache.block_size)?;
     let num_gpu_blocks = cache.num_gpu_blocks?;
+    // Raw kv_cache_max_concurrency: geometry audit only. Not a seat/occupancy wall.
     let observed_concurrency = cache.kv_cache_max_concurrency?;
     let current_max_len = current_max_len?;
     let page_bytes = cache.mamba_page_size_padded?;
@@ -581,28 +747,71 @@ pub(super) fn push_bullet_with_subline(
     }
 }
 
-/// Emit `Fix:` then safe bullets, then optional `Cuts throughput:` / `Rejects requests:`
-/// groups. Empty safe group: `Cuts throughput:` follows `Fix:` with no blank between.
+/// One Fix-group bullet with an optional action-attached subline.
+/// Subline is decided when the bullet is built, never by re-reading printed text.
+pub(super) type CutBullet = (String, Option<&'static str>);
+
+/// Emit `Fix:` then safe / cuts / rejects groups.
+///
+/// When both safe and cuts are non-empty, both get labels (`Safe to apply:` /
+/// `Cuts throughput:`). A labeled group is never followed by unlabeled bullets.
+/// When only one of those groups exists, keep unlabeled safe under `Fix:` and
+/// labeled cuts only (today's single-group behavior).
+///
+/// `lead_with_cuts`: emit the cuts group before safe (shrink-led / contradicted-cap
+/// paths). Labels and truncation warnings stay attached to their bullets.
 pub(super) fn push_grouped_fixes(
     out: &mut Vec<String>,
     mut safe: Vec<String>,
-    mut cuts_throughput: Vec<String>,
+    mut cuts_throughput: Vec<CutBullet>,
     mut rejects: Vec<String>,
+    lead_with_cuts: bool,
 ) {
     trim_group_trailing_blanks(&mut safe);
-    trim_group_trailing_blanks(&mut cuts_throughput);
+    while cuts_throughput.last().is_some_and(|(b, _)| b.is_empty()) {
+        cuts_throughput.pop();
+    }
     trim_group_trailing_blanks(&mut rejects);
 
     out.push("    Fix:".to_string());
-    let had_safe = !safe.is_empty();
-    out.extend(safe);
+    let both_safe_and_cuts = !safe.is_empty() && !cuts_throughput.is_empty();
 
-    if !cuts_throughput.is_empty() {
-        if had_safe {
+    let push_safe = |out: &mut Vec<String>, safe: Vec<String>| {
+        if safe.is_empty() {
+            return;
+        }
+        if both_safe_and_cuts {
+            out.push("    Safe to apply:".to_string());
+        }
+        out.extend(safe);
+    };
+    let push_cuts = |out: &mut Vec<String>, cuts: Vec<CutBullet>, blank_before: bool| {
+        if cuts.is_empty() {
+            return;
+        }
+        if blank_before {
             out.push(String::new());
         }
         out.push("    Cuts throughput:".to_string());
-        out.extend(cuts_throughput);
+        for (bullet, sub) in cuts {
+            push_bullet_with_subline(out, bullet, sub);
+        }
+        // Subline blanks are group-internal; strip trailing so the caller owns
+        // the blank before the next section (Expected / Rejects).
+        while out.last().is_some_and(|l| l.is_empty()) {
+            out.pop();
+        }
+    };
+
+    if lead_with_cuts {
+        push_cuts(out, cuts_throughput, false);
+        if both_safe_and_cuts {
+            out.push(String::new());
+        }
+        push_safe(out, safe);
+    } else {
+        push_safe(out, safe);
+        push_cuts(out, cuts_throughput, both_safe_and_cuts);
     }
 
     if !rejects.is_empty() {
@@ -615,17 +824,16 @@ pub(super) fn push_grouped_fixes(
     }
 }
 
-/// Push shrink suggestion lines into a group, routing the truncation Warning
-/// through [`push_bullet_with_subline`].
-pub(super) fn extend_with_shrink_suggestion(out: &mut Vec<String>, shrink_lines: Vec<String>) {
-    let mut it = shrink_lines.into_iter();
+/// Push a shrink suggestion into a cuts group. Subline (truncation warning or
+/// verify) is taken from [`ShrinkSuggestion::subline`], decided at build time.
+pub(super) fn extend_with_shrink_suggestion(out: &mut Vec<CutBullet>, shrink: ShrinkSuggestion) {
+    let mut it = shrink.lines.into_iter();
     let Some(bullet) = it.next() else {
         return;
     };
-    let warning = it.next();
-    push_bullet_with_subline(out, bullet, warning.as_deref());
+    out.push((bullet, shrink.subline));
     for extra in it {
-        out.push(extra);
+        out.push((extra, None));
     }
 }
 
