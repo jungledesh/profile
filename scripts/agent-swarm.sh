@@ -18,11 +18,18 @@
 #
 # Knobs (env):
 #   AGENTS=16          concurrent agent workers
-#   STAGGER=5          seconds between worker launches
-#   DURATION=0         total seconds to run (0 = until Ctrl-C)
+#   STAGGER=5          seconds between worker launches (ignored when STABLE=1)
+#   DURATION=0         total seconds to run (0 = until Ctrl-C; use 0 during profile)
 #   TASK_TIMEOUT=600   max seconds per task before the worker moves on
+#   STABLE=1           spread worker phases + jitter timeouts for steady vLLM load (default on)
+#   PHASE_SPREAD=600   seconds across which worker start phases are evenly spread
+#   TIMEOUT_JITTER=90  per-task timeout ± seconds when STABLE=1
 #   SWARM_HOME=/workspace/swarm   scratch area (clones, checkouts, venvs, log)
 #   MODEL_ALIAS=qwen-local        grok model alias (see config below)
+#
+# Profile demo (steady traffic, no cohort ramp):
+#   STABLE=1 AGENTS=16 TASK_TIMEOUT=600 DURATION=0 ./agent-swarm.sh run
+#   Wait ~2 min after launch for phase spread to fill, then run profile diagnose.
 #
 # Requires: vLLM serving Qwen3.6-27B on localhost:8000 (see start.sh); jq; git.
 #
@@ -37,6 +44,9 @@ AGENTS="${AGENTS:-16}"
 STAGGER="${STAGGER:-5}"
 DURATION="${DURATION:-0}"
 TASK_TIMEOUT="${TASK_TIMEOUT:-600}"
+STABLE="${STABLE:-1}"
+PHASE_SPREAD="${PHASE_SPREAD:-$TASK_TIMEOUT}"
+TIMEOUT_JITTER="${TIMEOUT_JITTER:-90}"
 SWARM_HOME="${SWARM_HOME:-/workspace/swarm}"
 MODEL_ALIAS="${MODEL_ALIAS:-qwen-local}"
 
@@ -266,6 +276,19 @@ smoke_imports() {
 # ── Swarm ───────────────────────────────────────────────────────────────────
 END=0
 
+task_timeout_secs() {
+    local base="$1"
+    if [[ "$STABLE" != "1" ]]; then
+        echo "$base"
+        return
+    fi
+    local span=$(( 2 * TIMEOUT_JITTER + 1 ))
+    local jitter=$(( RANDOM % span - TIMEOUT_JITTER ))
+    local t=$(( base + jitter ))
+    (( t < 60 )) && t=60
+    echo "$t"
+}
+
 worker() {
     local id_w="$1"
     local run=0
@@ -273,11 +296,17 @@ worker() {
     n=$(jq length "$TASKS_JSON")
     order=()
     pos=$n
+
+    if [[ "$STABLE" == "1" && "$AGENTS" -gt 0 ]]; then
+        local phase=$(( id_w * PHASE_SPREAD / AGENTS ))
+        (( phase > 0 )) && sleep "$phase"
+    fi
+
     while true; do
         local now t
         now=$(date +%s)
         if (( END > 0 && now >= END - 30 )); then break; fi
-        t="$TASK_TIMEOUT"
+        t=$(task_timeout_secs "$TASK_TIMEOUT")
         if (( END > 0 && END - now < t )); then t=$(( END - now )); fi
 
         if (( pos >= n )); then
@@ -354,12 +383,18 @@ run_swarm() {
     (( DURATION > 0 )) && END=$(( start_ts + DURATION ))
 
     trap cleanup INT TERM
-    echo "Launching $AGENTS agents (stagger ${STAGGER}s, task timeout ${TASK_TIMEOUT}s, duration $( ((DURATION > 0)) && echo "${DURATION}s" || echo "until Ctrl-C" ))"
+    local launch_stagger=0
+    [[ "$STABLE" != "1" ]] && launch_stagger="$STAGGER"
+    if [[ "$STABLE" == "1" ]]; then
+        echo "Launching $AGENTS agents (stable: phase spread ${PHASE_SPREAD}s, timeout ${TASK_TIMEOUT}s ±${TIMEOUT_JITTER}s, duration $( ((DURATION > 0)) && echo "${DURATION}s" || echo "until Ctrl-C" ))"
+    else
+        echo "Launching $AGENTS agents (stagger ${STAGGER}s, task timeout ${TASK_TIMEOUT}s, duration $( ((DURATION > 0)) && echo "${DURATION}s" || echo "until Ctrl-C" ))"
+    fi
     local i
     for (( i = 0; i < AGENTS; i++ )); do
         worker "$i" &
         WORKER_PIDS+=($!)
-        (( i < AGENTS - 1 )) && sleep "$STAGGER"
+        (( i < AGENTS - 1 && launch_stagger > 0 )) && sleep "$launch_stagger"
     done
     echo "All $AGENTS agents running. Live log: tail -f $SWARM_LOG"
     wait
