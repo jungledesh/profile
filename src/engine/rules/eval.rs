@@ -10,9 +10,8 @@ use super::r1_under_batching::{
 use super::r2_kv_cache_pressure::{
     KvAdmissionBacklogDetail, KvCachePressureDetail, KvFormatCtx, Rule2Outcome,
     aggregate_backlog_detail, aggregate_r2_detail, format_kv_admission_backlog_issue,
-    format_kv_cache_window_issue, kv_pressure_confidence, model_is_hybrid,
-    prescribed_for_self_grade, resolve_r2_kv_capacity, rule2_kv_admission_backlog,
-    rule2_kv_cache_pressure,
+    format_kv_cache_window_issue, kv_pressure_confidence, model_is_hybrid, resolve_r2_kv_capacity,
+    rule2_kv_admission_backlog, rule2_kv_cache_pressure,
 };
 use super::r3_low_prefix_reuse::{
     LowPrefixReuseDetail, Rule3Outcome, aggregate_r3_detail, format_low_prefix_window_issue,
@@ -422,13 +421,11 @@ fn build_report_from_eval(
             suppressed_rules: Vec::new(),
             suppressed_recs: Vec::new(),
             kv_max_seqs: derived.max_seqs,
-            prescribed_kv_capacity: None,
             catalog_state_mismatch: catalog_state_pages_mismatch(
                 &summary_snap.vllm.cache_config,
                 summary.ctx.config.max_model_len,
                 &summary.ctx.model,
             ),
-            memory_budget_self_grade: derived.budget_self_grade,
             n_eval: 0,
             skipped_broken: eval.skipped_broken,
             skipped_idle: eval.skipped_idle,
@@ -460,23 +457,29 @@ fn build_report_from_eval(
     // else derived, else empirical (run-level mean(running) / peak(kv%)). R5 and R7
     // both read this so they never print two different recommended values.
     let ridge_run = baseline.as_ref().map(|b| b.ridge_batch_size);
-    let (run_kv_bound, run_kv_source) = resolve_kv_bound(
+    let (run_kv_bound, run_kv_source, run_kv_floor) = resolve_kv_bound(
         usable_kv_concurrency(summary_snap),
         kv_max_seqs,
         model_is_hybrid(&summary.ctx.model),
         eval.mean_running(),
         eval.session_kv_peak,
+        summary_snap.vllm.num_requests_running_peak,
     );
     let run_rec = recommended_seqs(
         ridge_run,
         run_kv_bound,
         run_kv_source,
+        run_kv_floor,
         summary.ctx.config.max_num_seqs,
         baseline.as_ref().map(|b| b.kv_cache_dtype_source),
     );
     let r2_significant = eval.r2_significant();
     let r2_backlog_significant = eval.r2_backlog_significant();
     let limiter_evidence = Some(crate::engine::limiter::LimiterEvidence {
+        kv_cache_mean_perc: summary_snap
+            .vllm
+            .kv_cache_usage_perc
+            .filter(|v| v.is_finite()),
         kv_cache_peak_perc: eval.session_kv_peak,
         mean_running: eval.mean_running(),
         ridge_batch_size: ridge_run.filter(|r| r.is_finite() && *r > 0.0),
@@ -484,11 +487,14 @@ fn build_report_from_eval(
         tpot_floor_ms: baseline.as_ref().map(|b| b.tpot_floor_ms),
         effective_prompt_decode_ratio: eval.mean_effective_ratio(),
         chunked_prefill_enabled: summary.ctx.config.enable_chunked_prefill,
+        headroom_pct: baseline.as_ref().and_then(|b| b.headroom_pct),
         n_eval: eval.n_eval,
+        ceiling_unknown_reason: baseline
+            .is_none()
+            .then(|| baseline::baseline_missing_reason(summary.ctx)),
     });
 
     let mut recs: Vec<Recommendation> = Vec::new();
-    let mut prescribed_kv_capacity: Option<u32> = None;
 
     if eval.r1_significant() {
         let d = aggregate_r1_detail(&eval.r1_details);
@@ -512,7 +518,6 @@ fn build_report_from_eval(
     if r2_significant {
         let r2_agg = aggregate_r2_detail(&eval.r2_details);
         let conf = kv_pressure_confidence(eval.r2_fired, eval.n_eval);
-        prescribed_kv_capacity = prescribed_for_self_grade(r2_kv_max_seqs, r2_capacity_label);
         let display_lines = format_kv_cache_window_issue(
             &r2_agg,
             pct(eval.r2_fired, eval.n_eval),
@@ -521,6 +526,7 @@ fn build_report_from_eval(
                 max_model_len,
                 kv_headroom_gb,
                 kv_max_seqs: r2_kv_max_seqs,
+                config_max_num_seqs: summary.ctx.config.max_num_seqs,
                 capacity_label: r2_capacity_label,
                 fp8_compiler_available,
                 model: Some(&summary.ctx.model),
@@ -539,7 +545,6 @@ fn build_report_from_eval(
         });
     } else if r2_backlog_significant {
         let agg = aggregate_backlog_detail(&eval.r2_backlog_details);
-        prescribed_kv_capacity = prescribed_for_self_grade(r2_kv_max_seqs, r2_capacity_label);
         let display_lines = format_kv_admission_backlog_issue(
             &agg,
             pct(eval.r2_backlog_fired, eval.n_eval),
@@ -548,6 +553,7 @@ fn build_report_from_eval(
                 max_model_len,
                 kv_headroom_gb,
                 kv_max_seqs: r2_kv_max_seqs,
+                config_max_num_seqs: summary.ctx.config.max_num_seqs,
                 capacity_label: r2_capacity_label,
                 fp8_compiler_available,
                 model: Some(&summary.ctx.model),
@@ -570,20 +576,12 @@ fn build_report_from_eval(
         && let Some(agg) =
             aggregate_concurrency_saturation_detail(&eval.r5_details, eval.session_kv_peak)
     {
-        let hyp = super::HypCapacityCtx {
-            cache: &summary_snap.vllm.cache_config,
-            kv_headroom_gb,
-            model: Some(&summary.ctx.model),
-            kv_cache_dtype,
-            tp,
-        };
         let display_lines = format_concurrency_saturation_window_issue(
             &agg,
             pct(eval.r5_fired, eval.n_eval),
             max_model_len,
             run_rec.as_ref(),
             summary_snap,
-            Some(&hyp),
         );
         let empirical = run_rec.is_some_and(|r| r.empirical);
         recs.push(Recommendation {
@@ -619,7 +617,7 @@ fn build_report_from_eval(
                         b.kv_cache_dtype_source != baseline::KvCacheDtypeSource::Unknown
                     })
                 }
-                Some(KvBoundSource::Empirical) | None => false,
+                None => false,
             };
             let display_lines = format_config_headroom_window_issue(
                 &display,
@@ -713,13 +711,11 @@ fn build_report_from_eval(
         baseline,
         ReportCapacityMetadata {
             kv_max_seqs,
-            prescribed_kv_capacity,
             catalog_state_mismatch: catalog_state_pages_mismatch(
                 &summary_snap.vllm.cache_config,
                 max_model_len,
                 &summary.ctx.model,
             ),
-            memory_budget_self_grade: derived_capacity.budget_self_grade,
         },
         eval.n_eval,
         crate::engine::EvalSkipStats {
@@ -734,9 +730,7 @@ fn build_report_from_eval(
 
 struct ReportCapacityMetadata {
     kv_max_seqs: Option<u32>,
-    prescribed_kv_capacity: Option<u32>,
     catalog_state_mismatch: Option<(u64, u64)>,
-    memory_budget_self_grade: Option<(u64, u64)>,
 }
 
 /// Suppressing live R2 evidence requires the strongest claim: weights alone overflow VRAM.
@@ -755,9 +749,7 @@ fn finalize_report_groups(
 ) -> Report {
     let ReportCapacityMetadata {
         kv_max_seqs,
-        prescribed_kv_capacity,
         catalog_state_mismatch,
-        memory_budget_self_grade,
     } = capacity;
     let mut suppressed_rules = Vec::new();
     let mut suppressed_recs = Vec::new();
@@ -790,9 +782,7 @@ fn finalize_report_groups(
             suppressed_rules,
             suppressed_recs,
             kv_max_seqs,
-            prescribed_kv_capacity: None,
             catalog_state_mismatch,
-            memory_budget_self_grade,
             n_eval,
             skipped_broken: skips.skipped_broken,
             skipped_idle: skips.skipped_idle,
@@ -834,24 +824,13 @@ fn finalize_report_groups(
         sb.total_cmp(&sa)
     });
 
-    let prescribed_kv_capacity = if primary_recs.iter().any(|r| {
-        r.rule_name == rule_names::KV_CACHE_PRESSURE
-            || r.rule_name == rule_names::KV_ADMISSION_BACKLOG
-    }) {
-        prescribed_kv_capacity
-    } else {
-        None
-    };
-
     Report {
         baseline,
         recommendations: primary_recs,
         suppressed_rules,
         suppressed_recs,
         kv_max_seqs,
-        prescribed_kv_capacity,
         catalog_state_mismatch,
-        memory_budget_self_grade,
         n_eval,
         skipped_broken: skips.skipped_broken,
         skipped_idle: skips.skipped_idle,
@@ -872,9 +851,7 @@ pub fn build_report_for_windows(windows: &[RuntimeWindow], summary: AnalysisInpu
             suppressed_rules: Vec::new(),
             suppressed_recs: Vec::new(),
             kv_max_seqs: None,
-            prescribed_kv_capacity: None,
             catalog_state_mismatch: None,
-            memory_budget_self_grade: None,
             n_eval: 0,
             skipped_broken: windows.len(),
             skipped_idle: 0,
@@ -943,9 +920,7 @@ mod tests {
             Some(baseline_with_headroom(h)),
             ReportCapacityMetadata {
                 kv_max_seqs: None,
-                prescribed_kv_capacity: None,
                 catalog_state_mismatch: None,
-                memory_budget_self_grade: None,
             },
             15,
             crate::engine::EvalSkipStats {

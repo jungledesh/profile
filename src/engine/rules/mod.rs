@@ -21,6 +21,9 @@ pub(crate) use format::{MuVariant, mu_diagnose_lines};
 #[cfg(test)]
 pub(crate) use r1_under_batching::{R1EvalInput, Rule1Outcome};
 pub(crate) use r2_kv_cache_pressure::KV_CACHE_PRESSURE_MIN_PERC;
+/// KV cache usage below this means the pool has room to absorb new sequences safely.
+/// Shared by R5 raise gate and R7 headroom cause line.
+pub(super) const KV_CACHE_SAFE_TO_SCALE_PCT: f64 = 80.0;
 #[cfg(test)]
 pub(crate) use r3_low_prefix_reuse::{LowPrefixReuseDetail, Rule3Outcome, r3_recommendation};
 pub use r4_oom_risk::{r4_advisory, r4_recommendation};
@@ -72,8 +75,8 @@ pub(super) fn usable_kv_concurrency(snapshot: &crate::collectors::RawSnapshot) -
 }
 
 /// True when Observed full-context concurrency is present and peak running has
-/// already exceeded `floor(cap)`. R2 uses this to omit the seat bullet entirely
-/// (not fall through to a numberless throttle or derived print).
+/// already exceeded `floor(cap)`. R2 still prints a seat bullet; the number is
+/// withheld in favor of the direction-only form.
 pub(super) fn observed_kv_cap_contradicted(snapshot: &crate::collectors::RawSnapshot) -> bool {
     kv_cap_positive_after_floor(snapshot).is_some() && usable_kv_concurrency(snapshot).is_none()
 }
@@ -197,7 +200,7 @@ impl ShrinkEvidence {
 
 /// Result of building shrink suggestion lines. `target` is set only when a
 /// concrete max_model_len was prescribed (>= 100 completions, both p99s, >=5% cut).
-/// `subline` is decided here and attached at render (truncation warning or verify).
+/// `subline` is decided here and attached at render (rejection warning).
 #[derive(Debug, Clone)]
 pub(super) struct ShrinkSuggestion {
     pub lines: Vec<String>,
@@ -205,31 +208,22 @@ pub(super) struct ShrinkSuggestion {
     pub subline: Option<&'static str>,
 }
 
-/// Truncation caution for a named shrink target.
-pub(super) const SHRINK_TRUNCATION_WARNING: &str =
-    "Warning: max_model_len is total context (prompt + completion). Truncation risk!";
-
-/// When current max_model_len is unknown, tell the operator where to read it.
-pub(super) const MAX_MODEL_LEN_VERIFY_SUBLINE: &str =
-    "Verify: check the vLLM start command for the current value.";
+/// vLLM rejects over-limit requests; attach to every shrink bullet form.
+pub(super) const SHRINK_REJECTION_WARNING: &str =
+    "Requests above the new limit are rejected with a 400, not truncated.";
 
 /// Build max_model_len shrink suggestion lines.
 /// Hard number only when `total_count >= 100` and both p99s are present.
 /// Empty only when a known `max_model_len` would shrink by < 5% (no-op).
 /// When `max_model_len` is None, still prescribe lowering it and attach the
-/// verify subline so Fix is never an empty promise.
+/// rejection subline so Fix is never an empty promise.
 ///
 /// `current_shown`: when true, the block already names the current max_model_len
 /// above this bullet, so emit `to {suggested}`; otherwise `{current} → {suggested}`.
-///
-/// Projected concurrency at `{suggested}` comes only from
-/// [`capacity_at_hypothetical_max_len`](suggested), never from the current-config
-/// R2 ceiling (`r2_kv_max_seqs` / observed concurrency at full `max_model_len`).
 pub(super) fn model_len_shrink_suggestion_lines(
     max_model_len: Option<u32>,
     evidence: &ShrinkEvidence,
     indent: &str,
-    hyp: Option<&HypCapacityCtx<'_>>,
     current_shown: bool,
 ) -> ShrinkSuggestion {
     let mut lines = Vec::new();
@@ -240,7 +234,7 @@ pub(super) fn model_len_shrink_suggestion_lines(
         return ShrinkSuggestion {
             lines,
             target: None,
-            subline: Some(MAX_MODEL_LEN_VERIFY_SUBLINE),
+            subline: Some(SHRINK_REJECTION_WARNING),
         };
     };
 
@@ -252,7 +246,7 @@ pub(super) fn model_len_shrink_suggestion_lines(
             return ShrinkSuggestion {
                 lines,
                 target: None,
-                subline: None,
+                subline: Some(SHRINK_REJECTION_WARNING),
             };
         };
         let Some(gp) = evidence.generation_p99 else {
@@ -262,7 +256,7 @@ pub(super) fn model_len_shrink_suggestion_lines(
             return ShrinkSuggestion {
                 lines,
                 target: None,
-                subline: None,
+                subline: Some(SHRINK_REJECTION_WARNING),
             };
         };
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -276,23 +270,20 @@ pub(super) fn model_len_shrink_suggestion_lines(
             };
         }
         // Projection at the *suggested* length only — not current observed concurrency.
-        let fits = hyp
-            .and_then(|h| capacity_at_hypothetical_max_len(suggested, Some(m), h))
-            .map(|n| format!("; fits at least {n} worst-case requests (est)"))
-            .unwrap_or_default();
         let len_clause = if current_shown {
             format!("to {suggested}")
         } else {
             format!("{m} → {suggested}")
         };
+        let p99_ctx = format_observed_context_tokens(pp + gp);
         lines.push(format!(
-            "{indent}• Lower --max-model-len {len_clause} \
-             (fits p99 of observed requests){fits}"
+            "{indent}• Lower --max-model-len {len_clause}. \
+             Observed p99 {p99_ctx} tokens per request (prompt + generation p99)."
         ));
         return ShrinkSuggestion {
             lines,
             target: Some(suggested),
-            subline: Some(SHRINK_TRUNCATION_WARNING),
+            subline: Some(SHRINK_REJECTION_WARNING),
         };
     }
     lines.push(sub_floor_shrink_evidence_line(
@@ -304,7 +295,7 @@ pub(super) fn model_len_shrink_suggestion_lines(
     ShrinkSuggestion {
         lines,
         target: None,
-        subline: None,
+        subline: Some(SHRINK_REJECTION_WARNING),
     }
 }
 
@@ -402,8 +393,6 @@ pub(super) fn catalog_state_pages_mismatch(
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct DerivedCapacity {
     pub max_seqs: Option<u32>,
-    /// `(observed_budget_bytes, estimated_budget_bytes)` when both are available.
-    pub budget_self_grade: Option<(u64, u64)>,
 }
 
 pub(super) fn compute_kv_max_seqs_for_cache(
@@ -474,10 +463,7 @@ fn compute_kv_max_seqs_with_mode<const MULTI_GPU: bool>(
         .and_then(|n| u32::try_from(n).ok())
         .filter(|&n| n > 0);
 
-    DerivedCapacity {
-        max_seqs,
-        budget_self_grade: observed.zip(estimated),
-    }
+    DerivedCapacity { max_seqs }
 }
 
 fn derived_budget_bytes(kv_headroom_gb: Option<f64>) -> Option<u64> {
@@ -540,8 +526,8 @@ pub(crate) enum BindingWall {
     },
 }
 
-/// Source of a resolved `kv_bound`. Observed and derived are trusted in full;
-/// empirical is a load extrapolation that takes bounded, verified steps.
+/// Source of a resolved KV capacity bound (Observed / Derived only).
+/// Live-traffic extrapolation is a separate `kv_floor`, not a source here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum KvBoundSource {
     /// vLLM-reported `kv_cache_max_concurrency`. No "(est)".
@@ -550,8 +536,6 @@ pub(super) enum KvBoundSource {
     Derived,
     /// `compute_kv_max_seqs_for_cache` on a hybrid model (linear_* fields set).
     DerivedHybrid,
-    /// `mean(running) / peak(kv_fraction)` extrapolation, last resort.
-    Empirical,
 }
 
 /// Three-wall headroom: `min(max_num_seqs, ridge?, kv_capacity?)`.
@@ -626,53 +610,96 @@ pub(super) fn empirical_kv_max(running: f64, kv_cache_usage_perc: Option<f64>) -
     Some(run / (kv_frac / 100.0))
 }
 
-/// Resolve the KV concurrency bound once for the run: Observed, else derived, else
-/// empirical (run-level `mean(running) / peak(kv_fraction)`). Priority mirrors R2's
-/// `resolve_r2_kv_capacity`; empirical fills the last gap and says so.
+/// Decline a capacity value when peak running has already exceeded `floor(value)`.
+pub(super) fn kv_bound_survives_peak(peak_running: Option<f64>, value: f64) -> bool {
+    match peak_running.filter(|p| p.is_finite()) {
+        Some(peak) => peak <= value.floor(),
+        None => true,
+    }
+}
+
+/// Resolve the KV concurrency bound once for the run.
+///
+/// Returns `(capacity, source, floor)`:
+/// - `capacity` / `source`: Observed, else derived / DerivedHybrid (peak-gated).
+/// - `floor`: empirical `mean(running) / peak(kv_fraction)` when no real capacity
+///   survived; never mixed into `capacity`. Callers pass it to
+///   [`recommended_seqs`] as `kv_floor` so it caps the target without becoming
+///   the binding wall.
+///
+/// Observed and derived values are declined when `peak_running > floor(value)`;
+/// empirical is not peak-gated. It is a conservative floor, not a measured wall:
+/// `mean(running) / peak(kv_fraction)` biases low on purpose, so peak running
+/// exceeding it is expected by design. Observed and derived are full-context
+/// capacity claims, so peak running above those does falsify them.
 pub(super) fn resolve_kv_bound(
     observed_concurrency: Option<f64>,
     derived: Option<u32>,
     is_hybrid: bool,
     mean_running: Option<f64>,
     peak_kv_pct: Option<f64>,
-) -> (Option<f64>, Option<KvBoundSource>) {
-    if let Some(c) = observed_concurrency.filter(|c| c.is_finite() && *c > 0.0) {
-        return (Some(c), Some(KvBoundSource::Observed));
+    peak_running: Option<f64>,
+) -> (Option<f64>, Option<KvBoundSource>, Option<f64>) {
+    if let Some(c) = observed_concurrency.filter(|c| c.is_finite() && *c > 0.0)
+        && kv_bound_survives_peak(peak_running, c)
+    {
+        return (Some(c), Some(KvBoundSource::Observed), None);
     }
     if let Some(d) = derived.filter(|&d| d > 0) {
-        let src = if is_hybrid {
-            KvBoundSource::DerivedHybrid
-        } else {
-            KvBoundSource::Derived
-        };
-        return (Some(f64::from(d)), Some(src));
+        let value = f64::from(d);
+        if kv_bound_survives_peak(peak_running, value) {
+            let src = if is_hybrid {
+                KvBoundSource::DerivedHybrid
+            } else {
+                KvBoundSource::Derived
+            };
+            return (Some(value), Some(src), None);
+        }
     }
     if let Some(mean_r) = mean_running
         && let Some(emp) = empirical_kv_max(mean_r, peak_kv_pct)
     {
-        return (Some(emp), Some(KvBoundSource::Empirical));
+        return (None, None, Some(emp));
     }
-    (None, None)
+    (None, None, None)
 }
 
 /// A margined `--max-num-seqs` recommendation and the wall that produced it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct RecommendedSeqs {
-    /// `floor(0.80 x wall)`, step-capped when the binding wall is empirical.
+    /// `floor(0.80 x wall)`, optionally floored by `kv_floor`, then step-capped
+    /// when empirical-grade.
     pub target: u32,
-    /// The binding wall value (ridge tok/s knee or floored KV cap).
+    /// Binding value used for the margined target: ridge knee, Observed/Derived
+    /// KV cap, or (floor-only fallback) the live-traffic floor itself. Only a
+    /// real capacity number when [`Self::wall_is_capacity`] is true; the
+    /// floor-only fallback must not be divided into as "hardware capacity."
     pub wall: f64,
     /// Ridge or Memory (config is never a wall here).
     pub binder: BindingWall,
-    /// Source of the KV bound when memory binds; `None` when ridge binds.
+    /// Source of the KV bound when memory binds; `None` when ridge binds or when
+    /// only the live-traffic floor is known.
     pub source: Option<KvBoundSource>,
-    /// True when the binding wall's source is empirical (drives step cap, Low
-    /// confidence, and the raise-path "Monitor KV cache" caution line).
+    /// True when the live-traffic KV floor lowered the target (or was the only
+    /// capacity input). Drives step cap, Low confidence, `(est)`, and the
+    /// raise-path "Monitor KV cache" caution line together with derived-unknown
+    /// demotion via [`Self::empirical`].
     pub empirical: bool,
+    /// True when the live-traffic KV floor lowered the target below
+    /// `floor(0.80 x wall)`, or when the floor was the only capacity input.
+    pub floor_capped: bool,
+    /// True when [`Self::wall`] is a real capacity number (ridge or
+    /// Observed/Derived KV). False only for the floor-only fallback, where
+    /// `wall` holds the live-traffic estimate so target math still works.
+    pub wall_is_capacity: bool,
 }
 
-/// One margined recommendation from the two physical walls. `None` when neither
-/// ridge nor `kv_bound` is known (never invent a number).
+/// One margined recommendation from the physical walls plus an optional
+/// live-traffic floor. `None` when neither ridge, real `kv_bound`, nor `kv_floor`
+/// is known (never invent a number).
+///
+/// `kv_bound` / `kv_source` are Observed or Derived only. Empirical arrives as
+/// `kv_floor` and caps the target without entering [`physical_wall_and_binder`].
 ///
 /// `kv_dtype_source`: when the binding wall is Derived/DerivedHybrid and the KV
 /// element width was priced as [`KvCacheDtypeSource::Unknown`], the bound is
@@ -681,12 +708,30 @@ pub(super) fn recommended_seqs(
     ridge: Option<f64>,
     kv_bound: Option<f64>,
     kv_source: Option<KvBoundSource>,
+    kv_floor: Option<f64>,
     current_max_num_seqs: Option<u32>,
     kv_dtype_source: Option<crate::engine::baseline::KvCacheDtypeSource>,
 ) -> Option<RecommendedSeqs> {
     use crate::engine::baseline::KvCacheDtypeSource;
 
-    let (wall, binder) = physical_wall_and_binder(ridge, kv_bound)?;
+    let floor_positive = kv_floor.filter(|f| f.is_finite() && *f > 0.0);
+    let physical = physical_wall_and_binder(ridge, kv_bound);
+    let floor_only = physical.is_none() && floor_positive.is_some();
+
+    let (wall, binder) = match physical {
+        Some(wb) => wb,
+        None => {
+            let f = floor_positive?;
+            let cap = f.floor();
+            if !(cap > 0.0 && cap <= f64::from(u32::MAX)) {
+                return None;
+            }
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let cap_u = cap as u32;
+            (cap, BindingWall::Memory { cap: cap_u })
+        }
+    };
+
     let binder_is_memory = matches!(binder, BindingWall::Memory { .. });
     let derived_unknown = binder_is_memory
         && matches!(
@@ -694,23 +739,37 @@ pub(super) fn recommended_seqs(
             Some(KvBoundSource::Derived | KvBoundSource::DerivedHybrid)
         )
         && kv_dtype_source == Some(KvCacheDtypeSource::Unknown);
-    let empirical =
-        (binder_is_memory && kv_source == Some(KvBoundSource::Empirical)) || derived_unknown;
 
     let mut target = (wall * RECOMMENDED_SEQS_SAFETY_MARGIN).floor();
+    let mut floor_capped = floor_only;
+    if let Some(f) = floor_positive {
+        let floored = (f * RECOMMENDED_SEQS_SAFETY_MARGIN).floor();
+        if floored < target {
+            target = floored;
+            floor_capped = true;
+        }
+    }
+
+    let empirical = floor_capped || derived_unknown;
     if empirical && let Some(cur) = current_max_num_seqs {
         target = target.min(EMPIRICAL_STEP_CAP_MULT * f64::from(cur));
     }
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let target_u = u32::try_from(target as u64).ok().filter(|&n| n > 0)?;
 
-    let source = binder_is_memory.then_some(kv_source).flatten();
+    let source = if floor_only {
+        None
+    } else {
+        binder_is_memory.then_some(kv_source).flatten()
+    };
     Some(RecommendedSeqs {
         target: target_u,
         wall,
         binder,
         source,
         empirical,
+        floor_capped,
+        wall_is_capacity: !floor_only,
     })
 }
 
@@ -762,7 +821,7 @@ pub(super) type CutBullet = (String, Option<&'static str>);
 /// labeled cuts only (today's single-group behavior).
 ///
 /// `lead_with_cuts`: emit the cuts group before safe (shrink-led / contradicted-cap
-/// paths). Labels and truncation warnings stay attached to their bullets.
+/// paths). Labels and rejection warnings stay attached to their bullets.
 pub(super) fn push_grouped_fixes(
     out: &mut Vec<String>,
     mut safe: Vec<String>,
@@ -827,8 +886,8 @@ pub(super) fn push_grouped_fixes(
     }
 }
 
-/// Push a shrink suggestion into a cuts group. Subline (truncation warning or
-/// verify) is taken from [`ShrinkSuggestion::subline`], decided at build time.
+/// Push a shrink suggestion into a cuts group. Subline (rejection warning) is
+/// taken from [`ShrinkSuggestion::subline`], decided at build time.
 pub(super) fn extend_with_shrink_suggestion(out: &mut Vec<CutBullet>, shrink: ShrinkSuggestion) {
     let mut it = shrink.lines.into_iter();
     let Some(bullet) = it.next() else {

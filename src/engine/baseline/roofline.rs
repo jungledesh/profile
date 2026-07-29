@@ -76,6 +76,18 @@ pub struct PhysicsBaseline {
 const CEILING_LOWER_BAND: f64 = 0.85;
 const CEILING_UPPER_BAND: f64 = 1.05;
 
+/// Why `compute` returned None, read from the same inputs it guards on.
+/// Order matches compute's early returns: GPU first, then model.
+pub fn baseline_missing_reason(ctx: &crate::context::StaticContext) -> &'static str {
+    if ctx.gpu.peak_flops_tc_tflops.is_none() || ctx.gpu.peak_bw_gbps.is_none() {
+        return "GPU not in catalog";
+    }
+    if ctx.model.active_param_count.is_none() && ctx.model.param_count.is_none() {
+        return "model not in catalog";
+    }
+    "hardware ceiling inputs incomplete"
+}
+
 pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
     let ctx = input.ctx;
     let peak_flops = ctx.gpu.peak_flops_tc_tflops?;
@@ -470,6 +482,53 @@ mod tests {
         );
         let input = AnalysisInput::new(&ctx, &win);
         assert!(compute(&input).is_none());
+        assert_eq!(baseline_missing_reason(&ctx), "model not in catalog");
+    }
+
+    #[test]
+    fn baseline_missing_reason_gpu_absent() {
+        let (ctx, _) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            None,
+            None,
+            None,
+            VllmConfig::default(),
+            VllmRawMetrics::default(),
+        );
+        assert_eq!(baseline_missing_reason(&ctx), "GPU not in catalog");
+    }
+
+    #[test]
+    fn baseline_missing_reason_model_absent() {
+        let (ctx, _) = baseline_input(
+            None,
+            None,
+            None,
+            Some(67.0),
+            Some(3350.0),
+            VllmConfig::default(),
+            VllmRawMetrics::default(),
+        );
+        assert_eq!(baseline_missing_reason(&ctx), "model not in catalog");
+    }
+
+    #[test]
+    fn baseline_missing_reason_catalog_complete() {
+        let (ctx, win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            None,
+            Some(67.0),
+            Some(3350.0),
+            VllmConfig::default(),
+            VllmRawMetrics::default(),
+        );
+        assert_eq!(
+            baseline_missing_reason(&ctx),
+            "hardware ceiling inputs incomplete"
+        );
+        assert!(compute(&AnalysisInput::new(&ctx, &win)).is_some());
     }
 
     #[test]

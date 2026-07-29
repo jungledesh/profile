@@ -21,6 +21,8 @@ const KV_CAPACITY_LIMITER_PERC: f64 = 80.0; // below r2's crisis threshold of 88
 const TRAFFIC_LIMITER_RIDGE_FRACTION: f64 = 0.25;
 const TRAFFIC_LIMITER_MIN_RUNNING: f64 = 8.0;
 const PHYSICS_LIMITER_FLOOR_MARGIN: f64 = 1.2; // within 20% of tpot_floor_ms
+/// Efficiency headroom below this: hardware ceiling (matches former loop_runner gate).
+pub(crate) const HEADROOM_LIMITER_THRESHOLD_PCT: f64 = 10.0;
 /// Effective prompt/decode ratio where prefill begins to interfere even below R6.
 /// Provisional, calibrate on RunPod.
 const LIMITER_PREFILL_RATIO_MIN: f64 = 0.5;
@@ -28,6 +30,10 @@ const LIMITER_PREFILL_RATIO_MIN: f64 = 0.5;
 /// Aggregated run evidence, same courtroom as rule evaluation.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct LimiterEvidence {
+    /// Duration-weighted mean KV usage across the run. Capacity fires on this;
+    /// peak is display context only. Mean is always <= peak, so requiring both
+    /// reduces to requiring mean.
+    pub kv_cache_mean_perc: Option<f64>,
     pub kv_cache_peak_perc: Option<f64>,
     pub mean_running: Option<f64>,
     pub ridge_batch_size: Option<f64>,
@@ -35,9 +41,14 @@ pub struct LimiterEvidence {
     pub tpot_floor_ms: Option<f64>,
     pub effective_prompt_decode_ratio: Option<f64>,
     pub chunked_prefill_enabled: Option<bool>,
+    /// `100 - efficiency_pct` from baseline; below [`HEADROOM_LIMITER_THRESHOLD_PCT`]
+    /// triggers Physics even when TPOT is not near its floor.
+    pub headroom_pct: Option<f64>,
     /// Evaluable windows in the run. Below `ENGINE_MIN_PERSISTENT_WINDOWS`,
     /// identify declines (same trust bar as rules).
     pub n_eval: usize,
+    /// When baseline is absent and the limiter names CeilingUnknown.
+    pub ceiling_unknown_reason: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,7 +64,7 @@ pub enum LimiterVerdict {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IdentifyResult {
     pub verdict: Option<LimiterVerdict>,
-    /// KV peak was None (capacity stage could not run).
+    /// KV mean was None (capacity stage could not run).
     pub capacity_skipped: bool,
     /// Running or ridge was None (traffic stage could not run).
     pub traffic_skipped: bool,
@@ -67,7 +78,7 @@ pub struct IdentifyResult {
 /// Cascade order: hardest physical limits first. Each stage is only
 /// reached if the stage above it did not fire.
 pub fn identify(e: &LimiterEvidence) -> IdentifyResult {
-    let capacity_skipped = e.kv_cache_peak_perc.is_none();
+    let capacity_skipped = e.kv_cache_mean_perc.is_none();
     let traffic_skipped = e.mean_running.is_none() || e.ridge_batch_size.is_none();
 
     // Sparse runs: decline before naming a boundary (healthy-exit and quiet report
@@ -81,7 +92,7 @@ pub fn identify(e: &LimiterEvidence) -> IdentifyResult {
     }
 
     // 1. Capacity - KV cache full enough to cap concurrency growth.
-    if e.kv_cache_peak_perc
+    if e.kv_cache_mean_perc
         .is_some_and(|kv| kv.is_finite() && kv >= KV_CAPACITY_LIMITER_PERC)
     {
         return IdentifyResult {
@@ -104,8 +115,17 @@ pub fn identify(e: &LimiterEvidence) -> IdentifyResult {
         }
     }
 
-    // 3. Physics - TPOT near theoretical floor; hardware is saturated.
-    // Unknown GPU: no floor, no confident name.
+    // 3. Physics - efficiency headroom exhausted, or TPOT near theoretical floor.
+    if e.headroom_pct
+        .is_some_and(|h| h.is_finite() && h < HEADROOM_LIMITER_THRESHOLD_PCT)
+    {
+        return IdentifyResult {
+            verdict: Some(LimiterVerdict::Known(PrimaryLimiter::Physics)),
+            capacity_skipped,
+            traffic_skipped,
+        };
+    }
+    // Unknown GPU: no floor, no confident TPOT-based name.
     if e.mean_tpot_ms
         .is_some_and(|tpot| tpot.is_finite() && tpot > 0.0)
         && e.tpot_floor_ms
@@ -159,12 +179,18 @@ pub fn limiter_line(e: &LimiterEvidence) -> Option<String> {
     let result = identify(e);
     match result.verdict? {
         LimiterVerdict::CeilingUnknown(_) => {
-            Some("Hardware ceiling unknown (GPU not in catalog).".to_string())
+            let reason = e
+                .ceiling_unknown_reason
+                .unwrap_or("hardware ceiling inputs incomplete");
+            Some(format!("Hardware ceiling unknown ({reason})."))
         }
         LimiterVerdict::Known(PrimaryLimiter::Capacity) => {
-            let kv = e.kv_cache_peak_perc?;
+            let mean = e.kv_cache_mean_perc?;
+            let peak = e.kv_cache_peak_perc;
+            let peak_s = peak.map(|p| format!(", {p:.0}% peak")).unwrap_or_default();
             Some(format!(
-                "Capped by memory: KV cache at {kv:.0}% peak (R2 fires at 88%). Concurrency cannot grow further on this pool."
+                "Capped by memory: KV cache at {mean:.0}% avg{peak_s} (R2 fires at {:.0}%). Concurrency cannot grow further on this pool.",
+                crate::engine::rules::KV_CACHE_PRESSURE_MIN_PERC
             ))
         }
         LimiterVerdict::Known(PrimaryLimiter::Traffic) => {
@@ -180,11 +206,25 @@ pub fn limiter_line(e: &LimiterEvidence) -> Option<String> {
             Some(line)
         }
         LimiterVerdict::Known(PrimaryLimiter::Physics) => {
-            let tpot = e.mean_tpot_ms?;
-            let floor = e.tpot_floor_ms?;
-            Some(format!(
-                "Capped by hardware: TPOT {tpot:.1}ms vs ~{floor:.1}ms floor. This GPU is saturated, scale out to go faster."
-            ))
+            if let (Some(tpot), Some(floor)) = (e.mean_tpot_ms, e.tpot_floor_ms)
+                && tpot.is_finite()
+                && floor.is_finite()
+                && floor > 0.0
+                && tpot <= floor * PHYSICS_LIMITER_FLOOR_MARGIN
+            {
+                Some(format!(
+                    "Capped by hardware: TPOT {tpot:.1}ms vs ~{floor:.1}ms floor. This GPU is saturated, scale out to go faster."
+                ))
+            } else if e
+                .headroom_pct
+                .is_some_and(|h| h.is_finite() && h < HEADROOM_LIMITER_THRESHOLD_PCT)
+            {
+                Some(format!(
+                    "Capped by hardware: efficiency headroom below {HEADROOM_LIMITER_THRESHOLD_PCT:.0}%. This GPU is saturated, scale out to go faster."
+                ))
+            } else {
+                None
+            }
         }
         LimiterVerdict::Known(PrimaryLimiter::PrefillInterference) => {
             let ratio = e.effective_prompt_decode_ratio?;
@@ -223,24 +263,30 @@ pub fn limiter_line(e: &LimiterEvidence) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[allow(clippy::too_many_arguments)]
     fn ev(
-        kv: Option<f64>,
+        kv_mean: Option<f64>,
+        kv_peak: Option<f64>,
         running: Option<f64>,
         ridge: Option<f64>,
         tpot: Option<f64>,
         floor: Option<f64>,
         ratio: Option<f64>,
         chunked: Option<bool>,
+        headroom: Option<f64>,
     ) -> LimiterEvidence {
         LimiterEvidence {
-            kv_cache_peak_perc: kv,
+            kv_cache_mean_perc: kv_mean,
+            kv_cache_peak_perc: kv_peak,
             mean_running: running,
             ridge_batch_size: ridge,
             mean_tpot_ms: tpot,
             tpot_floor_ms: floor,
             effective_prompt_decode_ratio: ratio,
             chunked_prefill_enabled: chunked,
+            headroom_pct: headroom,
             n_eval: crate::engine::ENGINE_MIN_PERSISTENT_WINDOWS,
+            ceiling_unknown_reason: None,
         }
     }
 
@@ -248,12 +294,14 @@ mod tests {
     fn identify_declines_below_min_persistent_windows() {
         let mut e = ev(
             Some(85.0),
+            Some(85.0),
             Some(50.0),
             Some(40.0),
             Some(20.0),
             Some(5.0),
             None,
             Some(false),
+            None,
         );
         e.n_eval = 1;
         assert_eq!(identify(&e).verdict, None);
@@ -270,12 +318,14 @@ mod tests {
         assert_eq!(
             identify(&ev(
                 Some(85.0),
+                Some(85.0),
                 Some(50.0),
                 Some(40.0),
                 Some(20.0),
                 Some(5.0),
                 Some(0.2),
-                Some(false)
+                Some(false),
+                None
             ))
             .verdict,
             Some(LimiterVerdict::Known(PrimaryLimiter::Capacity))
@@ -287,12 +337,14 @@ mod tests {
         assert_eq!(
             identify(&ev(
                 Some(50.0),
+                Some(50.0),
                 Some(5.0),
                 Some(100.0),
                 Some(20.0),
                 Some(5.0),
                 Some(0.2),
-                Some(false)
+                Some(false),
+                None
             ))
             .verdict,
             Some(LimiterVerdict::Known(PrimaryLimiter::Traffic))
@@ -305,11 +357,13 @@ mod tests {
             identify(&ev(
                 Some(50.0),
                 Some(50.0),
+                Some(50.0),
                 Some(40.0),
                 Some(12.0),
                 Some(10.0),
                 Some(0.2),
-                Some(false)
+                Some(false),
+                None
             ))
             .verdict,
             Some(LimiterVerdict::Known(PrimaryLimiter::Physics))
@@ -323,14 +377,48 @@ mod tests {
         let result = identify(&ev(
             Some(50.0),
             Some(50.0),
+            Some(50.0),
             Some(40.0),
             Some(15.0),
             Some(10.0),
             Some(0.2),
             Some(false),
+            None,
         ))
         .verdict;
         assert_ne!(result, Some(LimiterVerdict::Known(PrimaryLimiter::Physics)));
+    }
+
+    #[test]
+    fn physics_fires_when_headroom_below_threshold_even_if_tpot_above_floor() {
+        assert_eq!(
+            identify(&ev(
+                Some(50.0),
+                Some(50.0),
+                Some(50.0),
+                Some(40.0),
+                Some(50.0),
+                Some(10.0),
+                Some(0.2),
+                Some(false),
+                Some(2.0),
+            ))
+            .verdict,
+            Some(LimiterVerdict::Known(PrimaryLimiter::Physics))
+        );
+        let line = limiter_line(&ev(
+            Some(50.0),
+            Some(50.0),
+            Some(50.0),
+            Some(40.0),
+            Some(50.0),
+            Some(10.0),
+            Some(0.2),
+            Some(false),
+            Some(2.0),
+        ))
+        .expect("line");
+        assert!(line.contains("headroom below 10%"));
     }
 
     #[test]
@@ -339,11 +427,13 @@ mod tests {
             identify(&ev(
                 Some(50.0),
                 Some(50.0),
+                Some(50.0),
                 Some(40.0),
                 Some(50.0),
                 Some(10.0),
                 Some(0.6),
-                Some(true)
+                Some(true),
+                None
             ))
             .verdict,
             Some(LimiterVerdict::Known(PrimaryLimiter::PrefillInterference))
@@ -356,11 +446,13 @@ mod tests {
             identify(&ev(
                 Some(50.0),
                 Some(50.0),
+                Some(50.0),
                 Some(40.0),
                 Some(50.0),
                 Some(10.0),
                 Some(0.1),
-                Some(false)
+                Some(false),
+                None
             ))
             .verdict,
             Some(LimiterVerdict::Known(PrimaryLimiter::FrameworkOverhead))
@@ -370,18 +462,20 @@ mod tests {
     #[test]
     fn none_returned_when_data_missing() {
         assert_eq!(
-            identify(&ev(None, None, None, None, None, None, None)).verdict,
+            identify(&ev(None, None, None, None, None, None, None, None, None)).verdict,
             None
         );
         assert_eq!(
             identify(&ev(
+                Some(50.0),
                 Some(50.0),
                 None,
                 Some(40.0),
                 None,
                 Some(10.0),
                 None,
-                Some(false)
+                Some(false),
+                None
             ))
             .verdict,
             None
@@ -393,15 +487,36 @@ mod tests {
         assert_eq!(
             identify(&ev(
                 Some(85.0),
+                Some(92.0),
                 Some(2.0),
                 Some(100.0),
                 Some(20.0),
                 Some(5.0),
                 Some(0.6),
-                Some(false)
+                Some(false),
+                None
             ))
             .verdict,
             Some(LimiterVerdict::Known(PrimaryLimiter::Capacity))
+        );
+    }
+
+    #[test]
+    fn traffic_fires_when_peak_high_but_mean_below_capacity_bar() {
+        assert_eq!(
+            identify(&ev(
+                Some(73.4),
+                Some(92.5),
+                Some(64.0),
+                Some(295.0),
+                Some(20.0),
+                Some(5.0),
+                Some(0.2),
+                Some(false),
+                None
+            ))
+            .verdict,
+            Some(LimiterVerdict::Known(PrimaryLimiter::Traffic))
         );
     }
 
@@ -410,12 +525,14 @@ mod tests {
         assert_eq!(
             identify(&ev(
                 Some(50.0),
+                Some(50.0),
                 Some(5.0),
                 Some(100.0),
                 Some(11.0),
                 Some(10.0),
                 Some(0.6),
-                Some(false)
+                Some(false),
+                None
             ))
             .verdict,
             Some(LimiterVerdict::Known(PrimaryLimiter::Traffic))
@@ -428,14 +545,62 @@ mod tests {
             identify(&ev(
                 Some(50.0),
                 Some(50.0),
+                Some(50.0),
                 Some(100.0),
                 Some(11.0),
                 None,
                 Some(0.7),
-                Some(true)
+                Some(true),
+                None
             ))
             .verdict,
             Some(LimiterVerdict::CeilingUnknown(CeilingUnknown))
+        );
+    }
+
+    #[test]
+    fn ceiling_unknown_line_uses_evidence_reason() {
+        let mut e = ev(
+            Some(50.0),
+            Some(50.0),
+            Some(50.0),
+            Some(100.0),
+            Some(11.0),
+            None,
+            Some(0.7),
+            Some(true),
+            None,
+        );
+        e.ceiling_unknown_reason = Some("model not in catalog");
+        assert_eq!(
+            limiter_line(&e).as_deref(),
+            Some("Hardware ceiling unknown (model not in catalog).")
+        );
+    }
+
+    #[test]
+    fn ceiling_unknown_line_fallback_is_neutral_when_reason_unset() {
+        // CeilingUnknown with floor None/non-finite/<=0 and reason unset
+        // (baseline present with a bad floor, or hand-built evidence). Must not
+        // invent "GPU not in catalog".
+        let e = ev(
+            Some(50.0),
+            Some(50.0),
+            Some(50.0),
+            Some(100.0),
+            Some(11.0),
+            None,
+            Some(0.7),
+            Some(true),
+            None,
+        );
+        assert_eq!(
+            identify(&e).verdict,
+            Some(LimiterVerdict::CeilingUnknown(CeilingUnknown))
+        );
+        assert_eq!(
+            limiter_line(&e).as_deref(),
+            Some("Hardware ceiling unknown (hardware ceiling inputs incomplete).")
         );
     }
 
@@ -445,11 +610,13 @@ mod tests {
             identify(&ev(
                 Some(50.0),
                 Some(50.0),
+                Some(50.0),
                 Some(100.0),
                 Some(50.0),
                 Some(10.0),
                 Some(0.6),
-                Some(false)
+                Some(false),
+                None
             ))
             .verdict,
             Some(LimiterVerdict::Known(PrimaryLimiter::FrameworkOverhead))
@@ -462,11 +629,13 @@ mod tests {
             identify(&ev(
                 Some(50.0),
                 Some(50.0),
+                Some(50.0),
                 Some(100.0),
                 Some(50.0),
                 Some(10.0),
                 Some(0.3),
-                Some(true)
+                Some(true),
+                None
             ))
             .verdict,
             Some(LimiterVerdict::Known(PrimaryLimiter::FrameworkOverhead))
@@ -477,17 +646,39 @@ mod tests {
     fn capacity_line_names_r2_relationship() {
         let line = limiter_line(&ev(
             Some(84.0),
+            None,
             Some(50.0),
             Some(100.0),
             Some(20.0),
             Some(10.0),
             Some(0.2),
             Some(false),
+            None,
         ))
         .expect("line");
         assert_eq!(
             line,
-            "Capped by memory: KV cache at 84% peak (R2 fires at 88%). Concurrency cannot grow further on this pool."
+            "Capped by memory: KV cache at 84% avg (R2 fires at 88%). Concurrency cannot grow further on this pool."
+        );
+    }
+
+    #[test]
+    fn capacity_line_shows_mean_and_peak() {
+        let line = limiter_line(&ev(
+            Some(85.0),
+            Some(92.0),
+            Some(50.0),
+            Some(100.0),
+            Some(20.0),
+            Some(10.0),
+            Some(0.2),
+            Some(false),
+            None,
+        ))
+        .expect("line");
+        assert_eq!(
+            line,
+            "Capped by memory: KV cache at 85% avg, 92% peak (R2 fires at 88%). Concurrency cannot grow further on this pool."
         );
     }
 
@@ -495,12 +686,14 @@ mod tests {
     fn traffic_line_contains_no_flags() {
         let line = limiter_line(&ev(
             Some(20.0),
+            Some(20.0),
             Some(6.0),
             Some(153.0),
             Some(20.0),
             Some(10.0),
             Some(0.2),
             Some(false),
+            None,
         ))
         .expect("line");
         assert!(line.contains("Capped by traffic"));
@@ -512,12 +705,14 @@ mod tests {
         assert_eq!(
             identify(&ev(
                 Some(20.0),
+                Some(20.0),
                 Some(50.0),
                 Some(100.0),
                 Some(50.0),
                 Some(10.0),
                 Some(0.3),
-                Some(true)
+                Some(true),
+                None
             ))
             .verdict,
             Some(LimiterVerdict::Known(PrimaryLimiter::FrameworkOverhead))
@@ -528,12 +723,14 @@ mod tests {
     fn framework_line_claims_only_cleared_stages() {
         let both_cleared = limiter_line(&ev(
             Some(20.0),
+            Some(20.0),
             Some(50.0),
             Some(100.0),
             Some(50.0),
             Some(10.0),
             Some(0.2),
             Some(false),
+            None,
         ))
         .expect("line");
         assert!(both_cleared.contains("batch healthy"));
@@ -543,12 +740,14 @@ mod tests {
 
         let kv_skipped = limiter_line(&ev(
             None,
+            None,
             Some(50.0),
             Some(100.0),
             Some(50.0),
             Some(10.0),
             Some(0.2),
             Some(false),
+            None,
         ))
         .expect("line");
         assert!(kv_skipped.contains("KV unmeasured"));
@@ -557,12 +756,14 @@ mod tests {
 
         let traffic_skipped = limiter_line(&ev(
             Some(20.0),
+            Some(20.0),
             Some(50.0),
             None,
             Some(50.0),
             Some(10.0),
             Some(0.2),
             Some(false),
+            None,
         ))
         .expect("line");
         assert!(traffic_skipped.contains("memory free"));
@@ -574,12 +775,14 @@ mod tests {
     fn traffic_line_notes_memory_unmeasured_when_capacity_skipped() {
         let line = limiter_line(&ev(
             None,
+            None,
             Some(5.0),
             Some(100.0),
             Some(20.0),
             Some(5.0),
             Some(0.2),
             Some(false),
+            None,
         ))
         .expect("line");
         assert!(line.contains("Capped by traffic"));

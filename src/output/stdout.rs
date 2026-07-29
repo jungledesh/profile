@@ -108,6 +108,7 @@ fn build_diagnose_lines(
         lines.push(String::new());
         lines.extend(baseline_lines(
             report.baseline,
+            &result.static_ctx,
             aggregate_win.snapshot.vllm.num_requests_running,
             aggregate_win.snapshot.vllm.cache_config.num_gpu_blocks,
         ));
@@ -339,15 +340,17 @@ fn weight_dtype_display(source: engine::WeightDtypeSource, weight_gb: f64) -> St
 
 fn baseline_lines(
     baseline: Option<engine::PhysicsBaseline>,
+    ctx: &crate::context::StaticContext,
     num_requests_running: Option<f64>,
     num_gpu_blocks: Option<u32>,
 ) -> Vec<String> {
     let Some(b) = baseline else {
+        let reason = engine::baseline_missing_reason(ctx);
         return vec![format!(
             "{:<width$}{}{}",
             "HW LIMITS",
             VLLM_LABEL_METRICS_GAP,
-            "unavailable (model not recognized). Add model to catalog",
+            format!("unavailable ({reason})"),
             width = GPU_LABEL_W
         )];
     };
@@ -936,7 +939,12 @@ mod tests {
             config_relative_efficiency_pct: None,
             cost: None,
         };
-        let lines = baseline_lines(Some(b), None, None);
+        let lines = baseline_lines(
+            Some(b),
+            &crate::context::StaticContext::default(),
+            None,
+            None,
+        );
         assert_eq!(
             lines[0],
             format!(
@@ -981,7 +989,12 @@ mod tests {
             config_relative_efficiency_pct: None,
             cost: None,
         };
-        let above = baseline_lines(Some(base()), Some(40.0), None);
+        let above = baseline_lines(
+            Some(base()),
+            &crate::context::StaticContext::default(),
+            Some(40.0),
+            None,
+        );
         assert!(
             above[0].contains("decode_eff ~50.0%"),
             "derived efficiency should carry estimate marker: {}",
@@ -992,7 +1005,12 @@ mod tests {
             "expected no prefill_floor at ridge: {}",
             above[1]
         );
-        let below = baseline_lines(Some(base()), Some(39.0), None);
+        let below = baseline_lines(
+            Some(base()),
+            &crate::context::StaticContext::default(),
+            Some(39.0),
+            None,
+        );
         assert!(
             below[1].contains("prefill_floor ~42ms"),
             "expected prefill_floor below ridge: {}",
@@ -1027,7 +1045,12 @@ mod tests {
             config_relative_efficiency_pct: None,
             cost: None,
         };
-        let lines = baseline_lines(Some(b), Some(5.0), None);
+        let lines = baseline_lines(
+            Some(b),
+            &crate::context::StaticContext::default(),
+            Some(5.0),
+            None,
+        );
         assert!(
             !lines[0].contains("prefill ~"),
             "line1 should omit low prefill ceiling: {}",
@@ -1067,7 +1090,12 @@ mod tests {
             config_relative_efficiency_pct: None,
             cost: None,
         };
-        let lines = baseline_lines(Some(b), Some(10.0), None);
+        let lines = baseline_lines(
+            Some(b),
+            &crate::context::StaticContext::default(),
+            Some(10.0),
+            None,
+        );
         assert!(
             lines[0].contains("prefill ~50 prompts/s (est)"),
             "line1 should include prefill ceiling: {}",
@@ -1797,9 +1825,7 @@ mod tests {
             suppressed_rules: Vec::new(),
             suppressed_recs: Vec::new(),
             kv_max_seqs: None,
-            prescribed_kv_capacity: None,
             catalog_state_mismatch: None,
-            memory_budget_self_grade: None,
             n_eval,
             skipped_broken: 0,
             skipped_idle: 0,

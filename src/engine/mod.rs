@@ -6,7 +6,7 @@ use crate::context::{AnalysisInput, RuntimeWindow};
 
 pub use baseline::{
     CeilingEstimate, CostEstimate, CostSource, KvCacheDtypeSource, PhysicsBaseline,
-    WeightDtypeSource, catalog_model_weight_gb,
+    WeightDtypeSource, baseline_missing_reason, catalog_model_weight_gb,
 };
 pub use rules::*;
 
@@ -49,16 +49,11 @@ pub struct Report {
     /// Rendered only when the loop reveals alternatives after a stuck fix.
     pub suppressed_recs: Vec<rules::Recommendation>,
     pub kv_max_seqs: Option<u32>,
-    /// Capacity value R2 prescribed this iteration (`≤N`). Used for self-grade after restart.
-    pub prescribed_kv_capacity: Option<u32>,
     /// When labels and catalog hybrid facts both exist and disagree on state
     /// pages: `(catalog_pages, observed_pages)`. Verbose (-v) only. Default
     /// output is unaffected. Label uncertainty tracks the printed number's
     /// source, not the existence of disagreement between sources.
     pub catalog_state_mismatch: Option<(u64, u64)>,
-    /// When allocator bytes and the 3 GB estimate both exist:
-    /// `(observed_budget_bytes, estimated_budget_bytes)`. Verbose only.
-    pub memory_budget_self_grade: Option<(u64, u64)>,
     /// Evaluable window count. `engine::build_report_for_diagnose` gates MU
     /// inject on `ENGINE_MIN_PERSISTENT_WINDOWS`; stdout gates only the journey
     /// footer on the same threshold. `--json` (when emitted) should keep raw
@@ -586,6 +581,38 @@ mod build_report_tests {
                 .iter()
                 .map(|r| r.rule_name)
                 .collect::<Vec<_>>()
+        );
+        let limiter_report = diagnose_windows(&ctx, &win);
+        let ev = limiter_report.limiter_evidence.expect("limiter evidence");
+        assert_eq!(
+            limiter::identify(&ev).verdict,
+            Some(limiter::LimiterVerdict::Known(
+                limiter::PrimaryLimiter::Traffic
+            )),
+            "peak burst must not alone trigger Capacity; mean 73.4% is below the 80% bar"
+        );
+        let line = limiter::limiter_line(&ev).expect("limiter line");
+        assert!(line.contains("Capped by traffic"));
+        assert!(!line.contains("Capped by memory"));
+    }
+
+    #[test]
+    fn limiter_capacity_when_mean_above_bar_shows_avg_and_peak() {
+        let (ctx, mut win) = starved_no_rules_fixture();
+        win.snapshot.vllm.kv_cache_usage_perc = Some(85.0);
+        win.snapshot.vllm.kv_cache_peak_perc = Some(92.0);
+        let report = diagnose_windows(&ctx, &win);
+        let ev = report.limiter_evidence.expect("limiter evidence");
+        assert_eq!(
+            limiter::identify(&ev).verdict,
+            Some(limiter::LimiterVerdict::Known(
+                limiter::PrimaryLimiter::Capacity
+            ))
+        );
+        let line = limiter::limiter_line(&ev).expect("limiter line");
+        assert_eq!(
+            line,
+            "Capped by memory: KV cache at 85% avg, 92% peak (R2 fires at 88%). Concurrency cannot grow further on this pool."
         );
     }
 

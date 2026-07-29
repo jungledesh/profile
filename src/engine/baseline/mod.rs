@@ -8,5 +8,6 @@ pub use math::{
     observed_state_pages, page_model_fits, resolve_kv_cache_element, state_dtype_bytes, weight_gb,
 };
 pub use roofline::{
-    CeilingEstimate, CostEstimate, CostSource, PhysicsBaseline, WeightDtypeSource, compute,
+    CeilingEstimate, CostEstimate, CostSource, PhysicsBaseline, WeightDtypeSource,
+    baseline_missing_reason, compute,
 };

@@ -2,24 +2,14 @@ use crate::engine::Report;
 
 use super::DiagnoseResult;
 
-/// Relative load move (running or QPS) that counts as a witness flip.
-/// Judgment threshold: traffic noise below this is not labeled "Load changed."
-const LOAD_CHANGE_MIN_REL: f64 = 0.25;
-
-/// Absolute prefix-hit move (percentage points) that counts as a witness flip.
-/// Judgment threshold: hit-rate noise below this is not labeled.
-const PREFIX_HIT_CHANGE_MIN_PP: f64 = 5.0;
-
 #[derive(Debug, Clone)]
 pub struct Delta {
     pub throughput_before: Option<f64>,
     pub throughput_after: Option<f64>,
     /// Absolute percentage-point change in efficiency.
     ///
-    /// Efficiency = actual_tps / (decode_ceiling × num_running), where num_running
-    /// is the time-weighted average across active windows in the measurement period.
-    /// This normalization cancels traffic-induced concurrency changes so the signal
-    /// reflects per-request hardware utilization, not load volume.
+    /// Efficiency = actual_tps / (decode_ceiling × ridge_batch_size); the
+    /// denominator is fixed from GPU specs and model catalog, not traffic.
     pub efficiency_delta_pp: Option<f64>,
     pub efficiency_pct_before: Option<f64>,
     pub efficiency_pct_after: Option<f64>,
@@ -39,16 +29,6 @@ pub struct Delta {
     pub config_drifted: bool,
     /// Non-baseline config knobs changed (max_num_seqs, batched tokens, caching, eager).
     pub non_baseline_drifted: bool,
-    /// Relative move in running concurrency or QPS past [`LOAD_CHANGE_MIN_REL`].
-    /// Drives the "Load changed" status line.
-    pub load_changed: bool,
-    /// Running concurrency before/after (for the load status line).
-    pub running_before: Option<f64>,
-    pub running_after: Option<f64>,
-    /// Absolute move in prefix hit rate past [`PREFIX_HIT_CHANGE_MIN_PP`] pp.
-    pub prefix_hit_changed: bool,
-    /// Self-grade after R2 prescribed a capacity and fresh observed concurrency exists.
-    pub capacity_self_grade: Option<(u32, f64)>,
 }
 
 pub fn compute(
@@ -108,35 +88,6 @@ pub fn compute(
         .and_then(|b| b.cost.as_ref())
         .and_then(|c| c.joules_per_token);
 
-    let capacity_self_grade = match (
-        prev_report.prescribed_kv_capacity,
-        curr_result
-            .snapshot
-            .vllm
-            .cache_config
-            .kv_cache_max_concurrency
-            .filter(|c| c.is_finite() && *c > 0.0),
-    ) {
-        (Some(x), Some(y)) => Some((x, y)),
-        _ => None,
-    };
-
-    let load_changed = relative_load_changed(
-        prev_result.snapshot.vllm.num_requests_running,
-        curr_result.snapshot.vllm.num_requests_running,
-    ) || relative_load_changed(
-        prev_result.snapshot.vllm.request_success_per_sec,
-        curr_result.snapshot.vllm.request_success_per_sec,
-    );
-
-    let running_before = prev_result.snapshot.vllm.num_requests_running;
-    let running_after = curr_result.snapshot.vllm.num_requests_running;
-
-    let prefix_hit_changed = prefix_hit_rate_changed(
-        prev_result.snapshot.vllm.prefix_cache_hit_rate,
-        curr_result.snapshot.vllm.prefix_cache_hit_rate,
-    );
-
     Delta {
         throughput_before,
         throughput_after,
@@ -158,51 +109,11 @@ pub fn compute(
         tpot_p95_after_ms,
         config_drifted,
         non_baseline_drifted,
-        load_changed,
-        running_before,
-        running_after,
-        prefix_hit_changed,
-        capacity_self_grade,
     }
-}
-
-/// Relative change ≥ [`LOAD_CHANGE_MIN_REL`]. If prev is 0, any finite curr > 0 counts.
-fn relative_load_changed(before: Option<f64>, after: Option<f64>) -> bool {
-    let (Some(prev), Some(curr)) = (before, after) else {
-        return false;
-    };
-    if !prev.is_finite() || !curr.is_finite() {
-        return false;
-    }
-    if prev == 0.0 {
-        return curr > 0.0;
-    }
-    ((curr - prev).abs() / prev.abs()) >= LOAD_CHANGE_MIN_REL
-}
-
-/// Absolute hit-rate change ≥ [`PREFIX_HIT_CHANGE_MIN_PP`] percentage points.
-/// Rates are stored as fractions (0–1); convert to pp via ×100.
-fn prefix_hit_rate_changed(before: Option<f64>, after: Option<f64>) -> bool {
-    let (Some(prev), Some(curr)) = (before, after) else {
-        return false;
-    };
-    if !prev.is_finite() || !curr.is_finite() {
-        return false;
-    }
-    ((curr - prev).abs() * 100.0) >= PREFIX_HIT_CHANGE_MIN_PP
 }
 
 #[cfg(test)]
 mod tests {
-    fn pct_delta(before: Option<f64>, after: Option<f64>) -> Option<f64> {
-        match (before, after) {
-            (Some(b), Some(a)) if b > 0.0 && b.is_finite() && a.is_finite() => {
-                Some((a - b) / b * 100.0)
-            }
-            _ => None,
-        }
-    }
-
     use super::*;
     use crate::engine::baseline::{CostEstimate, CostSource};
     use crate::engine::{CeilingEstimate, KvCacheDtypeSource, PhysicsBaseline, WeightDtypeSource};
@@ -274,9 +185,7 @@ mod tests {
             suppressed_rules: Vec::new(),
             suppressed_recs: Vec::new(),
             kv_max_seqs: None,
-            prescribed_kv_capacity: None,
             catalog_state_mismatch: None,
-            memory_budget_self_grade: None,
             n_eval: 0,
             skipped_broken: 0,
             skipped_idle: 0,
@@ -284,16 +193,6 @@ mod tests {
             gauge_missing: Default::default(),
             limiter_evidence: None,
         }
-    }
-
-    #[test]
-    fn pct_delta_returns_none_when_before_zero() {
-        assert!(pct_delta(Some(0.0), Some(50.0)).is_none());
-    }
-
-    #[test]
-    fn pct_delta_returns_correct_value() {
-        assert!((pct_delta(Some(100.0), Some(110.0)).unwrap() - 10.0).abs() < 1e-9);
     }
 
     #[test]
@@ -326,109 +225,6 @@ mod tests {
     }
 
     #[test]
-    fn load_changed_fires_at_25_pct_rel() {
-        assert!(relative_load_changed(Some(100.0), Some(125.0)));
-        assert!(relative_load_changed(Some(100.0), Some(75.0)));
-    }
-
-    #[test]
-    fn load_changed_absent_below_25_pct() {
-        assert!(!relative_load_changed(Some(100.0), Some(124.0)));
-        assert!(!relative_load_changed(Some(100.0), Some(76.0)));
-    }
-
-    #[test]
-    fn load_changed_zero_prev_guard() {
-        assert!(relative_load_changed(Some(0.0), Some(1.0)));
-        assert!(!relative_load_changed(Some(0.0), Some(0.0)));
-    }
-
-    #[test]
-    fn prefix_hit_changed_at_5pp() {
-        // Stay clear of exact 5.0pp float boundary (0.05 in fraction space).
-        assert!(prefix_hit_rate_changed(Some(0.20), Some(0.26)));
-        assert!(prefix_hit_rate_changed(Some(0.50), Some(0.44)));
-    }
-
-    #[test]
-    fn prefix_hit_changed_absent_below_5pp() {
-        assert!(!prefix_hit_rate_changed(Some(0.20), Some(0.249)));
-        assert!(!prefix_hit_rate_changed(Some(0.50), Some(0.46)));
-    }
-
-    #[test]
-    fn compute_sets_load_and_prefix_witnesses() {
-        let mut prev = diagnose(Some(100.0));
-        prev.snapshot.vllm.num_requests_running = Some(10.0);
-        prev.snapshot.vllm.prefix_cache_hit_rate = Some(0.20);
-        let mut curr = diagnose(Some(100.0));
-        curr.snapshot.vllm.num_requests_running = Some(15.0);
-        curr.snapshot.vllm.prefix_cache_hit_rate = Some(0.30);
-        let d = compute(
-            &prev,
-            &report_eff(Some(50.0), None, None),
-            &curr,
-            &report_eff(Some(50.0), None, None),
-            false,
-            false,
-        );
-        assert!(d.load_changed);
-        assert!(d.prefix_hit_changed);
-    }
-
-    #[test]
-    fn capacity_self_grade_when_derived_prescription_and_observed() {
-        // Derived prescriptions are captured on Report; Observed sets None (see
-        // prescribed_for_self_grade). Delta only grades when both sides exist.
-        let mut prev_rep = report_eff(Some(40.0), None, None);
-        prev_rep.prescribed_kv_capacity = Some(24);
-        let mut curr = diagnose(Some(100.0));
-        curr.snapshot.vllm.cache_config.kv_cache_max_concurrency = Some(24.64);
-        let d = compute(
-            &diagnose(Some(100.0)),
-            &prev_rep,
-            &curr,
-            &report_eff(Some(50.0), None, None),
-            false,
-            false,
-        );
-        assert_eq!(d.capacity_self_grade, Some((24, 24.64)));
-    }
-
-    #[test]
-    fn capacity_self_grade_absent_when_observed_prescription_not_captured() {
-        // Observed R2 prescriptions leave prescribed_kv_capacity = None.
-        let prev_rep = report_eff(Some(40.0), None, None);
-        assert_eq!(prev_rep.prescribed_kv_capacity, None);
-        let mut curr = diagnose(Some(100.0));
-        curr.snapshot.vllm.cache_config.kv_cache_max_concurrency = Some(24.64);
-        let d = compute(
-            &diagnose(Some(100.0)),
-            &prev_rep,
-            &curr,
-            &report_eff(Some(50.0), None, None),
-            false,
-            false,
-        );
-        assert_eq!(d.capacity_self_grade, None);
-    }
-
-    #[test]
-    fn capacity_self_grade_absent_without_both() {
-        let mut prev_rep = report_eff(Some(40.0), None, None);
-        prev_rep.prescribed_kv_capacity = Some(24);
-        let d = compute(
-            &diagnose(Some(100.0)),
-            &prev_rep,
-            &diagnose(Some(100.0)),
-            &report_eff(Some(50.0), None, None),
-            false,
-            false,
-        );
-        assert_eq!(d.capacity_self_grade, None);
-    }
-
-    #[test]
     fn populates_cost_and_efficiency_before_after() {
         let d = compute(
             &diagnose(Some(100.0)),
@@ -443,27 +239,7 @@ mod tests {
         assert_eq!(d.cost_per_million_before, Some(2.50));
         assert_eq!(d.cost_per_million_after, Some(2.00));
         assert_eq!(d.cost_source_after, Some(CostSource::Catalog));
-        assert!(!d.load_changed);
         assert!((d.efficiency_delta_pp.unwrap() - 15.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn load_changed_when_running_moves_25_pct() {
-        let mut prev = diagnose(Some(100.0));
-        prev.snapshot.vllm.num_requests_running = Some(10.0);
-        let mut curr = diagnose(Some(100.0));
-        curr.snapshot.vllm.num_requests_running = Some(16.0);
-        let d = compute(
-            &prev,
-            &report_eff(Some(40.0), Some(2.50), Some(0.31)),
-            &curr,
-            &report_eff(Some(40.0), Some(2.00), Some(0.28)),
-            false,
-            false,
-        );
-        assert!(d.load_changed);
-        assert_eq!(d.cost_per_million_before, Some(2.50));
-        assert_eq!(d.joules_per_token_before, Some(0.31));
     }
 
     #[test]

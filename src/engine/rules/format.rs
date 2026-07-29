@@ -5,7 +5,7 @@ use crate::collectors::{
 };
 use crate::context::{AnalysisInput, RuntimeWindow};
 use crate::engine::Report;
-use crate::engine::baseline::{ACTIVATION_KV_BUFFER_GB, WeightDtypeSource};
+use crate::engine::baseline::WeightDtypeSource;
 
 use super::r4_oom_risk::r4_advisory;
 use super::{ENGINE_MIN_PERSISTENT_WINDOWS, NO_ISSUES_LINE, Recommendation, rule_names};
@@ -170,23 +170,6 @@ fn catalog_state_mismatch_verbose_line(
     let (catalog_pages, observed_pages) = mismatch?;
     Some(format!(
         "Note: Catalog state {catalog_pages} pages, observed {observed_pages}; entry may be stale."
-    ))
-}
-
-fn memory_budget_self_grade_verbose_line(
-    grade: Option<(u64, u64)>,
-    verbose_rules: bool,
-) -> Option<String> {
-    if !verbose_rules {
-        return None;
-    }
-    let (observed, estimated) = grade?;
-    let observed_gb = observed as f64 / 1e9;
-    let estimated_gb = estimated as f64 / 1e9;
-    let gap_gb = observed_gb - estimated_gb;
-    Some(format!(
-        "Note: Request-memory budget {observed_gb:.1}GB vLLM-reported, \
-         {estimated_gb:.1}GB estimated ({ACTIVATION_KV_BUFFER_GB:.0}GB allowance), gap {gap_gb:+.1}GB."
     ))
 }
 
@@ -615,7 +598,7 @@ pub fn format_diagnose_rules_for_windows(
                 report.n_eval,
             );
         }
-        if !any_advisory && !verbose_rules {
+        if !any_advisory {
             out.push(NO_ISSUES_LINE.to_string());
             if let Some(ev) = report.limiter_evidence.as_ref()
                 && let Some(line) = crate::engine::limiter::limiter_line(ev)
@@ -646,10 +629,7 @@ pub fn format_diagnose_rules_for_windows(
         if !warnings.last().is_some_and(|l| l.is_empty()) {
             warnings.push(String::new());
         }
-        warnings.push(
-            "Previous fix brought no material improvement. Other possible causes shown below."
-                .to_string(),
-        );
+        warnings.push("Same issue after remeasure. Other possible causes shown below.".to_string());
         warnings.push(String::new());
         for rec in &report.suppressed_recs {
             warnings.extend(rule_display_block(rec));
@@ -672,11 +652,6 @@ pub fn format_diagnose_rules_for_windows(
     }
     if let Some(line) =
         catalog_state_mismatch_verbose_line(report.catalog_state_mismatch, verbose_rules)
-    {
-        append_display_block(&mut out, vec![line]);
-    }
-    if let Some(line) =
-        memory_budget_self_grade_verbose_line(report.memory_budget_self_grade, verbose_rules)
     {
         append_display_block(&mut out, vec![line]);
     }
@@ -1086,7 +1061,7 @@ mod load_hint_tests {
 
 #[cfg(test)]
 mod catalog_mismatch_note_tests {
-    use super::{catalog_state_mismatch_verbose_line, memory_budget_self_grade_verbose_line};
+    use super::catalog_state_mismatch_verbose_line;
 
     #[test]
     fn verbose_only_on_mismatch() {
@@ -1097,17 +1072,6 @@ mod catalog_mismatch_note_tests {
             line,
             "Note: Catalog state 7 pages, observed 3; entry may be stale."
         );
-    }
-
-    #[test]
-    fn memory_budget_self_grade_names_both_sources_and_gap() {
-        assert!(memory_budget_self_grade_verbose_line(Some((12, 10)), false).is_none());
-        let line =
-            memory_budget_self_grade_verbose_line(Some((12_000_000_000, 10_000_000_000)), true)
-                .expect("verbose self-grade");
-        assert!(line.contains("12.0GB vLLM-reported"));
-        assert!(line.contains("10.0GB estimated (3GB allowance)"));
-        assert!(line.contains("gap +2.0GB"));
     }
 }
 
@@ -1157,9 +1121,7 @@ mod stuck_fix_reveal_tests {
                 .collect(),
             suppressed_recs: suppressed,
             kv_max_seqs: None,
-            prescribed_kv_capacity: None,
             catalog_state_mismatch: None,
-            memory_budget_self_grade: None,
             n_eval: ENGINE_MIN_PERSISTENT_WINDOWS,
             skipped_broken: 0,
             skipped_idle: 0,
@@ -1201,8 +1163,7 @@ mod stuck_fix_reveal_tests {
             ],
         );
         let text = render(&report, true);
-        let warn =
-            "Previous fix brought no material improvement. Other possible causes shown below.";
+        let warn = "Same issue after remeasure. Other possible causes shown below.";
         assert!(
             text.lines().any(|l| l == warn),
             "warning must be at column 0; got:\n{text}"
@@ -1234,7 +1195,7 @@ mod stuck_fix_reveal_tests {
             )],
         );
         let hidden = render(&report, false);
-        assert!(!hidden.contains("Previous fix brought no material improvement"));
+        assert!(!hidden.contains("Same issue after remeasure"));
         assert!(!hidden.contains("[!] KV Cache Pressure"));
         assert!(hidden.contains("[!] OOM Risk"));
     }
@@ -1243,7 +1204,7 @@ mod stuck_fix_reveal_tests {
     fn triggered_but_no_suppressed_prints_nothing_extra() {
         let report = report_with(rec(rule_names::OOM_RISK, 5, 0.9, "[!] OOM Risk"), vec![]);
         let text = render(&report, true);
-        assert!(!text.contains("Previous fix brought no material improvement"));
+        assert!(!text.contains("Same issue after remeasure"));
     }
 
     #[test]
@@ -1259,7 +1220,7 @@ mod stuck_fix_reveal_tests {
             )],
         );
         let text = render(&report, false);
-        assert!(!text.contains("Previous fix brought no material improvement"));
+        assert!(!text.contains("Same issue after remeasure"));
         assert!(!text.contains("[!] KV Cache Pressure"));
     }
 }

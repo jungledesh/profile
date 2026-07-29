@@ -19,9 +19,11 @@ const QUEUE_BACKPRESSURE_MIN_WAITING: f64 = 2.0;
 /// 30% of active requests waiting signals the scheduler is consistently holding
 /// requests for KV capacity, not just transient batching delay.
 const KV_ADMISSION_BACKLOG_QUEUE_RATIO_MIN: f64 = 0.30;
-/// Minimum KV headroom (GB) before recommending --gpu-memory-utilization; below this,
-/// weights and allocator overhead leave no safe room to expand the KV pool.
+/// Minimum headroom (GB) before recommending --gpu-memory-utilization; observed free
+/// VRAM and the computed utilization budget must both exceed this value.
 const KV_HEADROOM_SAFE_MIN_GB: f64 = 2.0;
+const GPU_MEM_UTIL_FIX: &str =
+    "      • Raise --gpu-memory-utilization (check vRAM header for avail mem) to expand KV pool";
 const FP8_KV_CACHE_FIX: &str =
     "      • Switch --kv-cache-dtype fp8 to halve KV memory footprint (affects output quality)";
 /// Suggest prefix caching when mean prompt length exceeds this (tokens).
@@ -49,18 +51,47 @@ pub(super) fn fp8_kv_cache_fix_bullet(
     })
 }
 
-fn kv_headroom_gpu_mem_bullet(kv_headroom_gb: Option<f64>) -> String {
-    match kv_headroom_gb {
-        Some(h) if h >= KV_HEADROOM_SAFE_MIN_GB => {
-            "      • Raise --gpu-memory-utilization (check vRAM header for avail mem) to expand KV pool"
-                .to_string()
-        }
-        Some(_) => {
-            "      • GPU at VRAM capacity: cannot raise --gpu-memory-utilization. Add a replica to scale out."
-                .to_string()
-        }
-        None => "      • Raise --gpu-memory-utilization (check vRAM header for avail mem) to expand KV pool".to_string(),
+/// Observed device free VRAM in binary GB (MiB / 1024), matching the vRAM header.
+fn observed_free_vram_gb(snapshot: &RawSnapshot) -> Option<f64> {
+    let agg = snapshot.aggregate_gpu();
+    let total = agg.sum_vram_total_mb?;
+    let used = agg.vram_used_mb?;
+    Some((total.saturating_sub(used)) as f64 / 1024.0)
+}
+
+/// Offer `--gpu-memory-utilization` only when measured free VRAM and the computed
+/// utilization budget both clear the safe minimum.
+fn gpu_mem_utilization_fix_bullet(
+    snapshot: &RawSnapshot,
+    kv_headroom_gb: Option<f64>,
+) -> Option<String> {
+    let free_gb = observed_free_vram_gb(snapshot)?;
+    if free_gb <= KV_HEADROOM_SAFE_MIN_GB {
+        return None;
     }
+    if kv_headroom_gb.is_none_or(|h| h <= KV_HEADROOM_SAFE_MIN_GB) {
+        return None;
+    }
+    Some(GPU_MEM_UTIL_FIX.to_string())
+}
+
+fn push_kv_pressure_safe_levers(
+    safe: &mut Vec<String>,
+    snapshot: &RawSnapshot,
+    kv_headroom_gb: Option<f64>,
+    kv_cache_dtype: Option<&str>,
+    fp8_compiler_available: bool,
+) {
+    if let Some(bullet) = prefix_caching_fix_bullet(snapshot) {
+        safe.push(bullet);
+    }
+    if let Some(bullet) = gpu_mem_utilization_fix_bullet(snapshot, kv_headroom_gb) {
+        safe.push(bullet);
+    }
+    if let Some(bullet) = fp8_kv_cache_fix_bullet(kv_cache_dtype, fp8_compiler_available) {
+        safe.push(bullet);
+    }
+    push_kv_offload_fix_last(safe, &snapshot.vllm.cache_config);
 }
 
 fn prefix_caching_fix_bullet(snapshot: &RawSnapshot) -> Option<String> {
@@ -81,10 +112,27 @@ fn prefix_caching_fix_bullet(snapshot: &RawSnapshot) -> Option<String> {
 
 const KV_OFFLOAD_FIX: &str = "      • Set --kv-offloading-size (GiB) to hold evicted KV in host memory instead of recomputing it";
 /// Host-RAM caution; rendered via [`super::push_bullet_with_subline`] (8-space indent).
-const KV_OFFLOAD_SUBLINE: &str = "Check available host RAM before allocating.";
+const KV_OFFLOAD_SUBLINE: &str =
+    "Check host RAM and your container memory limit before allocating.";
 
-/// Caution when every config lever is already set or unavailable. Not a Fix bullet.
-const NO_LEVER_VERIFY_LINE: &str = "        No config lever remains. Verify prefix caching, gpu-memory-utilization, kv-cache-dtype, and kv-offloading-size are set as intended.";
+/// Dead-end verify: config labels read set; effect is what we cannot prove.
+const DEAD_END_VERIFY_BULLET: &str = "      • Verify prefix caching, gpu-memory-utilization, kv-cache-dtype and kv-offloading-size took effect.";
+const DEAD_END_VERIFY_SUBLINE: &str = "Every lever profile can read is set or unavailable.";
+const REPLICA_SCALE_OUT_BULLET: &str = "      • Add a replica to scale out.";
+const REPLICA_KV_WALL_SUFFIX: &str = " No config change on this GPU moves the KV wall.";
+
+fn replica_kv_wall_bullet() -> String {
+    format!("{REPLICA_SCALE_OUT_BULLET}{REPLICA_KV_WALL_SUFFIX}")
+}
+
+fn push_dead_end_fixes(safe: &mut Vec<String>) {
+    super::push_bullet_with_subline(
+        safe,
+        DEAD_END_VERIFY_BULLET.to_string(),
+        Some(DEAD_END_VERIFY_SUBLINE),
+    );
+    safe.push(replica_kv_wall_bullet());
+}
 
 /// Suggest KV offload when the build exposes the label and size is off.
 fn kv_offload_fix_bullet(cache: &crate::collectors::CacheConfigLabels) -> Option<String> {
@@ -97,7 +145,7 @@ fn kv_offload_fix_bullet(cache: &crate::collectors::CacheConfigLabels) -> Option
     }
 }
 
-fn push_kv_offload_fix(safe: &mut Vec<String>, cache: &crate::collectors::CacheConfigLabels) {
+fn push_kv_offload_fix_last(safe: &mut Vec<String>, cache: &crate::collectors::CacheConfigLabels) {
     if let Some(bullet) = kv_offload_fix_bullet(cache) {
         super::push_bullet_with_subline(safe, bullet, Some(KV_OFFLOAD_SUBLINE));
     }
@@ -106,6 +154,7 @@ fn push_kv_offload_fix(safe: &mut Vec<String>, cache: &crate::collectors::CacheC
 #[derive(Debug, Clone, PartialEq)]
 pub struct KvAdmissionBacklogDetail {
     pub kv_cache_usage_perc: f64,
+    pub kv_peak_pct: Option<f64>,
     pub admission_ratio: f64,
     pub requests_waiting: f64,
     pub requests_running: f64,
@@ -128,6 +177,12 @@ pub enum Rule2Outcome {
 }
 
 pub fn rule2_kv_admission_backlog(snapshot: &RawSnapshot) -> Option<KvAdmissionBacklogDetail> {
+    // Spec (CLAUDE.md r2): backlog is queue pressure *with KV near full*, minus
+    // the preemption fire. Same bar the pressure path uses.
+    if !super::kv_near_full(snapshot) {
+        return None;
+    }
+
     let kv = snapshot
         .vllm
         .kv_cache_usage_perc
@@ -171,6 +226,11 @@ pub fn rule2_kv_admission_backlog(snapshot: &RawSnapshot) -> Option<KvAdmissionB
 
     Some(KvAdmissionBacklogDetail {
         kv_cache_usage_perc: kv,
+        kv_peak_pct: snapshot
+            .vllm
+            .kv_cache_peak_perc
+            .filter(|v| v.is_finite())
+            .map(|peak| peak.max(kv)),
         admission_ratio: ratio,
         requests_waiting: wait,
         requests_running: run,
@@ -280,6 +340,7 @@ pub fn r2_recommendation(input: R2RecommendationInput<'_>) -> Option<Recommendat
                 max_model_len,
                 kv_headroom_gb,
                 kv_max_seqs,
+                config_max_num_seqs: snapshot.vllm.max_num_seqs.or(Some(256)),
                 capacity_label,
                 fp8_compiler_available,
                 model: None,
@@ -335,63 +396,34 @@ pub(super) fn resolve_r2_kv_capacity(
     (derived, label)
 }
 
-/// Self-grade exists to audit derived estimates. Observed prescriptions are the
-/// allocator's own numbers; grading them against themselves is noise.
-pub(super) fn prescribed_for_self_grade(
-    capacity: Option<u32>,
-    label: KvCapacityLabel,
-) -> Option<u32> {
-    match label {
-        KvCapacityLabel::Derived | KvCapacityLabel::DerivedHybrid => capacity,
-        KvCapacityLabel::Observed => None,
+fn seat_phrase_shows_number(snapshot: &RawSnapshot, cap: u32) -> bool {
+    let Some(current) = snapshot.vllm.max_num_seqs else {
+        return false;
+    };
+    if cap >= current {
+        return false;
+    }
+    // Derived capacity is a full-context worst case, not a limit. If peak running
+    // already beat it, printing it as a ceiling tells the operator to cut seats
+    // the run proved they do not need to cut. Same test resolve_kv_bound applies
+    // to derived (mod.rs kv_bound_survives_peak).
+    if super::kv_cap_positive_after_floor(snapshot).is_some() {
+        super::usable_kv_concurrency(snapshot).is_some()
+    } else {
+        super::kv_bound_survives_peak(snapshot.vllm.num_requests_running_peak, f64::from(cap))
     }
 }
 
-fn r2_capacity_phrase(n: u32, max_model_len: Option<u32>, label: KvCapacityLabel) -> String {
-    // Vocabulary: simultaneous-work counts are "N concurrent requests", never bare
-    // "capacity". Bounds name their source and condition.
-    match label {
-        KvCapacityLabel::Observed => match max_model_len {
-            Some(m) => {
-                format!(
-                    "Lower --max-num-seqs to ≤{n} concurrent requests \
-                     (vLLM-reported at max_model_len={m})"
-                )
-            }
-            None => {
-                format!("Lower --max-num-seqs to ≤{n} concurrent requests (vLLM-reported)")
-            }
-        },
-        KvCapacityLabel::Derived => match max_model_len {
-            Some(m) => {
-                format!(
-                    "Lower --max-num-seqs to ≤{n} concurrent requests \
-                     (est); at least {n} worst-case requests fit at max_model_len={m}"
-                )
-            }
-            None => format!(
-                "Lower --max-num-seqs to ≤{n} concurrent requests \
-                 (est); at least {n} worst-case requests fit"
-            ),
-        },
-        KvCapacityLabel::DerivedHybrid => match max_model_len {
-            Some(m) => format!(
-                "Lower --max-num-seqs to ≤{n} concurrent requests \
-                 (est); at least {n} worst-case requests fit at max_model_len={m}, including hybrid state"
-            ),
-            None => format!(
-                "Lower --max-num-seqs to ≤{n} concurrent requests \
-                 (est); at least {n} worst-case requests fit, including hybrid state"
-            ),
-        },
+fn r2_capacity_phrase(n: u32, show_number: bool) -> String {
+    if show_number {
+        format!("Lower --max-num-seqs to ≤{n} to reduce KV demand")
+    } else {
+        "Lower --max-num-seqs to reduce KV demand".to_string()
     }
 }
 
-/// Follow-on seats after a named shrink target. Derived at the new length only.
-/// Two knobs, one restart, one delta covering both: intentional, not an attribution bug.
-fn max_num_seqs_after_shrink_target_bullet(n: u32, target_max_len: u32) -> String {
-    format!("      • Then set --max-num-seqs to ≤{n} (est, at max_model_len={target_max_len})")
-}
+/// Follow-on seats after a named shrink target.
+const FOLLOW_ON_SEAT_BULLET: &str = "      • Then lower --max-num-seqs to reduce KV demand";
 
 pub(super) fn kv_pressure_confidence(windows_fired: usize, total_evaluable: usize) -> f64 {
     if total_evaluable == 0 {
@@ -410,22 +442,32 @@ pub(super) fn kv_pressure_confidence_label(confidence: f64) -> &'static str {
     }
 }
 
-fn max_num_seqs_bullet(
-    kv_max_seqs: Option<u32>,
-    max_model_len: Option<u32>,
-    label: KvCapacityLabel,
-    evictions: bool,
-) -> String {
+fn max_num_seqs_bullet(snapshot: &RawSnapshot, kv_max_seqs: Option<u32>) -> String {
     match kv_max_seqs {
-        Some(n) => format!("      • {}", r2_capacity_phrase(n, max_model_len, label)),
-        None => {
-            if evictions {
-                "      • Lower --max-num-seqs to stop evictions".to_string()
-            } else {
-                "      • Lower --max-num-seqs to free KV blocks".to_string()
-            }
+        Some(n) => {
+            let show = seat_phrase_shows_number(snapshot, n);
+            format!("      • {}", r2_capacity_phrase(n, show))
         }
+        None => "      • Lower --max-num-seqs to reduce KV demand".to_string(),
     }
+}
+
+/// True when `--max-num-seqs` is known and above the floor of 1.
+fn seat_lever_available(snapshot: &RawSnapshot, config_max_num_seqs: Option<u32>) -> bool {
+    snapshot
+        .vllm
+        .max_num_seqs
+        .or(config_max_num_seqs)
+        .is_some_and(|n| n > 1)
+}
+
+fn full_window_seat_bullet(
+    snapshot: &RawSnapshot,
+    kv_max_seqs: Option<u32>,
+    config_max_num_seqs: Option<u32>,
+) -> Option<String> {
+    seat_lever_available(snapshot, config_max_num_seqs)
+        .then(|| max_num_seqs_bullet(snapshot, kv_max_seqs))
 }
 
 /// Crisis-only risk subline on the full-window seat throttle. Attached when the
@@ -437,6 +479,8 @@ pub(super) struct KvFormatCtx<'a> {
     pub max_model_len: Option<u32>,
     pub kv_headroom_gb: Option<f64>,
     pub kv_max_seqs: Option<u32>,
+    /// Launch/config `--max-num-seqs` when the scrape gauge is absent.
+    pub config_max_num_seqs: Option<u32>,
     pub capacity_label: KvCapacityLabel,
     pub fp8_compiler_available: bool,
     pub model: Option<&'a crate::context::ModelArch>,
@@ -469,6 +513,7 @@ pub(super) fn format_kv_cache_pressure_fired(
     let max_model_len = ctx.max_model_len;
     let kv_headroom_gb = ctx.kv_headroom_gb;
     let kv_max_seqs = ctx.kv_max_seqs;
+    let config_max_num_seqs = ctx.config_max_num_seqs;
     let capacity_label = ctx.capacity_label;
     let fp8_compiler_available = ctx.fp8_compiler_available;
     let kv_cache_dtype = ctx.kv_cache_dtype;
@@ -517,8 +562,7 @@ pub(super) fn format_kv_cache_pressure_fired(
     out.push(evidence);
     out.push(String::new());
 
-    // Cap contradicted by peak running: omit every full-window seat bullet (numbered
-    // or numberless). Derived fallback from resolve_r2 must not print either.
+    // Peak above floor(cap) → numberless seat line; bullet still renders.
     let contradicted = super::observed_kv_cap_contradicted(snapshot);
     // Cap-leads with Observed/Derived + m already name current max_model_len; use "to N".
     // Shrink-leads, DerivedHybrid, and no-capacity keep the arrow form.
@@ -539,50 +583,35 @@ pub(super) fn format_kv_cache_pressure_fired(
         max_model_len,
         &evidence,
         "      ",
-        Some(&hyp),
         shrink_current_shown,
     );
     // Lead with model-len when observed traffic fits in half the window: the
     // full-context concurrency floor is then a secondary bound, not the primary fix.
     // Composition: when p99s are missing, lead_with_shrink is false and ordering
-    // would fall back to seat-first, but a contradicted cap already removed the
-    // seat bullet, so shrink leads by elimination. That is correct; do not "fix"
-    // the fallback by restoring a seat bullet.
+    // falls back to seat-first under safe.
     let lead_with_shrink = !shrink.lines.is_empty() && would_lead_if_shrink;
 
     let mut safe = Vec::new();
-    if let Some(bullet) = prefix_caching_fix_bullet(snapshot) {
-        safe.push(bullet);
-    }
-    push_kv_offload_fix(&mut safe, &snapshot.vllm.cache_config);
-    if d.preemptions_active {
-        // Same raise string as non-crisis; omit when headroom is missing or < 2GB.
-        if kv_headroom_gb.is_some_and(|h| h >= KV_HEADROOM_SAFE_MIN_GB) {
-            safe.push(kv_headroom_gpu_mem_bullet(kv_headroom_gb));
-        }
-    } else {
-        safe.push(kv_headroom_gpu_mem_bullet(kv_headroom_gb));
-    }
-    if let Some(bullet) = fp8_kv_cache_fix_bullet(kv_cache_dtype, fp8_compiler_available) {
-        safe.push(bullet);
-    }
+    push_kv_pressure_safe_levers(
+        &mut safe,
+        snapshot,
+        kv_headroom_gb,
+        kv_cache_dtype,
+        fp8_compiler_available,
+    );
 
-    let full_window_seat = if contradicted {
-        None
-    } else {
-        Some(max_num_seqs_bullet(
-            kv_max_seqs,
-            max_model_len,
-            capacity_label,
-            d.preemptions_active,
-        ))
-    };
-    // Follow-on seats use the same target the shrink lines just prescribed — never
-    // recompute. Two knobs, one restart, one delta covering both: intentional.
+    // Lowering seats always reduces KV demand, down to 1. At 1 there is nothing
+    // left to lower and the KV wall is hardware.
+    let full_window_seat = full_window_seat_bullet(snapshot, kv_max_seqs, config_max_num_seqs);
+    // Gate only: the projection's value is unused, since the bullet carries no
+    // number. We offer the follow-on seat cut only when capacity at the new window
+    // is computable, from observed page geometry (dense via block_size, hybrid via
+    // mamba_block_size) or the catalog fallback. Unknown geometry means we cannot
+    // say the shorter window admits more sequences, so we stay quiet.
     let follow_on_seat = if lead_with_shrink {
         shrink.target.and_then(|suggested| {
             super::capacity_at_hypothetical_max_len(suggested, max_model_len, &hyp)
-                .map(|n| max_num_seqs_after_shrink_target_bullet(n, suggested))
+                .map(|_| FOLLOW_ON_SEAT_BULLET.to_string())
         })
     } else {
         None
@@ -595,58 +624,72 @@ pub(super) fn format_kv_cache_pressure_fired(
             // Permanent seat at the new window, not a temporary throttle.
             cuts.push((fo, None));
         }
-    } else if let Some(seat) = full_window_seat {
-        // Crisis is a flat list with no group header, so the subline is the only
-        // risk marker. Non-crisis sits under "Cuts throughput:", which already says it.
-        cuts.push((
-            seat,
-            d.preemptions_active.then_some(CRISIS_THROTTLE_SUBLINE),
-        ));
-        super::extend_with_shrink_suggestion(&mut cuts, shrink);
     } else {
         super::extend_with_shrink_suggestion(&mut cuts, shrink);
     }
 
-    let has_fix = !(safe.is_empty() && cuts.is_empty());
+    let has_other_fix = !safe.is_empty() || !cuts.is_empty();
+    if !has_other_fix {
+        if let Some(seat) = full_window_seat {
+            cuts.push((
+                seat,
+                d.preemptions_active.then_some(CRISIS_THROTTLE_SUBLINE),
+            ));
+        }
+    } else if !lead_with_shrink && let Some(seat) = full_window_seat {
+        cuts.insert(
+            0,
+            (
+                seat,
+                d.preemptions_active.then_some(CRISIS_THROTTLE_SUBLINE),
+            ),
+        );
+    }
+
+    let has_fix = !safe.is_empty() || !cuts.is_empty();
     if !has_fix {
-        // Cause kept; no Fix header (nothing to head). No Expected (nothing to promise).
-        out.push(NO_LEVER_VERIFY_LINE.to_string());
-        out.push(String::new());
-    } else if d.preemptions_active {
-        // Crisis: flat Fix list, no group labels. Cuts before safe when shrink
-        // leads or the seat bullet was omitted as contradicted.
-        let lead_with_cuts = lead_with_shrink || contradicted;
+        push_dead_end_fixes(&mut safe);
+    }
+
+    if d.preemptions_active {
+        // Crisis: flat Fix list, no group labels. Cuts before safe when shrink leads.
+        let lead_with_cuts = lead_with_shrink;
         out.push("    Fix:".to_string());
         let emit_cuts = |out: &mut Vec<String>, cuts: Vec<super::CutBullet>| {
             for (bullet, sub) in cuts {
                 super::push_bullet_with_subline(out, bullet, sub);
             }
         };
+        super::trim_group_trailing_blanks(&mut safe);
+        let safe_nonempty = !safe.is_empty();
+        let cuts_nonempty = !cuts.is_empty();
         if lead_with_cuts {
             emit_cuts(&mut out, cuts);
+            if cuts_nonempty && safe_nonempty {
+                out.push(String::new());
+            }
             out.extend(safe);
         } else {
             out.extend(safe);
+            if safe_nonempty && cuts_nonempty {
+                out.push(String::new());
+            }
             emit_cuts(&mut out, cuts);
         }
     } else {
-        // Cuts first when shrink leads, or when contradicted cap removed the seat
-        // bullet and shrink leads by elimination.
-        let lead_with_cuts = lead_with_shrink || contradicted;
+        let lead_with_cuts = lead_with_shrink;
+        super::trim_group_trailing_blanks(&mut safe);
         super::push_grouped_fixes(&mut out, safe, cuts, Vec::new(), lead_with_cuts);
     }
 
-    if has_fix {
-        let expected = if d.preemptions_active {
-            "    Expected: TTFT and TPOT recover once evictions stop."
-        } else {
-            "    Expected: Wait queue drains, TTFT recovers once KV pool has capacity."
-        };
-        // Exactly one blank before Expected, regardless of what the last group left.
-        super::trim_group_trailing_blanks(&mut out);
-        out.push(String::new());
-        out.push(expected.to_string());
-    }
+    let expected = if d.preemptions_active {
+        "    Expected: TTFT and TPOT recover once evictions stop."
+    } else {
+        "    Expected: Wait queue drains, TTFT recovers once KV pool has capacity."
+    };
+    super::trim_group_trailing_blanks(&mut out);
+    out.push(String::new());
+    out.push(expected.to_string());
     if super::rule_is_significant(windows_fired, total_evaluable) {
         let confidence = kv_pressure_confidence(windows_fired, total_evaluable);
         out.push(format!("    {}", kv_pressure_confidence_label(confidence)));
@@ -670,35 +713,57 @@ pub(super) fn format_kv_admission_backlog_issue(
             d.requests_waiting,
             d.admission_ratio * 100.0
         ),
-        format!(
-            "      Free KV tokens: {:.0} available, {:.0} demanded.",
-            d.free_kv_tokens, d.demand_tokens
-        ),
-        String::new(),
     ];
+    let avg_s = format!("{:.0}%", d.kv_cache_usage_perc);
+    let peak_s = d
+        .kv_peak_pct
+        .filter(|v| v.is_finite())
+        .map(|v| format!("{v:.0}%"))
+        .unwrap_or_else(|| "-".to_string());
+    let burst = d.kv_cache_usage_perc < KV_CACHE_PRESSURE_MIN_PERC;
+    if burst {
+        out.push(format!(
+            "      KV cache {avg_s} avg, {peak_s} peak (burst pressure, threshold: {:.0}%).",
+            KV_CACHE_PRESSURE_MIN_PERC
+        ));
+    } else {
+        out.push(format!(
+            "      KV cache {avg_s} avg, {peak_s} peak (threshold: {:.0}%).",
+            KV_CACHE_PRESSURE_MIN_PERC
+        ));
+    }
+    out.push(format!(
+        "      Free KV tokens: {:.0} available, {:.0} demanded (est, worst case).",
+        d.free_kv_tokens, d.demand_tokens
+    ));
+    out.push(String::new());
 
     let evidence = super::ShrinkEvidence::from_snapshot(ctx.snapshot);
-    let hyp = ctx.hyp_capacity();
-    let shrink = super::model_len_shrink_suggestion_lines(
-        ctx.max_model_len,
-        &evidence,
-        "      ",
-        Some(&hyp),
-        false,
-    );
+    let shrink =
+        super::model_len_shrink_suggestion_lines(ctx.max_model_len, &evidence, "      ", false);
 
     let mut safe = Vec::new();
-    if let Some(bullet) = prefix_caching_fix_bullet(ctx.snapshot) {
-        safe.push(bullet);
-    }
-    push_kv_offload_fix(&mut safe, &ctx.snapshot.vllm.cache_config);
-    safe.push(kv_headroom_gpu_mem_bullet(ctx.kv_headroom_gb));
-    if let Some(bullet) = fp8_kv_cache_fix_bullet(kv_cache_dtype, ctx.fp8_compiler_available) {
-        safe.push(bullet);
-    }
+    push_kv_pressure_safe_levers(
+        &mut safe,
+        ctx.snapshot,
+        ctx.kv_headroom_gb,
+        kv_cache_dtype,
+        ctx.fp8_compiler_available,
+    );
 
     let mut cuts: Vec<super::CutBullet> = Vec::new();
+    if let Some(seat) =
+        full_window_seat_bullet(ctx.snapshot, ctx.kv_max_seqs, ctx.config_max_num_seqs)
+    {
+        cuts.push((seat, None));
+    }
     super::extend_with_shrink_suggestion(&mut cuts, shrink);
+
+    if safe.is_empty() && cuts.is_empty() {
+        push_dead_end_fixes(&mut safe);
+    }
+
+    super::trim_group_trailing_blanks(&mut safe);
     super::push_grouped_fixes(&mut out, safe, cuts, Vec::new(), false);
 
     out.push(String::new());
@@ -724,8 +789,14 @@ pub(super) fn aggregate_backlog_detail(
     let run = details.iter().map(|d| d.requests_running).sum::<f64>() / n;
     let free_kv_tokens = details.iter().map(|d| d.free_kv_tokens).sum::<f64>() / n;
     let demand_tokens = details.iter().map(|d| d.demand_tokens).sum::<f64>() / n;
+    let peak = details
+        .iter()
+        .filter_map(|d| d.kv_peak_pct)
+        .chain(details.iter().map(|d| d.kv_cache_usage_perc))
+        .fold(None, |acc, v| Some(acc.map_or(v, |a: f64| a.max(v))));
     KvAdmissionBacklogDetail {
         kv_cache_usage_perc: kv,
+        kv_peak_pct: peak,
         admission_ratio: ratio,
         requests_waiting: wait,
         requests_running: run,
@@ -769,11 +840,28 @@ pub(super) fn aggregate_r2_detail(details: &[KvCachePressureDetail]) -> KvCacheP
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::collectors::{CacheConfigLabels, VllmRawMetrics};
+    use crate::collectors::{CacheConfigLabels, GpuRawMetrics, RawSnapshotFixture, VllmRawMetrics};
 
     fn snap(vllm: VllmRawMetrics) -> RawSnapshot {
         crate::collectors::snap_vllm(vllm)
     }
+
+    /// Snapshot with observed VRAM for gpu-memory-utilization gating tests.
+    fn snap_vram(vllm: VllmRawMetrics, used_mb: u64, total_mb: u64) -> RawSnapshot {
+        RawSnapshotFixture::default()
+            .vllm(vllm)
+            .gpus(vec![GpuRawMetrics {
+                vram_used_mb: Some(used_mb),
+                vram_total_mb: Some(total_mb),
+                ..Default::default()
+            }])
+            .build()
+    }
+
+    const VRAM_AMPLY_FREE_USED_MB: u64 = 40 * 1024;
+    const VRAM_AMPLY_FREE_TOTAL_MB: u64 = 80 * 1024;
+    const VRAM_ITER3_USED_MB: u64 = 78 * 1024;
+    const VRAM_ITER3_TOTAL_MB: u64 = 80 * 1024;
 
     fn kv_ctx(
         snapshot: &RawSnapshot,
@@ -781,17 +869,118 @@ mod tests {
         kv_headroom_gb: Option<f64>,
         kv_max_seqs: Option<u32>,
     ) -> KvFormatCtx<'_> {
+        let config_max_num_seqs = snapshot.vllm.max_num_seqs.or(Some(256));
+        kv_ctx_config(
+            snapshot,
+            max_model_len,
+            kv_headroom_gb,
+            kv_max_seqs,
+            config_max_num_seqs,
+        )
+    }
+
+    fn kv_ctx_config(
+        snapshot: &RawSnapshot,
+        max_model_len: Option<u32>,
+        kv_headroom_gb: Option<f64>,
+        kv_max_seqs: Option<u32>,
+        config_max_num_seqs: Option<u32>,
+    ) -> KvFormatCtx<'_> {
         KvFormatCtx {
             snapshot,
             max_model_len,
             kv_headroom_gb,
             kv_max_seqs,
+            config_max_num_seqs,
             capacity_label: KvCapacityLabel::Derived,
             fp8_compiler_available: false,
             model: None,
             tp: None,
             kv_cache_dtype: snapshot.vllm.cache_config.cache_dtype.as_deref(),
         }
+    }
+
+    fn assert_dead_end_pair(text: &str) {
+        assert!(text.contains("    Fix:"));
+        assert!(text.contains(DEAD_END_VERIFY_BULLET.trim()));
+        assert!(text.contains(DEAD_END_VERIFY_SUBLINE));
+        assert!(text.contains("Add a replica to scale out."));
+        assert!(text.contains("No config change on this GPU moves the KV wall."));
+        assert!(text.contains("Expected:"));
+    }
+
+    fn assert_no_dead_end_pair(text: &str) {
+        assert!(!text.contains("took effect"));
+        assert!(!text.contains("No config change on this GPU moves the KV wall."));
+    }
+
+    fn format_seat_lever_crisis(
+        snap_max_num_seqs: Option<u32>,
+        config_max_num_seqs: Option<u32>,
+    ) -> String {
+        use crate::collectors::KvOffloadState;
+        let (snap, m) = dead_end_snap(
+            KvOffloadState::Enabled(16.0),
+            10000,
+            5000.0,
+            4600.0,
+            snap_max_num_seqs,
+        );
+        format_kv_cache_pressure_fired(
+            &detail(98.0, true),
+            &kv_ctx_config(&snap, Some(m), None, None, config_max_num_seqs),
+            3,
+            4,
+        )
+        .join("\n")
+    }
+
+    fn format_seat_lever_non_crisis(
+        snap_max_num_seqs: Option<u32>,
+        config_max_num_seqs: Option<u32>,
+    ) -> String {
+        use crate::collectors::KvOffloadState;
+        let (snap, m) = dead_end_snap(
+            KvOffloadState::Enabled(16.0),
+            10000,
+            5000.0,
+            4600.0,
+            snap_max_num_seqs,
+        );
+        format_kv_cache_pressure_fired(
+            &KvCachePressureDetail {
+                kv_cache_usage_perc: Some(98.0),
+                kv_peak_pct: Some(98.0),
+                preemptions_active: false,
+                queue_backpressure: true,
+            },
+            &kv_ctx_config(&snap, Some(m), None, None, config_max_num_seqs),
+            3,
+            4,
+        )
+        .join("\n")
+    }
+
+    fn format_seat_lever_backlog(
+        snap_max_num_seqs: Option<u32>,
+        config_max_num_seqs: Option<u32>,
+    ) -> String {
+        use crate::collectors::KvOffloadState;
+        let (snap, m) = dead_end_snap(
+            KvOffloadState::Enabled(16.0),
+            10000,
+            5000.0,
+            4600.0,
+            snap_max_num_seqs,
+        );
+        format_kv_admission_backlog_issue(
+            &sample_backlog_detail(),
+            50,
+            &kv_ctx_config(&snap, Some(m), None, None, config_max_num_seqs),
+            3,
+            4,
+        )
+        .join("\n")
     }
 
     fn backlog_vllm(
@@ -819,6 +1008,21 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn backlog_declines_when_kv_below_pressure_bar() {
+        assert!(
+            rule2_kv_admission_backlog(&snap(backlog_vllm(
+                40.0,
+                10.0,
+                5.0,
+                20.0,
+                Some(100),
+                Some(16),
+            )))
+            .is_none()
+        );
     }
 
     #[test]
@@ -1046,10 +1250,11 @@ mod tests {
             generation_tokens_per_sec: Some(100.0),
             ..Default::default()
         };
+        let snapshot = snap_vram(v.clone(), VRAM_AMPLY_FREE_USED_MB, VRAM_AMPLY_FREE_TOTAL_MB);
         let r = r2_recommendation(R2RecommendationInput {
-            snapshot: &snap(v.clone()),
+            snapshot: &snapshot,
             max_model_len: None,
-            kv_headroom_gb: None,
+            kv_headroom_gb: Some(30.0),
             kv_max_seqs: None,
             capacity_label: KvCapacityLabel::Derived,
             windows_fired: 1,
@@ -1059,7 +1264,7 @@ mod tests {
         .expect("fired");
         let text = r.display_lines.join("\n");
         assert!(!text.contains("evictions stop"));
-        assert!(text.contains("gpu-memory-utilization") || text.contains("GPU memory"));
+        assert!(text.contains("Raise --gpu-memory-utilization"));
         assert!(matches!(
             rule2_kv_cache_pressure(&snap(v)),
             Rule2Outcome::Fired(d) if !d.preemptions_active && d.queue_backpressure
@@ -1088,8 +1293,8 @@ mod tests {
         })
         .expect("fired");
         let text = r.display_lines.join("\n");
-        assert!(text.contains("≤14"));
-        assert!(text.contains("max_model_len=8192"));
+        assert!(text.contains("Lower --max-num-seqs to reduce KV demand"));
+        assert!(!text.contains('≤'));
     }
 
     #[test]
@@ -1112,8 +1317,8 @@ mod tests {
         })
         .expect("fired");
         let text = r.display_lines.join("\n");
-        assert!(text.contains("max_model_len=8192"));
-        assert!(text.contains("≤15"));
+        assert!(text.contains("Lower --max-num-seqs to reduce KV demand"));
+        assert!(!text.contains('≤'));
     }
 
     #[test]
@@ -1136,7 +1341,8 @@ mod tests {
         })
         .expect("fired");
         let text = r.display_lines.join("\n");
-        assert!(text.contains("Lower --max-num-seqs to ≤18 concurrent requests (est)"));
+        assert!(text.contains("Lower --max-num-seqs to reduce KV demand"));
+        assert!(!text.contains('≤'));
     }
 
     #[test]
@@ -1159,7 +1365,7 @@ mod tests {
         })
         .expect("fired");
         let text = r.display_lines.join("\n");
-        assert!(text.contains("Lower --max-num-seqs to stop evictions"));
+        assert!(text.contains("Lower --max-num-seqs to reduce KV demand"));
         assert!((r.confidence - 0.5).abs() < 1e-9);
     }
 
@@ -1183,7 +1389,7 @@ mod tests {
             format_kv_cache_pressure_fired(&d, &kv_ctx(&snap(v), Some(8192), None, None), 3, 4)
                 .join("\n");
         assert!(text.contains("Lower --max-model-len 8192 → 6450"));
-        assert!(text.contains("Truncation risk"));
+        assert!(text.contains("rejected with a 400"));
     }
 
     #[test]
@@ -1204,11 +1410,11 @@ mod tests {
         )
         .join("\n");
         assert!(text.contains("Lower --max-model-len 8192 → 6450"));
-        assert!(text.contains("Truncation risk"));
+        assert!(text.contains("rejected with a 400"));
     }
 
     #[test]
-    fn model_len_prescribed_with_verify_when_ceiling_unknown() {
+    fn model_len_prescribed_with_rejection_warning_when_ceiling_unknown() {
         let v = VllmRawMetrics {
             kv_cache_usage_perc: Some(90.0),
             num_preemptions_per_sec: Some(0.05),
@@ -1222,7 +1428,8 @@ mod tests {
         )
         .join("\n");
         assert!(text.contains("Lower --max-model-len to safely raise concurrency."));
-        assert!(text.contains("Verify: check the vLLM start command for the current value."));
+        assert!(text.contains("rejected with a 400, not truncated."));
+        assert!(!text.contains("Verify: check the vLLM start command"));
     }
 
     #[test]
@@ -1239,19 +1446,15 @@ mod tests {
             4,
         )
         .join("\n");
-        assert!(
-            text.contains("max_model_len=4096"),
-            "evictions path should include max_model_len when ceiling is known"
-        );
-        assert!(
-            text.contains("≤16"),
-            "evictions path should include the ceiling value"
-        );
+        assert!(text.contains("Lower --max-num-seqs to reduce KV demand"));
+        assert!(!text.contains('≤'));
+        assert!(!text.contains("worst-case"));
     }
 
     fn sample_backlog_detail() -> KvAdmissionBacklogDetail {
         KvAdmissionBacklogDetail {
             kv_cache_usage_perc: 90.0,
+            kv_peak_pct: Some(90.0),
             admission_ratio: 0.4,
             requests_waiting: 10.0,
             requests_running: 15.0,
@@ -1261,7 +1464,7 @@ mod tests {
     }
 
     #[test]
-    fn backlog_shows_headroom_when_safe() {
+    fn backlog_cause_line_includes_kv_percentage() {
         let text = format_kv_admission_backlog_issue(
             &sample_backlog_detail(),
             27,
@@ -1270,33 +1473,86 @@ mod tests {
             4,
         )
         .join("\n");
-        assert!(text.contains("check vRAM header for avail mem"));
+        assert!(text.contains("KV cache 90% avg, 90% peak (threshold: 88%)."));
+        assert!(text.contains("Free KV tokens: 160 available, 200 demanded (est, worst case)."));
+        assert!(!text.contains("threshold: 88%). Free KV tokens"));
+        assert!(!text.contains("burst pressure"));
     }
 
     #[test]
-    fn backlog_warns_when_vram_full() {
+    fn backlog_cause_line_names_burst_when_avg_below_bar() {
+        let mut d = sample_backlog_detail();
+        d.kv_cache_usage_perc = 71.0;
+        d.kv_peak_pct = Some(92.0);
         let text = format_kv_admission_backlog_issue(
-            &sample_backlog_detail(),
+            &d,
             27,
-            &kv_ctx(&snap(VllmRawMetrics::default()), None, Some(1.0), None),
+            &kv_ctx(&snap(VllmRawMetrics::default()), None, Some(30.0), None),
             3,
             4,
         )
         .join("\n");
-        assert!(text.contains("GPU at VRAM capacity"));
+        assert!(text.contains("KV cache 71% avg, 92% peak (burst pressure, threshold: 88%)."));
+        assert!(text.contains("Free KV tokens: 160 available, 200 demanded (est, worst case)."));
+        assert!(!text.contains("threshold: 88%). Free KV tokens"));
     }
 
     #[test]
-    fn backlog_generic_when_headroom_unknown() {
+    fn backlog_shows_headroom_when_safe() {
         let text = format_kv_admission_backlog_issue(
             &sample_backlog_detail(),
             27,
-            &kv_ctx(&snap(VllmRawMetrics::default()), None, None, None),
+            &kv_ctx(
+                &snap_vram(
+                    VllmRawMetrics::default(),
+                    VRAM_AMPLY_FREE_USED_MB,
+                    VRAM_AMPLY_FREE_TOTAL_MB,
+                ),
+                None,
+                Some(30.0),
+                None,
+            ),
             3,
             4,
         )
         .join("\n");
         assert!(text.contains("check vRAM header for avail mem"));
+    }
+
+    #[test]
+    fn backlog_omits_gpu_mem_when_observed_vram_low() {
+        let text = format_kv_admission_backlog_issue(
+            &sample_backlog_detail(),
+            27,
+            &kv_ctx(
+                &snap_vram(
+                    VllmRawMetrics::default(),
+                    VRAM_ITER3_USED_MB,
+                    VRAM_ITER3_TOTAL_MB,
+                ),
+                None,
+                Some(30.0),
+                None,
+            ),
+            3,
+            4,
+        )
+        .join("\n");
+        assert!(!text.contains("Raise --gpu-memory-utilization"));
+        assert!(!text.contains("GPU at VRAM capacity"));
+    }
+
+    #[test]
+    fn backlog_omits_gpu_mem_when_vram_unreadable() {
+        let text = format_kv_admission_backlog_issue(
+            &sample_backlog_detail(),
+            27,
+            &kv_ctx(&snap(VllmRawMetrics::default()), None, Some(30.0), None),
+            3,
+            4,
+        )
+        .join("\n");
+        assert!(!text.contains("Raise --gpu-memory-utilization"));
     }
 
     #[test]
@@ -1327,7 +1583,7 @@ mod tests {
         )
         .join("\n");
         assert!(lines.contains("Lower --max-model-len 8192 → 6450"));
-        assert!(lines.contains("Truncation risk"));
+        assert!(lines.contains("rejected with a 400"));
     }
 
     #[test]
@@ -1386,7 +1642,7 @@ mod tests {
         };
         let text = format_kv_cache_pressure_fired(&d, &kv_ctx(&snap(v), None, None, None), 1, 1)
             .join("\n");
-        assert!(text.contains("Lower --max-num-seqs to free KV blocks"));
+        assert!(text.contains("Lower --max-num-seqs to reduce KV demand"));
     }
 
     #[test]
@@ -1402,11 +1658,20 @@ mod tests {
             num_requests_waiting: Some(5.0),
             ..Default::default()
         };
-        let text =
-            format_kv_cache_pressure_fired(&d, &kv_ctx(&snap(v), None, Some(1.0), None), 1, 1)
-                .join("\n");
-        assert!(text.contains("GPU at VRAM capacity"));
-        assert!(text.contains("Add a replica to scale out"));
+        let text = format_kv_cache_pressure_fired(
+            &d,
+            &kv_ctx(
+                &snap_vram(v, VRAM_ITER3_USED_MB, VRAM_ITER3_TOTAL_MB),
+                None,
+                Some(1.0),
+                None,
+            ),
+            1,
+            1,
+        )
+        .join("\n");
+        assert!(!text.contains("Raise --gpu-memory-utilization"));
+        assert!(!text.contains("GPU at VRAM capacity"));
         assert!(!text.contains("max context length"));
         assert!(!text.contains("30GB VRAM available"));
     }
@@ -1420,7 +1685,12 @@ mod tests {
         };
         let text = format_kv_cache_pressure_fired(
             &detail(90.0, true),
-            &kv_ctx(&snap(v), None, Some(30.0), None),
+            &kv_ctx(
+                &snap_vram(v, VRAM_AMPLY_FREE_USED_MB, VRAM_AMPLY_FREE_TOTAL_MB),
+                None,
+                Some(30.0),
+                None,
+            ),
             1,
             1,
         )
@@ -1451,7 +1721,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_backpressure_shows_raise_gpu_mem_bullet_when_headroom_unknown() {
+    fn queue_backpressure_omits_gpu_mem_when_vram_unreadable() {
         let d = KvCachePressureDetail {
             kv_cache_usage_perc: Some(90.0),
             kv_peak_pct: Some(90.0),
@@ -1465,9 +1735,7 @@ mod tests {
         };
         let text = format_kv_cache_pressure_fired(&d, &kv_ctx(&snap(v), None, None, None), 1, 1)
             .join("\n");
-        assert!(text.contains(
-            "Raise --gpu-memory-utilization (check vRAM header for avail mem) to expand KV pool"
-        ));
+        assert!(!text.contains("Raise --gpu-memory-utilization"));
     }
 
     #[test]
@@ -1775,35 +2043,190 @@ mod tests {
     }
 
     #[test]
-    fn observed_capacity_fix_omits_est_label() {
-        let phrase = r2_capacity_phrase(24, Some(8192), KvCapacityLabel::Observed);
-        assert!(phrase.contains("vLLM-reported"));
-        assert!(phrase.contains("concurrent requests"));
-        assert!(phrase.contains("≤24"));
-        assert!(!phrase.contains("(est)"));
+    fn observed_capacity_fix_shows_number_when_believable() {
+        let mut v = VllmRawMetrics {
+            max_num_seqs: Some(154),
+            num_requests_running_peak: Some(14.0),
+            cache_config: CacheConfigLabels {
+                kv_cache_max_concurrency: Some(24.64),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let snap_ok = snap(v.clone());
+        assert_eq!(
+            r2_capacity_phrase(24, seat_phrase_shows_number(&snap_ok, 24)),
+            "Lower --max-num-seqs to ≤24 to reduce KV demand"
+        );
+        assert!(!r2_capacity_phrase(24, true).contains("vLLM-reported"));
+        assert!(!r2_capacity_phrase(24, true).contains("(est)"));
+        v.num_requests_running_peak = Some(25.0);
+        let snap_bad = snap(v);
+        assert_eq!(
+            r2_capacity_phrase(24, seat_phrase_shows_number(&snap_bad, 24)),
+            "Lower --max-num-seqs to reduce KV demand"
+        );
     }
 
     #[test]
-    fn derived_dense_capacity_uses_est_label() {
-        let (n, label) = resolve_r2_kv_capacity(None, Some(18), false);
+    fn derived_dense_capacity_uses_number_when_reduction() {
+        let (n, _label) = resolve_r2_kv_capacity(None, Some(18), false);
         assert_eq!(n, Some(18));
-        assert_eq!(label, KvCapacityLabel::Derived);
-        let phrase = r2_capacity_phrase(18, None, label);
-        assert!(phrase.contains("(est)"));
+        let v = VllmRawMetrics {
+            max_num_seqs: Some(32),
+            ..Default::default()
+        };
+        let snap = snap(v);
+        let phrase = r2_capacity_phrase(18, seat_phrase_shows_number(&snap, 18));
+        assert_eq!(phrase, "Lower --max-num-seqs to ≤18 to reduce KV demand");
+        assert!(!phrase.contains("(est)"));
         assert!(!phrase.contains("hybrid"));
     }
 
     #[test]
-    fn derived_hybrid_capacity_uses_hybrid_label() {
+    fn derived_capacity_hides_number_when_peak_running_exceeds_cap() {
+        // No Observed label: resolve_r2_kv_capacity returns derived unchecked;
+        // seat_phrase must still peak-gate the printed number.
+        let (n, label) = resolve_r2_kv_capacity(None, Some(33), false);
+        assert_eq!(n, Some(33));
+        assert_eq!(label, KvCapacityLabel::Derived);
+        let v = VllmRawMetrics {
+            max_num_seqs: Some(154),
+            num_requests_running_peak: Some(45.0),
+            ..Default::default()
+        };
+        let phrase = r2_capacity_phrase(33, seat_phrase_shows_number(&snap(v), 33));
+        assert_eq!(phrase, "Lower --max-num-seqs to reduce KV demand");
+        assert!(!phrase.contains('≤'));
+    }
+
+    #[test]
+    fn derived_capacity_shows_number_when_peak_running_below_cap() {
+        let v = VllmRawMetrics {
+            max_num_seqs: Some(154),
+            num_requests_running_peak: Some(20.0),
+            ..Default::default()
+        };
+        let phrase = r2_capacity_phrase(33, seat_phrase_shows_number(&snap(v), 33));
+        assert_eq!(phrase, "Lower --max-num-seqs to ≤33 to reduce KV demand");
+    }
+
+    #[test]
+    fn derived_capacity_shows_number_when_peak_running_absent() {
+        let v = VllmRawMetrics {
+            max_num_seqs: Some(154),
+            ..Default::default()
+        };
+        let phrase = r2_capacity_phrase(33, seat_phrase_shows_number(&snap(v), 33));
+        assert_eq!(phrase, "Lower --max-num-seqs to ≤33 to reduce KV demand");
+    }
+
+    #[test]
+    fn derived_capacity_shows_number_when_peak_running_equals_cap() {
+        // peak <= floor(value) keeps the number (same boundary as kv_bound_survives_peak).
+        let v = VllmRawMetrics {
+            max_num_seqs: Some(154),
+            num_requests_running_peak: Some(33.0),
+            ..Default::default()
+        };
+        let phrase = r2_capacity_phrase(33, seat_phrase_shows_number(&snap(v), 33));
+        assert_eq!(phrase, "Lower --max-num-seqs to ≤33 to reduce KV demand");
+    }
+
+    #[test]
+    fn derived_hybrid_capacity_direction_when_not_reduction() {
         let (n, label) = resolve_r2_kv_capacity(None, Some(18), true);
         assert_eq!(n, Some(18));
         assert_eq!(label, KvCapacityLabel::DerivedHybrid);
-        let phrase = r2_capacity_phrase(18, Some(8192), label);
-        assert!(phrase.contains("(est)"));
-        assert!(phrase.contains("at least 18 worst-case requests fit"));
-        assert!(phrase.contains("including hybrid state"));
-        assert!(phrase.contains("concurrent requests"));
-        assert!(phrase.contains("max_model_len=8192"));
+        let v = VllmRawMetrics {
+            max_num_seqs: Some(16),
+            ..Default::default()
+        };
+        let snap = snap(v);
+        let phrase = r2_capacity_phrase(18, seat_phrase_shows_number(&snap, 18));
+        assert_eq!(phrase, "Lower --max-num-seqs to reduce KV demand");
+        assert!(!phrase.contains("worst-case"));
+        assert!(!phrase.contains("hybrid"));
+    }
+
+    #[test]
+    fn seat_bullet_numbering_peak_cap_and_reduction() {
+        fn pressure_text(v: VllmRawMetrics, kv_max_seqs: u32) -> String {
+            format_kv_cache_pressure_fired(
+                &detail(98.0, false),
+                &kv_ctx(&snap(v), Some(8192), Some(30.0), Some(kv_max_seqs)),
+                3,
+                4,
+            )
+            .join("\n")
+        }
+        let believable = VllmRawMetrics {
+            kv_cache_usage_perc: Some(95.0),
+            max_num_seqs: Some(154),
+            num_requests_running_peak: Some(14.0),
+            cache_config: CacheConfigLabels {
+                kv_cache_max_concurrency: Some(23.0),
+                cache_dtype: Some("bf16".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let t1 = pressure_text(believable, 23);
+        assert!(t1.contains("Lower --max-num-seqs to ≤23 to reduce KV demand"));
+        assert!(!t1.contains("vLLM-reported"));
+        assert!(!t1.contains("worst-case"));
+
+        let contradicted = VllmRawMetrics {
+            kv_cache_usage_perc: Some(95.0),
+            max_num_seqs: Some(154),
+            num_requests_running_peak: Some(35.0),
+            cache_config: CacheConfigLabels {
+                kv_cache_max_concurrency: Some(13.0),
+                cache_dtype: Some("bf16".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let t2 = pressure_text(contradicted, 13);
+        assert!(t2.contains("Lower --max-num-seqs to reduce KV demand"));
+        assert!(!t2.contains('≤'));
+
+        let not_reduction = VllmRawMetrics {
+            kv_cache_usage_perc: Some(95.0),
+            max_num_seqs: Some(154),
+            cache_config: CacheConfigLabels {
+                cache_dtype: Some("bf16".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let t3 = pressure_text(not_reduction, 200);
+        assert!(t3.contains("Lower --max-num-seqs to reduce KV demand"));
+        assert!(!t3.contains('≤'));
+    }
+
+    #[test]
+    fn seat_bullet_always_renders_on_admission_backlog() {
+        let v = VllmRawMetrics {
+            kv_cache_usage_perc: Some(90.0),
+            max_num_seqs: Some(154),
+            num_requests_running_peak: Some(14.0),
+            cache_config: CacheConfigLabels {
+                kv_cache_max_concurrency: Some(23.0),
+                cache_dtype: Some("bf16".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let text = format_kv_admission_backlog_issue(
+            &sample_backlog_detail(),
+            50,
+            &kv_ctx(&snap(v), None, Some(30.0), Some(23)),
+            3,
+            4,
+        )
+        .join("\n");
+        assert!(text.contains("Lower --max-num-seqs to ≤23 to reduce KV demand"));
     }
 
     #[test]
@@ -1831,6 +2254,7 @@ mod tests {
             max_model_len: Some(32768),
             kv_headroom_gb: None,
             kv_max_seqs: Some(8),
+            config_max_num_seqs: None,
             capacity_label: KvCapacityLabel::Observed,
             fp8_compiler_available: false,
             model: None,
@@ -1851,7 +2275,7 @@ mod tests {
             .expect("shrink line");
         let follow_idx = lines
             .iter()
-            .position(|l| l.contains("Then set --max-num-seqs to ≤39"))
+            .position(|l| l.contains("Then lower --max-num-seqs to reduce KV demand"))
             .expect("follow-on seats at shrink target");
         let cuts_idx = lines
             .iter()
@@ -1873,15 +2297,16 @@ mod tests {
                 .count(),
             1
         );
-        assert!(text.contains("fits at least 39 worst-case requests (est)"));
-        assert!(text.contains("Then set --max-num-seqs to ≤39 (est, at max_model_len=5465)"));
+        assert!(!text.contains("fits at least"));
+        assert!(!text.contains("worst-case"));
+        assert!(text.contains("Then lower --max-num-seqs to reduce KV demand"));
         assert!(!text.contains("Or cap --max-num-seqs"));
         assert!(!text.contains("guaranteed at full"));
         assert!(!text.contains("fits 8 concurrent"));
         // D5: blank after Warning before next bullet
         let warn_idx = lines
             .iter()
-            .position(|l| l.contains("Truncation risk"))
+            .position(|l| l.contains("rejected with a 400"))
             .expect("warning");
         assert!(lines[warn_idx + 1].is_empty());
         assert!(follow_idx > warn_idx);
@@ -1926,11 +2351,6 @@ mod tests {
             !text.contains("8192 → 6450"),
             "current already shown on cap bullet"
         );
-        assert_eq!(
-            text.matches("max_model_len=8192").count(),
-            1,
-            "current max_model_len once per block"
-        );
     }
 
     #[test]
@@ -1961,7 +2381,6 @@ mod tests {
         .join("\n");
         assert!(text.contains("Lower --max-model-len to 6800"));
         assert!(!text.contains('→'));
-        assert_eq!(text.matches("max_model_len=8192").count(), 1);
         assert!(text.contains("    Cuts throughput:"));
     }
 
@@ -1991,11 +2410,8 @@ mod tests {
         )
         .join("\n");
         assert!(text.contains("Lower --max-model-len 8192 → 6800"));
-        assert!(
-            text.contains("max_model_len=8192"),
-            "DerivedHybrid capacity phrase names max_model_len like Derived"
-        );
-        assert_eq!(text.matches("max_model_len=8192").count(), 1);
+        assert!(!text.contains("worst-case"));
+        assert!(!text.contains('≤'));
     }
 
     #[test]
@@ -2008,7 +2424,12 @@ mod tests {
         };
         let lines = format_kv_cache_pressure_fired(
             &detail(90.0, true),
-            &kv_ctx(&snap(v), None, Some(30.0), Some(18)),
+            &kv_ctx(
+                &snap_vram(v, VRAM_AMPLY_FREE_USED_MB, VRAM_AMPLY_FREE_TOTAL_MB),
+                None,
+                Some(30.0),
+                Some(18),
+            ),
             3,
             4,
         );
@@ -2050,7 +2471,12 @@ mod tests {
                 preemptions_active: false,
                 queue_backpressure: true,
             },
-            &kv_ctx(&snap(v), Some(8192), Some(30.0), Some(16)),
+            &kv_ctx(
+                &snap_vram(v, VRAM_AMPLY_FREE_USED_MB, VRAM_AMPLY_FREE_TOTAL_MB),
+                Some(8192),
+                Some(30.0),
+                Some(16),
+            ),
             3,
             4,
         )
@@ -2114,12 +2540,12 @@ mod tests {
             .find("Lower --max-model-len to 6450")
             .expect("to-form shrink when seat leads");
         assert!(text.find("    Fix:").unwrap() < shrink);
-        assert!(text.contains("Truncation risk"));
+        assert!(text.contains("rejected with a 400"));
         let warn = lines
             .iter()
-            .position(|l| l.contains("Truncation risk"))
+            .position(|l| l.contains("rejected with a 400"))
             .expect("warning subline");
-        assert!(lines[warn].contains("Warning") || lines[warn].contains("Truncation"));
+        assert!(lines[warn].contains("rejected with a 400"));
         assert!(
             !lines.windows(2).any(|w| w[0].is_empty() && w[1].is_empty()),
             "no consecutive blank lines in block"
@@ -2206,12 +2632,18 @@ mod tests {
         };
         let text = format_kv_cache_pressure_fired(
             &d,
-            &kv_ctx(&snap(v), Some(8192), Some(1.0), None),
+            &kv_ctx(
+                &snap_vram(v, VRAM_ITER3_USED_MB, VRAM_ITER3_TOTAL_MB),
+                Some(8192),
+                Some(1.0),
+                None,
+            ),
             3,
             4,
         )
         .join("\n");
-        assert!(text.contains("GPU at VRAM capacity"));
+        assert!(!text.contains("Raise --gpu-memory-utilization"));
+        assert!(!text.contains("GPU at VRAM capacity"));
         assert!(!text.contains("max context length"));
         assert_eq!(
             text.matches("Lower --max-model-len").count(),
@@ -2232,27 +2664,7 @@ mod tests {
     }
 
     #[test]
-    fn self_grade_prescribes_only_derived_labels() {
-        assert_eq!(
-            prescribed_for_self_grade(Some(24), KvCapacityLabel::Derived),
-            Some(24)
-        );
-        assert_eq!(
-            prescribed_for_self_grade(Some(18), KvCapacityLabel::DerivedHybrid),
-            Some(18)
-        );
-        assert_eq!(
-            prescribed_for_self_grade(Some(24), KvCapacityLabel::Observed),
-            None
-        );
-        assert_eq!(
-            prescribed_for_self_grade(None, KvCapacityLabel::Derived),
-            None
-        );
-    }
-
-    #[test]
-    fn contradicted_cap_omits_seat_bullet_including_numberless() {
+    fn contradicted_cap_renders_direction_only_seat_bullet() {
         let v = VllmRawMetrics {
             kv_cache_usage_perc: Some(98.0),
             kv_cache_peak_perc: Some(100.0),
@@ -2263,6 +2675,7 @@ mod tests {
             generation_tokens_completed: Some(48.0),
             prompt_tokens_mean: Some(1100.0),
             generation_tokens_mean: Some(4000.0),
+            max_num_seqs: Some(256),
             cache_config: CacheConfigLabels {
                 kv_cache_max_concurrency: Some(1.06),
                 enable_prefix_caching: Some(true),
@@ -2273,15 +2686,15 @@ mod tests {
         };
         let snap = snap(v);
         assert!(super::super::observed_kv_cap_contradicted(&snap));
-        // Pass derived capacity so a naive fallthrough would still print a seat line.
         let text = format_kv_cache_pressure_fired(
             &detail(98.0, true),
-            &kv_ctx(&snap, Some(262144), Some(1.0), Some(40)),
+            &kv_ctx(&snap, Some(262144), Some(1.0), Some(1)),
             3,
             4,
         )
         .join("\n");
-        assert!(!text.contains("Lower --max-num-seqs"));
+        assert!(text.contains("Lower --max-num-seqs to reduce KV demand"));
+        assert!(!text.contains('≤'));
         assert!(!text.contains("Then set --max-num-seqs"));
         assert!(text.contains("Observed 5.1k tokens per request, prompt plus generation."));
         assert!(!text.contains('~'));
@@ -2336,6 +2749,7 @@ mod tests {
                 max_model_len: Some(32768),
                 kv_headroom_gb: Some(1.0),
                 kv_max_seqs: Some(8),
+                config_max_num_seqs: None,
                 capacity_label: KvCapacityLabel::Observed,
                 fp8_compiler_available: false,
                 model: None,
@@ -2355,7 +2769,7 @@ mod tests {
         let text = lines.join("\n");
         let then_idx = lines
             .iter()
-            .position(|l| l.contains("Then set --max-num-seqs to ≤39"))
+            .position(|l| l.contains("Then lower --max-num-seqs to reduce KV demand"))
             .expect("follow-on seat at shrink target");
         assert!(
             then_idx + 1 >= lines.len()
@@ -2427,6 +2841,7 @@ mod tests {
                 max_model_len: Some(32768),
                 kv_headroom_gb: None,
                 kv_max_seqs: Some(8),
+                config_max_num_seqs: None,
                 capacity_label: KvCapacityLabel::Observed,
                 fp8_compiler_available: false,
                 model: None,
@@ -2437,14 +2852,15 @@ mod tests {
             4,
         )
         .join("\n");
-        assert!(text.contains("fits at least 39 worst-case requests (est)"));
-        assert!(text.contains("Then set --max-num-seqs to ≤39 (est, at max_model_len=5465)"));
+        assert!(!text.contains("fits at least"));
+        assert!(!text.contains("worst-case"));
+        assert!(text.contains("Then lower --max-num-seqs to reduce KV demand"));
         assert!(!text.contains("Lower --max-num-seqs to ≤8"));
         assert!(!text.contains("Or cap --max-num-seqs"));
     }
 
     #[test]
-    fn unknown_max_model_len_always_prescribes_shrink_with_verify() {
+    fn unknown_max_model_len_always_prescribes_shrink_with_rejection_warning() {
         let v = VllmRawMetrics {
             kv_cache_usage_perc: Some(98.0),
             num_requests_running_peak: Some(16.0),
@@ -2459,7 +2875,7 @@ mod tests {
             },
             ..Default::default()
         };
-        // No max_model_len → still prescribe shrink + verify; contradicted → no seat.
+        // No max_model_len → still prescribe shrink + rejection warning; contradicted → direction-only seat.
         let lines = format_kv_cache_pressure_fired(
             &detail(98.0, true),
             &kv_ctx(&snap(v), None, Some(1.0), Some(40)),
@@ -2470,26 +2886,27 @@ mod tests {
         assert!(text.contains("Cause:"));
         assert!(text.contains("    Fix:"));
         assert!(text.contains("Lower --max-model-len to safely raise concurrency."));
-        let verify_idx = lines
+        let warn_idx = lines
             .iter()
-            .position(|l| l.contains("Verify: check the vLLM start command"))
-            .expect("verify subline");
+            .position(|l| l.contains("rejected with a 400, not truncated."))
+            .expect("rejection subline");
         assert!(
-            lines[verify_idx].starts_with("        "),
-            "verify at 8 spaces: {:?}",
-            lines[verify_idx]
+            lines[warn_idx].starts_with("        "),
+            "subline at 8 spaces: {:?}",
+            lines[warn_idx]
         );
+        assert!(lines[warn_idx + 1].is_empty(), "blank after subline");
         assert!(!text.contains("KV cache is the wall"));
-        assert!(!text.contains("Lower --max-num-seqs"));
+        assert!(text.contains("Lower --max-num-seqs to reduce KV demand"));
+        assert!(!text.contains('≤'));
         assert!(text.contains("Expected:"));
     }
 
     fn offload_cache(state: crate::collectors::KvOffloadState) -> CacheConfigLabels {
         CacheConfigLabels {
             kv_offloading: state,
-            // Silence other safe levers so offload asserts stay focused.
             enable_prefix_caching: Some(true),
-            cache_dtype: Some("fp8".into()),
+            cache_dtype: Some("bf16".into()),
             ..Default::default()
         }
     }
@@ -2499,6 +2916,22 @@ mod tests {
             .iter()
             .position(|l| l.contains("Set --kv-offloading-size"))
             .expect("offload bullet");
+        let gpu_idx = lines
+            .iter()
+            .position(|l| l.contains("Raise --gpu-memory-utilization"))
+            .expect("gpu-mem bullet");
+        let fp8_idx = lines
+            .iter()
+            .position(|l| l.contains("Switch --kv-cache-dtype fp8"))
+            .expect("fp8 bullet");
+        assert!(gpu_idx < idx, "offload must follow gpu-memory-utilization");
+        assert!(fp8_idx < idx, "offload must follow fp8");
+        if let Some(safe_idx) = lines.iter().position(|l| l == "    Safe to apply:") {
+            assert!(safe_idx < idx, "offload must sit inside the safe group");
+            if let Some(cuts_idx) = lines.iter().position(|l| l == "    Cuts throughput:") {
+                assert!(idx < cuts_idx, "offload must precede the cuts group");
+            }
+        }
         assert!(
             lines[idx].starts_with("      •"),
             "bullet indent 6 spaces: {:?}",
@@ -2506,18 +2939,72 @@ mod tests {
         );
         assert_eq!(
             lines[idx + 1].trim_start(),
-            "Check available host RAM before allocating."
+            "Check host RAM and your container memory limit before allocating."
         );
-        assert!(
-            lines[idx + 1].starts_with("        "),
-            "subline indent 8 spaces: {:?}",
-            lines[idx + 1]
+        assert_eq!(
+            lines[idx + 1],
+            format!("        {}", KV_OFFLOAD_SUBLINE.trim_start()),
+            "offload subline must match push_bullet_with_subline indent"
         );
-        assert!(
-            lines[idx + 2].is_empty(),
-            "blank line after subline: {:?}",
-            lines.get(idx + 2)
-        );
+        if lines.get(idx + 2).is_some_and(|l| l.is_empty()) {
+            assert_eq!(lines[idx + 2], String::new(), "blank after subline");
+        }
+        let fix_idx = lines
+            .iter()
+            .position(|l| l == "    Fix:")
+            .expect("Fix header");
+        let section_end = lines
+            .iter()
+            .position(|l| l.starts_with("    Expected:"))
+            .unwrap_or(lines.len());
+        if lines.iter().any(|l| l == "    Safe to apply:") {
+            let cuts_idx = lines
+                .iter()
+                .position(|l| l == "    Cuts throughput:")
+                .expect("labeled safe requires cuts group in offload test fixture");
+            let safe_end = lines[fix_idx + 1..cuts_idx]
+                .iter()
+                .rfind(|l| l.starts_with("      •") || l.starts_with("        "))
+                .expect("safe group content");
+            assert!(
+                safe_end.contains("Set --kv-offloading-size")
+                    || lines[idx + 1].trim_start() == KV_OFFLOAD_SUBLINE,
+                "offload must be the last safe-group item"
+            );
+            for line in &lines[cuts_idx + 1..section_end] {
+                assert!(
+                    line.is_empty()
+                        || line.starts_with("    Cuts throughput:")
+                        || line.starts_with("      •")
+                        || line.starts_with("        "),
+                    "no unlabeled fix line after labeled groups: {line:?}"
+                );
+            }
+        } else {
+            // Crisis: flat Fix list (no group labels). Safe bullets precede cut bullets.
+            let bullets: Vec<&String> = lines[fix_idx + 1..section_end]
+                .iter()
+                .filter(|l| l.starts_with("      •"))
+                .collect();
+            let offload_pos = bullets
+                .iter()
+                .position(|l| l.contains("Set --kv-offloading-size"))
+                .expect("offload bullet in crisis fix list");
+            let fp8_pos = bullets
+                .iter()
+                .position(|l| l.contains("Switch --kv-cache-dtype fp8"))
+                .expect("fp8 bullet in crisis fix list");
+            assert!(
+                fp8_pos < offload_pos,
+                "offload must follow fp8 in crisis list"
+            );
+            if let Some(after) = bullets.get(offload_pos + 1) {
+                assert!(
+                    after.contains("max-num-seqs") || after.contains("max-model-len"),
+                    "only cut bullets may follow offload in crisis list: {after:?}"
+                );
+            }
+        }
     }
 
     fn format_offload_three_paths(
@@ -2531,7 +3018,12 @@ mod tests {
         };
         let crisis = format_kv_cache_pressure_fired(
             &detail(90.0, true),
-            &kv_ctx(&snap(v.clone()), None, Some(1.0), None),
+            &kv_ctx(
+                &snap_vram(v.clone(), VRAM_AMPLY_FREE_USED_MB, VRAM_AMPLY_FREE_TOTAL_MB),
+                None,
+                Some(30.0),
+                None,
+            ),
             3,
             4,
         );
@@ -2544,13 +3036,19 @@ mod tests {
                 preemptions_active: false,
                 queue_backpressure: true,
             },
-            &kv_ctx(&snap(v.clone()), None, Some(30.0), None),
+            &kv_ctx(
+                &snap_vram(v.clone(), VRAM_AMPLY_FREE_USED_MB, VRAM_AMPLY_FREE_TOTAL_MB),
+                None,
+                Some(30.0),
+                None,
+            ),
             3,
             4,
         );
         let backlog = format_kv_admission_backlog_issue(
             &KvAdmissionBacklogDetail {
                 kv_cache_usage_perc: 90.0,
+                kv_peak_pct: Some(90.0),
                 admission_ratio: 0.5,
                 requests_waiting: 10.0,
                 requests_running: 10.0,
@@ -2558,11 +3056,47 @@ mod tests {
                 demand_tokens: 200.0,
             },
             50,
-            &kv_ctx(&snap(v), None, Some(30.0), None),
+            &kv_ctx(
+                &snap_vram(v, VRAM_AMPLY_FREE_USED_MB, VRAM_AMPLY_FREE_TOTAL_MB),
+                None,
+                Some(30.0),
+                None,
+            ),
             3,
             4,
         );
         (crisis, non_crisis, backlog)
+    }
+
+    #[test]
+    fn kv_offload_subline_matches_dead_end_subline_convention() {
+        use crate::collectors::KvOffloadState;
+        let (_, non_crisis, _) = format_offload_three_paths(offload_cache(KvOffloadState::Off));
+        let offload_idx = non_crisis
+            .iter()
+            .position(|l| l.contains("Set --kv-offloading-size"))
+            .expect("offload bullet");
+        let offload_subline = &non_crisis[offload_idx + 1];
+        let verify_subline = format!("        {}", DEAD_END_VERIFY_SUBLINE.trim_start());
+        assert_eq!(
+            offload_subline
+                .chars()
+                .take_while(|c| *c == ' ')
+                .collect::<String>(),
+            verify_subline
+                .chars()
+                .take_while(|c| *c == ' ')
+                .collect::<String>(),
+            "offload and dead-end sublines must share push_bullet_with_subline indent"
+        );
+        assert_eq!(
+            *offload_subline,
+            format!("        {}", KV_OFFLOAD_SUBLINE.trim_start())
+        );
+        assert_eq!(
+            verify_subline,
+            format!("        {}", DEAD_END_VERIFY_SUBLINE)
+        );
     }
 
     #[test]
@@ -2620,12 +3154,13 @@ mod tests {
     }
 
     /// Crisis dead end: shrink no-op (<5%), cap contradicted, every safe lever already set
-    /// or unavailable. Produces the no-lever verify caution, not Fix / Expected.
+    /// or unavailable. Verify then replica bullets under Fix:, with Expected.
     fn dead_end_snap(
         offload: crate::collectors::KvOffloadState,
         max_model_len: u32,
         prompt_p99: f64,
         generation_p99: f64,
+        max_num_seqs: Option<u32>,
     ) -> (RawSnapshot, u32) {
         let v = VllmRawMetrics {
             kv_cache_usage_perc: Some(98.0),
@@ -2635,6 +3170,7 @@ mod tests {
             generation_tokens_completed: Some(150.0),
             prompt_tokens_p99: Some(prompt_p99),
             generation_tokens_p99: Some(generation_p99),
+            max_num_seqs,
             cache_config: CacheConfigLabels {
                 kv_cache_max_concurrency: Some(1.06),
                 enable_prefix_caching: Some(true),
@@ -2648,10 +3184,226 @@ mod tests {
     }
 
     #[test]
-    fn no_lever_verify_when_fix_list_empty() {
+    fn seat_lever_dead_end_at_floor_crisis_and_non_crisis() {
+        let crisis = format_seat_lever_crisis(Some(1), None);
+        assert_dead_end_pair(&crisis);
+        assert!(!crisis.contains("Lower --max-num-seqs to reduce KV demand"));
+
+        let non_crisis = format_seat_lever_non_crisis(Some(1), None);
+        assert!(!non_crisis.contains("Lower --max-num-seqs to reduce KV demand"));
+        assert_dead_end_pair(&non_crisis);
+
+        let backlog = format_seat_lever_backlog(Some(1), None);
+        assert!(!backlog.contains("Lower --max-num-seqs"));
+        assert_dead_end_pair(&backlog);
+    }
+
+    #[test]
+    fn seat_lever_shows_seat_when_above_floor() {
+        for text in [
+            format_seat_lever_crisis(Some(45), None),
+            format_seat_lever_non_crisis(Some(45), None),
+            format_seat_lever_backlog(Some(45), None),
+        ] {
+            assert!(text.contains("Lower --max-num-seqs to reduce KV demand"));
+            assert_no_dead_end_pair(&text);
+        }
+    }
+
+    #[test]
+    fn seat_lever_withheld_when_max_num_seqs_unknown() {
+        for text in [
+            format_seat_lever_crisis(None, None),
+            format_seat_lever_non_crisis(None, None),
+            format_seat_lever_backlog(None, None),
+        ] {
+            assert!(!text.contains("Lower --max-num-seqs to reduce KV demand"));
+        }
+        assert_dead_end_pair(&format_seat_lever_crisis(None, None));
+        assert_dead_end_pair(&format_seat_lever_non_crisis(None, None));
+        assert_dead_end_pair(&format_seat_lever_backlog(None, None));
+    }
+
+    #[test]
+    fn seat_lever_available_at_two_not_one() {
+        for text in [
+            format_seat_lever_crisis(Some(2), None),
+            format_seat_lever_non_crisis(Some(2), None),
+            format_seat_lever_backlog(Some(2), None),
+        ] {
+            assert!(text.contains("Lower --max-num-seqs to reduce KV demand"));
+            assert_no_dead_end_pair(&text);
+        }
+    }
+
+    #[test]
+    fn seat_lever_reads_config_when_scrape_absent() {
+        let text = format_seat_lever_crisis(None, Some(45));
+        assert!(text.contains("Lower --max-num-seqs to reduce KV demand"));
+        assert_no_dead_end_pair(&text);
+        let dead = format_seat_lever_crisis(None, Some(1));
+        assert_dead_end_pair(&dead);
+    }
+
+    fn headroom_gate_non_crisis(
+        used_mb: u64,
+        total_mb: u64,
+        kv_headroom_gb: Option<f64>,
+        max_num_seqs: Option<u32>,
+    ) -> String {
+        use crate::collectors::KvOffloadState;
+        let (base, m) = dead_end_snap(
+            KvOffloadState::Enabled(16.0),
+            10000,
+            5000.0,
+            4600.0,
+            max_num_seqs,
+        );
+        let snap = snap_vram(base.vllm.clone(), used_mb, total_mb);
+        format_kv_cache_pressure_fired(
+            &KvCachePressureDetail {
+                kv_cache_usage_perc: Some(98.0),
+                kv_peak_pct: Some(98.0),
+                preemptions_active: false,
+                queue_backpressure: true,
+            },
+            &kv_ctx_config(&snap, Some(m), kv_headroom_gb, None, None),
+            3,
+            4,
+        )
+        .join("\n")
+    }
+
+    #[test]
+    fn gpu_mem_bullet_omitted_when_observed_vram_low_non_crisis() {
+        let text = headroom_gate_non_crisis(
+            VRAM_ITER3_USED_MB,
+            VRAM_ITER3_TOTAL_MB,
+            Some(30.0),
+            Some(45),
+        );
+        assert!(!text.contains("Raise --gpu-memory-utilization"));
+    }
+
+    #[test]
+    fn gpu_mem_bullet_omitted_when_computed_budget_exhausted() {
+        let text = headroom_gate_non_crisis(
+            VRAM_AMPLY_FREE_USED_MB,
+            VRAM_AMPLY_FREE_TOTAL_MB,
+            Some(1.0),
+            Some(45),
+        );
+        assert!(!text.contains("Raise --gpu-memory-utilization"));
+    }
+
+    #[test]
+    fn gpu_mem_bullet_omitted_when_vram_unreadable() {
+        use crate::collectors::KvOffloadState;
+        let (snap, m) = dead_end_snap(
+            KvOffloadState::Enabled(16.0),
+            10000,
+            5000.0,
+            4600.0,
+            Some(45),
+        );
+        let text = format_kv_cache_pressure_fired(
+            &KvCachePressureDetail {
+                kv_cache_usage_perc: Some(98.0),
+                kv_peak_pct: Some(98.0),
+                preemptions_active: false,
+                queue_backpressure: true,
+            },
+            &kv_ctx_config(&snap, Some(m), Some(30.0), None, None),
+            3,
+            4,
+        )
+        .join("\n");
+        assert!(!text.contains("Raise --gpu-memory-utilization"));
+    }
+
+    #[test]
+    fn crisis_gpu_mem_bullet_when_headroom_and_vram_ample() {
+        let v = VllmRawMetrics {
+            kv_cache_usage_perc: Some(90.0),
+            num_preemptions_per_sec: Some(0.05),
+            ..Default::default()
+        };
+        let text = format_kv_cache_pressure_fired(
+            &detail(90.0, true),
+            &kv_ctx(
+                &snap_vram(v, VRAM_AMPLY_FREE_USED_MB, VRAM_AMPLY_FREE_TOTAL_MB),
+                None,
+                Some(30.0),
+                None,
+            ),
+            3,
+            4,
+        )
+        .join("\n");
+        assert!(text.contains("Raise --gpu-memory-utilization"));
+    }
+
+    #[test]
+    fn iteration3_shape_no_gpu_mem_bullet_at_78_of_80() {
+        use crate::collectors::KvOffloadState;
+        let v = VllmRawMetrics {
+            kv_cache_usage_perc: Some(97.0),
+            num_requests_running_peak: Some(1.0),
+            num_preemptions_per_sec: Some(0.05),
+            cache_config: CacheConfigLabels {
+                kv_cache_max_concurrency: Some(1.06),
+                enable_prefix_caching: Some(true),
+                cache_dtype: Some("fp8".into()),
+                kv_offloading: KvOffloadState::Enabled(16.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let text = format_kv_cache_pressure_fired(
+            &detail(97.0, true),
+            &kv_ctx(
+                &snap_vram(v, VRAM_ITER3_USED_MB, VRAM_ITER3_TOTAL_MB),
+                Some(262144),
+                Some(15.0),
+                None,
+            ),
+            3,
+            4,
+        )
+        .join("\n");
+        assert!(!text.contains("Raise --gpu-memory-utilization"));
+        assert!(!text.contains("GPU at VRAM capacity"));
+    }
+
+    #[test]
+    fn hardware_wall_dead_end_absent_when_offload_off() {
+        use crate::collectors::KvOffloadState;
+        let (snap, m) = dead_end_snap(KvOffloadState::Off, 10000, 5000.0, 4600.0, Some(256));
+        let text = format_kv_cache_pressure_fired(
+            &detail(98.0, true),
+            &kv_ctx(&snap, Some(m), None, None),
+            3,
+            4,
+        )
+        .join("\n");
+        assert!(text.contains("    Fix:"));
+        assert!(text.contains("Set --kv-offloading-size"));
+        assert!(!text.contains("took effect"));
+        assert!(!text.contains("No config change on this GPU moves the KV wall."));
+        assert!(text.contains("Expected:"));
+    }
+
+    #[test]
+    fn no_lever_verify_when_only_seat_remains() {
         use crate::collectors::KvOffloadState;
         // 5000+4600=9600; at max_model_len=10000 that is within the 5% no-op band.
-        let (snap, m) = dead_end_snap(KvOffloadState::Enabled(16.0), 10000, 5000.0, 4600.0);
+        let (snap, m) = dead_end_snap(
+            KvOffloadState::Enabled(16.0),
+            10000,
+            5000.0,
+            4600.0,
+            Some(256),
+        );
         let lines = format_kv_cache_pressure_fired(
             &detail(98.0, true),
             &kv_ctx(&snap, Some(m), None, Some(40)),
@@ -2660,29 +3412,12 @@ mod tests {
         );
         let text = lines.join("\n");
         assert!(text.contains("Cause:"));
-        assert!(
-            !text.contains("    Fix:"),
-            "no Fix header when nothing to prescribe"
-        );
-        assert!(
-            !text.contains("Expected:"),
-            "no Expected when nothing to promise"
-        );
-        let idx = lines
-            .iter()
-            .position(|l| l.contains("No config lever remains"))
-            .expect("no-lever verify line");
-        assert_eq!(lines[idx], NO_LEVER_VERIFY_LINE);
-        assert!(
-            lines[idx].starts_with("        ") && !lines[idx].contains('•'),
-            "caution indent, no bullet: {:?}",
-            lines[idx]
-        );
-        assert!(
-            lines[idx + 1].is_empty(),
-            "blank after no-lever line: {:?}",
-            lines.get(idx + 1)
-        );
+        assert!(text.contains("    Fix:"));
+        assert!(text.contains("Lower --max-num-seqs to reduce KV demand"));
+        assert!(!text.contains('≤'));
+        assert!(!text.contains("took effect"));
+        assert!(!text.contains("No config change on this GPU moves the KV wall."));
+        assert!(text.contains("Expected:"));
         assert!(!text.contains("Set --kv-offloading-size"));
         assert!(!text.contains("Lower --max-model-len"));
     }
@@ -2690,7 +3425,7 @@ mod tests {
     #[test]
     fn no_lever_verify_absent_when_offload_off_fills_fix() {
         use crate::collectors::KvOffloadState;
-        let (snap, m) = dead_end_snap(KvOffloadState::Off, 10000, 5000.0, 4600.0);
+        let (snap, m) = dead_end_snap(KvOffloadState::Off, 10000, 5000.0, 4600.0, Some(256));
         let text = format_kv_cache_pressure_fired(
             &detail(98.0, true),
             &kv_ctx(&snap, Some(m), None, Some(40)),
@@ -2700,7 +3435,8 @@ mod tests {
         .join("\n");
         assert!(text.contains("    Fix:"));
         assert!(text.contains("Set --kv-offloading-size"));
-        assert!(!text.contains("No config lever remains"));
+        assert!(!text.contains("took effect"));
+        assert!(!text.contains("No config change on this GPU moves the KV wall."));
         assert!(text.contains("Expected:"));
     }
 
@@ -2708,7 +3444,13 @@ mod tests {
     fn no_lever_verify_absent_when_shrink_available() {
         use crate::collectors::KvOffloadState;
         // Same p99s; max_model_len far above → named shrink fires.
-        let (snap, m) = dead_end_snap(KvOffloadState::Enabled(16.0), 32768, 5000.0, 4600.0);
+        let (snap, m) = dead_end_snap(
+            KvOffloadState::Enabled(16.0),
+            32768,
+            5000.0,
+            4600.0,
+            Some(256),
+        );
         let text = format_kv_cache_pressure_fired(
             &detail(98.0, true),
             &kv_ctx(&snap, Some(m), None, Some(40)),
@@ -2718,7 +3460,8 @@ mod tests {
         .join("\n");
         assert!(text.contains("    Fix:"));
         assert!(text.contains("Lower --max-model-len"));
-        assert!(!text.contains("No config lever remains"));
+        assert!(!text.contains("took effect"));
+        assert!(!text.contains("No config change on this GPU moves the KV wall."));
         assert!(text.contains("Expected:"));
     }
 }
