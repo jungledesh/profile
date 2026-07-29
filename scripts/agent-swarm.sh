@@ -301,7 +301,7 @@ worker() {
         local phase=$(( id_w * PHASE_SPREAD / AGENTS ))
         if (( phase > 0 )); then
             if (( DURATION > 0 )); then
-                local remaining=$(( END - $(date +%s) ))
+                local remaining=$(( END - $(date +%s) - 30 ))
                 if (( remaining <= 0 || phase > remaining )); then
                     echo "worker=$id_w skipped: phase ${phase}s exceeds remaining run time" >> "$SWARM_LOG"
                     echo 1 >> "$PHASE_SKIPPED_FILE"
