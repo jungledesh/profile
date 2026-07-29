@@ -134,23 +134,18 @@ pub fn run(input: LoopRunnerInput<'_>) -> anyhow::Result<()> {
         if state.is_oscillating() {
             match state.oscillating_pair() {
                 Some((a, b)) if is_kv_r5_oscillation_pair(a, b) => {
-                    if state.midpoint_suggested() {
-                        let (dead_line, replica_line) = kv_r5_dead_end_lines();
-                        println!("{dead_line}");
-                        println!("{replica_line}");
-                        break;
-                    }
-
+                    let known = kv_r5_known_bracket(state.history());
                     let bounds = kv_r5_midpoint_bounds(state.history());
                     match bounds {
-                        Some((lo, hi)) => {
+                        Some((lo, hi)) if state.should_suggest_midpoint(lo, hi) => {
                             let (bound_line, try_line) = kv_r5_midpoint_suggestion(lo, hi);
                             println!("{bound_line}");
                             println!("{try_line}");
-                            state.set_midpoint_suggested();
+                            state.record_midpoint_suggestion(lo, hi);
                         }
                         _ => {
-                            let (dead_line, replica_line) = kv_r5_dead_end_lines();
+                            let reason = kv_r5_dead_end_reason(bounds, known, &state);
+                            let (dead_line, replica_line) = kv_r5_dead_end_lines(reason);
                             println!("{dead_line}");
                             println!("{replica_line}");
                             break;
@@ -280,25 +275,108 @@ fn is_kv_r5_oscillation_pair(a: &str, b: &str) -> bool {
     )
 }
 
+/// Shared bound-line wording for midpoint suggestion and named dead end.
+fn kv_r5_bracket_line(lo: u32, hi: u32) -> String {
+    format!("\n--max-num-seqs={hi} filled KV cache. --max-num-seqs={lo} saturated the queue.")
+}
+
 /// Bound line and try line for the R2/R5 oscillation midpoint escape.
 pub(crate) fn kv_r5_midpoint_suggestion(lo: u32, hi: u32) -> (String, String) {
     let mid = (lo + hi) / 2;
     (
-        format!("\n--max-num-seqs={hi} filled KV cache. --max-num-seqs={lo} saturated the queue."),
+        kv_r5_bracket_line(lo, hi),
         format!("Try --max-num-seqs={mid}."),
     )
 }
 
-/// Dead-end lines when no seat count resolves both KV pressure and queue saturation.
-pub(crate) fn kv_r5_dead_end_lines() -> (String, String) {
-    (
-        "\nNo --max-num-seqs value resolves both KV pressure and queue saturation.".to_string(),
-        "Add a replica to scale out.".to_string(),
-    )
+/// Why the R2/R5 oscillation path exits without another midpoint suggestion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KvR5DeadEndReason {
+    /// Same `(lo, hi)` bracket already got a midpoint (case C).
+    RepeatBracket { lo: u32, hi: u32 },
+    /// Different bracket, same midpoint as last Try line (case D).
+    RepeatMidpoint { lo: u32, hi: u32, mid: u32 },
+    /// Session cap reached with a wide bracket still available (case E).
+    CapExhausted { lo: u32, hi: u32 },
+    /// Bracket too tight after at least one midpoint was tried (case F).
+    TooCloseAfterMidpoint { lo: u32, hi: u32 },
+    /// First oscillation already too tight to suggest a midpoint (case G).
+    TooCloseFirst { lo: u32, hi: u32 },
+    /// Could not resolve both seat counts from history (case H).
+    SeatsUnknown,
 }
 
-/// Last seat counts from R5 (low, queue saturation) and R2 (high, KV pressure) iterations.
-pub(crate) fn kv_r5_midpoint_bounds(
+/// Classify the dead-end path from bounds, known bracket, and session state.
+pub(crate) fn kv_r5_dead_end_reason(
+    bounds: Option<(u32, u32)>,
+    known: Option<(u32, u32)>,
+    state: &super::state::LoopState,
+) -> KvR5DeadEndReason {
+    if let Some((lo, hi)) = bounds {
+        if state.last_bracket() == Some((lo, hi)) {
+            return KvR5DeadEndReason::RepeatBracket { lo, hi };
+        }
+        let mid = lo.saturating_add(hi) / 2;
+        if state.last_midpoint() == Some(mid) {
+            return KvR5DeadEndReason::RepeatMidpoint { lo, hi, mid };
+        }
+        return KvR5DeadEndReason::CapExhausted { lo, hi };
+    }
+    if state.midpoint_count() > 0
+        && let Some((lo, hi)) = known
+    {
+        return KvR5DeadEndReason::TooCloseAfterMidpoint { lo, hi };
+    }
+    if let Some((lo, hi)) = known {
+        return KvR5DeadEndReason::TooCloseFirst { lo, hi };
+    }
+    KvR5DeadEndReason::SeatsUnknown
+}
+
+/// Dead-end lines when no further midpoint is offered.
+pub(crate) fn kv_r5_dead_end_lines(reason: KvR5DeadEndReason) -> (String, String) {
+    match reason {
+        KvR5DeadEndReason::RepeatBracket { lo, hi } => {
+            let mid = lo.saturating_add(hi) / 2;
+            (
+                kv_r5_bracket_line(lo, hi),
+                format!("Bracket unchanged after midpoint {mid}. Add a replica to scale out."),
+            )
+        }
+        KvR5DeadEndReason::RepeatMidpoint { lo, hi, mid } => (
+            kv_r5_bracket_line(lo, hi),
+            format!("Midpoint {mid} already suggested. Add a replica to scale out."),
+        ),
+        KvR5DeadEndReason::CapExhausted { lo, hi } => (
+            kv_r5_bracket_line(lo, hi),
+            format!(
+                "Midpoint cap ({}) reached. Add a replica to scale out.",
+                super::state::MAX_MIDPOINT_SUGGESTIONS
+            ),
+        ),
+        KvR5DeadEndReason::TooCloseAfterMidpoint { lo, hi } => (
+            kv_r5_bracket_line(lo, hi),
+            "Too close to try another value between them. Add a replica to scale out.".to_string(),
+        ),
+        KvR5DeadEndReason::TooCloseFirst { lo, hi } => {
+            let gap = hi - lo;
+            (
+                kv_r5_bracket_line(lo, hi),
+                format!(
+                    "Only {gap} seat{} apart; no midpoint to try. Add a replica to scale out.",
+                    if gap == 1 { "" } else { "s" }
+                ),
+            )
+        }
+        KvR5DeadEndReason::SeatsUnknown => (
+            "\nNo --max-num-seqs value resolves both KV pressure and queue saturation.".to_string(),
+            "Add a replica to scale out.".to_string(),
+        ),
+    }
+}
+
+/// Last seat counts from R5 (low) and R2 (high), when both are known.
+pub(crate) fn kv_r5_known_bracket(
     history: &std::collections::VecDeque<super::state::IterationRecord>,
 ) -> Option<(u32, u32)> {
     let lo = history
@@ -322,9 +400,16 @@ pub(crate) fn kv_r5_midpoint_bounds(
         })
         .and_then(|r| r.result.static_ctx.config.max_num_seqs);
     match (lo, hi) {
-        (Some(lo), Some(hi)) if hi > lo + 2 => Some((lo, hi)),
+        (Some(lo), Some(hi)) if hi > lo => Some((lo, hi)),
         _ => None,
     }
+}
+
+/// Bisectable bracket only: both seats known and `hi > lo + 2`.
+pub(crate) fn kv_r5_midpoint_bounds(
+    history: &std::collections::VecDeque<super::state::IterationRecord>,
+) -> Option<(u32, u32)> {
+    kv_r5_known_bracket(history).filter(|&(lo, hi)| hi > lo + 2)
 }
 
 fn capacity_levers(enable_prefix_caching: Option<bool>) -> String {
@@ -436,8 +521,11 @@ fn healthy_exit_message(input: HealthyExitInput) -> String {
                 limiter_line.as_deref().unwrap_or_default()
             )
         }
-        Some(engine::limiter::LimiterVerdict::CeilingUnknown(_)) => limiter_line
-            .unwrap_or_else(|| "Hardware ceiling unknown (GPU not in catalog).".to_string()),
+        Some(engine::limiter::LimiterVerdict::CeilingUnknown(_)) => {
+            limiter_line.unwrap_or_else(|| {
+                "Hardware ceiling unknown (hardware ceiling inputs incomplete).".to_string()
+            })
+        }
         None => {
             format!("{eff_str} - insufficient data to identify primary limiter.")
         }
@@ -1492,6 +1580,22 @@ mod tests {
     }
 
     #[test]
+    fn kv_r5_known_bracket_when_too_tight_to_bisect() {
+        use std::collections::VecDeque;
+
+        let mut history = VecDeque::new();
+        history.push_back(kv_bounds_record(
+            150,
+            rule_names::CONCURRENCY_SATURATION,
+            None,
+        ));
+        history.push_back(kv_bounds_record(152, rule_names::KV_CACHE_PRESSURE, None));
+
+        assert_eq!(kv_r5_known_bracket(&history), Some((150, 152)));
+        assert!(kv_r5_midpoint_bounds(&history).is_none());
+    }
+
+    #[test]
     fn kv_r5_midpoint_bounds_none_when_hi_within_margin_of_lo() {
         use std::collections::VecDeque;
 
@@ -1503,6 +1607,7 @@ mod tests {
         ));
         history.push_back(kv_bounds_record(12, rule_names::KV_CACHE_PRESSURE, None));
 
+        assert_eq!(kv_r5_known_bracket(&history), Some((10, 12)));
         assert!(kv_r5_midpoint_bounds(&history).is_none());
     }
 
@@ -1512,5 +1617,204 @@ mod tests {
         assert!(bound_line.contains("--max-num-seqs=345 filled KV cache"));
         assert!(bound_line.contains("--max-num-seqs=45 saturated the queue"));
         assert_eq!(try_line, "Try --max-num-seqs=195.");
+    }
+
+    #[test]
+    fn kv_r5_dead_end_repeat_bracket_case_c() {
+        let (dead, replica) =
+            kv_r5_dead_end_lines(KvR5DeadEndReason::RepeatBracket { lo: 150, hi: 180 });
+        assert!(dead.contains("--max-num-seqs=180 filled KV cache"));
+        assert!(dead.contains("--max-num-seqs=150 saturated the queue"));
+        assert_eq!(
+            replica,
+            "Bracket unchanged after midpoint 165. Add a replica to scale out."
+        );
+    }
+
+    #[test]
+    fn kv_r5_dead_end_repeat_midpoint_case_d() {
+        let (dead, replica) = kv_r5_dead_end_lines(KvR5DeadEndReason::RepeatMidpoint {
+            lo: 151,
+            hi: 179,
+            mid: 165,
+        });
+        assert!(dead.contains("--max-num-seqs=179 filled KV cache"));
+        assert!(dead.contains("--max-num-seqs=151 saturated the queue"));
+        assert_eq!(
+            replica,
+            "Midpoint 165 already suggested. Add a replica to scale out."
+        );
+    }
+
+    #[test]
+    fn kv_r5_dead_end_cap_exhausted_case_e() {
+        let (dead, replica) =
+            kv_r5_dead_end_lines(KvR5DeadEndReason::CapExhausted { lo: 125, hi: 137 });
+        assert!(dead.contains("--max-num-seqs=137 filled KV cache"));
+        assert!(dead.contains("--max-num-seqs=125 saturated the queue"));
+        assert_eq!(
+            replica,
+            "Midpoint cap (3) reached. Add a replica to scale out."
+        );
+    }
+
+    #[test]
+    fn dead_end_reason_cap_exhausted_case_e() {
+        use super::super::state::{LoopState, MAX_MIDPOINT_SUGGESTIONS};
+
+        let mut state = LoopState::new(kv_bounds_diagnose(137), kv_bounds_empty_report());
+        state.record_midpoint_suggestion(100, 200);
+        state.record_midpoint_suggestion(120, 200);
+        state.record_midpoint_suggestion(140, 200);
+        assert_eq!(state.midpoint_count(), MAX_MIDPOINT_SUGGESTIONS);
+
+        let bounds = Some((125, 137));
+        let known = Some((125, 137));
+        assert!(!state.should_suggest_midpoint(125, 137));
+        assert_eq!(
+            kv_r5_dead_end_reason(bounds, known, &state),
+            KvR5DeadEndReason::CapExhausted { lo: 125, hi: 137 }
+        );
+    }
+
+    #[test]
+    fn kv_r5_dead_end_too_close_after_midpoint_case_f() {
+        let (dead, replica) =
+            kv_r5_dead_end_lines(KvR5DeadEndReason::TooCloseAfterMidpoint { lo: 150, hi: 152 });
+        assert!(dead.contains("--max-num-seqs=152 filled KV cache"));
+        assert!(dead.contains("--max-num-seqs=150 saturated the queue"));
+        assert_eq!(
+            replica,
+            "Too close to try another value between them. Add a replica to scale out."
+        );
+    }
+
+    #[test]
+    fn kv_r5_dead_end_too_close_first_gap_one() {
+        let (dead, replica) =
+            kv_r5_dead_end_lines(KvR5DeadEndReason::TooCloseFirst { lo: 150, hi: 151 });
+        assert!(dead.contains("--max-num-seqs=151 filled KV cache"));
+        assert!(dead.contains("--max-num-seqs=150 saturated the queue"));
+        assert_eq!(
+            replica,
+            "Only 1 seat apart; no midpoint to try. Add a replica to scale out."
+        );
+    }
+
+    #[test]
+    fn kv_r5_dead_end_too_close_first_gap_two() {
+        let (dead, replica) =
+            kv_r5_dead_end_lines(KvR5DeadEndReason::TooCloseFirst { lo: 150, hi: 152 });
+        assert!(dead.contains("--max-num-seqs=152 filled KV cache"));
+        assert!(dead.contains("--max-num-seqs=150 saturated the queue"));
+        assert_eq!(
+            replica,
+            "Only 2 seats apart; no midpoint to try. Add a replica to scale out."
+        );
+    }
+
+    #[test]
+    fn kv_r5_dead_end_generic_when_seats_unknown_case_h() {
+        let (dead, replica) = kv_r5_dead_end_lines(KvR5DeadEndReason::SeatsUnknown);
+        assert!(
+            dead.contains(
+                "No --max-num-seqs value resolves both KV pressure and queue saturation."
+            )
+        );
+        assert_eq!(replica, "Add a replica to scale out.");
+    }
+
+    #[test]
+    fn dead_end_reason_repeat_bracket_case_c() {
+        use super::super::state::LoopState;
+
+        let mut state = LoopState::new(kv_bounds_diagnose(180), kv_bounds_empty_report());
+        state.record_midpoint_suggestion(150, 180);
+        let bounds = Some((150, 180));
+        let known = Some((150, 180));
+        assert_eq!(
+            kv_r5_dead_end_reason(bounds, known, &state),
+            KvR5DeadEndReason::RepeatBracket { lo: 150, hi: 180 }
+        );
+    }
+
+    #[test]
+    fn dead_end_reason_repeat_midpoint_case_d() {
+        use super::super::state::LoopState;
+
+        let mut state = LoopState::new(kv_bounds_diagnose(180), kv_bounds_empty_report());
+        state.record_midpoint_suggestion(150, 180);
+        let bounds = Some((151, 179));
+        let known = Some((151, 179));
+        assert_eq!(
+            kv_r5_dead_end_reason(bounds, known, &state),
+            KvR5DeadEndReason::RepeatMidpoint {
+                lo: 151,
+                hi: 179,
+                mid: 165,
+            }
+        );
+    }
+
+    #[test]
+    fn dead_end_reason_too_close_after_midpoint_case_f() {
+        use super::super::state::LoopState;
+        use std::collections::VecDeque;
+
+        let mut state = LoopState::new(kv_bounds_diagnose(180), kv_bounds_empty_report());
+        state.record_midpoint_suggestion(150, 180);
+
+        let mut history = VecDeque::new();
+        history.push_back(kv_bounds_record(
+            150,
+            rule_names::CONCURRENCY_SATURATION,
+            None,
+        ));
+        history.push_back(kv_bounds_record(152, rule_names::KV_CACHE_PRESSURE, None));
+        let known = kv_r5_known_bracket(&history);
+        let bounds = kv_r5_midpoint_bounds(&history);
+        assert!(bounds.is_none());
+        assert_eq!(known, Some((150, 152)));
+
+        assert_eq!(
+            kv_r5_dead_end_reason(bounds, known, &state),
+            KvR5DeadEndReason::TooCloseAfterMidpoint { lo: 150, hi: 152 }
+        );
+    }
+
+    #[test]
+    fn dead_end_generic_when_known_absent_after_midpoint() {
+        use super::super::state::LoopState;
+
+        let mut state = LoopState::new(kv_bounds_diagnose(180), kv_bounds_empty_report());
+        state.record_midpoint_suggestion(150, 180);
+        assert_eq!(
+            kv_r5_dead_end_reason(None, None, &state),
+            KvR5DeadEndReason::SeatsUnknown
+        );
+    }
+
+    #[test]
+    fn dead_end_reason_too_close_first_case_g() {
+        use super::super::state::LoopState;
+        use std::collections::VecDeque;
+
+        let state = LoopState::new(kv_bounds_diagnose(152), kv_bounds_empty_report());
+        let mut history = VecDeque::new();
+        history.push_back(kv_bounds_record(
+            150,
+            rule_names::CONCURRENCY_SATURATION,
+            None,
+        ));
+        history.push_back(kv_bounds_record(152, rule_names::KV_CACHE_PRESSURE, None));
+        let known = kv_r5_known_bracket(&history);
+        let bounds = kv_r5_midpoint_bounds(&history);
+        assert_eq!(known, Some((150, 152)));
+        assert!(bounds.is_none());
+
+        assert_eq!(
+            kv_r5_dead_end_reason(bounds, known, &state),
+            KvR5DeadEndReason::TooCloseFirst { lo: 150, hi: 152 }
+        );
     }
 }

@@ -213,13 +213,7 @@ pub(super) fn format_under_batching_fired(
     let max_str = max_n.to_string();
     let idle = (d.effective_max - d.running).max(0.0);
     let fix_line = r1_fix_line(idle, d.binding_wall);
-    let confidence_str = if confidence >= 0.8 {
-        "High"
-    } else if confidence >= 0.6 {
-        "Medium"
-    } else {
-        "Low"
-    };
+    let confidence_str = super::confidence_label(confidence);
 
     let mut lines = vec![
         "[!] Under-batching: Insufficient Concurrency".to_string(),
@@ -825,6 +819,28 @@ mod tests {
                 assert!(!text.contains("degrades TPOT"));
             }
             Rule1Outcome::NotFired => panic!("expected memory-bound under-batching"),
+        }
+    }
+
+    #[test]
+    fn contradicted_kv_cap_falls_to_ridge() {
+        // Same as memory_binds, but peak running 40 beats cap 35 → usable None → ridge.
+        let mut s = snap(Some(6.0), Some(256), Some(0.0));
+        s.vllm.cache_config.kv_cache_max_concurrency = Some(35.0);
+        s.vllm.num_requests_running_peak = Some(40.0);
+        match rule1_under_batching_with_efficiency(r1_input(
+            &s,
+            R1InputOpts {
+                config_relative_efficiency_pct: Some(15.0),
+                ridge_batch_size: Some(153.0),
+                ..Default::default()
+            },
+        )) {
+            Rule1Outcome::Fired(d) => {
+                assert!((d.effective_max - 153.0).abs() < 1e-9);
+                assert_eq!(d.binding_wall, R1BindingWall::Ridge);
+            }
+            Rule1Outcome::NotFired => panic!("expected ridge-bound under-batching"),
         }
     }
 

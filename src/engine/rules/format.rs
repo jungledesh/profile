@@ -643,7 +643,6 @@ pub fn format_diagnose_rules_for_windows(
         metrics_url,
         build_r4_advisory_input(&summary, report),
     );
-    let any_advisory = advisories.any();
     let mut out = warnings;
     append_display_block(&mut out, advisories.lines);
 
@@ -662,7 +661,6 @@ pub fn format_diagnose_rules_for_windows(
         advisories.r2_present,
         advisories.r4_present,
     );
-    let any_warning = !report.recommendations.is_empty();
     if verbose_rules {
         append_not_triggered_lines(
             &mut out,
@@ -671,9 +669,6 @@ pub fn format_diagnose_rules_for_windows(
             &report.gauge_missing,
             report.n_eval,
         );
-    }
-    if !any_warning && !any_advisory && !verbose_rules {
-        out.push(NO_ISSUES_LINE.to_string());
     }
     append_report_skip_notes(&mut out, report, true);
 

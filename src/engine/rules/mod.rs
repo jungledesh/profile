@@ -28,6 +28,22 @@ pub(super) const KV_CACHE_SAFE_TO_SCALE_PCT: f64 = 80.0;
 pub(crate) use r3_low_prefix_reuse::{LowPrefixReuseDetail, Rule3Outcome, r3_recommendation};
 pub use r4_oom_risk::{r4_advisory, r4_recommendation};
 
+/// Single number-to-word mapping for user-facing confidence. Every rule's
+/// confidence VALUE stays rule-owned (calibration); the WORD is global.
+/// Thresholds match the majority ladder (r1, r7): >= 0.8 High, >= 0.6 Medium, else Low.
+/// NaN falls through to Low (comparisons are already false for NaN).
+pub(crate) fn confidence_label(c: f64) -> &'static str {
+    if c >= CONFIDENCE_HIGH_MIN {
+        "High"
+    } else if c >= CONFIDENCE_MEDIUM_MIN {
+        "Medium"
+    } else {
+        "Low"
+    }
+}
+pub(crate) const CONFIDENCE_HIGH_MIN: f64 = 0.8;
+pub(crate) const CONFIDENCE_MEDIUM_MIN: f64 = 0.6;
+
 /// True when avg or peak KV usage is at/above the R2 pressure bar.
 /// Shared by R2's fire gate and MU's memory-wall veto so the threshold cannot drift.
 pub(super) fn kv_near_full(snapshot: &crate::collectors::RawSnapshot) -> bool {
@@ -101,8 +117,8 @@ pub(super) const ENGINE_MIN_WINDOW_PCT: f64 = 0.25;
 ///
 /// Assumptions: block geometry constant across `max_model_len` (ladder-proven);
 /// NOT proven constant across `gpu-memory-utilization` or vLLM versions.
-/// `mamba_cache_mode` changes shift `state_pages` (measured 3→6 none→align) —
-/// counterfactuals that change caching mode stay directional, no number.
+/// `mamba_cache_mode` changes shift `state_pages` (measured 3→6 none→align).
+/// Counterfactuals that change caching mode stay directional, no number.
 pub(super) struct HypCapacityCtx<'a> {
     pub cache: &'a crate::collectors::CacheConfigLabels,
     pub kv_headroom_gb: Option<f64>,
@@ -127,7 +143,7 @@ pub(super) fn capacity_at_hypothetical_max_len(
 
     // Hybrid ladder geometry uses mamba_block_size when present; dense uses block_size.
     // Raw kv_cache_max_concurrency: page-model geometry, not a seat wall. Do not route
-    // through usable_kv_concurrency — peak running says nothing about block arithmetic.
+    // through usable_kv_concurrency; peak running says nothing about block arithmetic.
     let block_size = ctx.cache.mamba_block_size.or(ctx.cache.block_size);
     if let (Some(bs), Some(blocks), Some(obs), Some(cur)) = (
         block_size,
@@ -188,12 +204,16 @@ pub(super) struct ShrinkEvidence {
 
 impl ShrinkEvidence {
     pub(super) fn from_snapshot(snapshot: &crate::collectors::RawSnapshot) -> Self {
+        // Every field feeds a printed max-model-len number. NaN and negatives
+        // saturate to 0 on the u32 cast, which would prescribe a window that
+        // rejects all traffic. Drop them at the boundary.
+        let ok = |v: Option<f64>| v.filter(|x| x.is_finite() && *x >= 0.0);
         Self {
-            prompt_p99: snapshot.vllm.prompt_tokens_p99,
-            generation_p99: snapshot.vllm.generation_tokens_p99,
-            prompt_mean: snapshot.vllm.prompt_tokens_mean,
-            generation_mean: snapshot.vllm.generation_tokens_mean,
-            total_count: snapshot.vllm.generation_tokens_completed.unwrap_or(0.0),
+            prompt_p99: ok(snapshot.vllm.prompt_tokens_p99),
+            generation_p99: ok(snapshot.vllm.generation_tokens_p99),
+            prompt_mean: ok(snapshot.vllm.prompt_tokens_mean),
+            generation_mean: ok(snapshot.vllm.generation_tokens_mean),
+            total_count: ok(snapshot.vllm.generation_tokens_completed).unwrap_or(0.0),
         }
     }
 }
@@ -269,7 +289,7 @@ pub(super) fn model_len_shrink_suggestion_lines(
                 subline: None,
             };
         }
-        // Projection at the *suggested* length only — not current observed concurrency.
+        // Projection at the *suggested* length only, not current observed concurrency.
         let len_clause = if current_shown {
             format!("to {suggested}")
         } else {
@@ -955,6 +975,44 @@ pub mod rule_names {
             CONFIG_HEADROOM => "Configured Batch Limit",
             MASSIVE_UNDERUTILIZATION => "Massive Under-utilization",
             _ => rule_name,
+        }
+    }
+}
+
+#[cfg(test)]
+mod confidence_tests {
+    use super::{CONFIDENCE_HIGH_MIN, CONFIDENCE_MEDIUM_MIN, confidence_label};
+
+    #[test]
+    fn confidence_label_boundaries() {
+        assert_eq!(confidence_label(CONFIDENCE_HIGH_MIN), "High");
+        assert_eq!(confidence_label(CONFIDENCE_HIGH_MIN - 0.01), "Medium");
+        assert_eq!(confidence_label(CONFIDENCE_MEDIUM_MIN), "Medium");
+        assert_eq!(confidence_label(CONFIDENCE_MEDIUM_MIN - 0.01), "Low");
+    }
+
+    #[test]
+    fn confidence_label_nan_is_low() {
+        assert_eq!(confidence_label(f64::NAN), "Low");
+    }
+
+    #[test]
+    fn no_rule_defines_own_confidence_ladder() {
+        // Single definition site in mod.rs; no rule file may duplicate it.
+        let rule_files = [
+            include_str!("r1_under_batching.rs"),
+            include_str!("r2_kv_cache_pressure.rs"),
+            include_str!("r3_low_prefix_reuse.rs"),
+            include_str!("r4_oom_risk.rs"),
+            include_str!("r5_concurrency_saturation.rs"),
+            include_str!("r6_prefill_bound.rs"),
+            include_str!("r7_config_headroom.rs"),
+        ];
+        for src in &rule_files {
+            assert!(
+                !src.contains("fn confidence_label"),
+                "Rule file defines its own confidence_label; use super::confidence_label instead"
+            );
         }
     }
 }

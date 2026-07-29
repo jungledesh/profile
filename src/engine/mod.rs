@@ -566,7 +566,7 @@ mod build_report_tests {
     #[test]
     fn massive_underutilization_silent_when_kv_peak_high_with_empty_queue() {
         // Journey iteration 1 KV shape on the R1-silent fixture seats (64/256).
-        // Do not set ctx.config.max_num_seqs — that flips R1 to known-GPU and
+        // Do not set ctx.config.max_num_seqs. That flips R1 to known-GPU and
         // R1 owns the window before MU reads KV.
         let (ctx, mut win) = starved_no_rules_fixture();
         win.snapshot.vllm.num_requests_waiting = Some(0.0);
@@ -698,7 +698,7 @@ mod build_report_tests {
     fn massive_underutilization_unaffected_when_no_wall_reported() {
         // Same starved fixture as the MU fire test: unknown-GPU R1 bar is 25%,
         // and 64/256 sits on that line so R1 stays silent. Do not raise
-        // max_num_seqs / drop running — that drops occupancy under 25% and R1
+        // max_num_seqs / drop running, which drops occupancy under 25% and R1
         // owns the window, so MU never runs (false fail for Fix 2).
         let (ctx, mut win) = starved_no_rules_fixture();
         win.snapshot.vllm.cache_config.kv_cache_max_concurrency = None;

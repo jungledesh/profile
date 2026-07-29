@@ -299,7 +299,19 @@ worker() {
 
     if [[ "$STABLE" == "1" && "$AGENTS" -gt 0 ]]; then
         local phase=$(( id_w * PHASE_SPREAD / AGENTS ))
-        (( phase > 0 )) && sleep "$phase"
+        if (( phase > 0 )); then
+            if (( DURATION > 0 )); then
+                local remaining=$(( END - $(date +%s) ))
+                if (( remaining <= 0 || phase > remaining )); then
+                    echo "worker=$id_w skipped: phase ${phase}s exceeds remaining run time" >> "$SWARM_LOG"
+                    echo 1 >> "$PHASE_SKIPPED_FILE"
+                    return 0
+                fi
+                sleep "$phase"
+            else
+                sleep "$phase"
+            fi
+        fi
     fi
 
     while true; do
@@ -377,6 +389,8 @@ run_swarm() {
 
     mkdir -p "$AGENTS_DIR"
     : > "$SWARM_LOG"
+    PHASE_SKIPPED_FILE="$AGENTS_DIR/phase_skipped.count"
+    : > "$PHASE_SKIPPED_FILE"
 
     local start_ts
     start_ts=$(date +%s)
@@ -398,6 +412,11 @@ run_swarm() {
     done
     echo "All $AGENTS agents running. Live log: tail -f $SWARM_LOG"
     wait
+    local phase_skipped=0
+    if [[ -f "$PHASE_SKIPPED_FILE" ]]; then
+        phase_skipped=$(wc -l < "$PHASE_SKIPPED_FILE" | tr -d ' ')
+    fi
+    (( phase_skipped > 0 )) && echo "Skipped $phase_skipped worker(s): phase sleep exceeded remaining run time."
     summary
 }
 

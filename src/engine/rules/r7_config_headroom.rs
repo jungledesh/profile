@@ -147,16 +147,6 @@ pub(super) fn aggregate_r7_detail(details: &[ConfigHeadroomDetail]) -> ConfigHea
     }
 }
 
-fn confidence_label(conf: f64) -> &'static str {
-    if conf >= 0.8 {
-        "High"
-    } else if conf >= 0.6 {
-        "Medium"
-    } else {
-        "Low"
-    }
-}
-
 /// Recommended line binder label. Ridge number is on its own line (do not repeat).
 /// Memory cap appears nowhere else in the block, so show it. Empirical: "(est)" only.
 fn recommended_binder_suffix(rec: &RecommendedSeqs) -> String {
@@ -265,7 +255,7 @@ pub(super) fn format_config_headroom_window_issue(
         "    Watch: Higher concurrency increases prefill load. Monitor decode latency after applying."
             .to_string(),
         String::new(),
-        format!("    Confidence: {}", confidence_label(confidence)),
+        format!("    Confidence: {}", super::confidence_label(confidence)),
     ]);
     super::with_seen_pct(lines, seen_pct)
 }

@@ -932,6 +932,71 @@ fn rule_is_significant_zero_evaluable_windows_is_false() {
 }
 
 #[test]
+fn shrink_evidence_from_snapshot_drops_nan_and_negative() {
+    let nan_snap = RawSnapshot {
+        vllm: VllmRawMetrics {
+            prompt_tokens_p99: Some(f64::NAN),
+            generation_tokens_p99: Some(450.0),
+            generation_tokens_completed: Some(150.0),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let evidence = ShrinkEvidence::from_snapshot(&nan_snap);
+    assert!(evidence.prompt_p99.is_none());
+    assert_eq!(evidence.generation_p99, Some(450.0));
+    let mut lines = Vec::new();
+    extend_with_shrink_suggestion(
+        &mut lines,
+        model_len_shrink_suggestion_lines(Some(8192), &evidence, "      ", false),
+    );
+    let text = lines
+        .iter()
+        .map(|(b, _)| b.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("Lower --max-model-len (current: 8192) to safely raise concurrency."));
+    assert!(!text.contains("→ 0"));
+
+    let neg_snap = RawSnapshot {
+        vllm: VllmRawMetrics {
+            prompt_tokens_p99: Some(6000.0),
+            generation_tokens_p99: Some(-50.0),
+            generation_tokens_completed: Some(150.0),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let evidence = ShrinkEvidence::from_snapshot(&neg_snap);
+    assert!(evidence.generation_p99.is_none());
+    let mut lines = Vec::new();
+    extend_with_shrink_suggestion(
+        &mut lines,
+        model_len_shrink_suggestion_lines(Some(8192), &evidence, "      ", false),
+    );
+    let text = lines
+        .iter()
+        .map(|(b, _)| b.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("Lower --max-model-len (current: 8192) to safely raise concurrency."));
+    assert!(!text.contains("→ 0"));
+
+    let ok_snap = RawSnapshot {
+        vllm: VllmRawMetrics {
+            prompt_tokens_p99: Some(6000.0),
+            generation_tokens_p99: Some(450.0),
+            generation_tokens_completed: Some(150.0),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let evidence = ShrinkEvidence::from_snapshot(&ok_snap);
+    assert_eq!(evidence.prompt_p99, Some(6000.0));
+    assert_eq!(evidence.generation_p99, Some(450.0));
+}
+
+#[test]
 fn model_len_suggestion_uses_p99_sum_when_count_sufficient() {
     let mut lines = Vec::new();
     extend_with_shrink_suggestion(
@@ -1233,7 +1298,7 @@ fn model_len_suggestion_suppressed_when_delta_below_5pct() {
 
 #[test]
 fn model_len_suggestion_projects_capacity_from_observed_geometry() {
-    // Source: H100 ladder 2026-07-17 — 390 blocks, mamba_block_size 784,
+    // Source: H100 ladder 2026-07-17, 390 blocks, mamba_block_size 784,
     // obs 8.667 @ 32768. Suggested 16384 → floor(16.25)=16 concurrent (est).
     let mut lines = Vec::new();
     extend_with_shrink_suggestion(
@@ -1270,7 +1335,7 @@ fn model_len_suggestion_projects_capacity_from_observed_geometry() {
 
 #[test]
 fn model_len_suggestion_live_run_projection_at_5465_is_39_not_observed_8() {
-    // Source: live pressure run 2026-07-17 05:53 UTC — 390 blocks / 784
+    // Source: live pressure run 2026-07-17 05:53 UTC, 390 blocks / 784
     // block_size / state_pages 3. At suggested 5465:
     // 390 ÷ (ceil(5465/784) + 3) = 390 ÷ 10 = 39. Never current observed (8).
     let cache = crate::collectors::CacheConfigLabels {
@@ -1707,7 +1772,7 @@ fn qwen36_hybrid_model_with_attention() -> ModelArch {
 
 #[test]
 fn catalog_state_mismatch_none_when_qwen36_agrees_with_ladder() {
-    // Source: H100 ladder 2026-07-17 — observed state_pages=3; fixed formula agrees.
+    // Source: H100 ladder 2026-07-17. Observed state_pages=3; fixed formula agrees.
     let cache = crate::collectors::CacheConfigLabels {
         block_size: Some(16),
         num_gpu_blocks: Some(390),

@@ -340,7 +340,7 @@ pub fn r2_recommendation(input: R2RecommendationInput<'_>) -> Option<Recommendat
                 max_model_len,
                 kv_headroom_gb,
                 kv_max_seqs,
-                config_max_num_seqs: snapshot.vllm.max_num_seqs.or(Some(256)),
+                config_max_num_seqs: snapshot.vllm.max_num_seqs,
                 capacity_label,
                 fp8_compiler_available,
                 model: None,
@@ -396,6 +396,9 @@ pub(super) fn resolve_r2_kv_capacity(
     (derived, label)
 }
 
+/// Known: this gate is inverted for a throttle (hides the number when a cut
+/// would bite, shows it when peak never reaches the cap). Decided: keep.
+/// Rationale in deferred.md, Parked, "R2 seat number peak gate". Do not re-flag.
 fn seat_phrase_shows_number(snapshot: &RawSnapshot, cap: u32) -> bool {
     let Some(current) = snapshot.vllm.max_num_seqs else {
         return false;
@@ -430,16 +433,6 @@ pub(super) fn kv_pressure_confidence(windows_fired: usize, total_evaluable: usiz
         return 0.0;
     }
     (windows_fired as f64 / total_evaluable as f64).clamp(0.0, 1.0)
-}
-
-pub(super) fn kv_pressure_confidence_label(confidence: f64) -> &'static str {
-    if confidence > 0.75 {
-        "Confidence: High"
-    } else if confidence >= 0.5 {
-        "Confidence: Medium-High"
-    } else {
-        "Confidence: Medium"
-    }
 }
 
 fn max_num_seqs_bullet(snapshot: &RawSnapshot, kv_max_seqs: Option<u32>) -> String {
@@ -618,14 +611,10 @@ pub(super) fn format_kv_cache_pressure_fired(
     };
 
     let mut cuts: Vec<super::CutBullet> = Vec::new();
-    if lead_with_shrink {
-        super::extend_with_shrink_suggestion(&mut cuts, shrink);
-        if let Some(fo) = follow_on_seat {
-            // Permanent seat at the new window, not a temporary throttle.
-            cuts.push((fo, None));
-        }
-    } else {
-        super::extend_with_shrink_suggestion(&mut cuts, shrink);
+    super::extend_with_shrink_suggestion(&mut cuts, shrink);
+    if let Some(fo) = follow_on_seat {
+        // Permanent seat at the new window, not a temporary throttle.
+        cuts.push((fo, None));
     }
 
     let has_other_fix = !safe.is_empty() || !cuts.is_empty();
@@ -692,7 +681,10 @@ pub(super) fn format_kv_cache_pressure_fired(
     out.push(expected.to_string());
     if super::rule_is_significant(windows_fired, total_evaluable) {
         let confidence = kv_pressure_confidence(windows_fired, total_evaluable);
-        out.push(format!("    {}", kv_pressure_confidence_label(confidence)));
+        out.push(format!(
+            "    Confidence: {}",
+            super::confidence_label(confidence)
+        ));
     }
     out
 }
@@ -770,7 +762,10 @@ pub(super) fn format_kv_admission_backlog_issue(
     out.push("    Expected: Wait queue drains, TTFT recovers.".to_string());
     if super::rule_is_significant(windows_fired, total_evaluable) {
         let confidence = kv_pressure_confidence(windows_fired, total_evaluable);
-        out.push(format!("    {}", kv_pressure_confidence_label(confidence)));
+        out.push(format!(
+            "    Confidence: {}",
+            super::confidence_label(confidence)
+        ));
     }
     super::with_seen_pct(out, seen_pct)
 }
@@ -869,7 +864,7 @@ mod tests {
         kv_headroom_gb: Option<f64>,
         kv_max_seqs: Option<u32>,
     ) -> KvFormatCtx<'_> {
-        let config_max_num_seqs = snapshot.vllm.max_num_seqs.or(Some(256));
+        let config_max_num_seqs = snapshot.vllm.max_num_seqs;
         kv_ctx_config(
             snapshot,
             max_model_len,
@@ -1125,9 +1120,17 @@ mod tests {
 
     #[test]
     fn kv_pressure_confidence_label_maps_density() {
-        assert_eq!(kv_pressure_confidence_label(0.4), "Confidence: Medium");
-        assert_eq!(kv_pressure_confidence_label(0.5), "Confidence: Medium-High");
-        assert_eq!(kv_pressure_confidence_label(0.76), "Confidence: High");
+        use crate::engine::rules::{CONFIDENCE_HIGH_MIN, CONFIDENCE_MEDIUM_MIN};
+        // 4/15 = 0.267: below CONFIDENCE_MEDIUM_MIN (0.6), prints Low.
+        let density_4_of_15 = kv_pressure_confidence(4, 15);
+        assert!(density_4_of_15 < CONFIDENCE_MEDIUM_MIN);
+        // 9/15 = 0.6: at CONFIDENCE_MEDIUM_MIN, prints Medium.
+        let density_9_of_15 = kv_pressure_confidence(9, 15);
+        assert!(density_9_of_15 >= CONFIDENCE_MEDIUM_MIN);
+        assert!(density_9_of_15 < CONFIDENCE_HIGH_MIN);
+        // 13/15 = 0.867: above CONFIDENCE_HIGH_MIN (0.8), prints High.
+        let density_13_of_15 = kv_pressure_confidence(13, 15);
+        assert!(density_13_of_15 >= CONFIDENCE_HIGH_MIN);
     }
 
     #[test]
@@ -1152,7 +1155,8 @@ mod tests {
             4,
         )
         .join("\n");
-        assert!(stable.contains("Confidence: Medium-High"));
+        assert!(stable.contains("Confidence: Medium"));
+        assert!(!stable.contains("Medium-High"));
     }
 
     #[test]
@@ -1279,6 +1283,7 @@ mod tests {
             num_requests_waiting: Some(5.0),
             num_preemptions_per_sec: Some(0.0),
             generation_tokens_per_sec: Some(100.0),
+            max_num_seqs: Some(256),
             ..Default::default()
         };
         let r = r2_recommendation(R2RecommendationInput {
@@ -1293,8 +1298,7 @@ mod tests {
         })
         .expect("fired");
         let text = r.display_lines.join("\n");
-        assert!(text.contains("Lower --max-num-seqs to reduce KV demand"));
-        assert!(!text.contains('≤'));
+        assert!(text.contains("Lower --max-num-seqs to ≤14 to reduce KV demand"));
     }
 
     #[test]
@@ -1303,6 +1307,7 @@ mod tests {
             kv_cache_usage_perc: Some(90.0),
             num_preemptions_per_sec: Some(0.05),
             generation_tokens_per_sec: Some(100.0),
+            max_num_seqs: Some(256),
             ..Default::default()
         };
         let r = r2_recommendation(R2RecommendationInput {
@@ -1317,8 +1322,7 @@ mod tests {
         })
         .expect("fired");
         let text = r.display_lines.join("\n");
-        assert!(text.contains("Lower --max-num-seqs to reduce KV demand"));
-        assert!(!text.contains('≤'));
+        assert!(text.contains("Lower --max-num-seqs to ≤15 to reduce KV demand"));
     }
 
     #[test]
@@ -1327,6 +1331,7 @@ mod tests {
             kv_cache_usage_perc: Some(90.0),
             num_preemptions_per_sec: Some(0.05),
             generation_tokens_per_sec: Some(100.0),
+            max_num_seqs: Some(256),
             ..Default::default()
         };
         let r = r2_recommendation(R2RecommendationInput {
@@ -1341,8 +1346,7 @@ mod tests {
         })
         .expect("fired");
         let text = r.display_lines.join("\n");
-        assert!(text.contains("Lower --max-num-seqs to reduce KV demand"));
-        assert!(!text.contains('≤'));
+        assert!(text.contains("Lower --max-num-seqs to ≤18 to reduce KV demand"));
     }
 
     #[test]
@@ -1351,6 +1355,7 @@ mod tests {
             kv_cache_usage_perc: Some(90.0),
             num_preemptions_per_sec: Some(0.05),
             generation_tokens_per_sec: Some(100.0),
+            max_num_seqs: Some(256),
             ..Default::default()
         };
         let r = r2_recommendation(R2RecommendationInput {
@@ -1437,6 +1442,7 @@ mod tests {
         let v = VllmRawMetrics {
             kv_cache_usage_perc: Some(90.0),
             num_preemptions_per_sec: Some(0.05),
+            max_num_seqs: Some(256),
             ..Default::default()
         };
         let text = format_kv_cache_pressure_fired(
@@ -1446,8 +1452,7 @@ mod tests {
             4,
         )
         .join("\n");
-        assert!(text.contains("Lower --max-num-seqs to reduce KV demand"));
-        assert!(!text.contains('≤'));
+        assert!(text.contains("Lower --max-num-seqs to ≤16 to reduce KV demand"));
         assert!(!text.contains("worst-case"));
     }
 
@@ -1563,7 +1568,8 @@ mod tests {
         let single = format_kv_admission_backlog_issue(&d, 27, &ctx, 1, 1).join("\n");
         assert!(!single.contains("Confidence:"));
         let stable = format_kv_admission_backlog_issue(&d, 27, &ctx, 3, 4).join("\n");
-        assert!(stable.contains("Confidence: Medium-High"));
+        assert!(stable.contains("Confidence: Medium"));
+        assert!(!stable.contains("Medium-High"));
     }
 
     #[test]
@@ -1638,6 +1644,7 @@ mod tests {
             kv_cache_usage_perc: Some(90.0),
             num_requests_running: Some(93.0),
             num_requests_waiting: Some(5.0),
+            max_num_seqs: Some(256),
             ..Default::default()
         };
         let text = format_kv_cache_pressure_fired(&d, &kv_ctx(&snap(v), None, None, None), 1, 1)
@@ -2036,7 +2043,7 @@ mod tests {
 
     #[test]
     fn resolve_observed_floors_h100_boot_log_ground_truth() {
-        // Source: H100 boot log Jul 16 — kv_cache_max_concurrency = 24.64
+        // Source: H100 boot log Jul 16, kv_cache_max_concurrency = 24.64
         let (n, label) = resolve_r2_kv_capacity(Some(24.64), Some(99), false);
         assert_eq!(n, Some(24));
         assert_eq!(label, KvCapacityLabel::Observed);
@@ -2231,7 +2238,7 @@ mod tests {
 
     #[test]
     fn fix_order_leads_with_model_len_when_p99_below_half() {
-        // Source: live run 2026-07-17 — short p99 vs max_model_len; shrink leads.
+        // Source: live run 2026-07-17, short p99 vs max_model_len; shrink leads.
         // 5465 < 32768/2; projection at 5465 is 39, not observed 8.
         let v = VllmRawMetrics {
             kv_cache_usage_perc: Some(90.0),
@@ -2321,6 +2328,7 @@ mod tests {
             prompt_tokens_p99: Some(6000.0),
             generation_tokens_p99: Some(450.0),
             generation_tokens_completed: Some(150.0),
+            max_num_seqs: Some(256),
             ..Default::default()
         };
         let text = format_kv_cache_pressure_fired(
@@ -2361,6 +2369,7 @@ mod tests {
             prompt_tokens_p99: Some(6000.0),
             generation_tokens_p99: Some(800.0),
             generation_tokens_completed: Some(150.0),
+            max_num_seqs: Some(256),
             ..Default::default()
         };
         // 6800 >= 8192/2 → cap leads; Observed names max_model_len → "to 6800".
@@ -2420,6 +2429,7 @@ mod tests {
             kv_cache_usage_perc: Some(90.0),
             num_preemptions_per_sec: Some(0.05),
             generation_tokens_per_sec: Some(100.0),
+            max_num_seqs: Some(256),
             ..Default::default()
         };
         let lines = format_kv_cache_pressure_fired(
@@ -2458,6 +2468,7 @@ mod tests {
             kv_cache_usage_perc: Some(90.0),
             num_requests_waiting: Some(5.0),
             prompt_tokens_mean: Some(250.0),
+            max_num_seqs: Some(256),
             cache_config: CacheConfigLabels {
                 enable_prefix_caching: Some(false),
                 ..Default::default()
@@ -2508,6 +2519,7 @@ mod tests {
             prompt_tokens_p99: Some(6000.0),
             generation_tokens_p99: Some(450.0),
             generation_tokens_completed: Some(150.0),
+            max_num_seqs: Some(256),
             cache_config: CacheConfigLabels {
                 enable_prefix_caching: Some(true),
                 cache_dtype: Some("fp8".into()),
@@ -2599,6 +2611,7 @@ mod tests {
             kv_cache_usage_perc: Some(90.0),
             num_requests_waiting: Some(5.0),
             // No p99 / low count → no shrink; still has max-num-seqs in cuts though.
+            max_num_seqs: Some(256),
             ..Default::default()
         };
         // max-num-seqs always in cuts for non-crisis → header present.
@@ -2628,6 +2641,7 @@ mod tests {
             prompt_tokens_p99: Some(6000.0),
             generation_tokens_p99: Some(450.0),
             generation_tokens_completed: Some(150.0),
+            max_num_seqs: Some(256),
             ..Default::default()
         };
         let text = format_kv_cache_pressure_fired(
@@ -2867,6 +2881,7 @@ mod tests {
             num_requests_waiting: Some(4.0),
             num_preemptions_per_sec: Some(0.05),
             generation_tokens_completed: Some(10.0),
+            max_num_seqs: Some(256),
             cache_config: CacheConfigLabels {
                 kv_cache_max_concurrency: Some(1.06),
                 enable_prefix_caching: Some(true),
@@ -3014,6 +3029,7 @@ mod tests {
             kv_cache_usage_perc: Some(90.0),
             num_preemptions_per_sec: Some(0.05),
             cache_config: cache.clone(),
+            max_num_seqs: Some(256),
             ..Default::default()
         };
         let crisis = format_kv_cache_pressure_fired(
@@ -3222,6 +3238,32 @@ mod tests {
         assert_dead_end_pair(&format_seat_lever_crisis(None, None));
         assert_dead_end_pair(&format_seat_lever_non_crisis(None, None));
         assert_dead_end_pair(&format_seat_lever_backlog(None, None));
+    }
+
+    #[test]
+    fn r2_recommendation_withholds_seat_when_max_num_seqs_absent() {
+        // Test helper must not invent 256; scrape and config both absent → no seat bullet.
+        let v = VllmRawMetrics {
+            kv_cache_usage_perc: Some(95.0),
+            num_preemptions_per_sec: Some(0.05),
+            ..Default::default()
+        };
+        let snapshot = snap(v);
+        assert!(snapshot.vllm.max_num_seqs.is_none());
+        let r = r2_recommendation(R2RecommendationInput {
+            snapshot: &snapshot,
+            max_model_len: None,
+            kv_headroom_gb: None,
+            kv_max_seqs: None,
+            capacity_label: KvCapacityLabel::Derived,
+            windows_fired: 3,
+            total_evaluable: 4,
+            fp8_compiler_available: false,
+        })
+        .expect("fired");
+        let text = r.display_lines.join("\n");
+        assert!(!text.contains("Lower --max-num-seqs"));
+        assert!(text.contains("Lower --max-model-len"));
     }
 
     #[test]
