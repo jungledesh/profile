@@ -451,6 +451,8 @@ fn apply_histogram_window(first: &Scrape, last: &Scrape, m: &mut VllmRawMetrics)
     m.prefill_window_mass = histogram_window_mass(first, last, "vllm_request_prefill_time_seconds");
     m.queue_window_mass = histogram_window_mass(first, last, "vllm_request_queue_time_seconds");
     m.prompt_tokens_window_mass = histogram_window_mass(first, last, "vllm_request_prompt_tokens");
+    m.generation_tokens_window_mass =
+        histogram_window_mass(first, last, "vllm_request_generation_tokens");
 
     // Prefer Δsum/Δcount over that window; if no new observations, use last-scrape mean.
     m.ttft_ms = histogram_window_mean_ms(first, last, "vllm_time_to_first_token_seconds")
@@ -466,6 +468,8 @@ fn apply_histogram_window(first: &Scrape, last: &Scrape, m: &mut VllmRawMetrics)
         .or_else(|| histogram_mean_ms_from_scrape(last, "vllm_request_queue_time_seconds"));
     m.prompt_tokens_mean = histogram_window_mean(first, last, "vllm_request_prompt_tokens")
         .or_else(|| histogram_mean_from_scrape(last, "vllm_request_prompt_tokens"));
+    m.generation_tokens_mean = histogram_window_mean(first, last, "vllm_request_generation_tokens")
+        .or_else(|| histogram_mean_from_scrape(last, "vllm_request_generation_tokens"));
     let prompt_delta = histogram_window_delta_buckets(first, last, "vllm_request_prompt_tokens");
     m.prompt_tokens_p99 = histogram_quantile(0.99, &prompt_delta).map(|q| q.value);
     m.prompt_tokens_p99_buckets = prompt_delta;
@@ -551,12 +555,17 @@ pub fn collect_vllm_metrics_for(
     let mut first_scrape: Option<Scrape> = None;
     let mut last_scrape: Option<Scrape> = None;
     let mut kv_cache_peak_perc: Option<f64> = None;
+    let mut num_requests_running_peak: Option<f64> = None;
 
     run_sampling_loop(sample_count, |i| {
         let body = fetch_metrics_body(&client, &url)?;
         let scrape = scrape_from_body(&body)?;
         if let Some(k) = kv_cache_usage_perc_from_scrape(&scrape).filter(|x| x.is_finite()) {
             kv_cache_peak_perc = Some(kv_cache_peak_perc.map_or(k, |p| p.max(k)));
+        }
+        if let Some(r) = first_gauge(&scrape, "vllm_num_requests_running").filter(|x| x.is_finite())
+        {
+            num_requests_running_peak = Some(num_requests_running_peak.map_or(r, |p| p.max(r)));
         }
         prefix_samples.push(prefix_scrape_sample(&scrape));
 
@@ -579,6 +588,7 @@ pub fn collect_vllm_metrics_for(
     let last_scrape = last_scrape.context("vLLM gauge window missing last scrape")?;
     let mut m = parse_vllm_metrics(&last_scrape)?;
     m.kv_cache_peak_perc = kv_cache_peak_perc;
+    m.num_requests_running_peak = num_requests_running_peak;
 
     let rates = compute_counter_rates(&first_scrape, &last_scrape, window_secs);
     m.generation_tokens_per_sec = rates.generation_tokens_per_sec;
@@ -664,6 +674,25 @@ fn parse_cache_config_labels(scrape: &Scrape) -> CacheConfigLabels {
             .labels
             .get("mamba_page_size_padded")
             .and_then(|v| v.parse().ok()),
+        kv_offloading: parse_kv_offload_state(s.labels.get("kv_offloading_size")),
+    }
+}
+
+/// Map the `kv_offloading_size` label into a single state.
+fn parse_kv_offload_state(raw: Option<&str>) -> crate::collectors::types::KvOffloadState {
+    use crate::collectors::types::KvOffloadState;
+    let Some(raw) = raw else {
+        return KvOffloadState::Unsupported;
+    };
+    if raw == "None" {
+        return KvOffloadState::Off;
+    }
+    match raw.parse::<f64>() {
+        Ok(v) if !v.is_finite() => KvOffloadState::Unreadable,
+        Ok(v) if v > 0.0 => KvOffloadState::Enabled(v),
+        Ok(v) if v < 0.0 => KvOffloadState::Unreadable,
+        Ok(_) => KvOffloadState::Off,
+        Err(_) => KvOffloadState::Unreadable,
     }
 }
 
@@ -704,6 +733,7 @@ fn parse_vllm_metrics(scrape: &Scrape) -> Result<VllmRawMetrics> {
     Ok(VllmRawMetrics {
         model_name,
         num_requests_running,
+        num_requests_running_peak: None,
         num_requests_waiting,
         kv_cache_usage_perc,
         kv_cache_avg_perc: None,
@@ -725,6 +755,7 @@ fn parse_vllm_metrics(scrape: &Scrape) -> Result<VllmRawMetrics> {
         prompt_tokens_mean,
         prompt_tokens_p99: None,
         prompt_tokens_p99_buckets: vec![],
+        generation_tokens_mean: None,
         generation_tokens_p99: None,
         generation_tokens_p99_buckets: vec![],
         generation_tokens_completed: None,
@@ -734,8 +765,10 @@ fn parse_vllm_metrics(scrape: &Scrape) -> Result<VllmRawMetrics> {
         prefill_window_mass: None,
         queue_window_mass: None,
         prompt_tokens_window_mass: None,
+        generation_tokens_window_mass: None,
         generation_tokens_total,
         generation_tokens_per_sec: None,
+        aligned_generation_tokens_per_sec: None,
         prompt_tokens_per_sec: None,
         prefix_cache_hit_rate: None,
         prefix_cache_scrape_samples: vec![],
@@ -1287,6 +1320,10 @@ vllm:cache_config_info{block_size="16",cache_dtype="auto",cpu_offload_gb="0",ena
         assert!(cc.kv_cache_max_concurrency.is_none());
         assert!(cc.mamba_block_size.is_none());
         assert!(cc.mamba_page_size_padded.is_none());
+        assert_eq!(
+            cc.kv_offloading,
+            crate::collectors::types::KvOffloadState::Unsupported
+        );
     }
 
     #[test]
@@ -1303,6 +1340,10 @@ vllm:cache_config_info{block_size="16",cache_dtype="auto",cpu_offload_gb="0",ena
         assert!(cc.kv_cache_max_concurrency.is_none());
         assert!(cc.mamba_block_size.is_none());
         assert!(cc.mamba_page_size_padded.is_none());
+        assert_eq!(
+            cc.kv_offloading,
+            crate::collectors::types::KvOffloadState::Unsupported
+        );
     }
 
     /// Ground truth from H100 boot log Jul 16: concurrency 24.64x at max_model_len 8192.
@@ -1331,6 +1372,75 @@ vllm:cache_config_info{block_size="32",cache_dtype="fp8",enable_prefix_caching="
         assert_eq!(cc.block_size, Some(32));
         assert_eq!(cc.cache_dtype.as_deref(), Some("fp8"));
         assert_eq!(cc.enable_prefix_caching, Some(false));
+    }
+
+    #[test]
+    fn cache_config_info_kv_offloading_size_none_literal() {
+        use crate::collectors::types::KvOffloadState;
+        // Common off case: Python None stringified. Must not parse as a number.
+        let body = r#"
+vllm:cache_config_info{kv_offloading_size="None",kv_offloading_backend="native"} 1.0
+"#;
+        let scrape = scrape_from_body(body).unwrap();
+        let cc = parse_cache_config_labels(&scrape);
+        assert_eq!(cc.kv_offloading, KvOffloadState::Off);
+    }
+
+    #[test]
+    fn cache_config_info_kv_offloading_size_finite() {
+        use crate::collectors::types::KvOffloadState;
+        let body = r#"
+vllm:cache_config_info{kv_offloading_size="16.0"} 1.0
+"#;
+        let scrape = scrape_from_body(body).unwrap();
+        let cc = parse_cache_config_labels(&scrape);
+        assert_eq!(cc.kv_offloading, KvOffloadState::Enabled(16.0));
+    }
+
+    #[test]
+    fn cache_config_info_kv_offloading_size_zero() {
+        use crate::collectors::types::KvOffloadState;
+        let body = r#"
+vllm:cache_config_info{kv_offloading_size="0"} 1.0
+"#;
+        let scrape = scrape_from_body(body).unwrap();
+        let cc = parse_cache_config_labels(&scrape);
+        assert_eq!(cc.kv_offloading, KvOffloadState::Off);
+    }
+
+    #[test]
+    fn cache_config_info_kv_offloading_size_garbage_no_panic() {
+        use crate::collectors::types::KvOffloadState;
+        let body = r#"
+vllm:cache_config_info{kv_offloading_size="not-a-size"} 1.0
+"#;
+        let scrape = scrape_from_body(body).unwrap();
+        let cc = parse_cache_config_labels(&scrape);
+        assert_eq!(cc.kv_offloading, KvOffloadState::Unreadable);
+    }
+
+    #[test]
+    fn cache_config_info_kv_offloading_size_nan_is_unreadable() {
+        use crate::collectors::types::KvOffloadState;
+        // f64::from_str("NaN") succeeds; must not fall through to Off.
+        let body = r#"
+vllm:cache_config_info{kv_offloading_size="NaN"} 1.0
+"#;
+        let scrape = scrape_from_body(body).unwrap();
+        let cc = parse_cache_config_labels(&scrape);
+        assert_eq!(cc.kv_offloading, KvOffloadState::Unreadable);
+    }
+
+    #[test]
+    fn cache_config_info_kv_offloading_size_inf_is_unreadable() {
+        use crate::collectors::types::KvOffloadState;
+        // f64::from_str("inf") succeeds; must not fall through to Off.
+        let body = r#"
+vllm:cache_config_info{kv_offloading_size="inf"} 1.0
+"#;
+        let scrape = scrape_from_body(body).unwrap();
+        let cc = parse_cache_config_labels(&scrape);
+        assert_eq!(cc.kv_offloading, KvOffloadState::Unreadable);
     }
 
     #[test]

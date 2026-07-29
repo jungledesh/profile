@@ -219,7 +219,7 @@ pub fn ridge_batch_size(peak_flops_tc_tflops: f64, peak_bw_gbps: f64, bits_per_p
 /// missing or degenerate. Assumptions for callers: block geometry is constant
 /// across `max_model_len` changes (ladder-proven); not proven constant across
 /// `gpu-memory-utilization` or vLLM versions. `mamba_cache_mode` changes shift
-/// `state_pages` (measured 3→6 none→align) — mode-change counterfactuals stay
+/// `state_pages` (measured 3→6 none→align). Mode-change counterfactuals stay
 /// directional, no number.
 pub fn counterfactual_concurrency(
     target_max_len: u32,
@@ -692,7 +692,7 @@ mod tests {
         assert!(nan_eff.is_nan());
     }
 
-    // Source: H100 ladder 2026-07-17 — hybrid (Qwen3-next-style), 390 blocks,
+    // Source: H100 ladder 2026-07-17, hybrid (Qwen3-next-style), 390 blocks,
     // block_size 784, observed concurrency 8.667 at max_model_len 32768.
     // Five configs, zero residual vs vLLM-reported kv_cache_max_concurrency.
     #[test]
@@ -793,7 +793,7 @@ mod tests {
     #[test]
     fn catalog_hybrid_state_bytes_qwen36_fp32() {
         // Qwen3.6-27B catalog facts; GDN recurrent (per key head) + conv.
-        // Source: H100 ladder 2026-07-17 — agrees with observed state_pages=3.
+        // Source: H100 ladder 2026-07-17. Agrees with observed state_pages=3.
         let bytes = catalog_hybrid_state_bytes(48, 16, 48, 128, 128, 4, 4).unwrap();
         assert_eq!(bytes, 58_195_968);
         assert_eq!(catalog_state_pages(bytes, 25_690_112), Some(3));

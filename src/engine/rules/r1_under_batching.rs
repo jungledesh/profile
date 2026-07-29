@@ -6,6 +6,7 @@ use super::effective_max_and_binder;
 use super::r6_prefill_bound::{PROMPT_GEN_RATIO_MILD, effective_prompt_tps};
 #[cfg(test)]
 use super::rule_names;
+use super::usable_kv_concurrency;
 
 /// Occupancy ceiling: R1 does not fire above this. Server is not starved.
 const OCCUPANCY_CEILING_PCT: f64 = 0.75;
@@ -96,11 +97,8 @@ pub(super) fn rule1_under_batching_with_efficiency(input: R1EvalInput<'_>) -> Ru
         return Rule1Outcome::NotFired;
     };
 
-    let (effective_max, binding_wall) = effective_max_and_binder(
-        max_n,
-        ridge_batch_size,
-        snapshot.vllm.cache_config.kv_cache_max_concurrency,
-    );
+    let (effective_max, binding_wall) =
+        effective_max_and_binder(max_n, ridge_batch_size, usable_kv_concurrency(snapshot));
 
     // 3. Hard abort - running required and > 0
     let Some(run) = running.filter(|v| v.is_finite() && *v > 0.0) else {
@@ -193,16 +191,12 @@ pub fn r1_recommendation(input: R1EvalInput<'_>) -> Option<Recommendation> {
 
 fn r1_fix_line(idle: f64, binding_wall: R1BindingWall) -> String {
     match binding_wall {
-        R1BindingWall::Config => {
-            format!(
-                "      • Batch more requests or increase client concurrency ({idle:.0} slots idle)"
-            )
-        }
         R1BindingWall::Ridge => format!(
             "      • Batch more requests or increase client concurrency ({idle:.0} slots idle before hardware degrades TPOT)"
         ),
-        R1BindingWall::Memory { cap } => format!(
-            "      • Batch more requests or increase client concurrency ({idle:.0} slots idle; memory fits {cap} worst-case requests)"
+        // Memory's worst-case-at-full-context count never reaches the operator.
+        R1BindingWall::Config | R1BindingWall::Memory { .. } => format!(
+            "      • Batch more requests or increase client concurrency ({idle:.0} slots idle)"
         ),
     }
 }
@@ -219,13 +213,7 @@ pub(super) fn format_under_batching_fired(
     let max_str = max_n.to_string();
     let idle = (d.effective_max - d.running).max(0.0);
     let fix_line = r1_fix_line(idle, d.binding_wall);
-    let confidence_str = if confidence >= 0.8 {
-        "High"
-    } else if confidence >= 0.6 {
-        "Medium"
-    } else {
-        "Low"
-    };
+    let confidence_str = super::confidence_label(confidence);
 
     let mut lines = vec![
         "[!] Under-batching: Insufficient Concurrency".to_string(),
@@ -826,10 +814,33 @@ mod tests {
                 let idle = (d.effective_max - d.running).max(0.0);
                 assert!((idle - 29.0).abs() < 1e-9);
                 let text = format_under_batching_fired(&d, 0.8, false).join("\n");
-                assert!(text.contains("29 slots idle; memory fits 35 worst-case requests"));
-                assert!(!text.contains("before hardware degrades TPOT"));
+                assert!(text.contains("29 slots idle"));
+                assert!(!text.contains("worst-case"));
+                assert!(!text.contains("degrades TPOT"));
             }
             Rule1Outcome::NotFired => panic!("expected memory-bound under-batching"),
+        }
+    }
+
+    #[test]
+    fn contradicted_kv_cap_falls_to_ridge() {
+        // Same as memory_binds, but peak running 40 beats cap 35 → usable None → ridge.
+        let mut s = snap(Some(6.0), Some(256), Some(0.0));
+        s.vllm.cache_config.kv_cache_max_concurrency = Some(35.0);
+        s.vllm.num_requests_running_peak = Some(40.0);
+        match rule1_under_batching_with_efficiency(r1_input(
+            &s,
+            R1InputOpts {
+                config_relative_efficiency_pct: Some(15.0),
+                ridge_batch_size: Some(153.0),
+                ..Default::default()
+            },
+        )) {
+            Rule1Outcome::Fired(d) => {
+                assert!((d.effective_max - 153.0).abs() < 1e-9);
+                assert_eq!(d.binding_wall, R1BindingWall::Ridge);
+            }
+            Rule1Outcome::NotFired => panic!("expected ridge-bound under-batching"),
         }
     }
 
@@ -848,7 +859,8 @@ mod tests {
                 assert!((d.effective_max - 153.0).abs() < 1e-9);
                 assert_eq!(d.binding_wall, R1BindingWall::Ridge);
                 let text = format_under_batching_fired(&d, 0.8, false).join("\n");
-                assert!(text.contains("before hardware degrades TPOT"));
+                assert!(text.contains("slots idle before hardware degrades TPOT"));
+                assert!(!text.contains("worst-case"));
                 assert!(!text.contains("memory fits"));
             }
             Rule1Outcome::NotFired => panic!("expected ridge-bound fire"),
@@ -918,8 +930,9 @@ mod tests {
         assert!((agg.effective_max - 35.0).abs() < 1e-9);
         assert_eq!(agg.binding_wall, R1BindingWall::Memory { cap: 35 });
         let text = format_under_batching_fired(&agg, 0.8, false).join("\n");
-        assert!(text.contains("memory fits"));
-        assert!(!text.contains("before hardware degrades TPOT"));
+        assert!(text.contains("slots idle"));
+        assert!(!text.contains("worst-case"));
+        assert!(!text.contains("degrades TPOT"));
     }
 
     #[test]
@@ -939,8 +952,42 @@ mod tests {
         assert!((agg.effective_max - 153.0).abs() < 1e-9);
         assert_eq!(agg.binding_wall, R1BindingWall::Ridge);
         let text = format_under_batching_fired(&agg, 0.8, false).join("\n");
-        assert!(text.contains("before hardware degrades TPOT"));
+        assert!(text.contains("slots idle before hardware degrades TPOT"));
+        assert!(!text.contains("worst-case"));
         assert!(!text.contains("memory fits"));
+    }
+
+    #[test]
+    fn r1_fix_line_config_wall_omits_tpot_clause() {
+        let d = UnderBatchingDetail {
+            running: 5.0,
+            waiting: 0.0,
+            max_num_seqs: Some(256),
+            effective_max: 256.0,
+            binding_wall: R1BindingWall::Config,
+            occupancy_pct: (5.0 / 256.0) * 100.0,
+            efficiency_pct: Some(12.0),
+            config_relative_efficiency_pct: Some(15.0),
+            known_gpu: true,
+        };
+        let text = format_under_batching_fired(&d, 0.8, false).join("\n");
+        assert!(text.contains("(251 slots idle)"));
+        assert!(!text.contains("degrades TPOT"));
+        assert!(!text.contains("worst-case"));
+    }
+
+    #[test]
+    fn r1_fix_line_ridge_wall_includes_tpot_clause() {
+        let idle = 147.0;
+        let ridge = r1_fix_line(idle, R1BindingWall::Ridge);
+        assert!(ridge.contains("degrades TPOT"));
+        assert!(!ridge.contains("worst-case"));
+        let mem = r1_fix_line(idle, R1BindingWall::Memory { cap: 35 });
+        assert!(!mem.contains("degrades TPOT"));
+        assert!(!mem.contains("worst-case"));
+        let cfg = r1_fix_line(idle, R1BindingWall::Config);
+        assert!(!cfg.contains("degrades TPOT"));
+        assert!(!cfg.contains("worst-case"));
     }
 
     #[test]
@@ -960,6 +1007,8 @@ mod tests {
         assert_eq!(agg.binding_wall, R1BindingWall::Ridge);
         let text = format_under_batching_fired(&agg, 0.8, false).join("\n");
         assert!(!text.contains("memory fits"));
+        assert!(text.contains("slots idle before hardware degrades TPOT"));
+        assert!(!text.contains("worst-case"));
     }
 
     #[test]

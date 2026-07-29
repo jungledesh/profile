@@ -6,11 +6,11 @@ use super::math::{self, KvCacheDtypeSource};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CostEstimate {
-    /// Tokens generated per watt of power draw. None if power_watts unavailable.
+    /// Tokens generated per watt of aligned power draw. None if aligned energy unavailable.
     pub tok_per_watt: Option<f64>,
-    /// Energy per generated token (J/tok). None if power or throughput unavailable.
+    /// Energy per generated token (J/tok) from the energy-pair window set. None if unavailable.
     pub joules_per_token: Option<f64>,
-    /// Estimated cost per 1M tokens (USD). None if no price source available.
+    /// Estimated cost per 1M output tokens (USD). None if turnover gate fails or tps missing.
     pub cost_per_million_tokens: Option<f64>,
     /// Source of the cost estimate.
     pub cost_source: CostSource,
@@ -75,6 +75,18 @@ pub struct PhysicsBaseline {
 /// Lower/upper band around roofline ceiling `expected` (conservative / optimistic).
 const CEILING_LOWER_BAND: f64 = 0.85;
 const CEILING_UPPER_BAND: f64 = 1.05;
+
+/// Why `compute` returned None, read from the same inputs it guards on.
+/// Order matches compute's early returns: GPU first, then model.
+pub fn baseline_missing_reason(ctx: &crate::context::StaticContext) -> &'static str {
+    if ctx.gpu.peak_flops_tc_tflops.is_none() || ctx.gpu.peak_bw_gbps.is_none() {
+        return "GPU not in catalog";
+    }
+    if ctx.model.active_param_count.is_none() && ctx.model.param_count.is_none() {
+        return "model not in catalog";
+    }
+    "hardware ceiling inputs incomplete"
+}
 
 pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
     let ctx = input.ctx;
@@ -181,40 +193,33 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
         .vllm
         .generation_tokens_per_sec
         .filter(|v| v.is_finite() && *v > 0.0);
-    // Energy: aligned_power only. Never divide misaligned NVML/vLLM clocks.
-    // $/1M tok joins cost/hr (config or catalog) with vLLM tok/s only; no GPU clock.
-    let total_power: f64 = snap.gpus.iter().filter_map(|g| g.aligned_power_watts).sum();
-    let power_watts = (total_power > 0.0).then_some(total_power);
-
-    let tok_per_watt = match (tps, power_watts) {
-        (Some(t), Some(p)) => Some(t / p),
-        _ => None,
-    };
-
-    let joules_per_token = match (power_watts, tps) {
-        (Some(p), Some(t)) if p > 0.0 && t > 0.0 => Some(p / t),
-        _ => None,
-    };
+    // Energy: energy-pair set only (aligned_power ÷ aligned_generation tok/s).
+    // Never join unaligned power with all-active tok/s.
+    // $/1M output tok joins cost/hr with generation tok/s only; no GPU clock.
+    // Turnover gate: completed requests must cover mean running concurrency,
+    // or the rate is noise under load (field is request count, not tokens).
+    let tps_for_dollar = dollar_cost_tps(snap, tps);
+    let (tok_per_watt, joules_per_token) = energy_metrics(snap);
 
     let cost = if let Some(hr) = ctx
         .config
         .cost_per_hour
         .filter(|v| v.is_finite() && *v > 0.0)
     {
-        build_cost_estimate(
+        Some(build_cost_estimate(
             tok_per_watt,
             joules_per_token,
             hr,
-            tps,
+            tps_for_dollar,
             CostSource::UserProvided,
-        )
+        ))
     } else if let Some(gpu_name) = ctx.gpu.name.as_deref() {
-        gpu_prices::lookup_gpu_price(gpu_name).and_then(|p| {
+        gpu_prices::lookup_gpu_price(gpu_name).map(|p| {
             build_cost_estimate(
                 tok_per_watt,
                 joules_per_token,
                 p.on_demand_per_hr * tp,
-                tps,
+                tps_for_dollar,
                 CostSource::Catalog,
             )
         })
@@ -241,26 +246,81 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
     })
 }
 
+/// J/tok and tok/W from the energy-pair window set only.
+///
+/// `sum(aligned_power_watts) / aligned_generation_tokens_per_sec`. Empty pair set → both None.
+/// Never falls back to unaligned `power_watts` or all-active `generation_tokens_per_sec`.
+fn energy_metrics(snap: &crate::collectors::RawSnapshot) -> (Option<f64>, Option<f64>) {
+    let aligned_tps = snap
+        .vllm
+        .aligned_generation_tokens_per_sec
+        .filter(|t| t.is_finite() && *t > 0.0);
+    let total_power: f64 = snap
+        .gpus
+        .iter()
+        .filter_map(|g| g.aligned_power_watts.filter(|p| p.is_finite()))
+        .sum();
+    let power = (total_power.is_finite() && total_power > 0.0).then_some(total_power);
+    match (aligned_tps, power) {
+        (Some(t), Some(p)) => {
+            let jtok = p / t;
+            let tpw = t / p;
+            (
+                tpw.is_finite().then_some(tpw),
+                // Some implies finite; delta/print consumers rely on it.
+                jtok.is_finite().then_some(jtok),
+            )
+        }
+        _ => (None, None),
+    }
+}
+
+/// True when this iteration completed enough requests to cover mean running.
+/// Missing completed or running → not sufficient (show `-`, do not invent).
+/// `generation_tokens_completed` is a request count (+Inf bucket), not tokens.
+///
+/// Uses mean running, not peak: turnover asks whether completions covered the
+/// steady concurrent seat count that produced the tok/s in the cost formula.
+/// Peak would over-require completions for a brief spike. (KV usable-cap uses
+/// peak running for a different job: one burst above the full-context guarantee
+/// already falsifies that wall.)
+fn dollar_cost_turnover_ok(snap: &crate::collectors::RawSnapshot) -> bool {
+    let Some(completed) = snap
+        .vllm
+        .generation_tokens_completed
+        .filter(|c| c.is_finite())
+    else {
+        return false;
+    };
+    let Some(running) = snap.vllm.num_requests_running.filter(|r| r.is_finite()) else {
+        return false;
+    };
+    running > 0.0 && completed >= running
+}
+
+fn dollar_cost_tps(snap: &crate::collectors::RawSnapshot, tps: Option<f64>) -> Option<f64> {
+    tps.filter(|t| *t > 0.0)
+        .filter(|_| dollar_cost_turnover_ok(snap))
+}
+
 fn build_cost_estimate(
     tok_per_watt: Option<f64>,
     joules_per_token: Option<f64>,
     cost_per_hr: f64,
     tps: Option<f64>,
     cost_source: CostSource,
-) -> Option<CostEstimate> {
+) -> CostEstimate {
     let cost_per_million_tokens = tps.filter(|t| *t > 0.0).and_then(|t| {
         let cpm = cost_per_hr * 1_000_000.0 / (t * 3600.0);
+        // Some implies finite; delta/print consumers rely on it.
         cpm.is_finite().then_some(cpm)
     });
-    if tok_per_watt.is_none() && joules_per_token.is_none() && cost_per_million_tokens.is_none() {
-        return None;
-    }
-    Some(CostEstimate {
+    CostEstimate {
         tok_per_watt,
         joules_per_token,
         cost_per_million_tokens,
         cost_source,
-    })
+    }
 }
 
 fn make_estimate(expected: f64) -> Option<CeilingEstimate> {
@@ -422,6 +482,53 @@ mod tests {
         );
         let input = AnalysisInput::new(&ctx, &win);
         assert!(compute(&input).is_none());
+        assert_eq!(baseline_missing_reason(&ctx), "model not in catalog");
+    }
+
+    #[test]
+    fn baseline_missing_reason_gpu_absent() {
+        let (ctx, _) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            None,
+            None,
+            None,
+            VllmConfig::default(),
+            VllmRawMetrics::default(),
+        );
+        assert_eq!(baseline_missing_reason(&ctx), "GPU not in catalog");
+    }
+
+    #[test]
+    fn baseline_missing_reason_model_absent() {
+        let (ctx, _) = baseline_input(
+            None,
+            None,
+            None,
+            Some(67.0),
+            Some(3350.0),
+            VllmConfig::default(),
+            VllmRawMetrics::default(),
+        );
+        assert_eq!(baseline_missing_reason(&ctx), "model not in catalog");
+    }
+
+    #[test]
+    fn baseline_missing_reason_catalog_complete() {
+        let (ctx, win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            None,
+            Some(67.0),
+            Some(3350.0),
+            VllmConfig::default(),
+            VllmRawMetrics::default(),
+        );
+        assert_eq!(
+            baseline_missing_reason(&ctx),
+            "hardware ceiling inputs incomplete"
+        );
+        assert!(compute(&AnalysisInput::new(&ctx, &win)).is_some());
     }
 
     #[test]
@@ -974,7 +1081,9 @@ mod tests {
         };
         let snap = VllmRawMetrics {
             generation_tokens_per_sec: Some(100.0),
+            aligned_generation_tokens_per_sec: Some(100.0),
             num_requests_running: Some(1.0),
+            generation_tokens_completed: Some(1.0),
             ..Default::default()
         };
         let (mut ctx, mut win) = baseline_input(
@@ -1013,6 +1122,7 @@ mod tests {
         let snap = VllmRawMetrics {
             generation_tokens_per_sec: Some(100.0),
             num_requests_running: Some(1.0),
+            generation_tokens_completed: Some(1.0),
             ..Default::default()
         };
         let (ctx, mut win) = baseline_input(
@@ -1043,7 +1153,7 @@ mod tests {
     #[test]
     fn dollar_cost_survives_when_aligned_power_missing_but_raw_present() {
         // All windows skewed: raw power exists, aligned is None. Energy refuses the
-        // bad join; $/1M tok still uses cost_per_hour × tok/s.
+        // bad join; $/1M output tok still uses cost_per_hour × tok/s.
         let cfg = VllmConfig {
             kv_cache_dtype: Some("bf16".to_string()),
             max_model_len: Some(2048),
@@ -1053,6 +1163,7 @@ mod tests {
         let snap = VllmRawMetrics {
             generation_tokens_per_sec: Some(100.0),
             num_requests_running: Some(1.0),
+            generation_tokens_completed: Some(1.0),
             ..Default::default()
         };
         let (ctx, mut win) = baseline_input(
@@ -1090,6 +1201,7 @@ mod tests {
         };
         let snap = VllmRawMetrics {
             generation_tokens_per_sec: Some(0.0),
+            aligned_generation_tokens_per_sec: None,
             num_requests_running: Some(1.0),
             ..Default::default()
         };
@@ -1110,7 +1222,10 @@ mod tests {
             .expect("gpu")
             .aligned_power_watts = Some(50.0);
         let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
-        assert!(b.cost.is_none_or(|c| c.joules_per_token.is_none()));
+        let cost = b.cost.expect("catalog price");
+        assert!(cost.joules_per_token.is_none());
+        assert!(cost.tok_per_watt.is_none());
+        assert!(cost.cost_per_million_tokens.is_none());
     }
 
     #[test]
@@ -1122,7 +1237,9 @@ mod tests {
         };
         let snap = VllmRawMetrics {
             generation_tokens_per_sec: Some(200.0),
+            aligned_generation_tokens_per_sec: Some(200.0),
             num_requests_running: Some(1.0),
+            generation_tokens_completed: Some(1.0),
             ..Default::default()
         };
         let (mut ctx, mut win) = baseline_input(
@@ -1159,7 +1276,9 @@ mod tests {
         };
         let snap = VllmRawMetrics {
             generation_tokens_per_sec: Some(100.0),
+            aligned_generation_tokens_per_sec: Some(100.0),
             num_requests_running: Some(1.0),
+            generation_tokens_completed: Some(1.0),
             ..Default::default()
         };
         let (mut ctx, win) = baseline_input(
@@ -1172,7 +1291,7 @@ mod tests {
             snap,
         );
         ctx.gpu.name = Some("NVIDIA H100 80GB HBM3".to_string());
-        // Cost join requires aligned power even for $/1M tok.
+        // Energy needs aligned power; dollar cost does not.
         let mut win = win;
         win.snapshot.gpus.first_mut().expect("gpu").power_watts = Some(400.0);
         win.snapshot
@@ -1199,7 +1318,9 @@ mod tests {
         };
         let snap = VllmRawMetrics {
             generation_tokens_per_sec: Some(200.0),
+            aligned_generation_tokens_per_sec: Some(200.0),
             num_requests_running: Some(1.0),
+            generation_tokens_completed: Some(1.0),
             ..Default::default()
         };
         let (mut ctx, mut win) = baseline_input(
@@ -1304,7 +1425,8 @@ mod tests {
     }
 
     #[test]
-    fn cost_none_when_tps_missing() {
+    fn dollar_cost_absent_when_tps_missing() {
+        // Price source present → CostEstimate always built; cpm None without tps.
         let cfg = VllmConfig {
             kv_cache_dtype: Some("bf16".to_string()),
             max_model_len: Some(2048),
@@ -1320,12 +1442,88 @@ mod tests {
             VllmRawMetrics {
                 generation_tokens_per_sec: None,
                 num_requests_running: Some(1.0),
+                generation_tokens_completed: Some(1.0),
                 ..Default::default()
             },
         );
         ctx.gpu.name = Some("NVIDIA H100 80GB HBM3".to_string());
-        let no_tps = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
-        assert!(no_tps.cost.is_none());
+        let cost = compute(&AnalysisInput::new(&ctx, &win))
+            .expect("baseline")
+            .cost
+            .expect("catalog price");
+        assert!(cost.cost_per_million_tokens.is_none());
+        assert!(cost.joules_per_token.is_none());
+    }
+
+    #[test]
+    fn dollar_cost_none_when_turnover_below_running() {
+        let cfg = VllmConfig {
+            kv_cache_dtype: Some("bf16".to_string()),
+            max_model_len: Some(2048),
+            cost_per_hour: Some(3.6),
+            ..Default::default()
+        };
+        let snap = VllmRawMetrics {
+            generation_tokens_per_sec: Some(100.0),
+            num_requests_running: Some(10.0),
+            generation_tokens_completed: Some(3.0),
+            ..Default::default()
+        };
+        let (ctx, win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(67.0),
+            Some(3350.0),
+            cfg,
+            snap,
+        );
+        let cost = compute(&AnalysisInput::new(&ctx, &win))
+            .expect("baseline")
+            .cost
+            .expect("cost block with price source");
+        assert!(cost.cost_per_million_tokens.is_none());
+        assert_eq!(cost.cost_source, CostSource::UserProvided);
+    }
+
+    #[test]
+    fn energy_uses_aligned_tps_not_active_mean() {
+        let cfg = VllmConfig {
+            kv_cache_dtype: Some("bf16".to_string()),
+            max_model_len: Some(2048),
+            cost_per_hour: Some(1.0),
+            ..Default::default()
+        };
+        let snap = VllmRawMetrics {
+            generation_tokens_per_sec: Some(250.0),
+            aligned_generation_tokens_per_sec: Some(100.0),
+            num_requests_running: Some(1.0),
+            generation_tokens_completed: Some(1.0),
+            ..Default::default()
+        };
+        let (ctx, mut win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(67.0),
+            Some(3350.0),
+            cfg,
+            snap,
+        );
+        win.snapshot
+            .gpus
+            .first_mut()
+            .expect("gpu")
+            .aligned_power_watts = Some(200.0);
+        let cost = compute(&AnalysisInput::new(&ctx, &win))
+            .expect("baseline")
+            .cost
+            .expect("cost");
+        assert!((cost.joules_per_token.expect("J/tok") - 2.0).abs() < 1e-9);
+        assert!((cost.tok_per_watt.expect("tok/W") - 0.5).abs() < 1e-9);
+        let cpm = cost.cost_per_million_tokens.expect("cpm");
+        let expected = 1.0 * 1_000_000.0 / (250.0 * 3600.0);
+        assert!((cpm - expected).abs() < 1e-9);
     }
 
     #[test]
@@ -1346,6 +1544,7 @@ mod tests {
             VllmRawMetrics {
                 generation_tokens_per_sec: Some(100.0),
                 num_requests_running: Some(1.0),
+                generation_tokens_completed: Some(1.0),
                 ..Default::default()
             },
         );
@@ -1397,12 +1596,8 @@ mod tests {
             .expect("gpu")
             .aligned_power_watts = Some(300.0);
         let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
-        assert!(
-            b.cost
-                .as_ref()
-                .and_then(|c| c.cost_per_million_tokens)
-                .is_none()
-        );
+        // No price source → cost absent (energy alone does not create CostEstimate).
+        assert!(b.cost.is_none());
     }
 
     #[test]

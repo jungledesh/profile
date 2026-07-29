@@ -18,11 +18,18 @@
 #
 # Knobs (env):
 #   AGENTS=16          concurrent agent workers
-#   STAGGER=5          seconds between worker launches
-#   DURATION=0         total seconds to run (0 = until Ctrl-C)
+#   STAGGER=5          seconds between worker launches (ignored when STABLE=1)
+#   DURATION=0         total seconds to run (0 = until Ctrl-C; use 0 during profile)
 #   TASK_TIMEOUT=600   max seconds per task before the worker moves on
+#   STABLE=1           spread worker phases + jitter timeouts for steady vLLM load (default on)
+#   PHASE_SPREAD=600   seconds across which worker start phases are evenly spread
+#   TIMEOUT_JITTER=90  per-task timeout ± seconds when STABLE=1
 #   SWARM_HOME=/workspace/swarm   scratch area (clones, checkouts, venvs, log)
 #   MODEL_ALIAS=qwen-local        grok model alias (see config below)
+#
+# Profile demo (steady traffic, no cohort ramp):
+#   STABLE=1 AGENTS=16 TASK_TIMEOUT=600 DURATION=0 ./agent-swarm.sh run
+#   Wait ~2 min after launch for phase spread to fill, then run profile diagnose.
 #
 # Requires: vLLM serving Qwen3.6-27B on localhost:8000 (see start.sh); jq; git.
 #
@@ -37,6 +44,9 @@ AGENTS="${AGENTS:-16}"
 STAGGER="${STAGGER:-5}"
 DURATION="${DURATION:-0}"
 TASK_TIMEOUT="${TASK_TIMEOUT:-600}"
+STABLE="${STABLE:-1}"
+PHASE_SPREAD="${PHASE_SPREAD:-$TASK_TIMEOUT}"
+TIMEOUT_JITTER="${TIMEOUT_JITTER:-90}"
 SWARM_HOME="${SWARM_HOME:-/workspace/swarm}"
 MODEL_ALIAS="${MODEL_ALIAS:-qwen-local}"
 
@@ -48,14 +58,33 @@ CHECKOUTS_DIR="$SWARM_HOME/checkouts"
 AGENTS_DIR="$SWARM_HOME/agents"
 SWARM_LOG="$SWARM_HOME/swarm.log"
 
-export PATH="$HOME/.local/bin:$PATH"
+# .local/bin: uv. .grok/bin: grok installer target (installer edits .bashrc,
+# which this non-login script never re-reads).
+export PATH="$HOME/.local/bin:$HOME/.grok/bin:$PATH"
 
 # ── Grok Build binary ───────────────────────────────────────────────────────
+# Pin 0.2.111: that build requests the grok-4.5 model alias for auxiliary calls
+# (observed 404 in vLLM log Jul 24). write_grok_config redirects grok-4.5 to
+# local vLLM. x.ai install.sh accepts the version as bash -s <X.Y.Z>.
+GROK_VERSION="${GROK_VERSION:-0.2.111}"
+
+# Installer integrity: sha256 recorded at audit (Jul 24 2026). x.ai publishes
+# no signatures for the installer or the CLI binary it downloads, so this pin
+# protects against endpoint tampering after our audit, not a compromised
+# vendor. If upstream changes install.sh, setup fails closed: re-audit, bump.
+GROK_INSTALLER_SHA256="0465d810453bbf18608ccae310fa79f4c59ae4a0538bd8a3a374ebce749be952"
+
 install_grok() {
     if ! command -v grok >/dev/null 2>&1; then
-        echo "Installing Grok Build..."
-        curl -fsSL https://x.ai/cli/install.sh | bash
-        export PATH="$HOME/.local/bin:$PATH"
+        echo "Installing Grok Build ${GROK_VERSION}..."
+        local installer
+        installer=$(mktemp)
+        curl -fsSL https://x.ai/cli/install.sh -o "$installer"
+        echo "${GROK_INSTALLER_SHA256}  ${installer}" | sha256sum -c - >/dev/null 2>&1 \
+            || { echo "installer hash mismatch; upstream changed, re-audit before use" >&2; rm -f "$installer"; exit 1; }
+        bash "$installer" "$GROK_VERSION"
+        rm -f "$installer"
+        export PATH="$HOME/.local/bin:$HOME/.grok/bin:$PATH"
     fi
     command -v grok >/dev/null 2>&1 || { echo "grok not on PATH after install" >&2; exit 1; }
 }
@@ -78,6 +107,15 @@ context_window = 32768
 # Redirect it locally. api_backend must be chat_completions: the built-in
 # defaults to the Responses API, which crashes on vLLM reasoning stream events.
 [model.grok-build]
+model = "Qwen3.6-27B"
+base_url = "http://localhost:8000/v1"
+api_key = "none"
+api_backend = "chat_completions"
+context_window = 32768
+
+# grok 0.2.111 also requests "grok-4.5" for auxiliary calls (observed 404 in
+# vLLM log, Jul 24). Same redirect.
+[model."grok-4.5"]
 model = "Qwen3.6-27B"
 base_url = "http://localhost:8000/v1"
 api_key = "none"
@@ -238,6 +276,19 @@ smoke_imports() {
 # ── Swarm ───────────────────────────────────────────────────────────────────
 END=0
 
+task_timeout_secs() {
+    local base="$1"
+    if [[ "$STABLE" != "1" ]]; then
+        echo "$base"
+        return
+    fi
+    local span=$(( 2 * TIMEOUT_JITTER + 1 ))
+    local jitter=$(( RANDOM % span - TIMEOUT_JITTER ))
+    local t=$(( base + jitter ))
+    (( t < 60 )) && t=60
+    echo "$t"
+}
+
 worker() {
     local id_w="$1"
     local run=0
@@ -245,11 +296,29 @@ worker() {
     n=$(jq length "$TASKS_JSON")
     order=()
     pos=$n
+
+    if [[ "$STABLE" == "1" && "$AGENTS" -gt 0 ]]; then
+        local phase=$(( id_w * PHASE_SPREAD / AGENTS ))
+        if (( phase > 0 )); then
+            if (( DURATION > 0 )); then
+                local remaining=$(( END - $(date +%s) - 30 ))
+                if (( remaining <= 0 || phase > remaining )); then
+                    echo "worker=$id_w skipped: phase ${phase}s exceeds remaining run time" >> "$SWARM_LOG"
+                    echo 1 >> "$PHASE_SKIPPED_FILE"
+                    return 0
+                fi
+                sleep "$phase"
+            else
+                sleep "$phase"
+            fi
+        fi
+    fi
+
     while true; do
         local now t
         now=$(date +%s)
         if (( END > 0 && now >= END - 30 )); then break; fi
-        t="$TASK_TIMEOUT"
+        t=$(task_timeout_secs "$TASK_TIMEOUT")
         if (( END > 0 && END - now < t )); then t=$(( END - now )); fi
 
         if (( pos >= n )); then
@@ -320,21 +389,34 @@ run_swarm() {
 
     mkdir -p "$AGENTS_DIR"
     : > "$SWARM_LOG"
+    PHASE_SKIPPED_FILE="$AGENTS_DIR/phase_skipped.count"
+    : > "$PHASE_SKIPPED_FILE"
 
     local start_ts
     start_ts=$(date +%s)
     (( DURATION > 0 )) && END=$(( start_ts + DURATION ))
 
     trap cleanup INT TERM
-    echo "Launching $AGENTS agents (stagger ${STAGGER}s, task timeout ${TASK_TIMEOUT}s, duration $( ((DURATION > 0)) && echo "${DURATION}s" || echo "until Ctrl-C" ))"
+    local launch_stagger=0
+    [[ "$STABLE" != "1" ]] && launch_stagger="$STAGGER"
+    if [[ "$STABLE" == "1" ]]; then
+        echo "Launching $AGENTS agents (stable: phase spread ${PHASE_SPREAD}s, timeout ${TASK_TIMEOUT}s ±${TIMEOUT_JITTER}s, duration $( ((DURATION > 0)) && echo "${DURATION}s" || echo "until Ctrl-C" ))"
+    else
+        echo "Launching $AGENTS agents (stagger ${STAGGER}s, task timeout ${TASK_TIMEOUT}s, duration $( ((DURATION > 0)) && echo "${DURATION}s" || echo "until Ctrl-C" ))"
+    fi
     local i
     for (( i = 0; i < AGENTS; i++ )); do
         worker "$i" &
         WORKER_PIDS+=($!)
-        (( i < AGENTS - 1 )) && sleep "$STAGGER"
+        (( i < AGENTS - 1 && launch_stagger > 0 )) && sleep "$launch_stagger"
     done
     echo "All $AGENTS agents running. Live log: tail -f $SWARM_LOG"
     wait
+    local phase_skipped=0
+    if [[ -f "$PHASE_SKIPPED_FILE" ]]; then
+        phase_skipped=$(wc -l < "$PHASE_SKIPPED_FILE" | tr -d ' ')
+    fi
+    (( phase_skipped > 0 )) && echo "Skipped $phase_skipped worker(s): phase sleep exceeded remaining run time."
     summary
 }
 

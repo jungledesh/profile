@@ -55,25 +55,21 @@ if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
     tmux kill-session -t "$TMUX_SESSION"
 fi
 
-# Baseline config: maximum defaults. Every flag below was forced by the server,
-# the model, or the workload; none is performance tuning. Validated on H100, Jul 16 2026.
-#   --max-model-len 32768        agent harness preamble is 8193+ tokens; 8192 rejects the
-#                                first request. 32K is the standard agent-serving rung.
-#   --max-num-seqs 345           vLLM default (1024) refuses to boot: hybrid mamba state
-#                                fits 345 seqs in the post-weights pool. 345 is vLLM's own number.
-#   --trust-remote-code          model ships custom architecture code; load fails without it.
-#   --enable-auto-tool-choice    lets the model emit tool calls on its own (agent workload).
-#   --tool-call-parser qwen3_coder  Qwen3.6 emits XML-style tool calls; hermes (JSON) mangles them.
-#                                   qwen3_xml is an alias of the same parser.
-#   --reasoning-parser qwen3     routes <think> text to the reasoning field; without it the
-#                                model's monologue floods content and breaks the client.
-# Everything else (dtype, gpu-memory-utilization, TP, scheduling, caching) stays default.
+# Model/client flags only, plus the one boot requirement vLLM names on this
+# hybrid model. No other scheduler/memory tuning; Profile diagnoses the rest.
+#   --max-num-seqs 345           serve default 1024 exceeds Mamba cache blocks
+#                                (345 on H100 @ default gpu-memory-utilization).
+#                                Boot error: lower max_num_seqs to at most 345.
+#   --trust-remote-code          custom arch; load fails without it
+#   --enable-auto-tool-choice    agent workload must be allowed to call tools
+#   --tool-call-parser           qwen3_coder: XML tool calls (hermes mangles them)
+#   --reasoning-parser           qwen3: route <think> out of content or client breaks
+# --max-model-len omitted: vLLM derives model config max (262144).
 tmux new-session -d -s "$TMUX_SESSION" \
 "bash -lc 'source \"$VENV_DIR/bin/activate\" && \
 export LD_LIBRARY_PATH=\"${CUDA13_LIB}:\${LD_LIBRARY_PATH:-}\" && \
 vllm serve \"$MODEL_PATH\" \
   --served-model-name Qwen3.6-27B \
-  --max-model-len 32768 \
   --max-num-seqs 345 \
   --trust-remote-code \
   --enable-auto-tool-choice \

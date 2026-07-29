@@ -6,7 +6,7 @@ use crate::context::{AnalysisInput, RuntimeWindow};
 
 pub use baseline::{
     CeilingEstimate, CostEstimate, CostSource, KvCacheDtypeSource, PhysicsBaseline,
-    WeightDtypeSource, catalog_model_weight_gb,
+    WeightDtypeSource, baseline_missing_reason, catalog_model_weight_gb,
 };
 pub use rules::*;
 
@@ -49,16 +49,11 @@ pub struct Report {
     /// Rendered only when the loop reveals alternatives after a stuck fix.
     pub suppressed_recs: Vec<rules::Recommendation>,
     pub kv_max_seqs: Option<u32>,
-    /// Capacity value R2 prescribed this iteration (`≤N`). Used for self-grade after restart.
-    pub prescribed_kv_capacity: Option<u32>,
     /// When labels and catalog hybrid facts both exist and disagree on state
     /// pages: `(catalog_pages, observed_pages)`. Verbose (-v) only. Default
     /// output is unaffected. Label uncertainty tracks the printed number's
     /// source, not the existence of disagreement between sources.
     pub catalog_state_mismatch: Option<(u64, u64)>,
-    /// When allocator bytes and the 3 GB estimate both exist:
-    /// `(observed_budget_bytes, estimated_budget_bytes)`. Verbose only.
-    pub memory_budget_self_grade: Option<(u64, u64)>,
     /// Evaluable window count. `engine::build_report_for_diagnose` gates MU
     /// inject on `ENGINE_MIN_PERSISTENT_WINDOWS`; stdout gates only the journey
     /// footer on the same threshold. `--json` (when emitted) should keep raw
@@ -122,22 +117,30 @@ fn maybe_add_massive_underutilization(
         .kv_cache_usage_perc
         .filter(|v| v.is_finite() && *v >= 0.0);
 
-    // Near-cap is R5 territory (occupancy ≈ 1.0 always clears 0.75).
-    if let Some(max_n) = max_num_seqs
-        && running.is_some_and(|run| {
-            run > 0.0 && run / f64::from(max_n) >= MASSIVE_UNDERUTIL_OCCUPANCY_CEILING
-        })
-    {
+    // Occupancy against real capacity, not the knob. Same three walls R1 uses
+    // (src/engine/rules/r1_under_batching.rs:99). Near-cap is R5 territory.
+    if let Some(max_n) = max_num_seqs {
+        let (effective_max, _) = rules::effective_max_and_binder(
+            max_n,
+            baseline.map(|b| b.ridge_batch_size),
+            rules::usable_kv_concurrency(snapshot),
+        );
+        if running.is_some_and(|run| {
+            run > 0.0 && run / effective_max >= MASSIVE_UNDERUTIL_OCCUPANCY_CEILING
+        }) {
+            return;
+        }
+    }
+
+    // KV near full means memory is the wall, not the client. Never call this
+    // starvation, whatever the queue looks like.
+    if rules::kv_near_full(snapshot) {
         return;
     }
 
     let variant = match waiting {
         None => rules::MuVariant::GaugeMissing,
         Some(w) if w < 1.0 => rules::MuVariant::Starved,
-        Some(_) if kv.is_some_and(|k| k >= rules::KV_CACHE_PRESSURE_MIN_PERC) => {
-            // r2's shape; it did not sustain significance, don't mislabel as MU.
-            return;
-        }
         Some(_) => rules::MuVariant::BlockedAdmission { kv_pct: kv },
     };
 
@@ -499,7 +502,7 @@ mod build_report_tests {
         let mut mid = high.clone();
         mid.snapshot.vllm.kv_cache_usage_perc = Some(80.0);
         // 95, 95, 80 → r2 fires in 2 windows (< ENGINE_MIN_PERSISTENT_WINDOWS);
-        // aggregate mean kv = 90 >= 88 so MU's kv-pressure silence branch runs.
+        // summary avg kv = 90 >= 88 so MU's KV veto (kv_near_full) silences.
         let windows = vec![high.clone(), high.clone(), mid];
         let mut summary = high.clone();
         summary.snapshot.vllm.kv_cache_usage_perc = Some(90.0);
@@ -510,7 +513,7 @@ mod build_report_tests {
                 .recommendations
                 .iter()
                 .any(|r| r.rule_name == rule_names::KV_CACHE_PRESSURE),
-            "r2 must be absent: silence must come from MU's kv branch"
+            "r2 must be absent: silence must come from MU's KV veto"
         );
         assert_eq!(
             massive_underutilization_count(&report),
@@ -558,5 +561,192 @@ mod build_report_tests {
             0,
             "MU must not inject below ENGINE_MIN_PERSISTENT_WINDOWS"
         );
+    }
+
+    #[test]
+    fn massive_underutilization_silent_when_kv_peak_high_with_empty_queue() {
+        // Journey iteration 1 KV shape on the R1-silent fixture seats (64/256).
+        // Do not set ctx.config.max_num_seqs. That flips R1 to known-GPU and
+        // R1 owns the window before MU reads KV.
+        let (ctx, mut win) = starved_no_rules_fixture();
+        win.snapshot.vllm.num_requests_waiting = Some(0.0);
+        win.snapshot.vllm.kv_cache_usage_perc = Some(73.4);
+        win.snapshot.vllm.kv_cache_peak_perc = Some(92.5);
+        let report = diagnose_mu(&ctx, &win, ENGINE_MIN_PERSISTENT_WINDOWS);
+        assert!(
+            report.recommendations.is_empty(),
+            "MU must be the only possible output here: {:?}",
+            report
+                .recommendations
+                .iter()
+                .map(|r| r.rule_name)
+                .collect::<Vec<_>>()
+        );
+        let limiter_report = diagnose_windows(&ctx, &win);
+        let ev = limiter_report.limiter_evidence.expect("limiter evidence");
+        assert_eq!(
+            limiter::identify(&ev).verdict,
+            Some(limiter::LimiterVerdict::Known(
+                limiter::PrimaryLimiter::Traffic
+            )),
+            "peak burst must not alone trigger Capacity; mean 73.4% is below the 80% bar"
+        );
+        let line = limiter::limiter_line(&ev).expect("limiter line");
+        assert!(line.contains("Capped by traffic"));
+        assert!(!line.contains("Capped by memory"));
+    }
+
+    #[test]
+    fn limiter_capacity_when_mean_above_bar_shows_avg_and_peak() {
+        let (ctx, mut win) = starved_no_rules_fixture();
+        win.snapshot.vllm.kv_cache_usage_perc = Some(85.0);
+        win.snapshot.vllm.kv_cache_peak_perc = Some(92.0);
+        let report = diagnose_windows(&ctx, &win);
+        let ev = report.limiter_evidence.expect("limiter evidence");
+        assert_eq!(
+            limiter::identify(&ev).verdict,
+            Some(limiter::LimiterVerdict::Known(
+                limiter::PrimaryLimiter::Capacity
+            ))
+        );
+        let line = limiter::limiter_line(&ev).expect("limiter line");
+        assert_eq!(
+            line,
+            "Capped by memory: KV cache at 85% avg, 92% peak (R2 fires at 88%). Concurrency cannot grow further on this pool."
+        );
+    }
+
+    #[test]
+    fn massive_underutilization_silent_when_kv_avg_high_with_empty_queue() {
+        let (ctx, mut win) = starved_no_rules_fixture();
+        win.snapshot.vllm.num_requests_waiting = Some(0.0);
+        win.snapshot.vllm.kv_cache_usage_perc = Some(90.0);
+        win.snapshot.vllm.kv_cache_peak_perc = None;
+        let report = diagnose_mu(&ctx, &win, ENGINE_MIN_PERSISTENT_WINDOWS);
+        assert!(
+            report.recommendations.is_empty(),
+            "MU must be the only possible output here: {:?}",
+            report
+                .recommendations
+                .iter()
+                .map(|r| r.rule_name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn massive_underutilization_fires_when_kv_below_veto() {
+        let (ctx, mut win) = starved_no_rules_fixture();
+        win.snapshot.vllm.num_requests_waiting = Some(0.0);
+        win.snapshot.vllm.kv_cache_usage_perc = Some(87.9);
+        win.snapshot.vllm.kv_cache_peak_perc = Some(87.9);
+        let report = diagnose_mu(&ctx, &win, ENGINE_MIN_PERSISTENT_WINDOWS);
+        assert_eq!(report.recommendations.len(), 1);
+        assert_eq!(
+            report.recommendations[0].rule_name,
+            rule_names::MASSIVE_UNDERUTILIZATION
+        );
+        let text = mu_rec(&report).display_lines.join("\n");
+        assert!(text.contains("server not saturated"));
+    }
+
+    #[test]
+    fn massive_underutilization_silent_when_waiting_with_peak_above_veto() {
+        // waiting = 1: at/above 1 so pre-veto took BlockedAdmission; below R2's
+        // w > 2 and R5's waiting >= 2 so neither owns the window. Peak 95 hits
+        // kv_near_full → silence is the veto alone.
+        let (ctx, mut win) = starved_no_rules_fixture();
+        win.snapshot.vllm.num_requests_waiting = Some(1.0);
+        win.snapshot.vllm.kv_cache_usage_perc = Some(70.0);
+        win.snapshot.vllm.kv_cache_peak_perc = Some(95.0);
+        let report = diagnose_mu(&ctx, &win, ENGINE_MIN_PERSISTENT_WINDOWS);
+        assert!(
+            report.recommendations.is_empty(),
+            "MU must be the only possible output here: {:?}",
+            report
+                .recommendations
+                .iter()
+                .map(|r| r.rule_name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn massive_underutilization_suppressed_when_kv_concurrency_cap_binds() {
+        // Occupancy vs memory wall, not the knob. Keep KV gauges low so the
+        // veto cannot mute. Leave ctx.config alone so R1 stays unknown-GPU.
+        let (ctx, mut win) = starved_no_rules_fixture();
+        win.snapshot.vllm.num_requests_running = Some(14.0);
+        win.snapshot.vllm.num_requests_waiting = Some(0.0);
+        win.snapshot.vllm.max_num_seqs = Some(345);
+        win.snapshot.vllm.kv_cache_usage_perc = Some(10.0);
+        win.snapshot.vllm.kv_cache_peak_perc = None;
+        win.snapshot.vllm.cache_config.kv_cache_max_concurrency = Some(1.06);
+        let report = diagnose_mu(&ctx, &win, ENGINE_MIN_PERSISTENT_WINDOWS);
+        assert!(
+            report.recommendations.is_empty(),
+            "MU must be the only possible output here: {:?}",
+            report
+                .recommendations
+                .iter()
+                .map(|r| r.rule_name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn massive_underutilization_unaffected_when_no_wall_reported() {
+        // Same starved fixture as the MU fire test: unknown-GPU R1 bar is 25%,
+        // and 64/256 sits on that line so R1 stays silent. Do not raise
+        // max_num_seqs / drop running, which drops occupancy under 25% and R1
+        // owns the window, so MU never runs (false fail for Fix 2).
+        let (ctx, mut win) = starved_no_rules_fixture();
+        win.snapshot.vllm.cache_config.kv_cache_max_concurrency = None;
+        let report = diagnose_mu(&ctx, &win, ENGINE_MIN_PERSISTENT_WINDOWS);
+        assert_eq!(report.recommendations.len(), 1);
+        assert_eq!(
+            report.recommendations[0].rule_name,
+            rule_names::MASSIVE_UNDERUTILIZATION,
+            "no concurrency wall: Fix 2 is inert; MU still fires"
+        );
+    }
+
+    #[test]
+    fn contradicted_kv_cap_does_not_bind_mu_occupancy_wall() {
+        // Peak 64 vs floor(1.06)=1: usable declines. Occupancy must not be 64/1.
+        // Keep fixture seats (64/256) so unknown-GPU R1 stays on the 25% line.
+        let (ctx, mut win) = starved_no_rules_fixture();
+        win.snapshot.vllm.num_requests_running_peak = Some(64.0);
+        win.snapshot.vllm.kv_cache_usage_perc = Some(30.0);
+        win.snapshot.vllm.kv_cache_peak_perc = None;
+        win.snapshot.vllm.cache_config.kv_cache_max_concurrency = Some(1.06);
+        let ridge = report_ridge(&ctx, &win);
+        let (effective_max, wall) = rules::effective_max_and_binder(
+            win.snapshot.vllm.max_num_seqs.unwrap_or(256),
+            ridge,
+            rules::usable_kv_concurrency(&win.snapshot),
+        );
+        assert!(
+            (effective_max - 1.0).abs() > 0.5,
+            "contradicted cap must not bind effective_max to 1, got {effective_max} wall={wall:?}"
+        );
+        assert!(rules::usable_kv_concurrency(&win.snapshot).is_none());
+        let report = diagnose_mu(&ctx, &win, ENGINE_MIN_PERSISTENT_WINDOWS);
+        assert_eq!(report.recommendations.len(), 1);
+        assert_eq!(
+            report.recommendations[0].rule_name,
+            rule_names::MASSIVE_UNDERUTILIZATION,
+            "contradicted 1-seat wall must not silence MU: {:?}",
+            report
+                .recommendations
+                .iter()
+                .map(|r| r.rule_name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    fn report_ridge(ctx: &StaticContext, win: &RuntimeWindow) -> Option<f64> {
+        let input = AnalysisInput::new(ctx, win);
+        crate::engine::baseline::compute(&input).map(|b| b.ridge_batch_size)
     }
 }

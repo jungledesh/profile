@@ -34,16 +34,6 @@ fn confidence_for_source(weight_dtype_source: WeightDtypeSource) -> f64 {
     }
 }
 
-fn confidence_label(confidence: f64) -> &'static str {
-    if confidence >= 0.9 {
-        "High"
-    } else if confidence >= 0.7 {
-        "Medium"
-    } else {
-        "Low"
-    }
-}
-
 /// r4: weights exceed GPU VRAM budget (`kv_headroom_gb < 0`).
 pub fn r4_recommendation(
     kv_headroom_gb: Option<f64>,
@@ -130,7 +120,7 @@ pub(super) fn r4_recommendation_with_request_floor(
             fix_line,
             String::new(),
             "    Expected: Model and one request fit in VRAM.".to_string(),
-            format!("    Confidence: {}", confidence_label(confidence)),
+            format!("    Confidence: {}", super::confidence_label(confidence)),
         ]);
         return Some(Recommendation {
             rule_name: rule_names::OOM_RISK,
@@ -185,7 +175,7 @@ pub(super) fn r4_recommendation_with_request_floor(
             fix_line,
             String::new(),
             "    Expected: Model fits in VRAM; eliminates OOM risk.".to_string(),
-            format!("    Confidence: {}", confidence_label(confidence)),
+            format!("    Confidence: {}", super::confidence_label(confidence)),
         ],
     })
 }

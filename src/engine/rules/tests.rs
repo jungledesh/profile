@@ -137,6 +137,16 @@ fn gpu_busy() -> GpuRawMetrics {
     }
 }
 
+fn gpu_busy_with_vram() -> GpuRawMetrics {
+    GpuRawMetrics {
+        gpu_name: Some("NVIDIA H100 80GB HBM3".to_string()),
+        gpu_util_pct: Some(75.0),
+        vram_used_mb: Some(40 * 1024),
+        vram_total_mb: Some(80 * 1024),
+        ..Default::default()
+    }
+}
+
 fn r1_test_input(snapshot: &RawSnapshot) -> R1EvalInput<'_> {
     R1EvalInput {
         snapshot,
@@ -211,7 +221,7 @@ fn mk_evaluable_backlog_window(
         block_size: Some(block_size),
         ..Default::default()
     };
-    mk_win(snap(t, t, v, gpu_busy()))
+    mk_win(snap(t, t, v, gpu_busy_with_vram()))
 }
 
 fn r2_issue_lines(windows: &[RuntimeWindow]) -> Vec<String> {
@@ -453,9 +463,11 @@ fn compute_kv_max_seqs_declines_tp2_when_launch_flag_off() {
     let derived =
         compute_kv_max_seqs_with_mode::<false>(Some(20.0), Some(4096), &model, None, Some(2), None);
     assert_eq!(derived.max_seqs, None);
-    let (bound, source) = resolve_kv_bound(None, derived.max_seqs, false, Some(4.0), Some(50.0));
-    assert_eq!(bound, Some(8.0));
-    assert_eq!(source, Some(KvBoundSource::Empirical));
+    let (bound, source, floor) =
+        resolve_kv_bound(None, derived.max_seqs, false, Some(4.0), Some(50.0), None);
+    assert_eq!(bound, None);
+    assert_eq!(source, None);
+    assert_eq!(floor, Some(8.0));
 }
 
 #[test]
@@ -829,7 +841,6 @@ fn capacity_budget_rungs_prefer_observed_and_refuse_windowed_blocks() {
     let dense_result =
         compute_kv_max_seqs_for_cache(Some(20.0), Some(4096), &dense, None, None, &dense_cache);
     assert_eq!(dense_result.max_seqs, Some(39));
-    assert!(dense_result.budget_self_grade.is_some());
 
     let hybrid = qwen36_hybrid_model_with_attention();
     let hybrid_cache = crate::collectors::CacheConfigLabels {
@@ -840,7 +851,6 @@ fn capacity_budget_rungs_prefer_observed_and_refuse_windowed_blocks() {
     let hybrid_result =
         compute_kv_max_seqs_for_cache(Some(20.0), Some(4096), &hybrid, None, None, &hybrid_cache);
     assert_eq!(hybrid_result.max_seqs, Some(30));
-    assert!(hybrid_result.budget_self_grade.is_some());
 
     let windowed = ModelArch {
         swa_window: Some(1024),
@@ -850,7 +860,6 @@ fn capacity_budget_rungs_prefer_observed_and_refuse_windowed_blocks() {
     let windowed_result =
         compute_kv_max_seqs_for_cache(Some(20.0), Some(4096), &windowed, None, None, &dense_cache);
     assert_eq!(windowed_result.max_seqs, Some(95));
-    assert_eq!(windowed_result.budget_self_grade, None);
 
     let no_labels = compute_kv_max_seqs_for_cache(
         Some(20.0),
@@ -892,10 +901,14 @@ fn unpriced_currency_declines_to_empirical_low_confidence() {
     )
     .max_seqs;
     assert_eq!(derived, None);
-    let (bound, source) = resolve_kv_bound(None, derived, true, Some(4.0), Some(50.0));
-    let rec = recommended_seqs(None, bound, source, Some(4), None).expect("empirical fallback");
-    assert_eq!(source, Some(KvBoundSource::Empirical));
+    let (bound, source, floor) = resolve_kv_bound(None, derived, true, Some(4.0), Some(50.0), None);
+    let rec =
+        recommended_seqs(None, bound, source, floor, Some(4), None).expect("empirical fallback");
+    assert_eq!(bound, None);
+    assert_eq!(source, None);
+    assert!(floor.is_some());
     assert!(rec.empirical);
+    assert!(rec.floor_capped);
 }
 
 #[test]
@@ -919,25 +932,167 @@ fn rule_is_significant_zero_evaluable_windows_is_false() {
 }
 
 #[test]
+fn shrink_evidence_from_snapshot_drops_nan_and_negative() {
+    let nan_snap = RawSnapshot {
+        vllm: VllmRawMetrics {
+            prompt_tokens_p99: Some(f64::NAN),
+            generation_tokens_p99: Some(450.0),
+            generation_tokens_completed: Some(150.0),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let evidence = ShrinkEvidence::from_snapshot(&nan_snap);
+    assert!(evidence.prompt_p99.is_none());
+    assert_eq!(evidence.generation_p99, Some(450.0));
+    let mut lines = Vec::new();
+    extend_with_shrink_suggestion(
+        &mut lines,
+        model_len_shrink_suggestion_lines(Some(8192), &evidence, "      ", false),
+    );
+    let text = lines
+        .iter()
+        .map(|(b, _)| b.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("Lower --max-model-len (current: 8192) to safely raise concurrency."));
+    assert!(!text.contains("→ 0"));
+
+    let neg_snap = RawSnapshot {
+        vllm: VllmRawMetrics {
+            prompt_tokens_p99: Some(6000.0),
+            generation_tokens_p99: Some(-50.0),
+            generation_tokens_completed: Some(150.0),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let evidence = ShrinkEvidence::from_snapshot(&neg_snap);
+    assert!(evidence.generation_p99.is_none());
+    let mut lines = Vec::new();
+    extend_with_shrink_suggestion(
+        &mut lines,
+        model_len_shrink_suggestion_lines(Some(8192), &evidence, "      ", false),
+    );
+    let text = lines
+        .iter()
+        .map(|(b, _)| b.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("Lower --max-model-len (current: 8192) to safely raise concurrency."));
+    assert!(!text.contains("→ 0"));
+
+    let ok_snap = RawSnapshot {
+        vllm: VllmRawMetrics {
+            prompt_tokens_p99: Some(6000.0),
+            generation_tokens_p99: Some(450.0),
+            generation_tokens_completed: Some(150.0),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let evidence = ShrinkEvidence::from_snapshot(&ok_snap);
+    assert_eq!(evidence.prompt_p99, Some(6000.0));
+    assert_eq!(evidence.generation_p99, Some(450.0));
+}
+
+#[test]
 fn model_len_suggestion_uses_p99_sum_when_count_sufficient() {
     let mut lines = Vec::new();
     extend_with_shrink_suggestion(
         &mut lines,
         model_len_shrink_suggestion_lines(
             Some(8192),
-            Some(6000.0),
-            Some(450.0),
-            150.0,
+            &ShrinkEvidence {
+                prompt_p99: Some(6000.0),
+                generation_p99: Some(450.0),
+                prompt_mean: None,
+                generation_mean: None,
+                total_count: 150.0,
+            },
             "      ",
-            None,
             false,
         ),
     );
-    let text = lines.join("\n");
+    let text = lines
+        .iter()
+        .map(|(b, _)| b.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(text.contains("Lower --max-model-len 8192 → 6450"));
-    assert!(text.contains("fits p99 of observed requests"));
+    assert!(text.contains("Observed p99 6.5k tokens per request (prompt + generation p99)"));
     assert!(!text.contains("prompt p99"));
-    assert!(text.contains("Truncation risk"));
+    assert_eq!(lines[0].1, Some(SHRINK_REJECTION_WARNING));
+}
+
+#[test]
+fn shrink_rejection_warning_on_all_four_forms() {
+    const WARN: &str = SHRINK_REJECTION_WARNING;
+
+    let named = model_len_shrink_suggestion_lines(
+        Some(262144),
+        &ShrinkEvidence {
+            prompt_p99: Some(17000.0),
+            generation_p99: Some(1500.0),
+            prompt_mean: None,
+            generation_mean: None,
+            total_count: 150.0,
+        },
+        "      ",
+        false,
+    );
+    assert_eq!(named.subline, Some(WARN));
+    assert!(named.lines[0].contains("262144 → 18500"));
+    assert!(
+        named.lines[0].contains("Observed p99 18.5k tokens per request (prompt + generation p99)")
+    );
+
+    let both_halves = model_len_shrink_suggestion_lines(
+        Some(262144),
+        &ShrinkEvidence {
+            prompt_p99: None,
+            generation_p99: None,
+            prompt_mean: Some(1100.0),
+            generation_mean: Some(4000.0),
+            total_count: 48.0,
+        },
+        "      ",
+        false,
+    );
+    assert_eq!(both_halves.subline, Some(WARN));
+    assert!(
+        both_halves.lines[0].contains("Observed 5.1k tokens per request, prompt plus generation.")
+    );
+
+    let single_half = model_len_shrink_suggestion_lines(
+        Some(262144),
+        &ShrinkEvidence {
+            prompt_p99: None,
+            generation_p99: None,
+            prompt_mean: Some(1100.0),
+            generation_mean: None,
+            total_count: 48.0,
+        },
+        "      ",
+        false,
+    );
+    assert_eq!(single_half.subline, Some(WARN));
+    assert!(single_half.lines[0].contains("Observed prompt 1.1k tokens per request."));
+
+    let no_max = model_len_shrink_suggestion_lines(
+        None,
+        &ShrinkEvidence {
+            prompt_p99: None,
+            generation_p99: None,
+            prompt_mean: None,
+            generation_mean: None,
+            total_count: 0.0,
+        },
+        "      ",
+        false,
+    );
+    assert_eq!(no_max.subline, Some(WARN));
+    assert!(no_max.lines[0].contains("to safely raise concurrency."));
 }
 
 #[test]
@@ -947,37 +1102,177 @@ fn model_len_suggestion_no_op_when_count_below_threshold() {
         &mut lines,
         model_len_shrink_suggestion_lines(
             Some(8192),
-            Some(6000.0),
-            Some(450.0),
-            50.0,
+            &ShrinkEvidence {
+                prompt_p99: Some(6000.0),
+                generation_p99: Some(450.0),
+                prompt_mean: None,
+                generation_mean: None,
+                total_count: 50.0,
+            },
             "      ",
-            None,
             false,
         ),
     );
-    let text = lines.join("\n");
+    let text = lines
+        .iter()
+        .map(|(b, _)| b.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(text.contains("to safely raise concurrency"));
     assert!(!text.contains('→'));
 }
 
 #[test]
-fn model_len_suggestion_no_op_when_p99_missing() {
+fn model_len_suggestion_missing_generation_p99_has_rejection_warning() {
     let mut lines = Vec::new();
     extend_with_shrink_suggestion(
         &mut lines,
         model_len_shrink_suggestion_lines(
             Some(8192),
-            Some(6000.0),
-            None,
-            150.0,
+            &ShrinkEvidence {
+                prompt_p99: Some(6000.0),
+                generation_p99: None,
+                prompt_mean: None,
+                generation_mean: None,
+                total_count: 150.0,
+            },
             "      ",
-            None,
             false,
         ),
     );
-    let text = lines.join("\n");
+    let text = lines
+        .iter()
+        .map(|(b, sub)| sub.map_or_else(|| b.clone(), |s| format!("{b}\n        {s}")))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(text.contains("to safely raise concurrency"));
     assert!(!text.contains('→'));
+    assert!(text.contains(SHRINK_REJECTION_WARNING));
+    assert_eq!(lines[0].1, Some(SHRINK_REJECTION_WARNING));
+}
+
+#[test]
+fn model_len_suggestion_missing_prompt_p99_has_rejection_warning() {
+    let mut lines = Vec::new();
+    extend_with_shrink_suggestion(
+        &mut lines,
+        model_len_shrink_suggestion_lines(
+            Some(8192),
+            &ShrinkEvidence {
+                prompt_p99: None,
+                generation_p99: Some(450.0),
+                prompt_mean: None,
+                generation_mean: None,
+                total_count: 150.0,
+            },
+            "      ",
+            false,
+        ),
+    );
+    let text = lines
+        .iter()
+        .map(|(b, sub)| sub.map_or_else(|| b.clone(), |s| format!("{b}\n        {s}")))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("to safely raise concurrency"));
+    assert!(!text.contains('→'));
+    assert!(text.contains(SHRINK_REJECTION_WARNING));
+    assert_eq!(lines[0].1, Some(SHRINK_REJECTION_WARNING));
+}
+
+#[test]
+fn shrink_rejection_warning_on_all_nonempty_return_paths() {
+    const WARN: &str = SHRINK_REJECTION_WARNING;
+
+    let paths = [
+        model_len_shrink_suggestion_lines(
+            None,
+            &ShrinkEvidence {
+                prompt_p99: None,
+                generation_p99: None,
+                prompt_mean: None,
+                generation_mean: None,
+                total_count: 0.0,
+            },
+            "      ",
+            false,
+        ),
+        model_len_shrink_suggestion_lines(
+            Some(8192),
+            &ShrinkEvidence {
+                prompt_p99: Some(6000.0),
+                generation_p99: None,
+                prompt_mean: None,
+                generation_mean: None,
+                total_count: 150.0,
+            },
+            "      ",
+            false,
+        ),
+        model_len_shrink_suggestion_lines(
+            Some(8192),
+            &ShrinkEvidence {
+                prompt_p99: None,
+                generation_p99: Some(450.0),
+                prompt_mean: None,
+                generation_mean: None,
+                total_count: 150.0,
+            },
+            "      ",
+            false,
+        ),
+        model_len_shrink_suggestion_lines(
+            Some(8192),
+            &ShrinkEvidence {
+                prompt_p99: Some(6000.0),
+                generation_p99: Some(450.0),
+                prompt_mean: None,
+                generation_mean: None,
+                total_count: 150.0,
+            },
+            "      ",
+            false,
+        ),
+        model_len_shrink_suggestion_lines(
+            Some(262144),
+            &ShrinkEvidence {
+                prompt_p99: None,
+                generation_p99: None,
+                prompt_mean: Some(1100.0),
+                generation_mean: Some(4000.0),
+                total_count: 48.0,
+            },
+            "      ",
+            false,
+        ),
+    ];
+    for suggestion in paths {
+        assert!(
+            !suggestion.lines.is_empty(),
+            "expected non-empty shrink path"
+        );
+        assert_eq!(suggestion.subline, Some(WARN));
+    }
+
+    let noop = model_len_shrink_suggestion_lines(
+        Some(5464),
+        &ShrinkEvidence {
+            prompt_p99: Some(5400.0),
+            generation_p99: Some(65.0),
+            prompt_mean: None,
+            generation_mean: None,
+            total_count: 150.0,
+        },
+        "      ",
+        false,
+    );
+    assert!(noop.lines.is_empty());
+    assert_eq!(noop.subline, None);
+}
+
+#[test]
+fn model_len_suggestion_no_op_when_p99_missing() {
+    model_len_suggestion_missing_generation_p99_has_rejection_warning();
 }
 
 #[test]
@@ -987,11 +1282,14 @@ fn model_len_suggestion_suppressed_when_delta_below_5pct() {
         &mut lines,
         model_len_shrink_suggestion_lines(
             Some(5464),
-            Some(5400.0),
-            Some(65.0),
-            150.0,
+            &ShrinkEvidence {
+                prompt_p99: Some(5400.0),
+                generation_p99: Some(65.0),
+                prompt_mean: None,
+                generation_mean: None,
+                total_count: 150.0,
+            },
             "      ",
-            None,
             false,
         ),
     );
@@ -1000,44 +1298,35 @@ fn model_len_suggestion_suppressed_when_delta_below_5pct() {
 
 #[test]
 fn model_len_suggestion_projects_capacity_from_observed_geometry() {
-    // Source: H100 ladder 2026-07-17 — 390 blocks, mamba_block_size 784,
+    // Source: H100 ladder 2026-07-17, 390 blocks, mamba_block_size 784,
     // obs 8.667 @ 32768. Suggested 16384 → floor(16.25)=16 concurrent (est).
-    let cache = crate::collectors::CacheConfigLabels {
-        block_size: Some(16),
-        num_gpu_blocks: Some(390),
-        mamba_block_size: Some(784),
-        kv_cache_max_concurrency: Some(8.667),
-        ..Default::default()
-    };
-    let hyp = HypCapacityCtx {
-        cache: &cache,
-        kv_headroom_gb: None,
-        model: None,
-        kv_cache_dtype: None,
-        tp: None,
-    };
     let mut lines = Vec::new();
     extend_with_shrink_suggestion(
         &mut lines,
         model_len_shrink_suggestion_lines(
             Some(32768),
-            Some(15000.0),
-            Some(1384.0),
-            150.0,
+            &ShrinkEvidence {
+                prompt_p99: Some(15000.0),
+                generation_p99: Some(1384.0),
+                prompt_mean: None,
+                generation_mean: None,
+                total_count: 150.0,
+            },
             "      ",
-            Some(&hyp),
             false,
         ),
     );
-    let text = lines.join("\n");
+    let text = lines
+        .iter()
+        .map(|(b, _)| b.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         text.contains("Lower --max-model-len 32768 → 16384"),
         "got: {text}"
     );
-    assert!(
-        text.contains("fits at least 16 worst-case requests (est)"),
-        "got: {text}"
-    );
+    assert!(!text.contains("fits at least"), "got: {text}");
+    assert!(!text.contains("worst-case"));
     assert!(
         !text.contains("fits 8 concurrent"),
         "must not use current observed"
@@ -1046,7 +1335,7 @@ fn model_len_suggestion_projects_capacity_from_observed_geometry() {
 
 #[test]
 fn model_len_suggestion_live_run_projection_at_5465_is_39_not_observed_8() {
-    // Source: live pressure run 2026-07-17 05:53 UTC — 390 blocks / 784
+    // Source: live pressure run 2026-07-17 05:53 UTC, 390 blocks / 784
     // block_size / state_pages 3. At suggested 5465:
     // 390 ÷ (ceil(5465/784) + 3) = 390 ÷ 10 = 39. Never current observed (8).
     let cache = crate::collectors::CacheConfigLabels {
@@ -1072,27 +1361,166 @@ fn model_len_suggestion_live_run_projection_at_5465_is_39_not_observed_8() {
         &mut lines,
         model_len_shrink_suggestion_lines(
             Some(32768),
-            Some(5000.0),
-            Some(465.0),
-            150.0,
+            &ShrinkEvidence {
+                prompt_p99: Some(5000.0),
+                generation_p99: Some(465.0),
+                prompt_mean: None,
+                generation_mean: None,
+                total_count: 150.0,
+            },
             "      ",
-            Some(&hyp),
             false,
         ),
     );
-    let text = lines.join("\n");
+    let text = lines
+        .iter()
+        .map(|(b, _)| b.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         text.contains("Lower --max-model-len 32768 → 5465"),
         "got: {text}"
     );
-    assert!(
-        text.contains("fits at least 39 worst-case requests (est)"),
-        "got: {text}"
-    );
+    assert!(!text.contains("fits at least"), "got: {text}");
+    assert!(!text.contains("worst-case"));
     assert!(
         !text.contains("fits 8 concurrent"),
         "suffix must not be current observed concurrency"
     );
+}
+
+#[test]
+fn operator_text_has_no_capacity_numbers_in_r1_r2_r5_r7() {
+    use super::r5_concurrency_saturation::{
+        ConcurrencySaturationDetail, format_concurrency_saturation_issue, r5_recommendation,
+    };
+    use super::r7_config_headroom::{ConfigHeadroomDetail, format_config_headroom_window_issue};
+    use super::{BindingWall, KvBoundSource, RecommendedSeqs, recommended_seqs};
+
+    let assert_clean = |label: &str, text: &str| {
+        for term in ["vLLM-reported", "worst-case requests"] {
+            assert!(
+                !text.contains(term),
+                "{label}: forbidden {term} in:\n{text}"
+            );
+        }
+        for line in text.lines() {
+            if line.contains("Batch more requests") || line.contains("Raise --max-num-seqs") {
+                assert!(
+                    !line.contains('≤'),
+                    "{label}: fix line must not contain ≤ capacity: {line}"
+                );
+            }
+        }
+    };
+
+    let t = SystemTime::UNIX_EPOCH;
+    let r1_win = mk_r1_window_with_kv(50.0);
+    let r1 = r1_recommendation(r1_test_input(&r1_win.snapshot)).expect("r1");
+    assert_clean("r1", &r1.display_lines.join("\n"));
+
+    let mut v = vllm_high_kv();
+    v.num_requests_waiting = Some(5.0);
+    v.prompt_tokens_p99 = Some(6000.0);
+    v.generation_tokens_p99 = Some(450.0);
+    v.generation_tokens_completed = Some(150.0);
+    let s = snap(t, t, v, gpu_low());
+    let r2 = r2_recommendation(R2RecommendationInput {
+        snapshot: &s,
+        max_model_len: Some(8192),
+        kv_headroom_gb: None,
+        kv_max_seqs: Some(24),
+        capacity_label: KvCapacityLabel::Observed,
+        windows_fired: 1,
+        total_evaluable: 1,
+        fp8_compiler_available: false,
+    })
+    .expect("r2");
+    assert_clean("r2", &r2.display_lines.join("\n"));
+
+    let r5_rec = recommended_seqs(
+        Some(153.0),
+        Some(120.0),
+        Some(KvBoundSource::Observed),
+        None,
+        Some(32),
+        None,
+    )
+    .expect("r5 rec");
+    let r5_raise = r5_recommendation(
+        &snap(
+            t,
+            t,
+            VllmRawMetrics {
+                num_requests_running: Some(32.0),
+                num_requests_waiting: Some(15.0),
+                max_num_seqs: Some(32),
+                kv_cache_usage_perc: Some(70.0),
+                generation_tokens_per_sec: Some(100.0),
+                ..Default::default()
+            },
+            gpu_low(),
+        ),
+        Some(70.0),
+        None,
+        None,
+        Some(r5_rec),
+    )
+    .expect("r5 raise");
+    assert_clean("r5 raise", &r5_raise.display_lines.join("\n"));
+
+    let at_wall_rec = recommended_seqs(
+        None,
+        Some(15.0),
+        Some(KvBoundSource::Derived),
+        None,
+        Some(15),
+        None,
+    )
+    .expect("r5 at wall");
+    let r5_wall = format_concurrency_saturation_issue(
+        &ConcurrencySaturationDetail {
+            requests_running: 15.0,
+            requests_waiting: 10.0,
+            max_num_seqs: Some(15),
+            queue_ratio: 10.0 / 25.0,
+            ttft_ms: None,
+            ttft_p99_ms: None,
+            ttft_p99_clamped: false,
+            ttft_p99_buckets: vec![],
+            kv_cache_usage_perc: Some(50.0),
+        },
+        Some(8192),
+        Some(&at_wall_rec),
+        &snap(t, t, VllmRawMetrics::default(), gpu_low()),
+    )
+    .join("\n");
+    assert_clean("r5 at wall", &r5_wall);
+
+    for (label, src) in [
+        ("r7 observed", KvBoundSource::Observed),
+        ("r7 derived", KvBoundSource::Derived),
+    ] {
+        let rec = RecommendedSeqs {
+            target: 96,
+            wall: 120.0,
+            binder: BindingWall::Memory { cap: 120 },
+            source: Some(src),
+            empirical: false,
+            floor_capped: false,
+            wall_is_capacity: true,
+        };
+        let d = ConfigHeadroomDetail {
+            max_num_seqs: 32,
+            recommended_seqs: 96,
+            ridge_batch_size: Some(153.0),
+            kv_cache_usage_perc: None,
+            occupancy_pct: 62.5,
+            running: 20.0,
+        };
+        let r7 = format_config_headroom_window_issue(&d, 100, 0.8, Some(&rec), true).join("\n");
+        assert_clean(label, &r7);
+    }
 }
 
 #[test]
@@ -1208,13 +1636,17 @@ fn capacity_at_hypothetical_gate_suppresses_both_tiers() {
 
     let text = model_len_shrink_suggestion_lines(
         Some(8192),
-        Some(3500.0),
-        Some(596.0),
-        150.0,
+        &ShrinkEvidence {
+            prompt_p99: Some(3500.0),
+            generation_p99: Some(596.0),
+            prompt_mean: None,
+            generation_mean: None,
+            total_count: 150.0,
+        },
         "      ",
-        Some(&hyp),
         false,
     )
+    .lines
     .join("\n");
     assert!(text.contains("Lower --max-model-len"), "got: {text}");
     assert!(!text.contains("; fits"), "got: {text}");
@@ -1340,7 +1772,7 @@ fn qwen36_hybrid_model_with_attention() -> ModelArch {
 
 #[test]
 fn catalog_state_mismatch_none_when_qwen36_agrees_with_ladder() {
-    // Source: H100 ladder 2026-07-17 — observed state_pages=3; fixed formula agrees.
+    // Source: H100 ladder 2026-07-17. Observed state_pages=3; fixed formula agrees.
     let cache = crate::collectors::CacheConfigLabels {
         block_size: Some(16),
         num_gpu_blocks: Some(390),
@@ -1735,6 +2167,91 @@ fn format_diagnose_verbose_shows_not_indicated_when_no_issue() {
 }
 
 #[test]
+fn format_diagnose_verbose_healthy_shows_not_triggered_and_limiter() {
+    let t = SystemTime::UNIX_EPOCH;
+    let mut g = gpu_low();
+    g.gpu_util_pct = Some(75.0);
+    g.gpu_name = Some("NVIDIA H100 80GB HBM3".to_string());
+    g.vram_total_mb = Some(80 * 1024);
+    let mut v = vllm_base();
+    v.num_requests_running = Some(64.0);
+    v.model_name = Some("meta-llama/Llama-3.1-8B-Instruct".to_string());
+    let s = snap(t, t, v, g);
+    let cfg = VllmConfig {
+        dtype: Some("bf16".to_string()),
+        max_model_len: Some(2048),
+        ..Default::default()
+    };
+    let ctx = StaticContext::from_snapshot(&s, cfg);
+    let win = mk_win(s);
+    let lines = format_diagnose_rules_test(&ctx, &win, true, "http://127.0.0.1:8000/metrics");
+    let text = lines.join("\n");
+    assert!(text.contains("Under-batching: not triggered"));
+    assert!(text.contains("No issues detected."));
+    assert!(
+        text.contains("Capped by "),
+        "verbose healthy must render limiter after not-triggered list: {text}"
+    );
+    let not_triggered = text
+        .find("Under-batching: not triggered")
+        .expect("not triggered list");
+    let capped = text.find("Capped by ").expect("limiter line");
+    assert!(
+        not_triggered < capped,
+        "not-triggered list must precede limiter verdict: {text}"
+    );
+}
+
+#[test]
+fn format_diagnose_quiet_healthy_renders_no_issues_and_limiter_only() {
+    let t = SystemTime::UNIX_EPOCH;
+    let mut g = gpu_low();
+    g.gpu_util_pct = Some(75.0);
+    g.gpu_name = Some("NVIDIA H100 80GB HBM3".to_string());
+    g.vram_total_mb = Some(80 * 1024);
+    let mut v = vllm_base();
+    v.num_requests_running = Some(64.0);
+    v.model_name = Some("meta-llama/Llama-3.1-8B-Instruct".to_string());
+    let s = snap(t, t, v, g);
+    let cfg = VllmConfig {
+        dtype: Some("bf16".to_string()),
+        max_model_len: Some(2048),
+        ..Default::default()
+    };
+    let ctx = StaticContext::from_snapshot(&s, cfg);
+    let win = mk_win(s);
+    let lines = format_diagnose_rules_test(&ctx, &win, false, "http://127.0.0.1:8000/metrics");
+    assert_eq!(
+        lines.first().map(String::as_str),
+        Some("No issues detected.")
+    );
+    assert!(
+        lines.get(1).is_some_and(|l| l.starts_with("Capped by ")),
+        "expected limiter line, got: {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains(": not triggered")),
+        "quiet healthy must not list not-triggered rules: {lines:?}"
+    );
+}
+
+#[test]
+fn format_diagnose_verbose_advisory_suppresses_no_issues_and_limiter() {
+    let t = SystemTime::UNIX_EPOCH;
+    let mut v = vllm_base();
+    v.num_requests_running = Some(64.0);
+    v.kv_cache_usage_perc = None;
+    let s = snap(t, t, v, gpu_busy());
+    let ctx = mk_ctx();
+    let win = mk_win(s);
+    let text =
+        format_diagnose_rules_test(&ctx, &win, true, "http://127.0.0.1:8000/metrics").join("\n");
+    assert!(text.contains("[i] KV Cache Pressure: core metric unavailable"));
+    assert!(!text.contains("No issues detected."));
+    assert!(!text.contains("Capped by "));
+}
+
+#[test]
 fn kv_cache_pressure_fires_despite_observation_skew() {
     // r2 is vLLM-only; GPU/vLLM clock divergence must not suppress KV pressure.
     let t0 = SystemTime::UNIX_EPOCH;
@@ -1858,10 +2375,15 @@ fn r2_backlog_fires_when_sustained_admission_pressure() {
         .map(|_| mk_evaluable_backlog_window(10.0, 1.0, 9.0, 10.0, 10_000, 16))
         .collect();
     for w in windows.iter_mut().take(4) {
-        *w = mk_evaluable_backlog_window(70.0, 15.0, 5.0, 40.0, 100, 16);
+        // 90% KV satisfies kv_near_full; wait=2 avoids R2 queue_backpressure (>2).
+        *w = mk_evaluable_backlog_window(90.0, 2.0, 4.0, 100.0, 100, 16);
     }
     let text = r2_issue_lines(&windows).join("\n");
     assert!(text.contains("[!] KV Cache Pressure: Admission Backlog"));
+    assert!(
+        !text.lines().any(|l| l.trim() == "[!] KV Cache Pressure"),
+        "standard R2 must not co-fire: {text}"
+    );
 }
 
 #[test]
@@ -2004,9 +2526,7 @@ fn empty_run_stdout_and_format_sites_byte_identical() {
                     suppressed_rules: Vec::new(),
                     suppressed_recs: Vec::new(),
                     kv_max_seqs: None,
-                    prescribed_kv_capacity: None,
                     catalog_state_mismatch: None,
-                    memory_budget_self_grade: None,
                     n_eval: 0,
                     skipped_broken: if any_evaluable { 0 } else { windows.len() },
                     skipped_idle: if any_evaluable { windows.len() } else { 0 },
@@ -2583,7 +3103,7 @@ fn kv_cache_pressure_preemption_displays_without_premature_confidence() {
     assert!(text.contains("Cause:"));
     assert!(text.contains("KV cache 89% avg, 89% peak (threshold: 88%)."));
     assert!(text.contains("Expected: TTFT and TPOT recover once evictions stop."));
-    assert!(text.contains("Lower --max-num-seqs to stop evictions"));
+    assert!(text.contains("Lower --max-num-seqs to reduce KV demand"));
     assert!(text.contains("Switch --kv-cache-dtype fp8"));
 }
 
@@ -2728,9 +3248,17 @@ fn backlog_display_matches_spec() {
         .map(|_| mk_evaluable_backlog_window(10.0, 1.0, 9.0, 10.0, 10_000, 16))
         .collect();
     for w in windows.iter_mut().take(4) {
-        *w = mk_evaluable_backlog_window(70.0, 15.0, 5.0, 40.0, 100, 16);
+        *w = mk_evaluable_backlog_window(90.0, 2.0, 4.0, 100.0, 100, 16);
     }
-    let ctx = mk_ctx();
+    let snap = windows.last().expect("windows").snapshot.clone();
+    let cfg = VllmConfig {
+        dtype: Some("bf16".to_string()),
+        max_model_len: Some(8192),
+        max_num_seqs: Some(256),
+        ..Default::default()
+    };
+    let mut ctx = StaticContext::from_snapshot(&snap, cfg);
+    ctx.model.param_count = Some(8_000_000_000);
     let summary = ai(&ctx, windows.last().expect("windows"));
     let report = build_report_for_windows(&windows, summary);
     let r = report
@@ -2741,10 +3269,11 @@ fn backlog_display_matches_spec() {
         .clone();
     let display = r.display_lines.join("\n");
     assert!(display.contains("[!] KV Cache Pressure: Admission Backlog"));
-    assert!(display.contains("gpu-memory-utilization") || display.contains("GPU memory"));
+    assert!(display.contains("KV cache 90% avg, 90% peak (threshold: 88%)"));
+    assert!(display.contains("Raise --gpu-memory-utilization"));
     assert!(
-        !display.contains("Lower --max-num-seqs"),
-        "backlog must not prescribe lowering max-num-seqs: {display}"
+        display.contains("Lower --max-num-seqs to reduce KV demand"),
+        "backlog must prescribe seat guidance: {display}"
     );
     if display.contains("Lower --max-model-len") {
         let cuts = display
@@ -3062,7 +3591,7 @@ fn r5_uses_session_kv_peak_from_non_r5_window() {
     );
     // Session peak 95% (from non-r5 window) blocks raise even though landing KV is low.
     assert!(
-        text.contains("KV at 95%: scheduler at cap, pool full."),
+        text.contains("KV at 95%: scheduler at cap, pool full; no config change helps"),
         "session peak must gate the fix: {text}"
     );
     assert!(text.contains("Add a replica"));
@@ -3096,7 +3625,7 @@ fn session_kv_peak_from_non_r5_window_reaches_build_report_from_eval() {
         .expect("r5 group");
     let text = r5.display_lines.join("\n");
     assert!(
-        text.contains("KV at 95%: scheduler at cap, pool full."),
+        text.contains("KV at 95%: scheduler at cap, pool full; no config change helps"),
         "display fix line must use session peak: {text}"
     );
     assert!(text.contains("Add a replica"));

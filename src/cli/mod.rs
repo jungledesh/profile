@@ -10,7 +10,7 @@ const DEFAULT_METRICS_URL: &str = "http://localhost:8000/metrics";
 const DEFAULT_DURATION: &str = "30s";
 
 const ABOUT: &str = "Detects inefficiencies. Suggests fixes.";
-const MAX_DURATION: Duration = Duration::from_secs(3 * 60);
+const MAX_DURATION: Duration = Duration::from_secs(30 * 60);
 const MIN_DURATION: Duration = Duration::from_secs(30);
 
 /// Shown for `profile diagnose --help` only (root help omits options via template).
@@ -100,16 +100,16 @@ pub enum Commands {
             long = "duration",
             default_value = DEFAULT_DURATION,
             value_parser = parse_duration_arg,
-            help = "Observation window (default: 30s, minimum: 30s). s=seconds, m=minutes (not ms/mins). Examples: 30s, 1m, 2m, 3m",
+            help = "Measurement period (default: 30s, minimum: 30s, maximum: 30m). s=seconds, m=minutes (not ms/mins). Examples: 30s, 2m, 10m, 30m",
             long_help = "How long to collect metrics before analyzing each iteration (default: 30s).\n\n\
                 Units:\n  \
                   s  seconds\n  \
                   m  minutes (not ms, not \"mins\", not bare m)\n\n\
                 Examples:\n  \
                   30s   minimum (default)\n  \
-                  1m    one-minute run\n  \
                   2m    short run\n  \
-                  3m    maximum"
+                  10m   longer run\n  \
+                  30m   maximum"
         )]
         duration: Duration,
     },
@@ -141,14 +141,14 @@ fn parse_duration_arg(input: &str) -> Result<Duration, String> {
     let s = input.trim();
     if s.len() < 2 {
         return Err(
-            "duration needs a number and unit: s (seconds) or m (minutes). Examples: 30s, 1m, 2m, 3m"
+            "duration needs a number and unit: s (seconds) or m (minutes). Examples: 30s, 2m, 10m, 30m"
                 .to_string(),
         );
     }
     let (num, unit) = s.split_at(s.len() - 1);
-    let value: u64 = num
-        .parse()
-        .map_err(|_| format!("invalid duration value in \"{input}\" (examples: 30s, 2m, 3m)"))?;
+    let value: u64 = num.parse().map_err(|_| {
+        format!("invalid duration value in \"{input}\" (examples: 30s, 2m, 10m, 30m)")
+    })?;
     if value == 0 {
         return Err("duration must be greater than zero".to_string());
     }
@@ -157,7 +157,7 @@ fn parse_duration_arg(input: &str) -> Result<Duration, String> {
         "m" => Duration::from_secs(value.saturating_mul(60)),
         _ => {
             return Err(format!(
-                "invalid unit in \"{input}\": use s (seconds) or m (minutes), not ms/mins. Examples: 30s, 1m, 2m, 3m"
+                "invalid unit in \"{input}\": use s (seconds) or m (minutes), not ms/mins. Examples: 30s, 2m, 10m, 30m"
             ));
         }
     };
@@ -165,7 +165,7 @@ fn parse_duration_arg(input: &str) -> Result<Duration, String> {
         return Err("minimum duration is 30s".to_string());
     }
     if duration > MAX_DURATION {
-        return Err("maximum duration is 3m".to_string());
+        return Err("maximum duration is 30m".to_string());
     }
     Ok(duration)
 }
@@ -188,7 +188,11 @@ mod tests {
     fn parse_duration_seconds_and_minutes() {
         assert_eq!(parse_duration_arg("30s").unwrap(), Duration::from_secs(30));
         assert_eq!(parse_duration_arg("2m").unwrap(), Duration::from_secs(120));
-        assert_eq!(parse_duration_arg("3m").unwrap(), Duration::from_secs(180));
+        assert_eq!(parse_duration_arg("10m").unwrap(), Duration::from_secs(600));
+        assert_eq!(
+            parse_duration_arg("30m").unwrap(),
+            Duration::from_secs(30 * 60)
+        );
     }
 
     #[test]
@@ -211,15 +215,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_duration_rejects_above_3m() {
+    fn parse_duration_rejects_above_30m() {
         assert_eq!(
-            parse_duration_arg("4m").unwrap_err(),
-            "maximum duration is 3m"
+            parse_duration_arg("31m").unwrap_err(),
+            "maximum duration is 30m"
         );
         assert_eq!(
-            parse_duration_arg("181s").unwrap_err(),
-            "maximum duration is 3m"
+            parse_duration_arg("1801s").unwrap_err(),
+            "maximum duration is 30m"
         );
+        assert!(parse_duration_arg("30m").is_ok());
+        assert!(parse_duration_arg("3m").is_ok());
     }
 
     #[test]

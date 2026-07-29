@@ -15,7 +15,7 @@ const PROMPT_GEN_RATIO_SEVERE: f64 = 20.0;
 const TPOT_INFLATION_GATE: f64 = 4.0;
 
 /// Confidence cap when TPOT evidence could not be checked (missing tpot or floor).
-/// Below Medium threshold (0.7) so the label renders Low.
+/// Below Medium threshold (0.6) so the label renders Low.
 pub(super) const TPOT_UNVERIFIED_CONFIDENCE_CAP: f64 = 0.5;
 
 /// Decode efficiency below this indicates underperformance that prefill might explain.
@@ -241,16 +241,6 @@ pub fn confidence(sev: Severity) -> f64 {
         Severity::Severe => 0.85,
         Severity::Moderate => 0.75,
         Severity::Mild => 0.65,
-    }
-}
-
-fn confidence_label(conf: f64) -> &'static str {
-    if conf >= 0.8 {
-        "High"
-    } else if conf >= 0.7 {
-        "Medium"
-    } else {
-        "Low"
     }
 }
 
@@ -587,7 +577,7 @@ pub(super) fn format_prefill_bound_window_issue(
         let rejects = vec![
             "      • Cap --max-model-len at p99 prompt length to reject outlier prompts, or truncate them at app layer.".to_string(),
         ];
-        super::push_grouped_fixes(&mut lines, safe, Vec::new(), rejects);
+        super::push_grouped_fixes(&mut lines, safe, Vec::new(), rejects, false);
         SKEWED_EXPECTED.to_string()
     } else {
         lines.push("    Fix:".to_string());
@@ -599,7 +589,7 @@ pub(super) fn format_prefill_bound_window_issue(
     };
     lines.push(String::new());
     lines.push(format!("    Expected: {expected}"));
-    lines.push(format!("    Confidence: {}", confidence_label(conf)));
+    lines.push(format!("    Confidence: {}", super::confidence_label(conf)));
     super::with_seen_pct(lines, seen_pct)
 }
 

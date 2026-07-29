@@ -7,6 +7,13 @@ use super::DiagnoseResult;
 const OSCILLATION_WINDOW: usize = 3;
 /// Per-session diagnose iterations stored in `LoopState`; 20 is a generous bound that costs nothing.
 pub const MAX_LOOP_ITERATIONS: usize = 20;
+/// Each midpoint round costs the operator a vLLM restart plus a measurement
+/// window. Bisection halves the bracket per round; the value of the next
+/// halving shrinks while its cost stays constant. Cap at three: enough to
+/// narrow a launch-realistic search, not enough to grind the operator for
+/// diminishing returns. (Three halvings leave ~1/8 of the original width, not
+/// the `hi > lo + 2` floor; that floor is the bisectability guard, not this cap.)
+pub const MAX_MIDPOINT_SUGGESTIONS: u8 = 3;
 
 pub struct IterationRecord {
     pub result: DiagnoseResult,
@@ -18,15 +25,18 @@ pub struct IterationRecord {
 pub struct LoopState {
     history: VecDeque<IterationRecord>,
     rec_history: VecDeque<&'static str>,
-    midpoint_suggested: bool,
-    last_efficiency_pct: Option<f64>,
-    plateau_count: u32,
+    /// Midpoint suggestions made this session. Hard cap; see [`MAX_MIDPOINT_SUGGESTIONS`].
+    midpoint_count: u8,
+    /// `(lo, hi)` of the last suggested bracket. A repeat bracket gets no second suggestion.
+    last_bracket: Option<(u32, u32)>,
+    /// Midpoint last printed (`(lo + hi) / 2`). A different bracket with the same
+    /// mid is not fresh information; refuse it so we do not re-fire a stuck prescription.
+    last_midpoint: Option<u32>,
 }
 
 impl LoopState {
     pub fn new(result: DiagnoseResult, report: Report) -> Self {
         let mut history = VecDeque::with_capacity(MAX_LOOP_ITERATIONS);
-        let last_efficiency_pct = report.baseline.as_ref().and_then(|b| b.efficiency_pct);
         history.push_back(IterationRecord {
             result,
             report,
@@ -35,9 +45,9 @@ impl LoopState {
         Self {
             history,
             rec_history: VecDeque::with_capacity(OSCILLATION_WINDOW + 1),
-            midpoint_suggested: false,
-            last_efficiency_pct,
-            plateau_count: 0,
+            midpoint_count: 0,
+            last_bracket: None,
+            last_midpoint: None,
         }
     }
 
@@ -45,12 +55,38 @@ impl LoopState {
         &self.history
     }
 
-    pub fn midpoint_suggested(&self) -> bool {
-        self.midpoint_suggested
+    pub fn midpoint_count(&self) -> u8 {
+        self.midpoint_count
     }
 
-    pub fn set_midpoint_suggested(&mut self) {
-        self.midpoint_suggested = true;
+    pub fn last_bracket(&self) -> Option<(u32, u32)> {
+        self.last_bracket
+    }
+
+    pub fn last_midpoint(&self) -> Option<u32> {
+        self.last_midpoint
+    }
+
+    /// True when a fresh prescription may still be suggested under the session cap.
+    /// Refuses an exact repeat bracket and any bracket whose midpoint matches the
+    /// last printed mid (same Try line, different endpoints).
+    pub fn should_suggest_midpoint(&self, lo: u32, hi: u32) -> bool {
+        if self.midpoint_count >= MAX_MIDPOINT_SUGGESTIONS {
+            return false;
+        }
+        if self.last_bracket == Some((lo, hi)) {
+            return false;
+        }
+        let mid = lo.saturating_add(hi) / 2;
+        self.last_midpoint != Some(mid)
+    }
+
+    /// Record a midpoint suggestion: bump the count, store bracket and mid, clear
+    /// oscillation history so the next ping-pong is measured afresh.
+    pub fn record_midpoint_suggestion(&mut self, lo: u32, hi: u32) {
+        self.midpoint_count = self.midpoint_count.saturating_add(1);
+        self.last_bracket = Some((lo, hi));
+        self.last_midpoint = Some(lo.saturating_add(hi) / 2);
         self.rec_history.clear();
     }
 
@@ -104,19 +140,6 @@ impl LoopState {
     pub fn iteration_count(&self) -> usize {
         self.history.len().saturating_sub(1)
     }
-
-    pub fn update_efficiency_plateau(&mut self, current_eff: Option<f64>, delta: f64) -> u32 {
-        match (self.last_efficiency_pct, current_eff) {
-            (Some(prev), Some(cur)) if (cur - prev).abs() < delta => {
-                self.plateau_count += 1;
-            }
-            _ => {
-                self.plateau_count = 0;
-            }
-        }
-        self.last_efficiency_pct = current_eff;
-        self.plateau_count
-    }
 }
 
 #[cfg(test)]
@@ -133,9 +156,7 @@ mod tests {
             suppressed_rules: Vec::new(),
             suppressed_recs: Vec::new(),
             kv_max_seqs: None,
-            prescribed_kv_capacity: None,
             catalog_state_mismatch: None,
-            memory_budget_self_grade: None,
             n_eval: 0,
             skipped_broken: 0,
             skipped_idle: 0,
@@ -183,9 +204,7 @@ mod tests {
             suppressed_rules: Vec::new(),
             suppressed_recs: Vec::new(),
             kv_max_seqs: None,
-            prescribed_kv_capacity: None,
             catalog_state_mismatch: None,
-            memory_budget_self_grade: None,
             n_eval: 1,
             skipped_broken: 0,
             skipped_idle: 0,
@@ -209,9 +228,7 @@ mod tests {
             suppressed_rules: Vec::new(),
             suppressed_recs: Vec::new(),
             kv_max_seqs: None,
-            prescribed_kv_capacity: None,
             catalog_state_mismatch: None,
-            memory_budget_self_grade: None,
             n_eval: 1,
             skipped_broken: 0,
             skipped_idle: 0,
@@ -301,8 +318,71 @@ mod tests {
         s.record_recommendation("concurrency_saturation");
         s.record_recommendation("kv_cache_pressure");
         assert!(s.is_oscillating());
-        s.set_midpoint_suggested();
+        s.record_midpoint_suggestion(150, 180);
         assert!(!s.is_oscillating());
-        assert!(s.midpoint_suggested());
+        assert_eq!(s.midpoint_count(), 1);
+        assert_eq!(s.last_bracket(), Some((150, 180)));
+        assert_eq!(s.last_midpoint(), Some(165));
+    }
+
+    #[test]
+    fn second_suggestion_granted_on_fresh_bracket() {
+        let mut s = LoopState::new(minimal_diagnose(), empty_report());
+        assert!(s.should_suggest_midpoint(150, 180));
+        s.record_midpoint_suggestion(150, 180);
+        assert_eq!(s.midpoint_count(), 1);
+        assert!(s.should_suggest_midpoint(160, 180));
+        s.record_midpoint_suggestion(160, 180);
+        assert_eq!(s.midpoint_count(), 2);
+        assert_eq!(s.last_bracket(), Some((160, 180)));
+    }
+
+    #[test]
+    fn same_bracket_twice_refuses_second_suggestion() {
+        let mut s = LoopState::new(minimal_diagnose(), empty_report());
+        s.record_midpoint_suggestion(150, 180);
+        assert!(!s.should_suggest_midpoint(150, 180));
+        assert_eq!(s.midpoint_count(), 1);
+        assert_eq!(s.last_bracket(), Some((150, 180)));
+        assert_eq!(s.last_midpoint(), Some(165));
+    }
+
+    #[test]
+    fn same_midpoint_different_bracket_refused() {
+        // (150,180) and (151,179) both mid at 165; second is not fresh.
+        let mut s = LoopState::new(minimal_diagnose(), empty_report());
+        s.record_midpoint_suggestion(150, 180);
+        assert!(!s.should_suggest_midpoint(151, 179));
+        assert_eq!(s.midpoint_count(), 1);
+        // A bracket with a different mid remains allowed.
+        assert!(s.should_suggest_midpoint(160, 180));
+    }
+
+    #[test]
+    fn fourth_fresh_bracket_refused_at_cap() {
+        let mut s = LoopState::new(minimal_diagnose(), empty_report());
+        s.record_midpoint_suggestion(100, 200);
+        s.record_midpoint_suggestion(120, 200);
+        s.record_midpoint_suggestion(140, 200);
+        assert_eq!(s.midpoint_count(), MAX_MIDPOINT_SUGGESTIONS);
+        assert!(!s.should_suggest_midpoint(160, 200));
+    }
+
+    #[test]
+    fn rec_history_cleared_on_every_suggestion() {
+        let mut s = LoopState::new(minimal_diagnose(), empty_report());
+        s.record_recommendation("kv_cache_pressure");
+        s.record_recommendation("concurrency_saturation");
+        s.record_recommendation("kv_cache_pressure");
+        assert!(s.is_oscillating());
+        s.record_midpoint_suggestion(150, 180);
+        assert!(!s.is_oscillating());
+        s.record_recommendation("kv_cache_pressure");
+        s.record_recommendation("concurrency_saturation");
+        s.record_recommendation("kv_cache_pressure");
+        assert!(s.is_oscillating());
+        s.record_midpoint_suggestion(160, 180);
+        assert!(!s.is_oscillating());
+        assert_eq!(s.midpoint_count(), 2);
     }
 }

@@ -3,10 +3,9 @@ use std::time::Duration;
 use super::{DiagnoseResult, MaxNumSeqsPrompt, delta, drift, poll, run_diagnose, state::LoopState};
 use crate::context::{AnalysisInput, RuntimeWindow};
 use crate::engine;
+use crate::engine::rule_names;
 use crate::output;
 
-const CEILING_HEADROOM_THRESHOLD_PCT: f64 = 10.0;
-/// Minimum |Δpp| to print Decode eff.; below this the line is omitted (noise).
 const EFFICIENCY_DISPLAY_MIN_PP: f64 = 0.05;
 /// Absolute efficiency drop (pp) required before appending `worse`.
 const EFFICIENCY_WORSE_MIN_PP: f64 = 1.0;
@@ -20,19 +19,29 @@ const JTOK_WORSE_THRESHOLD: f64 = 0.02;
 const TTFT_WORSE_MIN_MS: f64 = 5.0;
 /// TPOT avg materiality gate (ms).
 const TPOT_WORSE_MIN_MS: f64 = 0.5;
-const EFFICIENCY_PLATEAU_DELTA: f64 = 2.0;
-const PLATEAU_CONSECUTIVE_ITERS: u32 = 3;
+/// Absolute efficiency rise (pp) that counts as material improvement (reveal gate).
+const EFFICIENCY_MATERIAL_MIN_PP: f64 = 2.0;
+/// Left label width for remeasure before→after lines (excludes leading `"  "`).
+/// Sized for the longest label so Throughput, latency, and economics share one value column.
+const DELTA_LABEL_WIDTH: usize = 18; // "Cost/1M output tok"
 
 fn worse_suffix(material_regression: bool) -> &'static str {
     if material_regression { "  worse" } else { "" }
 }
 
-/// True when efficiency or throughput moved up by at least the worse/plateau gates.
-/// Symmetric to the regression labels: plateau band for eff, worse % for throughput.
+/// Shared gate for efficiency pp: the remeasure printed line and the reveal
+/// material-improvement efficiency arm both call this. Keep them on one predicate.
+fn include_efficiency_delta(config_drifted: bool) -> bool {
+    !config_drifted
+}
+
+/// True when efficiency or throughput moved up by at least the material gates.
+/// Symmetric to the regression labels: material pp for eff, worse % for throughput.
+/// After a baseline reset the efficiency arm is discounted; throughput alone decides.
 pub(crate) fn delta_shows_material_improvement(d: &delta::Delta) -> bool {
-    let eff_improved = d
-        .efficiency_delta_pp
-        .is_some_and(|pp| pp.is_finite() && pp >= EFFICIENCY_PLATEAU_DELTA);
+    let eff_improved = include_efficiency_delta(d.config_drifted)
+        && d.efficiency_delta_pp
+            .is_some_and(|pp| pp.is_finite() && pp >= EFFICIENCY_MATERIAL_MIN_PP);
     let tput_improved = match (d.throughput_before, d.throughput_after) {
         (Some(before), Some(after)) if before.is_finite() && after.is_finite() && before > 0.0 => {
             ((after - before) / before) * 100.0 >= THROUGHPUT_WORSE_MIN_PCT
@@ -124,45 +133,21 @@ pub fn run(input: LoopRunnerInput<'_>) -> anyhow::Result<()> {
 
         if state.is_oscillating() {
             match state.oscillating_pair() {
-                Some((a, b))
-                    if (a == "kv_cache_pressure" && b == "concurrency_saturation")
-                        || (a == "concurrency_saturation" && b == "kv_cache_pressure") =>
-                {
-                    if state.midpoint_suggested() {
-                        println!(
-                            "\nNo --max-num-seqs value resolves both KV pressure and queue saturation."
-                        );
-                        println!("Add a replica to scale out.");
-                        break;
-                    }
-
-                    let lo = state
-                        .history()
-                        .iter()
-                        .rev()
-                        .find(|r| r.recommendation_shown == Some("kv_cache_pressure"))
-                        .and_then(|r| r.result.static_ctx.config.max_num_seqs);
-                    let hi = state
-                        .history()
-                        .iter()
-                        .rev()
-                        .find(|r| r.recommendation_shown == Some("concurrency_saturation"))
-                        .and_then(|r| r.result.static_ctx.config.max_num_seqs);
-
-                    match (lo, hi) {
-                        (Some(lo), Some(hi)) if hi > lo + 2 => {
-                            let mid = (lo + hi) / 2;
-                            println!(
-                                "\n--max-num-seqs={hi} filled KV cache. --max-num-seqs={lo} saturated the queue."
-                            );
-                            println!("Try --max-num-seqs={mid}.");
-                            state.set_midpoint_suggested();
+                Some((a, b)) if is_kv_r5_oscillation_pair(a, b) => {
+                    let known = kv_r5_known_bracket(state.history());
+                    let bounds = kv_r5_midpoint_bounds(state.history());
+                    match bounds {
+                        Some((lo, hi)) if state.should_suggest_midpoint(lo, hi) => {
+                            let (bound_line, try_line) = kv_r5_midpoint_suggestion(lo, hi);
+                            println!("{bound_line}");
+                            println!("{try_line}");
+                            state.record_midpoint_suggestion(lo, hi);
                         }
                         _ => {
-                            println!(
-                                "\nNo --max-num-seqs value resolves both KV pressure and queue saturation."
-                            );
-                            println!("Add a replica to scale out.");
+                            let reason = kv_r5_dead_end_reason(bounds, known, &state);
+                            let (dead_line, replica_line) = kv_r5_dead_end_lines(reason);
+                            println!("{dead_line}");
+                            println!("{replica_line}");
                             break;
                         }
                     }
@@ -219,8 +204,6 @@ pub fn run(input: LoopRunnerInput<'_>) -> anyhow::Result<()> {
             drifted,
             non_baseline,
         );
-        let current_eff = new_report.baseline.as_ref().and_then(|b| b.efficiency_pct);
-        let plateau_count = state.update_efficiency_plateau(current_eff, EFFICIENCY_PLATEAU_DELTA);
         print_delta(&d);
         println!();
         let new_primary = new_report.recommendations.first().map(|r| r.rule_name);
@@ -238,34 +221,13 @@ pub fn run(input: LoopRunnerInput<'_>) -> anyhow::Result<()> {
             reveal_suppressed,
         );
 
-        let headroom = new_report.baseline.as_ref().and_then(|b| b.headroom_pct);
-        if at_hardware_ceiling(headroom) {
-            println!(
-                "\nHardware ceiling reached. Headroom < {CEILING_HEADROOM_THRESHOLD_PCT:.0}%: further gains require scaling hardware."
-            );
-            break;
-        }
-        if plateau_count >= PLATEAU_CONSECUTIVE_ITERS {
-            let eff_display = current_eff
-                .filter(|e| e.is_finite())
-                .map(|e| format!("{e:.1}%"))
-                .unwrap_or_else(|| "unknown".to_string());
-            println!(
-                "\nEfficiency plateaued at {eff_display} over {PLATEAU_CONSECUTIVE_ITERS} iterations."
-            );
-            println!("No further improvement from current config.");
-            println!("Either the workload has hit the hardware ceiling, or");
-            println!("a bottleneck exists that profile cannot yet identify.");
-            break;
-        }
-
         state.push(new_result, new_report, Some(rule_name));
     }
 
     Ok(())
 }
 
-/// Mid-loop remesure abort copy. Pure so the gate is unit-testable.
+/// Mid-loop remeasure abort copy. Pure so the gate is unit-testable.
 pub(crate) fn mid_loop_abort_message(
     any_evaluable: bool,
     all_idle: bool,
@@ -300,8 +262,154 @@ fn iteration_limit_message() -> String {
     )
 }
 
-fn at_hardware_ceiling(headroom_pct: Option<f64>) -> bool {
-    headroom_pct.is_some_and(|h| h < CEILING_HEADROOM_THRESHOLD_PCT)
+fn is_kv_r5_oscillation_pair(a: &str, b: &str) -> bool {
+    matches!(
+        (a, b),
+        (
+            rule_names::KV_CACHE_PRESSURE,
+            rule_names::CONCURRENCY_SATURATION
+        ) | (
+            rule_names::CONCURRENCY_SATURATION,
+            rule_names::KV_CACHE_PRESSURE
+        )
+    )
+}
+
+/// Shared bound-line wording for midpoint suggestion and named dead end.
+fn kv_r5_bracket_line(lo: u32, hi: u32) -> String {
+    format!("\n--max-num-seqs={hi} filled KV cache. --max-num-seqs={lo} saturated the queue.")
+}
+
+/// Bound line and try line for the R2/R5 oscillation midpoint escape.
+pub(crate) fn kv_r5_midpoint_suggestion(lo: u32, hi: u32) -> (String, String) {
+    let mid = (lo + hi) / 2;
+    (
+        kv_r5_bracket_line(lo, hi),
+        format!("Try --max-num-seqs={mid}."),
+    )
+}
+
+/// Why the R2/R5 oscillation path exits without another midpoint suggestion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KvR5DeadEndReason {
+    /// Same `(lo, hi)` bracket already got a midpoint (case C).
+    RepeatBracket { lo: u32, hi: u32 },
+    /// Different bracket, same midpoint as last Try line (case D).
+    RepeatMidpoint { lo: u32, hi: u32, mid: u32 },
+    /// Session cap reached with a wide bracket still available (case E).
+    CapExhausted { lo: u32, hi: u32 },
+    /// Bracket too tight after at least one midpoint was tried (case F).
+    TooCloseAfterMidpoint { lo: u32, hi: u32 },
+    /// First oscillation already too tight to suggest a midpoint (case G).
+    TooCloseFirst { lo: u32, hi: u32 },
+    /// Could not resolve both seat counts from history (case H).
+    SeatsUnknown,
+}
+
+/// Classify the dead-end path from bounds, known bracket, and session state.
+pub(crate) fn kv_r5_dead_end_reason(
+    bounds: Option<(u32, u32)>,
+    known: Option<(u32, u32)>,
+    state: &super::state::LoopState,
+) -> KvR5DeadEndReason {
+    if let Some((lo, hi)) = bounds {
+        if state.last_bracket() == Some((lo, hi)) {
+            return KvR5DeadEndReason::RepeatBracket { lo, hi };
+        }
+        let mid = lo.saturating_add(hi) / 2;
+        if state.last_midpoint() == Some(mid) {
+            return KvR5DeadEndReason::RepeatMidpoint { lo, hi, mid };
+        }
+        return KvR5DeadEndReason::CapExhausted { lo, hi };
+    }
+    if state.midpoint_count() > 0
+        && let Some((lo, hi)) = known
+    {
+        return KvR5DeadEndReason::TooCloseAfterMidpoint { lo, hi };
+    }
+    if let Some((lo, hi)) = known {
+        return KvR5DeadEndReason::TooCloseFirst { lo, hi };
+    }
+    KvR5DeadEndReason::SeatsUnknown
+}
+
+/// Dead-end lines when no further midpoint is offered.
+pub(crate) fn kv_r5_dead_end_lines(reason: KvR5DeadEndReason) -> (String, String) {
+    match reason {
+        KvR5DeadEndReason::RepeatBracket { lo, hi } => {
+            let mid = lo.saturating_add(hi) / 2;
+            (
+                kv_r5_bracket_line(lo, hi),
+                format!("Bracket unchanged after midpoint {mid}. Add a replica to scale out."),
+            )
+        }
+        KvR5DeadEndReason::RepeatMidpoint { lo, hi, mid } => (
+            kv_r5_bracket_line(lo, hi),
+            format!("Midpoint {mid} already suggested. Add a replica to scale out."),
+        ),
+        KvR5DeadEndReason::CapExhausted { lo, hi } => (
+            kv_r5_bracket_line(lo, hi),
+            format!(
+                "Midpoint cap ({}) reached. Add a replica to scale out.",
+                super::state::MAX_MIDPOINT_SUGGESTIONS
+            ),
+        ),
+        KvR5DeadEndReason::TooCloseAfterMidpoint { lo, hi } => (
+            kv_r5_bracket_line(lo, hi),
+            "Too close to try another value between them. Add a replica to scale out.".to_string(),
+        ),
+        KvR5DeadEndReason::TooCloseFirst { lo, hi } => {
+            let gap = hi - lo;
+            (
+                kv_r5_bracket_line(lo, hi),
+                format!(
+                    "Only {gap} seat{} apart; no midpoint to try. Add a replica to scale out.",
+                    if gap == 1 { "" } else { "s" }
+                ),
+            )
+        }
+        KvR5DeadEndReason::SeatsUnknown => (
+            "\nNo --max-num-seqs value resolves both KV pressure and queue saturation.".to_string(),
+            "Add a replica to scale out.".to_string(),
+        ),
+    }
+}
+
+/// Last seat counts from R5 (low) and R2 (high), when both are known.
+pub(crate) fn kv_r5_known_bracket(
+    history: &std::collections::VecDeque<super::state::IterationRecord>,
+) -> Option<(u32, u32)> {
+    let lo = history
+        .iter()
+        .rev()
+        .find(|r| {
+            r.report
+                .recommendations
+                .first()
+                .is_some_and(|rec| rec.rule_name == rule_names::CONCURRENCY_SATURATION)
+        })
+        .and_then(|r| r.result.static_ctx.config.max_num_seqs);
+    let hi = history
+        .iter()
+        .rev()
+        .find(|r| {
+            r.report
+                .recommendations
+                .first()
+                .is_some_and(|rec| rec.rule_name == rule_names::KV_CACHE_PRESSURE)
+        })
+        .and_then(|r| r.result.static_ctx.config.max_num_seqs);
+    match (lo, hi) {
+        (Some(lo), Some(hi)) if hi > lo => Some((lo, hi)),
+        _ => None,
+    }
+}
+
+/// Bisectable bracket only: both seats known and `hi > lo + 2`.
+pub(crate) fn kv_r5_midpoint_bounds(
+    history: &std::collections::VecDeque<super::state::IterationRecord>,
+) -> Option<(u32, u32)> {
+    kv_r5_known_bracket(history).filter(|&(lo, hi)| hi > lo + 2)
 }
 
 fn capacity_levers(enable_prefix_caching: Option<bool>) -> String {
@@ -413,8 +521,11 @@ fn healthy_exit_message(input: HealthyExitInput) -> String {
                 limiter_line.as_deref().unwrap_or_default()
             )
         }
-        Some(engine::limiter::LimiterVerdict::CeilingUnknown(_)) => limiter_line
-            .unwrap_or_else(|| "Hardware ceiling unknown (GPU not in catalog).".to_string()),
+        Some(engine::limiter::LimiterVerdict::CeilingUnknown(_)) => {
+            limiter_line.unwrap_or_else(|| {
+                "Hardware ceiling unknown (hardware ceiling inputs incomplete).".to_string()
+            })
+        }
         None => {
             format!("{eff_str} - insufficient data to identify primary limiter.")
         }
@@ -425,12 +536,6 @@ fn healthy_exit_message(input: HealthyExitInput) -> String {
         None => "Rules clear.",
     };
     format!("{prefix}\n\n{limiter_block}")
-}
-
-/// Efficiency is throughput/ceiling. After baseline reset the ceiling may have
-/// moved; the pp delta would compare two rulers. Skip it when config drifted.
-fn include_efficiency_delta(config_drifted: bool) -> bool {
-    !config_drifted
 }
 
 fn format_efficiency_delta_line(delta_pp: Option<f64>) -> Option<String> {
@@ -452,7 +557,8 @@ fn format_throughput_delta_line(before: f64, after: f64) -> String {
     };
     let worse = after < before && drop_pct >= THROUGHPUT_WORSE_MIN_PCT;
     format!(
-        "  Throughput  {before:.0} → {after:.0} tok/s{}",
+        "  {:<DELTA_LABEL_WIDTH$}  {before:.0} → {after:.0} tok/s{}",
+        "Throughput",
         worse_suffix(worse)
     )
 }
@@ -474,7 +580,8 @@ fn format_ttft_delta_line(
         _ => String::new(),
     };
     Some(format!(
-        "  TTFT        {before:.0} → {after:.0}ms{p95_suffix}{}",
+        "  {:<DELTA_LABEL_WIDTH$}  {before:.0} → {after:.0}ms{p95_suffix}{}",
+        "TTFT",
         worse_suffix(delta > TTFT_WORSE_MIN_MS)
     ))
 }
@@ -496,7 +603,8 @@ fn format_tpot_delta_line(
         _ => String::new(),
     };
     Some(format!(
-        "  TPOT        {before:.1} → {after:.1}ms{p95_suffix}{}",
+        "  {:<DELTA_LABEL_WIDTH$}  {before:.1} → {after:.1}ms{p95_suffix}{}",
+        "TPOT",
         worse_suffix(delta > TPOT_WORSE_MIN_MS)
     ))
 }
@@ -504,7 +612,8 @@ fn format_tpot_delta_line(
 fn format_jtok_delta_line(before: f64, after: f64) -> String {
     let worse = after - before > JTOK_WORSE_THRESHOLD;
     format!(
-        "  J/tok         {before:.2} → {after:.2}{}",
+        "  {:<DELTA_LABEL_WIDTH$}  {before:.2} → {after:.2}{}",
+        "J/tok",
         worse_suffix(worse)
     )
 }
@@ -512,62 +621,31 @@ fn format_jtok_delta_line(before: f64, after: f64) -> String {
 fn format_cost_delta_line(before: f64, after: f64, est_suffix: &str) -> String {
     let worse = after - before > COST_WORSE_THRESHOLD_USD;
     format!(
-        "  Cost/1M tok   ${before:.2} → ${after:.2}{est_suffix}{}",
+        "  {:<DELTA_LABEL_WIDTH$}  ${before:.2} → ${after:.2}{est_suffix}{}",
+        "Cost/1M output tok",
         worse_suffix(worse)
     )
 }
 
-/// One status line for the remesure delta header.
-///
-/// Precedence (first match wins): baseline drift → non-baseline drift → load
-/// Status header for the delta block.
-/// Precedence: drifted → non_baseline → load → prefix → no change.
-/// Load line applies for any primary (not R1-only).
-fn config_status_lines(
-    config_drifted: bool,
-    non_baseline_drifted: bool,
-    load_changed: bool,
-    prefix_hit_changed: bool,
-    running_before: Option<f64>,
-    running_after: Option<f64>,
-) -> Vec<String> {
+/// One status line for the remeasure delta header.
+fn config_status_lines(config_drifted: bool, non_baseline_drifted: bool) -> Vec<String> {
     let line = if config_drifted {
         "  Config changed. Baseline reset.".to_string()
     } else if non_baseline_drifted {
         "  Config changed.".to_string()
-    } else if load_changed {
-        // QPS-only load moves leave running equal; never print "N -> N".
-        // Compare rounded display values so 50.2 → 50.4 does not claim "50 -> 50".
-        match (running_before, running_after) {
-            (Some(n), Some(m)) if n.is_finite() && m.is_finite() && n.round() != m.round() => {
-                format!("  Load changed (running {n:.0} -> {m:.0}).")
-            }
-            _ => "  Load changed.".to_string(),
-        }
-    } else if prefix_hit_changed {
-        "  Prefix cache hit rate changed.".to_string()
     } else {
         "  No change detected.".to_string()
     };
     vec![line, String::new()]
 }
 
-fn print_delta(d: &delta::Delta) {
-    for line in config_status_lines(
-        d.config_drifted,
-        d.non_baseline_drifted,
-        d.load_changed,
-        d.prefix_hit_changed,
-        d.running_before,
-        d.running_after,
-    ) {
-        println!("{line}");
-    }
+fn remeasure_delta_lines(d: &delta::Delta) -> Vec<String> {
+    let mut lines = config_status_lines(d.config_drifted, d.non_baseline_drifted);
     if let (Some(before), Some(after)) = (d.throughput_before, d.throughput_after)
         && before.is_finite()
         && after.is_finite()
     {
-        println!("{}", format_throughput_delta_line(before, after));
+        lines.push(format_throughput_delta_line(before, after));
     }
     if let (Some(before), Some(after)) = (d.ttft_before_ms, d.ttft_after_ms)
         && before.is_finite()
@@ -575,7 +653,7 @@ fn print_delta(d: &delta::Delta) {
         && let Some(line) =
             format_ttft_delta_line(before, after, d.ttft_p95_before_ms, d.ttft_p95_after_ms)
     {
-        println!("{line}");
+        lines.push(line);
     }
     if let (Some(before), Some(after)) = (d.tpot_before_ms, d.tpot_after_ms)
         && before.is_finite()
@@ -583,48 +661,40 @@ fn print_delta(d: &delta::Delta) {
         && let Some(line) =
             format_tpot_delta_line(before, after, d.tpot_p95_before_ms, d.tpot_p95_after_ms)
     {
-        println!("{line}");
+        lines.push(line);
     }
-    // Efficiency is throughput/ceiling. Baseline reset means the ceiling may have
-    // moved (e.g. quantize); the pp delta would compare two rulers. Skip it.
     if include_efficiency_delta(d.config_drifted)
         && let Some(line) = format_efficiency_delta_line(d.efficiency_delta_pp)
     {
-        println!("{line}");
+        lines.push(line);
     }
-    if let Some((x, y)) = d.capacity_self_grade {
-        let y_disp = if (y - y.round()).abs() < 1e-9 {
-            format!("{y:.0}")
-        } else {
-            format!("{y:.2}")
-        };
-        println!("  Capacity: prescribed ≤{x}, vLLM now reports {y_disp}.");
+    lines
+}
+
+fn print_delta(d: &delta::Delta) {
+    for line in remeasure_delta_lines(d) {
+        println!("{line}");
     }
     if economics_section_active(d) {
         println!();
         println!("ECONOMICS:");
-    }
-    match (d.joules_per_token_before, d.joules_per_token_after) {
-        (Some(before), Some(after)) if before.is_finite() && after.is_finite() => {
+        if let (Some(before), Some(after)) = (d.joules_per_token_before, d.joules_per_token_after) {
             println!("{}", format_jtok_delta_line(before, after));
         }
-        _ => {}
-    }
-    match (d.cost_per_million_before, d.cost_per_million_after) {
-        (Some(before), Some(after)) if before.is_finite() && after.is_finite() => {
+        if let (Some(before), Some(after)) = (d.cost_per_million_before, d.cost_per_million_after) {
             let est = match d.cost_source_after {
                 Some(engine::CostSource::Catalog) | None => " (est)",
                 _ => "",
             };
             println!("{}", format_cost_delta_line(before, after, est));
         }
-        _ => {}
     }
 }
 
 fn economics_section_active(d: &delta::Delta) -> bool {
-    (d.cost_per_million_before.is_some() && d.cost_per_million_after.is_some())
-        || (d.joules_per_token_before.is_some() && d.joules_per_token_after.is_some())
+    let cost_line = d.cost_per_million_before.is_some() && d.cost_per_million_after.is_some();
+    let jtok_line = d.joules_per_token_before.is_some() && d.joules_per_token_after.is_some();
+    cost_line || jtok_line
 }
 
 /// Closed-loop pass gate: fingerprint must match the prior iteration.
@@ -644,11 +714,6 @@ mod tests {
     use crate::collectors::test_fixtures::snap_with_gpu_indices;
 
     #[test]
-    fn at_hardware_ceiling_below_threshold() {
-        assert!(at_hardware_ceiling(Some(9.0)));
-    }
-
-    #[test]
     fn iteration_limit_message_states_cap_not_outcome() {
         let msg = iteration_limit_message();
         assert!(msg.contains("Iteration limit (20) reached."));
@@ -656,19 +721,11 @@ mod tests {
     }
 
     #[test]
-    fn at_hardware_ceiling_at_threshold_not_reached() {
-        assert!(!at_hardware_ceiling(Some(10.0)));
-    }
-
-    #[test]
-    fn at_hardware_ceiling_none_not_reached() {
-        assert!(!at_hardware_ceiling(None));
-    }
-
-    fn framework_overhead_input(enforce_eager: Option<bool>) -> HealthyExitInput {
-        HealthyExitInput {
-            efficiency: Some(60.0),
+    fn healthy_exit_low_headroom_names_physics_ceiling_without_tpot_near_floor() {
+        let msg = healthy_exit_message(HealthyExitInput {
+            efficiency: Some(98.0),
             limiter_evidence: engine::limiter::LimiterEvidence {
+                kv_cache_mean_perc: Some(50.0),
                 kv_cache_peak_perc: Some(50.0),
                 mean_running: Some(50.0),
                 ridge_batch_size: Some(40.0),
@@ -676,7 +733,35 @@ mod tests {
                 tpot_floor_ms: Some(10.0),
                 effective_prompt_decode_ratio: None,
                 chunked_prefill_enabled: Some(false),
+                headroom_pct: Some(2.0),
                 n_eval: 0,
+                ceiling_unknown_reason: None,
+            },
+            n_eval: 3,
+            enforce_eager: None,
+            enable_prefix_caching: None,
+            quantization: None,
+        });
+        assert!(msg.contains("Physics (Hardware Ceiling)"));
+        assert!(msg.contains("headroom below 10%"));
+        assert!(msg.contains("scale out"));
+    }
+
+    fn framework_overhead_input(enforce_eager: Option<bool>) -> HealthyExitInput {
+        HealthyExitInput {
+            efficiency: Some(60.0),
+            limiter_evidence: engine::limiter::LimiterEvidence {
+                kv_cache_mean_perc: Some(50.0),
+                kv_cache_peak_perc: Some(50.0),
+                mean_running: Some(50.0),
+                ridge_batch_size: Some(40.0),
+                mean_tpot_ms: Some(50.0),
+                tpot_floor_ms: Some(10.0),
+                effective_prompt_decode_ratio: None,
+                chunked_prefill_enabled: Some(false),
+                headroom_pct: None,
+                n_eval: 0,
+                ceiling_unknown_reason: None,
             },
             n_eval: 3,
             enforce_eager,
@@ -689,6 +774,7 @@ mod tests {
         HealthyExitInput {
             efficiency: Some(42.5),
             limiter_evidence: engine::limiter::LimiterEvidence {
+                kv_cache_mean_perc: Some(85.0),
                 kv_cache_peak_perc: Some(85.0),
                 mean_running: Some(50.0),
                 ridge_batch_size: Some(40.0),
@@ -696,7 +782,9 @@ mod tests {
                 tpot_floor_ms: Some(5.0),
                 effective_prompt_decode_ratio: None,
                 chunked_prefill_enabled: Some(false),
+                headroom_pct: None,
                 n_eval: 0,
+                ceiling_unknown_reason: None,
             },
             n_eval: 3,
             enforce_eager: None,
@@ -709,6 +797,7 @@ mod tests {
         HealthyExitInput {
             efficiency: Some(91.0),
             limiter_evidence: engine::limiter::LimiterEvidence {
+                kv_cache_mean_perc: Some(50.0),
                 kv_cache_peak_perc: Some(50.0),
                 mean_running: Some(50.0),
                 ridge_batch_size: Some(40.0),
@@ -716,7 +805,9 @@ mod tests {
                 tpot_floor_ms: Some(10.0),
                 effective_prompt_decode_ratio: None,
                 chunked_prefill_enabled: Some(false),
+                headroom_pct: None,
                 n_eval: 0,
+                ceiling_unknown_reason: None,
             },
             n_eval: 3,
             enforce_eager: None,
@@ -739,6 +830,7 @@ mod tests {
         let msg = healthy_exit_message(HealthyExitInput {
             efficiency: Some(34.0),
             limiter_evidence: engine::limiter::LimiterEvidence {
+                kv_cache_mean_perc: Some(50.0),
                 kv_cache_peak_perc: Some(50.0),
                 mean_running: Some(5.0),
                 ridge_batch_size: Some(100.0),
@@ -746,7 +838,9 @@ mod tests {
                 tpot_floor_ms: Some(5.0),
                 effective_prompt_decode_ratio: None,
                 chunked_prefill_enabled: Some(false),
+                headroom_pct: None,
                 n_eval: 0,
+                ceiling_unknown_reason: None,
             },
             n_eval: 3,
             enforce_eager: None,
@@ -765,6 +859,7 @@ mod tests {
         let msg = healthy_exit_message(HealthyExitInput {
             efficiency: Some(12.4),
             limiter_evidence: engine::limiter::LimiterEvidence {
+                kv_cache_mean_perc: Some(10.0),
                 kv_cache_peak_perc: Some(10.0),
                 mean_running: Some(10.0),
                 ridge_batch_size: Some(100.0),
@@ -772,7 +867,9 @@ mod tests {
                 tpot_floor_ms: Some(5.0),
                 effective_prompt_decode_ratio: None,
                 chunked_prefill_enabled: Some(false),
+                headroom_pct: None,
                 n_eval: 0,
+                ceiling_unknown_reason: None,
             },
             n_eval: 3,
             enforce_eager: None,
@@ -789,6 +886,7 @@ mod tests {
         let msg = healthy_exit_message(HealthyExitInput {
             efficiency: Some(34.0),
             limiter_evidence: engine::limiter::LimiterEvidence {
+                kv_cache_mean_perc: Some(50.0),
                 kv_cache_peak_perc: Some(50.0),
                 mean_running: Some(5.0),
                 ridge_batch_size: Some(100.0),
@@ -796,7 +894,9 @@ mod tests {
                 tpot_floor_ms: Some(5.0),
                 effective_prompt_decode_ratio: None,
                 chunked_prefill_enabled: Some(false),
+                headroom_pct: None,
                 n_eval: 0,
+                ceiling_unknown_reason: None,
             },
             n_eval: 3,
             enforce_eager: None,
@@ -820,6 +920,7 @@ mod tests {
         let msg = healthy_exit_message(HealthyExitInput {
             efficiency: Some(55.0),
             limiter_evidence: engine::limiter::LimiterEvidence {
+                kv_cache_mean_perc: Some(50.0),
                 kv_cache_peak_perc: Some(50.0),
                 mean_running: Some(50.0),
                 ridge_batch_size: Some(40.0),
@@ -827,7 +928,9 @@ mod tests {
                 tpot_floor_ms: Some(10.0),
                 effective_prompt_decode_ratio: Some(0.6),
                 chunked_prefill_enabled: Some(true),
+                headroom_pct: None,
                 n_eval: 0,
+                ceiling_unknown_reason: None,
             },
             n_eval: 3,
             enforce_eager: None,
@@ -849,6 +952,7 @@ mod tests {
     #[test]
     fn healthy_exit_reuses_same_limiter_line_as_quiet_report() {
         let ev = engine::limiter::LimiterEvidence {
+            kv_cache_mean_perc: Some(84.0),
             kv_cache_peak_perc: Some(84.0),
             mean_running: Some(50.0),
             ridge_batch_size: Some(153.0),
@@ -856,7 +960,9 @@ mod tests {
             tpot_floor_ms: Some(10.0),
             effective_prompt_decode_ratio: Some(0.2),
             chunked_prefill_enabled: Some(false),
+            headroom_pct: None,
             n_eval: 3,
+            ceiling_unknown_reason: None,
         };
         let line = engine::limiter::limiter_line(&ev).expect("limiter line");
         let msg = healthy_exit_message(HealthyExitInput {
@@ -978,64 +1084,30 @@ mod tests {
 
     #[test]
     fn config_status_lines_baseline_beats_non_baseline() {
-        let lines = config_status_lines(true, true, true, true, Some(10.0), Some(20.0));
+        let lines = config_status_lines(true, true);
         assert_eq!(lines[0], "  Config changed. Baseline reset.");
     }
 
     #[test]
-    fn config_status_lines_non_baseline_beats_witness() {
-        let lines = config_status_lines(false, true, true, true, Some(10.0), Some(20.0));
-        assert_eq!(lines[0], "  Config changed.");
-    }
-
-    #[test]
-    fn config_status_lines_load_for_any_primary() {
-        let lines = config_status_lines(false, false, true, false, Some(10.0), Some(40.0));
-        assert_eq!(lines[0], "  Load changed (running 10 -> 40).");
-    }
-
-    #[test]
-    fn config_status_lines_without_load_is_no_change() {
-        let lines = config_status_lines(false, false, false, false, Some(10.0), Some(10.0));
-        assert_eq!(lines[0], "  No change detected.");
-    }
-
-    #[test]
-    fn config_status_lines_prefix_witness() {
-        let lines = config_status_lines(false, false, false, true, Some(10.0), Some(10.0));
-        assert_eq!(lines[0], "  Prefix cache hit rate changed.");
-    }
-
-    #[test]
-    fn config_status_lines_non_r1_load_move_shows_load() {
-        let lines = config_status_lines(false, false, true, false, Some(5.0), Some(25.0));
-        assert_eq!(lines[0], "  Load changed (running 5 -> 25).");
-    }
-
-    #[test]
-    fn config_status_lines_equal_running_falls_back_to_generic() {
-        // load_changed can fire from QPS alone while running stays flat.
-        let lines = config_status_lines(false, false, true, false, Some(50.0), Some(50.0));
-        assert_eq!(lines[0], "  Load changed.");
-    }
-
-    #[test]
-    fn config_status_lines_same_rounded_running_falls_back_to_generic() {
-        // Display uses {:.0}; raw inequality that rounds equal must not print "50 -> 50".
-        let lines = config_status_lines(false, false, true, false, Some(50.2), Some(50.4));
-        assert_eq!(lines[0], "  Load changed.");
-    }
-
-    #[test]
-    fn config_status_lines_config_beats_load() {
-        let lines = config_status_lines(false, true, true, false, Some(5.0), Some(25.0));
+    fn config_status_lines_non_baseline_beats_no_change() {
+        let lines = config_status_lines(false, true);
         assert_eq!(lines[0], "  Config changed.");
     }
 
     #[test]
     fn config_status_lines_no_changes() {
-        let lines = config_status_lines(false, false, false, false, None, None);
+        let lines = config_status_lines(false, false);
         assert_eq!(lines[0], "  No change detected.");
+    }
+
+    #[test]
+    fn remeasure_delta_no_config_change_large_throughput_still_no_change_detected() {
+        let mut d = flat_delta();
+        d.throughput_before = Some(100.0);
+        d.throughput_after = Some(300.0);
+        let text = remeasure_delta_lines(&d).join("\n");
+        assert!(text.starts_with("  No change detected."));
+        assert!(text.contains("Throughput"));
     }
 
     #[test]
@@ -1108,6 +1180,33 @@ mod tests {
     }
 
     #[test]
+    fn before_after_delta_labels_share_value_column() {
+        // "  " + label(18) + "  " → value starts at byte index 22.
+        const VALUE_COL: usize = 2 + DELTA_LABEL_WIDTH + 2;
+        let lines = [
+            format_throughput_delta_line(1000.0, 900.0),
+            format_ttft_delta_line(98.0, 5793.0, None, None).unwrap(),
+            format_tpot_delta_line(26.3, 47.8, None, None).unwrap(),
+            format_jtok_delta_line(1.19, 1.28),
+            format_cost_delta_line(2.04, 2.27, " (est)"),
+        ];
+        for line in &lines {
+            assert_eq!(
+                line.as_bytes().get(VALUE_COL - 1),
+                Some(&b' '),
+                "space before value: {line:?}"
+            );
+            assert_ne!(
+                line.as_bytes().get(VALUE_COL),
+                Some(&b' '),
+                "value starts at col {VALUE_COL}: {line:?}"
+            );
+        }
+        assert!(lines[3].as_bytes()[VALUE_COL].is_ascii_digit());
+        assert_eq!(lines[4].as_bytes()[VALUE_COL], b'$');
+    }
+
+    #[test]
     fn p95_has_no_own_label() {
         let line = format_ttft_delta_line(98.0, 5793.0, Some(228.0), Some(10556.0)).unwrap();
         assert!(line.contains("(p95 228 → 10556ms)"));
@@ -1124,7 +1223,32 @@ mod tests {
 
     #[test]
     fn economics_header_shown_when_only_jtok_available() {
-        let d = delta::Delta {
+        let mut d = economics_delta_base();
+        d.joules_per_token_before = Some(0.31);
+        d.joules_per_token_after = Some(0.28);
+        assert!(economics_section_active(&d));
+    }
+
+    #[test]
+    fn economics_header_shown_when_only_cost_available() {
+        let mut d = economics_delta_base();
+        d.cost_per_million_before = Some(2.50);
+        d.cost_per_million_after = Some(2.00);
+        assert!(economics_section_active(&d));
+    }
+
+    #[test]
+    fn economics_header_shown_when_both_metrics_available() {
+        let mut d = economics_delta_base();
+        d.joules_per_token_before = Some(0.31);
+        d.joules_per_token_after = Some(0.28);
+        d.cost_per_million_before = Some(2.50);
+        d.cost_per_million_after = Some(2.00);
+        assert!(economics_section_active(&d));
+    }
+
+    fn economics_delta_base() -> delta::Delta {
+        delta::Delta {
             throughput_before: None,
             throughput_after: None,
             efficiency_delta_pp: None,
@@ -1132,8 +1256,8 @@ mod tests {
             efficiency_pct_after: None,
             cost_per_million_before: None,
             cost_per_million_after: None,
-            joules_per_token_before: Some(0.31),
-            joules_per_token_after: Some(0.28),
+            joules_per_token_before: None,
+            joules_per_token_after: None,
             cost_source_after: None,
             ttft_before_ms: None,
             ttft_after_ms: None,
@@ -1145,13 +1269,20 @@ mod tests {
             tpot_p95_after_ms: None,
             config_drifted: false,
             non_baseline_drifted: false,
-            load_changed: false,
-            running_before: None,
-            running_after: None,
-            prefix_hit_changed: false,
-            capacity_self_grade: None,
-        };
-        assert!(economics_section_active(&d));
+        }
+    }
+
+    #[test]
+    fn remeasure_delta_output_excludes_capacity_prescription() {
+        let mut d = flat_delta();
+        d.ttft_before_ms = Some(120.0);
+        d.ttft_after_ms = Some(95.0);
+        d.tpot_before_ms = Some(45.0);
+        d.tpot_after_ms = Some(38.0);
+        d.efficiency_delta_pp = Some(3.5);
+        let text = remeasure_delta_lines(&d).join("\n");
+        assert!(!text.contains("Capacity:"));
+        assert!(!text.contains("prescribed"));
     }
 
     #[test]
@@ -1207,11 +1338,6 @@ mod tests {
             tpot_p95_after_ms: None,
             config_drifted: false,
             non_baseline_drifted: false,
-            load_changed: false,
-            running_before: None,
-            running_after: None,
-            prefix_hit_changed: false,
-            capacity_self_grade: None,
         }
     }
 
@@ -1221,9 +1347,9 @@ mod tests {
     }
 
     #[test]
-    fn material_improvement_true_on_eff_plateau_exit() {
+    fn material_improvement_true_on_eff_gain() {
         let mut d = flat_delta();
-        d.efficiency_delta_pp = Some(EFFICIENCY_PLATEAU_DELTA);
+        d.efficiency_delta_pp = Some(EFFICIENCY_MATERIAL_MIN_PP);
         assert!(delta_shows_material_improvement(&d));
     }
 
@@ -1258,6 +1384,29 @@ mod tests {
     }
 
     #[test]
+    fn reveal_fires_when_config_drifted_eff_gain_is_discounted() {
+        let mut d = flat_delta();
+        d.config_drifted = true;
+        d.efficiency_delta_pp = Some(5.0);
+        assert!(!delta_shows_material_improvement(&d));
+        assert!(should_reveal_suppressed(
+            "oom_risk",
+            Some("oom_risk"),
+            &d,
+            true
+        ));
+    }
+
+    #[test]
+    fn throughput_arm_survives_baseline_reset() {
+        let mut d = flat_delta();
+        d.config_drifted = true;
+        d.throughput_before = Some(100.0);
+        d.throughput_after = Some(140.0);
+        assert!(delta_shows_material_improvement(&d));
+    }
+
+    #[test]
     fn no_reveal_when_primary_changed() {
         assert!(!should_reveal_suppressed(
             "oom_risk",
@@ -1275,5 +1424,397 @@ mod tests {
             &flat_delta(),
             false
         ));
+    }
+
+    fn kv_bounds_empty_report() -> engine::Report {
+        engine::Report {
+            baseline: None,
+            recommendations: Vec::new(),
+            suppressed_rules: Vec::new(),
+            suppressed_recs: Vec::new(),
+            kv_max_seqs: None,
+            catalog_state_mismatch: None,
+            n_eval: 1,
+            skipped_broken: 0,
+            skipped_idle: 0,
+            energy_skew_skipped: 0,
+            gauge_missing: Default::default(),
+            limiter_evidence: None,
+        }
+    }
+
+    fn kv_bounds_report_firing(rule_name: &'static str) -> engine::Report {
+        let mut report = kv_bounds_empty_report();
+        report.recommendations.push(engine::Recommendation {
+            rule_name,
+            layer: 1,
+            impact: 5,
+            confidence: 0.9,
+            display_lines: Vec::new(),
+        });
+        report
+    }
+
+    fn kv_bounds_diagnose(max_num_seqs: u32) -> DiagnoseResult {
+        use crate::collectors::VllmRawMetrics;
+        use crate::context::StaticContext;
+        use std::time::{Duration, SystemTime};
+
+        DiagnoseResult {
+            snapshot: crate::collectors::RawSnapshot {
+                gpu_observed_at: SystemTime::UNIX_EPOCH,
+                vllm_observed_at: SystemTime::UNIX_EPOCH,
+                timestamp: SystemTime::UNIX_EPOCH,
+                vllm: VllmRawMetrics::default(),
+                gpus: vec![],
+            },
+            windows: Vec::new(),
+            static_ctx: StaticContext {
+                config: crate::collectors::VllmConfig {
+                    max_num_seqs: Some(max_num_seqs),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            duration: Duration::from_secs(2),
+            started_at: SystemTime::UNIX_EPOCH,
+            any_evaluable: true,
+            all_idle: false,
+            metrics_input: String::new(),
+        }
+    }
+
+    fn kv_bounds_record(
+        max_num_seqs: u32,
+        fired: &'static str,
+        recommendation_shown: Option<&'static str>,
+    ) -> super::super::state::IterationRecord {
+        super::super::state::IterationRecord {
+            result: kv_bounds_diagnose(max_num_seqs),
+            report: kv_bounds_report_firing(fired),
+            recommendation_shown,
+        }
+    }
+
+    #[test]
+    fn kv_r5_midpoint_bounds_kv_high_r5_low() {
+        use super::super::state::IterationRecord;
+        use std::collections::VecDeque;
+
+        let mut history = VecDeque::new();
+        history.push_back(IterationRecord {
+            result: kv_bounds_diagnose(100),
+            report: kv_bounds_empty_report(),
+            recommendation_shown: None,
+        });
+        // Operator raised seats after R5; remeasure fired R2 at the higher cap.
+        history.push_back(kv_bounds_record(
+            345,
+            rule_names::KV_CACHE_PRESSURE,
+            Some(rule_names::CONCURRENCY_SATURATION),
+        ));
+        // Operator lowered seats after R2; remeasure fired R5 at the lower cap.
+        history.push_back(kv_bounds_record(
+            45,
+            rule_names::CONCURRENCY_SATURATION,
+            Some(rule_names::KV_CACHE_PRESSURE),
+        ));
+
+        let (lo, hi) = kv_r5_midpoint_bounds(&history).expect("bounds");
+        assert_eq!(lo, 45);
+        assert_eq!(hi, 345);
+        assert_eq!((lo + hi) / 2, 195);
+    }
+
+    #[test]
+    fn kv_r5_midpoint_bounds_saturation_before_kv_in_history() {
+        use super::super::state::LoopState;
+        use std::collections::VecDeque;
+
+        let mut history = VecDeque::new();
+        history.push_back(kv_bounds_record(
+            45,
+            rule_names::CONCURRENCY_SATURATION,
+            Some(rule_names::KV_CACHE_PRESSURE),
+        ));
+        history.push_back(kv_bounds_record(
+            345,
+            rule_names::KV_CACHE_PRESSURE,
+            Some(rule_names::CONCURRENCY_SATURATION),
+        ));
+
+        let (lo, hi) = kv_r5_midpoint_bounds(&history).expect("bounds");
+        assert_eq!((lo, hi), (45, 345));
+
+        let mut state = LoopState::new(kv_bounds_diagnose(345), kv_bounds_empty_report());
+        state.record_recommendation(rule_names::CONCURRENCY_SATURATION);
+        state.record_recommendation(rule_names::KV_CACHE_PRESSURE);
+        state.record_recommendation(rule_names::CONCURRENCY_SATURATION);
+        assert_eq!(
+            state.oscillating_pair(),
+            Some((
+                rule_names::CONCURRENCY_SATURATION,
+                rule_names::KV_CACHE_PRESSURE
+            ))
+        );
+    }
+
+    #[test]
+    fn kv_r5_midpoint_bounds_uses_firing_rule_not_recommendation_shown() {
+        use std::collections::VecDeque;
+
+        let mut history = VecDeque::new();
+        history.push_back(kv_bounds_record(
+            345,
+            rule_names::KV_CACHE_PRESSURE,
+            Some(rule_names::CONCURRENCY_SATURATION),
+        ));
+        history.push_back(kv_bounds_record(
+            45,
+            rule_names::CONCURRENCY_SATURATION,
+            Some(rule_names::KV_CACHE_PRESSURE),
+        ));
+
+        let (lo, hi) = kv_r5_midpoint_bounds(&history).expect("bounds");
+        assert_eq!((lo, hi), (45, 345));
+    }
+
+    #[test]
+    fn kv_r5_known_bracket_when_too_tight_to_bisect() {
+        use std::collections::VecDeque;
+
+        let mut history = VecDeque::new();
+        history.push_back(kv_bounds_record(
+            150,
+            rule_names::CONCURRENCY_SATURATION,
+            None,
+        ));
+        history.push_back(kv_bounds_record(152, rule_names::KV_CACHE_PRESSURE, None));
+
+        assert_eq!(kv_r5_known_bracket(&history), Some((150, 152)));
+        assert!(kv_r5_midpoint_bounds(&history).is_none());
+    }
+
+    #[test]
+    fn kv_r5_midpoint_bounds_none_when_hi_within_margin_of_lo() {
+        use std::collections::VecDeque;
+
+        let mut history = VecDeque::new();
+        history.push_back(kv_bounds_record(
+            10,
+            rule_names::CONCURRENCY_SATURATION,
+            None,
+        ));
+        history.push_back(kv_bounds_record(12, rule_names::KV_CACHE_PRESSURE, None));
+
+        assert_eq!(kv_r5_known_bracket(&history), Some((10, 12)));
+        assert!(kv_r5_midpoint_bounds(&history).is_none());
+    }
+
+    #[test]
+    fn kv_r5_midpoint_message_maps_hi_to_kv_and_lo_to_queue() {
+        let (bound_line, try_line) = kv_r5_midpoint_suggestion(45, 345);
+        assert!(bound_line.contains("--max-num-seqs=345 filled KV cache"));
+        assert!(bound_line.contains("--max-num-seqs=45 saturated the queue"));
+        assert_eq!(try_line, "Try --max-num-seqs=195.");
+    }
+
+    #[test]
+    fn kv_r5_dead_end_repeat_bracket_case_c() {
+        let (dead, replica) =
+            kv_r5_dead_end_lines(KvR5DeadEndReason::RepeatBracket { lo: 150, hi: 180 });
+        assert!(dead.contains("--max-num-seqs=180 filled KV cache"));
+        assert!(dead.contains("--max-num-seqs=150 saturated the queue"));
+        assert_eq!(
+            replica,
+            "Bracket unchanged after midpoint 165. Add a replica to scale out."
+        );
+    }
+
+    #[test]
+    fn kv_r5_dead_end_repeat_midpoint_case_d() {
+        let (dead, replica) = kv_r5_dead_end_lines(KvR5DeadEndReason::RepeatMidpoint {
+            lo: 151,
+            hi: 179,
+            mid: 165,
+        });
+        assert!(dead.contains("--max-num-seqs=179 filled KV cache"));
+        assert!(dead.contains("--max-num-seqs=151 saturated the queue"));
+        assert_eq!(
+            replica,
+            "Midpoint 165 already suggested. Add a replica to scale out."
+        );
+    }
+
+    #[test]
+    fn kv_r5_dead_end_cap_exhausted_case_e() {
+        let (dead, replica) =
+            kv_r5_dead_end_lines(KvR5DeadEndReason::CapExhausted { lo: 125, hi: 137 });
+        assert!(dead.contains("--max-num-seqs=137 filled KV cache"));
+        assert!(dead.contains("--max-num-seqs=125 saturated the queue"));
+        assert_eq!(
+            replica,
+            "Midpoint cap (3) reached. Add a replica to scale out."
+        );
+    }
+
+    #[test]
+    fn dead_end_reason_cap_exhausted_case_e() {
+        use super::super::state::{LoopState, MAX_MIDPOINT_SUGGESTIONS};
+
+        let mut state = LoopState::new(kv_bounds_diagnose(137), kv_bounds_empty_report());
+        state.record_midpoint_suggestion(100, 200);
+        state.record_midpoint_suggestion(120, 200);
+        state.record_midpoint_suggestion(140, 200);
+        assert_eq!(state.midpoint_count(), MAX_MIDPOINT_SUGGESTIONS);
+
+        let bounds = Some((125, 137));
+        let known = Some((125, 137));
+        assert!(!state.should_suggest_midpoint(125, 137));
+        assert_eq!(
+            kv_r5_dead_end_reason(bounds, known, &state),
+            KvR5DeadEndReason::CapExhausted { lo: 125, hi: 137 }
+        );
+    }
+
+    #[test]
+    fn kv_r5_dead_end_too_close_after_midpoint_case_f() {
+        let (dead, replica) =
+            kv_r5_dead_end_lines(KvR5DeadEndReason::TooCloseAfterMidpoint { lo: 150, hi: 152 });
+        assert!(dead.contains("--max-num-seqs=152 filled KV cache"));
+        assert!(dead.contains("--max-num-seqs=150 saturated the queue"));
+        assert_eq!(
+            replica,
+            "Too close to try another value between them. Add a replica to scale out."
+        );
+    }
+
+    #[test]
+    fn kv_r5_dead_end_too_close_first_gap_one() {
+        let (dead, replica) =
+            kv_r5_dead_end_lines(KvR5DeadEndReason::TooCloseFirst { lo: 150, hi: 151 });
+        assert!(dead.contains("--max-num-seqs=151 filled KV cache"));
+        assert!(dead.contains("--max-num-seqs=150 saturated the queue"));
+        assert_eq!(
+            replica,
+            "Only 1 seat apart; no midpoint to try. Add a replica to scale out."
+        );
+    }
+
+    #[test]
+    fn kv_r5_dead_end_too_close_first_gap_two() {
+        let (dead, replica) =
+            kv_r5_dead_end_lines(KvR5DeadEndReason::TooCloseFirst { lo: 150, hi: 152 });
+        assert!(dead.contains("--max-num-seqs=152 filled KV cache"));
+        assert!(dead.contains("--max-num-seqs=150 saturated the queue"));
+        assert_eq!(
+            replica,
+            "Only 2 seats apart; no midpoint to try. Add a replica to scale out."
+        );
+    }
+
+    #[test]
+    fn kv_r5_dead_end_generic_when_seats_unknown_case_h() {
+        let (dead, replica) = kv_r5_dead_end_lines(KvR5DeadEndReason::SeatsUnknown);
+        assert!(
+            dead.contains(
+                "No --max-num-seqs value resolves both KV pressure and queue saturation."
+            )
+        );
+        assert_eq!(replica, "Add a replica to scale out.");
+    }
+
+    #[test]
+    fn dead_end_reason_repeat_bracket_case_c() {
+        use super::super::state::LoopState;
+
+        let mut state = LoopState::new(kv_bounds_diagnose(180), kv_bounds_empty_report());
+        state.record_midpoint_suggestion(150, 180);
+        let bounds = Some((150, 180));
+        let known = Some((150, 180));
+        assert_eq!(
+            kv_r5_dead_end_reason(bounds, known, &state),
+            KvR5DeadEndReason::RepeatBracket { lo: 150, hi: 180 }
+        );
+    }
+
+    #[test]
+    fn dead_end_reason_repeat_midpoint_case_d() {
+        use super::super::state::LoopState;
+
+        let mut state = LoopState::new(kv_bounds_diagnose(180), kv_bounds_empty_report());
+        state.record_midpoint_suggestion(150, 180);
+        let bounds = Some((151, 179));
+        let known = Some((151, 179));
+        assert_eq!(
+            kv_r5_dead_end_reason(bounds, known, &state),
+            KvR5DeadEndReason::RepeatMidpoint {
+                lo: 151,
+                hi: 179,
+                mid: 165,
+            }
+        );
+    }
+
+    #[test]
+    fn dead_end_reason_too_close_after_midpoint_case_f() {
+        use super::super::state::LoopState;
+        use std::collections::VecDeque;
+
+        let mut state = LoopState::new(kv_bounds_diagnose(180), kv_bounds_empty_report());
+        state.record_midpoint_suggestion(150, 180);
+
+        let mut history = VecDeque::new();
+        history.push_back(kv_bounds_record(
+            150,
+            rule_names::CONCURRENCY_SATURATION,
+            None,
+        ));
+        history.push_back(kv_bounds_record(152, rule_names::KV_CACHE_PRESSURE, None));
+        let known = kv_r5_known_bracket(&history);
+        let bounds = kv_r5_midpoint_bounds(&history);
+        assert!(bounds.is_none());
+        assert_eq!(known, Some((150, 152)));
+
+        assert_eq!(
+            kv_r5_dead_end_reason(bounds, known, &state),
+            KvR5DeadEndReason::TooCloseAfterMidpoint { lo: 150, hi: 152 }
+        );
+    }
+
+    #[test]
+    fn dead_end_generic_when_known_absent_after_midpoint() {
+        use super::super::state::LoopState;
+
+        let mut state = LoopState::new(kv_bounds_diagnose(180), kv_bounds_empty_report());
+        state.record_midpoint_suggestion(150, 180);
+        assert_eq!(
+            kv_r5_dead_end_reason(None, None, &state),
+            KvR5DeadEndReason::SeatsUnknown
+        );
+    }
+
+    #[test]
+    fn dead_end_reason_too_close_first_case_g() {
+        use super::super::state::LoopState;
+        use std::collections::VecDeque;
+
+        let state = LoopState::new(kv_bounds_diagnose(152), kv_bounds_empty_report());
+        let mut history = VecDeque::new();
+        history.push_back(kv_bounds_record(
+            150,
+            rule_names::CONCURRENCY_SATURATION,
+            None,
+        ));
+        history.push_back(kv_bounds_record(152, rule_names::KV_CACHE_PRESSURE, None));
+        let known = kv_r5_known_bracket(&history);
+        let bounds = kv_r5_midpoint_bounds(&history);
+        assert_eq!(known, Some((150, 152)));
+        assert!(bounds.is_none());
+
+        assert_eq!(
+            kv_r5_dead_end_reason(bounds, known, &state),
+            KvR5DeadEndReason::TooCloseFirst { lo: 150, hi: 152 }
+        );
     }
 }
