@@ -97,6 +97,14 @@ pub(super) fn observed_kv_cap_contradicted(snapshot: &crate::collectors::RawSnap
     kv_cap_positive_after_floor(snapshot).is_some() && usable_kv_concurrency(snapshot).is_none()
 }
 
+/// Minimum bootable `--max-num-batched-tokens` from scraped page alignment.
+/// Boot fact from `cache_config.block_size` only; never from catalog or constants.
+pub(super) fn chunk_batched_tokens_floor(
+    cache: &crate::collectors::CacheConfigLabels,
+) -> Option<u32> {
+    cache.block_size.filter(|b| *b > 0)
+}
+
 /// Minimum active windows for a trustworthy verdict. Window size scales with run
 /// duration (2s for <= 30s runs, else 10s), so this enforces 6s to 30s of sustained
 /// traffic. See profiler::logical_window_size.
@@ -341,21 +349,21 @@ fn sub_floor_shrink_evidence_line(
             let ctx = format_observed_context_tokens(p + g);
             format!(
                 "{indent}• Lower --max-model-len (current: {max_model_len}). \
-                 Observed {ctx} tokens per request, prompt plus generation."
+                 Observed avg {ctx} tokens per request, prompt plus generation."
             )
         }
         (Some(p), None) => {
             let ctx = format_observed_context_tokens(p);
             format!(
                 "{indent}• Lower --max-model-len (current: {max_model_len}). \
-                 Observed prompt {ctx} tokens per request."
+                 Observed avg prompt {ctx} tokens per request."
             )
         }
         (None, Some(g)) => {
             let ctx = format_observed_context_tokens(g);
             format!(
                 "{indent}• Lower --max-model-len (current: {max_model_len}). \
-                 Observed generation {ctx} tokens per request."
+                 Observed avg generation {ctx} tokens per request."
             )
         }
         (None, None) => format!(
@@ -446,39 +454,15 @@ fn compute_kv_max_seqs_with_mode<const MULTI_GPU: bool>(
     let Some(max_len) = max_model_len.filter(|&v| v > 0) else {
         return DerivedCapacity::default();
     };
-    let tp = tp.unwrap_or(1);
-    if tp == 0 || (!MULTI_GPU && tp > 1) {
+    let Some(model_view) = tp_priced_model::<MULTI_GPU>(model, tp.unwrap_or(1)) else {
         return DerivedCapacity::default();
-    }
-    if tp > 1 && r2_kv_cache_pressure::model_is_hybrid(model) {
-        return DerivedCapacity::default();
-    }
-
-    // Resharding heads needs a mutated copy; the tp=1 launch path borrows directly.
-    // Non-divisible TP is refused (vLLM refuses it too). Never truncate a shard.
-    let sharded_model = if tp > 1 {
-        let mut priced_model = model.clone();
-        let Some(heads) = priced_model.num_kv_heads.filter(|&h| h > 0) else {
-            return DerivedCapacity::default();
-        };
-        if heads % tp != 0 {
-            return DerivedCapacity::default();
-        }
-        priced_model.num_kv_heads = Some(heads / tp);
-        Some(priced_model)
-    } else {
-        None
     };
-    let model_view = sharded_model.as_ref().unwrap_or(model);
 
     let kv_bpp = kv_bytes_per_element(kv_cache_dtype);
-    let Some(request_bytes) = bytes_per_seq(model_view, max_len, kv_bpp) else {
+    let Some(request_bytes) = bytes_per_seq(model_view.as_ref(), max_len, kv_bpp) else {
         return DerivedCapacity::default();
     };
-    let observed = cache.and_then(|c| observed_budget_bytes(c, model_view, kv_bpp));
-    let estimated = derived_budget_bytes(kv_headroom_gb);
-    let budget = observed.or(estimated);
-    let max_seqs = budget
+    let max_seqs = kv_pool_budget_bytes(model_view.as_ref(), kv_cache_dtype, kv_headroom_gb, cache)
         .and_then(|bytes| bytes.checked_div(request_bytes))
         .and_then(|n| u32::try_from(n).ok())
         .filter(|&n| n > 0);
@@ -490,6 +474,69 @@ fn derived_budget_bytes(kv_headroom_gb: Option<f64>) -> Option<u64> {
     let gb = kv_headroom_gb.filter(|v| v.is_finite() && *v > 0.0)?;
     let bytes = gb * 1e9;
     (bytes.is_finite() && bytes <= u64::MAX as f64).then_some(bytes as u64)
+}
+
+/// TP-priced model view for budget and per-request cost. One view for both;
+/// pricing blocks with whole-model heads under TP overstates the budget.
+/// `None` when TP is refused (launch flag off, hybrid+TP, missing or
+/// non-divisible heads). Never truncates a shard.
+fn tp_priced_model<'a, const MULTI_GPU: bool>(
+    model: &'a crate::context::ModelArch,
+    tp: u32,
+) -> Option<std::borrow::Cow<'a, crate::context::ModelArch>> {
+    if tp == 0 || (!MULTI_GPU && tp > 1) {
+        return None;
+    }
+    if tp > 1 && r2_kv_cache_pressure::model_is_hybrid(model) {
+        return None;
+    }
+    if tp <= 1 {
+        return Some(std::borrow::Cow::Borrowed(model));
+    }
+    // Resharding heads needs a mutated copy; the tp=1 path borrows above.
+    let mut priced = model.clone();
+    let heads = priced.num_kv_heads.filter(|&h| h > 0)?;
+    if heads % tp != 0 {
+        return None;
+    }
+    priced.num_kv_heads = Some(heads / tp);
+    Some(std::borrow::Cow::Owned(priced))
+}
+
+/// Observed block budget when labels+geometry resolve, else derived headroom.
+/// Call with the TP-priced view from [`tp_priced_model`].
+fn kv_pool_budget_bytes(
+    model_view: &crate::context::ModelArch,
+    kv_cache_dtype: Option<&str>,
+    kv_headroom_gb: Option<f64>,
+    cache: Option<&crate::collectors::CacheConfigLabels>,
+) -> Option<u64> {
+    use crate::engine::baseline::kv_bytes_per_element;
+    let kv_bpp = kv_bytes_per_element(kv_cache_dtype);
+    let observed = cache.and_then(|c| observed_budget_bytes(c, model_view, kv_bpp));
+    observed.or(derived_budget_bytes(kv_headroom_gb))
+}
+
+/// GPU KV pool bytes: observed block budget when labels+geometry resolve, else
+/// derived headroom. `None` for SWA / incomplete inputs (same gates as capacity).
+/// On TP refusal, falls back to headroom-only (unlike capacity, which declines).
+pub(super) fn resolve_kv_pool_bytes(
+    kv_headroom_gb: Option<f64>,
+    model: Option<&crate::context::ModelArch>,
+    kv_cache_dtype: Option<&str>,
+    tp: Option<u32>,
+    cache: Option<&crate::collectors::CacheConfigLabels>,
+) -> Option<u64> {
+    let estimated = derived_budget_bytes(kv_headroom_gb);
+    let Some(model) = model else {
+        return estimated;
+    };
+    let Some(model_view) =
+        tp_priced_model::<{ crate::engine::MULTI_GPU_TP }>(model, tp.unwrap_or(1))
+    else {
+        return estimated;
+    };
+    kv_pool_budget_bytes(model_view.as_ref(), kv_cache_dtype, kv_headroom_gb, cache)
 }
 
 /// Takes the same (possibly TP-sharded) view used to price requests. Budget and

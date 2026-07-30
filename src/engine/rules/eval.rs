@@ -286,6 +286,7 @@ fn eval_window_rules(
                 .max_num_batched_tokens
                 .or(summary.ctx.config.max_num_batched_tokens),
             is_hybrid: model_is_hybrid(&summary.ctx.model),
+            model_in_catalog: summary.ctx.model.param_count.is_some(),
         });
         let r6_fired = matches!(r6_outcome, Rule6Outcome::Fired(_));
         match r6_outcome {

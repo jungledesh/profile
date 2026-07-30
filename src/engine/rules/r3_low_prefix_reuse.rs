@@ -226,6 +226,7 @@ mod tests {
             timestamp: t,
             vllm: v,
             gpus: vec![],
+            host_memory: None,
         }
     }
 

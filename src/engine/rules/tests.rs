@@ -96,7 +96,9 @@ fn input_r4_suppresses_r2() -> (StaticContext, RuntimeWindow) {
             gpu_util_pct: Some(58.0),
             ..Default::default()
         }],
+        host_memory: None,
     };
+
     let cfg = VllmConfig {
         dtype: Some("bf16".to_string()),
         max_model_len: Some(2048),
@@ -625,7 +627,9 @@ fn effective_kv_dtype_baseline_capacity_and_r2_agree() {
             vram_total_mb: Some(80 * 1024),
             ..Default::default()
         }],
+        host_memory: None,
     };
+
     let cfg = VllmConfig {
         dtype: Some("bf16".to_string()),
         kv_cache_dtype: None,
@@ -668,7 +672,9 @@ fn unknown_kv_dtype_request_floor_fires_hedged_weights_overflow_unaffected() {
             vram_total_mb: Some(80 * 1024),
             ..Default::default()
         }],
+        host_memory: None,
     };
+
     let cfg = VllmConfig {
         dtype: Some("bf16".to_string()),
         kv_cache_dtype: None,
@@ -714,6 +720,7 @@ fn unknown_kv_dtype_request_floor_fires_hedged_weights_overflow_unaffected() {
         },
         ..windows[0].snapshot.clone()
     };
+
     let win_known = RuntimeWindow::from_snapshot(snap_known);
     let windows_known: Vec<_> = (0..ENGINE_MIN_PERSISTENT_WINDOWS)
         .map(|_| win_known.clone())
@@ -942,6 +949,7 @@ fn shrink_evidence_from_snapshot_drops_nan_and_negative() {
         },
         ..Default::default()
     };
+
     let evidence = ShrinkEvidence::from_snapshot(&nan_snap);
     assert!(evidence.prompt_p99.is_none());
     assert_eq!(evidence.generation_p99, Some(450.0));
@@ -967,6 +975,7 @@ fn shrink_evidence_from_snapshot_drops_nan_and_negative() {
         },
         ..Default::default()
     };
+
     let evidence = ShrinkEvidence::from_snapshot(&neg_snap);
     assert!(evidence.generation_p99.is_none());
     let mut lines = Vec::new();
@@ -991,6 +1000,7 @@ fn shrink_evidence_from_snapshot_drops_nan_and_negative() {
         },
         ..Default::default()
     };
+
     let evidence = ShrinkEvidence::from_snapshot(&ok_snap);
     assert_eq!(evidence.prompt_p99, Some(6000.0));
     assert_eq!(evidence.generation_p99, Some(450.0));
@@ -1061,7 +1071,8 @@ fn shrink_rejection_warning_on_all_four_forms() {
     );
     assert_eq!(both_halves.subline, Some(WARN));
     assert!(
-        both_halves.lines[0].contains("Observed 5.1k tokens per request, prompt plus generation.")
+        both_halves.lines[0]
+            .contains("Observed avg 5.1k tokens per request, prompt plus generation.")
     );
 
     let single_half = model_len_shrink_suggestion_lines(
@@ -1077,7 +1088,7 @@ fn shrink_rejection_warning_on_all_four_forms() {
         false,
     );
     assert_eq!(single_half.subline, Some(WARN));
-    assert!(single_half.lines[0].contains("Observed prompt 1.1k tokens per request."));
+    assert!(single_half.lines[0].contains("Observed avg prompt 1.1k tokens per request."));
 
     let no_max = model_len_shrink_suggestion_lines(
         None,
@@ -3045,7 +3056,7 @@ fn r2_recommendation_includes_peak_from_detail() {
     })
     .expect("fired");
     let text = r.display_lines.join("\n");
-    assert!(text.contains("KV cache 89% avg, 99% peak (threshold: 88%)."));
+    assert!(text.contains("KV cache 89% avg in fired windows, 99% peak (threshold: 88%)."));
 }
 
 #[test]
@@ -3101,7 +3112,7 @@ fn kv_cache_pressure_preemption_displays_without_premature_confidence() {
         format_diagnose_rules_test(&ctx2, &win_kv_only, false, "http://127.0.0.1:8000/metrics")
             .join("\n");
     assert!(text.contains("Cause:"));
-    assert!(text.contains("KV cache 89% avg, 89% peak (threshold: 88%)."));
+    assert!(text.contains("KV cache 89% avg in fired windows, 89% peak (threshold: 88%)."));
     assert!(text.contains("Expected: TTFT and TPOT recover once evictions stop."));
     assert!(text.contains("Lower --max-num-seqs to reduce KV demand"));
     assert!(text.contains("Switch --kv-cache-dtype fp8"));
@@ -3204,7 +3215,7 @@ fn cause_line_peak_matches_summary_snapshot() {
         "http://127.0.0.1:8000/metrics",
     )
     .join("\n");
-    assert!(text.contains("KV cache 95% avg, 95% peak (threshold: 88%)."));
+    assert!(text.contains("KV cache 95% avg in fired windows, 95% peak (threshold: 88%)."));
     assert!(!text.contains("92% avg"));
 }
 
@@ -3269,7 +3280,7 @@ fn backlog_display_matches_spec() {
         .clone();
     let display = r.display_lines.join("\n");
     assert!(display.contains("[!] KV Cache Pressure: Admission Backlog"));
-    assert!(display.contains("KV cache 90% avg, 90% peak (threshold: 88%)"));
+    assert!(display.contains("KV cache 90% avg in fired windows, 90% peak (threshold: 88%)"));
     assert!(display.contains("Raise --gpu-memory-utilization"));
     assert!(
         display.contains("Lower --max-num-seqs to reduce KV demand"),

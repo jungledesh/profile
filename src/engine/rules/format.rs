@@ -708,6 +708,8 @@ mod load_hint_tests {
                 ..Default::default()
             },
             gpus: vec![GpuRawMetrics::default()],
+
+            host_memory: None,
         })
     }
 
@@ -723,6 +725,8 @@ mod load_hint_tests {
                 ..Default::default()
             },
             gpus: vec![GpuRawMetrics::default()],
+
+            host_memory: None,
         })
     }
 
@@ -1093,6 +1097,8 @@ mod stuck_fix_reveal_tests {
                 ..Default::default()
             },
             gpus: vec![GpuRawMetrics::default()],
+
+            host_memory: None,
         })
     }
 
