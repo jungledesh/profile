@@ -23,6 +23,10 @@ const DECODE_EFFICIENCY_GATE: f64 = 40.0;
 const PROMPT_SKEW_RATIO: f64 = 5.0;
 const SKEWED_EXPECTED: &str = "Eliminates head-of-line blocking from long-tail prompts.";
 
+/// Subline on the budget bullet when chunked prefill is off or unknown.
+/// 8-space caution indent via [`super::push_bullet_with_subline`].
+const CHUNKED_PREFILL_BUDGET_DEPENDENCY: &str = "Takes effect only with chunked prefill on.";
+
 /// Fixed label column width for R6 metric rows (longest label: "Prefill ratio").
 const R6_METRIC_LABEL_W: usize = 20;
 
@@ -106,19 +110,127 @@ fn batch_budget_paren(d: &PrefillBoundDetail) -> Option<&'static str> {
         })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchTokenPrescription {
+    /// Row 1: ideal >= floor, or dense default tier with no floor.
+    Ideal {
+        value: u64,
+        est_paren: Option<&'static str>,
+    },
+    /// Rows 2 and 4: floor > ideal, prescribe floor.
+    FloorLimited { value: u64 },
+    /// Row 3: at page floor within band; no target number.
+    TerminalAtFloor { floor: u32 },
+    /// Row 6: hybrid or unknown model, no scraped floor.
+    HybridFloorUnknown,
+    /// Row 7: scraped floor, no derived ideal tier.
+    DirectionOnly { floor: u32 },
+}
+
+fn current_within_floor_band(current: u32, floor: u32) -> bool {
+    let c = f64::from(current);
+    let f = f64::from(floor);
+    f > 0.0 && (c - f).abs() / f <= R6_BUDGET_BAND
+}
+
+fn ideal_budget_tier(d: &PrefillBoundDetail) -> Option<u64> {
+    let (value, tier) = batch_token_budget(d);
+    match tier {
+        BatchBudgetTier::Ridge | BatchBudgetTier::Workload => Some(value),
+        BatchBudgetTier::Default => None,
+    }
+}
+
+fn resolve_batch_token_prescription(d: &PrefillBoundDetail) -> BatchTokenPrescription {
+    let floor = d.chunk_floor;
+    if let Some(ideal_val) = ideal_budget_tier(d) {
+        if let Some(floor) = floor {
+            if ideal_val >= u64::from(floor) {
+                return BatchTokenPrescription::Ideal {
+                    value: ideal_val,
+                    est_paren: batch_budget_paren(d),
+                };
+            }
+            if let Some(current) = d.max_num_batched_tokens
+                && current_within_floor_band(current, floor)
+            {
+                return BatchTokenPrescription::TerminalAtFloor { floor };
+            }
+            return BatchTokenPrescription::FloorLimited {
+                value: u64::from(floor),
+            };
+        }
+        if d.is_hybrid || !d.model_in_catalog {
+            return BatchTokenPrescription::HybridFloorUnknown;
+        }
+        return BatchTokenPrescription::Ideal {
+            value: ideal_val,
+            est_paren: batch_budget_paren(d).or(Some("(est)")),
+        };
+    }
+    if let Some(floor) = floor {
+        return BatchTokenPrescription::DirectionOnly { floor };
+    }
+    if d.is_hybrid || !d.model_in_catalog {
+        return BatchTokenPrescription::HybridFloorUnknown;
+    }
+    let (value, _) = batch_token_budget(d);
+    BatchTokenPrescription::Ideal {
+        value,
+        est_paren: None,
+    }
+}
+
+fn batch_token_budget_bullets(d: &PrefillBoundDetail, verb: &str) -> Vec<String> {
+    match resolve_batch_token_prescription(d) {
+        BatchTokenPrescription::Ideal { value, est_paren } => {
+            let tail = match est_paren {
+                Some(paren) => format!(
+                    " {paren} to shrink prefill chunk size. Lower for smoother TPOT, raise for lower TTFT."
+                ),
+                None => {
+                    " to shrink prefill chunk size. Lower for smoother TPOT, raise for lower TTFT."
+                        .to_string()
+                }
+            };
+            vec![format!(
+                "      • {verb} --max-num-batched-tokens to {value}{tail}"
+            )]
+        }
+        BatchTokenPrescription::FloorLimited { value } => vec![format!(
+            "      • {verb} --max-num-batched-tokens to {value} (floor-limited; page alignment) to shrink prefill chunk size. Lower for smoother TPOT, raise for lower TTFT."
+        )],
+        BatchTokenPrescription::TerminalAtFloor { floor } => vec![format!(
+            "      • Prefill chunk size is at the page floor ({floor}); no smaller value boots on this server."
+        )],
+        BatchTokenPrescription::HybridFloorUnknown => vec![
+            "      • Confirm page size in vLLM boot logs, then set --max-num-batched-tokens manually."
+                .to_string(),
+        ],
+        BatchTokenPrescription::DirectionOnly { floor } => vec![format!(
+            "      • {verb} --max-num-batched-tokens lower to shrink prefill chunk size (not below {floor}). Lower for smoother TPOT, raise for lower TTFT."
+        )],
+    }
+}
+
 fn batch_budget_fix_bullet(d: &PrefillBoundDetail, verb: &str) -> String {
-    let (budget, _) = batch_token_budget(d);
-    match batch_budget_paren(d) {
-        Some(paren) => {
-            format!(
-                "      • {verb} --max-num-batched-tokens to {budget} {paren} to shrink prefill chunk size. Lower for smoother TPOT, raise for lower TTFT."
-            )
+    batch_token_budget_bullets(d, verb)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| {
+            format!("      • {verb} --max-num-batched-tokens to shrink prefill chunk size.")
+        })
+}
+
+fn batch_token_prescription_expected(d: &PrefillBoundDetail) -> &'static str {
+    match resolve_batch_token_prescription(d) {
+        BatchTokenPrescription::TerminalAtFloor { .. } => {
+            "No setting on this server makes prefill chunks smaller. Chunk size stays as is."
         }
-        None => {
-            format!(
-                "      • {verb} --max-num-batched-tokens to {budget} to shrink prefill chunk size. Lower for smoother TPOT, raise for lower TTFT."
-            )
+        BatchTokenPrescription::HybridFloorUnknown => {
+            "No scraped page floor; confirm boot geometry before setting chunk size."
         }
+        _ => "Lower TTFT variance, steadier decode throughput.",
     }
 }
 
@@ -158,8 +270,8 @@ fn compute_wall_fix_lines(d: &PrefillBoundDetail) -> (Vec<String>, String) {
 
 fn knob_fix_lines(d: &PrefillBoundDetail) -> (Vec<String>, String) {
     (
-        vec![batch_budget_fix_bullet(d, "Set")],
-        "Lower TTFT variance, steadier decode throughput.".to_string(),
+        batch_token_budget_bullets(d, "Set"),
+        batch_token_prescription_expected(d).to_string(),
     )
 }
 
@@ -183,6 +295,10 @@ pub struct PrefillBoundDetail {
     pub max_num_batched_tokens: Option<u32>,
     /// Hybrid/linear catalog model: ridge budget is optimistic on long prompts.
     pub is_hybrid: bool,
+    /// Scraped `cache_config.block_size`; minimum bootable chunk size.
+    pub chunk_floor: Option<u32>,
+    /// Catalog matched at context build; unknown models defer to hybrid floor rules.
+    pub model_in_catalog: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,6 +332,7 @@ pub struct PrefillBoundEvalInput<'a> {
     /// Gauge else config; resolved by the caller before evaluate.
     pub max_num_batched_tokens: Option<u32>,
     pub is_hybrid: bool,
+    pub model_in_catalog: bool,
 }
 
 pub fn severity(prompt_gen_ratio: f64) -> Severity {
@@ -280,6 +397,7 @@ pub fn evaluate(input: PrefillBoundEvalInput<'_>) -> Rule6Outcome {
         ridge_batch_size,
         max_num_batched_tokens,
         is_hybrid,
+        model_in_catalog,
     } = input;
     let Some(raw_prompt_tps) = prompt_tokens_per_sec.filter(|v| v.is_finite() && *v > 0.0) else {
         return Rule6Outcome::NotFired;
@@ -345,6 +463,8 @@ pub fn evaluate(input: PrefillBoundEvalInput<'_>) -> Rule6Outcome {
         ridge_batch_size,
         max_num_batched_tokens,
         is_hybrid,
+        chunk_floor: super::chunk_batched_tokens_floor(&snapshot.vllm.cache_config),
+        model_in_catalog,
     })
 }
 
@@ -387,6 +507,8 @@ pub(super) fn aggregate_r6_detail(details: &[PrefillBoundDetail]) -> PrefillBoun
         ridge_batch_size: details.first().and_then(|d| d.ridge_batch_size),
         max_num_batched_tokens: details.first().and_then(|d| d.max_num_batched_tokens),
         is_hybrid: details.first().is_some_and(|d| d.is_hybrid),
+        chunk_floor: details.first().and_then(|d| d.chunk_floor),
+        model_in_catalog: details.first().is_some_and(|d| d.model_in_catalog),
     }
 }
 
@@ -424,12 +546,22 @@ pub(super) fn prefill_fix_lines(d: &PrefillBoundDetail, sev: Severity) -> (Vec<S
             "20-40% reduction in prefill time for workloads with shared prefixes.".to_string(),
         )
     } else if chunked_not_enabled {
-        let bullet = batch_budget_fix_bullet(d, "Set");
+        // Budget knob is inert without chunked prefill. State the dependency on
+        // the budget bullet so both land in one restart. Skip when the budget
+        // line is terminal (nothing prescribed to "take effect").
+        let mut bullets =
+            vec!["      • Enable chunked prefill (--enable-chunked-prefill).".to_string()];
+        let actionable = !matches!(
+            resolve_batch_token_prescription(d),
+            BatchTokenPrescription::TerminalAtFloor { .. }
+        );
+        super::push_bullet_with_subline(
+            &mut bullets,
+            batch_budget_fix_bullet(d, "Set"),
+            actionable.then_some(CHUNKED_PREFILL_BUDGET_DEPENDENCY),
+        );
         (
-            vec![
-                "      • Enable chunked prefill (--enable-chunked-prefill).".to_string(),
-                bullet,
-            ],
+            bullets,
             "Decode batches interleave with prefill, reducing head-of-line blocking.".to_string(),
         )
     } else if sev == Severity::Severe && d.prefix_caching_enabled == Some(true) && chunked_on {
@@ -625,6 +757,7 @@ mod tests {
             ridge_batch_size: None,
             max_num_batched_tokens: None,
             is_hybrid: false,
+            model_in_catalog: true,
         })
     }
 
@@ -645,6 +778,7 @@ mod tests {
             ridge_batch_size: None,
             max_num_batched_tokens: None,
             is_hybrid: false,
+            model_in_catalog: true,
         });
         assert!(matches!(result, Rule6Outcome::NotFired));
     }
@@ -858,6 +992,7 @@ mod tests {
             ridge_batch_size: None,
             max_num_batched_tokens: None,
             is_hybrid: false,
+            model_in_catalog: true,
         });
         assert!(matches!(result, Rule6Outcome::NotFired));
     }
@@ -889,6 +1024,8 @@ mod tests {
             ridge_batch_size: None,
             max_num_batched_tokens: None,
             is_hybrid: false,
+            chunk_floor: None,
+            model_in_catalog: true,
         };
         let inf_window = PrefillBoundDetail {
             prompt_gen_ratio: f64::INFINITY,
@@ -920,6 +1057,8 @@ mod tests {
             ridge_batch_size: None,
             max_num_batched_tokens: None,
             is_hybrid: false,
+            chunk_floor: None,
+            model_in_catalog: true,
         };
         let agg = aggregate_r6_detail(&[d.clone(), d]);
         assert!(agg.prompt_gen_ratio.is_infinite());
@@ -948,6 +1087,8 @@ mod tests {
             ridge_batch_size: None,
             max_num_batched_tokens: None,
             is_hybrid: false,
+            chunk_floor: None,
+            model_in_catalog: true,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
         assert!(text.contains("Route long-context requests"));
@@ -986,6 +1127,8 @@ mod tests {
             ridge_batch_size: None,
             max_num_batched_tokens: None,
             is_hybrid: false,
+            chunk_floor: None,
+            model_in_catalog: true,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
         assert!(!text.contains("Enable --enable-chunked-prefill to interleave short requests"));
@@ -1014,6 +1157,8 @@ mod tests {
             ridge_batch_size: None,
             max_num_batched_tokens: None,
             is_hybrid: false,
+            chunk_floor: None,
+            model_in_catalog: true,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
         assert!(text.contains("--enable-prefix-caching"));
@@ -1036,10 +1181,78 @@ mod tests {
             ridge_batch_size: None,
             max_num_batched_tokens: None,
             is_hybrid: false,
+            chunk_floor: None,
+            model_in_catalog: true,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
         assert!(text.contains("--enable-chunked-prefill"));
+        assert!(text.contains("Set --max-num-batched-tokens"));
+        assert!(text.contains(CHUNKED_PREFILL_BUDGET_DEPENDENCY));
         assert!(!text.contains("Disaggregate prefill and decode"));
+        // Subline sits under the budget bullet, not the enable bullet.
+        let lines: Vec<&str> = text.lines().collect();
+        let budget_idx = lines
+            .iter()
+            .position(|l| l.contains("Set --max-num-batched-tokens"))
+            .expect("budget bullet");
+        assert!(
+            lines[budget_idx + 1].contains(CHUNKED_PREFILL_BUDGET_DEPENDENCY),
+            "dependency subline under budget: {}",
+            lines[budget_idx + 1]
+        );
+        assert!(lines[budget_idx + 1].starts_with("        "));
+    }
+
+    #[test]
+    fn chunked_unknown_budget_bullet_carries_dependency_subline() {
+        let d = PrefillBoundDetail {
+            prompt_gen_ratio: 10.0,
+            decode_efficiency_pct: 8.0,
+            tpot_ms: Some(80.0),
+            tpot_floor_ms: Some(7.85),
+            tpot_unverified: false,
+            prefix_caching_enabled: Some(true),
+            chunked_prefill_enabled: None,
+            prompt_tokens_mean: Some(4096.0),
+            prompt_tokens_p99: Some(6000.0),
+            prompt_skew_ratio: Some(1.46),
+            running_count: None,
+            ridge_batch_size: None,
+            max_num_batched_tokens: None,
+            is_hybrid: false,
+            chunk_floor: None,
+            model_in_catalog: true,
+        };
+        let text = format_prefill_bound_window_issue(&d, 100).join("\n");
+        assert!(text.contains("Enable chunked prefill (--enable-chunked-prefill)."));
+        assert!(text.contains("Set --max-num-batched-tokens"));
+        assert!(text.contains(CHUNKED_PREFILL_BUDGET_DEPENDENCY));
+    }
+
+    #[test]
+    fn chunked_on_budget_bullet_has_no_dependency_subline() {
+        let d = PrefillBoundDetail {
+            prompt_gen_ratio: 12.0,
+            decode_efficiency_pct: 8.0,
+            tpot_ms: Some(80.0),
+            tpot_floor_ms: Some(7.85),
+            tpot_unverified: false,
+            prefix_caching_enabled: Some(true),
+            chunked_prefill_enabled: Some(true),
+            prompt_tokens_mean: Some(4096.0),
+            prompt_tokens_p99: Some(6000.0),
+            prompt_skew_ratio: Some(1.46),
+            running_count: None,
+            ridge_batch_size: None,
+            max_num_batched_tokens: None,
+            is_hybrid: false,
+            chunk_floor: None,
+            model_in_catalog: true,
+        };
+        let text = format_prefill_bound_window_issue(&d, 100).join("\n");
+        assert!(!text.contains("Enable chunked prefill (--enable-chunked-prefill)."));
+        assert!(text.contains("Set --max-num-batched-tokens to 2048"));
+        assert!(!text.contains(CHUNKED_PREFILL_BUDGET_DEPENDENCY));
     }
 
     #[test]
@@ -1059,6 +1272,8 @@ mod tests {
             ridge_batch_size: None,
             max_num_batched_tokens: None,
             is_hybrid: false,
+            chunk_floor: None,
+            model_in_catalog: true,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
         assert!(text.contains("Set --max-num-batched-tokens to 2048"));
@@ -1083,6 +1298,8 @@ mod tests {
             ridge_batch_size: None,
             max_num_batched_tokens: None,
             is_hybrid: false,
+            chunk_floor: None,
+            model_in_catalog: true,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
         assert!(text.contains("Disaggregate prefill and decode"));
@@ -1105,6 +1322,8 @@ mod tests {
             ridge_batch_size: None,
             max_num_batched_tokens: None,
             is_hybrid: false,
+            chunk_floor: None,
+            model_in_catalog: true,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
         assert!(text.contains("avg when prefill-bound"));
@@ -1128,6 +1347,8 @@ mod tests {
             ridge_batch_size: None,
             max_num_batched_tokens: None,
             is_hybrid: false,
+            chunk_floor: None,
+            model_in_catalog: true,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
         assert!(text.contains("Reduce prompt length where possible"));
@@ -1150,6 +1371,8 @@ mod tests {
             ridge_batch_size: None,
             max_num_batched_tokens: None,
             is_hybrid: false,
+            chunk_floor: None,
+            model_in_catalog: true,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
         assert!(!text.contains("Reduce prompt length where possible"));
@@ -1173,6 +1396,8 @@ mod tests {
             ridge_batch_size: None,
             max_num_batched_tokens: None,
             is_hybrid: false,
+            chunk_floor: None,
+            model_in_catalog: true,
         };
         assert!(skewed_mode(&d));
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
@@ -1200,6 +1425,8 @@ mod tests {
             ridge_batch_size: None,
             max_num_batched_tokens: None,
             is_hybrid: false,
+            chunk_floor: None,
+            model_in_catalog: true,
         };
         let skewed_lines = format_prefill_bound_window_issue(&skewed, 40);
         assert_eq!(
@@ -1231,6 +1458,8 @@ mod tests {
             ridge_batch_size: None,
             max_num_batched_tokens: None,
             is_hybrid: false,
+            chunk_floor: None,
+            model_in_catalog: true,
         };
         let uniform_lines = format_prefill_bound_window_issue(&uniform, 100);
         assert_eq!(
@@ -1268,6 +1497,8 @@ mod tests {
             ridge_batch_size: None,
             max_num_batched_tokens: None,
             is_hybrid: false,
+            chunk_floor: None,
+            model_in_catalog: true,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
         assert!(text.contains("Set --max-num-batched-tokens to 896"));
@@ -1300,6 +1531,8 @@ mod tests {
             ridge_batch_size: Some(153.0),
             max_num_batched_tokens: None,
             is_hybrid: false,
+            chunk_floor: None,
+            model_in_catalog: true,
         };
         assert_eq!(batch_token_budget(&d).0, 256);
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
@@ -1329,6 +1562,8 @@ mod tests {
             ridge_batch_size: Some(153.0),
             max_num_batched_tokens: None,
             is_hybrid: false,
+            chunk_floor: None,
+            model_in_catalog: true,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
         assert!(text.contains(
@@ -1354,6 +1589,8 @@ mod tests {
             ridge_batch_size: Some(153.0),
             max_num_batched_tokens: None,
             is_hybrid: true,
+            chunk_floor: Some(128),
+            model_in_catalog: true,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
         assert!(text.contains(
@@ -1379,6 +1616,8 @@ mod tests {
             ridge_batch_size: None,
             max_num_batched_tokens: None,
             is_hybrid: false,
+            chunk_floor: None,
+            model_in_catalog: true,
         };
         assert_eq!(batch_token_budget(&d).0, DEFAULT_BATCH_TOKEN_BUDGET);
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
@@ -1407,6 +1646,8 @@ mod tests {
             ridge_batch_size: ridge,
             max_num_batched_tokens: configured,
             is_hybrid: false,
+            chunk_floor: None,
+            model_in_catalog: true,
         }
     }
 
@@ -1465,6 +1706,8 @@ mod tests {
             ridge_batch_size: None,
             max_num_batched_tokens: Some(2048),
             is_hybrid: false,
+            chunk_floor: None,
+            model_in_catalog: true,
         };
         assert_eq!(batch_token_budget(&d), (2048, BatchBudgetTier::Default));
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
@@ -1506,5 +1749,237 @@ mod tests {
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
         assert!(text.contains("no single-GPU knob adds FLOPs"));
         assert!(!text.contains("--max-num-batched-tokens"));
+    }
+
+    /// Class-example hybrid page floor (14 × 112); not a production constant.
+    const HYBRID_ALIGN_FLOOR_EXAMPLE: u32 = 14 * 112;
+
+    fn hybrid_align_floor_detail(max_num_batched_tokens: Option<u32>) -> PrefillBoundDetail {
+        PrefillBoundDetail {
+            prompt_gen_ratio: 12.0,
+            decode_efficiency_pct: 8.0,
+            tpot_ms: Some(80.0),
+            tpot_floor_ms: Some(7.85),
+            tpot_unverified: false,
+            prefix_caching_enabled: Some(true),
+            chunked_prefill_enabled: Some(true),
+            prompt_tokens_mean: Some(4096.0),
+            prompt_tokens_p99: Some(6000.0),
+            prompt_skew_ratio: Some(1.46),
+            running_count: Some(90.0),
+            ridge_batch_size: Some(295.2),
+            max_num_batched_tokens,
+            is_hybrid: true,
+            chunk_floor: Some(HYBRID_ALIGN_FLOOR_EXAMPLE),
+            model_in_catalog: true,
+        }
+    }
+
+    fn prescription_numbers(text: &str) -> Vec<u64> {
+        let mut out = Vec::new();
+        for line in text.lines() {
+            if !line.contains("--max-num-batched-tokens") {
+                continue;
+            }
+            if let Some(rest) = line.split("to ").nth(1)
+                && let Some(tok) = rest.split_whitespace().next()
+                && let Ok(n) = tok.parse::<u64>()
+            {
+                out.push(n);
+            }
+            if let Some(idx) = line.find("not below ") {
+                let rest = &line[idx + "not below ".len()..];
+                if let Some(tok) = rest.split_whitespace().next()
+                    && let Ok(n) = tok.parse::<u64>()
+                {
+                    out.push(n);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn floor_limited_when_floor_above_ideal_and_current_high() {
+        let d = hybrid_align_floor_detail(Some(8192));
+        assert_eq!(batch_token_budget(&d).0, 384);
+        let text = format_prefill_bound_window_issue(&d, 100).join("\n");
+        assert!(text.contains(&format!(
+            "Set --max-num-batched-tokens to {HYBRID_ALIGN_FLOOR_EXAMPLE} (floor-limited; page alignment)"
+        )));
+        assert!(!text.contains("to 384"));
+    }
+
+    #[test]
+    fn terminal_at_floor_when_current_within_band() {
+        let d = hybrid_align_floor_detail(Some(HYBRID_ALIGN_FLOOR_EXAMPLE));
+        let text = format_prefill_bound_window_issue(&d, 100).join("\n");
+        assert!(text.contains(&format!(
+            "Prefill chunk size is at the page floor ({HYBRID_ALIGN_FLOOR_EXAMPLE}); no smaller value boots on this server."
+        )));
+        assert!(!text.contains("prefix caching"));
+        assert!(!text.contains("disable prefix"));
+        assert!(prescription_numbers(&text).is_empty());
+    }
+
+    #[test]
+    fn chunked_off_terminal_at_floor_omits_dependency_subline() {
+        let mut d = hybrid_align_floor_detail(Some(HYBRID_ALIGN_FLOOR_EXAMPLE));
+        d.chunked_prefill_enabled = Some(false);
+        let text = format_prefill_bound_window_issue(&d, 100).join("\n");
+        assert!(text.contains("Enable chunked prefill (--enable-chunked-prefill)."));
+        assert!(text.contains(&format!(
+            "Prefill chunk size is at the page floor ({HYBRID_ALIGN_FLOOR_EXAMPLE}); no smaller value boots on this server."
+        )));
+        assert!(
+            !text.contains(CHUNKED_PREFILL_BUDGET_DEPENDENCY),
+            "terminal statement has nothing to take effect: {text}"
+        );
+    }
+
+    #[test]
+    fn floor_limited_when_current_unknown() {
+        let d = hybrid_align_floor_detail(None);
+        let text = format_prefill_bound_window_issue(&d, 100).join("\n");
+        assert!(text.contains(&format!(
+            "Set --max-num-batched-tokens to {HYBRID_ALIGN_FLOOR_EXAMPLE} (floor-limited; page alignment)"
+        )));
+        assert!(!text.contains("to 384"));
+    }
+
+    #[test]
+    fn dense_no_floor_prescribes_ideal_with_parenthetical() {
+        let d = PrefillBoundDetail {
+            prompt_gen_ratio: 12.0,
+            decode_efficiency_pct: 8.0,
+            tpot_ms: Some(80.0),
+            tpot_floor_ms: Some(7.85),
+            tpot_unverified: false,
+            prefix_caching_enabled: Some(true),
+            chunked_prefill_enabled: Some(true),
+            prompt_tokens_mean: Some(4096.0),
+            prompt_tokens_p99: None,
+            prompt_skew_ratio: None,
+            running_count: None,
+            ridge_batch_size: Some(1638.4),
+            max_num_batched_tokens: Some(8192),
+            is_hybrid: false,
+            chunk_floor: None,
+            model_in_catalog: true,
+        };
+        let text = format_prefill_bound_window_issue(&d, 100).join("\n");
+        assert!(text.contains("Set --max-num-batched-tokens to 2048 (est)"));
+    }
+
+    #[test]
+    fn hybrid_no_floor_warns_without_number() {
+        let d = PrefillBoundDetail {
+            prompt_gen_ratio: 12.0,
+            decode_efficiency_pct: 8.0,
+            tpot_ms: Some(80.0),
+            tpot_floor_ms: Some(7.85),
+            tpot_unverified: false,
+            prefix_caching_enabled: Some(true),
+            chunked_prefill_enabled: Some(true),
+            prompt_tokens_mean: Some(4096.0),
+            prompt_tokens_p99: None,
+            prompt_skew_ratio: None,
+            running_count: None,
+            ridge_batch_size: Some(295.2),
+            max_num_batched_tokens: Some(8192),
+            is_hybrid: true,
+            chunk_floor: None,
+            model_in_catalog: false,
+        };
+        let text = format_prefill_bound_window_issue(&d, 100).join("\n");
+        assert!(text.contains("Confirm page size in vLLM boot logs"));
+        assert!(prescription_numbers(&text).is_empty());
+    }
+
+    #[test]
+    fn direction_only_when_floor_known_without_ideal() {
+        let d = PrefillBoundDetail {
+            prompt_gen_ratio: 12.0,
+            decode_efficiency_pct: 8.0,
+            tpot_ms: Some(80.0),
+            tpot_floor_ms: Some(7.85),
+            tpot_unverified: false,
+            prefix_caching_enabled: Some(true),
+            chunked_prefill_enabled: Some(true),
+            prompt_tokens_mean: None,
+            prompt_tokens_p99: None,
+            prompt_skew_ratio: None,
+            running_count: None,
+            ridge_batch_size: None,
+            max_num_batched_tokens: Some(8192),
+            is_hybrid: true,
+            chunk_floor: Some(HYBRID_ALIGN_FLOOR_EXAMPLE),
+            model_in_catalog: true,
+        };
+        let text = format_prefill_bound_window_issue(&d, 100).join("\n");
+        assert!(text.contains(&format!("not below {HYBRID_ALIGN_FLOOR_EXAMPLE}")));
+        assert!(!text.contains("to 2048"));
+        assert!(!text.contains("to 384"));
+    }
+
+    #[test]
+    fn crash_fixture_never_prescribes_below_scraped_floor() {
+        for current in [
+            Some(8192),
+            Some(HYBRID_ALIGN_FLOOR_EXAMPLE),
+            None,
+            Some(384),
+        ] {
+            let d = hybrid_align_floor_detail(current);
+            let knob = format_prefill_bound_window_issue(&d, 100).join("\n");
+            for n in prescription_numbers(&knob) {
+                assert!(
+                    n >= u64::from(d.chunk_floor.unwrap()),
+                    "prescribed {n} below floor {:?} (current {current:?})",
+                    d.chunk_floor
+                );
+            }
+            let mut chunked_off = d.clone();
+            chunked_off.chunked_prefill_enabled = Some(false);
+            let off = format_prefill_bound_window_issue(&chunked_off, 100).join("\n");
+            for n in prescription_numbers(&off) {
+                assert!(n >= u64::from(d.chunk_floor.unwrap()));
+            }
+        }
+    }
+
+    #[test]
+    fn prescription_numbers_respect_floor_across_fired_fixtures() {
+        let fixtures = [
+            hybrid_align_floor_detail(Some(8192)),
+            hybrid_align_floor_detail(Some(HYBRID_ALIGN_FLOOR_EXAMPLE)),
+            hybrid_align_floor_detail(None),
+            wall_path_base(Some(2048), Some(1638.4), Some(true), 12.0),
+            wall_path_base(Some(1024), Some(1638.4), Some(true), 12.0),
+        ];
+        for d in fixtures {
+            let text = format_prefill_bound_window_issue(&d, 100).join("\n");
+            if let Some(floor) = d.chunk_floor {
+                for n in prescription_numbers(&text) {
+                    assert!(
+                        n >= u64::from(floor),
+                        "fixture floor {floor}, printed {n}: {text}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chunk_floor_reader_uses_block_size_label_only() {
+        let cache = CacheConfigLabels {
+            block_size: Some(HYBRID_ALIGN_FLOOR_EXAMPLE),
+            mamba_block_size: Some(16),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::super::chunk_batched_tokens_floor(&cache),
+            Some(HYBRID_ALIGN_FLOOR_EXAMPLE)
+        );
     }
 }

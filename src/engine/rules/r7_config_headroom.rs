@@ -301,6 +301,7 @@ mod tests {
                 ..Default::default()
             },
             gpus: vec![],
+            host_memory: None,
         }
     }
 

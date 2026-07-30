@@ -17,6 +17,7 @@ pub(crate) struct RawSnapshotFixture {
     pub timestamp: SystemTime,
     pub vllm: VllmRawMetrics,
     pub gpus: Vec<GpuRawMetrics>,
+    pub host_memory: Option<super::HostMemoryFacts>,
 }
 
 impl Default for RawSnapshotFixture {
@@ -28,11 +29,16 @@ impl Default for RawSnapshotFixture {
             timestamp: t,
             vllm: VllmRawMetrics::default(),
             gpus: vec![],
+            host_memory: None,
         }
     }
 }
 
 impl RawSnapshotFixture {
+    pub fn host_memory(mut self, facts: Option<super::HostMemoryFacts>) -> Self {
+        self.host_memory = facts;
+        self
+    }
     pub fn vllm(mut self, vllm: VllmRawMetrics) -> Self {
         self.vllm = vllm;
         self
@@ -57,6 +63,7 @@ impl RawSnapshotFixture {
             timestamp: self.timestamp,
             vllm: self.vllm,
             gpus: self.gpus,
+            host_memory: self.host_memory,
         }
     }
 }

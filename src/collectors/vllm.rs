@@ -556,6 +556,7 @@ pub fn collect_vllm_metrics_for(
     let mut last_scrape: Option<Scrape> = None;
     let mut kv_cache_peak_perc: Option<f64> = None;
     let mut num_requests_running_peak: Option<f64> = None;
+    let mut num_requests_waiting_peak: Option<f64> = None;
 
     run_sampling_loop(sample_count, |i| {
         let body = fetch_metrics_body(&client, &url)?;
@@ -566,6 +567,10 @@ pub fn collect_vllm_metrics_for(
         if let Some(r) = first_gauge(&scrape, "vllm_num_requests_running").filter(|x| x.is_finite())
         {
             num_requests_running_peak = Some(num_requests_running_peak.map_or(r, |p| p.max(r)));
+        }
+        if let Some(w) = first_gauge(&scrape, "vllm_num_requests_waiting").filter(|x| x.is_finite())
+        {
+            num_requests_waiting_peak = Some(num_requests_waiting_peak.map_or(w, |p| p.max(w)));
         }
         prefix_samples.push(prefix_scrape_sample(&scrape));
 
@@ -589,6 +594,7 @@ pub fn collect_vllm_metrics_for(
     let mut m = parse_vllm_metrics(&last_scrape)?;
     m.kv_cache_peak_perc = kv_cache_peak_perc;
     m.num_requests_running_peak = num_requests_running_peak;
+    m.num_requests_waiting_peak = num_requests_waiting_peak;
 
     let rates = compute_counter_rates(&first_scrape, &last_scrape, window_secs);
     m.generation_tokens_per_sec = rates.generation_tokens_per_sec;
@@ -735,6 +741,8 @@ fn parse_vllm_metrics(scrape: &Scrape) -> Result<VllmRawMetrics> {
         num_requests_running,
         num_requests_running_peak: None,
         num_requests_waiting,
+        num_requests_waiting_peak: None,
+        kv_frac_per_running_peak: None,
         kv_cache_usage_perc,
         kv_cache_avg_perc: None,
         kv_cache_peak_perc: None,

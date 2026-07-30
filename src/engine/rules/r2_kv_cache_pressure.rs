@@ -81,6 +81,8 @@ fn push_kv_pressure_safe_levers(
     kv_headroom_gb: Option<f64>,
     kv_cache_dtype: Option<&str>,
     fp8_compiler_available: bool,
+    model: Option<&crate::context::ModelArch>,
+    tp: Option<u32>,
 ) {
     if let Some(bullet) = prefix_caching_fix_bullet(snapshot) {
         safe.push(bullet);
@@ -91,29 +93,156 @@ fn push_kv_pressure_safe_levers(
     if let Some(bullet) = fp8_kv_cache_fix_bullet(kv_cache_dtype, fp8_compiler_available) {
         safe.push(bullet);
     }
-    push_kv_offload_fix_last(safe, &snapshot.vllm.cache_config);
+    push_kv_offload_fix_last(safe, snapshot, kv_headroom_gb, kv_cache_dtype, model, tp);
 }
 
-fn prefix_caching_fix_bullet(snapshot: &RawSnapshot) -> Option<String> {
-    if snapshot.vllm.cache_config.enable_prefix_caching != Some(true)
-        && snapshot
-            .vllm
-            .prompt_tokens_mean
-            .is_some_and(|t| t >= PREFIX_CACHING_LONG_PROMPT_MIN_TOKENS)
-    {
-        Some(
-            "      • Enable --enable-prefix-caching to share KV blocks across identical prompt prefixes"
-                .to_string(),
-        )
-    } else {
-        None
+fn push_kv_offload_fix_last(
+    safe: &mut Vec<String>,
+    snapshot: &RawSnapshot,
+    kv_headroom_gb: Option<f64>,
+    kv_cache_dtype: Option<&str>,
+    model: Option<&crate::context::ModelArch>,
+    tp: Option<u32>,
+) {
+    if snapshot.vllm.cache_config.kv_offloading != crate::collectors::KvOffloadState::Off {
+        return;
+    }
+    let size = resolve_kv_offload_size_gib(KvOffloadSizeInput {
+        host_memory: snapshot.host_memory,
+        pool_bytes: super::resolve_kv_pool_bytes(
+            kv_headroom_gb,
+            model,
+            kv_cache_dtype,
+            tp,
+            Some(&snapshot.vllm.cache_config),
+        ),
+        kv_frac_per_running_peak: peak_kv_frac_per_running(snapshot),
+        preempt_per_sec: snapshot.vllm.num_preemptions_per_sec,
+        run_duration_secs: snapshot.vllm.window_duration_secs,
+        peak_waiting: peak_waiting(snapshot),
+    });
+    let bullet = kv_offload_fix_bullet(size);
+    let subline = format_kv_offload_subline(snapshot.host_memory);
+    super::push_bullet_with_subline(safe, bullet, Some(&subline));
+}
+
+fn peak_waiting(snapshot: &RawSnapshot) -> Option<f64> {
+    snapshot
+        .vllm
+        .num_requests_waiting_peak
+        .or(snapshot.vllm.num_requests_waiting)
+        .filter(|w| w.is_finite())
+}
+
+fn peak_kv_frac_per_running(snapshot: &RawSnapshot) -> Option<f64> {
+    snapshot
+        .vllm
+        .kv_frac_per_running_peak
+        .filter(|f| f.is_finite() && *f > 0.0)
+        .or_else(|| {
+            let running = snapshot
+                .vllm
+                .num_requests_running
+                .filter(|r| r.is_finite() && *r >= 1.0)?;
+            let kv = snapshot
+                .vllm
+                .kv_cache_usage_perc
+                .filter(|k| k.is_finite())?;
+            let frac = (kv / 100.0) / running;
+            frac.is_finite().then_some(frac).filter(|f| *f > 0.0)
+        })
+}
+
+/// Host RAM reserve kept free so the OOM killer stays away. Judgment, provisional.
+pub(super) const KV_OFFLOAD_RESERVE_FRACTION: f64 = 0.5;
+
+const GIB_BYTES: f64 = 1024.0 * 1024.0 * 1024.0;
+
+/// Round demand/supply bytes up to a whole GiB for `--kv-offloading-size`.
+pub(super) fn ceil_bytes_to_whole_gib(bytes: f64) -> Option<u64> {
+    if !bytes.is_finite() || bytes <= 0.0 {
+        return None;
+    }
+    let gib = (bytes / GIB_BYTES).ceil();
+    (gib.is_finite() && gib > 0.0 && gib <= u64::MAX as f64).then_some(gib as u64)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct KvOffloadSizeInput {
+    pub host_memory: Option<crate::collectors::HostMemoryFacts>,
+    pub pool_bytes: Option<u64>,
+    pub kv_frac_per_running_peak: Option<f64>,
+    pub preempt_per_sec: Option<f64>,
+    pub run_duration_secs: Option<f64>,
+    pub peak_waiting: Option<f64>,
+}
+
+fn usable_host_bytes(facts: crate::collectors::HostMemoryFacts) -> u64 {
+    match facts.container_limit_bytes {
+        Some(lim) => facts.available_bytes.min(lim),
+        None => facts.available_bytes,
     }
 }
 
+/// Eviction-spill size in whole GiB, or `None` when any input is missing / zero.
+/// Never returns a number from a partial formula.
+pub(super) fn resolve_kv_offload_size_gib(input: KvOffloadSizeInput) -> Option<u64> {
+    let facts = input.host_memory?;
+    let usable = usable_host_bytes(facts);
+    if usable == 0 {
+        return None;
+    }
+    let pool = input.pool_bytes.filter(|&b| b > 0)?;
+    let frac = input
+        .kv_frac_per_running_peak
+        .filter(|f| f.is_finite() && *f > 0.0)?;
+    let preempt = input
+        .preempt_per_sec
+        .filter(|p| p.is_finite() && *p > 0.0)?;
+    let duration = input
+        .run_duration_secs
+        .filter(|d| d.is_finite() && *d > 0.0)?;
+    // Stock cap required when preempting: flow alone is forbidden.
+    let peak_waiting = input.peak_waiting.filter(|w| w.is_finite() && *w > 0.0)?;
+
+    let flow = preempt * duration;
+    if !flow.is_finite() || flow <= 0.0 {
+        return None;
+    }
+    let parked = flow.min(peak_waiting);
+    let per_seq = (pool as f64) * frac;
+    if !per_seq.is_finite() || per_seq <= 0.0 {
+        return None;
+    }
+    let demand = parked * per_seq;
+    let supply = KV_OFFLOAD_RESERVE_FRACTION * (usable as f64);
+    if !demand.is_finite() || !supply.is_finite() || supply <= 0.0 {
+        return None;
+    }
+    ceil_bytes_to_whole_gib(demand.min(supply))
+}
+
 const KV_OFFLOAD_FIX: &str = "      • Set --kv-offloading-size (GiB) to hold evicted KV in host memory instead of recomputing it";
-/// Host-RAM caution; rendered via [`super::push_bullet_with_subline`] (8-space indent).
-const KV_OFFLOAD_SUBLINE: &str =
+/// Fallback when host memory reads fail; rendered via [`super::push_bullet_with_subline`].
+const KV_OFFLOAD_SUBLINE_FALLBACK: &str =
     "Check host RAM and your container memory limit before allocating.";
+
+pub(super) fn format_kv_offload_subline(
+    facts: Option<crate::collectors::HostMemoryFacts>,
+) -> String {
+    use crate::collectors::host_memory::bytes_to_display_gib;
+    match facts {
+        Some(f) => {
+            let ram_gib = bytes_to_display_gib(f.available_bytes);
+            let limit = match f.container_limit_bytes {
+                Some(b) => format!("{} GiB", bytes_to_display_gib(b)),
+                None => "none".to_string(),
+            };
+            format!("Host RAM available: {ram_gib} GiB, container limit {limit}.")
+        }
+        None => KV_OFFLOAD_SUBLINE_FALLBACK.to_string(),
+    }
+}
 
 /// Dead-end verify: config labels read set; effect is what we cannot prove.
 const DEAD_END_VERIFY_BULLET: &str = "      • Verify prefix caching, gpu-memory-utilization, kv-cache-dtype and kv-offloading-size took effect.";
@@ -135,19 +264,28 @@ fn push_dead_end_fixes(safe: &mut Vec<String>) {
 }
 
 /// Suggest KV offload when the build exposes the label and size is off.
-fn kv_offload_fix_bullet(cache: &crate::collectors::CacheConfigLabels) -> Option<String> {
-    use crate::collectors::KvOffloadState;
-    match cache.kv_offloading {
-        KvOffloadState::Off => Some(KV_OFFLOAD_FIX.to_string()),
-        KvOffloadState::Unsupported | KvOffloadState::Enabled(_) | KvOffloadState::Unreadable => {
-            None
-        }
+fn kv_offload_fix_bullet(size_gib: Option<u64>) -> String {
+    match size_gib {
+        Some(n) => format!(
+            "      • Set --kv-offloading-size {n} (est) to hold evicted KV in host memory instead of recomputing it"
+        ),
+        None => KV_OFFLOAD_FIX.to_string(),
     }
 }
 
-fn push_kv_offload_fix_last(safe: &mut Vec<String>, cache: &crate::collectors::CacheConfigLabels) {
-    if let Some(bullet) = kv_offload_fix_bullet(cache) {
-        super::push_bullet_with_subline(safe, bullet, Some(KV_OFFLOAD_SUBLINE));
+fn prefix_caching_fix_bullet(snapshot: &RawSnapshot) -> Option<String> {
+    if snapshot.vllm.cache_config.enable_prefix_caching != Some(true)
+        && snapshot
+            .vllm
+            .prompt_tokens_mean
+            .is_some_and(|t| t >= PREFIX_CACHING_LONG_PROMPT_MIN_TOKENS)
+    {
+        Some(
+            "      • Enable --enable-prefix-caching to share KV blocks across identical prompt prefixes"
+                .to_string(),
+        )
+    } else {
+        None
     }
 }
 
@@ -495,6 +633,21 @@ impl<'a> KvFormatCtx<'a> {
     }
 }
 
+/// Fired-window KV evidence line shared by pressure and admission-backlog Cause.
+fn kv_cause_line(avg_s: &str, peak_s: &str, burst: bool) -> String {
+    if burst {
+        format!(
+            "      KV cache {avg_s} avg in fired windows, {peak_s} peak (burst pressure, threshold: {:.0}%).",
+            KV_CACHE_PRESSURE_MIN_PERC
+        )
+    } else {
+        format!(
+            "      KV cache {avg_s} avg in fired windows, {peak_s} peak (threshold: {:.0}%).",
+            KV_CACHE_PRESSURE_MIN_PERC
+        )
+    }
+}
+
 pub(super) fn format_kv_cache_pressure_fired(
     d: &KvCachePressureDetail,
     ctx: &KvFormatCtx<'_>,
@@ -525,30 +678,21 @@ pub(super) fn format_kv_cache_pressure_fired(
         .map(|v| format!("{v:.0}%"))
         .unwrap_or_else(|| "-".to_string());
     let burst = kv_avg.is_none_or(|avg| avg < KV_CACHE_PRESSURE_MIN_PERC);
-    if burst {
-        out.push(format!(
-            "      KV cache {avg_s} avg, {peak_s} peak (burst pressure, threshold: {:.0}%).",
-            KV_CACHE_PRESSURE_MIN_PERC
-        ));
-    } else {
-        out.push(format!(
-            "      KV cache {avg_s} avg, {peak_s} peak (threshold: {:.0}%).",
-            KV_CACHE_PRESSURE_MIN_PERC
-        ));
-    }
+    out.push(kv_cause_line(&avg_s, &peak_s, burst));
+    // Cause and crisis layout use the same summary snapshot as TRAFFIC preempt/s
+    // (run-level mean rate / swapped), not per-window any(). Otherwise a single
+    // spike can print "Scheduler evicting" while the header shows preempt/s 0.01.
+    // Waiting print uses the measured mean whenever present. The >2 queue bar is a
+    // fire gate only; gating display on it falsely claims "unavailable" for 0 < w ≤ 2.
+    let preemptions_active = eviction_signal_active(snapshot);
     let wait_count = snapshot.vllm.num_requests_waiting.filter(|v| v.is_finite());
-    let evidence = match (
-        d.preemptions_active,
-        d.queue_backpressure.then_some(wait_count).flatten(),
-    ) {
+    let evidence = match (preemptions_active, wait_count) {
         (true, Some(w)) => {
             format!("      Scheduler evicting; {w:.0} requests queued on KV admission.")
         }
         (true, None) => "      Scheduler evicting sequences to free KV blocks.".to_string(),
         (false, Some(w)) => format!("      {w:.0} requests queued on KV admission."),
         (false, None) => {
-            // Aggregate can keep queue_backpressure from earlier windows while the
-            // landing snapshot's waiting gauge is gone. Never panic in display.
             "      Scheduler queueing requests; waiting count unavailable this window.".to_string()
         }
     };
@@ -591,48 +735,35 @@ pub(super) fn format_kv_cache_pressure_fired(
         kv_headroom_gb,
         kv_cache_dtype,
         fp8_compiler_available,
+        ctx.model,
+        ctx.tp,
     );
 
     // Lowering seats always reduces KV demand, down to 1. At 1 there is nothing
     // left to lower and the KV wall is hardware.
-    let full_window_seat = full_window_seat_bullet(snapshot, kv_max_seqs, config_max_num_seqs);
-    // Gate only: the projection's value is unused, since the bullet carries no
-    // number. We offer the follow-on seat cut only when capacity at the new window
-    // is computable, from observed page geometry (dense via block_size, hybrid via
-    // mamba_block_size) or the catalog fallback. Unknown geometry means we cannot
-    // say the shorter window admits more sequences, so we stay quiet.
-    let follow_on_seat = if lead_with_shrink {
-        shrink.target.and_then(|suggested| {
-            super::capacity_at_hypothetical_max_len(suggested, max_model_len, &hyp)
-                .map(|_| FOLLOW_ON_SEAT_BULLET.to_string())
-        })
-    } else {
-        None
-    };
-
+    //
+    // Invariant: when the seat lever exists, exactly one seat line. Follow-on
+    // ("Then…") only when shrink leads with a projectable named target; otherwise
+    // the plain form. Crisis subline on the plain form only, gated by summary
+    // eviction (same as crisis layout).
+    let follow_on_seat = lead_with_shrink
+        && shrink.target.is_some_and(|suggested| {
+            super::capacity_at_hypothetical_max_len(suggested, max_model_len, &hyp).is_some()
+        });
     let mut cuts: Vec<super::CutBullet> = Vec::new();
     super::extend_with_shrink_suggestion(&mut cuts, shrink);
-    if let Some(fo) = follow_on_seat {
-        // Permanent seat at the new window, not a temporary throttle.
-        cuts.push((fo, None));
-    }
-
-    let has_other_fix = !safe.is_empty() || !cuts.is_empty();
-    if !has_other_fix {
-        if let Some(seat) = full_window_seat {
-            cuts.push((
-                seat,
-                d.preemptions_active.then_some(CRISIS_THROTTLE_SUBLINE),
-            ));
+    if seat_lever_available(snapshot, config_max_num_seqs) {
+        if follow_on_seat {
+            cuts.push((FOLLOW_ON_SEAT_BULLET.to_string(), None));
+        } else {
+            let seat = max_num_seqs_bullet(snapshot, kv_max_seqs);
+            let sub = preemptions_active.then_some(CRISIS_THROTTLE_SUBLINE);
+            if lead_with_shrink {
+                cuts.push((seat, sub));
+            } else {
+                cuts.insert(0, (seat, sub));
+            }
         }
-    } else if !lead_with_shrink && let Some(seat) = full_window_seat {
-        cuts.insert(
-            0,
-            (
-                seat,
-                d.preemptions_active.then_some(CRISIS_THROTTLE_SUBLINE),
-            ),
-        );
     }
 
     let has_fix = !safe.is_empty() || !cuts.is_empty();
@@ -640,7 +771,7 @@ pub(super) fn format_kv_cache_pressure_fired(
         push_dead_end_fixes(&mut safe);
     }
 
-    if d.preemptions_active {
+    if preemptions_active {
         // Crisis: flat Fix list, no group labels. Cuts before safe when shrink leads.
         let lead_with_cuts = lead_with_shrink;
         out.push("    Fix:".to_string());
@@ -654,13 +785,14 @@ pub(super) fn format_kv_cache_pressure_fired(
         let cuts_nonempty = !cuts.is_empty();
         if lead_with_cuts {
             emit_cuts(&mut out, cuts);
-            if cuts_nonempty && safe_nonempty {
+            // Subline already leaves one blank; do not add a second separator.
+            if cuts_nonempty && safe_nonempty && !out.last().is_some_and(|l| l.is_empty()) {
                 out.push(String::new());
             }
             out.extend(safe);
         } else {
             out.extend(safe);
-            if safe_nonempty && cuts_nonempty {
+            if safe_nonempty && cuts_nonempty && !out.last().is_some_and(|l| l.is_empty()) {
                 out.push(String::new());
             }
             emit_cuts(&mut out, cuts);
@@ -671,7 +803,7 @@ pub(super) fn format_kv_cache_pressure_fired(
         super::push_grouped_fixes(&mut out, safe, cuts, Vec::new(), lead_with_cuts);
     }
 
-    let expected = if d.preemptions_active {
+    let expected = if preemptions_active {
         "    Expected: TTFT and TPOT recover once evictions stop."
     } else {
         "    Expected: Wait queue drains, TTFT recovers once KV pool has capacity."
@@ -713,17 +845,7 @@ pub(super) fn format_kv_admission_backlog_issue(
         .map(|v| format!("{v:.0}%"))
         .unwrap_or_else(|| "-".to_string());
     let burst = d.kv_cache_usage_perc < KV_CACHE_PRESSURE_MIN_PERC;
-    if burst {
-        out.push(format!(
-            "      KV cache {avg_s} avg, {peak_s} peak (burst pressure, threshold: {:.0}%).",
-            KV_CACHE_PRESSURE_MIN_PERC
-        ));
-    } else {
-        out.push(format!(
-            "      KV cache {avg_s} avg, {peak_s} peak (threshold: {:.0}%).",
-            KV_CACHE_PRESSURE_MIN_PERC
-        ));
-    }
+    out.push(kv_cause_line(&avg_s, &peak_s, burst));
     out.push(format!(
         "      Free KV tokens: {:.0} available, {:.0} demanded (est, worst case).",
         d.free_kv_tokens, d.demand_tokens
@@ -741,6 +863,8 @@ pub(super) fn format_kv_admission_backlog_issue(
         ctx.kv_headroom_gb,
         kv_cache_dtype,
         ctx.fp8_compiler_available,
+        ctx.model,
+        ctx.tp,
     );
 
     let mut cuts: Vec<super::CutBullet> = Vec::new();
@@ -1478,10 +1602,14 @@ mod tests {
             4,
         )
         .join("\n");
-        assert!(text.contains("KV cache 90% avg, 90% peak (threshold: 88%)."));
+        assert!(text.contains("KV cache 90% avg in fired windows, 90% peak (threshold: 88%)."));
         assert!(text.contains("Free KV tokens: 160 available, 200 demanded (est, worst case)."));
         assert!(!text.contains("threshold: 88%). Free KV tokens"));
         assert!(!text.contains("burst pressure"));
+        assert!(
+            !text.contains("peak in fired windows"),
+            "peak must not carry the fired-windows label"
+        );
     }
 
     #[test]
@@ -1497,7 +1625,9 @@ mod tests {
             4,
         )
         .join("\n");
-        assert!(text.contains("KV cache 71% avg, 92% peak (burst pressure, threshold: 88%)."));
+        assert!(text.contains(
+            "KV cache 71% avg in fired windows, 92% peak (burst pressure, threshold: 88%)."
+        ));
         assert!(text.contains("Free KV tokens: 160 available, 200 demanded (est, worst case)."));
         assert!(!text.contains("threshold: 88%). Free KV tokens"));
     }
@@ -1959,6 +2089,54 @@ mod tests {
     }
 
     #[test]
+    fn cause_scheduler_evicting_follows_summary_rate_not_detail_flag() {
+        // Detail claims preemptions (as multi-window any() would), but summary
+        // rate matches TRAFFIC preempt/s below the 0.02 bar → no "Scheduler evicting".
+        let d = KvCachePressureDetail {
+            kv_cache_usage_perc: Some(93.0),
+            kv_peak_pct: Some(100.0),
+            preemptions_active: true,
+            queue_backpressure: true,
+        };
+        let v = VllmRawMetrics {
+            kv_cache_usage_perc: Some(93.0),
+            kv_cache_peak_perc: Some(100.0),
+            num_preemptions_per_sec: Some(0.01),
+            num_requests_waiting: Some(6.0),
+            ..Default::default()
+        };
+        let text = format_kv_cache_pressure_fired(&d, &kv_ctx(&snap(v), None, None, None), 3, 4)
+            .join("\n");
+        assert!(!text.contains("Scheduler evicting"));
+        assert!(text.contains("6 requests queued on KV admission"));
+    }
+
+    #[test]
+    fn cause_prints_below_bar_waiting_mean_not_unavailable() {
+        // Fired on per-window queue spikes; summary waiting 1.4 is below the >2
+        // fire bar but still measured. Must not claim "unavailable".
+        let d = KvCachePressureDetail {
+            kv_cache_usage_perc: Some(93.0),
+            kv_peak_pct: Some(100.0),
+            preemptions_active: false,
+            queue_backpressure: true,
+        };
+        let v = VllmRawMetrics {
+            kv_cache_usage_perc: Some(93.0),
+            kv_cache_peak_perc: Some(100.0),
+            num_preemptions_per_sec: Some(0.01),
+            num_requests_waiting: Some(1.4),
+            max_num_seqs: Some(256),
+            ..Default::default()
+        };
+        let text = format_kv_cache_pressure_fired(&d, &kv_ctx(&snap(v), None, None, None), 3, 4)
+            .join("\n");
+        assert!(text.contains("1 requests queued on KV admission"));
+        assert!(!text.contains("waiting count unavailable"));
+        assert!(!text.contains("Scheduler queueing requests"));
+    }
+
+    #[test]
     fn display_shows_burst_pressure_when_peak_triggered() {
         let d = KvCachePressureDetail {
             kv_cache_usage_perc: Some(58.0),
@@ -1975,8 +2153,12 @@ mod tests {
         let text = format_kv_cache_pressure_fired(&d, &kv_ctx(&snap(v), None, None, None), 1, 1)
             .join("\n");
         assert!(text.contains("burst pressure"));
-        assert!(text.contains("58% avg, 93% peak"));
+        assert!(text.contains("58% avg in fired windows, 93% peak"));
         assert!(text.contains("Scheduler evicting"));
+        assert!(
+            !text.contains("peak in fired windows"),
+            "peak must not carry the fired-windows label"
+        );
     }
 
     #[test]
@@ -1995,7 +2177,7 @@ mod tests {
         };
         let text = format_kv_cache_pressure_fired(&d, &kv_ctx(&snap(v), None, None, None), 1, 1)
             .join("\n");
-        assert!(text.contains("- avg, 93% peak"));
+        assert!(text.contains("- avg in fired windows, 93% peak"));
         assert!(!text.contains("0% avg"));
     }
 
@@ -2037,8 +2219,34 @@ mod tests {
         let text = format_kv_cache_pressure_fired(&d, &kv_ctx(&snap(v), None, None, None), 1, 1)
             .join("\n");
         assert!(!text.contains("burst pressure"));
-        assert!(text.contains("92% avg, 97% peak"));
+        assert!(text.contains("92% avg in fired windows, 97% peak"));
         assert!(text.contains("Scheduler evicting"));
+        assert!(
+            !text.contains("peak in fired windows"),
+            "peak must not carry the fired-windows label"
+        );
+    }
+
+    #[test]
+    fn cause_labels_fired_window_avg_final_iteration_fixture() {
+        // Journey final iter: header CACHE 85.4% (run-level); Cause 91% (fired only).
+        let d = KvCachePressureDetail {
+            kv_cache_usage_perc: Some(91.0),
+            kv_peak_pct: Some(98.0),
+            preemptions_active: false,
+            queue_backpressure: true,
+        };
+        let v = VllmRawMetrics {
+            kv_cache_usage_perc: Some(85.4),
+            kv_cache_peak_perc: Some(97.9),
+            num_requests_waiting: Some(11.0),
+            max_num_seqs: Some(60),
+            ..Default::default()
+        };
+        let text = format_kv_cache_pressure_fired(&d, &kv_ctx(&snap(v), None, None, None), 7, 12)
+            .join("\n");
+        assert!(text.contains("KV cache 91% avg in fired windows, 98% peak (threshold: 88%)."));
+        assert!(!text.contains("peak in fired windows"));
     }
 
     #[test]
@@ -2246,6 +2454,7 @@ mod tests {
             prompt_tokens_p99: Some(5000.0),
             generation_tokens_p99: Some(465.0),
             generation_tokens_completed: Some(150.0),
+            max_num_seqs: Some(256),
             cache_config: CacheConfigLabels {
                 block_size: Some(16),
                 num_gpu_blocks: Some(390),
@@ -2610,12 +2819,13 @@ mod tests {
         let v = VllmRawMetrics {
             kv_cache_usage_perc: Some(90.0),
             num_requests_waiting: Some(5.0),
+            num_preemptions_per_sec: Some(0.05),
             // No p99 / low count → no shrink; still has max-num-seqs in cuts though.
             max_num_seqs: Some(256),
             ..Default::default()
         };
         // max-num-seqs always in cuts for non-crisis → header present.
-        // Crisis without shrink: no Cuts header.
+        // Crisis without shrink: no Cuts header. Cause/layout follow snapshot rate.
         let text = format_kv_cache_pressure_fired(
             &detail(90.0, true),
             &kv_ctx(&snap(v), None, Some(30.0), Some(18)),
@@ -2710,7 +2920,7 @@ mod tests {
         assert!(text.contains("Lower --max-num-seqs to reduce KV demand"));
         assert!(!text.contains('≤'));
         assert!(!text.contains("Then set --max-num-seqs"));
-        assert!(text.contains("Observed 5.1k tokens per request, prompt plus generation."));
+        assert!(text.contains("Observed avg 5.1k tokens per request, prompt plus generation."));
         assert!(!text.contains('~'));
     }
 
@@ -2744,6 +2954,7 @@ mod tests {
             prompt_tokens_p99: Some(5000.0),
             generation_tokens_p99: Some(465.0),
             generation_tokens_completed: Some(150.0),
+            max_num_seqs: Some(256),
             cache_config: CacheConfigLabels {
                 block_size: Some(16),
                 num_gpu_blocks: Some(390),
@@ -2817,9 +3028,326 @@ mod tests {
             4,
         )
         .join("\n");
-        assert!(text.contains("Observed prompt 1.1k tokens per request."));
+        assert!(text.contains("Observed avg prompt 1.1k tokens per request."));
         assert!(!text.contains("prompt plus generation"));
         assert!(!text.contains("unavailable"));
+    }
+
+    /// Count `--max-num-seqs` mentions in the Fix block only (not Cause).
+    fn seat_lines_in_fix(text: &str) -> usize {
+        let Some(fix_at) = text.find("    Fix:") else {
+            return 0;
+        };
+        let fix = &text[fix_at..];
+        let end = fix.find("\n    Expected:").unwrap_or(fix.len());
+        fix[..end].matches("--max-num-seqs").count()
+    }
+
+    #[test]
+    fn seat_line_plain_when_sub_floor_shrink_leads_no_crisis_subline() {
+        // Iter-1 shape: means path (target None) but p99s still short enough that
+        // shrink leads. Seat lever must appear as plain form; preempt 0.01 is below bar.
+        let v = VllmRawMetrics {
+            kv_cache_usage_perc: Some(93.0),
+            kv_cache_peak_perc: Some(100.0),
+            num_requests_waiting: Some(6.0),
+            num_preemptions_per_sec: Some(0.01),
+            generation_tokens_completed: Some(48.0),
+            prompt_tokens_mean: Some(11000.0),
+            generation_tokens_mean: Some(8200.0),
+            prompt_tokens_p99: Some(5000.0),
+            generation_tokens_p99: Some(465.0),
+            max_num_seqs: Some(256),
+            ..Default::default()
+        };
+        let lines = format_kv_cache_pressure_fired(
+            &detail(93.0, true),
+            &kv_ctx(&snap(v), Some(262144), Some(30.0), Some(16)),
+            3,
+            4,
+        );
+        let text = lines.join("\n");
+        let shrink_idx = lines
+            .iter()
+            .position(|l| l.contains("Lower --max-model-len") && l.contains("Observed avg"))
+            .expect("sub-floor shrink");
+        let seat_idx = lines
+            .iter()
+            .position(|l| l.contains("Lower --max-num-seqs") && !l.contains("Then lower"))
+            .expect("plain seat");
+        assert!(shrink_idx < seat_idx, "shrink leads, seat follows");
+        assert!(!text.contains("Then lower --max-num-seqs"));
+        assert!(!text.contains("Cuts throughput. Revert after pressure clears."));
+        assert_eq!(seat_lines_in_fix(&text), 1);
+    }
+
+    #[test]
+    fn seat_line_then_form_when_named_target_projects() {
+        let v = VllmRawMetrics {
+            kv_cache_usage_perc: Some(90.0),
+            num_requests_waiting: Some(5.0),
+            prompt_tokens_p99: Some(5000.0),
+            generation_tokens_p99: Some(465.0),
+            generation_tokens_completed: Some(150.0),
+            max_num_seqs: Some(256),
+            cache_config: CacheConfigLabels {
+                block_size: Some(16),
+                num_gpu_blocks: Some(390),
+                mamba_block_size: Some(784),
+                kv_cache_max_concurrency: Some(8.667),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let text = format_kv_cache_pressure_fired(
+            &KvCachePressureDetail {
+                kv_cache_usage_perc: Some(90.0),
+                kv_peak_pct: Some(90.0),
+                preemptions_active: false,
+                queue_backpressure: true,
+            },
+            &kv_ctx(&snap(v), Some(32768), None, Some(8)),
+            3,
+            4,
+        )
+        .join("\n");
+        assert!(text.contains("Then lower --max-num-seqs to reduce KV demand"));
+        assert!(!text.contains("• Lower --max-num-seqs to"));
+        assert!(!text.contains("Cuts throughput. Revert after pressure clears."));
+        assert_eq!(seat_lines_in_fix(&text), 1);
+    }
+
+    #[test]
+    fn seat_line_then_form_dense_geometry_without_mamba_block() {
+        let dense_model = crate::context::ModelArch {
+            num_kv_heads: Some(8),
+            head_dim: Some(128),
+            num_layers: Some(32),
+            ..Default::default()
+        };
+        let v = VllmRawMetrics {
+            kv_cache_usage_perc: Some(90.0),
+            num_requests_waiting: Some(5.0),
+            prompt_tokens_p99: Some(5000.0),
+            generation_tokens_p99: Some(465.0),
+            generation_tokens_completed: Some(150.0),
+            max_num_seqs: Some(256),
+            cache_config: CacheConfigLabels {
+                block_size: Some(16),
+                num_gpu_blocks: Some(390),
+                kv_cache_max_concurrency: Some(8.667),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let snap = snap(v);
+        let text = format_kv_cache_pressure_fired(
+            &KvCachePressureDetail {
+                kv_cache_usage_perc: Some(90.0),
+                kv_peak_pct: Some(90.0),
+                preemptions_active: false,
+                queue_backpressure: true,
+            },
+            &KvFormatCtx {
+                snapshot: &snap,
+                max_model_len: Some(32768),
+                kv_headroom_gb: None,
+                kv_max_seqs: Some(8),
+                config_max_num_seqs: snap.vllm.max_num_seqs,
+                capacity_label: KvCapacityLabel::Derived,
+                fp8_compiler_available: false,
+                model: Some(&dense_model),
+                tp: None,
+                kv_cache_dtype: snap.vllm.cache_config.cache_dtype.as_deref(),
+            },
+            3,
+            4,
+        )
+        .join("\n");
+        assert!(text.contains("Then lower --max-num-seqs to reduce KV demand"));
+        assert!(!text.contains("• Lower --max-num-seqs to"));
+        assert_eq!(seat_lines_in_fix(&text), 1);
+    }
+
+    #[test]
+    fn seat_line_plain_when_named_target_projection_fails() {
+        // Named p99 target, shrink leads, but no page geometry and no model →
+        // capacity_at_hypothetical_max_len is None → plain seat, not Then.
+        let v = VllmRawMetrics {
+            kv_cache_usage_perc: Some(90.0),
+            num_requests_waiting: Some(5.0),
+            prompt_tokens_p99: Some(5000.0),
+            generation_tokens_p99: Some(465.0),
+            generation_tokens_completed: Some(150.0),
+            max_num_seqs: Some(256),
+            ..Default::default()
+        };
+        let text = format_kv_cache_pressure_fired(
+            &KvCachePressureDetail {
+                kv_cache_usage_perc: Some(90.0),
+                kv_peak_pct: Some(90.0),
+                preemptions_active: false,
+                queue_backpressure: true,
+            },
+            &kv_ctx(&snap(v), Some(32768), None, Some(8)),
+            3,
+            4,
+        )
+        .join("\n");
+        assert!(text.contains("Observed p99"));
+        assert!(text.contains("Lower --max-num-seqs"));
+        assert!(!text.contains("Then lower --max-num-seqs"));
+        assert_eq!(seat_lines_in_fix(&text), 1);
+    }
+
+    #[test]
+    fn seat_line_plain_crisis_subline_when_eviction_active() {
+        let v = VllmRawMetrics {
+            kv_cache_usage_perc: Some(93.0),
+            num_requests_waiting: Some(6.0),
+            num_preemptions_per_sec: Some(0.05),
+            generation_tokens_completed: Some(48.0),
+            prompt_tokens_mean: Some(11000.0),
+            generation_tokens_mean: Some(8200.0),
+            prompt_tokens_p99: Some(5000.0),
+            generation_tokens_p99: Some(465.0),
+            max_num_seqs: Some(256),
+            ..Default::default()
+        };
+        let lines = format_kv_cache_pressure_fired(
+            &detail(93.0, true),
+            &kv_ctx(&snap(v), Some(262144), Some(30.0), Some(16)),
+            3,
+            4,
+        );
+        let seat_idx = lines
+            .iter()
+            .position(|l| l.contains("Lower --max-num-seqs") && !l.contains("Then lower"))
+            .expect("plain seat");
+        assert!(
+            lines[seat_idx + 1].contains("Cuts throughput. Revert after pressure clears."),
+            "crisis subline attaches to plain seat only"
+        );
+        assert!(!lines.join("\n").contains("Then lower --max-num-seqs"));
+        assert_eq!(seat_lines_in_fix(&lines.join("\n")), 1);
+    }
+
+    #[test]
+    fn seat_line_absent_when_lever_unavailable() {
+        let v = VllmRawMetrics {
+            kv_cache_usage_perc: Some(90.0),
+            num_requests_waiting: Some(5.0),
+            prompt_tokens_p99: Some(5000.0),
+            generation_tokens_p99: Some(465.0),
+            generation_tokens_completed: Some(150.0),
+            // No scrape max_num_seqs; config also None via kv_ctx_config.
+            cache_config: CacheConfigLabels {
+                block_size: Some(16),
+                num_gpu_blocks: Some(390),
+                mamba_block_size: Some(784),
+                kv_cache_max_concurrency: Some(8.667),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let text = format_kv_cache_pressure_fired(
+            &KvCachePressureDetail {
+                kv_cache_usage_perc: Some(90.0),
+                kv_peak_pct: Some(90.0),
+                preemptions_active: false,
+                queue_backpressure: true,
+            },
+            &kv_ctx_config(&snap(v), Some(32768), None, Some(8), None),
+            3,
+            4,
+        )
+        .join("\n");
+        assert!(text.contains("Lower --max-model-len"));
+        assert_eq!(seat_lines_in_fix(&text), 0);
+    }
+
+    #[test]
+    fn seat_line_exactly_one_across_fired_shapes_when_lever_exists() {
+        let shapes: &[String] = &[
+            {
+                let v = VllmRawMetrics {
+                    kv_cache_usage_perc: Some(90.0),
+                    num_requests_waiting: Some(5.0),
+                    max_num_seqs: Some(256),
+                    ..Default::default()
+                };
+                format_kv_cache_pressure_fired(
+                    &KvCachePressureDetail {
+                        kv_cache_usage_perc: Some(90.0),
+                        kv_peak_pct: Some(90.0),
+                        preemptions_active: false,
+                        queue_backpressure: true,
+                    },
+                    &kv_ctx(&snap(v), None, Some(30.0), Some(18)),
+                    3,
+                    4,
+                )
+                .join("\n")
+            },
+            {
+                let v = VllmRawMetrics {
+                    kv_cache_usage_perc: Some(93.0),
+                    num_requests_waiting: Some(6.0),
+                    num_preemptions_per_sec: Some(0.01),
+                    generation_tokens_completed: Some(48.0),
+                    prompt_tokens_mean: Some(11000.0),
+                    generation_tokens_mean: Some(8200.0),
+                    prompt_tokens_p99: Some(5000.0),
+                    generation_tokens_p99: Some(465.0),
+                    max_num_seqs: Some(256),
+                    ..Default::default()
+                };
+                format_kv_cache_pressure_fired(
+                    &detail(93.0, true),
+                    &kv_ctx(&snap(v), Some(262144), Some(30.0), Some(16)),
+                    3,
+                    4,
+                )
+                .join("\n")
+            },
+            {
+                let v = VllmRawMetrics {
+                    kv_cache_usage_perc: Some(90.0),
+                    num_requests_waiting: Some(5.0),
+                    prompt_tokens_p99: Some(5000.0),
+                    generation_tokens_p99: Some(465.0),
+                    generation_tokens_completed: Some(150.0),
+                    max_num_seqs: Some(256),
+                    cache_config: CacheConfigLabels {
+                        block_size: Some(16),
+                        num_gpu_blocks: Some(390),
+                        mamba_block_size: Some(784),
+                        kv_cache_max_concurrency: Some(8.667),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                format_kv_cache_pressure_fired(
+                    &KvCachePressureDetail {
+                        kv_cache_usage_perc: Some(90.0),
+                        kv_peak_pct: Some(90.0),
+                        preemptions_active: false,
+                        queue_backpressure: true,
+                    },
+                    &kv_ctx(&snap(v), Some(32768), None, Some(8)),
+                    3,
+                    4,
+                )
+                .join("\n")
+            },
+        ];
+        for text in shapes {
+            assert_eq!(
+                seat_lines_in_fix(text),
+                1,
+                "exactly one seat line when lever exists:\n{text}"
+            );
+        }
     }
 
     #[test]
@@ -2832,6 +3360,7 @@ mod tests {
             prompt_tokens_p99: Some(5000.0),
             generation_tokens_p99: Some(465.0),
             generation_tokens_completed: Some(150.0),
+            max_num_seqs: Some(256),
             cache_config: CacheConfigLabels {
                 block_size: Some(16),
                 num_gpu_blocks: Some(390),
@@ -2958,7 +3487,7 @@ mod tests {
         );
         assert_eq!(
             lines[idx + 1],
-            format!("        {}", KV_OFFLOAD_SUBLINE.trim_start()),
+            format!("        {}", KV_OFFLOAD_SUBLINE_FALLBACK.trim_start()),
             "offload subline must match push_bullet_with_subline indent"
         );
         if lines.get(idx + 2).is_some_and(|l| l.is_empty()) {
@@ -2983,7 +3512,7 @@ mod tests {
                 .expect("safe group content");
             assert!(
                 safe_end.contains("Set --kv-offloading-size")
-                    || lines[idx + 1].trim_start() == KV_OFFLOAD_SUBLINE,
+                    || lines[idx + 1].trim_start() == KV_OFFLOAD_SUBLINE_FALLBACK,
                 "offload must be the last safe-group item"
             );
             for line in &lines[cuts_idx + 1..section_end] {
@@ -3107,7 +3636,7 @@ mod tests {
         );
         assert_eq!(
             *offload_subline,
-            format!("        {}", KV_OFFLOAD_SUBLINE.trim_start())
+            format!("        {}", KV_OFFLOAD_SUBLINE_FALLBACK.trim_start())
         );
         assert_eq!(
             verify_subline,
@@ -3125,7 +3654,6 @@ mod tests {
                 "absent label must not suggest offload: {text}"
             );
         }
-        assert!(kv_offload_fix_bullet(&offload_cache(KvOffloadState::Unsupported)).is_none());
     }
 
     #[test]
@@ -3135,7 +3663,6 @@ mod tests {
         assert_offload_block(&c);
         assert_offload_block(&n);
         assert_offload_block(&b);
-        assert!(kv_offload_fix_bullet(&offload_cache(KvOffloadState::Off)).is_some());
     }
 
     #[test]
@@ -3145,7 +3672,6 @@ mod tests {
         for text in [c.join("\n"), n.join("\n"), b.join("\n")] {
             assert!(!text.contains("kv-offloading-size"), "already on: {text}");
         }
-        assert!(kv_offload_fix_bullet(&offload_cache(KvOffloadState::Enabled(16.0))).is_none());
     }
 
     #[test]
@@ -3162,10 +3688,410 @@ mod tests {
     fn kv_offload_garbage_no_bullet_no_panic() {
         use crate::collectors::KvOffloadState;
         let cache = offload_cache(KvOffloadState::Unreadable);
-        assert!(kv_offload_fix_bullet(&cache).is_none());
         let (c, n, b) = format_offload_three_paths(cache);
         for text in [c.join("\n"), n.join("\n"), b.join("\n")] {
             assert!(!text.contains("kv-offloading-size"), "garbage: {text}");
+        }
+    }
+
+    #[test]
+    fn kv_offload_subline_shows_measured_host_memory() {
+        use crate::collectors::HostMemoryFacts;
+        let facts = HostMemoryFacts {
+            available_bytes: 1921 << 30,
+            container_limit_bytes: Some(234 << 30),
+        };
+        assert_eq!(
+            super::format_kv_offload_subline(Some(facts)),
+            "Host RAM available: 1921 GiB, container limit 234 GiB."
+        );
+    }
+
+    #[test]
+    fn kv_offload_subline_unlimited_container_renders_none() {
+        use crate::collectors::HostMemoryFacts;
+        let facts = HostMemoryFacts {
+            available_bytes: 64 << 30,
+            container_limit_bytes: None,
+        };
+        assert_eq!(
+            super::format_kv_offload_subline(Some(facts)),
+            "Host RAM available: 64 GiB, container limit none."
+        );
+    }
+
+    #[test]
+    fn kv_offload_subline_fallback_when_host_memory_unreadable() {
+        assert_eq!(
+            super::format_kv_offload_subline(None),
+            KV_OFFLOAD_SUBLINE_FALLBACK
+        );
+    }
+
+    #[test]
+    fn kv_offload_rendered_subline_uses_snapshot_host_memory() {
+        use crate::collectors::{HostMemoryFacts, KvOffloadState, RawSnapshotFixture};
+        let facts = HostMemoryFacts {
+            available_bytes: 1921 << 30,
+            container_limit_bytes: Some(234 << 30),
+        };
+        let snap = RawSnapshotFixture::default()
+            .vllm(VllmRawMetrics {
+                kv_cache_usage_perc: Some(90.0),
+                num_requests_waiting: Some(5.0),
+                cache_config: offload_cache(KvOffloadState::Off),
+                max_num_seqs: Some(256),
+                ..Default::default()
+            })
+            .host_memory(Some(facts))
+            .build();
+        let text = format_kv_cache_pressure_fired(
+            &KvCachePressureDetail {
+                kv_cache_usage_perc: Some(90.0),
+                kv_peak_pct: Some(90.0),
+                preemptions_active: false,
+                queue_backpressure: true,
+            },
+            &kv_ctx(&snap, None, Some(30.0), None),
+            3,
+            4,
+        )
+        .join("\n");
+        assert!(text.contains("Host RAM available: 1921 GiB, container limit 234 GiB."));
+        assert!(!text.contains(KV_OFFLOAD_SUBLINE_FALLBACK));
+    }
+
+    fn journey_host_memory() -> crate::collectors::HostMemoryFacts {
+        crate::collectors::HostMemoryFacts {
+            available_bytes: 1921 << 30,
+            container_limit_bytes: Some(234 << 30),
+        }
+    }
+
+    fn journey_pool_bytes() -> u64 {
+        (24.8 * super::GIB_BYTES).round() as u64
+    }
+
+    fn journey_offload_input() -> super::KvOffloadSizeInput {
+        super::KvOffloadSizeInput {
+            host_memory: Some(journey_host_memory()),
+            pool_bytes: Some(journey_pool_bytes()),
+            kv_frac_per_running_peak: Some(0.97 / 34.0),
+            preempt_per_sec: Some(0.27),
+            run_duration_secs: Some(120.0),
+            peak_waiting: Some(36.0),
+        }
+    }
+
+    #[test]
+    fn kv_offload_journey_fixture_resolves_23() {
+        assert_eq!(
+            super::resolve_kv_offload_size_gib(journey_offload_input()),
+            Some(23)
+        );
+    }
+
+    #[test]
+    fn kv_offload_kv_percent_units_are_0_to_100() {
+        // Window stores 97 (not 0.97); per_seq must divide by 100.
+        let mut input = journey_offload_input();
+        input.kv_frac_per_running_peak = Some(97.0 / 34.0); // forgot /100
+        let wrong = super::resolve_kv_offload_size_gib(input);
+        assert_ne!(
+            wrong,
+            Some(23),
+            "forgetting /100 must not yield journey size"
+        );
+        let mut input = journey_offload_input();
+        input.kv_frac_per_running_peak = Some(97.0 / 100.0 / 34.0);
+        assert_eq!(super::resolve_kv_offload_size_gib(input), Some(23));
+    }
+
+    #[test]
+    fn kv_offload_peak_ratio_uses_max_window_not_mean() {
+        // Windows: kv50/run50 → 0.01; kv95/run10 → 0.095. Peak is second.
+        let peak = (95.0_f64 / 100.0 / 10.0).max(50.0 / 100.0 / 50.0);
+        let mean = ((50.0_f64 / 100.0 / 50.0) + (95.0 / 100.0 / 10.0)) / 2.0;
+        assert!((peak - 0.095).abs() < 1e-12);
+        assert!((mean - 0.0525).abs() < 1e-12);
+
+        let mut peak_input = journey_offload_input();
+        peak_input.kv_frac_per_running_peak = Some(peak);
+        let mut mean_input = journey_offload_input();
+        mean_input.kv_frac_per_running_peak = Some(mean);
+        let from_peak = super::resolve_kv_offload_size_gib(peak_input).unwrap();
+        let from_mean = super::resolve_kv_offload_size_gib(mean_input).unwrap();
+        assert!(from_peak > from_mean, "mean ratio must not pass as peak");
+    }
+
+    #[test]
+    fn kv_offload_flow_vs_stock_takes_min() {
+        let mut flow_wins = journey_offload_input();
+        flow_wins.preempt_per_sec = Some(32.0 / 120.0);
+        flow_wins.peak_waiting = Some(200.0);
+        // parked = 32
+        let mut stock_wins = journey_offload_input();
+        stock_wins.preempt_per_sec = Some(90.0 / 120.0);
+        stock_wins.peak_waiting = Some(36.0);
+        // parked = 36
+        assert_eq!(
+            super::resolve_kv_offload_size_gib(flow_wins),
+            super::resolve_kv_offload_size_gib(journey_offload_input())
+        );
+        let stock = super::resolve_kv_offload_size_gib(stock_wins).unwrap();
+        let journey = super::resolve_kv_offload_size_gib(journey_offload_input()).unwrap();
+        assert!(stock > journey, "parked 36 must exceed parked 32");
+    }
+
+    #[test]
+    fn kv_offload_supply_clips_large_demand() {
+        let mut input = journey_offload_input();
+        // Huge pool → demand >> supply (0.5 × 234 GiB = 117)
+        input.pool_bytes = Some(400 << 30);
+        input.kv_frac_per_running_peak = Some(1.0);
+        input.preempt_per_sec = Some(10.0);
+        input.peak_waiting = Some(100.0);
+        assert_eq!(super::resolve_kv_offload_size_gib(input), Some(117));
+    }
+
+    #[test]
+    fn kv_offload_degrades_without_host_memory() {
+        let mut input = journey_offload_input();
+        input.host_memory = None;
+        assert_eq!(super::resolve_kv_offload_size_gib(input), None);
+    }
+
+    #[test]
+    fn kv_offload_degrades_without_pool() {
+        let mut input = journey_offload_input();
+        input.pool_bytes = None;
+        assert_eq!(super::resolve_kv_offload_size_gib(input), None);
+    }
+
+    #[test]
+    fn kv_offload_degrades_without_kv_frac() {
+        let mut input = journey_offload_input();
+        input.kv_frac_per_running_peak = None;
+        assert_eq!(super::resolve_kv_offload_size_gib(input), None);
+    }
+
+    #[test]
+    fn kv_offload_degrades_without_preempt_rate() {
+        let mut input = journey_offload_input();
+        input.preempt_per_sec = None;
+        assert_eq!(super::resolve_kv_offload_size_gib(input), None);
+    }
+
+    #[test]
+    fn kv_offload_degrades_when_preempt_zero() {
+        let mut input = journey_offload_input();
+        input.preempt_per_sec = Some(0.0);
+        assert_eq!(super::resolve_kv_offload_size_gib(input), None);
+    }
+
+    #[test]
+    fn kv_offload_degrades_when_peak_waiting_absent_or_zero() {
+        let mut absent = journey_offload_input();
+        absent.peak_waiting = None;
+        assert_eq!(super::resolve_kv_offload_size_gib(absent), None);
+        let mut zero = journey_offload_input();
+        zero.peak_waiting = Some(0.0);
+        assert_eq!(super::resolve_kv_offload_size_gib(zero), None);
+    }
+
+    #[test]
+    fn kv_offload_journey_renders_23_est_with_ram_subline() {
+        use crate::collectors::{KvOffloadState, RawSnapshotFixture};
+        // derived_budget_bytes is SI GB; feed SI equal to 24.8 binary GiB so pool
+        // bytes match the journey arithmetic that resolves to 23.
+        let headroom_si = 24.8 * super::GIB_BYTES / 1e9;
+        let snap = RawSnapshotFixture::default()
+            .vllm(VllmRawMetrics {
+                kv_cache_usage_perc: Some(97.0),
+                num_requests_running: Some(34.0),
+                num_requests_waiting: Some(36.0),
+                num_requests_waiting_peak: Some(36.0),
+                kv_frac_per_running_peak: Some(0.97 / 34.0),
+                num_preemptions_per_sec: Some(0.27),
+                window_duration_secs: Some(120.0),
+                max_num_seqs: Some(175),
+                cache_config: offload_cache(KvOffloadState::Off),
+                ..Default::default()
+            })
+            .host_memory(Some(journey_host_memory()))
+            .build();
+        let text = format_kv_cache_pressure_fired(
+            &KvCachePressureDetail {
+                kv_cache_usage_perc: Some(97.0),
+                kv_peak_pct: Some(100.0),
+                preemptions_active: true,
+                queue_backpressure: true,
+            },
+            &kv_ctx(&snap, None, Some(headroom_si), None),
+            3,
+            4,
+        )
+        .join("\n");
+        assert!(
+            text.contains("Set --kv-offloading-size 23 (est) to hold evicted KV"),
+            "journey render:\n{text}"
+        );
+        assert!(text.contains("Host RAM available: 1921 GiB, container limit 234 GiB."));
+        assert!(!text.contains("Set --kv-offloading-size (GiB)"));
+    }
+
+    #[test]
+    fn kv_offload_degrade_renders_directionless_bullet() {
+        use crate::collectors::{KvOffloadState, RawSnapshotFixture};
+        let snap = RawSnapshotFixture::default()
+            .vllm(VllmRawMetrics {
+                kv_cache_usage_perc: Some(97.0),
+                num_requests_running: Some(34.0),
+                num_requests_waiting_peak: Some(36.0),
+                num_preemptions_per_sec: Some(0.0),
+                window_duration_secs: Some(120.0),
+                max_num_seqs: Some(175),
+                cache_config: offload_cache(KvOffloadState::Off),
+                ..Default::default()
+            })
+            .host_memory(Some(journey_host_memory()))
+            .build();
+        let text = format_kv_cache_pressure_fired(
+            &detail(97.0, true),
+            &kv_ctx(&snap, None, Some(24.8), None),
+            1,
+            1,
+        )
+        .join("\n");
+        assert!(text.contains("Set --kv-offloading-size (GiB) to hold evicted KV"));
+        assert!(!text.contains("(est)"));
+        assert!(text.contains("Host RAM available: 1921 GiB, container limit 234 GiB."));
+    }
+
+    #[test]
+    fn kv_offload_backlog_path_same_sized_bullet() {
+        use crate::collectors::{KvOffloadState, RawSnapshotFixture};
+        let headroom_si = 24.8 * super::GIB_BYTES / 1e9;
+        let snap = RawSnapshotFixture::default()
+            .vllm(VllmRawMetrics {
+                kv_cache_usage_perc: Some(97.0),
+                num_requests_running: Some(34.0),
+                num_requests_waiting: Some(36.0),
+                num_requests_waiting_peak: Some(36.0),
+                kv_frac_per_running_peak: Some(0.97 / 34.0),
+                num_preemptions_per_sec: Some(0.27),
+                window_duration_secs: Some(120.0),
+                max_num_seqs: Some(175),
+                prompt_tokens_mean: Some(64.0),
+                cache_config: CacheConfigLabels {
+                    num_gpu_blocks: Some(1000),
+                    block_size: Some(16),
+                    ..offload_cache(KvOffloadState::Off)
+                },
+                ..Default::default()
+            })
+            .host_memory(Some(journey_host_memory()))
+            .build();
+        let ctx = kv_ctx(&snap, None, Some(headroom_si), None);
+        let pressure = format_kv_cache_pressure_fired(&detail(97.0, true), &ctx, 3, 4).join("\n");
+        let backlog = format_kv_admission_backlog_issue(
+            &KvAdmissionBacklogDetail {
+                kv_cache_usage_perc: 97.0,
+                kv_peak_pct: Some(100.0),
+                admission_ratio: 36.0 / 70.0,
+                requests_waiting: 36.0,
+                requests_running: 34.0,
+                free_kv_tokens: 100.0,
+                demand_tokens: 200.0,
+            },
+            75,
+            &ctx,
+            3,
+            4,
+        )
+        .join("\n");
+        let extract = |t: &str| {
+            t.lines()
+                .find(|l| l.contains("Set --kv-offloading-size"))
+                .expect("offload bullet")
+                .to_string()
+        };
+        assert_eq!(extract(&pressure), extract(&backlog));
+        assert!(extract(&pressure).contains("23 (est)"));
+    }
+
+    #[test]
+    fn kv_offload_unlimited_container_supply_from_mem_available() {
+        let facts = crate::collectors::HostMemoryFacts {
+            available_bytes: 64 << 30,
+            container_limit_bytes: None,
+        };
+        let mut input = journey_offload_input();
+        input.host_memory = Some(facts);
+        // supply = 0.5 × 64 = 32 GiB; journey demand ~23 → still 23
+        assert_eq!(super::resolve_kv_offload_size_gib(input), Some(23));
+        assert_eq!(
+            super::format_kv_offload_subline(Some(facts)),
+            "Host RAM available: 64 GiB, container limit none."
+        );
+        // Clip when demand exceeds half of MemAvailable alone
+        let mut clipped = journey_offload_input();
+        clipped.host_memory = Some(facts);
+        clipped.pool_bytes = Some(400 << 30);
+        clipped.kv_frac_per_running_peak = Some(1.0);
+        clipped.preempt_per_sec = Some(10.0);
+        clipped.peak_waiting = Some(100.0);
+        assert_eq!(super::resolve_kv_offload_size_gib(clipped), Some(32));
+    }
+
+    #[test]
+    fn kv_offload_printed_value_never_exceeds_reserve_fraction() {
+        use crate::collectors::{KvOffloadState, RawSnapshotFixture};
+        let usable = (journey_host_memory()
+            .available_bytes
+            .min(journey_host_memory().container_limit_bytes.unwrap())) as f64
+            / super::GIB_BYTES;
+        let cap = (super::KV_OFFLOAD_RESERVE_FRACTION * usable).floor() as u64;
+        let headroom_si = 24.8 * super::GIB_BYTES / 1e9;
+        let snap = RawSnapshotFixture::default()
+            .vllm(VllmRawMetrics {
+                kv_cache_usage_perc: Some(97.0),
+                num_requests_running: Some(34.0),
+                num_requests_waiting_peak: Some(36.0),
+                kv_frac_per_running_peak: Some(0.97 / 34.0),
+                num_preemptions_per_sec: Some(0.27),
+                window_duration_secs: Some(120.0),
+                max_num_seqs: Some(175),
+                cache_config: offload_cache(KvOffloadState::Off),
+                ..Default::default()
+            })
+            .host_memory(Some(journey_host_memory()))
+            .build();
+        let text = format_kv_cache_pressure_fired(
+            &detail(97.0, true),
+            &kv_ctx(&snap, None, Some(headroom_si), None),
+            1,
+            1,
+        )
+        .join("\n");
+        let bullet = text
+            .lines()
+            .find(|l| l.contains("Set --kv-offloading-size"))
+            .expect("bullet");
+        if let Some(rest) = bullet.split("Set --kv-offloading-size ").nth(1) {
+            if rest.starts_with("(GiB)") {
+                return;
+            }
+            let n: u64 = rest
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse().ok())
+                .expect("sized number");
+            assert!(
+                bullet.contains("(est)"),
+                "sized bullet must carry (est): {bullet}"
+            );
+            assert!(n <= cap, "value {n} exceeds 0.5×usable ({cap})");
         }
     }
 

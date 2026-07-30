@@ -151,11 +151,15 @@ fn build_diagnose_lines(
         ),
         width = GPU_LABEL_W
     ));
-    if verbose_rules && report.energy_skew_skipped > 0 {
-        lines.push(format!(
-            "energy: skipped {} windows (observation skew).",
-            report.energy_skew_skipped
-        ));
+    if verbose_rules
+        && let Some(line) = format_energy_verbose_line(
+            result.energy_pair_windows,
+            result.energy_active_windows,
+            report.energy_skew_skipped,
+            snapshot.vllm.aligned_generation_tokens_per_sec,
+        )
+    {
+        lines.push(line);
     }
     if n_gpus <= 1 {
         let g = snapshot.gpus.first().unwrap_or(&cluster_gpu);
@@ -223,6 +227,37 @@ fn build_diagnose_lines(
     }
 
     lines
+}
+
+/// Verbose-only disclosure when J/tok's energy-pair population differs from
+/// active-window throughput. Default output unchanged.
+fn format_energy_verbose_line(
+    paired: usize,
+    active: usize,
+    skew_skipped: usize,
+    aligned_generation_tokens_per_sec: Option<f64>,
+) -> Option<String> {
+    if paired == 0 {
+        if skew_skipped > 0 {
+            return Some(format!(
+                "energy: skipped {} windows (observation skew).",
+                skew_skipped
+            ));
+        }
+        return None;
+    }
+    if paired == active && skew_skipped == 0 {
+        return None;
+    }
+    let mut line = format!("energy: {paired} of {active} active windows paired");
+    if let Some(rate) = aligned_generation_tokens_per_sec.filter(|r| r.is_finite()) {
+        line.push_str(&format!("; J/tok basis {rate:.0} tok/s"));
+    }
+    line.push('.');
+    if skew_skipped > 0 {
+        line.push_str(&format!(" Skipped {skew_skipped} (observation skew)."));
+    }
+    Some(line)
 }
 
 /// Action line: printed below the box, not inside it.
@@ -862,8 +897,98 @@ mod tests {
     fn diagnose_lines_for(result: &DiagnoseResult, verbose_rules: bool) -> Vec<String> {
         let aggregate_win = RuntimeWindow::from_snapshot(result.snapshot.clone());
         let summary_input = AnalysisInput::new(&result.static_ctx, &aggregate_win);
+        // Report is built without energy pair counts; -v reads those from DiagnoseResult.
         let report = engine::build_report_for_diagnose(&result.windows, summary_input);
         build_diagnose_lines(result, &aggregate_win, &report, verbose_rules, false)
+    }
+
+    #[test]
+    fn energy_verbose_partial_pairing_shows_counts_and_basis() {
+        let line = format_energy_verbose_line(9, 12, 3, Some(174.4)).expect("line");
+        assert_eq!(
+            line,
+            "energy: 9 of 12 active windows paired; J/tok basis 174 tok/s. Skipped 3 (observation skew)."
+        );
+        // Basis is aligned rate, not active-window throughput (e.g. 179).
+        assert!(line.contains("174"));
+        assert!(!line.contains("179"));
+        assert!((642.0_f64 / 174.0 - 3.69).abs() < 0.005);
+    }
+
+    #[test]
+    fn energy_verbose_zero_pairs_falls_back_to_skew_line() {
+        assert_eq!(
+            format_energy_verbose_line(0, 12, 3, Some(174.0)).as_deref(),
+            Some("energy: skipped 3 windows (observation skew).")
+        );
+        assert!(format_energy_verbose_line(0, 12, 0, Some(174.0)).is_none());
+    }
+
+    #[test]
+    fn energy_verbose_full_pairing_zero_skips_renders_nothing() {
+        assert!(format_energy_verbose_line(12, 12, 0, Some(174.0)).is_none());
+    }
+
+    #[test]
+    fn energy_verbose_skew_zero_omits_skipped_clause() {
+        assert_eq!(
+            format_energy_verbose_line(9, 12, 0, Some(174.0)).as_deref(),
+            Some("energy: 9 of 12 active windows paired; J/tok basis 174 tok/s.")
+        );
+    }
+
+    #[test]
+    fn energy_verbose_no_aligned_rate_drops_basis_clause() {
+        assert_eq!(
+            format_energy_verbose_line(9, 12, 3, None).as_deref(),
+            Some("energy: 9 of 12 active windows paired. Skipped 3 (observation skew).")
+        );
+    }
+
+    #[test]
+    fn energy_line_absent_when_not_verbose() {
+        let mut snap = RawSnapshot {
+            gpu_observed_at: UNIX_EPOCH,
+            vllm_observed_at: UNIX_EPOCH,
+            timestamp: UNIX_EPOCH,
+            vllm: VllmRawMetrics {
+                num_requests_running: Some(8.0),
+                generation_tokens_per_sec: Some(179.0),
+                aligned_generation_tokens_per_sec: Some(174.0),
+                window_duration_secs: Some(10.0),
+                ..Default::default()
+            },
+            gpus: vec![GpuRawMetrics {
+                aligned_power_watts: Some(642.0),
+                power_watts: Some(642.0),
+                ..Default::default()
+            }],
+            host_memory: None,
+        };
+
+        snap.gpus[0].gpu_uuid = Some("GPU-test".into());
+        let win = RuntimeWindow::from_snapshot(snap.clone());
+        let static_ctx = StaticContext::from_snapshot(&snap, VllmConfig::default());
+        let result = DiagnoseResult {
+            snapshot: snap,
+            windows: vec![win],
+            static_ctx,
+            duration: Duration::from_secs(30),
+            started_at: UNIX_EPOCH,
+            any_evaluable: true,
+            all_idle: false,
+            metrics_input: "http://127.0.0.1:8000/metrics".to_string(),
+            energy_active_windows: 12,
+            energy_pair_windows: 9,
+        };
+        let text = diagnose_lines_for(&result, false).join("\n");
+        assert!(!text.contains("energy:"));
+        // Counts live only on DiagnoseResult; Report is untouched by the helper.
+        // If print ever required a Report copy again, this would regress to silence
+        // or the skew-only line.
+        let verbose = diagnose_lines_for(&result, true).join("\n");
+        assert!(verbose.contains("energy: 9 of 12 active windows paired; J/tok basis 174 tok/s."));
+        assert!(!verbose.contains("Skipped"));
     }
 
     #[test]
@@ -1641,7 +1766,9 @@ mod tests {
                 gpu_util_pct: Some(70.0),
                 ..Default::default()
             }],
+            host_memory: None,
         };
+
         let w1 = RuntimeWindow::from_snapshot(mk_snapshot());
         let w2 = RuntimeWindow::from_snapshot(mk_snapshot());
         let w3 = RuntimeWindow::from_snapshot(mk_snapshot());
@@ -1656,6 +1783,8 @@ mod tests {
             any_evaluable: true,
             all_idle: false,
             metrics_input: "http://127.0.0.1:8000/metrics".to_string(),
+            energy_active_windows: 0,
+            energy_pair_windows: 0,
         };
         let text = diagnose_lines_for(&result, false).join("\n");
         assert!(text.contains("pfix_cache 27.6%"));
@@ -1678,7 +1807,9 @@ mod tests {
                 gpu_name: Some("Test GPU".into()),
                 ..Default::default()
             }],
+            host_memory: None,
         };
+
         let result = DiagnoseResult {
             snapshot: idle_snap.clone(),
             windows: vec![RuntimeWindow::from_snapshot(idle_snap)],
@@ -1688,6 +1819,8 @@ mod tests {
             any_evaluable: false,
             all_idle: false,
             metrics_input: "http://127.0.0.1:8000/metrics".into(),
+            energy_active_windows: 0,
+            energy_pair_windows: 0,
         };
         let lines = diagnose_lines_for(&result, false);
         let text = lines.join("\n");
@@ -1721,7 +1854,9 @@ mod tests {
                 gpu_name: Some("Test GPU".into()),
                 ..Default::default()
             }],
+            host_memory: None,
         };
+
         let result = DiagnoseResult {
             snapshot: idle_snap.clone(),
             windows: vec![RuntimeWindow::from_snapshot(idle_snap)],
@@ -1731,6 +1866,8 @@ mod tests {
             any_evaluable: true,
             all_idle: true,
             metrics_input: "http://127.0.0.1:8000/metrics".into(),
+            energy_active_windows: 0,
+            energy_pair_windows: 0,
         };
         let lines = diagnose_lines_for(&result, false);
         let text = lines.join("\n");
@@ -1754,6 +1891,7 @@ mod tests {
             }],
             ..Default::default()
         };
+
         push_gpu_advisories(&mut lines, &snap);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("device index only"));
@@ -1793,7 +1931,9 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            host_memory: None,
         };
+
         let static_ctx = StaticContext::from_snapshot(&snapshot, VllmConfig::default());
         let result = DiagnoseResult {
             snapshot: snapshot.clone(),
@@ -1804,6 +1944,8 @@ mod tests {
             any_evaluable: true,
             all_idle: false,
             metrics_input: "http://127.0.0.1:8000/metrics".into(),
+            energy_active_windows: 0,
+            energy_pair_windows: 0,
         };
         let text = diagnose_lines_for(&result, false).join("\n");
         assert!(text.contains(" x2"));

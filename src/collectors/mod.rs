@@ -4,6 +4,7 @@
 
 pub mod config;
 pub mod gpu;
+pub mod host_memory;
 pub mod sampling;
 pub mod types;
 pub mod vllm;
@@ -17,8 +18,8 @@ pub use config::{VllmConfig, build_config};
 pub(crate) use types::observations_aligned;
 pub use types::{
     AggregateGpuMetrics, CacheConfigLabels, GpuFingerprint, GpuRawMetrics, HistogramCount,
-    HistogramWindowMass, KvOffloadState, PrefixCacheScrapeSample, RawSnapshot, VllmRawMetrics,
-    effective_tensor_parallel, mib_to_decimal_gb, snapshot_uses_display_names,
+    HistogramWindowMass, HostMemoryFacts, KvOffloadState, PrefixCacheScrapeSample, RawSnapshot,
+    VllmRawMetrics, effective_tensor_parallel, mib_to_decimal_gb, snapshot_uses_display_names,
     snapshot_uses_index_only, window_is_active, window_is_evaluable, window_is_idle,
 };
 pub(crate) use vllm::merge_p99_bucket_vecs;
@@ -55,12 +56,15 @@ pub fn collect_snapshot_for_window(
         .join()
         .map_err(|_| anyhow::anyhow!("vLLM collector panicked"))??;
 
+    let host_memory = host_memory::read_host_memory_facts();
+
     Ok(RawSnapshot {
         gpu_observed_at,
         vllm_observed_at,
         timestamp: std::time::SystemTime::now(),
         vllm,
         gpus,
+        host_memory,
     })
 }
 
@@ -82,6 +86,7 @@ pub(crate) mod test_fixtures {
                     ..Default::default()
                 })
                 .collect(),
+            host_memory: None,
         }
     }
 }

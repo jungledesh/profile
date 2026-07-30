@@ -19,6 +19,14 @@ pub enum KvOffloadState {
     Unreadable,
 }
 
+/// Host RAM and container cgroup cap, read together or not at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostMemoryFacts {
+    pub available_bytes: u64,
+    /// `None` = unlimited container cap (`max` or no cgroup file).
+    pub container_limit_bytes: Option<u64>,
+}
+
 /// Config fields extracted from the `vllm:cache_config_info` labeled gauge.
 /// All `Option<T>` - absent when the metric isn't present in the scrape.
 ///
@@ -76,6 +84,13 @@ pub struct VllmRawMetrics {
     /// evaluable windows (not mean). Used to disprove full-context `kv_cache_max_concurrency`.
     pub num_requests_running_peak: Option<f64>,
     pub num_requests_waiting: Option<f64>,
+    /// Max `num_requests_waiting` across scrapes in this window. Multi-window: max over
+    /// evaluable windows (not mean). Caps kv-offload parked-request demand.
+    pub num_requests_waiting_peak: Option<f64>,
+    /// Max over active windows of `(kv_cache_usage_perc / 100) / num_requests_running`
+    /// for windows with `running >= 1`. Multi-window aggregate only; single-window
+    /// resolve may fall back to the landing gauges. Used for kv-offload sizing.
+    pub kv_frac_per_running_peak: Option<f64>,
     /// KV cache usage %: last scrape in a single window; duration-weighted mean across evaluable windows in diagnose aggregate.
     pub kv_cache_usage_perc: Option<f64>,
     /// Same as `kv_cache_usage_perc` after multi-window aggregate; carried for display clarity.
@@ -295,6 +310,8 @@ pub struct RawSnapshot {
     pub timestamp: SystemTime,
     pub vllm: VllmRawMetrics,
     pub gpus: Vec<GpuRawMetrics>,
+    /// Host RAM + container cap when both reads succeed at collect time.
+    pub host_memory: Option<HostMemoryFacts>,
 }
 
 impl Default for RawSnapshot {
@@ -305,6 +322,7 @@ impl Default for RawSnapshot {
             timestamp: SystemTime::UNIX_EPOCH,
             vllm: VllmRawMetrics::default(),
             gpus: Vec::new(),
+            host_memory: None,
         }
     }
 }
@@ -545,6 +563,7 @@ mod window_evaluable_tests {
                 ..Default::default()
             },
             gpus: vec![],
+            host_memory: None,
         }
     }
 
@@ -579,6 +598,7 @@ mod window_evaluable_tests {
             },
             ..Default::default()
         };
+
         assert!(window_is_idle(&s));
     }
 
@@ -594,6 +614,7 @@ mod window_evaluable_tests {
             },
             ..Default::default()
         };
+
         assert!(window_is_idle(&s));
     }
 
@@ -609,6 +630,7 @@ mod window_evaluable_tests {
             },
             ..Default::default()
         };
+
         assert!(!window_is_idle(&s));
         assert!(window_is_active(&s));
     }
@@ -622,6 +644,7 @@ mod window_evaluable_tests {
             },
             ..Default::default()
         };
+
         assert!(!window_is_idle(&s));
     }
 }
@@ -647,6 +670,7 @@ mod window_active_tests {
                 gpu_util_pct: gpu,
                 ..Default::default()
             }],
+            host_memory: None,
         }
     }
 
@@ -676,6 +700,7 @@ mod window_active_tests {
             },
             ..Default::default()
         };
+
         assert!(!window_is_active(&s));
     }
 
@@ -772,6 +797,7 @@ mod gpu_identity_tests {
             gpus: vec![GpuRawMetrics::default(), GpuRawMetrics::default()],
             ..Default::default()
         };
+
         let fp = snap.fingerprint();
         assert_eq!(fp.len(), 2);
         assert!(matches!(fp[0], GpuIdentity::Simple(_)));
@@ -941,6 +967,7 @@ mod scope_and_drift_tests {
             ],
             ..Default::default()
         };
+
         assert_eq!(snap.aggregate_gpu().temperature_peak_c, Some(88.0));
     }
 }

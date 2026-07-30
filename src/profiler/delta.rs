@@ -141,6 +141,8 @@ mod tests {
             any_evaluable: true,
             all_idle: false,
             metrics_input: String::new(),
+            energy_active_windows: 0,
+            energy_pair_windows: 0,
         }
     }
 

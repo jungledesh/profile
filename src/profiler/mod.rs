@@ -30,6 +30,10 @@ pub struct DiagnoseResult {
     pub all_idle: bool,
     /// Metrics URL passed to `diagnose` (for display when `any_evaluable` is false).
     pub metrics_input: String,
+    /// Active windows in the energy-pair denominator (from aggregate).
+    pub energy_active_windows: usize,
+    /// Windows that entered the J/tok energy-pair set (from aggregate).
+    pub energy_pair_windows: usize,
 }
 
 pub fn run_diagnose(
@@ -56,14 +60,23 @@ pub fn run_diagnose(
             .iter()
             .filter(|w| window_is_evaluable(w))
             .all(window_is_idle);
-    let snapshot = if raw_windows.is_empty() {
-        empty_snapshot(started_at)
+    let (snapshot, energy_meta) = if raw_windows.is_empty() {
+        (
+            empty_snapshot(started_at),
+            aggregate::EnergyPairMeta::default(),
+        )
     } else if any_evaluable {
         aggregate::aggregate_windows(&raw_windows, &window_durations, started_at)
     } else if let Some(last) = raw_windows.last() {
-        context_only_diagnose_snapshot(last, started_at)
+        (
+            context_only_diagnose_snapshot(last, started_at),
+            aggregate::EnergyPairMeta::default(),
+        )
     } else {
-        empty_snapshot(started_at)
+        (
+            empty_snapshot(started_at),
+            aggregate::EnergyPairMeta::default(),
+        )
     };
     let mut config = build_config(vllm_metrics_input, &snapshot, max_num_seqs);
     config.cost_per_hour = cost_per_hour;
@@ -83,6 +96,8 @@ pub fn run_diagnose(
         any_evaluable,
         all_idle,
         metrics_input,
+        energy_active_windows: energy_meta.active_windows,
+        energy_pair_windows: energy_meta.pair_windows,
     })
 }
 
@@ -151,6 +166,7 @@ fn empty_snapshot(at: SystemTime) -> collectors::RawSnapshot {
         timestamp: at,
         vllm: collectors::VllmRawMetrics::default(),
         gpus: vec![],
+        host_memory: None,
     }
 }
 
@@ -183,6 +199,7 @@ fn context_only_diagnose_snapshot(
                 ..Default::default()
             })
             .collect(),
+        host_memory: source.host_memory,
     }
 }
 
@@ -232,7 +249,9 @@ mod tests {
             timestamp: std::time::SystemTime::UNIX_EPOCH,
             vllm: v,
             gpus: vec![g],
+            host_memory: None,
         };
+
         let out = context_only_diagnose_snapshot(&src, std::time::SystemTime::UNIX_EPOCH);
         assert_eq!(out.vllm.model_name.as_deref(), Some("llama"));
         assert_eq!(out.vllm.max_num_seqs, Some(128));
@@ -285,6 +304,7 @@ mod tests {
                 ..Default::default()
             },
             gpus: vec![],
+            host_memory: None,
         };
 
         let non_eval_snap = RawSnapshot {
@@ -293,6 +313,7 @@ mod tests {
             timestamp: t,
             vllm: VllmRawMetrics::default(),
             gpus: vec![],
+            host_memory: None,
         };
 
         assert!(window_is_evaluable(&idle_snap));

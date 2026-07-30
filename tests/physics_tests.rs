@@ -29,7 +29,9 @@ fn build_input(
             gpu_name: Some(gpu_name.to_string()),
             ..Default::default()
         }],
+        host_memory: None,
     };
+
     let mut ctx = StaticContext::from_snapshot(&snap, cfg);
     if model_name == "test/Llama-3.1-70B" {
         ctx.model = ModelArch {

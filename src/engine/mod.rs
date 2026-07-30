@@ -200,7 +200,9 @@ mod build_report_tests {
             timestamp: t,
             vllm: v,
             gpus: vec![g],
+            host_memory: None,
         };
+
         let cfg = VllmConfig {
             dtype: Some("bf16".to_string()),
             max_model_len: Some(2048),
@@ -251,7 +253,9 @@ mod build_report_tests {
             timestamp: t,
             vllm: v,
             gpus: vec![g],
+            host_memory: None,
         };
+
         let cfg = VllmConfig {
             dtype: Some("bf16".to_string()),
             max_model_len: Some(2048),
@@ -305,7 +309,9 @@ mod build_report_tests {
             timestamp: t,
             vllm: v,
             gpus: vec![g],
+            host_memory: None,
         };
+
         let cfg = VllmConfig {
             dtype: Some("bf16".to_string()),
             max_model_len: Some(2048),
@@ -348,7 +354,9 @@ mod build_report_tests {
             timestamp: t,
             vllm: v,
             gpus: vec![g],
+            host_memory: None,
         };
+
         let cfg = VllmConfig {
             dtype: Some("bf16".to_string()),
             max_model_len: Some(2048),

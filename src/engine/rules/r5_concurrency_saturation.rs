@@ -737,6 +737,10 @@ mod tests {
             text.contains("16% of requests waiting (6 waiting, 32 running)"),
             "pct must divide snapshot counts, not d.queue_ratio: {text}"
         );
+        assert!(
+            !text.contains("in fired windows"),
+            "R5 Cause is run-level; must not carry fired-window label: {text}"
+        );
     }
 
     #[test]

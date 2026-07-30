@@ -1467,6 +1467,8 @@ mod tests {
                 timestamp: SystemTime::UNIX_EPOCH,
                 vllm: VllmRawMetrics::default(),
                 gpus: vec![],
+
+                host_memory: None,
             },
             windows: Vec::new(),
             static_ctx: StaticContext {
@@ -1481,6 +1483,8 @@ mod tests {
             any_evaluable: true,
             all_idle: false,
             metrics_input: String::new(),
+            energy_active_windows: 0,
+            energy_pair_windows: 0,
         }
     }
 

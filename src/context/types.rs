@@ -213,6 +213,7 @@ mod tests {
             }],
             ..Default::default()
         };
+
         let ctx = StaticContext::from_snapshot(&snap, VllmConfig::default());
         let expected = mib_to_decimal_gb(80 * 1024);
         let got = ctx.gpu.vram_gb.expect("vram");

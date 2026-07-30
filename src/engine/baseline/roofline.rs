@@ -465,6 +465,8 @@ mod tests {
             timestamp: SystemTime::UNIX_EPOCH,
             vllm: snapshot,
             gpus: vec![GpuRawMetrics::default(); n_gpus],
+
+            host_memory: None,
         });
         (ctx, win)
     }
@@ -1757,6 +1759,8 @@ mod tests {
             timestamp: SystemTime::UNIX_EPOCH,
             vllm: snapshot,
             gpus: vec![GpuRawMetrics::default()],
+
+            host_memory: None,
         });
         (ctx, win)
     }
@@ -1802,6 +1806,8 @@ mod tests {
                 ..Default::default()
             },
             gpus: vec![GpuRawMetrics::default()],
+
+            host_memory: None,
         });
         let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
         let expected = math::prefill_ops_per_sec(67.0, 37_000_000_000, 4096, 61, 139_264);
