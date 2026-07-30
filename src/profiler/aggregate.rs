@@ -242,8 +242,10 @@ fn empty_aggregate(at: SystemTime) -> collectors::RawSnapshot {
     }
 }
 
-/// `max(per-window peaks, last-evaluable landing waiting)` - mean would understate
-/// concurrent parked demand for kv-offload sizing.
+/// Max of three sources: per-window scrape-tracked waiting peaks, the highest
+/// per-window waiting gauge across evaluable windows, and the last evaluable
+/// landing waiting. Mean would understate concurrent parked demand for
+/// kv-offload sizing.
 fn num_requests_waiting_peak(
     pairs: &[(&collectors::RawSnapshot, Duration)],
     last: &collectors::RawSnapshot,

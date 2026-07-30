@@ -547,13 +547,18 @@ pub(super) fn prefill_fix_lines(d: &PrefillBoundDetail, sev: Severity) -> (Vec<S
         )
     } else if chunked_not_enabled {
         // Budget knob is inert without chunked prefill. State the dependency on
-        // the budget bullet so both land in one restart.
+        // the budget bullet so both land in one restart. Skip when the budget
+        // line is terminal (nothing prescribed to "take effect").
         let mut bullets =
             vec!["      • Enable chunked prefill (--enable-chunked-prefill).".to_string()];
+        let actionable = !matches!(
+            resolve_batch_token_prescription(d),
+            BatchTokenPrescription::TerminalAtFloor { .. }
+        );
         super::push_bullet_with_subline(
             &mut bullets,
             batch_budget_fix_bullet(d, "Set"),
-            Some(CHUNKED_PREFILL_BUDGET_DEPENDENCY),
+            actionable.then_some(CHUNKED_PREFILL_BUDGET_DEPENDENCY),
         );
         (
             bullets,
@@ -1815,6 +1820,21 @@ mod tests {
         assert!(!text.contains("prefix caching"));
         assert!(!text.contains("disable prefix"));
         assert!(prescription_numbers(&text).is_empty());
+    }
+
+    #[test]
+    fn chunked_off_terminal_at_floor_omits_dependency_subline() {
+        let mut d = hybrid_align_floor_detail(Some(HYBRID_ALIGN_FLOOR_EXAMPLE));
+        d.chunked_prefill_enabled = Some(false);
+        let text = format_prefill_bound_window_issue(&d, 100).join("\n");
+        assert!(text.contains("Enable chunked prefill (--enable-chunked-prefill)."));
+        assert!(text.contains(&format!(
+            "Prefill chunk size is at the page floor ({HYBRID_ALIGN_FLOOR_EXAMPLE}); no smaller value boots on this server."
+        )));
+        assert!(
+            !text.contains(CHUNKED_PREFILL_BUDGET_DEPENDENCY),
+            "terminal statement has nothing to take effect: {text}"
+        );
     }
 
     #[test]
