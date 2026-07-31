@@ -236,9 +236,16 @@ pub(super) struct ShrinkSuggestion {
     pub subline: Option<&'static str>,
 }
 
-/// vLLM rejects over-limit requests; attach to every shrink bullet form.
+/// Generic rejection caution when no p99/means evidence shapes the price.
 pub(super) const SHRINK_REJECTION_WARNING: &str =
     "Requests above the new limit are rejected with a 400, not truncated.";
+
+/// p99 target path: ~1% is definitional (not computed from the scrape).
+pub(super) const SHRINK_P99_REJECTION_WARNING: &str =
+    "~1% of observed requests ran longer; those are rejected with a 400, not truncated.";
+
+/// Means path (both-sided and single-sided): avg cannot bound the tail.
+pub(super) const SHRINK_MEANS_REJECTION_WARNING: &str = "Some requests are longer than avg; add buffer to it. Requests over the limit are rejected with a 400, not truncated.";
 
 /// Build max_model_len shrink suggestion lines.
 /// Hard number only when `total_count >= 100` and both p99s are present.
@@ -306,28 +313,29 @@ pub(super) fn model_len_shrink_suggestion_lines(
         let p99_ctx = format_observed_context_tokens(pp + gp);
         lines.push(format!(
             "{indent}• Lower --max-model-len {len_clause}. \
-             Observed p99 {p99_ctx} tokens per request (prompt + generation p99)."
+             Observed p99 {p99_ctx} tokens per request."
         ));
         return ShrinkSuggestion {
             lines,
             target: Some(suggested),
-            subline: Some(SHRINK_REJECTION_WARNING),
+            subline: Some(SHRINK_P99_REJECTION_WARNING),
         };
     }
-    lines.push(sub_floor_shrink_evidence_line(
-        indent,
-        m,
-        evidence.prompt_mean,
-        evidence.generation_mean,
-    ));
+    let (line, has_mean_evidence) =
+        sub_floor_shrink_evidence_line(indent, m, evidence.prompt_mean, evidence.generation_mean);
+    lines.push(line);
     ShrinkSuggestion {
         lines,
         target: None,
-        subline: Some(SHRINK_REJECTION_WARNING),
+        subline: Some(if has_mean_evidence {
+            SHRINK_MEANS_REJECTION_WARNING
+        } else {
+            SHRINK_REJECTION_WARNING
+        }),
     }
 }
 
-fn format_observed_context_tokens(n: f64) -> String {
+pub(super) fn format_observed_context_tokens(n: f64) -> String {
     if n >= 1000.0 {
         format!("{:.1}k", n / 1000.0)
     } else {
@@ -335,39 +343,83 @@ fn format_observed_context_tokens(n: f64) -> String {
     }
 }
 
+/// Concurrent seats the KV pool can hold at observed mean request size.
+///
+/// Pool tokens ≈ full-context concurrency × max_model_len (the same full-window
+/// pricing that produced `full_context_cap`). Divide by mean prompt+generation.
+/// Always estimated: live-traffic means, not a measured allocator label.
+pub(super) fn capacity_at_observed_request_sizes(
+    full_context_cap: u32,
+    max_model_len: u32,
+    prompt_mean: Option<f64>,
+    generation_mean: Option<f64>,
+) -> Option<u32> {
+    if full_context_cap == 0 || max_model_len == 0 {
+        return None;
+    }
+    let p = prompt_mean.filter(|v| v.is_finite() && *v >= 0.0)?;
+    let g = generation_mean.filter(|v| v.is_finite() && *v >= 0.0)?;
+    let mean = p + g;
+    if mean <= 0.0 {
+        return None;
+    }
+    let pool_tokens = f64::from(full_context_cap) * f64::from(max_model_len);
+    let n = (pool_tokens / mean).floor();
+    if !(n.is_finite() && n > 0.0 && n <= f64::from(u32::MAX)) {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let n_u = n as u32;
+    Some(n_u)
+}
+
 /// Below the 100-completion floor: evidence only, no named target.
+/// Returns `(line, has_mean_evidence)` so the caller can attach the means tip
+/// only when an average was shown.
 fn sub_floor_shrink_evidence_line(
     indent: &str,
     max_model_len: u32,
     prompt_mean: Option<f64>,
     gen_mean: Option<f64>,
-) -> String {
+) -> (String, bool) {
     let prompt = prompt_mean.filter(|v| v.is_finite() && *v >= 0.0);
     let generation = gen_mean.filter(|v| v.is_finite() && *v >= 0.0);
     match (prompt, generation) {
         (Some(p), Some(g)) => {
             let ctx = format_observed_context_tokens(p + g);
-            format!(
-                "{indent}• Lower --max-model-len (current: {max_model_len}). \
-                 Observed avg {ctx} tokens per request, prompt plus generation."
+            (
+                format!(
+                    "{indent}• Lower --max-model-len (current: {max_model_len}). \
+                 Observed avg {ctx} tokens per request, prompt + generation."
+                ),
+                true,
             )
         }
         (Some(p), None) => {
             let ctx = format_observed_context_tokens(p);
-            format!(
-                "{indent}• Lower --max-model-len (current: {max_model_len}). \
+            (
+                format!(
+                    "{indent}• Lower --max-model-len (current: {max_model_len}). \
                  Observed avg prompt {ctx} tokens per request."
+                ),
+                true,
             )
         }
         (None, Some(g)) => {
             let ctx = format_observed_context_tokens(g);
-            format!(
-                "{indent}• Lower --max-model-len (current: {max_model_len}). \
+            (
+                format!(
+                    "{indent}• Lower --max-model-len (current: {max_model_len}). \
                  Observed avg generation {ctx} tokens per request."
+                ),
+                true,
             )
         }
-        (None, None) => format!(
-            "{indent}• Lower --max-model-len (current: {max_model_len}) to safely raise concurrency."
+        (None, None) => (
+            format!(
+                "{indent}• Lower --max-model-len (current: {max_model_len}) to safely raise concurrency."
+            ),
+            false,
         ),
     }
 }
@@ -570,6 +622,41 @@ fn observed_budget_bytes(
 /// Safety margin on a recommended `--max-num-seqs`. Shared by R5 and R7 so two
 /// rules never print two different recommended values for the same server.
 pub(super) const RECOMMENDED_SEQS_SAFETY_MARGIN: f64 = 0.80;
+
+/// Percent buffer implied by [`RECOMMENDED_SEQS_SAFETY_MARGIN`] (0.80 → 20).
+/// Never hard-code "20" in operator strings; call this.
+pub(super) fn recommended_seqs_safety_buffer_pct() -> u32 {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    {
+        ((1.0 - RECOMMENDED_SEQS_SAFETY_MARGIN) * 100.0).round() as u32
+    }
+}
+
+/// Binder reason shared by R5 raise bullets and R7 Recommended lines.
+/// Callers wrap in parentheses. Ridge wording for R5 keeps the wall number
+/// inline separately; this helper covers R7 ridge + all memory binders.
+pub(super) fn recommended_seqs_binder_reason(rec: &RecommendedSeqs) -> String {
+    if rec.empirical {
+        return "est".to_string();
+    }
+    match rec.binder {
+        BindingWall::Ridge | BindingWall::Config => "bound by compute ridge".to_string(),
+        BindingWall::Memory { .. } => {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let wall_n = rec.wall.floor() as u32;
+            let pct = recommended_seqs_safety_buffer_pct();
+            match rec.source {
+                Some(KvBoundSource::Observed) => {
+                    format!("fits {wall_n} observed, {pct}% safety buffer")
+                }
+                Some(KvBoundSource::Derived | KvBoundSource::DerivedHybrid) => {
+                    format!("fits {wall_n} (est), {pct}% safety buffer")
+                }
+                None => format!("fits {wall_n}, {pct}% safety buffer"),
+            }
+        }
+    }
+}
 
 /// Empirical KV bounds are structurally optimistic (footprints grow over a
 /// request's life; the estimator sees them young). Cap each prescription at a

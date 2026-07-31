@@ -169,6 +169,61 @@ pub(super) fn rule1_under_batching_with_efficiency(input: R1EvalInput<'_>) -> Ru
     })
 }
 
+fn r1_fix_lines(
+    idle: f64,
+    binding_wall: R1BindingWall,
+    max_model_len: Option<u32>,
+    prompt_mean: Option<f64>,
+    generation_mean: Option<f64>,
+) -> Vec<String> {
+    match binding_wall {
+        R1BindingWall::Ridge => vec![format!(
+            "      • Batch more requests or increase client concurrency ({idle:.0} slots idle before hardware degrades TPOT)"
+        )],
+        R1BindingWall::Config => vec![format!(
+            "      • Batch more requests or increase client concurrency ({idle:.0} slots idle)"
+        )],
+        // Memory wall: full-context count is a floor, not an action cap. Label the
+        // assumption; never put the idle count in the action line.
+        R1BindingWall::Memory { cap } => {
+            let mut lines =
+                vec!["      • Batch more requests or increase client concurrency.".to_string()];
+            let Some(m) = max_model_len.filter(|&m| m > 0) else {
+                return lines;
+            };
+            let window = super::format_observed_context_tokens(f64::from(m));
+            let mut sub = format!("        Fits {cap} at the full {window} window");
+            if let Some(obs) =
+                super::capacity_at_observed_request_sizes(cap, m, prompt_mean, generation_mean)
+            {
+                sub.push_str(&format!("; ~{obs} at observed request sizes (est)"));
+            }
+            sub.push('.');
+            lines.push(sub);
+            lines
+        }
+    }
+}
+
+/// Context for R1 Fix lines that need config / traffic means (memory-wall subline).
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct R1FormatCtx {
+    pub max_model_len: Option<u32>,
+    pub prompt_mean: Option<f64>,
+    pub generation_mean: Option<f64>,
+}
+
+impl R1FormatCtx {
+    pub(super) fn from_snapshot(snapshot: &RawSnapshot, max_model_len: Option<u32>) -> Self {
+        let ok = |v: Option<f64>| v.filter(|x| x.is_finite() && *x >= 0.0);
+        Self {
+            max_model_len,
+            prompt_mean: ok(snapshot.vllm.prompt_tokens_mean),
+            generation_mean: ok(snapshot.vllm.generation_tokens_mean),
+        }
+    }
+}
+
 #[cfg(test)]
 pub fn r1_recommendation(input: R1EvalInput<'_>) -> Option<Recommendation> {
     let Rule1Outcome::Fired(d) = rule1_under_batching_with_efficiency(input) else {
@@ -185,26 +240,20 @@ pub fn r1_recommendation(input: R1EvalInput<'_>) -> Option<Recommendation> {
         layer: 4,
         impact: 4,
         confidence,
-        display_lines: format_under_batching_fired(&d, confidence, kv_warning),
+        display_lines: format_under_batching_fired(
+            &d,
+            confidence,
+            kv_warning,
+            &R1FormatCtx::default(),
+        ),
     })
-}
-
-fn r1_fix_line(idle: f64, binding_wall: R1BindingWall) -> String {
-    match binding_wall {
-        R1BindingWall::Ridge => format!(
-            "      • Batch more requests or increase client concurrency ({idle:.0} slots idle before hardware degrades TPOT)"
-        ),
-        // Memory's worst-case-at-full-context count never reaches the operator.
-        R1BindingWall::Config | R1BindingWall::Memory { .. } => format!(
-            "      • Batch more requests or increase client concurrency ({idle:.0} slots idle)"
-        ),
-    }
 }
 
 pub(super) fn format_under_batching_fired(
     d: &UnderBatchingDetail,
     confidence: f64,
     kv_warning: bool,
+    fmt: &R1FormatCtx,
 ) -> Vec<String> {
     let Some(max_n) = d.max_num_seqs else {
         // Structurally unreachable: r1 hard-aborts without max_num_seqs.
@@ -212,7 +261,13 @@ pub(super) fn format_under_batching_fired(
     };
     let max_str = max_n.to_string();
     let idle = (d.effective_max - d.running).max(0.0);
-    let fix_line = r1_fix_line(idle, d.binding_wall);
+    let fix_lines = r1_fix_lines(
+        idle,
+        d.binding_wall,
+        fmt.max_model_len,
+        fmt.prompt_mean,
+        fmt.generation_mean,
+    );
     let confidence_str = super::confidence_label(confidence);
 
     let mut lines = vec![
@@ -228,8 +283,8 @@ pub(super) fn format_under_batching_fired(
             .to_string(),
         String::new(),
         "    Fix:".to_string(),
-        fix_line,
     ];
+    lines.extend(fix_lines);
     if kv_warning {
         lines.push(super::KV_SCALE_CAUTION.to_string());
     }
@@ -253,9 +308,10 @@ pub(super) fn format_under_batching_window_issue(
     seen_pct: u32,
     confidence: f64,
     kv_warning: bool,
+    fmt: &R1FormatCtx,
 ) -> Vec<String> {
     super::with_seen_pct(
-        format_under_batching_fired(d, confidence, kv_warning),
+        format_under_batching_fired(d, confidence, kv_warning, fmt),
         seen_pct,
     )
 }
@@ -552,7 +608,8 @@ mod tests {
             Rule1Outcome::Fired(d) => {
                 assert!(d.known_gpu);
                 assert_eq!(d.config_relative_efficiency_pct, Some(15.0));
-                let text = format_under_batching_fired(&d, 0.8, false).join("\n");
+                let text =
+                    format_under_batching_fired(&d, 0.8, false, &R1FormatCtx::default()).join("\n");
                 assert!(text.contains("Requests (avg when starved)"));
                 assert!(text.contains("running"));
                 assert!(text.contains("max: 256"));
@@ -568,7 +625,8 @@ mod tests {
         match rule1_under_batching_with_efficiency(r1_input(&s, R1InputOpts::default())) {
             Rule1Outcome::Fired(d) => {
                 assert!(!d.known_gpu);
-                let text = format_under_batching_fired(&d, 0.5, false).join("\n");
+                let text =
+                    format_under_batching_fired(&d, 0.5, false, &R1FormatCtx::default()).join("\n");
                 assert!(text.contains("Requests (avg when starved)"));
                 assert!(text.contains("low confidence"));
                 assert!(!text.contains("Config efficiency"));
@@ -582,7 +640,8 @@ mod tests {
         let s = snap(Some(5.0), Some(256), Some(0.0));
         match rule1_under_batching_with_efficiency(r1_input(&s, R1InputOpts::default())) {
             Rule1Outcome::Fired(d) => {
-                let text = format_under_batching_fired(&d, 0.5, true).join("\n");
+                let text =
+                    format_under_batching_fired(&d, 0.5, true, &R1FormatCtx::default()).join("\n");
                 assert!(text.contains("        Monitor KV cache when scaling up."));
                 assert!(!text.contains("• Monitor"));
             }
@@ -595,7 +654,8 @@ mod tests {
         let s = snap(Some(5.0), Some(256), Some(0.0));
         match rule1_under_batching_with_efficiency(r1_input(&s, R1InputOpts::default())) {
             Rule1Outcome::Fired(d) => {
-                let text = format_under_batching_fired(&d, 0.5, false).join("\n");
+                let text =
+                    format_under_batching_fired(&d, 0.5, false, &R1FormatCtx::default()).join("\n");
                 assert!(!text.contains("Monitor KV cache when scaling up."));
                 assert!(!text.contains("• Monitor"));
             }
@@ -814,10 +874,24 @@ mod tests {
                 assert_eq!(d.binding_wall, R1BindingWall::Memory { cap: 35 });
                 let idle = (d.effective_max - d.running).max(0.0);
                 assert!((idle - 29.0).abs() < 1e-9);
-                let text = format_under_batching_fired(&d, 0.8, false).join("\n");
-                assert!(text.contains("29 slots idle"));
+                // No max_model_len in fmt → direction-only (no floor subline).
+                let text =
+                    format_under_batching_fired(&d, 0.8, false, &R1FormatCtx::default()).join("\n");
+                assert!(!text.contains("slots idle"));
+                assert!(text.contains("Batch more requests or increase client concurrency."));
                 assert!(!text.contains("worst-case"));
                 assert!(!text.contains("degrades TPOT"));
+                // With window + means: floor labeled + observed-sizes clause.
+                let fmt = R1FormatCtx {
+                    max_model_len: Some(8192),
+                    prompt_mean: Some(2000.0),
+                    generation_mean: Some(2096.0),
+                };
+                // pool = 35 * 8192; mean = 4096 → floor(70) = 70
+                let text = format_under_batching_fired(&d, 0.8, false, &fmt).join("\n");
+                assert!(text.contains("Fits 35 at the full 8.2k window"));
+                assert!(text.contains("~70 at observed request sizes (est)"));
+                assert!(!text.contains("slots idle"));
             }
             Rule1Outcome::NotFired => panic!("expected memory-bound under-batching"),
         }
@@ -859,7 +933,8 @@ mod tests {
             Rule1Outcome::Fired(d) => {
                 assert!((d.effective_max - 153.0).abs() < 1e-9);
                 assert_eq!(d.binding_wall, R1BindingWall::Ridge);
-                let text = format_under_batching_fired(&d, 0.8, false).join("\n");
+                let text =
+                    format_under_batching_fired(&d, 0.8, false, &R1FormatCtx::default()).join("\n");
                 assert!(text.contains("slots idle before hardware degrades TPOT"));
                 assert!(!text.contains("worst-case"));
                 assert!(!text.contains("memory fits"));
@@ -930,8 +1005,10 @@ mod tests {
         let agg = aggregate_r1_detail(&[ridge.clone(), ridge, mem.clone(), mem]);
         assert!((agg.effective_max - 35.0).abs() < 1e-9);
         assert_eq!(agg.binding_wall, R1BindingWall::Memory { cap: 35 });
-        let text = format_under_batching_fired(&agg, 0.8, false).join("\n");
-        assert!(text.contains("slots idle"));
+        let text =
+            format_under_batching_fired(&agg, 0.8, false, &R1FormatCtx::default()).join("\n");
+        assert!(!text.contains("slots idle"));
+        assert!(text.contains("Batch more requests or increase client concurrency."));
         assert!(!text.contains("worst-case"));
         assert!(!text.contains("degrades TPOT"));
     }
@@ -952,7 +1029,8 @@ mod tests {
         let agg = aggregate_r1_detail(&[d.clone(), d]);
         assert!((agg.effective_max - 153.0).abs() < 1e-9);
         assert_eq!(agg.binding_wall, R1BindingWall::Ridge);
-        let text = format_under_batching_fired(&agg, 0.8, false).join("\n");
+        let text =
+            format_under_batching_fired(&agg, 0.8, false, &R1FormatCtx::default()).join("\n");
         assert!(text.contains("slots idle before hardware degrades TPOT"));
         assert!(!text.contains("worst-case"));
         assert!(!text.contains("memory fits"));
@@ -971,7 +1049,7 @@ mod tests {
             config_relative_efficiency_pct: Some(15.0),
             known_gpu: true,
         };
-        let text = format_under_batching_fired(&d, 0.8, false).join("\n");
+        let text = format_under_batching_fired(&d, 0.8, false, &R1FormatCtx::default()).join("\n");
         assert!(text.contains("(251 slots idle)"));
         assert!(!text.contains("degrades TPOT"));
         assert!(!text.contains("worst-case"));
@@ -980,15 +1058,19 @@ mod tests {
     #[test]
     fn r1_fix_line_ridge_wall_includes_tpot_clause() {
         let idle = 147.0;
-        let ridge = r1_fix_line(idle, R1BindingWall::Ridge);
+        let ridge = r1_fix_lines(idle, R1BindingWall::Ridge, None, None, None).join("\n");
         assert!(ridge.contains("degrades TPOT"));
         assert!(!ridge.contains("worst-case"));
-        let mem = r1_fix_line(idle, R1BindingWall::Memory { cap: 35 });
+        let mem =
+            r1_fix_lines(idle, R1BindingWall::Memory { cap: 35 }, None, None, None).join("\n");
         assert!(!mem.contains("degrades TPOT"));
         assert!(!mem.contains("worst-case"));
-        let cfg = r1_fix_line(idle, R1BindingWall::Config);
+        assert!(!mem.contains("slots idle"));
+        assert!(mem.contains("Batch more requests or increase client concurrency."));
+        let cfg = r1_fix_lines(idle, R1BindingWall::Config, None, None, None).join("\n");
         assert!(!cfg.contains("degrades TPOT"));
         assert!(!cfg.contains("worst-case"));
+        assert!(cfg.contains("slots idle"));
     }
 
     #[test]
@@ -1006,7 +1088,8 @@ mod tests {
         };
         let agg = aggregate_r1_detail(&[d.clone(), d]);
         assert_eq!(agg.binding_wall, R1BindingWall::Ridge);
-        let text = format_under_batching_fired(&agg, 0.8, false).join("\n");
+        let text =
+            format_under_batching_fired(&agg, 0.8, false, &R1FormatCtx::default()).join("\n");
         assert!(!text.contains("memory fits"));
         assert!(text.contains("slots idle before hardware degrades TPOT"));
         assert!(!text.contains("worst-case"));
@@ -1126,5 +1209,71 @@ mod tests {
             }
             Rule1Outcome::NotFired => panic!("expected fired with all gates passing"),
         }
+    }
+
+    #[test]
+    fn memory_wall_journey_iter2_two_line_form() {
+        // Journey iter-2: full-context 15 @ 18200; mean prompt+gen 9100 → ~30 (est).
+        let d = UnderBatchingDetail {
+            running: 10.0,
+            waiting: 0.0,
+            max_num_seqs: Some(175),
+            effective_max: 15.0,
+            binding_wall: R1BindingWall::Memory { cap: 15 },
+            occupancy_pct: (10.0 / 15.0) * 100.0,
+            efficiency_pct: Some(12.0),
+            config_relative_efficiency_pct: Some(15.0),
+            known_gpu: true,
+        };
+        let fmt = R1FormatCtx {
+            max_model_len: Some(18200),
+            prompt_mean: Some(5000.0),
+            generation_mean: Some(4100.0),
+        };
+        let text = format_under_batching_fired(&d, 0.8, false, &fmt).join("\n");
+        assert!(text.contains("Batch more requests or increase client concurrency."));
+        assert!(
+            text.contains("Fits 15 at the full 18.2k window; ~30 at observed request sizes (est).")
+        );
+        assert!(!text.contains("slots idle"));
+    }
+
+    #[test]
+    fn memory_wall_degrades_without_observed_context() {
+        let d = UnderBatchingDetail {
+            running: 10.0,
+            waiting: 0.0,
+            max_num_seqs: Some(175),
+            effective_max: 15.0,
+            binding_wall: R1BindingWall::Memory { cap: 15 },
+            occupancy_pct: (10.0 / 15.0) * 100.0,
+            efficiency_pct: Some(12.0),
+            config_relative_efficiency_pct: Some(15.0),
+            known_gpu: true,
+        };
+        let fmt = R1FormatCtx {
+            max_model_len: Some(18200),
+            prompt_mean: None,
+            generation_mean: None,
+        };
+        let text = format_under_batching_fired(&d, 0.8, false, &fmt).join("\n");
+        assert!(text.contains("Fits 15 at the full 18.2k window."));
+        assert!(!text.contains("observed request sizes"));
+        assert!(!text.contains("slots idle"));
+    }
+
+    #[test]
+    fn memory_wall_degrades_without_max_model_len() {
+        let lines = r1_fix_lines(
+            5.0,
+            R1BindingWall::Memory { cap: 15 },
+            None,
+            Some(1.0),
+            Some(1.0),
+        );
+        assert_eq!(
+            lines,
+            vec!["      • Batch more requests or increase client concurrency.".to_string()]
+        );
     }
 }

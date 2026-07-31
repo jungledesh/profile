@@ -534,53 +534,16 @@ pub(super) fn resolve_r2_kv_capacity(
     (derived, label)
 }
 
-/// Known: this gate is inverted for a throttle (hides the number when a cut
-/// would bite, shows it when peak never reaches the cap). Decided: keep.
-/// Rationale in deferred.md, Parked, "R2 seat number peak gate". Do not re-flag.
-fn seat_phrase_shows_number(snapshot: &RawSnapshot, cap: u32) -> bool {
-    let Some(current) = snapshot.vllm.max_num_seqs else {
-        return false;
-    };
-    if cap >= current {
-        return false;
-    }
-    // Derived capacity is a full-context worst case, not a limit. If peak running
-    // already beat it, printing it as a ceiling tells the operator to cut seats
-    // the run proved they do not need to cut. Same test resolve_kv_bound applies
-    // to derived (mod.rs kv_bound_survives_peak).
-    if super::kv_cap_positive_after_floor(snapshot).is_some() {
-        super::usable_kv_concurrency(snapshot).is_some()
-    } else {
-        super::kv_bound_survives_peak(snapshot.vllm.num_requests_running_peak, f64::from(cap))
-    }
-}
-
-fn r2_capacity_phrase(n: u32, show_number: bool) -> String {
-    if show_number {
-        format!("Lower --max-num-seqs to ≤{n} to reduce KV demand")
-    } else {
-        "Lower --max-num-seqs to reduce KV demand".to_string()
-    }
-}
-
 /// Follow-on seats after a named shrink target.
 const FOLLOW_ON_SEAT_BULLET: &str = "      • Then lower --max-num-seqs to reduce KV demand";
+
+const SEAT_BULLET: &str = "      • Lower --max-num-seqs to reduce KV demand";
 
 pub(super) fn kv_pressure_confidence(windows_fired: usize, total_evaluable: usize) -> f64 {
     if total_evaluable == 0 {
         return 0.0;
     }
     (windows_fired as f64 / total_evaluable as f64).clamp(0.0, 1.0)
-}
-
-fn max_num_seqs_bullet(snapshot: &RawSnapshot, kv_max_seqs: Option<u32>) -> String {
-    match kv_max_seqs {
-        Some(n) => {
-            let show = seat_phrase_shows_number(snapshot, n);
-            format!("      • {}", r2_capacity_phrase(n, show))
-        }
-        None => "      • Lower --max-num-seqs to reduce KV demand".to_string(),
-    }
 }
 
 /// True when `--max-num-seqs` is known and above the floor of 1.
@@ -594,11 +557,9 @@ fn seat_lever_available(snapshot: &RawSnapshot, config_max_num_seqs: Option<u32>
 
 fn full_window_seat_bullet(
     snapshot: &RawSnapshot,
-    kv_max_seqs: Option<u32>,
     config_max_num_seqs: Option<u32>,
 ) -> Option<String> {
-    seat_lever_available(snapshot, config_max_num_seqs)
-        .then(|| max_num_seqs_bullet(snapshot, kv_max_seqs))
+    seat_lever_available(snapshot, config_max_num_seqs).then(|| SEAT_BULLET.to_string())
 }
 
 /// Crisis-only risk subline on the full-window seat throttle. Attached when the
@@ -756,7 +717,7 @@ pub(super) fn format_kv_cache_pressure_fired(
         if follow_on_seat {
             cuts.push((FOLLOW_ON_SEAT_BULLET.to_string(), None));
         } else {
-            let seat = max_num_seqs_bullet(snapshot, kv_max_seqs);
+            let seat = SEAT_BULLET.to_string();
             let sub = preemptions_active.then_some(CRISIS_THROTTLE_SUBLINE);
             if lead_with_shrink {
                 cuts.push((seat, sub));
@@ -868,9 +829,7 @@ pub(super) fn format_kv_admission_backlog_issue(
     );
 
     let mut cuts: Vec<super::CutBullet> = Vec::new();
-    if let Some(seat) =
-        full_window_seat_bullet(ctx.snapshot, ctx.kv_max_seqs, ctx.config_max_num_seqs)
-    {
+    if let Some(seat) = full_window_seat_bullet(ctx.snapshot, ctx.config_max_num_seqs) {
         cuts.push((seat, None));
     }
     super::extend_with_shrink_suggestion(&mut cuts, shrink);
@@ -1422,7 +1381,7 @@ mod tests {
         })
         .expect("fired");
         let text = r.display_lines.join("\n");
-        assert!(text.contains("Lower --max-num-seqs to ≤14 to reduce KV demand"));
+        assert!(text.contains("Lower --max-num-seqs to reduce KV demand"));
     }
 
     #[test]
@@ -1446,7 +1405,7 @@ mod tests {
         })
         .expect("fired");
         let text = r.display_lines.join("\n");
-        assert!(text.contains("Lower --max-num-seqs to ≤15 to reduce KV demand"));
+        assert!(text.contains("Lower --max-num-seqs to reduce KV demand"));
     }
 
     #[test]
@@ -1470,7 +1429,7 @@ mod tests {
         })
         .expect("fired");
         let text = r.display_lines.join("\n");
-        assert!(text.contains("Lower --max-num-seqs to ≤18 to reduce KV demand"));
+        assert!(text.contains("Lower --max-num-seqs to reduce KV demand"));
     }
 
     #[test]
@@ -1576,7 +1535,7 @@ mod tests {
             4,
         )
         .join("\n");
-        assert!(text.contains("Lower --max-num-seqs to ≤16 to reduce KV demand"));
+        assert!(text.contains("Lower --max-num-seqs to reduce KV demand"));
         assert!(!text.contains("worst-case"));
     }
 
@@ -2258,110 +2217,62 @@ mod tests {
     }
 
     #[test]
-    fn observed_capacity_fix_shows_number_when_believable() {
-        let mut v = VllmRawMetrics {
-            max_num_seqs: Some(154),
-            num_requests_running_peak: Some(14.0),
-            cache_config: CacheConfigLabels {
-                kv_cache_max_concurrency: Some(24.64),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let snap_ok = snap(v.clone());
+    fn seat_bullet_is_always_direction_only() {
+        // Full-context caps must not cap operator actions (2026-07-30).
+        fn pressure_text(v: VllmRawMetrics, kv_max_seqs: Option<u32>) -> String {
+            format_kv_cache_pressure_fired(
+                &detail(98.0, false),
+                &kv_ctx(&snap(v), Some(8192), Some(30.0), kv_max_seqs),
+                3,
+                4,
+            )
+            .join("\n")
+        }
+        let cases = [
+            (
+                VllmRawMetrics {
+                    kv_cache_usage_perc: Some(95.0),
+                    max_num_seqs: Some(154),
+                    num_requests_running_peak: Some(14.0),
+                    cache_config: CacheConfigLabels {
+                        kv_cache_max_concurrency: Some(24.64),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                Some(24u32),
+            ),
+            (
+                VllmRawMetrics {
+                    kv_cache_usage_perc: Some(95.0),
+                    max_num_seqs: Some(154),
+                    num_requests_running_peak: Some(45.0),
+                    ..Default::default()
+                },
+                Some(33),
+            ),
+            (
+                VllmRawMetrics {
+                    kv_cache_usage_perc: Some(95.0),
+                    max_num_seqs: Some(16),
+                    ..Default::default()
+                },
+                Some(18),
+            ),
+        ];
+        for (i, (v, cap)) in cases.into_iter().enumerate() {
+            let text = pressure_text(v, cap);
+            assert!(
+                text.contains("Lower --max-num-seqs to reduce KV demand"),
+                "case {i}"
+            );
+            assert!(!text.contains('≤'), "case {i}: {text}");
+        }
+        assert_eq!(resolve_r2_kv_capacity(None, Some(18), false).0, Some(18));
         assert_eq!(
-            r2_capacity_phrase(24, seat_phrase_shows_number(&snap_ok, 24)),
-            "Lower --max-num-seqs to ≤24 to reduce KV demand"
+            resolve_r2_kv_capacity(None, Some(18), true).1,
+            KvCapacityLabel::DerivedHybrid
         );
-        assert!(!r2_capacity_phrase(24, true).contains("vLLM-reported"));
-        assert!(!r2_capacity_phrase(24, true).contains("(est)"));
-        v.num_requests_running_peak = Some(25.0);
-        let snap_bad = snap(v);
-        assert_eq!(
-            r2_capacity_phrase(24, seat_phrase_shows_number(&snap_bad, 24)),
-            "Lower --max-num-seqs to reduce KV demand"
-        );
-    }
-
-    #[test]
-    fn derived_dense_capacity_uses_number_when_reduction() {
-        let (n, _label) = resolve_r2_kv_capacity(None, Some(18), false);
-        assert_eq!(n, Some(18));
-        let v = VllmRawMetrics {
-            max_num_seqs: Some(32),
-            ..Default::default()
-        };
-        let snap = snap(v);
-        let phrase = r2_capacity_phrase(18, seat_phrase_shows_number(&snap, 18));
-        assert_eq!(phrase, "Lower --max-num-seqs to ≤18 to reduce KV demand");
-        assert!(!phrase.contains("(est)"));
-        assert!(!phrase.contains("hybrid"));
-    }
-
-    #[test]
-    fn derived_capacity_hides_number_when_peak_running_exceeds_cap() {
-        // No Observed label: resolve_r2_kv_capacity returns derived unchecked;
-        // seat_phrase must still peak-gate the printed number.
-        let (n, label) = resolve_r2_kv_capacity(None, Some(33), false);
-        assert_eq!(n, Some(33));
-        assert_eq!(label, KvCapacityLabel::Derived);
-        let v = VllmRawMetrics {
-            max_num_seqs: Some(154),
-            num_requests_running_peak: Some(45.0),
-            ..Default::default()
-        };
-        let phrase = r2_capacity_phrase(33, seat_phrase_shows_number(&snap(v), 33));
-        assert_eq!(phrase, "Lower --max-num-seqs to reduce KV demand");
-        assert!(!phrase.contains('≤'));
-    }
-
-    #[test]
-    fn derived_capacity_shows_number_when_peak_running_below_cap() {
-        let v = VllmRawMetrics {
-            max_num_seqs: Some(154),
-            num_requests_running_peak: Some(20.0),
-            ..Default::default()
-        };
-        let phrase = r2_capacity_phrase(33, seat_phrase_shows_number(&snap(v), 33));
-        assert_eq!(phrase, "Lower --max-num-seqs to ≤33 to reduce KV demand");
-    }
-
-    #[test]
-    fn derived_capacity_shows_number_when_peak_running_absent() {
-        let v = VllmRawMetrics {
-            max_num_seqs: Some(154),
-            ..Default::default()
-        };
-        let phrase = r2_capacity_phrase(33, seat_phrase_shows_number(&snap(v), 33));
-        assert_eq!(phrase, "Lower --max-num-seqs to ≤33 to reduce KV demand");
-    }
-
-    #[test]
-    fn derived_capacity_shows_number_when_peak_running_equals_cap() {
-        // peak <= floor(value) keeps the number (same boundary as kv_bound_survives_peak).
-        let v = VllmRawMetrics {
-            max_num_seqs: Some(154),
-            num_requests_running_peak: Some(33.0),
-            ..Default::default()
-        };
-        let phrase = r2_capacity_phrase(33, seat_phrase_shows_number(&snap(v), 33));
-        assert_eq!(phrase, "Lower --max-num-seqs to ≤33 to reduce KV demand");
-    }
-
-    #[test]
-    fn derived_hybrid_capacity_direction_when_not_reduction() {
-        let (n, label) = resolve_r2_kv_capacity(None, Some(18), true);
-        assert_eq!(n, Some(18));
-        assert_eq!(label, KvCapacityLabel::DerivedHybrid);
-        let v = VllmRawMetrics {
-            max_num_seqs: Some(16),
-            ..Default::default()
-        };
-        let snap = snap(v);
-        let phrase = r2_capacity_phrase(18, seat_phrase_shows_number(&snap, 18));
-        assert_eq!(phrase, "Lower --max-num-seqs to reduce KV demand");
-        assert!(!phrase.contains("worst-case"));
-        assert!(!phrase.contains("hybrid"));
     }
 
     #[test]
@@ -2387,7 +2298,7 @@ mod tests {
             ..Default::default()
         };
         let t1 = pressure_text(believable, 23);
-        assert!(t1.contains("Lower --max-num-seqs to ≤23 to reduce KV demand"));
+        assert!(t1.contains("Lower --max-num-seqs to reduce KV demand"));
         assert!(!t1.contains("vLLM-reported"));
         assert!(!t1.contains("worst-case"));
 
@@ -2441,7 +2352,7 @@ mod tests {
             4,
         )
         .join("\n");
-        assert!(text.contains("Lower --max-num-seqs to ≤23 to reduce KV demand"));
+        assert!(text.contains("Lower --max-num-seqs to reduce KV demand"));
     }
 
     #[test]
@@ -2920,7 +2831,7 @@ mod tests {
         assert!(text.contains("Lower --max-num-seqs to reduce KV demand"));
         assert!(!text.contains('≤'));
         assert!(!text.contains("Then set --max-num-seqs"));
-        assert!(text.contains("Observed avg 5.1k tokens per request, prompt plus generation."));
+        assert!(text.contains("Observed avg 5.1k tokens per request, prompt + generation."));
         assert!(!text.contains('~'));
     }
 
@@ -3029,7 +2940,7 @@ mod tests {
         )
         .join("\n");
         assert!(text.contains("Observed avg prompt 1.1k tokens per request."));
-        assert!(!text.contains("prompt plus generation"));
+        assert!(!text.contains("prompt + generation"));
         assert!(!text.contains("unavailable"));
     }
 
@@ -3398,7 +3309,7 @@ mod tests {
         assert!(!text.contains("fits at least"));
         assert!(!text.contains("worst-case"));
         assert!(text.contains("Then lower --max-num-seqs to reduce KV demand"));
-        assert!(!text.contains("Lower --max-num-seqs to ≤8"));
+        assert!(!text.contains("Lower --max-num-seqs to reduce KV demand"));
         assert!(!text.contains("Or cap --max-num-seqs"));
     }
 

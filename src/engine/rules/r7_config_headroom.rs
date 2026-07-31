@@ -1,9 +1,11 @@
 use crate::collectors::RawSnapshot;
 
 use super::{
-    BindingWall, KvBoundSource, RecommendedSeqs, recommended_seqs, resolve_kv_bound,
-    usable_kv_concurrency,
+    KvBoundSource, RecommendedSeqs, recommended_seqs, resolve_kv_bound, usable_kv_concurrency,
 };
+
+#[cfg(test)]
+use super::BindingWall;
 
 /// Fire when max_num_seqs is less than 90% of hardware-recommended capacity.
 const CONFIG_HEADROOM_RATIO: f64 = 0.90;
@@ -148,15 +150,10 @@ pub(super) fn aggregate_r7_detail(details: &[ConfigHeadroomDetail]) -> ConfigHea
 }
 
 /// Recommended line binder label. Ridge number is on its own line (do not repeat).
-/// Memory cap appears nowhere else in the block, so show it. Empirical: "(est)" only.
+/// Memory: wall count + source + safety buffer from the shared helper (R5 uses
+/// the same reason string). Empirical: "(est)" only.
 fn recommended_binder_suffix(rec: &RecommendedSeqs) -> String {
-    if rec.empirical {
-        return " (est)".to_string();
-    }
-    match rec.binder {
-        BindingWall::Ridge | BindingWall::Config => " (bound by compute ridge)".to_string(),
-        BindingWall::Memory { .. } => " (bound by memory limit)".to_string(),
-    }
+    format!(" ({})", super::recommended_seqs_binder_reason(rec))
 }
 
 fn headroom_available_cause_line(
@@ -520,7 +517,7 @@ mod tests {
             wall_is_capacity: true,
         };
         let text = format_config_headroom_window_issue(&d, 100, 0.8, Some(&rec), true).join("\n");
-        assert!(text.contains("Recommended   96 (bound by memory limit)"));
+        assert!(text.contains("Recommended   96 (fits 120 observed, 20% safety buffer)"));
         assert!(text.contains("Compute and KV memory headroom available."));
         assert!(!text.contains("~120"));
         assert!(!text.contains("(est)"));
@@ -548,7 +545,7 @@ mod tests {
             wall_is_capacity: true,
         };
         let text = format_config_headroom_window_issue(&d, 100, 0.6, Some(&rec), true).join("\n");
-        assert!(text.contains("Recommended   96 (bound by memory limit)"));
+        assert!(text.contains("Recommended   96 (fits 120 (est), 20% safety buffer)"));
         assert!(text.contains("Compute headroom available; KV at 85%."));
         assert!(!text.contains("Compute and KV memory headroom available."));
         assert!(!text.contains("vLLM-reported"));
@@ -741,7 +738,7 @@ mod tests {
         };
         let text = format_config_headroom_window_issue(&d, 100, 0.8, Some(&rec), true).join("\n");
         assert!(text.contains("Compute headroom available; KV at 85%."));
-        assert!(text.contains("Recommended   96 (bound by memory limit)"));
+        assert!(text.contains("Recommended   96 (fits 120 observed, 20% safety buffer)"));
         assert!(!text.contains("Monitor KV cache"));
     }
 
