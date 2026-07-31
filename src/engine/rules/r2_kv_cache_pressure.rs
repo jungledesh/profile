@@ -546,10 +546,6 @@ pub(super) fn kv_pressure_confidence(windows_fired: usize, total_evaluable: usiz
     (windows_fired as f64 / total_evaluable as f64).clamp(0.0, 1.0)
 }
 
-fn max_num_seqs_bullet() -> String {
-    SEAT_BULLET.to_string()
-}
-
 /// True when `--max-num-seqs` is known and above the floor of 1.
 fn seat_lever_available(snapshot: &RawSnapshot, config_max_num_seqs: Option<u32>) -> bool {
     snapshot
@@ -563,7 +559,7 @@ fn full_window_seat_bullet(
     snapshot: &RawSnapshot,
     config_max_num_seqs: Option<u32>,
 ) -> Option<String> {
-    seat_lever_available(snapshot, config_max_num_seqs).then(max_num_seqs_bullet)
+    seat_lever_available(snapshot, config_max_num_seqs).then(|| SEAT_BULLET.to_string())
 }
 
 /// Crisis-only risk subline on the full-window seat throttle. Attached when the
@@ -721,7 +717,7 @@ pub(super) fn format_kv_cache_pressure_fired(
         if follow_on_seat {
             cuts.push((FOLLOW_ON_SEAT_BULLET.to_string(), None));
         } else {
-            let seat = max_num_seqs_bullet();
+            let seat = SEAT_BULLET.to_string();
             let sub = preemptions_active.then_some(CRISIS_THROTTLE_SUBLINE);
             if lead_with_shrink {
                 cuts.push((seat, sub));
