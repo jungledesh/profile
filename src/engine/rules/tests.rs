@@ -1026,19 +1026,20 @@ fn model_len_suggestion_uses_p99_sum_when_count_sufficient() {
     );
     let text = lines
         .iter()
-        .map(|(b, _)| b.as_str())
+        .map(|(b, sub)| sub.map_or_else(|| b.clone(), |s| format!("{b}\n        {s}")))
         .collect::<Vec<_>>()
         .join("\n");
     assert!(text.contains("Lower --max-model-len 8192 → 6450"));
-    assert!(text.contains("Observed p99 6.5k tokens per request (prompt + generation p99)"));
+    assert!(text.contains("Observed p99 6.5k tokens per request."));
+    assert!(!text.contains("prompt + generation p99"));
     assert!(!text.contains("prompt p99"));
-    assert_eq!(lines[0].1, Some(SHRINK_REJECTION_WARNING));
+    assert!(text.contains("~1% of observed requests ran longer"));
+    assert!(text.contains("rejected with a 400, not truncated"));
+    assert_eq!(lines[0].1, Some(SHRINK_P99_REJECTION_WARNING));
 }
 
 #[test]
 fn shrink_rejection_warning_on_all_four_forms() {
-    const WARN: &str = SHRINK_REJECTION_WARNING;
-
     let named = model_len_shrink_suggestion_lines(
         Some(262144),
         &ShrinkEvidence {
@@ -1051,11 +1052,10 @@ fn shrink_rejection_warning_on_all_four_forms() {
         "      ",
         false,
     );
-    assert_eq!(named.subline, Some(WARN));
+    assert_eq!(named.subline, Some(SHRINK_P99_REJECTION_WARNING));
     assert!(named.lines[0].contains("262144 → 18500"));
-    assert!(
-        named.lines[0].contains("Observed p99 18.5k tokens per request (prompt + generation p99)")
-    );
+    assert!(named.lines[0].contains("Observed p99 18.5k tokens per request."));
+    assert!(!named.lines[0].contains("prompt + generation p99"));
 
     let both_halves = model_len_shrink_suggestion_lines(
         Some(262144),
@@ -1069,10 +1069,9 @@ fn shrink_rejection_warning_on_all_four_forms() {
         "      ",
         false,
     );
-    assert_eq!(both_halves.subline, Some(WARN));
+    assert_eq!(both_halves.subline, Some(SHRINK_MEANS_REJECTION_WARNING));
     assert!(
-        both_halves.lines[0]
-            .contains("Observed avg 5.1k tokens per request, prompt plus generation.")
+        both_halves.lines[0].contains("Observed avg 5.1k tokens per request, prompt + generation.")
     );
 
     let single_half = model_len_shrink_suggestion_lines(
@@ -1087,7 +1086,7 @@ fn shrink_rejection_warning_on_all_four_forms() {
         "      ",
         false,
     );
-    assert_eq!(single_half.subline, Some(WARN));
+    assert_eq!(single_half.subline, Some(SHRINK_MEANS_REJECTION_WARNING));
     assert!(single_half.lines[0].contains("Observed avg prompt 1.1k tokens per request."));
 
     let no_max = model_len_shrink_suggestion_lines(
@@ -1102,8 +1101,68 @@ fn shrink_rejection_warning_on_all_four_forms() {
         "      ",
         false,
     );
-    assert_eq!(no_max.subline, Some(WARN));
+    assert_eq!(no_max.subline, Some(SHRINK_REJECTION_WARNING));
     assert!(no_max.lines[0].contains("to safely raise concurrency."));
+}
+
+#[test]
+fn shrink_caution_p99_and_means_price_the_cut() {
+    let p99 = model_len_shrink_suggestion_lines(
+        Some(18200),
+        &ShrinkEvidence {
+            prompt_p99: Some(10000.0),
+            generation_p99: Some(922.0),
+            prompt_mean: None,
+            generation_mean: None,
+            total_count: 150.0,
+        },
+        "      ",
+        false,
+    );
+    assert_eq!(p99.subline, Some(SHRINK_P99_REJECTION_WARNING));
+    assert!(p99.lines[0].contains("Observed p99 10.9k tokens per request."));
+    assert!(!p99.lines[0].contains("prompt + generation p99"));
+    let p99_text = format!("{}\n        {}", p99.lines[0], p99.subline.unwrap());
+    assert!(p99_text.contains("~1% of observed requests ran longer"));
+    assert!(p99_text.contains("rejected with a 400, not truncated"));
+    assert!(!p99_text.contains("concurrent at the new limit"));
+
+    let means = model_len_shrink_suggestion_lines(
+        Some(262144),
+        &ShrinkEvidence {
+            prompt_p99: None,
+            generation_p99: None,
+            prompt_mean: Some(12000.0),
+            generation_mean: Some(3200.0),
+            total_count: 48.0,
+        },
+        "      ",
+        false,
+    );
+    assert_eq!(means.subline, Some(SHRINK_MEANS_REJECTION_WARNING));
+    let means_text = format!("{}\n        {}", means.lines[0], means.subline.unwrap());
+    assert!(means_text.contains("Some requests are longer than avg; add buffer to it."));
+    assert!(means_text.contains("rejected with a 400, not truncated"));
+
+    let single = model_len_shrink_suggestion_lines(
+        Some(262144),
+        &ShrinkEvidence {
+            prompt_p99: None,
+            generation_p99: None,
+            prompt_mean: None,
+            generation_mean: Some(3200.0),
+            total_count: 48.0,
+        },
+        "      ",
+        false,
+    );
+    assert_eq!(single.subline, Some(SHRINK_MEANS_REJECTION_WARNING));
+    assert!(
+        single
+            .subline
+            .unwrap()
+            .contains("rejected with a 400, not truncated")
+    );
 }
 
 #[test]
@@ -1193,76 +1252,95 @@ fn model_len_suggestion_missing_prompt_p99_has_rejection_warning() {
 
 #[test]
 fn shrink_rejection_warning_on_all_nonempty_return_paths() {
-    const WARN: &str = SHRINK_REJECTION_WARNING;
-
     let paths = [
-        model_len_shrink_suggestion_lines(
-            None,
-            &ShrinkEvidence {
-                prompt_p99: None,
-                generation_p99: None,
-                prompt_mean: None,
-                generation_mean: None,
-                total_count: 0.0,
-            },
-            "      ",
-            false,
+        (
+            model_len_shrink_suggestion_lines(
+                None,
+                &ShrinkEvidence {
+                    prompt_p99: None,
+                    generation_p99: None,
+                    prompt_mean: None,
+                    generation_mean: None,
+                    total_count: 0.0,
+                },
+                "      ",
+                false,
+            ),
+            Some(SHRINK_REJECTION_WARNING),
         ),
-        model_len_shrink_suggestion_lines(
-            Some(8192),
-            &ShrinkEvidence {
-                prompt_p99: Some(6000.0),
-                generation_p99: None,
-                prompt_mean: None,
-                generation_mean: None,
-                total_count: 150.0,
-            },
-            "      ",
-            false,
+        (
+            model_len_shrink_suggestion_lines(
+                Some(8192),
+                &ShrinkEvidence {
+                    prompt_p99: Some(6000.0),
+                    generation_p99: None,
+                    prompt_mean: None,
+                    generation_mean: None,
+                    total_count: 150.0,
+                },
+                "      ",
+                false,
+            ),
+            Some(SHRINK_REJECTION_WARNING),
         ),
-        model_len_shrink_suggestion_lines(
-            Some(8192),
-            &ShrinkEvidence {
-                prompt_p99: None,
-                generation_p99: Some(450.0),
-                prompt_mean: None,
-                generation_mean: None,
-                total_count: 150.0,
-            },
-            "      ",
-            false,
+        (
+            model_len_shrink_suggestion_lines(
+                Some(8192),
+                &ShrinkEvidence {
+                    prompt_p99: None,
+                    generation_p99: Some(450.0),
+                    prompt_mean: None,
+                    generation_mean: None,
+                    total_count: 150.0,
+                },
+                "      ",
+                false,
+            ),
+            Some(SHRINK_REJECTION_WARNING),
         ),
-        model_len_shrink_suggestion_lines(
-            Some(8192),
-            &ShrinkEvidence {
-                prompt_p99: Some(6000.0),
-                generation_p99: Some(450.0),
-                prompt_mean: None,
-                generation_mean: None,
-                total_count: 150.0,
-            },
-            "      ",
-            false,
+        (
+            model_len_shrink_suggestion_lines(
+                Some(8192),
+                &ShrinkEvidence {
+                    prompt_p99: Some(6000.0),
+                    generation_p99: Some(450.0),
+                    prompt_mean: None,
+                    generation_mean: None,
+                    total_count: 150.0,
+                },
+                "      ",
+                false,
+            ),
+            Some(SHRINK_P99_REJECTION_WARNING),
         ),
-        model_len_shrink_suggestion_lines(
-            Some(262144),
-            &ShrinkEvidence {
-                prompt_p99: None,
-                generation_p99: None,
-                prompt_mean: Some(1100.0),
-                generation_mean: Some(4000.0),
-                total_count: 48.0,
-            },
-            "      ",
-            false,
+        (
+            model_len_shrink_suggestion_lines(
+                Some(262144),
+                &ShrinkEvidence {
+                    prompt_p99: None,
+                    generation_p99: None,
+                    prompt_mean: Some(1100.0),
+                    generation_mean: Some(4000.0),
+                    total_count: 48.0,
+                },
+                "      ",
+                false,
+            ),
+            Some(SHRINK_MEANS_REJECTION_WARNING),
         ),
     ];
-    for suggestion in paths {
+    for (suggestion, warn) in paths {
         assert!(
             !suggestion.lines.is_empty(),
             "expected non-empty shrink path"
         );
-        assert_eq!(suggestion.subline, Some(WARN));
+        assert_eq!(suggestion.subline, warn);
+        assert!(
+            suggestion
+                .subline
+                .unwrap()
+                .contains("rejected with a 400, not truncated")
+        );
     }
 
     let noop = model_len_shrink_suggestion_lines(
@@ -1338,6 +1416,7 @@ fn model_len_suggestion_projects_capacity_from_observed_geometry() {
     );
     assert!(!text.contains("fits at least"), "got: {text}");
     assert!(!text.contains("worst-case"));
+    assert!(!text.contains("concurrent at the new limit"));
     assert!(
         !text.contains("fits 8 concurrent"),
         "must not use current observed"
@@ -1531,6 +1610,22 @@ fn operator_text_has_no_capacity_numbers_in_r1_r2_r5_r7() {
         };
         let r7 = format_config_headroom_window_issue(&d, 100, 0.8, Some(&rec), true).join("\n");
         assert_clean(label, &r7);
+        let pct = super::recommended_seqs_safety_buffer_pct();
+        assert_eq!(pct, 20);
+        let reason = super::recommended_seqs_binder_reason(&rec);
+        assert!(
+            reason.contains(&format!("{pct}% safety buffer")),
+            "{label}: {reason}"
+        );
+        match src {
+            KvBoundSource::Observed => {
+                assert_eq!(reason, "fits 120 observed, 20% safety buffer");
+            }
+            KvBoundSource::Derived => {
+                assert_eq!(reason, "fits 120 (est), 20% safety buffer");
+            }
+            KvBoundSource::DerivedHybrid => unreachable!(),
+        }
     }
 }
 

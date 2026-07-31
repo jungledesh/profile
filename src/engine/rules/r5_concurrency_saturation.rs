@@ -162,13 +162,7 @@ fn walls_fix_lines(
                 BindingWall::Ridge | BindingWall::Config => {
                     format!("80% of compute ridge ~{:.0}", rec.wall)
                 }
-                BindingWall::Memory { .. } => match rec.source {
-                    Some(KvBoundSource::Observed) => "80% of memory limit".to_string(),
-                    Some(KvBoundSource::Derived) | Some(KvBoundSource::DerivedHybrid) => {
-                        "80% margin below memory limit (est)".to_string()
-                    }
-                    None => "80% of memory limit".to_string(),
-                },
+                BindingWall::Memory { .. } => super::recommended_seqs_binder_reason(rec),
             }
         };
         safe.push(format!(
@@ -987,7 +981,7 @@ mod tests {
         )
         .expect("fired");
         let text = r.display_lines.join("\n");
-        assert!(text.contains("Raise --max-num-seqs to 12 (80% margin below memory limit (est))"));
+        assert!(text.contains("Raise --max-num-seqs to 12 (fits 15 (est), 20% safety buffer)"));
     }
 
     #[test]
@@ -1056,7 +1050,7 @@ mod tests {
         let rec = rec_for(None, Some(15.0), Some(KvBoundSource::Derived), 10);
         let text = format_concurrency_saturation_issue(&d, Some(8192), Some(&rec), &blank_snap())
             .join("\n");
-        assert!(text.contains("Raise --max-num-seqs to 12 (80% margin below memory limit (est))"));
+        assert!(text.contains("Raise --max-num-seqs to 12 (fits 15 (est), 20% safety buffer)"));
     }
 
     #[test]
@@ -1131,7 +1125,7 @@ mod tests {
             &blank_snap(),
         )
         .join("\n");
-        assert!(text.contains("Raise --max-num-seqs to 96 (80% of memory limit)"));
+        assert!(text.contains("Raise --max-num-seqs to 96 (fits 120 observed, 20% safety buffer)"));
         assert!(!text.contains("~120"));
     }
 
@@ -1147,7 +1141,7 @@ mod tests {
             &blank_snap(),
         )
         .join("\n");
-        assert!(text.contains("Raise --max-num-seqs to 96 (80% margin below memory limit (est))"));
+        assert!(text.contains("Raise --max-num-seqs to 96 (fits 120 (est), 20% safety buffer)"));
     }
 
     // 4. current 130, ridge 153, target 122: margin zone, replica, no raise, no shrink.
@@ -1330,7 +1324,7 @@ mod tests {
         let d = detail_at(32, Some(50.0), Some(5000.0));
         let text =
             format_concurrency_saturation_issue(&d, None, Some(&rec), &blank_snap()).join("\n");
-        assert!(text.contains("Raise --max-num-seqs to 96 (80% of memory limit)"));
+        assert!(text.contains("Raise --max-num-seqs to 96 (fits 120 observed, 20% safety buffer)"));
         assert!(!text.contains("Monitor KV cache"));
         assert!(!text.contains("• Monitor"));
         assert!(text.contains("Confidence: High"));

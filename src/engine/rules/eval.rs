@@ -4,8 +4,8 @@ use crate::engine::Report;
 use crate::engine::baseline::{self, WeightDtypeSource, effective_kv_cache_dtype};
 
 use super::r1_under_batching::{
-    KV_MONITOR_WARNING_PCT, R1EvalInput, Rule1Outcome, UnderBatchingDetail, aggregate_r1_detail,
-    format_under_batching_window_issue, rule1_under_batching_with_efficiency,
+    KV_MONITOR_WARNING_PCT, R1EvalInput, R1FormatCtx, Rule1Outcome, UnderBatchingDetail,
+    aggregate_r1_detail, format_under_batching_window_issue, rule1_under_batching_with_efficiency,
 };
 use super::r2_kv_cache_pressure::{
     KvAdmissionBacklogDetail, KvCachePressureDetail, KvFormatCtx, Rule2Outcome,
@@ -501,11 +501,13 @@ fn build_report_from_eval(
         let d = aggregate_r1_detail(&eval.r1_details);
         let confidence = if d.known_gpu { 0.8 } else { 0.5 };
         let kv_warning = rule_is_significant(eval.r1_kv_warning_count, eval.r1_fired);
+        let r1_fmt = R1FormatCtx::from_snapshot(summary_snap, max_model_len);
         let display_lines = format_under_batching_window_issue(
             &d,
             pct(eval.r1_fired, eval.n_eval),
             confidence,
             kv_warning,
+            &r1_fmt,
         );
         recs.push(Recommendation {
             rule_name: rule_names::UNDER_BATCHING,
