@@ -1,29 +1,26 @@
 # Profile
 
-Profile finds what is limiting your vLLM server, names the cause, and prescribes the flag to change. On one A100 it took Qwen3.6-27B from [31 to 470 tok/s and cut cost from $13.26 to $0.89 per million tokens](#proof).
+Inference diagnostics for production vLLM servers.
 
-Single GPU. NVIDIA and AMD.
+**Are you getting what your hardware is capable of?** Profile finds what is keeping your GPU below the fastest it could serve your model, its physics ceiling, gives you the flag to change, and measures whether the fix worked.
 
-[Release](https://github.com/jungledesh/profile/releases/latest)
-[License](LICENSE)
-[GPU](#requirements)
-
-**[Website](https://jungledesh.github.io/profile/index.html)** | **[Docs](https://jungledesh.github.io/profile/docs.html)** | **[Demo](#proof)**
-
-
-
----
-
-## What is Profile
-
-Your server is slower than your hardware allows. Every monitoring tool will show you that it is slow. None will tell you why.
-
-Profile computes the physics ceiling for your GPU and model, measures the live server against it, names the one thing holding it back, and tells you the flag to change. Then you change it, and Profile measures whether it worked.
+On one A100, that loop took Qwen3.6-27B from **31 to 470 tok/s** and cut cost from **$13.26 to $0.89 per million tokens**. On an H100, **163 to 631 tok/s** at 74% lower cost. [Both runs, regressions included.](#proof)
 
 ```text
-dashboards:  metrics -------------------> you -> guess
-profile:     metrics -> physics ceiling -> cause -> fix -> re-measure
+✓ Single binary      ✓ No agent to deploy
+✓ No config file     ✓ Nothing leaves the machine
 ```
+
+One GPU, NVIDIA or AMD. Reads live `/metrics` and NVML or amdgpu.
+
+[![CI](https://github.com/jungledesh/profile/actions/workflows/build.yml/badge.svg)](https://github.com/jungledesh/profile/actions/workflows/build.yml)
+[![Release](https://img.shields.io/github/v/release/jungledesh/profile)](https://github.com/jungledesh/profile/releases/latest)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-2024_edition-orange)](Cargo.toml)
+
+**[Website](https://jungledesh.github.io/profile/index.html)** | **[Docs](https://jungledesh.github.io/profile/docs.html)** | **[Demo](#proof)** | **[Release](https://github.com/jungledesh/profile/releases/latest)**
+
+[Install](#install-and-run) · [What is Profile](#what-is-profile) · [What you get](#what-you-get) · [Proof](#proof) · [The loop](#the-loop) · [How it works](#how-it-works) · [Where Profile sits](#where-profile-sits) · [Limitations](#limitations) · [Roadmap](#roadmap) · [Research foundation](#research-foundation) · [Principles](#principles)
 
 ---
 
@@ -38,24 +35,21 @@ curl --proto '=https' --tlsv1.2 -LsSf \
 profile diagnose --url http://localhost:8000/metrics --duration 2m
 ```
 
-That is the whole setup. No agent to deploy, no config file, no calibration run. Nothing leaves the machine.
+That is the whole setup. No calibration run, no restart of your server.
 
-From source: `cargo install --git https://github.com/jungledesh/profile`
+Prefer not to pipe curl into sh? Download the binary from the [releases page](https://github.com/jungledesh/profile/releases/latest), or build from source: `cargo install --git https://github.com/jungledesh/profile`
 
----
-
-## Requirements
+**Requirements**
 
 - **GPU.** NVIDIA through NVML, or AMD through the amdgpu driver. Profile probes NVIDIA first and falls back to AMD.
 - **vLLM** with `/metrics` reachable. Default `http://localhost:8000/metrics`.
-- **Live traffic** during the window. An idle server has no waste to find, and Profile says so rather than invent a number.
+- **Live traffic** during the window. An idle server has no waste to find, and Profile says so rather than invent a number. Trying Profile without production traffic? Drive load with vLLM's own `vllm bench serve`, or any load generator.
 
 Launch scope is a single GPU. `--tensor-parallel-size` is accepted and scales the physics ceiling, but KV and weight sharding math stays single-GPU. Multi-GPU is on the [roadmap](#roadmap). Profile still tells you when a model needs tensor parallelism to fit at all.
 
-**Profile CLI flags**
-
-These configure Profile, not vLLM.
-
+<details>
+<summary><b>Profile CLI flags</b> (these configure Profile, not vLLM)</summary>
+<br>
 
 | Flag                     | Default                         | Description                                                          |
 | ------------------------ | ------------------------------- | -------------------------------------------------------------------- |
@@ -66,14 +60,37 @@ These configure Profile, not vLLM.
 | `--cost-per-hour`        | Catalog estimate                | GPU cost in USD/hr                                                   |
 | `-v`                     | Off                             | Show rules that did not fire, and the physics limits                 |
 
+</details>
 
+---
 
+## What is Profile
+
+> **TL;DR.** Profile computes the physics ceiling for your GPU and model, compares the live server against it, names the single highest-priority cause, and gives you the exact vLLM flag to change. Then it re-measures. Not a dashboard, not an autotuner, not a simulator.
+
+Your server is slower than your hardware allows. Every monitoring tool will show you that it is slow. None will tell you why.
+
+```text
+dashboards:  metrics -------------------> you -> guess
+profile:     metrics -> physics ceiling -> cause -> fix -> re-measure
+```
+
+**For:** engineers running vLLM who want to know whether their GPU is earning its price, and what to change when it is not.
+
+**Not for you if:** you shard across GPUs today (on the [roadmap](#roadmap)), run an engine other than vLLM, or have no traffic to measure. [Limitations](#limitations) lists every boundary.
 
 ---
 
 ## What you get
 
-The state of the server, the one thing wrong with it, and the fix.
+The state of the server, the one thing wrong with it, and the fix. Four things to find in the block below:
+
+```text
+GPU / vLLM header    where the server stands: efficiency vs ceiling, latency, cache, cost
+ISSUES               the one cause that survived ranking, with its evidence and threshold
+Fix                  the flags to change, split by whether applying them costs throughput
+Expected/Confidence  what should happen next, and how sure Profile is
+```
 
 ```text
 +----------------------------------------------------------------------------------------------------------------------------+
@@ -116,11 +133,32 @@ The state of the server, the one thing wrong with it, and the fix.
 +----------------------------------------------------------------------------------------------------------------------------+
 ```
 
-`decode_eff ~0.9%` is the gap against the hardware ceiling. `Cause:` is the evidence and the threshold crossed. `Fix:` is what to change, split by whether it costs you throughput to apply.
+Every value is measured or marked. A dash means Profile could not read it. An `(est)` means the number came from the physics model, not the server. A tilde marks a value derived from an estimated ceiling. Gaps are never filled with guesses.
 
-Every value is measured or marked. A dash means Profile could not read it. An `(est)` means the number came from the physics model, not the server. A tilde marks a value derived from an estimated ceiling, and measured values carry none. Gaps are never filled with guesses.
+---
 
+## Proof
 
+Two runs, same model, different hardware and different starting configs.
+
+```text
+                                                            tok/s
+A100   before  |██ 31
+       after   |███████████████████████████████ 470               15x
+
+H100   before  |███████████ 163
+       after   |██████████████████████████████████████████ 631    3.9x
+```
+
+**Qwen3.6-27B on an A100-SXM4-80GB.** 15x throughput, 93% lower cost: $13.26 to $0.89 per 1M tokens.
+
+**Qwen3.6-27B on an H100 80GB HBM3.** Seven iterations, 3.9x throughput, 74% lower cost: $5.09 to $1.32 per 1M output tokens. Every output sample on this page is from this run.
+
+[![Watch the A100 run](https://img.youtube.com/vi/XuPPKBteWH0/0.jpg)](https://www.youtube.com/watch?v=XuPPKBteWH0)
+
+The H100 run is the more honest picture of a working session. Throughput went 163, 328, 545, 543, 482, 610, 545, 631. Two of those steps were regressions, and Profile labelled both.
+
+Your starting point sets your gain. A server already near its ceiling has nothing to recover, and Profile will tell you that rather than manufacture a recommendation.
 
 ---
 
@@ -180,6 +218,12 @@ Four things the loop will not do to you:
 
 ## How it works
 
+Profile does three things:
+
+1. **Computes your hardware ceiling.** The fastest your GPU could serve this model, derived from physics.
+2. **Finds the bottleneck.** Eight rules cut everything suppressing the server down to one primary cause.
+3. **Measures whether your fix worked.** The re-measure is what makes the diagnosis causal.
+
 ### The ceiling
 
 Physics gives two hard limits. Profile derives both from your GPU and model.
@@ -206,9 +250,7 @@ Cost works differently. Dollars per million output tokens is GPU price divided b
 
 ### The rule engine
 
-Eight rules watch eight failure modes. On a struggling server, several fire at once. A wall of alerts carries the same information as no alert at all.
-
-Two filters cut them to one. The rules sit in a DAG, a fixed priority ordering where a rule can only be outranked by one above it, never by one below.
+One cause at a time. Eight rules watch eight failure modes, and on a struggling server several fire at once. A wall of alerts carries the same information as no alert at all, so two filters cut them to one: a mutual exclusivity table removes symptoms another cause already explains, and a priority DAG keeps a tuning suggestion from ever outranking an active bottleneck.
 
 ```text
                           rules evaluate
@@ -243,16 +285,13 @@ Two filters cut them to one. The rules sit in a DAG, a fixed priority ordering w
 
 **Mutual exclusivity** removes symptoms another cause already explains. If the model does not fit in VRAM, your KV cache is under pressure because of that. Telling you to shrink the KV pool would be treating a symptom.
 
-**The DAG layers** encode one rule: fix what is broken before tuning what is healthy. A tuning suggestion can never outrank an active bottleneck, because it sits structurally below one.
+**The DAG layers** encode one rule: fix what is broken before tuning what is healthy. A tuning suggestion sits structurally below an active bottleneck and can never outrank it.
 
 **Nothing is discarded.** Losing rules are held and released when the same cause fires again, so you get the next hypothesis without ever seeing five at once.
 
 Rules fire on evidence of harm, never on heat. A server at 95% KV cache with no evictions and no queue is healthy and busy, and Profile stays quiet.
 
-
-
 **The eight rules**
-
 
 | Rule                          | Fires when                                                                                                                               | Prescribes                                                                                                                                                                |
 | ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -265,42 +304,7 @@ Rules fire on evidence of harm, never on heat. A server at 95% KV cache with no 
 | **R6 Prefill-bound**          | Prompt to generation ratio elevated with decode efficiency low. Muted only when TPOT is measured and under 4x its floor.                 | Chunked prefill, `--max-num-batched-tokens`, shorter prompts; at the compute wall, disaggregate or add a replica                                                          |
 | **R7 Config headroom**        | `--max-num-seqs` below 90% of the recommended target, with occupancy at or above 50% and at most 1 waiting                               | Raise it, and name what binds the target                                                                                                                                  |
 
-
-When nothing fires but efficiency is still low, a fallback names the shape of the underuse. When nothing fires at all, Profile names the boundary capping the server: capacity, traffic, physics, prefill interference, or framework overhead. Where the ceiling itself is unknown, it says that instead of naming a boundary it cannot prove. Thresholds and edge cases are in the [rules documentation](https://jungledesh.github.io/profile/docs.html#rules).
-
-
-
----
-
-## Proof
-
-Two runs, same model, different hardware and different starting configs.
-
-**Qwen3.6-27B on an A100-SXM4-80GB.** 15x throughput, 93% lower cost.
-
-
-|            | Before             | After             |
-| ---------- | ------------------ | ----------------- |
-| Throughput | 31 tok/s           | 470 tok/s         |
-| Cost       | $13.26 / 1M tokens | $0.89 / 1M tokens |
-
-
-**[Watch the run](https://www.youtube.com/watch?v=XuPPKBteWH0)**
-
-
-
-**Qwen3.6-27B on an H100 80GB HBM3.** Seven iterations, 3.9x throughput, 74% lower cost. Every output sample on this page is from this run.
-
-
-|            | Before                   | After                    |
-| ---------- | ------------------------ | ------------------------ |
-| Throughput | 163 tok/s                | 631 tok/s                |
-| Cost       | $5.09 / 1M output tokens | $1.32 / 1M output tokens |
-
-
-The H100 run is the more honest picture of a working session. Throughput went 163, 328, 545, 543, 482, 610, 545, 631. Two of those steps were regressions, and Profile labelled both.
-
-Your starting point sets your gain. A server already near its ceiling has nothing to recover, and Profile will tell you that rather than manufacture a recommendation.
+When nothing fires but efficiency is still low, a fallback names the shape of the underuse. When nothing fires at all, Profile names the boundary capping the server: capacity, traffic, physics, prefill interference, or framework overhead. Where the ceiling itself is unknown, it says that instead of naming a boundary it cannot prove. Full thresholds, confidence scoring, and edge cases are in the [rules documentation](https://jungledesh.github.io/profile/docs.html#rules).
 
 ---
 
@@ -317,7 +321,6 @@ Silicon              NVIDIA, AMD, Cerebras, Groq         sets the ceiling
 
 Every layer above and below optimises something. None measures whether the result is any good on your machine.
 
-
 |                                  | Profile | Dashboards | Kernel profilers | Autotuners  | Simulators  |
 | -------------------------------- | ------- | ---------- | ---------------- | ----------- | ----------- |
 | Hardware ceiling from physics    | yes     | no         | no               | no          | predicted   |
@@ -327,7 +330,6 @@ Every layer above and below optimises something. None measures whether the resul
 | Measures the delta after the fix | yes     | no         | no               | partial     | no          |
 | Cost per million tokens          | yes     | no         | no               | no          | no          |
 | No restarts, no synthetic load   | yes     | yes        | yes              | no          | n/a         |
-
 
 Dashboards: Grafana, Datadog, vLLM `/metrics`. Kernel profilers: Nsight Systems, Nsight Compute. Autotuners: vLLM `auto_tune`, SCOOT. Simulators: Vidur, LLMCompass, GenZ.
 
@@ -339,43 +341,9 @@ Dashboards: Grafana, Datadog, vLLM `/metrics`. Kernel profilers: Nsight Systems,
 
 Two launches, and the users who tried them told us what was missing. Not more metrics. An answer.
 
-The shape came from [Andrej Karpathy's autoresearch](https://github.com/karpathy/autoresearch): propose a change, run it, measure, keep or revert. A loop that improves by measuring rather than predicting. We applied it to inference serving and changed who sits in the proposer's seat. Hypotheses come from roofline physics and a rule engine, which are checkable and deterministic, not from a model forming guesses. And you apply the change, not the tool. Autonomy is the roadmap, not the pitch.
+The shape came from [Andrej Karpathy's autoresearch](https://github.com/karpathy/autoresearch): propose a change, run it, measure, keep or revert. We applied it to inference serving and changed who sits in the proposer's seat. Hypotheses come from roofline physics and a deterministic rule engine, which are checkable, not from a model forming guesses. And you apply the change, not the tool. Autonomy is the roadmap, not the pitch.
 
-The research came last. We found it after the design had settled and it agreed with us, which is a better outcome than finding it first.
-
----
-
-## Research foundation
-
-Profile is not heuristics. Each part is the field's validated answer to a question it has already studied, and each of those answers has a known weakness Profile is built to survive.
-
-**The ceiling: roofline.** The standard model for LLM inference analysis. The 2024 survey *LLM Inference Unveiled* ([arXiv 2402.16363](https://arxiv.org/abs/2402.16363)) organises the field around it and RooflineBench ([arXiv 2602.11506](https://arxiv.org/abs/2602.11506)) still builds on it. Physics offers compute and bandwidth, and time is the maximum of the two. There is no tighter limit to derive.
-
-*Its weakness:* a raw spec-sheet roofline overestimates. Real servers have a third regime, overhead-bound, where the GPU idles on CPU work. The proven fix is calibration. A fitted overhead constant improved R-squared by roughly 12% and cut error up to 80% on a vLLM server ([NeurIPS 2024 MLforSystems](https://mlforsystems.org/assets/papers/neurips2024/paper28.pdf)), and GenZ ([arXiv 2406.01698](https://arxiv.org/abs/2406.01698)) reaches 5.82% geomean error by multiplying roofline by calibrated efficiency factors. Nobody accurate uses peak specs raw.
-
-*Where Profile stands:* uncalibrated, and it says so. Ceilings are marked `(est)` and derived values carry a tilde. An uncatalogued GPU gets no ceiling at all. Cost per million tokens is measured throughput against GPU price, so the dollar figure never inherits the ceiling's error. Calibration is on the roadmap.
-
-**The engine: DAG and mutual exclusivity.** Intel's Top-down Microarchitecture Analysis ([Yasin, ISPASS 2014](https://ieeexplore.ieee.org/document/6844459)) has shipped in VTune and Linux `perf` for a decade. It sorts failure modes into mutually exclusive categories under a hierarchical-safety rule: disregard an inner node unless every node on the path to it is flagged. That is a suppression table. TMA exists because the naive alternative, printing every issue with additive penalties, breaks down when stalls overlap.
-
-*Its weakness:* non-causal misattribution. Counters correlate, they do not establish cause. In one documented case ([arXiv 2412.13207](https://arxiv.org/abs/2412.13207)) TMA reported a region as 44.1% memory-bound and 43.4% core-bound when the real bottleneck was a dependence chain. TMA never catches this, because it reports once and never checks itself.
-
-*Profile's answer:* the loop. The literature's remedy for exactly this failure is perturbation, change one resource and measure the response ([Coz, SOSP 2015](https://arxiv.org/abs/1608.03676)). Profile runs that as a side effect of normal operation. Your applied fix is the perturbation and the re-measure is the response. The loop is not a workflow wrapped around a rule engine, it is what makes the rule engine causal.
-
-**Rules rather than learning.** Rule-based root cause analysis holds up in bounded, rule-defined systems and degrades in sprawling dynamic ones ([arXiv 2408.00803](https://arxiv.org/abs/2408.00803)), which is what pushed the field toward causal graphs and GNNs for microservice meshes. A single vLLM server is the bounded case, and rules have the property learning does not: you can read why.
-
-*The cycle objection:* [Murphy (SIGCOMM 2023)](https://dl.acm.org/doi/10.1145/3603269.3604877) moved from DAGs to Markov Random Fields because a DAG cannot represent cyclic dependencies. That critique targets graph-inference RCA, which propagates blame along edges. Profile's DAG is a priority and suppression ordering and never infers along an edge. Cycles are handled in time by the loop, and the visible symptom, two rules alternating, has an explicit detector with a midpoint escape.
-
-**Not an autotuner.** [SCOOT](https://arxiv.org/abs/2408.04323) (Ant Group, WWW 2025) and SLO-Guard ([arXiv 2604.17627](https://arxiv.org/abs/2604.17627)) search config space with Bayesian optimisation, and [vLLM `auto_tune](https://github.com/vllm-project/vllm/blob/main/benchmarks/auto_tune/README.md)` grid-searches under a latency cap.
-
-*Their weakness:* dozens of server restarts, with crashes used as training data. Not something to run against production. They also emit a config, not a cause.
-
-*Profile:* reads the live server under its own traffic. No restarts, no synthetic load, no crash trials. The trade, that autotuners explore configs nobody tried, is covered by you exploring at your own pace with a cause and a measured delta attached to each step.
-
-**Not a simulator.** [Vidur](https://arxiv.org/abs/2405.05465) (MLSys 2024) found the best LLaMA2-70B config in one CPU-hour against an estimated 42,000 GPU-hours of sweep. [LLMCompass](https://arxiv.org/abs/2312.03134) (ISCA 2024) reports 4.1% error.
-
-*Their weakness:* those figures are author-reported on narrow validation sets, and simulators lag serving features by generations. The Frontier critique ([arXiv 2605.21312](https://arxiv.org/abs/2605.21312)) finds Vidur missing chunked prefill, CUDA graphs, speculative decoding, disaggregation and MoE, with attention-predictor error up to 376% at p95 on modern dynamic workloads. Each also needs per-hardware profiling upfront.
-
-*Profile:* measures the server you have. A new vLLM feature is covered the moment its metrics exist.
+The research came last. We found it after the design had settled, and it agreed with us. That is a better outcome than finding it first.
 
 ---
 
@@ -393,12 +361,51 @@ Profile is not heuristics. Each part is the field's validated answer to a questi
 
 ## Roadmap
 
+Tentative, not exhaustive. Demand reorders this list and adds to it: [tell us](https://github.com/jungledesh/profile/issues) what you run and what is missing.
+
 - [ ] Multi-GPU and tensor parallelism
 - [ ] Calibrated ceilings, using a fitted overhead constant
-- [ ] A second engine (SGLang)
+- [ ] More engines: SGLang first, then llama.cpp and other local runtimes
 - [ ] Cluster aggregation across nodes
+- [ ] OTLP export, so findings land in the observability stack you already run (Grafana, Datadog)
 
 Beyond that: a server that heals itself. Bottlenecks surfaced by physics, fixes applied without a human waiting to press Enter, traffic moved off a node under KV pressure before latency spikes. That is where this goes. None of it is built, and none of it is safe to build until the physics and the engine are right on one node. That is the work happening now.
+
+---
+
+## Research foundation
+
+Profile is not heuristics. Each part is the field's validated answer to a question it has already studied, and each answer has a known weakness Profile is built to survive. The ceiling is a roofline model, the standard for LLM inference analysis; its weakness is that raw spec sheets overestimate, so every ceiling is marked `(est)` and calibration is on the roadmap. The rule engine uses mutual exclusivity under a priority DAG, the structure Intel's Top-down analysis has shipped in `perf` and VTune for a decade; its weakness is non-causal misattribution, and the loop is the remedy: your applied fix is the perturbation, the re-measure is the check. Rules beat learned models here because a single vLLM server is the bounded case where rules hold up, and you can read why one fired. Autotuners and simulators answer adjacent questions, at the price of restarts, synthetic load, or lagging real serving features; Profile reads the live server you already run.
+
+<details>
+<summary><b>The full argument, with citations</b></summary>
+<br>
+
+**The ceiling: roofline.** The standard model for LLM inference analysis. The 2024 survey *LLM Inference Unveiled* ([arXiv 2402.16363](https://arxiv.org/abs/2402.16363)) organises the field around it, and RooflineBench ([arXiv 2602.11506](https://arxiv.org/abs/2602.11506)) still builds on it. Physics offers compute and bandwidth, and time is the maximum of the two. There is no tighter limit to derive.
+
+*Its weakness:* a raw spec-sheet roofline overestimates. Real servers have a third regime, overhead-bound, where the GPU idles on CPU work. The proven fix is calibration: a fitted overhead constant cut error up to 80% on a vLLM server ([NeurIPS 2024 MLforSystems](https://mlforsystems.org/assets/papers/neurips2024/paper28.pdf)), and GenZ ([arXiv 2406.01698](https://arxiv.org/abs/2406.01698)) reaches 5.82% geomean error with calibrated efficiency factors. Nobody accurate uses peak specs raw.
+
+*Where Profile stands:* uncalibrated, and it says so. Ceilings are marked `(est)`, derived values carry a tilde, and an uncatalogued GPU gets no ceiling at all. Cost per million tokens is measured throughput against GPU price, so the dollar figure never inherits the ceiling's error. Calibration is on the roadmap.
+
+**The engine: DAG and mutual exclusivity.** Intel's Top-down Microarchitecture Analysis ([Yasin, ISPASS 2014](https://ieeexplore.ieee.org/document/6844459)) has shipped in VTune and Linux `perf` for a decade: mutually exclusive failure categories under a hierarchical-safety rule, which is a suppression table. TMA exists because printing every issue at once breaks down when stalls overlap.
+
+*Its weakness:* non-causal misattribution. Counters correlate, they do not establish cause. In one documented case ([arXiv 2412.13207](https://arxiv.org/abs/2412.13207)) TMA reported a region as 44.1% memory-bound and 43.4% core-bound when the real bottleneck was a dependence chain. TMA never catches this, because it reports once and never checks itself.
+
+*Profile's answer:* the loop. The literature's remedy for this failure is perturbation: change one resource and measure the response ([Coz, SOSP 2015](https://arxiv.org/abs/1608.03676)). Profile runs that as a side effect of normal operation. Your applied fix is the perturbation, the re-measure is the response. The loop is what makes the rule engine causal.
+
+**Rules rather than learning.** Rule-based root cause analysis holds up in bounded, rule-defined systems and degrades in sprawling dynamic ones ([arXiv 2408.00803](https://arxiv.org/abs/2408.00803)). A single vLLM server is the bounded case, and rules have the property learning does not: you can read why.
+
+*The cycle objection:* [Murphy (SIGCOMM 2023)](https://dl.acm.org/doi/10.1145/3603269.3604877) left DAGs for Markov Random Fields because a DAG cannot represent cyclic dependencies. That critique targets graph-inference RCA, which propagates blame along edges. Profile's DAG is a priority and suppression ordering and never infers along an edge. Cycles are handled in time by the loop, and the visible symptom, two rules alternating, has an explicit detector with a midpoint escape.
+
+**Not an autotuner.** [SCOOT](https://arxiv.org/abs/2408.04323) (WWW 2025) and SLO-Guard ([arXiv 2604.17627](https://arxiv.org/abs/2604.17627)) search config space with Bayesian optimisation, and [vLLM `auto_tune`](https://github.com/vllm-project/vllm/blob/main/benchmarks/auto_tune/README.md) grid-searches under a latency cap. All need dozens of restarts, with crashes as training data. Not something to run against production, and they emit a config, not a cause.
+
+*Profile:* reads the live server under its own traffic. No restarts, no synthetic load, no crash trials. Autotuners explore configs nobody tried; you explore at your own pace, with a cause and a measured delta attached to each step.
+
+**Not a simulator.** [Vidur](https://arxiv.org/abs/2405.05465) (MLSys 2024) found the best LLaMA2-70B config in one CPU-hour against an estimated 42,000 GPU-hours of sweep, and [LLMCompass](https://arxiv.org/abs/2312.03134) (ISCA 2024) reports 4.1% error. But those figures are author-reported on narrow validation sets, and simulators lag serving features by generations: the Frontier critique ([arXiv 2605.21312](https://arxiv.org/abs/2605.21312)) finds Vidur missing chunked prefill, CUDA graphs, speculative decoding, disaggregation and MoE, with attention-predictor error up to 376% at p95. Each also needs per-hardware profiling upfront.
+
+*Profile:* measures the server you have. A new vLLM feature is covered the moment its metrics exist.
+
+</details>
 
 ---
 
