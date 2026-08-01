@@ -1,4 +1,4 @@
-
+<div align="center">
 
 # Profile
 
@@ -8,7 +8,7 @@
 
 [Website](https://jungledesh.github.io/profile/index.html) · [Docs](https://jungledesh.github.io/profile/docs.html) · [Install](#install-and-run) · [Proof](#proof) · [Roadmap](#roadmap) · [Contributing](#contributing)
 
-
+</div>
 
 ---
 
@@ -50,8 +50,9 @@ Prefer not to pipe curl into sh? Download the binary from the [releases page](ht
 
 Launch scope is a single GPU. `--tensor-parallel-size` greater than 1 is refused today. Multi-GPU is on the [roadmap](#roadmap). Profile still tells you when a model needs tensor parallelism to fit at all.
 
-**Profile CLI flags** (these configure Profile, not vLLM)  
-
+<details>
+<summary><b>Profile CLI flags</b> (these configure Profile, not vLLM)</summary>
+<br>
 
 
 | Flag                     | Default                         | Description                                                                         |
@@ -63,8 +64,7 @@ Launch scope is a single GPU. `--tensor-parallel-size` greater than 1 is refused
 | `--cost-per-hour`        | Catalog estimate                | GPU cost in USD/hr                                                                  |
 | `-v`                     | Off                             | Show rules that did not fire, physics limits, and expanded GPU/latency/CACHE detail |
 
-
-
+</details>
 
 ---
 
@@ -269,7 +269,9 @@ Cost works differently. Dollars per million output tokens is `cost_per_hr × 1e6
 
 One cause at a time. Eight rules watch eight failure modes, and on a struggling server several fire at once. A wall of alerts carries the same information as no alert at all, so two filters cut them to one: a mutual exclusivity table removes symptoms another cause already explains, and a priority DAG keeps a tuning suggestion from ever outranking an active bottleneck.
 
-
+<p align="center">
+  <img src="docs/assets/rule-engine.svg" width="880" alt="Profile's rule engine: eight rules on DAG priority layers L2 to L6. Mutual exclusivity: R4 weights-alone overflow silences R2 and R2b, R6 silences R1. Highest surviving layer wins, ranked by impact x confidence, one primary shown, losers held.">
+</p>
 
 **Mutual exclusivity** removes symptoms another cause already explains. If the model weights alone overflow VRAM, your KV cache is under pressure because of that. Telling you to shrink the KV pool would be treating a symptom. A buffer squeeze without weights overflow does not silence R2.
 
@@ -379,7 +381,9 @@ Beyond that: a server that heals itself. Bottlenecks surfaced by physics, fixes 
 
 Profile is not heuristics. Each part is the field's validated answer to a question it has already studied, and each answer has a known weakness Profile is built to survive. The ceiling is a roofline model, the standard for LLM inference analysis; its weakness is that raw spec sheets overestimate, so every ceiling is marked `(est)` and calibration is on the roadmap. The rule engine uses mutual exclusivity under a priority DAG, the structure Intel's Top-down analysis has shipped in `perf` and VTune for a decade; its weakness is non-causal misattribution, and the loop is the remedy: your applied fix is the perturbation, the re-measure is the check. Rules beat learned models here because a single vLLM server is the bounded case where rules hold up, and you can read why one fired. Autotuners and simulators answer adjacent questions, at the price of restarts, synthetic load, or lagging real serving features; Profile reads the live server you already run.
 
-**The full argument, with citations**  
+<details>
+<summary><b>The full argument, with citations</b></summary>
+<br>
 
 
 **The ceiling: roofline.** The standard model for LLM inference analysis. The 2024 survey *LLM Inference Unveiled* ([arXiv 2402.16363](https://arxiv.org/abs/2402.16363)) organises the field around it, and RooflineBench ([arXiv 2602.11506](https://arxiv.org/abs/2602.11506)) still builds on it. Physics offers compute and bandwidth, and time is the maximum of the two. There is no tighter limit to derive.
@@ -405,6 +409,8 @@ Profile is not heuristics. Each part is the field's validated answer to a questi
 **Not a simulator.** [Vidur](https://arxiv.org/abs/2405.05465) (MLSys 2024) found the best LLaMA2-70B config in one CPU-hour against an estimated 42,000 GPU-hours of sweep, and [LLMCompass](https://arxiv.org/abs/2312.03134) (ISCA 2024) reports 4.1% error. But those figures are author-reported on narrow validation sets, and simulators lag serving features by generations: the Frontier critique ([arXiv 2605.21312](https://arxiv.org/abs/2605.21312)) finds Vidur missing chunked prefill, CUDA graphs, speculative decoding, disaggregation and MoE, with attention-predictor error up to 376% at p95. Each also needs per-hardware profiling upfront.
 
 *Profile:* measures the server you have. A new vLLM feature is covered the moment its metrics exist.
+
+</details>
 
 
 
