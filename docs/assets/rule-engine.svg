@@ -1,0 +1,151 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 700" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" role="img" aria-label="Profile's rule engine: eight rules on DAG priority layers L2 to L6, mutual exclusivity suppression edges, ranked by impact times confidence, one primary cause shown, losers held.">
+  <style>
+    .flow { stroke-dasharray: 5 5; animation: dash 1.4s linear infinite; }
+    @keyframes dash { to { stroke-dashoffset: -10; } }
+    .spin { animation: spin 90s linear infinite; transform-origin: 640px 350px; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+
+  <!-- surface -->
+  <rect x="0" y="0" width="1280" height="700" rx="18" fill="#000000" stroke="#1e1e1e" stroke-width="1"/>
+
+  <!-- orbits: DAG layers L2 (inner, broken) to L6 (outer, healthy) -->
+  <g fill="none" stroke="#202020" stroke-width="1">
+    <ellipse cx="640" cy="350" rx="130" ry="81"/>
+    <ellipse cx="640" cy="350" rx="205" ry="127"/>
+    <ellipse cx="640" cy="350" rx="280" ry="174"/>
+    <ellipse cx="640" cy="350" rx="355" ry="220"/>
+    <ellipse cx="640" cy="350" rx="430" ry="267"/>
+  </g>
+  <!-- decorative slow-rotating dotted ring -->
+  <g class="spin">
+    <ellipse cx="640" cy="350" rx="455" ry="283" fill="none" stroke="#161616" stroke-width="1" stroke-dasharray="2 10"/>
+  </g>
+
+  <!-- layer markers on the right of each ring -->
+  <g font-size="10" fill="#666666" text-anchor="middle">
+    <text x="770" y="342">L2</text>
+    <text x="845" y="342">L3</text>
+    <text x="920" y="342">L4</text>
+    <text x="995" y="342">L5</text>
+    <text x="1070" y="342">L6</text>
+  </g>
+
+  <!-- evaluation pulses: every rule reports toward the core -->
+  <g fill="#ffffff">
+    <circle r="2" opacity="0"><animateMotion dur="4s" begin="0s"    repeatCount="indefinite" path="M 640 269 L 640 350"/><animate attributeName="opacity" values="0;.7;0" dur="4s" begin="0s"    repeatCount="indefinite"/></circle>
+    <circle r="2" opacity="0"><animateMotion dur="4s" begin="0.5s"  repeatCount="indefinite" path="M 518 378 L 640 350"/><animate attributeName="opacity" values="0;.7;0" dur="4s" begin="0.5s"  repeatCount="indefinite"/></circle>
+    <circle r="2" opacity="0"><animateMotion dur="4s" begin="1s"    repeatCount="indefinite" path="M 762 378 L 640 350"/><animate attributeName="opacity" values="0;.7;0" dur="4s" begin="1s"    repeatCount="indefinite"/></circle>
+    <circle r="2" opacity="0"><animateMotion dur="4s" begin="1.5s"  repeatCount="indefinite" path="M 826 296 L 640 350"/><animate attributeName="opacity" values="0;.7;0" dur="4s" begin="1.5s"  repeatCount="indefinite"/></circle>
+    <circle r="2" opacity="0"><animateMotion dur="4s" begin="2s"    repeatCount="indefinite" path="M 386 276 L 640 350"/><animate attributeName="opacity" values="0;.7;0" dur="4s" begin="2s"    repeatCount="indefinite"/></circle>
+    <circle r="2" opacity="0"><animateMotion dur="4s" begin="2.5s"  repeatCount="indefinite" path="M 436 170 L 640 350"/><animate attributeName="opacity" values="0;.7;0" dur="4s" begin="2.5s"  repeatCount="indefinite"/></circle>
+    <circle r="2" opacity="0"><animateMotion dur="4s" begin="3s"    repeatCount="indefinite" path="M 844 530 L 640 350"/><animate attributeName="opacity" values="0;.7;0" dur="4s" begin="3s"    repeatCount="indefinite"/></circle>
+    <circle r="2" opacity="0"><animateMotion dur="4s" begin="3.5s"  repeatCount="indefinite" path="M 529 608 L 640 350"/><animate attributeName="opacity" values="0;.7;0" dur="4s" begin="3.5s"  repeatCount="indefinite"/></circle>
+  </g>
+
+  <!-- suppression edges (mutual exclusivity) -->
+  <defs>
+    <marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 8 4 L 0 8 z" fill="#8f8f8f"/>
+    </marker>
+  </defs>
+  <g fill="none" stroke="#8f8f8f" stroke-width="1.4" marker-end="url(#arrow)">
+    <path class="flow" d="M 625 281 Q 555 305 528 362"/>
+    <path class="flow" d="M 655 281 Q 725 305 752 362"/>
+    <path class="flow" d="M 428 187 Q 400 225 390 259"/>
+  </g>
+  <g font-size="10" fill="#8f8f8f">
+    <text x="536" y="310">silences</text>
+    <text x="700" y="310" text-anchor="end">silences</text>
+    <text x="352" y="222" text-anchor="end">silences</text>
+  </g>
+
+  <!-- core -->
+  <circle cx="640" cy="350" r="52" fill="none" stroke="#333333" stroke-width="1">
+    <animate attributeName="r" values="52;62;52" dur="3s" repeatCount="indefinite"/>
+    <animate attributeName="opacity" values="0.9;0;0.9" dur="3s" repeatCount="indefinite"/>
+  </circle>
+  <circle cx="640" cy="350" r="46" fill="#000000" stroke="#ffffff" stroke-width="1.6"/>
+  <text x="640" y="347" font-size="13" font-weight="bold" fill="#ffffff" text-anchor="middle">PRIMARY</text>
+  <text x="640" y="364" font-size="9" fill="#8f8f8f" text-anchor="middle">one cause shown</text>
+
+  <!-- rules -->
+  <!-- L2 -->
+  <g>
+    <circle cx="640" cy="269" r="17" fill="#000000" stroke="#ffffff" stroke-width="1.6"/>
+    <text x="640" y="273" font-size="11" font-weight="bold" fill="#ffffff" text-anchor="middle">R4</text>
+    <text x="640" y="243" font-size="11" fill="#bfbfbf" text-anchor="middle">OOM risk</text>
+  </g>
+  <g>
+    <circle cx="518" cy="378" r="17" fill="#000000" stroke="#ffffff" stroke-width="1.6"/>
+    <text x="518" y="382" font-size="11" font-weight="bold" fill="#ffffff" text-anchor="middle">R2</text>
+    <text x="504" y="406" font-size="11" fill="#bfbfbf" text-anchor="middle">KV pressure</text>
+  </g>
+  <g>
+    <circle cx="762" cy="378" r="17" fill="#000000" stroke="#ffffff" stroke-width="1.6"/>
+    <text x="762" y="382" font-size="11" font-weight="bold" fill="#ffffff" text-anchor="middle">R2b</text>
+    <text x="790" y="406" font-size="11" fill="#bfbfbf" text-anchor="middle">KV admission backlog</text>
+  </g>
+  <!-- L3 -->
+  <g>
+    <circle cx="826" cy="296" r="15" fill="#000000" stroke="#d4d4d4" stroke-width="1.5"/>
+    <text x="826" y="300" font-size="11" font-weight="bold" fill="#d4d4d4" text-anchor="middle">R5</text>
+    <text x="848" y="284" font-size="11" fill="#bfbfbf" text-anchor="start">concurrency saturation</text>
+  </g>
+  <!-- L4 -->
+  <g>
+    <circle cx="386" cy="276" r="14" fill="#000000" stroke="#a8a8a8" stroke-width="1.5"/>
+    <text x="386" y="280" font-size="11" font-weight="bold" fill="#a8a8a8" text-anchor="middle">R1</text>
+    <text x="364" y="264" font-size="11" fill="#bfbfbf" text-anchor="end">under-batching</text>
+  </g>
+  <!-- L5 -->
+  <g>
+    <circle cx="436" cy="170" r="13" fill="#000000" stroke="#8a8a8a" stroke-width="1.4"/>
+    <text x="436" y="174" font-size="11" font-weight="bold" fill="#9f9f9f" text-anchor="middle">R6</text>
+    <text x="436" y="146" font-size="11" fill="#bfbfbf" text-anchor="middle">prefill-bound</text>
+  </g>
+  <g>
+    <circle cx="844" cy="530" r="13" fill="#000000" stroke="#8a8a8a" stroke-width="1.4"/>
+    <text x="844" y="534" font-size="11" font-weight="bold" fill="#9f9f9f" text-anchor="middle">R3</text>
+    <text x="866" y="552" font-size="11" fill="#bfbfbf" text-anchor="start">low prefix reuse</text>
+  </g>
+  <!-- L6 -->
+  <g>
+    <circle cx="529" cy="608" r="12" fill="#000000" stroke="#6f6f6f" stroke-width="1.4"/>
+    <text x="529" y="612" font-size="11" font-weight="bold" fill="#9f9f9f" text-anchor="middle">R7</text>
+    <text x="505" y="630" font-size="11" fill="#bfbfbf" text-anchor="end">config headroom</text>
+  </g>
+
+  <!-- top-left: evaluation order -->
+  <g font-size="11" fill="#8f8f8f">
+    <text x="36" y="44" fill="#ffffff" font-weight="bold" font-size="12">EVERY WINDOW</text>
+    <text x="36" y="68">1  eight rules evaluate</text>
+    <text x="36" y="88">2  mutual exclusivity silences</text>
+    <text x="52" y="104">   explained symptoms</text>
+    <text x="36" y="124">3  highest surviving layer wins</text>
+    <text x="36" y="144">4  rank by impact x confidence</text>
+    <text x="36" y="164">5  one primary shown</text>
+  </g>
+
+  <!-- top-right: layer scale -->
+  <g font-size="11" text-anchor="end">
+    <text x="1244" y="44" fill="#ffffff" font-weight="bold" font-size="12">DAG LAYERS</text>
+    <text x="1244" y="68" fill="#ffffff">L2  broken</text>
+    <text x="1244" y="88" fill="#bfbfbf">L3</text>
+    <text x="1244" y="108" fill="#a8a8a8">L4</text>
+    <text x="1244" y="128" fill="#9f9f9f">L5</text>
+    <text x="1244" y="148" fill="#8f8f8f">L6  healthy</text>
+    <text x="1244" y="172" fill="#666666">inner outranks outer</text>
+  </g>
+
+  <!-- bottom-left: held note -->
+  <g font-size="11" fill="#8f8f8f">
+    <circle cx="42" cy="640" r="3" fill="none" stroke="#8f8f8f" stroke-width="1"/>
+    <text x="54" y="644">losers are held, released when the same cause returns with no material improvement</text>
+  </g>
+
+  <!-- bottom-right: sibling note -->
+  <g font-size="11" fill="#666666" text-anchor="end">
+    <text x="1244" y="644">R2 / R2b are mutually exclusive siblings, same layer</text>
+  </g>
+</svg>
