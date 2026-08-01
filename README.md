@@ -13,14 +13,9 @@ On one A100, that loop took Qwen3.6-27B from **31 to 470 tok/s** and cut cost fr
 
 One GPU, NVIDIA or AMD. Reads live `/metrics` and NVML or amdgpu.
 
-[![CI](https://github.com/jungledesh/profile/actions/workflows/build.yml/badge.svg)](https://github.com/jungledesh/profile/actions/workflows/build.yml)
-[![Release](https://img.shields.io/github/v/release/jungledesh/profile)](https://github.com/jungledesh/profile/releases/latest)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-2024_edition-orange)](Cargo.toml)
+**[Website](https://jungledesh.github.io/profile/index.html)** | **[Docs](https://jungledesh.github.io/profile/docs.html)**
 
-**[Website](https://jungledesh.github.io/profile/index.html)** | **[Docs](https://jungledesh.github.io/profile/docs.html)** | **[Demo](#proof)** | **[Release](https://github.com/jungledesh/profile/releases/latest)**
-
-[Install](#install-and-run) · [What is Profile](#what-is-profile) · [What you get](#what-you-get) · [Proof](#proof) · [The loop](#the-loop) · [How it works](#how-it-works) · [Where Profile sits](#where-profile-sits) · [Limitations](#limitations) · [Roadmap](#roadmap) · [Research foundation](#research-foundation) · [Principles](#principles) · [Contributing](#contributing)
+[Install](#install-and-run) · [What you get](#what-you-get) · [Proof](#proof) · [The loop](#the-loop) · [How it works](#how-it-works) · [Limitations](#limitations) · [Roadmap](#roadmap) · [Contributing](#contributing)
 
 ---
 
