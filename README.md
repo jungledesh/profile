@@ -15,7 +15,7 @@ One GPU, NVIDIA or AMD. Reads live `/metrics` and NVML or amdgpu.
 
 **[Website](https://jungledesh.github.io/profile/index.html)** | **[Docs](https://jungledesh.github.io/profile/docs.html)**
 
-[Install](#install-and-run) · [What you get](#what-you-get) · [Proof](#proof) · [The loop](#the-loop) · [How it works](#how-it-works) · [Limitations](#limitations) · [Roadmap](#roadmap) · [Contributing](#contributing)
+[What you get](#what-you-get) · [Proof](#proof) · [The loop](#the-loop) · [How it works](#how-it-works) · [Limitations](#limitations) · [Roadmap](#roadmap)
 
 ---
 
