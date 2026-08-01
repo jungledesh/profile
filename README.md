@@ -1,6 +1,14 @@
+<div align="center">
+
 # Profile
 
-Inference diagnostics for production vLLM servers.
+**Inference diagnostics for production vLLM servers.**
+
+[Website](https://jungledesh.github.io/profile/index.html) · [Docs](https://jungledesh.github.io/profile/docs.html) · [Install](#install-and-run) · [Proof](#proof) · [Roadmap](#roadmap) · [Contributing](#contributing)
+
+</div>
+
+---
 
 **Are you getting what your hardware is capable of?** Profile finds what is keeping your GPU below the fastest it could serve your model, its physics ceiling, gives you the flag to change, and measures whether the fix worked.
 
@@ -12,10 +20,6 @@ On one A100, that loop took Qwen3.6-27B from **31 to 470 tok/s** and cut cost fr
 ```
 
 One GPU, NVIDIA or AMD. Reads live `/metrics` and NVML or amdgpu.
-
-**[Website](https://jungledesh.github.io/profile/index.html)** | **[Docs](https://jungledesh.github.io/profile/docs.html)**
-
-[What you get](#what-you-get) · [Proof](#proof) · [The loop](#the-loop) · [How it works](#how-it-works) · [Limitations](#limitations) · [Roadmap](#roadmap)
 
 ---
 
