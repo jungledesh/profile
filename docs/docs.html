@@ -1,177 +1,115 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Profile | Docs</title>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-<link href="https://cdn.jsdelivr.net/npm/geist@1.3.0/dist/fonts/geist-mono/style.css" rel="stylesheet">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Docs | Profile</title>
+<meta name="description" content="Profile documentation: workflow, rules, data sources, catalog, math, limitations, design.">
 <style>
-* { margin: 0; padding: 0; box-sizing: border-box; }
+  :root {
+    --bg:#000; --ink:#d9d9d9; --ink-2:#9a9a9a; --ink-3:#5c5c5c;
+    --line:#1e1e1e; --line-2:#2c2c2c; --card:#0a0a0a; --white:#fff;
+    --mono: ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace;
+    --sans: -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:var(--bg); color:var(--ink); font-family:var(--sans); font-size:16px; line-height:1.7; -webkit-font-smoothing:antialiased; }
+  a { color:var(--white); text-decoration:none; border-bottom:1px solid var(--line-2); }
+  a:hover { border-color:var(--white); }
 
-body {
-  font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  font-size: 16px;
-  line-height: 1.7;
-  color: #111;
-  background:
-    linear-gradient(rgba(255,255,255,0.5), rgba(255,255,255,0.5)),
-    url("assets/bg.jpeg") center center / cover fixed;
-  min-height: 100vh;
-}
+  header { position:sticky; top:0; z-index:20; background:rgba(0,0,0,.85); backdrop-filter:blur(8px); border-bottom:1px solid var(--line); }
+  header .wrap { max-width:1180px; margin:0 auto; padding:0 24px; display:flex; align-items:center; justify-content:space-between; height:56px; }
+  .wordmark { font-family:var(--mono); font-size:15px; letter-spacing:.08em; color:#fff; border:none; }
+  header nav a { font-family:var(--mono); font-size:13px; color:var(--ink-2); border:none; margin-left:22px; }
+  header nav a:hover { color:#fff; }
 
-/* ── Header ── */
-header {
-  position: sticky; top: 0; z-index: 10;
-  background: rgba(245,242,237,0.92);
-  backdrop-filter: blur(4px);
-  border-bottom: 1px solid rgba(0,0,0,0.1);
-  padding: 12px 0;
-}
-header .wrap {
-  max-width: 1080px; margin: 0 auto; padding: 0 24px;
-  display: flex; align-items: center; justify-content: space-between;
-}
-header .site-title {
-  font-size: 1.2rem; font-weight: 700; letter-spacing: 0.1em;
-  color: #111; text-decoration: none;
-}
-header nav a {
-  font-size: 0.85rem; color: #666; text-decoration: none;
-  margin-left: 20px; letter-spacing: 0.04em;
-}
-header nav a:hover, header nav a.active { color: #111; }
+  .layout { max-width:1180px; margin:0 auto; padding:0 24px; display:grid; grid-template-columns:230px minmax(0,1fr); gap:48px; }
 
-/* ── Layout ── */
-.layout {
-  max-width: 920px; margin: 0 auto; padding: 0 24px;
-  min-height: calc(100vh - 60px);
-}
-p, ul, ol, blockquote, .tldr, h1, h2, h3, .subtitle {
-  max-width: 720px;
-}
+  /* sidebar */
+  aside { position:sticky; top:56px; align-self:start; height:calc(100vh - 56px); overflow-y:auto; padding:28px 0 40px; }
+  #search { width:100%; background:var(--card); border:1px solid var(--line-2); border-radius:6px; color:#fff; font-family:var(--mono); font-size:13px; padding:9px 12px; outline:none; }
+  #search:focus { border-color:#6a6a6a; }
+  #results { margin-top:6px; }
+  #results a { display:block; border:none; padding:7px 10px; border-radius:6px; font-size:13px; color:var(--ink-2); }
+  #results a:hover { background:var(--card); color:#fff; }
+  #results a b { display:block; color:var(--ink); font-weight:500; }
+  #results a span { font-family:var(--mono); font-size:10.5px; color:var(--ink-3); letter-spacing:.08em; }
+  .navlist { list-style:none; margin-top:22px; }
+  .navlist > li > a { display:block; border:none; font-family:var(--mono); font-size:13px; color:var(--ink-2); padding:6px 10px; border-radius:6px; letter-spacing:.03em; }
+  .navlist > li > a:hover { color:#fff; background:var(--card); }
+  .navlist > li > a.active { color:#000; background:#fff; }
+  .subnav { list-style:none; margin:2px 0 6px; }
+  .subnav a { display:block; border:none; font-size:12.5px; color:var(--ink-3); padding:3px 10px 3px 22px; border-left:1px solid var(--line); margin-left:10px; }
+  .subnav a:hover { color:#fff; }
 
-/* ── Pages ── */
-.page { display: none; padding: 40px 0 80px; }
-.page.visible { display: block; }
+  /* pages */
+  .page { display:none; padding:40px 0 100px; min-width:0; }
+  .page.visible { display:block; }
+  h1 { font-size:2.4rem; font-weight:600; letter-spacing:-.01em; color:#fff; margin-bottom:8px; line-height:1.12; }
+  h2 { font-size:1.45rem; font-weight:600; color:#fff; margin:44px 0 12px; }
+  h3 { font-size:1.1rem; font-weight:600; color:#fff; margin:30px 0 8px; }
+  p { margin-bottom:14px; }
+  p, ul, ol, blockquote, .tldr { max-width:74ch; }
+  ul, ol { padding-left:1.3em; margin-bottom:14px; }
+  .subtitle { font-size:1.05rem; color:var(--ink-2); margin-bottom:32px; }
 
-/* ── Typography ── */
-h1 { font-size: 2.8rem; font-weight: 700; letter-spacing: 0.02em; margin-bottom: 8px; line-height: 1.1; }
-h2 { font-size: 1.7rem; font-weight: 600; margin: 40px 0 12px; }
-h3 { font-size: 1.2rem; font-weight: 600; margin: 28px 0 8px; }
-p { margin-bottom: 14px; }
-a { color: #111; }
-a:hover { opacity: 0.6; }
-.subtitle { font-size: 1.1rem; color: #666; margin-bottom: 32px; font-style: italic; }
+  table { width:100%; border-collapse:collapse; margin:20px 0; font-size:.88rem; }
+  th { text-align:left; font-family:var(--mono); font-size:.62rem; letter-spacing:.12em; text-transform:uppercase; color:var(--ink-3); border-bottom:1px solid var(--line-2); padding:6px 14px 6px 0; }
+  td { border-bottom:1px solid var(--line); padding:9px 14px 9px 0; vertical-align:top; color:var(--ink); }
+  tr:last-child td { border-bottom:none; }
 
-/* ── Tables ── */
-table { width: 100%; border-collapse: collapse; margin: 20px 0; font-size: 0.9rem; }
-th { text-align: left; font-size: 0.65rem; letter-spacing: 0.1em; text-transform: uppercase;
-     color: #aaa; border-bottom: 1px solid rgba(0,0,0,0.15); padding: 6px 12px 6px 0; }
-td { border-bottom: 1px solid rgba(0,0,0,0.07); padding: 9px 12px 9px 0; vertical-align: top; }
-tr:last-child td { border-bottom: none; }
+  code { font-family:var(--mono); font-size:.8rem; background:var(--card); border:1px solid var(--line); padding:2px 5px; border-radius:4px; color:var(--ink); }
+  pre { background:var(--card); border:1px solid var(--line-2); border-radius:8px; color:#dcdcdc; padding:18px; overflow-x:auto; margin:18px 0; font-family:var(--mono); font-size:.78rem; line-height:1.6; position:relative; }
+  pre code { background:none; border:none; padding:0; color:inherit; }
+  .copy-btn { position:absolute; top:8px; right:8px; background:#000; border:1px solid var(--line-2); color:var(--ink-2); border-radius:5px; padding:4px 9px; font-size:.68rem; font-family:var(--mono); cursor:pointer; opacity:0; transition:opacity .15s; }
+  pre:hover .copy-btn { opacity:1; }
+  .copy-btn:hover { color:#fff; border-color:#6a6a6a; }
+  .copy-btn.copied { color:#000; background:#fff; border-color:#fff; opacity:1; }
 
-/* ── Code ── */
-code {
-  font-family: "Geist Mono", "SFMono-Regular", Consolas, monospace;
-  font-size: 0.8rem; background: rgba(0,0,0,0.06);
-  padding: 2px 5px; border-radius: 2px;
-}
-pre {
-  background: #1a1a18; color: #eceae7;
-  padding: 18px; overflow-x: auto; margin: 18px 0;
-  font-family: "Geist Mono", "SFMono-Regular", Consolas, monospace;
-  font-size: 0.8rem; line-height: 1.6;
-  position: relative;
-}
-.copy-btn {
-  position: absolute;
-  top: 8px; right: 8px;
-  background: rgba(255,255,255,0.1);
-  border: 1px solid rgba(255,255,255,0.2);
-  color: #eceae7;
-  border-radius: 4px;
-  padding: 4px 8px;
-  font-size: 0.7rem;
-  cursor: pointer;
-  transition: all 0.2s;
-  font-family: "Inter", sans-serif;
-  opacity: 0;
-}
-pre:hover .copy-btn { opacity: 1; }
-.copy-btn:hover { background: rgba(255,255,255,0.3); }
-.copy-btn.copied { background: #4caf50; border-color: #4caf50; opacity: 1; }
-pre code { background: none; padding: 0; color: inherit; }
+  .callout { border-left:2px solid var(--line-2); background:var(--card); padding:12px 16px; margin:18px 0; font-size:.9rem; color:var(--ink-2); max-width:74ch; }
+  .callout.warn { border-left-color:#fff; color:var(--ink); }
+  blockquote { border-left:2px solid var(--line-2); padding:4px 0 4px 16px; margin:20px 0; color:var(--ink-2); }
+  hr { border:none; border-top:1px solid var(--line); margin:36px 0; }
 
-/* ── Callout ── */
-.callout {
-  border-left: 2px solid rgba(0,0,0,0.25);
-  padding: 10px 16px; margin: 18px 0;
-  font-size: 0.9rem; color: #555;
-  background: rgba(0,0,0,0.03);
-}
-.callout.warn { border-left-color: #8a6000; }
+  .tldr { border:1px solid var(--line-2); border-radius:8px; padding:16px 18px; margin-bottom:36px; background:var(--card); }
+  .tldr .label { font-family:var(--mono); font-size:.62rem; letter-spacing:.16em; text-transform:uppercase; color:var(--ink-3); margin-bottom:8px; }
+  .tldr ul { list-style:none; padding:0; margin:0; }
+  .tldr ul li { padding:2px 0 2px 16px; position:relative; font-size:.95rem; }
+  .tldr ul li::before { content:"→"; position:absolute; left:0; color:var(--ink-3); font-size:.72rem; top:5px; }
 
-hr { border: none; border-top: 1px solid rgba(0,0,0,0.1); margin: 36px 0; }
+  .stats-row { display:flex; gap:24px; margin:24px 0; flex-wrap:wrap; }
+  .stat-block { flex:1; min-width:120px; border-top:1px solid #fff; padding-top:8px; }
+  .stat { font-family:var(--mono); font-size:1.9rem; font-weight:600; display:block; color:#fff; }
+  .stat-label { font-size:.8rem; color:var(--ink-2); line-height:1.4; }
 
-/* ── TL;DR ── */
-.tldr {
-  border-left: 2px solid #111; padding: 14px 18px;
-  margin-bottom: 36px; background: rgba(0,0,0,0.03);
-}
-.tldr .label {
-  font-size: 0.65rem; letter-spacing: 0.14em; text-transform: uppercase;
-  color: #aaa; margin-bottom: 8px;
-}
-.tldr ul { list-style: none; }
-.tldr ul li { padding: 2px 0 2px 16px; position: relative; font-size: 0.95rem; }
-.tldr ul li::before { content: "→"; position: absolute; left: 0; color: #aaa; font-size: 0.75rem; top: 6px; }
+  .post-title { font-size:2.6rem; font-weight:600; line-height:1.1; margin-bottom:6px; color:#fff; }
+  .post-meta { font-family:var(--mono); font-size:.75rem; color:var(--ink-3); margin-bottom:28px; letter-spacing:.05em; }
+  .sources { margin-top:36px; border-top:1px solid var(--line); padding-top:16px; }
+  .sources p { font-size:.8rem; color:var(--ink-3); margin-bottom:4px; }
+  .diagram { margin:24px auto; text-align:center; }
+  .diagram img { max-width:100%; border-radius:10px; }
+  .diagram figcaption { font-size:.75rem; color:var(--ink-3); margin-top:8px; }
 
-/* ── Stats ── */
-.stats-row { display: flex; gap: 24px; margin: 24px 0; flex-wrap: wrap; }
-.stat-block { flex: 1; min-width: 120px; border-top: 1px solid #111; padding-top: 8px; }
-.stat { font-size: 2rem; font-weight: 700; display: block; }
-.stat-label { font-size: 0.8rem; color: #666; line-height: 1.4; }
+  footer { border-top:1px solid var(--line); padding:28px 24px 48px; text-align:center; font-family:var(--mono); font-size:12px; color:var(--ink-3); }
+  footer a { color:var(--ink-3); border:none; }
+  footer a:hover { color:#fff; }
 
-blockquote {
-  border-left: 2px solid rgba(0,0,0,0.15);
-  padding: 4px 0 4px 16px; margin: 20px 0;
-  color: #555; font-style: italic;
-}
-
-.post-title { font-size: 3rem; font-weight: 700; line-height: 1.1; margin-bottom: 6px; }
-.post-meta { font-size: 0.8rem; color: #aaa; margin-bottom: 28px; letter-spacing: 0.04em; }
-.sources { margin-top: 36px; border-top: 1px solid rgba(0,0,0,0.1); padding-top: 16px; }
-.sources p { font-size: 0.8rem; color: #888; margin-bottom: 4px; }
-
-.diagram { margin: 24px auto; text-align: center; }
-.diagram figcaption { font-size: 0.75rem; color: #aaa; margin-top: 8px; }
-
-/* ── Footer ── */
-footer {
-  border-top: 1px solid rgba(0,0,0,0.1);
-  padding: 24px; margin-top: 40px;
-  display: flex; justify-content: center; align-items: center;
-  gap: 1.6rem; font-size: 0.65rem;
-  letter-spacing: 0.15em; text-transform: uppercase; opacity: 0.55;
-}
-.divider { width: 24px; height: 1px; background: #111; flex-shrink: 0; }
+  @media (max-width: 880px) {
+    .layout { grid-template-columns:1fr; gap:0; }
+    aside { position:static; height:auto; padding:20px 0 0; }
+    .navlist { display:flex; flex-wrap:wrap; gap:4px; }
+    .navlist > li > a { padding:5px 10px; }
+    .subnav { display:none; }
+  }
 </style>
 </head>
 <body>
 
 <header>
   <div class="wrap">
-    <a class="site-title" href="index.html">PROFILE</a>
+    <a class="wordmark" href="index.html">profile</a>
     <nav>
-      <a href="#home" data-page="home">Workflow</a>
-      <a href="#rules" data-page="rules">Rules</a>
-      <a href="#data" data-page="data">Data</a>
-      <a href="#catalog" data-page="catalog">Catalog</a>
-      <a href="#math" data-page="math">Math</a>
-      <a href="#limitations" data-page="limitations">Limitations</a>
-      <a href="#design" data-page="design">Design</a>
-      <a href="#blog" data-page="blog">Blog</a>
+      <a href="index.html">Home</a>
       <a href="https://github.com/jungledesh/profile" target="_blank" rel="noopener">GitHub</a>
     </nav>
   </div>
@@ -179,8 +117,23 @@ footer {
 
 <div class="layout" id="layout">
 
-  <!-- HOME -->
-    <article id="page-home" class="page">
+  <aside>
+    <input id="search" type="search" placeholder="Search docs  ( / )" autocomplete="off">
+    <div id="results"></div>
+    <ul class="navlist">
+      <li><a href="#home" data-page="home">Workflow</a></li>
+      <li><a href="#rules" data-page="rules">Rules</a></li>
+      <li><a href="#data" data-page="data">Data</a></li>
+      <li><a href="#catalog" data-page="catalog">Catalog</a></li>
+      <li><a href="#math" data-page="math">Math</a></li>
+      <li><a href="#limitations" data-page="limitations">Limitations</a></li>
+      <li><a href="#design" data-page="design">Design</a></li>
+      <li><a href="#blog" data-page="blog">Blog</a></li>
+    </ul>
+  </aside>
+
+  <main>
+<article id="page-home" class="page">
     <h1>Profile</h1>
     <p class="subtitle">Physics-grounded, cost-aware optimization loop for vLLM inference servers.</p>
 
@@ -345,9 +298,7 @@ ECONOMICS:
     </table>
   </article>
 
-  <!-- SEPARATOR -->
-
-  <article id="page-rules" class="page">
+<article id="page-rules" class="page">
     <h1>Rules</h1>
     <p class="subtitle">Five rules. Each fires when a specific bottleneck is confirmed under load.</p>
 
@@ -475,9 +426,7 @@ ECONOMICS:
     <p>Rules sorted by score, highest first. Grouped by root cause into <code>IssueGroup</code>. One primary recommendation surfaced per group: the rest are supporting evidence, not separate alerts.</p>
   </article>
 
-  <!-- SEPARATOR -->
-
-  <article id="page-data" class="page">
+<article id="page-data" class="page">
     <h1>Data</h1>
     <p class="subtitle">What, when, and how we collect.</p>
 
@@ -589,9 +538,7 @@ num_requests_running  is Some (even if zero)</code></pre>
     </table>
   </article>
 
-  <!-- SEPARATOR -->
-
-  <article id="page-catalog" class="page">
+<article id="page-catalog" class="page">
     <h1>Catalog</h1>
     <div class="callout">Missing your GPU or model? Request it <a href="https://github.com/jungledesh/profile/issues/new" target="_blank" rel="noopener">here</a>.</div>
     <p class="subtitle">GPU specs, model parameters, and cloud prices resolved once at startup.</p>
@@ -666,9 +613,7 @@ num_requests_running  is Some (even if zero)</code></pre>
     <div class="callout">MoE models: <code>active_param_count</code> drives roofline ceilings; <code>param_count</code> (total) drives <code>weight_gb</code> and OOM headroom. Unrecognized models skip roofline entirely. To add a model or GPU, open an issue or submit a PR to the catalog files in <code>src/context/</code>.</div>
   </article>
 
-  <!-- SEPARATOR -->
-
-  <article id="page-math" class="page">
+<article id="page-math" class="page">
     <h1>Math</h1>
     <p class="subtitle">The formulas Profile runs on collected data.</p>
 
@@ -800,9 +745,7 @@ efficiency_delta_pp  = efficiency_pct_after − efficiency_pct_before</code></pr
     </table>
   </article>
 
-  <!-- SEPARATOR -->
-
-  <article id="page-limitations" class="page">
+<article id="page-limitations" class="page">
     <h1>Limitations</h1>
     <p class="subtitle">Where the math is approximate and why.</p>
 
@@ -823,9 +766,7 @@ efficiency_delta_pp  = efficiency_pct_after − efficiency_pct_before</code></pr
     </table>
   </article>
 
-  <!-- SEPARATOR -->
-
-  <article id="page-design" class="page">
+<article id="page-design" class="page">
     <h1>Design</h1>
     <p class="subtitle">The non-obvious choices and the reasoning behind them.</p>
 
@@ -874,9 +815,7 @@ efficiency_delta_pp  = efficiency_pct_after − efficiency_pct_before</code></pr
     </ul>
   </article>
 
-  <!-- SEPARATOR -->
-
-  <article id="page-blog" class="page">
+<article id="page-blog" class="page">
     <h1 class="post-title">The Inference Problem</h1>
     <p class="post-meta">Apr 19, 2026</p>
 
@@ -948,66 +887,125 @@ efficiency_delta_pp  = efficiency_pct_after − efficiency_pct_before</code></pr
       <p><a href="https://www.benzinga.com/markets/earnings/25/09/47587481/larry-ellison-targets-multi-trillion-dollar-ai-inference-market-for-oracle-ai-will-change-everything">3. Larry Ellison Targets Multi-Trillion-Dollar AI Inference Market, Benzinga</a></p>
     </div>
   </article>
+  </main>
 
 </div>
 
 <footer>
-  <span>Profile</span>
-  <div class="divider"></div>
-  <span>v2.0</span>
-  <div class="divider"></div>
-  <span>Open Source</span>
-  <div class="divider"></div>
-  <span>2026</span>
+  © 2026 · Apache 2.0 · <a href="index.html">profile</a> · <a href="https://github.com/jungledesh/profile">GitHub</a>
 </footer>
 
 <script>
   const TITLES = {
-    home: 'Workflow | Profile',
-    catalog: 'Catalog | Profile',
-    math: 'Math | Profile',
-    rules: 'Rules | Profile',
-    data: 'Data | Profile',
-    limitations: 'Limitations | Profile',
-    design: 'Design | Profile',
-    blog: 'The Inference Problem | Profile',
+    home: 'Workflow | Profile', catalog: 'Catalog | Profile', math: 'Math | Profile',
+    rules: 'Rules | Profile', data: 'Data | Profile', limitations: 'Limitations | Profile',
+    design: 'Design | Profile', blog: 'The Inference Problem | Profile',
   };
 
+  // assign stable ids to headings
+  document.querySelectorAll('.page').forEach(p => {
+    const pid = p.id.replace('page-','');
+    p.querySelectorAll('h2, h3').forEach((h, i) => {
+      if (!h.id) h.id = pid + '-' + (h.textContent.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'') || i);
+    });
+  });
+
+  function buildSubnav(id) {
+    document.querySelectorAll('.subnav').forEach(s => s.remove());
+    const page = document.getElementById('page-' + id);
+    const navA = document.querySelector('[data-page="' + id + '"]');
+    if (!page || !navA) return;
+    const hs = page.querySelectorAll('h2');
+    if (!hs.length) return;
+    const ul = document.createElement('ul'); ul.className = 'subnav';
+    hs.forEach(h => {
+      const li = document.createElement('li'); const a = document.createElement('a');
+      a.textContent = h.textContent; a.href = '#' + id;
+      a.onclick = e => { e.preventDefault(); location.hash = id; h.scrollIntoView({behavior:'smooth', block:'start'}); };
+      li.appendChild(a); ul.appendChild(li);
+    });
+    navA.parentElement.appendChild(ul);
+  }
+
   function show(hash) {
-    const id = (hash || '#math').replace('#','');
+    const id = (hash || '#home').replace('#','');
     document.querySelectorAll('.page').forEach(p => p.classList.remove('visible'));
     const target = document.getElementById('page-' + id);
     if (target) target.classList.add('visible');
     document.querySelectorAll('[data-page]').forEach(a =>
       a.classList.toggle('active', a.dataset.page === id));
     document.title = TITLES[id] || 'Profile | Docs';
+    buildSubnav(id);
   }
+  window.addEventListener('hashchange', () => { show(location.hash); window.scrollTo(0,0); });
+  show(location.hash || '#home');
 
-  window.addEventListener('hashchange', () => show(window.location.hash));
-  show(window.location.hash || '#home');
-</script>
-
-
-<script>
-document.querySelectorAll('pre').forEach(pre => {
-  if (!pre.querySelector('code')) return;
-  const text = pre.querySelector('code').innerText.trim();
-  if (text.startsWith('+---') || text.startsWith('Apply your change')) return;
-  const btn = document.createElement('button');
-  btn.className = 'copy-btn';
-  btn.textContent = 'Copy';
-  btn.onclick = () => {
-    navigator.clipboard.writeText(pre.querySelector('code').innerText).then(() => {
-      btn.textContent = 'Copied!';
-      btn.classList.add('copied');
-      setTimeout(() => {
-        btn.textContent = 'Copy';
-        btn.classList.remove('copied');
-      }, 2000);
+  // search
+  const INDEX = [];
+  document.querySelectorAll('.page').forEach(p => {
+    const pid = p.id.replace('page-','');
+    const pageName = (TITLES[pid] || pid).split('|')[0].trim();
+    let current = { page: pid, pageName, heading: pageName, id: null, text: '' };
+    p.querySelectorAll('h1, h2, h3, p, li, td').forEach(el => {
+      if (/^H[123]$/.test(el.tagName)) {
+        if (current.text) INDEX.push(current);
+        current = { page: pid, pageName, heading: el.textContent.trim(), id: el.id || null, text: '' };
+      } else { current.text += ' ' + el.textContent; }
     });
-  };
-  pre.appendChild(btn);
-});
+    if (current.text) INDEX.push(current);
+  });
+
+  const box = document.getElementById('search'), out = document.getElementById('results');
+  box.addEventListener('input', () => {
+    const q = box.value.trim().toLowerCase();
+    out.innerHTML = '';
+    if (q.length < 2) return;
+    const hits = INDEX.map(e => {
+      const hay = (e.heading + ' ' + e.text).toLowerCase();
+      let score = 0;
+      q.split(/\s+/).forEach(w => {
+        if (e.heading.toLowerCase().includes(w)) score += 3;
+        if (hay.includes(w)) score += 1;
+      });
+      return { e, score };
+    }).filter(h => h.score > 0).sort((a,b) => b.score - a.score).slice(0, 8);
+    hits.forEach(({e}) => {
+      const a = document.createElement('a');
+      a.href = '#' + e.page;
+      a.innerHTML = '<b></b><span></span>';
+      a.querySelector('b').textContent = e.heading;
+      a.querySelector('span').textContent = e.pageName.toUpperCase();
+      a.onclick = ev => {
+        ev.preventDefault(); location.hash = e.page;
+        requestAnimationFrame(() => {
+          const t = e.id && document.getElementById(e.id);
+          if (t) t.scrollIntoView({behavior:'smooth', block:'start'});
+        });
+        out.innerHTML = ''; box.value = '';
+      };
+      out.appendChild(a);
+    });
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key === '/' && document.activeElement !== box) { e.preventDefault(); box.focus(); }
+    if (e.key === 'Escape') { out.innerHTML = ''; box.blur(); }
+  });
+
+  // copy buttons
+  document.querySelectorAll('pre').forEach(pre => {
+    if (!pre.querySelector('code')) return;
+    const text = pre.querySelector('code').innerText.trim();
+    if (text.startsWith('+---') || text.startsWith('Apply your change')) return;
+    const btn = document.createElement('button');
+    btn.className = 'copy-btn'; btn.textContent = 'copy';
+    btn.onclick = () => {
+      navigator.clipboard.writeText(pre.querySelector('code').innerText).then(() => {
+        btn.textContent = 'copied'; btn.classList.add('copied');
+        setTimeout(() => { btn.textContent = 'copy'; btn.classList.remove('copied'); }, 1600);
+      });
+    };
+    pre.appendChild(btn);
+  });
 </script>
 </body>
 </html>
