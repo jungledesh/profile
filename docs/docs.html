@@ -148,7 +148,7 @@
 
     <h3>Prerequisites</h3>
     <ul>
-      <li>NVIDIA GPU with NVML (for hardware metrics).</li>
+      <li>NVIDIA GPU (NVML) or AMD GPU (amdgpu driver). Profile probes NVIDIA first and falls back to AMD.</li>
       <li>vLLM running with <code>/metrics</code> reachable (default <code>http://localhost:8000/metrics</code>).</li>
       <li>Active production-like load during the <code>--duration</code> window. Idle servers produce no signal.</li>
     </ul>
@@ -166,99 +166,130 @@ profile diagnose --url http://localhost:8000/metrics --duration 2m</code></pre>
     <p>When sampling ends, Profile prints a summary block. Look at <code>ISSUES</code>. The <code>Fix:</code> tells you what to change in your vLLM startup command.</p>
 
     <h3>Read</h3>
-    <p>Profile prints a performance snapshot followed by an <code>ISSUES</code> block. Here is an example issue. Do exactly what the <code>Fix:</code> section recommends.</p>
-    <pre><code>+----------------------------------------------------------------------------------------------------+
-|PROFILE v2.1.4 [Qwen3.6-27B] [NVIDIA A100-SXM4-80GB] (1m from 2026-06-18 21:57:54 UTC)              |
-|                                                                                                    |
-|GPU =&gt;     EFFICIENCY 4.9% | POWER 391W | 1.37 J/tok | $1.46/1M tok (est) | vRAM 71/80GB            |
-|                                                                                                    |
-|vLLM:                                                                                               |
-|REQUESTS   run 53 (20.8%) | wait 196 | max 256                                                      |
-|LATENCY    ttft 50.0s (p95 96.0s) | tpot 193ms (p95 292ms)                                          |
-|CACHE      kv_cache 98.0% avg (99.7% peak) | pfix_cache -                                           |
-|THROUGHPUT 285 tok/s                                                                                |
-|TRAFFIC    qps 0.7 | req_total 80 | gen_total 28429 | preempt/s 0.00 | preempt_total 0              |
-|                                                                                                    |
-|ISSUES:                                                                                             |
-|                                                                                                    |
-|[!] KV Cache Pressure                                                                               |
-|  Seen in 83% of windows                                                                            |
-|  Cause:                                                                                            |
-|  - KV cache hit 99.7% peak (threshold: 88%)                                                        |
-|  - Queue backpressure: 196 requests waiting on KV admission                                        |
-|                                                                                                    |
-|  Fix:                                                                                              |
-|    • Lower --max-num-seqs to ≤13 (physics ceiling for max_model_len=8192)                          |
-|    • Raise --gpu-memory-utilization (check VRAM header for avail mem) to expand KV pool            |
-|    • Enable --enable-prefix-caching to share KV blocks across identical prompt prefixes            |
-|    • Switch --kv-cache-dtype fp8 to halve KV memory footprint                                      |
-|    • Lower --max-model-len (current: 8192) to safely raise concurrency.                            |
-|                                                                                                    |
-|  Expected: Wait queue drains, TTFT recovers once KV pool has capacity.                             |
-|  Confidence: High                                                                                  |
-+----------------------------------------------------------------------------------------------------+</code></pre>
+    <p>Profile prints a performance snapshot followed by an <code>ISSUES</code> block. Here is an example. Do exactly what the <code>Fix:</code> section recommends.</p>
+    <pre><code>+----------------------------------------------------------------------------------------------------------------------------+
+|PROFILE v2.1.4 [Qwen3.6-27B] [NVIDIA H100 80GB HBM3] (2m from 2026-07-31 07:13:29 UTC)                                      |
+|                                                                                                                            |
+|GPU =&gt;               decode_eff ~0.9% | power 653W | 3.57 J/tok | $5.09/1M output tok (est) | vRAM 74/80GB (peak 75GB)      |
+|                     mem_util 56%                                                                                           |
+|                                                                                                                            |
+|vLLM =&gt;                                                                                                                     |
+|REQUESTS             run 14 (4.0%) | wait 4 | max 345                                                                       |
+|LATENCY              ttft 8.7s (p95 19.2s) | tpot 97ms (p95 159ms)                                                          |
+|CACHE                kv_cache 93.1% avg (100.0% peak) | pfix_cache -                                                        |
+|THROUGHPUT           163 tok/s                                                                                              |
+|TRAFFIC              qps 0.5 | req_total 112 | gen_total 32368 | preempt/s 0.01 | preempt_total 2                           |
+|                                                                                                                            |
+|ISSUES:                                                                                                                     |
+|                                                                                                                            |
+|[!] KV Cache Pressure                                                                                                       |
+|    Seen in 92% of windows                                                                                                  |
+|    Cause:                                                                                                                  |
+|      KV cache 94% avg in fired windows, 100% peak (threshold: 88%).                                                        |
+|      4 requests queued on KV admission.                                                                                    |
+|                                                                                                                            |
+|    Fix:                                                                                                                    |
+|    Cuts throughput:                                                                                                        |
+|      • Lower --max-model-len (current: 262144). Observed avg 13.9k tokens per request, prompt + generation.                |
+|        Some requests are longer than avg; add buffer to it. Requests over the limit are rejected with a 400, not truncated.|
+|                                                                                                                            |
+|      • Lower --max-num-seqs to reduce KV demand                                                                            |
+|                                                                                                                            |
+|    Safe to apply:                                                                                                          |
+|      • Enable --enable-prefix-caching to share KV blocks across identical prompt prefixes                                  |
+|      • Raise --gpu-memory-utilization (check vRAM header for avail mem) to expand KV pool                                  |
+|      • Switch --kv-cache-dtype fp8 to halve KV memory footprint (affects output quality)                                   |
+|      • Set --kv-offloading-size 4 (est) to hold evicted KV in host memory instead of recomputing it                        |
+|        Host RAM available: 1953 GiB, container limit 234 GiB.                                                              |
+|                                                                                                                            |
+|    Expected: Wait queue drains, TTFT recovers once KV pool has capacity.                                                   |
+|    Confidence: High                                                                                                        |
++----------------------------------------------------------------------------------------------------------------------------+</code></pre>
 
+    <p>Every value is measured or marked. A dash (<code>-</code>) means the metric was not readable. <code>(est)</code> means the number came from the physics model. A tilde (<code>~</code>) marks a value derived from an estimated ceiling. Gaps are never filled with guesses.</p>
     <blockquote><em>Note: <code>[!] KV Cache Pressure</code> corresponds directly to rule <strong>R2</strong> in the Flag Recommendations Map below.</em></blockquote>
 
     <h3>Restart &amp; Measure</h3>
     <p>Apply primary and secondary fixes together in one restart. One flag per restart wastes time. Restart vLLM. Profile resumes on vLLM re-start and measures the new baseline. Repeat this process until the bottleneck clears or you reach hardware saturation.</p>
-    <pre><code>Apply your change. Press Enter when done.
+    <pre><code>Apply the fix above. Profile re-measures after your change.
+
+Press Enter when done.
+
 Connection restored. Resuming in 5s...
 
-New --max-num-seqs [current: 256]: 13
+New --max-num-seqs [current: 345]: 170
 
 Measuring delta...
 
-  Config changed, baseline reset.
+  Config changed.
 
-  Throughput   285 -&gt; 133 tok/s ↓
-  TTFT         50046 -&gt; 57230ms ↑  (p95 96000 -&gt; 78000ms ↓)
-  TPOT         193.2 -&gt; 75.6ms ↓   (p95 292.3 -&gt; 97.5ms ↓)
-  Efficiency   -2.6pp ↓
+  Throughput          163 → 328 tok/s
+  TTFT                8720 → 495ms (p95 19185 → 950ms)
+  TPOT                96.9 → 50.9ms (p95 158.7 → 73.0ms)
 
 ECONOMICS:
-  J/tok        1.37 -&gt; 2.14 ↑
-  Cost/1M tok  $1.46 -&gt; $3.14 ↑ (est)
-  Waste        $1.43 -&gt; $1.47/hr</code></pre>
+  Cost/1M output tok  $5.09 → $2.53 (est)</code></pre>
+
+    <p>Regressions are labelled, not buried:</p>
+    <pre><code>  Throughput          610 → 545 tok/s  worse
+  TTFT                1024 → 6067ms (p95 2407 → 16687ms)  worse
+  TPOT                118.4 → 147.0ms (p95 147.7 → 195.9ms)  worse
+  Decode eff.         -0.4pp
+
+ECONOMICS:
+  Cost/1M output tok  $1.36 → $1.52 (est)  worse</code></pre>
 
     <h3>Iterate</h3>
-    <p>Notice the throughput dropped? Profile reports regressions honestly. Fixing one bottleneck often exposes the next. Keep iterating, results improve over multiple restarts.</p>
+    <p>Notice the throughput dropped? Profile reports regressions honestly. Fixing one bottleneck often exposes the next. Keep iterating; results improve over multiple restarts.</p>
+
+    <h3>Loop behavior</h3>
+    <ul>
+      <li><strong>Same-primary reveal.</strong> When the same primary fires again, Profile lists the rules it suppressed under that block. No flat-delta gate: re-fire alone is enough, whether or not you applied a fix in between.</li>
+      <li><strong>Empty-fix reveal.</strong> When the primary has no lever left (fix list empty or exhausted), Profile shows the suppressed alternatives under that same block immediately, without waiting for a second fire.</li>
+      <li><strong>Dead-end.</strong> When no config lever remains, Profile names the wall (replica, or the physics boundary), points at scale-out, and surfaces what it was holding.</li>
+      <li><strong>Oscillation escape.</strong> When R2 (KV pressure) and R5 (concurrency saturation) alternate on <code>--max-num-seqs</code>, Profile names the bracket tried and suggests the midpoint. It offers this at most three times, then names the wall.</li>
+      <li><strong>Config-skip.</strong> Where Profile can read your running config, it skips levers you already set: prefix caching on, fp8 KV already active, chunked prefill on, <code>--max-num-batched-tokens</code> already at or above the suggestion, seats already at the target. Exception: <code>--kv-offloading-size</code> is re-derived on each R2 fire; if the new size differs from what is set, the flag is offered again with the new number (host-RAM subline included). If derived equals set, it stays quiet.</li>
+    </ul>
 
     <h3>Scale Out</h3>
-    <p>Eventually, no config change will help. You have hit hardware saturation. Time to scale out.</p>
-    <pre><code>+----------------------------------------------------------------------------------------------------+
-|PROFILE v2.1.4 [Qwen3.6-27B] [NVIDIA A100-SXM4-80GB] (1m from 2026-06-18 22:08:40 UTC)              |
-|                                                                                                    |
-|GPU =&gt;     EFFICIENCY 8.1% | POWER 390W | 0.83 J/tok | $0.89/1M tok (est) | vRAM 77/80GB (peak 79GB)|
-|                                                                                                    |
-|vLLM:                                                                                               |
-|REQUESTS   run 100 (95.6%) | wait 149 | max 105                                                     |
-|LATENCY    ttft 52.9s (p95 129.2s) | tpot 199ms (p95 295ms)                                         |
-|CACHE      kv_cache 81.5% avg | pfix_cache 61.6%                                                    |
-|THROUGHPUT 470 tok/s                                                                                |
-|                                                                                                    |
-|ISSUES:                                                                                             |
-|                                                                                                    |
-|[!] Concurrency Saturation                                                                          |
-|  Seen in 50% of windows                                                                            |
-|                                                                                                    |
-|  Fix:                                                                                              |
-|    • KV at 81%: scheduler at cap, pool full. No config change helps.                               |
-|    • Add a replica to scale out.                                                                   |
-|                                                                                                    |
-|~$1.38/hr lost to scheduler queuing                                                                 |
-+----------------------------------------------------------------------------------------------------+</code></pre>
+    <p>Eventually, no config change will help. You have hit hardware saturation.</p>
+    <pre><code>+----------------------------------------------------------------------------------------------------------------------------+
+|PROFILE v2.1.4 [Qwen3.6-27B] [NVIDIA H100 80GB HBM3] (2m from 2026-07-31 07:52:11 UTC)                                      |
+|                                                                                                                            |
+|GPU =&gt;               decode_eff ~8.1% | power 653W | 0.83 J/tok | $1.18/1M output tok (est) | vRAM 77/80GB (peak 79GB)      |
+|                                                                                                                            |
+|vLLM =&gt;                                                                                                                     |
+|REQUESTS             run 345 (100%) | wait 149 | max 345                                                                    |
+|LATENCY              ttft 52.9s (p95 129.2s) | tpot 199ms (p95 295ms)                                                       |
+|CACHE                kv_cache 81.5% avg | pfix_cache 61.6%                                                                  |
+|THROUGHPUT           470 tok/s                                                                                              |
+|                                                                                                                            |
+|ISSUES:                                                                                                                     |
+|                                                                                                                            |
+|[!] Concurrency Saturation                                                                                                  |
+|    Seen in 50% of windows                                                                                                  |
+|    Cause:                                                                                                                  |
+|      KV at 81.5%: memory wall reached. No config change helps.                                                             |
+|                                                                                                                            |
+|    Fix:                                                                                                                    |
+|      • Add a replica to scale out.                                                                                         |
+|                                                                                                                            |
+|    Confidence: High                                                                                                        |
++----------------------------------------------------------------------------------------------------------------------------+</code></pre>
 
     <h2>vLLM Flag Recommendations Map</h2>
     <p>Profile detects these bottlenecks and recommends the following vLLM flag changes:</p>
     <table>
       <thead><tr><th>Diagnosis</th><th>When it fires</th><th>vLLM flags to change</th></tr></thead>
       <tbody>
-        <tr><td><strong>R1 Under-batching</strong></td><td>GPU efficiency &lt;60%, no queue</td><td>Increase client concurrency (not a vLLM flag)</td></tr>
-        <tr><td><strong>R2 KV cache pressure</strong></td><td>KV ≥88%, preemptions, or admission backlog</td><td>Lower <code>--max-num-seqs</code> or <code>--max-model-len</code>; or raise <code>--gpu-memory-utilization</code>, switch to fp8 KV cache</td></tr>
-        <tr><td><strong>R3 Low prefix reuse</strong></td><td>Prefix hit rate &lt;35%</td><td>Add <code>--enable-prefix-caching</code>; restructure prompts if already enabled</td></tr>
-        <tr><td><strong>R4 OOM risk</strong></td><td>Weights exceed VRAM</td><td>Set <code>--tensor-parallel-size</code> (Profile computes the value)</td></tr>
-        <tr><td><strong>R5 Concurrency saturation</strong></td><td>Queueing, running at <code>--max-num-seqs</code> cap</td><td>Raise <code>--max-num-seqs</code> if KV &lt;80%; otherwise add a replica or lower <code>--max-model-len</code></td></tr>
+        <tr><td><strong>R1 Under-batching</strong></td><td>Known GPU: config-relative efficiency &lt;60% with occupancy &lt;75%, no backlog. Unknown GPU: occupancy &lt;25%.</td><td>Batch more requests or raise client concurrency</td></tr>
+        <tr><td><strong>R2 KV cache pressure</strong></td><td>KV &ge;88% (avg or peak) AND (eviction: preempt/s &gt;0.02 or swapped &ge;2, OR waiting &gt;2)</td><td>Split Cuts/Safe. Cuts: lower <code>--max-model-len</code> or <code>--max-num-seqs</code>. Safe: <code>--enable-prefix-caching</code>, raise <code>--gpu-memory-utilization</code>, fp8 KV, <code>--kv-offloading-size</code></td></tr>
+        <tr><td><strong>R2b KV admission backlog</strong></td><td>KV near full (&ge;88% avg or peak), queue ratio &ge;30%, scheduler not at seat cap, free KV below demand</td><td>Expand KV pool: raise <code>--gpu-memory-utilization</code>, fp8 KV, or reduce <code>--max-model-len</code></td></tr>
+        <tr><td><strong>R3 Low prefix reuse</strong></td><td>Active traffic (running &gt;0.75), mean prompt &ge;20 tok, QPS &times; mean prompt &ge;1000. Caching off: fires on volume alone. Caching on: hit rate &lt;35%.</td><td><code>--enable-prefix-caching</code>; restructure prompts if already on</td></tr>
+        <tr><td><strong>R4 OOM risk</strong></td><td>Weights overflow VRAM, or free VRAM cannot hold one worst-case request. Not fired when dtype is fallback (bf16 assumed).</td><td><code>--tensor-parallel-size</code> at minimum needed, raise <code>--gpu-memory-utilization</code>, or use a smaller model</td></tr>
+        <tr><td><strong>R5 Concurrency saturation</strong></td><td>Running at <code>--max-num-seqs</code> cap, &ge;2 waiting, queue ratio &ge;30%</td><td>Below 80% KV: raise <code>--max-num-seqs</code> to bounded target. At/above 80% KV: name the wall or add a replica.</td></tr>
+        <tr><td><strong>R6 Prefill-bound</strong></td><td>Prompt/gen ratio &ge;5, decode efficiency &lt;40%. Muted when TPOT is measured and under 4&times; its floor.</td><td>Chunked prefill, <code>--max-num-batched-tokens</code>; at compute wall, disaggregate or add a replica</td></tr>
+        <tr><td><strong>R7 Config headroom</strong></td><td><code>--max-num-seqs</code> below 90% of recommended target, occupancy &ge;50%, &le;1 waiting</td><td>Raise <code>--max-num-seqs</code>; output names the binding wall</td></tr>
       </tbody>
     </table>
     <blockquote><em>Note: Profile may list several fixes in one Fix: block. Apply them together when relevant. See <a href="#rules" data-page="rules">Rules</a> for thresholds and edge cases.</em></blockquote>
@@ -269,16 +300,16 @@ ECONOMICS:
       <thead><tr><th>Flag</th><th>Default</th><th>Description</th></tr></thead>
       <tbody>
         <tr><td><code>-u, --url</code></td><td><code>http://localhost:8000/metrics</code></td><td>vLLM metrics endpoint</td></tr>
-        <tr><td><code>--duration</code></td><td><code>30s</code></td><td>Sampling window (<code>30s</code>, <code>1m</code>, <code>2m</code>, <code>3m</code>)</td></tr>
+        <tr><td><code>--duration</code></td><td><code>30s</code></td><td>Sampling window. Minimum <code>30s</code>, maximum <code>30m</code>. Units are <code>s</code> or <code>m</code>.</td></tr>
         <tr><td><code>-m, --max-num-seqs</code></td><td>Prompted if absent</td><td>Pass to skip prompt. Auto-read from <code>/metrics</code> if available.</td></tr>
-        <tr><td><code>--tensor-parallel-size</code></td><td>Env or unset</td><td>TP degree (overrides <code>TENSOR_PARALLEL_SIZE</code>)</td></tr>
+        <tr><td><code>--tensor-parallel-size</code></td><td>Unset</td><td>Must be 1 today. Values above 1 are refused at launch. Profile still reports when a model needs TP to fit at all.</td></tr>
         <tr><td><code>--cost-per-hour</code></td><td>Catalog estimate</td><td>GPU cost in USD/hr (overrides catalog estimate)</td></tr>
-        <tr><td><code>-v</code></td><td>Off</td><td>Show non-triggered rules and physics limits</td></tr>
+        <tr><td><code>-v</code></td><td>Off</td><td>Show rules that did not fire, physics limits, and expanded GPU/latency/cache detail</td></tr>
       </tbody>
     </table>
 
     <h2>Proof: Qwen3.6-27B on A100-SXM4-80GB</h2>
-    <p>📺 <strong><a href="https://www.youtube.com/watch?v=XuPPKBteWH0" target="_blank" rel="noopener">Watch the 15x optimization demo</a></strong></p>
+    <p>&#x1F4FA; <strong><a href="https://www.youtube.com/watch?v=XuPPKBteWH0" target="_blank" rel="noopener">Watch the 15x optimization demo</a></strong></p>
     <p><strong>Before Profile:</strong> <code>31 tok/s</code> | <code>$13.26 / 1M tokens</code><br>
     <strong>After Profile:</strong> <code>470 tok/s</code> | <code>$0.89 / 1M tokens</code></p>
     <p><strong>Result:</strong> 15x throughput. 93% cost cut. Profile tracked live traffic and guided specific vLLM config changes (<code>--max-num-seqs</code>, prefix caching, FP8 KV cache, <code>--gpu-memory-utilization</code>) until hardware saturation was reached.</p>
@@ -288,142 +319,169 @@ ECONOMICS:
     <table>
       <thead><tr><th>Feature</th><th>Profile</th><th>Others</th></tr></thead>
       <tbody>
-        <tr><td>Physics ceiling (roofline math)</td><td>✓</td><td>✗</td></tr>
-        <tr><td>Filters idle, only analyzes under load</td><td>✓</td><td>✗</td></tr>
-        <tr><td>Bottleneck detection</td><td>✓</td><td>✓</td></tr>
-        <tr><td>Closed loop: measures delta after fix</td><td>✓</td><td>✗</td></tr>
-        <tr><td>Cost per 1M tokens + recoverable waste</td><td>✓</td><td>✗</td></tr>
-        <tr><td>Prescriptive fixes, not just alerts</td><td>✓</td><td>✗</td></tr>
+        <tr><td>Physics ceiling (roofline math)</td><td>&#10003;</td><td>&#10007;</td></tr>
+        <tr><td>Filters idle, only analyzes under load</td><td>&#10003;</td><td>&#10007;</td></tr>
+        <tr><td>Bottleneck detection</td><td>&#10003;</td><td>&#10003;</td></tr>
+        <tr><td>Closed loop: measures delta after fix</td><td>&#10003;</td><td>&#10007;</td></tr>
+        <tr><td>Cost per 1M output tokens</td><td>&#10003;</td><td>&#10007;</td></tr>
+        <tr><td>Prescriptive fixes, not just alerts</td><td>&#10003;</td><td>&#10007;</td></tr>
       </tbody>
     </table>
   </article>
 
 <article id="page-rules" class="page">
     <h1>Rules</h1>
-    <p class="subtitle">Five rules. Each fires when a specific bottleneck is confirmed under load.</p>
+    <p class="subtitle">Eight rules (R1&ndash;R7, R2b sibling). Each fires when a specific bottleneck is confirmed under load.</p>
 
     <div class="callout">New here? Start at the <a href="#home" data-page="home">Optimization Workflow</a>.</div>
 
-    <div class="callout">Rules evaluate on structurally valid windows (<code>window_is_evaluable</code>). Recommendations surface only when a signal is persistent across evaluable windows.</div>
-    <div class="callout">To prevent visual contradictions between the summary header and the recommendation blocks, display metrics (like <code>requests_running</code> and <code>requests_waiting</code>) are explicitly synced to the final session <code>snapshot</code> rather than using locally aggregated window approximations.</div>
+    <div class="callout">Rules evaluate on structurally valid windows (<code>window_is_evaluable</code>). A recommendation surfaces only when the signal is persistent: at least 3 windows and at least 25% of all evaluable windows in the run.</div>
+    <div class="callout">Display metrics (like <code>requests_running</code> and <code>requests_waiting</code>) are synced to the final session <code>snapshot</code> rather than locally aggregated window approximations, to prevent visual contradictions between the summary header and the recommendation blocks.</div>
 
     <h2>R1: Under-batching</h2>
     <table>
       <thead><tr><th>Condition</th><th>Threshold</th></tr></thead>
       <tbody>
-        <tr><td>GPU Efficiency</td><td>&lt;60% of physics ceiling</td></tr>
-        <tr><td>No backlog</td><td>waiting == 0</td></tr>
+        <tr><td>Known GPU: config-relative efficiency</td><td>&lt;60% of config capacity (decode ceiling &times; min(max_num_seqs, ridge))</td></tr>
+        <tr><td>Known GPU: occupancy</td><td>&lt;75% of effective max</td></tr>
+        <tr><td>No backlog</td><td>waiting &lt; 2</td></tr>
+        <tr><td>Unknown GPU fallback: occupancy</td><td>&lt;25% of max_num_seqs</td></tr>
       </tbody>
     </table>
-    <p><strong>Fix:</strong> Batch more requests or increase client concurrency. Profile calculates the exact idle capacity based on the physics ceiling.</p>
+    <p>R1 still evaluates when R6 (Prefill-bound) fires on the same window; R6 then suppresses it via the mutual exclusivity table so the under-batching recommendation is held for reveal, not silently deferred. Fix names the binding wall: config cap, compute ridge, or memory limit.</p>
+    <p><strong>Fix:</strong> Batch more requests or increase client concurrency.</p>
 
     <h2>R2: KV cache pressure</h2>
-    <p>R2 has two sub-variants. Both surface under the same <code>[!] KV Cache Pressure</code> header. The main path suppresses the backlog path when both fire.</p>
-    <h3>Main path</h3>
+    <p>R2 and R2b are sibling rules in the same DAG layer. Both surface KV-related pressure. When both would fire, eval takes R2 and skips R2b (<code>else if</code>), not the mutual exclusivity table. The ME table only silences R2/R2b under R4 weights-alone overflow, and R1 under R6.</p>
+    <h3>Main path (R2)</h3>
     <table>
       <thead><tr><th>Condition</th><th>Threshold</th></tr></thead>
       <tbody>
-        <tr><td>KV cache usage</td><td>≥88% (or preemptions active)</td></tr>
+        <tr><td>KV near full (avg or peak)</td><td>&ge;88%</td></tr>
+        <tr><td>Harm signal (at least one)</td><td><code>preempt/s &gt; 0.02</code>, or <code>swapped &ge; 2</code>, or <code>waiting &gt; 2</code></td></tr>
       </tbody>
     </table>
-    <div class="callout"><strong>Deep Dive: Threshold Calibration</strong><br>Profile evaluates KV cache pressure against an 88% threshold. This value is derived from observed vLLM production eviction metrics. Testing indicates that 85% yields false positives, while 88% represents the strict mathematical boundary before cache thrashing occurs. Active evictions are confirmed through velocity (<code>preemptions/sec > 0.02</code>) or static debt (<code>swapped requests >= 2</code>).</div>
-    <p>VRAM ≥78% is shown in output as corroborating evidence when present, but is not a required condition. R2 fires on KV usage or preemptions alone.</p>
-    <p><strong>Fix:</strong> Reduce <code>--max-num-seqs</code> or <code>--max-model-len</code>. The <code>max-model-len</code> shrink uses mathematically sound <code>p99 prompt + p99 gen</code> sums, gated by &gt;100 completion samples and a &lt;5% reduction suppression to avoid useless noise. The KV absolute max sequence ceiling is calculated physically using: <code>kv_headroom_gb</code>, <code>max_model_len</code>, <code>num_layers</code>, <code>num_kv_heads</code>, <code>head_dim</code>, and <code>kv_bytes_per_element</code>.</p>
-    <div class="callout"><strong>Deep Dive: Dynamic Context Reduction</strong><br>Profile calculates context window reductions using precise prompt and generation length distributions (<code>prompt_tokens_p99 + generation_tokens_p99</code>). To ensure statistical stability, this logic requires a minimum of 100 completion samples. Reductions below 5% are suppressed to prevent configuration churn. A truncation warning is issued if the mean prompt length exceeds 70% of the active context window.</div>
-    <h3>Admission backlog path</h3>
+    <p>Both conditions must hold. KV at 88% with no evictions and no queue is healthy and hot; R2 stays quiet.</p>
+    <p>The fix block is split into <strong>Cuts throughput</strong> and <strong>Safe to apply</strong>. The seat direction line (<code>--max-num-seqs</code>) gives direction only, not a specific ceiling number. <code>--max-model-len</code> shrink prefers observed <code>p99 prompt + p99 gen</code>; falls back to averages when p99s are missing.</p>
+    <p><code>--kv-offloading-size</code>: on every R2 fire, Profile re-derives the size (supply-capped by host / container RAM). If the derived value differs from what is already set, the Safe block offers the new number (e.g. set 4, derived 12 &rarr; <code>Set --kv-offloading-size 12 (est)</code>) with the Host RAM subline. If derived equals set, the lever stays quiet.</p>
+    <p><strong>Confidence:</strong> <code>windows_fired / total_evaluable</code>. Ranges from Low to High as more windows confirm the signal.</p>
+
+    <h3>Admission backlog path (R2b)</h3>
     <table>
       <thead><tr><th>Condition</th><th>Threshold</th></tr></thead>
       <tbody>
-        <tr><td>Queue ratio</td><td>waiting / (running + waiting) ≥ 30%</td></tr>
-        <tr><td>Free KV tokens</td><td>&lt; demand from queued requests (waiting × prompt_tokens_mean)</td></tr>
+        <tr><td>KV near full (avg or peak)</td><td>&ge;88% (same bar as R2)</td></tr>
+        <tr><td>Queue ratio</td><td>waiting / (running + waiting) &ge; 30%</td></tr>
+        <tr><td>Free KV tokens</td><td>&lt; demand from queued requests (waiting &times; prompt_tokens_mean)</td></tr>
         <tr><td>Concurrency cap</td><td>running &lt; max_num_seqs (scheduler not at cap)</td></tr>
       </tbody>
     </table>
-    <p>Fires when the scheduler is holding requests in queue to protect KV memory, before KV usage crosses the 88% threshold. The fix is to expand the KV pool, not reduce concurrency.</p>
-    <p><strong>Fix:</strong> Raise <code>--gpu-memory-utilization</code> if VRAM headroom exists; switch to fp8 KV cache; or reduce <code>--max-model-len</code>. The <code>fp8</code> fix dynamically suppresses itself if already active.</p>
+    <p>Fires when KV is near full and the scheduler is holding requests in queue to protect KV memory, without the R2 eviction/harm fire. The fix is to expand the KV pool, not reduce concurrency.</p>
+    <p><strong>Fix:</strong> Raise <code>--gpu-memory-utilization</code> if VRAM headroom exists; switch to fp8 KV cache; or reduce <code>--max-model-len</code>.</p>
     <div class="callout">R2 evaluates against <code>kv_cache_peak_perc</code>, the maximum KV usage across all polls in the window, not the average. A window that averaged 70% but peaked at 92% will still fire. The spike is what causes preemptions. The average hides it.</div>
-    <div class="callout">R2 is the only rule that cross-references a live GPU reading (VRAM from NVML) with a live vLLM reading (KV cache usage). If <code>gpu_observed_at</code> and <code>vllm_observed_at</code> are more than 1 second apart, R2 is skipped. The other rules draw from a single source and don't have this constraint.</div>
 
     <h2>R3: Low prefix reuse</h2>
     <table>
       <thead><tr><th>Condition</th><th>Threshold</th></tr></thead>
       <tbody>
-        <tr><td>Prefix cache hit rate</td><td>&lt;35%</td></tr>
-        <tr><td>Prompt throughput</td><td>≥1000 tok/s (QPS × mean_prompt_tokens)</td></tr>
+        <tr><td>Active traffic: running</td><td>&gt;0.75</td></tr>
+        <tr><td>Mean prompt tokens</td><td>&ge;20</td></tr>
+        <tr><td>Prompt token throughput (QPS &times; mean prompt)</td><td>&ge;1000 tok/s</td></tr>
+        <tr><td>Prefix caching off</td><td>Fires on volume alone (hit rate not required)</td></tr>
+        <tr><td>Prefix caching on: hit rate</td><td>&lt;35%</td></tr>
       </tbody>
     </table>
-    <div class="callout"><strong>Deep Dive: Workload Isolation</strong><br>The prompt throughput gate (<code>≥1000 tok/s</code>) isolates dense workloads from sparse, cold-cache scenarios where low prefix reuse is structurally unavoidable. This filters out unactionable signals, restricting rule evaluation to sustained traffic patterns such as Chat, Agent loops, or RAG systems.</div>
-    <p><strong>Fix:</strong> If prefix caching is disabled: enable <code>--enable-prefix-caching</code>, then restructure prompts. If already enabled: move shared instructions to the start, standardize templates, avoid unique tokens at the beginning.</p>
+    <p>Confidence: 0.95 when prefix caching is off (direct fix available); 0.90 when caching is on and hit rate is low.</p>
+    <p><strong>Fix:</strong> If prefix caching is disabled: enable <code>--enable-prefix-caching</code>. If already enabled: move shared instructions to the start, standardize templates, avoid unique tokens at the beginning.</p>
 
     <h2>R4: OOM risk</h2>
-    <p>Fires regardless of traffic. Configuration fact, not runtime observation.</p>
+    <p>Fires regardless of traffic. Configuration fact, not runtime observation. Does not fire when dtype is bf16 fallback (insufficient information to prescribe confidently).</p>
     <table>
       <thead><tr><th>Formula</th><th>What it computes</th></tr></thead>
       <tbody>
         <tr>
-          <td><code>usable_vram = (vram_total_gb × gpu_mem_util) − 3.0 GB</code></td>
-          <td>VRAM available after activation and KV buffer reservation (3 GB constant)</td>
+          <td><code>kv_headroom_gb = (vram_gb &times; gpu_mem_util) &minus; 3.0 &minus; weight_gb / tp</code></td>
+          <td>VRAM remaining after weights and activation buffer. Negative means weights alone exceed the VRAM budget.</td>
         </tr>
         <tr>
-          <td><code>min_tp = ceil(weight_gb / usable_vram)</code></td>
+          <td><code>min_tp = ceil(weight_gb / ((vram_gb &times; gpu_mem_util) &minus; 3.0))</code></td>
           <td>Minimum tensor parallel degree to fit the model</td>
         </tr>
       </tbody>
     </table>
-    <p>R4 fires when <code>kv_headroom_gb &lt; 0</code> (<code>weight_gb / tp &gt; per-GPU VRAM</code>). <code>min_tp</code> uses <code>gpu_memory_utilization</code> (default 0.90) for the fix recommendation.</p>
-    <div class="callout"><strong>Deep Dive: Static Activation Buffers</strong><br>The OOM evaluation reserves a strict 3.0 GB buffer (<code>usable_vram = (vram_total_gb × gpu_mem_util) - 3.0 GB</code>). This capacity is allocated for forward-pass activations, model weights, and initial contiguous KV blocks required prior to paged memory allocation. Failure to reserve this buffer guarantees an Out of Memory error during prefill.</div>
-    <p><strong>Fix:</strong> Profile computes required TP degree: <em>"Set --tensor-parallel-size N"</em>.</p>
+    <p>Two fire paths: (1) <code>kv_headroom_gb &lt; 0</code>, weights overflow. (2) Weights fit but free VRAM cannot hold one worst-case request's KV + state.</p>
+    <p><strong>Fix:</strong> <code>--tensor-parallel-size</code> at the computed minimum; raise <code>--gpu-memory-utilization</code>; use a smaller model; or the model does not fit on this hardware.</p>
+    <div class="callout">The 3.0&nbsp;GB buffer reserves activation memory. <code>kv_headroom_gb</code> negative means the model cannot run at all on this TP configuration, not just that KV space is tight.</div>
 
     <h2>R5: Concurrency saturation</h2>
     <table>
       <thead><tr><th>Condition</th><th>Threshold</th></tr></thead>
       <tbody>
-        <tr><td>running ≈ max_num_seqs</td><td>Within 0.5</td></tr>
-        <tr><td>Queue ratio</td><td>waiting / (running + waiting) ≥ 30%</td></tr>
-        <tr><td>Sustained</td><td>≥3 windows, ≥25% of evaluable</td></tr>
-        <tr><td>KV cache headroom</td><td>KV peak &lt;80% (falls back to avg when peak absent)</td></tr>
+        <tr><td>running &asymp; max_num_seqs</td><td>Within 0.5 (chunked prefill can batch above cap; cap is not the constraint)</td></tr>
+        <tr><td>Queue ratio</td><td>waiting / (running + waiting) &ge; 30%</td></tr>
+        <tr><td>Waiting floor</td><td>&ge; 2</td></tr>
       </tbody>
     </table>
-    <div class="callout"><strong>Deep Dive: Structural Saturation</strong><br>Concurrency saturation is defined by a 30% queue depth ratio (<code>waiting / (running + waiting)</code>). Below this threshold, queues typically indicate transient batching operations rather than systemic latency. The 30% limit mathematically confirms that the concurrency cap is functioning as a strict hardware bottleneck.</div>
-    <p><strong>Fix:</strong> Raise <code>--max-num-seqs</code> if KV peak &lt;80%. If KV is at or above 80%, raising the cap will cause thrashing; add a replica or lower <code>--max-model-len</code> instead. (Shares the same mathematically sound <code>p99 prompt + p99 gen</code> shrink logic as R2).</p>
-    <div class="callout warn">vLLM ≤0.18.0 doesn't expose <code>vllm_max_num_seqs</code>. Pass <code>-m &lt;value&gt;</code> or R5 won't fire.</div>
+    <p>R5 fires without a KV &lt;80% gate. The 80% check is in the fix branch only: below it, Profile raises <code>--max-num-seqs</code> to a bounded target; at or above it, Profile names the wall and recommends a replica instead.</p>
+    <p><strong>Fix:</strong> Below 80% KV: raise <code>--max-num-seqs</code> to the bounded target (80% margin on the binding wall). Above 80% KV: name the wall (replica; or lower <code>--max-model-len</code> to shrink KV demand).</p>
+    <div class="callout warn">vLLM &le;0.18.0 doesn't expose <code>vllm_max_num_seqs</code>. Pass <code>-m &lt;value&gt;</code> or R5 won't fire.</div>
+
+    <h2>R6: Prefill-bound</h2>
+    <table>
+      <thead><tr><th>Condition</th><th>Threshold</th></tr></thead>
+      <tbody>
+        <tr><td>Prompt/gen ratio</td><td>&ge;5</td></tr>
+        <tr><td>Decode efficiency</td><td>&lt;40%</td></tr>
+        <tr><td>TPOT mute</td><td>Muted when TPOT is measured and under 4&times; its floor. Still fires when TPOT or floor is missing (confidence capped at 0.5).</td></tr>
+      </tbody>
+    </table>
+    <p>R6 fires at DAG layer 5 and, via the suppression table, silences R1 (Under-batching) when it fires. R1 still evaluates so it lands in <code>suppressed_recs</code> for reveal; it is not deferred. A server that looks under-batched but is actually prefill-bound should not receive under-batching as the primary.</p>
+    <p><strong>Fix:</strong> Enable chunked prefill only when it is off or unread as off; raise <code>--max-num-batched-tokens</code> only when the configured value is below the derived suggestion; route shorter prompts. At the compute wall (configured budget already near the derived recommendation, or no knob left): disaggregate or add a replica, and show any suppressed alternatives under the same block.</p>
+
+    <h2>R7: Config headroom</h2>
+    <table>
+      <thead><tr><th>Condition</th><th>Threshold</th></tr></thead>
+      <tbody>
+        <tr><td><code>--max-num-seqs</code> vs recommended target</td><td>&lt;90% of the target</td></tr>
+        <tr><td>Occupancy</td><td>&ge;50% of effective max</td></tr>
+        <tr><td>Waiting</td><td>&le;1</td></tr>
+      </tbody>
+    </table>
+    <p>Optimistic rule (DAG layer 6). Only fires when no active bottleneck is present. The recommended target is shared with R5: 80% margin on the binding wall (ridge or observed KV capacity). Output names what binds the target.</p>
+    <p><strong>Fix:</strong> Raise <code>--max-num-seqs</code> to the computed target.</p>
 
     <h2>Confidence</h2>
-    <p>Per-rule, not a unified formula. Each rule sets confidence based on what signals it has.</p>
+    <p>Per-rule, not a unified formula.</p>
     <table>
       <thead><tr><th>Rule</th><th>Confidence</th><th>Condition</th></tr></thead>
       <tbody>
-        <tr><td>R1</td><td>0.80</td><td>Fixed</td></tr>
-        <tr><td>R2</td><td>0.95</td><td>Preemptions active</td></tr>
-        <tr><td>R2</td><td>0.85</td><td>KV cache ≥ 95%</td></tr>
-        <tr><td>R2</td><td>0.70</td><td>KV cache ≥ 88% (fire threshold), no preemptions</td></tr>
-        <tr><td>R2</td><td>0.85</td><td>KV admission backlog variant</td></tr>
-        <tr><td>R3</td><td>0.90</td><td>Fixed</td></tr>
-        <tr><td>R4</td><td>0.95</td><td>dtype from <code>DTYPE</code> / <code>VLLM_DTYPE</code> env var</td></tr>
-        <tr><td>R4</td><td>0.90</td><td>dtype from <code>kv_cache_dtype</code> or catalog</td></tr>
-        <tr><td>R4</td><td>0.60</td><td>dtype from bf16 fallback</td></tr>
-        <tr><td>R5</td><td>0.90</td><td>TTFT (mean or p99) and KV cache both present</td></tr>
+        <tr><td>R1</td><td>0.80 (known GPU) / 0.50 (unknown)</td><td>Fixed per GPU-knowledge path</td></tr>
+        <tr><td>R2 / R2b</td><td><code>windows_fired / total_evaluable</code></td><td>Density: rises as more windows confirm the signal</td></tr>
+        <tr><td>R3</td><td>0.95 (caching off) / 0.90 (caching on, low hit rate)</td><td>Fixed per caching path</td></tr>
+        <tr><td>R4</td><td>0.95</td><td>dtype or quantization from env var (<code>DTYPE</code>/<code>VLLM_DTYPE</code>, <code>QUANTIZATION</code>/<code>VLLM_QUANTIZATION</code>)</td></tr>
+        <tr><td>R4</td><td>0.90</td><td>vLLM-reported dtype or quantization, or catalog default</td></tr>
+        <tr><td>R4</td><td>Not fired</td><td>weight dtype is bf16 fallback</td></tr>
+        <tr><td>R5</td><td>0.50</td><td>Empirical KV bound used</td></tr>
+        <tr><td>R5</td><td>0.90</td><td>TTFT and KV cache both present</td></tr>
         <tr><td>R5</td><td>0.60</td><td>One or both absent</td></tr>
+        <tr><td>R6</td><td>0.85 / 0.75 / 0.65 by severity; capped at 0.5 when TPOT unverified</td><td>Severe / Moderate / Mild from prompt/gen ratio</td></tr>
+        <tr><td>R7</td><td>0.80 (Observed/ridge) / 0.60 (derived) / 0.50 (empirical)</td><td>By binding-wall source</td></tr>
       </tbody>
     </table>
+    <p>User-facing labels: High (&ge;0.8), Medium (&ge;0.6), Low (&lt;0.6).</p>
 
     <h2>Rule significance gate</h2>
-    <pre><code>rule_is_significant = fired ≥ 3  AND  fired / total_evaluable_windows ≥ 25%</code></pre>
-    <p>A rule that fired once is noise. Profile only surfaces a recommendation when the signal is persistent: at least 3 windows and at least 25% of all evaluable windows in the run.</p>
-    <p><strong>R2 main path exception.</strong> Critical KV conditions bypass the standard gate early:</p>
-    <table>
-      <thead><tr><th>Condition</th><th>Windows required</th></tr></thead>
-      <tbody>
-        <tr><td>Any window with active preemptions</td><td>1 (significant immediately)</td></tr>
-        <tr><td>KV ≥ 95% in ≥ 2 windows</td><td>2</td></tr>
-        <tr><td>Standard gate (KV 88-95%, no preemptions)</td><td>≥ 3 AND ≥ 25%</td></tr>
-      </tbody>
-    </table>
-    <p>The admission backlog path and all other rules use only the standard gate.</p>
+    <pre><code>rule_is_significant = fired &gt;= 3  AND  fired / total_evaluable_windows &gt;= 25%</code></pre>
+    <p>Shared by all rules. A rule that fired once is noise. All rules use this same gate; there are no per-rule exceptions.</p>
 
     <h2>Ranking</h2>
     <pre><code>score = impact × confidence  // impact: 1-5, confidence: 0.0-1.0</code></pre>
-    <p>Rules sorted by score, highest first. Grouped by root cause into <code>IssueGroup</code>. One primary recommendation surfaced per group: the rest are supporting evidence, not separate alerts.</p>
+    <p>Rules are ranked by score within the winning DAG layer. The highest-scoring rule in the winning layer is the primary recommendation. All others are held. They surface when the same primary re-fires, or immediately when the primary has no fix left to offer.</p>
+    <p><strong>DAG layers:</strong> R4, R2, R2b at layer 2 (highest priority). R5 at 3. R1 at 4. R3 and R6 at 5. R7 at 6 (lowest). The winning layer is the lowest-numbered layer that has a significant rule. Rules in higher-numbered layers are suppressed when a lower layer wins.</p>
+    <p><strong>Mutual exclusivity:</strong> R4 (weights overflow alone) silences R2 and R2b. R6 (Prefill-bound) silences R1 (Under-batching). These suppressions run before the layer filter. R2 vs R2b is handled separately in eval (<code>else if</code>), not this table.</p>
+
+    <h2>When no rule fires</h2>
+    <p>If efficiency is still low, a fallback names the shape of the underuse. If nothing fires at all, Profile names the boundary capping a healthy server: capacity, traffic, physics, prefill interference, or framework overhead (<code>PrimaryLimiter</code>). When the GPU or model is uncatalogued and the ceiling itself is unknown, it says that instead of naming a boundary it cannot prove.</p>
   </article>
 
 <article id="page-data" class="page">
@@ -433,7 +491,8 @@ ECONOMICS:
     <p><a href="#home" data-page="home" style="font-size: 0.85rem; color: #666; text-decoration: none;">&larr; Back to Workflow</a></p>
 
     <h2>Cadence</h2>
-    <p>GPU and vLLM scraped in parallel, 250ms apart. One window is ~2 seconds, ~9 polls. Each collector timestamps on completion. If the two timestamps diverge by more than 1 second, rules that cross-reference both sources are skipped.</p>
+    <p>GPU and vLLM are scraped in parallel at ~250ms intervals inside each collection window. Window size: 2s when <code>--duration</code> is 30s or less; 10s otherwise. Each window produces one snapshot from ~9 or ~40 polls respectively.</p>
+    <p>The 1-second observation skew gate (<code>|gpu_observed_at &minus; vllm_observed_at| &gt; 1s</code>) applies only to energy and cost metrics. No rule skips based on skew.</p>
     <p>Within each window, different metric types are treated differently:</p>
     <table>
       <thead><tr><th>Type</th><th>Treatment</th><th>Edge cases</th></tr></thead>
@@ -441,16 +500,16 @@ ECONOMICS:
         <tr>
           <td>Gauges</td>
           <td>Last scrape in the window</td>
-          <td><code>kv_cache_peak_perc</code> is max across all scrapes in the window, not last. KV cache can spike and recover within a window; last scrape alone misses it. Shown in output when peak &gt; avg + 10pp or peak ≥ 95%. Same pattern for VRAM peak (≥90% of total) and GPU temp peak (≥80°C).</td>
+          <td><code>kv_cache_peak_perc</code> is max across all scrapes in the window, not last. KV cache can spike and recover within a window; last scrape alone misses it. Shown in output when peak &gt; avg + 10pp or peak &ge; 95%. Same pattern for VRAM peak (&ge;90% of total) and GPU temp peak (&ge;80&deg;C).</td>
         </tr>
         <tr>
           <td>Histograms</td>
-          <td>Δsum/Δcount, first to last scrape</td>
-          <td>Falls back to last-scrape cumulative mean when Δcount ≤ 0 (no new completions in window). p99 has no fallback; stale p99 is worse than none.</td>
+          <td>&Delta;sum/&Delta;count, first to last scrape</td>
+          <td>Falls back to last-scrape cumulative mean when &Delta;count &le; 0 (no new completions in window). p99 has no fallback; stale p99 is worse than none.</td>
         </tr>
         <tr>
           <td>Counters</td>
-          <td>Rates = Δ / window duration. Raw totals from last scrape.</td>
+          <td>Rates = &Delta; / window duration. Raw totals from last scrape.</td>
           <td><code>None</code> on counter reset (negative delta) or zero-duration window. Zero delta is valid: no activity, not missing data.</td>
         </tr>
       </tbody>
@@ -465,13 +524,13 @@ num_requests_running  is Some (even if zero)</code></pre>
     <p><strong>Tier 2: active.</strong> Was the server doing real work? Aggregated means use this check. Throughput, efficiency %, GPU utilization, and latency averages are computed over active windows only.</p>
     <pre><code>window_is_evaluable(s) &amp;&amp; !window_is_idle(s)
 
-// idle: running &lt; 1 AND generation_tokens_per_sec &lt; 1
-// (missing tok/s counts as &lt; 1)</code></pre>
+// idle: running &lt; 1 AND generation_tokens_per_sec &lt; 1 AND waiting &lt; 1
+// (None for any field counts as &lt; 1)</code></pre>
     <p>Active is the inverse of idle for evaluable windows. Low numbers are included; blank numbers are not. Idle windows pass tier 1 but not tier 2 and are excluded from the averages.</p>
     <p>Multi-window aggregation, which window set applies to which field, is in <a href="#math" data-page="math">Math</a>.</p>
 
-    <h2>Source 1: NVML</h2>
-    <p>NVIDIA Management Library. Direct access to GPU hardware state, polled at 250ms intervals.</p>
+    <h2>Source 1: GPU telemetry</h2>
+    <p>NVIDIA via NVML, or AMD via <code>libamdgpu_top</code> when NVML is unavailable. Polled at 250ms intervals. Same gauge fields either way; FLOPs and bandwidth still come from the GPU catalog.</p>
     <table>
       <thead><tr><th>Field</th><th>Type</th><th>What it is</th><th>How collected</th></tr></thead>
       <tbody>
@@ -481,15 +540,15 @@ num_requests_running  is Some (even if zero)</code></pre>
         <tr><td><code>power_limit_watts</code></td><td>Gauge</td><td>Driver-set TDP limit (W)</td><td>Once at startup</td></tr>
         <tr><td><code>vram_used_mb</code></td><td>Gauge</td><td>VRAM in use (MiB)</td><td>Last poll</td></tr>
         <tr><td><code>vram_total_mb</code></td><td>Gauge</td><td>Total device VRAM (MiB)</td><td>Last poll</td></tr>
-        <tr><td><code>temperature_c</code></td><td>Gauge</td><td>GPU core temp (°C)</td><td>Last poll</td></tr>
+        <tr><td><code>temperature_c</code></td><td>Gauge</td><td>GPU core temp (&deg;C)</td><td>Last poll</td></tr>
         <tr><td><code>sm_clock_mhz</code></td><td>Gauge</td><td>SM clock frequency (MHz)</td><td>Last poll</td></tr>
       </tbody>
     </table>
-    <div class="callout">Two values are computed from the polls, not read directly from NVML: <code>vram_peak_mb</code> (max of <code>vram_used_mb</code> across all polls) and <code>temperature_peak_c</code> (max of <code>temperature_c</code> across all polls). Derived within the window, not collected.</div>
-    <div class="callout">NVML does not expose theoretical peak FLOPs or memory bandwidth. Those come from the GPU catalog, looked up once at startup from <code>gpu_name</code>, labeled <code>(est)</code> in output.</div>
+    <div class="callout">Two values are computed from the polls, not read directly: <code>vram_peak_mb</code> (max of <code>vram_used_mb</code> across all polls) and <code>temperature_peak_c</code> (max of <code>temperature_c</code> across all polls). Derived within the window, not collected.</div>
+    <div class="callout">Neither NVML nor the AMD path exposes theoretical peak FLOPs or memory bandwidth. Those come from the GPU catalog, looked up once at startup from <code>gpu_name</code>, labeled <code>(est)</code> in output. Host RAM (for <code>--kv-offloading-size</code> sizing) is read separately from the host / container memory path.</div>
 
     <h2>Source 2: vLLM Prometheus</h2>
-    <p>Scraped from <code>/metrics</code> at ~250ms intervals, ~9 times per window. See <a href="https://docs.vllm.ai/en/stable/" target="_blank" rel="noopener">vLLM docs</a> for the full metric reference.</p>
+    <p>Scraped from <code>/metrics</code> at ~250ms intervals. See <a href="https://docs.vllm.ai/en/stable/" target="_blank" rel="noopener">vLLM docs</a> for the full metric reference.</p>
     <table>
       <thead><tr><th>Field</th><th>Type</th><th>What it is</th></tr></thead>
       <tbody>
@@ -508,7 +567,7 @@ num_requests_running  is Some (even if zero)</code></pre>
         <tr><td><code>vllm:request_success_total</code></td><td>Counter</td><td>Cumulative completed requests. Legacy name: <code>vllm:request_success</code>.</td></tr>
         <tr><td><code>vllm:num_preemptions_total</code></td><td>Counter</td><td>Cumulative KV cache preemptions. Legacy name: <code>vllm:num_preemptions</code>.</td></tr>
         <tr><td><code>vllm:cache_config_info</code></td><td>Gauge (labels)</td><td>Static cache config: block_size, cache_dtype, prefix_caching, chunked_prefill</td></tr>
-        <tr><td><code>vllm:max_num_seqs</code></td><td>Gauge</td><td>Concurrency cap. Absent in vLLM ≤0.18.0; pass <code>-m</code>.</td></tr>
+        <tr><td><code>vllm:max_num_seqs</code></td><td>Gauge</td><td>Concurrency cap. Absent in vLLM &le;0.18.0; pass <code>-m</code>.</td></tr>
         <tr><td><code>vllm:prefix_cache_hits_total</code>, <code>vllm:prefix_cache_queries_total</code>, <code>vllm:external_prefix_cache_hits_total</code>, <code>vllm:external_prefix_cache_queries_total</code></td><td>Counter</td><td>Internal and external prefix cache hits and queries. Legacy names without <code>_total</code> also supported.</td></tr>
       </tbody>
     </table>
@@ -520,7 +579,7 @@ num_requests_running  is Some (even if zero)</code></pre>
       <tbody>
         <tr><td><code>peak_flops_tc_tflops</code>, <code>peak_bw_gbps</code></td><td>GPU catalog. BF16 Tensor Core dense throughput, physics roofline input.</td><td>Ceilings not computed</td></tr>
         <tr><td><code>param_count</code>, <code>active_param_count</code></td><td>Model catalog. MoE: total for weight/OOM; active for roofline.</td><td>Roofline skipped</td></tr>
-        <tr><td><code>bytes_per_param</code></td><td><code>DTYPE</code> / <code>VLLM_DTYPE</code> env → <code>kv_cache_dtype</code> → catalog default → bf16 (2 bytes)</td><td>bf16 fallback, labeled in output</td></tr>
+        <tr><td><code>bytes_per_param</code> (weights)</td><td>vLLM-reported quantization &rarr; <code>QUANTIZATION</code>/<code>VLLM_QUANTIZATION</code> env &rarr; vLLM-reported dtype &rarr; <code>DTYPE</code>/<code>VLLM_DTYPE</code> env &rarr; catalog default &rarr; bf16 (2 bytes). <code>kv_cache_dtype</code> is not in this chain; it sets KV element bytes only.</td><td>bf16 fallback, labeled in output</td></tr>
       </tbody>
     </table>
     <div class="callout">All catalog-derived numbers are labeled <code>(est)</code> in output. Upper-bound approximations, not measured values.</div>
@@ -530,9 +589,9 @@ num_requests_running  is Some (even if zero)</code></pre>
       <thead><tr><th>Field</th><th>Primary</th><th>Fallback</th><th>If absent</th></tr></thead>
       <tbody>
         <tr><td><code>max_num_seqs</code></td><td><code>vllm:max_num_seqs</code> gauge</td><td><code>-m</code> CLI flag</td><td>R1 and R5 silent</td></tr>
-        <tr><td><code>tensor_parallel_size</code></td><td><code>--tensor-parallel-size</code> CLI flag</td><td><code>TENSOR_PARALLEL_SIZE</code> / <code>VLLM_TENSOR_PARALLEL_SIZE</code> env var</td><td>Treated as 1; ceilings and kv_headroom unscaled</td></tr>
+        <tr><td><code>tensor_parallel_size</code></td><td><code>--tensor-parallel-size</code> CLI flag</td><td>Treated as 1. Values above 1 are refused at launch; multi-GPU is not supported.</td><td>Ceilings and kv_headroom unscaled</td></tr>
         <tr><td>TPOT histogram</td><td><code>request_time_per_output_token</code></td><td><code>time_per_output_token</code></td><td><code>None</code></td></tr>
-        <tr><td><code>bytes_per_param</code></td><td><code>DTYPE</code> / <code>VLLM_DTYPE</code> env var</td><td><code>kv_cache_dtype</code> → catalog → bf16</td><td>bf16, labeled in output</td></tr>
+        <tr><td><code>bytes_per_param</code> (weights)</td><td>vLLM-reported quantization</td><td><code>QUANTIZATION</code>/<code>VLLM_QUANTIZATION</code> env &rarr; vLLM-reported dtype &rarr; <code>DTYPE</code>/<code>VLLM_DTYPE</code> env &rarr; catalog &rarr; bf16. KV width uses <code>kv_cache_dtype</code> only.</td><td>bf16, labeled in output</td></tr>
         <tr><td>All windows non-evaluable</td><td>-</td><td>Chronologically last raw window</td><td>Labeled as non-evaluable</td></tr>
       </tbody>
     </table>
@@ -546,7 +605,7 @@ num_requests_running  is Some (even if zero)</code></pre>
     <p><a href="#home" data-page="home" style="font-size: 0.85rem; color: #666; text-decoration: none;">&larr; Back to Workflow</a></p>
 
     <h2>GPUs</h2>
-    <p>FP32 TFLOPs and memory bandwidth feed the roofline math. Prices are market-average estimates as of 2026-06. Use <code>--cost-per-hour</code> for exact rates.</p>
+    <p>BF16 Tensor Core dense TFLOPs and memory bandwidth feed the roofline math. Prices are market-average estimates as of 2026-06. Use <code>--cost-per-hour</code> for exact rates.</p>
     <table>
       <thead><tr><th>GPU</th><th>Arch</th><th>BF16 TC Dense TFLOPs</th><th>Mem BW GB/s</th><th>On-demand $/hr</th><th>Spot $/hr</th></tr></thead>
       <tbody>
@@ -618,7 +677,7 @@ num_requests_running  is Some (even if zero)</code></pre>
     <p class="subtitle">The formulas Profile runs on collected data.</p>
 
     <p><a href="#home" data-page="home" style="font-size: 0.85rem; color: #666; text-decoration: none;">&larr; Back to Workflow</a></p>
-    <div class="callout">Profile measures behavior under load. Idle time has no waste to cut. Ceilings are catalog-derived upper bounds, labeled <code>(est)</code>. Missing data stays absent (<code>None</code>), never guessed.</div>
+    <div class="callout">Profile measures behavior under load. Idle time has no waste to find. Ceilings are catalog-derived upper bounds, labeled <code>(est)</code>. Missing data stays absent (<code>None</code>), never guessed.</div>
 
     <h2>Roofline: hardware ceilings</h2>
     <h3>Baseline inputs</h3>
@@ -627,9 +686,9 @@ num_requests_running  is Some (even if zero)</code></pre>
       <tbody>
         <tr><td><code>roofline_params</code></td><td><code>active_param_count</code> if present, else <code>param_count</code>. Decode and prefill ceilings, efficiency %, ridge batch size.</td></tr>
         <tr><td><code>weight_params</code></td><td><code>param_count</code> if present, else <code>active_param_count</code>. <code>weight_gb</code> and <code>kv_headroom_gb</code> (OOM check).</td></tr>
-        <tr><td><code>bytes_per_param</code></td><td><code>DTYPE</code> / <code>VLLM_DTYPE</code> env → <code>kv_cache_dtype</code> → catalog default → bf16 (2 bytes). fp8 = 1, fp16/bf16 = 2, fp32 = 4. Source labeled in output when fallback is used.</td></tr>
-        <tr><td><code>tensor_parallel_size</code></td><td><code>--tensor-parallel-size</code> CLI flag → <code>TENSOR_PARALLEL_SIZE</code> / <code>VLLM_TENSOR_PARALLEL_SIZE</code> env var → 1. Scales both ceilings and per-GPU KV headroom.</td></tr>
-        <tr><td><code>seq_len</code> (prefill only)</td><td><code>prompt_tokens_mean</code> rounded → <code>max_model_len</code> → absent: prefill ceiling skipped.</td></tr>
+        <tr><td><code>bytes_per_param</code> (weights)</td><td>vLLM-reported quantization &rarr; <code>QUANTIZATION</code>/<code>VLLM_QUANTIZATION</code> env &rarr; vLLM-reported dtype &rarr; <code>DTYPE</code>/<code>VLLM_DTYPE</code> env &rarr; catalog default &rarr; bf16 (2 bytes). fp8 = 1, fp16/bf16 = 2, fp32 = 4. <code>kv_cache_dtype</code> sets KV element bytes only, never weight width. Source labeled in output when fallback is used.</td></tr>
+        <tr><td><code>tensor_parallel_size</code></td><td><code>--tensor-parallel-size</code> CLI flag only in practice (TP &gt;1 is refused at launch). Defaults to 1. Scales both ceilings and per-GPU KV headroom.</td></tr>
+        <tr><td><code>seq_len</code> (prefill only)</td><td><code>prompt_tokens_mean</code> rounded &rarr; <code>max_model_len</code> &rarr; absent: prefill ceiling skipped.</td></tr>
       </tbody>
     </table>
 
@@ -638,42 +697,41 @@ num_requests_running  is Some (even if zero)</code></pre>
       <thead><tr><th>Formula</th><th>Result</th><th>Binding constraint</th></tr></thead>
       <tbody>
         <tr>
-          <td><code>(peak_bw_gbps × tp) × 1e9 / (params × bytes_per_param)</code></td>
+          <td><code>(peak_bw_gbps &times; tp) &times; 1e9 / (params &times; bytes_per_param)</code></td>
           <td>Decode ceiling (tok/s)</td>
-          <td>Memory bandwidth, binding in steady-state serving. <code>tp</code> GPUs contribute <code>tp×</code> aggregate bandwidth.</td>
+          <td>Memory bandwidth, binding in steady-state serving. <code>tp</code> GPUs contribute <code>tp&times;</code> aggregate bandwidth.</td>
         </tr>
         <tr>
-          <td><code>(peak_flops × tp) × 1e12 / (6 × params × seq_len)</code></td>
-          <td>Prefill ceiling (tok/s)</td>
-          <td>Compute, binding during prompt processing. <code>tp</code> GPUs contribute <code>tp×</code> aggregate FLOPs.</td>
+          <td><code>(peak_flops &times; tp) &times; 1e12 / (2 &times; params &times; seq_len + attn_coeff &times; layers &times; seq_len&sup2;)</code></td>
+          <td>Prefill ceiling (prompts/s)</td>
+          <td>Compute, binding during prompt processing. Attention term is quadratic in seq_len; linear-only rooflines overstate long-context capability.</td>
         </tr>
         <tr>
-          <td><code>expected × 0.85</code> / <code>expected × 1.05</code></td>
+          <td><code>expected &times; 0.85</code> / <code>expected &times; 1.05</code></td>
           <td>Ceiling range (lower / upper)</td>
-          <td>−15% / +5% band around expected. Reflects catalog approximation, not measured hardware.</td>
+          <td>&minus;15% / +5% band around expected. Reflects catalog approximation, not measured hardware.</td>
         </tr>
         <tr>
-          <td><code>(peak_flops × 1e12 × bytes_per_param) / (peak_bw × 1e9)</code></td>
+          <td><code>(peak_flops &times; 1e12 &times; bits_per_param) / (peak_bw &times; 1e9 &times; 16)</code></td>
           <td>Ridge batch size</td>
-          <td>Concurrent batch at which decode crosses from BW-bound to compute-bound. Below: BW limits throughput. At or above: compute limits throughput. Prefill floor display suppressed when <code>num_running ≥ ridge_batch_size</code>.</td>
+          <td>Concurrent batch at which decode crosses from BW-bound to compute-bound. Below: BW limits throughput. At or above: compute limits throughput.</td>
         </tr>
       </tbody>
     </table>
     <p><code>peak_bw_gbps</code>, <code>peak_flops</code>, and <code>params</code> come from catalogs, not live measurement. All ceiling outputs labeled <code>(est)</code>.</p>
 
-    <h2>Efficiency %</h2>
-    <pre><code>aggregate_ceiling = decode_ceiling_tps × num_requests_running
-efficiency_pct    = actual_tps / aggregate_ceiling × 100</code></pre>
-    <p><code>decode_ceiling_tps</code> is TP-scaled (<code>peak_bw × tp</code> from the roofline above). Requires <code>num_requests_running &gt; 0</code> and <code>generation_tokens_per_sec &gt; 0</code>. Not shown if <code>actual_tps &gt; aggregate_ceiling</code>: that indicates a catalog or measurement mismatch.</p>
+    <h2>Efficiency % (<code>decode_eff</code>)</h2>
+    <pre><code>absolute_ceiling = decode_ceiling_tps &times; ridge_batch_size
+efficiency_pct   = actual_tps / absolute_ceiling &times; 100</code></pre>
+    <p><code>decode_ceiling_tps</code> is TP-scaled (<code>peak_bw &times; tp</code> from the roofline above). The denominator is the absolute hardware ceiling, independent of current traffic. An idle server reads low, correctly. Requires <code>generation_tokens_per_sec &gt; 0</code>. When <code>actual_tps</code> exceeds <code>absolute_ceiling</code>, <code>decode_eff</code> is clamped to 100% (catalog or measurement mismatch). Values derived from the estimated ceiling carry a tilde (<code>~</code>) in output.</p>
     <div class="callout warn">Calibrated for decode-bound workloads. Prefill-heavy workloads (long prompts, short outputs) show artificially low efficiency %. The prefill ceiling is the relevant constraint there, not decode.</div>
 
     <h2>Weight footprint and headroom</h2>
-    <pre><code>weight_gb        = weight_params × bytes_per_param / 1e9
-kv_headroom_gb   = vram_total_gb − (weight_gb / tp)
-headroom_pct     = 100 − min(efficiency_pct, 100)
+    <pre><code>weight_gb        = weight_params &times; bytes_per_param / 1e9
+kv_headroom_gb   = (vram_total_gb &times; gpu_memory_utilization) &minus; 3.0 &minus; (weight_gb / tp)
 tpot_floor_ms    = 1000 / decode_ceiling_tps
 prefill_floor_ms = 1000 / prefill_ceiling_tps</code></pre>
-    <p><code>kv_headroom_gb</code>: per-GPU; each GPU holds <code>weight_gb/N</code> with TP=N. Negative means current TP is insufficient. <code>headroom_pct</code>: unused fraction of the decode ceiling. <code>tpot_floor_ms</code> and <code>prefill_floor_ms</code>: theoretical minimum latencies at ceiling; actual values above these indicate overhead.</p>
+    <p><code>kv_headroom_gb</code>: per-GPU after the 3.0&nbsp;GB activation buffer; negative means current TP is insufficient. <code>tpot_floor_ms</code> and <code>prefill_floor_ms</code>: theoretical minimum latencies at ceiling; actual values above these indicate overhead.</p>
 
     <h2>Economics</h2>
     <table>
@@ -681,63 +739,60 @@ prefill_floor_ms = 1000 / prefill_ceiling_tps</code></pre>
       <tbody>
         <tr><td>tok / W</td><td><code>generation_tokens_per_sec / power_watts</code></td></tr>
         <tr><td>J / token</td><td><code>power_watts / generation_tokens_per_sec</code></td></tr>
-        <tr><td>$ / 1M tokens</td><td><code>(cost_per_hr / tokens_per_hr) × 1e6</code></td></tr>
-        <tr><td>Recoverable $/hr</td><td><code>cost_per_hr × (1 − efficiency_pct / 100)</code></td></tr>
+        <tr><td>$ / 1M output tok</td><td><code>cost_per_hr &times; 1e6 / (generation_tokens_per_sec &times; 3600)</code></td></tr>
       </tbody>
     </table>
-    <p><code>tokens_per_hr = generation_tokens_per_sec × 3600</code>. You pay <code>cost_per_hr</code> for that many tokens; scale to 1M.</p>
-    <p>Cost priority: <code>--cost-per-hour</code> flag, then GPU catalog on-demand price, then absent. Catalog-derived $/1M tok is labeled <code>(est)</code> in output; user-provided rates are not.</p>
+    <p>Cost priority: <code>--cost-per-hour</code> flag, then GPU catalog on-demand price, then absent. Catalog-derived $/1M output tok is labeled <code>(est)</code> in output; user-provided rates are not. Energy metrics (J/tok, tok/W) use energy-pair windows only (aligned GPU power and vLLM tok/s in the same window).</p>
 
     <h2>Closed-loop delta</h2>
-    <pre><code>throughput_delta_pct = (after − before) / before × 100
-efficiency_delta_pp  = efficiency_pct_after − efficiency_pct_before</code></pre>
-    <p>Computed after every re-measure cycle. Direction uses <code>efficiency_delta_pp</code>, not raw throughput. Dividing by <code>num_running</code> (time-weighted mean across the window) cancels traffic-induced concurrency changes; what remains is per-request hardware utilization.</p>
+    <p>Computed after every re-measure cycle. Each metric line shows <code>before &rarr; after</code>. A <code>worse</code> suffix marks material regressions only (not every negative delta).</p>
+    <pre><code>  Config changed.
+
+  Throughput          163 &rarr; 328 tok/s
+  TTFT                8720 &rarr; 495ms (p95 19185 &rarr; 950ms)
+  TPOT                96.9 &rarr; 50.9ms (p95 158.7 &rarr; 73.0ms)
+
+ECONOMICS:
+  Cost/1M output tok  $5.09 &rarr; $2.53 (est)</code></pre>
+    <p>When config drifted between windows (vLLM restart detected), the line reads <code>Config changed. Baseline reset.</code> and the efficiency arm of the delta is discounted; throughput alone decides improvement direction after a reset.</p>
+    <p>On regression: the degraded state becomes the new baseline and is pushed to the history stack. The loop continues without pausing for confirmation, since you apply the changes manually.</p>
     <table>
-      <thead><tr><th>Signal</th><th>Better</th><th>Worse</th><th>Plateau</th></tr></thead>
+      <thead><tr><th>Field</th><th><code>worse</code> threshold</th></tr></thead>
       <tbody>
-        <tr>
-          <td><code>efficiency_delta_pp</code> (primary)</td>
-          <td>&gt; +2.0 pp, and ttft_p99 not regressed &gt; 20%</td>
-          <td>&lt; −5.0 pp</td>
-          <td>between, or latency veto fired</td>
-        </tr>
-        <tr>
-          <td><code>throughput_delta_pct</code> (fallback when efficiency unavailable)</td>
-          <td>&gt; +10%</td>
-          <td>&lt; −10%</td>
-          <td>between or both absent</td>
-        </tr>
+        <tr><td>Throughput</td><td>Drop &ge;5%</td></tr>
+        <tr><td>Efficiency (pp)</td><td>Drop &ge;1.0pp</td></tr>
+        <tr><td>Cost/1M output tok</td><td>Rise &gt;$0.01</td></tr>
+        <tr><td>J/tok</td><td>Rise &gt;0.02</td></tr>
+        <tr><td>TTFT avg</td><td>Rise &gt;5ms</td></tr>
+        <tr><td>TPOT avg</td><td>Rise &gt;0.5ms</td></tr>
       </tbody>
     </table>
-    <p><strong>Latency veto:</strong> if efficiency says Better but <code>ttft_p99_delta_pct &gt; +20%</code>, direction is Plateau. Downgrades Better only; does not affect Plateau or Worse. Skipped on the throughput fallback path.</p>
-    <p><strong>On Worse:</strong> the degraded state seamlessly becomes the new baseline and is pushed to the history stack. The loop does not pause to ask for revert confirmations-since you are making the config changes manually, the tool simply measures the result, provides its next recommendation, and keeps profiling.</p>
-    <p>All thresholds are provisional constants. Latency, cost, and p99 before/after are tracked alongside direction for display.</p>
 
-    <h2>Per-window collection (~2s)</h2>
-    <p>Each window polls at ~250ms intervals. GPU (NVML) and vLLM are collected in parallel threads on each poll. These formulas produce one snapshot before multi-window aggregation.</p>
+    <h2>Per-window collection</h2>
+    <p>Window size: 2s when <code>--duration</code> is 30s or less; 10s otherwise. Each window polls GPU (NVML, or AMD via <code>libamdgpu_top</code>) and vLLM in parallel at ~250ms intervals. These formulas produce one snapshot before multi-window aggregation.</p>
     <table>
       <thead><tr><th>Metric type</th><th>Formula</th><th>On failure</th></tr></thead>
       <tbody>
-        <tr><td>Histogram mean (TTFT, TPOT, prefill, queue, prompt tokens)</td><td><code>Δsum / Δcount</code> first→last scrape; ×1000 for seconds-based latencies</td><td>Last-scrape cumulative mean when <code>Δcount ≤ 0</code></td></tr>
+        <tr><td>Histogram mean (TTFT, TPOT, prefill, queue, prompt tokens)</td><td><code>&Delta;sum / &Delta;count</code> first&rarr;last scrape; &times;1000 for seconds-based latencies</td><td>Last-scrape cumulative mean when <code>&Delta;count &le; 0</code></td></tr>
         <tr><td>Histogram p99</td><td>Delta buckets, then linear interpolation at q=0.99. If target falls in +Inf bucket, returns last finite bucket's upper bound.</td><td><code>None</code>. No cumulative fallback (stale p99 is worse than none)</td></tr>
-        <tr><td>Counter rate (tok/s, req/s, preemptions/s)</td><td><code>(last − first) / window_duration_secs</code></td><td><code>None</code> on negative delta or zero duration. Zero delta is valid idle, not missing</td></tr>
-        <tr><td>Prefix cache hit rate</td><td><code>Δhits / Δqueries</code></td><td><code>None</code> when <code>Δqueries ≤ 0</code> (never divide by zero)</td></tr>
-        <tr><td>GPU util, power</td><td>Mean across window polls</td><td>Poll skipped if NVML field absent</td></tr>
+        <tr><td>Counter rate (tok/s, req/s, preemptions/s)</td><td><code>(last &minus; first) / window_duration_secs</code></td><td><code>None</code> on negative delta or zero duration. Zero delta is valid idle, not missing</td></tr>
+        <tr><td>Prefix cache hit rate</td><td><code>&Delta;hits / &Delta;queries</code></td><td><code>None</code> when <code>&Delta;queries &le; 0</code> (never divide by zero)</td></tr>
+        <tr><td>GPU util, power</td><td>Mean across window polls</td><td>Poll skipped if GPU field absent</td></tr>
         <tr><td>VRAM, temp (current)</td><td>Last poll</td><td>Peaks (<code>vram_peak_mb</code>, <code>temperature_peak_c</code>, <code>kv_cache_peak_perc</code>): max across polls/scrapes</td></tr>
       </tbody>
     </table>
     <p>Collection cadence and edge cases: <a href="#data" data-page="data">Data</a>.</p>
 
     <h2>Aggregation: combining windows</h2>
-    <p>Each ~2s window produces one snapshot. Fields aggregate by type across windows. <strong>Active:</strong> server under real load (requests running, KV or GPU util above threshold). <strong>Evaluable:</strong> endpoint responded with valid data.</p>
+    <p>Each window produces one snapshot. Fields aggregate by type across windows. <strong>Active:</strong> server under real load. <strong>Evaluable:</strong> endpoint responded with valid data.</p>
     <table>
       <thead><tr><th>Field type</th><th>Window set</th><th>Method</th></tr></thead>
       <tbody>
-        <tr><td>GPU util, power, running/waiting means, rates (tok/s, req/s)</td><td>Active</td><td>Time-weighted mean: <code>Σ(value × duration) / Σ(duration)</code></td></tr>
-        <tr><td>Histogram means (TTFT, TPOT, prefill, queue latency)</td><td>Active</td><td><code>ΣΔsum / ΣΔcount</code> across active windows. Weighted by observation count, not time.</td></tr>
+        <tr><td>GPU util, power, running/waiting means, rates (tok/s, req/s)</td><td>Active</td><td>Time-weighted mean: <code>&Sigma;(value &times; duration) / &Sigma;(duration)</code></td></tr>
+        <tr><td>Histogram means (TTFT, TPOT, prefill, queue latency)</td><td>Active</td><td><code>&Sigma;&Delta;sum / &Sigma;&Delta;count</code> across active windows. Weighted by observation count, not time.</td></tr>
         <tr><td>p99 (TTFT, TPOT, Prompt tokens, Generation tokens)</td><td>Active (Tokens: Evaluable)</td><td>Merge per-window delta bucket vectors (sum counts at matching boundaries), recompute q=0.99 via linear interpolation. Length or boundary mismatches (e.g. version skew) skip the window gracefully instead of aborting. Never average scalar p99 values.</td></tr>
-        <tr><td>KV cache avg, prefix cache hit rate, <code>prompt_tokens_mean</code></td><td>Evaluable</td><td>KV avg: time-weighted mean. Prefix hit rate: <code>Σ Δhits / Σ Δqueries</code> across all evaluable windows.</td></tr>
-        <tr><td>KV / VRAM / temp peaks</td><td>Evaluable</td><td><code>max(per-window peak, last evaluable landing value)</code> so aggregate peak ≥ displayed current.</td></tr>
+        <tr><td>KV cache avg, prefix cache hit rate, <code>prompt_tokens_mean</code></td><td>Evaluable</td><td>KV avg: time-weighted mean. Prefix hit rate: <code>&Sigma; &Delta;hits / &Sigma; &Delta;queries</code> across all evaluable windows.</td></tr>
+        <tr><td>KV / VRAM / temp peaks</td><td>Evaluable</td><td><code>max(per-window peak, last evaluable landing value)</code> so aggregate peak &ge; displayed current.</td></tr>
         <tr><td>State gauges (VRAM used, temp, sm_clock)</td><td>Evaluable (last)</td><td>Last evaluable window's landing value.</td></tr>
         <tr><td>Cumulative counters (total tokens, total reqs)</td><td>All (chronological last)</td><td>Chronologically last collected window. Idle tail included. Preserves true Prometheus server totals.</td></tr>
         <tr><td>All windows non-evaluable</td><td>-</td><td>Chronologically last raw window returned in full.</td></tr>
@@ -755,10 +810,10 @@ efficiency_delta_pp  = efficiency_pct_after − efficiency_pct_before</code></pr
         <tr><td>MoE active parameters assume uniform routing</td><td>R4, baseline</td><td>If traffic heavily skews to specific experts, actual VRAM usage may differ from the baseline <code>active_param_count</code> approximation.</td></tr>
         <tr><td>Sampling cliff / Temperature absent</td><td>R5</td><td>Sampling temperature is not exposed in vLLM metrics, so R5 cannot factor token diversity into concurrency saturation logic.</td></tr>
         <tr><td>MoE weight uses catalog total <code>param_count</code></td><td>R4, baseline</td><td>Runtime VRAM may be lower if not all experts are loaded</td></tr>
-        <tr><td>TP degree not reported by vLLM metrics; must be set via flag or env var</td><td>Baseline, R4</td><td>If <code>--tensor-parallel-size</code> / <code>TENSOR_PARALLEL_SIZE</code> absent, Profile assumes TP=1 and underestimates ceilings on multi-GPU deployments</td></tr>
+        <tr><td>TP &gt;1 not supported. Multi-GPU deployments are not supported today.</td><td>Baseline, R4, all rules</td><td><code>--tensor-parallel-size</code> values above 1 are refused at launch. Profile still reports when a model needs TP to fit at all.</td></tr>
         <tr><td>Efficiency % uses theoretical BW ceiling, not measured HBM</td><td>All rules</td><td>Can't distinguish BW bottleneck from scheduler under-feeding</td></tr>
         <tr><td>FLOPs/s not measurable via NVML</td><td>R1</td><td>Prefill-heavy workloads show artificially low efficiency %</td></tr>
-        <tr><td><code>vllm_max_num_seqs</code> absent in vLLM ≤0.18.0</td><td>R5</td><td>Requires <code>-m</code> flag</td></tr>
+        <tr><td><code>vllm_max_num_seqs</code> absent in vLLM &le;0.18.0</td><td>R5</td><td>Requires <code>-m</code> flag</td></tr>
         <tr><td>Chunked prefill: run can exceed max_num_seqs</td><td>R5</td><td>R5 skips. Cap is not the constraint</td></tr>
         <tr><td>GPU and model specs from catalog, not measured</td><td>Baseline</td><td>Output labels ceilings <code>(est)</code></td></tr>
         <tr><td>p99 absent on counter reset or zero-traffic window</td><td>Display</td><td>By design. Stale p99 is worse than none.</td></tr>
@@ -771,16 +826,16 @@ efficiency_delta_pp  = efficiency_pct_after − efficiency_pct_before</code></pr
     <p class="subtitle">The non-obvious choices and the reasoning behind them.</p>
 
     <h2>Option&lt;T&gt; over sentinels</h2>
-    <p><code>Some(0.0) ≠ None</code>. Every metric is optional. Missing data and zero are different. Treating them the same produces confident wrong answers.</p>
+    <p><code>Some(0.0) &ne; None</code>. Every metric is optional. Missing data and zero are different. Treating them the same produces confident wrong answers.</p>
 
     <h2>Physics ceiling as a range</h2>
     <p><code>CeilingEstimate { lower, expected, upper }</code>. Catalog-derived specs carry uncertainty. Output labels ceilings <code>(est)</code>.</p>
 
     <h2>One recommendation per iteration</h2>
-    <p>Rules grouped by root cause. One primary signal per group. Five simultaneous recommendations produce paralysis, not action.</p>
+    <p>Rules ranked by impact &times; confidence within the winning DAG layer. One primary signal per iteration. Five simultaneous recommendations produce paralysis, not action.</p>
 
     <h2>Delta, not snapshot</h2>
-    <p>Each iteration reports what changed since the last: direction, magnitude, likely cause. A snapshot without temporal comparison is a status report, not a diagnosis.</p>
+    <p>Each iteration reports what changed since the last: before &rarr; after values with <code>worse</code> labels on material regressions. A snapshot without temporal comparison is a status report, not a diagnosis.</p>
 
     <h2>Shared traffic gate</h2>
     <p><code>window_is_evaluable</code> is one function, called once, used by all rules. Idle state has no waste to measure.</p>
@@ -789,7 +844,7 @@ efficiency_delta_pp  = efficiency_pct_after − efficiency_pct_before</code></pr
     <p>The <code>src/collectors</code> module abstracts raw Prometheus and NVML metrics into a standard <code>RawSnapshot</code> structure. The core diagnostic engine operates strictly on these snapshots. Adding support for a new inference framework requires writing a new collector; zero changes to the engine, mathematical models, or rules are necessary.</p>
 
     <h2>Deterministic Reasoning</h2>
-    <p>The diagnostic engine is completely decoupled from CLI execution and network I/O. By enforcing a strict <code>fn(RawSnapshot) -&gt; Output</code> paradigm, the reasoning layer is deterministic. This design enables the replay of historical telemetry for exact regression testing and outcome verification.</p>
+    <p>The diagnostic engine is decoupled from CLI execution and network I/O. <code>run_diagnose</code> collects windows and builds the run-level aggregate; <code>engine::build_report_for_diagnose</code> takes that aggregate and produces the <code>Report</code>; <code>output::stdout</code> formats it. The loop runner (<code>profiler::loop_runner</code>) runs conditionally only when there are sufficient evaluable, non-idle windows. This separation means the reasoning layer is deterministic and historical telemetry can be replayed for exact regression testing.</p>
 
     <h2>250ms collection interval</h2>
     <p>Fast enough to catch GPU utilization transients that a 1s or 5s poll would average away. Slow enough that scrapes per window add no meaningful load to the vLLM endpoint or NVML.</p>
@@ -803,11 +858,11 @@ efficiency_delta_pp  = efficiency_pct_after − efficiency_pct_before</code></pr
     <h2>Graceful degradation over Panics</h2>
     <p>When integrating parallel telemetry sources (vLLM and NVML), mismatches occur. Version skew can change bucket boundaries in histograms; instead of panicking, the engine skips the corrupted merge and degrades gracefully. One bad scrape window should never destroy the entire session's dataset.</p>
 
-    <h2>Code Hygiene & Security</h2>
+    <h2>Code Hygiene &amp; Security</h2>
     <p>rustls only, no OpenSSL. Read-only NVML. No external API calls. No telemetry.</p>
     <p>The CI pipeline rigorously enforces engineering standards on every pull request and merge:</p>
     <ul>
-      <li><strong>OSV-Scanner:</strong> Fails the build immediately on any HIGH or CRITICAL vulnerabilities (CVSS v3 ≥ 7.0) in dependencies.</li>
+      <li><strong>OSV-Scanner:</strong> Fails the build immediately on any HIGH or CRITICAL vulnerabilities (CVSS v3 &ge; 7.0) in dependencies.</li>
       <li><strong>Semgrep SAST:</strong> Static application security testing scans the source code for strict security practices.</li>
       <li><strong>cargo audit:</strong> Validates the crate dependency tree against the RustSec Advisory Database.</li>
       <li><strong>cargo clippy:</strong> Fails the build on any compiler warnings (<code>-D warnings</code>), ensuring zero-tolerance code hygiene.</li>
@@ -841,7 +896,7 @@ efficiency_delta_pp  = efficiency_pct_after − efficiency_pct_before</code></pr
         <span class="stat-label">of a production AI system's lifetime cost is inference, not training <a href="https://arxiv.org/html/2510.26136v1">[1]</a></span>
       </div>
       <div class="stat-block">
-        <span class="stat">15×</span>
+        <span class="stat">15&times;</span>
         <span class="stat-label">GPT-4 inference cost vs training cost. $2.3B in inference by end of 2024 vs ~$150M to train</span>
       </div>
     </div>
@@ -872,7 +927,7 @@ efficiency_delta_pp  = efficiency_pct_after − efficiency_pct_before</code></pr
 
     <p>Amazon chose to lose money, a deliberate bet on demand. Companies running AI inference are burning money on hardware they already paid for, because it is sitting misconfigured. That is not a growth strategy. It is waste that shows up on your cloud compute bill this month.</p>
 
-    <p>Enterprises running production AI spend $50,000 to $500,000 per month on inference infrastructure. <a href="https://www.tensormesh.ai/blog-posts/ai-inference-costs-2025-energy-crisis">[2]</a> Inference costs have dropped 280× since 2022, from $20 to $0.07 per million tokens. That gap between what hardware can do and what most teams extract from it is your cost problem today.</p>
+    <p>Enterprises running production AI spend $50,000 to $500,000 per month on inference infrastructure. <a href="https://www.tensormesh.ai/blog-posts/ai-inference-costs-2025-energy-crisis">[2]</a> Inference costs have dropped 280&times; since 2022, from $20 to $0.07 per million tokens. That gap between what hardware can do and what most teams extract from it is your cost problem today.</p>
 
     <blockquote>
       "The AI inferencing market will be much, much larger than the AI training market. People are running out of usable inference computing capacity." - Larry Ellison, Oracle earnings call <a href="https://www.benzinga.com/markets/earnings/25/09/47587481/larry-ellison-targets-multi-trillion-dollar-ai-inference-market-for-oracle-ai-will-change-everything">[3]</a>
@@ -892,7 +947,7 @@ efficiency_delta_pp  = efficiency_pct_after − efficiency_pct_before</code></pr
 </div>
 
 <footer>
-  © 2026 · Apache 2.0 · <a href="index.html">profile</a> · <a href="https://github.com/jungledesh/profile">GitHub</a>
+  &copy; 2026 &middot; Apache 2.0 &middot; <a href="index.html">profile</a> &middot; <a href="https://github.com/jungledesh/profile">GitHub</a>
 </footer>
 
 <script>
@@ -995,7 +1050,7 @@ efficiency_delta_pp  = efficiency_pct_after − efficiency_pct_before</code></pr
   document.querySelectorAll('pre').forEach(pre => {
     if (!pre.querySelector('code')) return;
     const text = pre.querySelector('code').innerText.trim();
-    if (text.startsWith('+---') || text.startsWith('Apply your change')) return;
+    if (text.startsWith('+---') || text.startsWith('Apply the fix') || text.startsWith('Throughput') || text.startsWith('Config changed.')) return;
     const btn = document.createElement('button');
     btn.className = 'copy-btn'; btn.textContent = 'copy';
     btn.onclick = () => {
