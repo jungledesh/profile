@@ -257,8 +257,8 @@ One cause at a time. Eight rules watch eight failure modes, and on a struggling 
                           rules evaluate
                                 |
         R2 KV pressure    R5 saturation    R1 under-batching
-        R6 prefill-bound  R7 headroom      R4 OOM risk
-        R3 low prefix reuse
+        R2b admission     R6 prefill-bound R7 headroom
+        R3 low prefix     R4 OOM risk
                                 |
                                 v
                     mutual exclusivity table
@@ -299,7 +299,7 @@ Rules fire on evidence of harm, never on heat. A server at 95% KV cache with no 
 | Rule                          | Fires when                                                                                                                               | Prescribes                                                                                                                                                                |
 | ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **R1 Under-batching**         | Known GPU: config-relative efficiency under 60% with occupancy under 75% and no backlog. Uncatalogued GPU: occupancy under 25%.          | Batch more requests or raise client concurrency, naming the binding wall: config, compute ridge, or memory                                                                |
-| **R2 KV cache pressure**      | KV at or above 88%, and either an eviction signal (preemptions or swapped ≥ 2) or queue backpressure (waiting > 2)                       | Split by cost. Cuts throughput: lower `--max-model-len` or `--max-num-seqs`. Safe: prefix caching, raise `--gpu-memory-utilization`, fp8 KV cache, `--kv-offloading-size` |
+| **R2 KV cache pressure**      | KV at or above 88%, and either an eviction signal (`num_preemptions_per_sec` > 0.02, or swapped ≥ 2) or queue backpressure (waiting > 2) | Split by cost. Cuts throughput: lower `--max-model-len` or `--max-num-seqs`. Safe: prefix caching, raise `--gpu-memory-utilization`, fp8 KV cache, `--kv-offloading-size` |
 | **R2b KV admission backlog**  | Queue ratio at or above 0.30 with KV near full, scheduler not at the seat cap, and estimated free KV below demand                        | Same family, without the eviction signal                                                                                                                                  |
 | **R3 Low prefix reuse**       | Active traffic (running > 0.75), mean prompt ≥ 20, and qps × mean prompt ≥ 1000. Caching off: fires on that volume. Caching on: hit rate under 35%. | `--enable-prefix-caching`, or restructure prompts if already on                                                                                                           |
 | **R4 OOM risk**               | Weights overflow VRAM, or weights fit but free VRAM cannot hold one worst-case request                                                   | `--tensor-parallel-size` at the computed minimum, raise `--gpu-memory-utilization`, a smaller model, or the model does not fit on this hardware                           |

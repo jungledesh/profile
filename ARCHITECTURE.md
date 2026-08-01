@@ -6,7 +6,7 @@ Single Rust binary. `profile diagnose` runs an interactive closed loop: collect,
 
 ## Data flow
 
-```
+```text
 CLI flags
   └─ cli (clap) → cli::diagnose::execute
        └─ closed loop (profiler::loop_runner)

@@ -9,15 +9,15 @@ Read [ARCHITECTURE.md](ARCHITECTURE.md) first. It tells you where code lives, wh
 ```bash
 git clone https://github.com/jungledesh/profile
 cd profile
-cargo build
+cargo build --locked
 ```
 
-The toolchain is pinned in `rust-toolchain.toml`. `Cargo.lock` is committed and stays committed; it is required for reproducible builds and OSV scanning.
+The toolchain is pinned in `rust-toolchain.toml`. `Cargo.lock` is committed and stays committed; it is required for reproducible builds and OSV scanning. Use `--locked` on build, test, and Clippy so the committed lockfile is what runs.
 
 ## Test
 
 ```bash
-cargo test
+cargo test --locked
 ```
 
 Unit tests cover rule logic, physics math, and mock payload validation. Rule logic is the core engine: smoke test every rule with mock payloads, and confirm ranked output, suppression-table dedup, and confidence values.
@@ -26,21 +26,21 @@ End-to-end validation is manual, on a live vLLM server with a GPU (e.g. RunPod).
 
 ## The gate
 
-Required before merge:
+Required before merge (matches CI):
 
 ```bash
-cargo fmt
-cargo clippy --all-targets --all-features -- -D warnings
+cargo fmt -- --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo audit
-cargo deny check
-cargo test
+cargo deny check --all-features
+cargo test --locked
 ```
 
 Fix clippy findings, do not silence them. Never mask CI security scanners; `|| true` after a scanner is a rejection. Allowlist real false positives in `deny.toml`.
 
 ## Code rules
 
-- **No dead code.** If it is not called outside tests, delete it.
+- **No dead production code.** If production code is unused outside tests, delete it. Test fixtures, mock payload helpers, and other `#[cfg(test)]` utilities are exempt.
 - **No duplication.** Two near-identical functions become one. Near-duplicates count as duplicates.
 - **No speculative abstraction.** No trait, enum, or generic until the second caller exists.
 - **`Option<T>` over sentinels.** `Some(0.0) != None`.
@@ -52,16 +52,16 @@ Fix clippy findings, do not silence them. Never mask CI security scanners; `|| t
 - **HTTP uses rustls, not OpenSSL.** `default-features = false` on `reqwest`.
 - **No secrets, tokens, or personal helper scripts in the repo.**
 
-All user-facing strings, not only rule output, follow the output rules: prescriptive, units on every number, no colors, no emojis, `-` for a metric that cannot be read, `(est)` for values from the physics model.
+All user-facing strings, not only rule output, follow the output rules: prescriptive, units on every number, no colors, no emojis, `-` for a metric that cannot be read, `(est)` for values from the physics model, `~` for values derived from estimated ceilings.
 
 ## Adding a new rule
 
-1. Create `src/engine/rules/rN_name.rs`. Match the API shape of the nearest existing rule: a detection function over the snapshot or window evidence, plus a `*_recommendation(...) -> Option<Recommendation>` builder. APIs vary by rule; the neighbors are the reference.
+1. Create `src/engine/rules/rN_name.rs` with a production evaluator over the snapshot or window evidence. Match the nearest production neighbor. Add a `*_recommendation(...)` helper only when that neighbor exposes one in production code; do not treat test-only helpers (for example `r1_recommendation`) as the API.
 2. Threshold constants at the top of the new file.
 3. Assign the rule to a DAG layer (L2-L6) and define any mutual exclusivity suppressions in the suppression table.
-4. Wire it into `rules::build_report_for_windows` in `src/engine/rules/eval.rs`.
+4. Wire detection and report assembly into `rules::build_report_for_windows` in `src/engine/rules/eval.rs`.
 5. Smoke test with a mock payload in unit tests. Then validate against a live vLLM server with a GPU.
-6. Output is prescriptive: what to change and how, one line, with units. Rules fire on evidence of harm (evictions, queue growth, latency inflation), never on utilization alone.
+6. Output is prescriptive: what to change and how, one line, with units. Fire on evidence of harm (evictions, queue growth, latency inflation) or under-use (low occupancy or efficiency). Never on utilization alone.
 
 ## Where to start
 
