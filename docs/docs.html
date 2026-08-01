@@ -259,7 +259,7 @@ ECONOMICS:
 |GPU =&gt;               decode_eff ~8.1% | power 653W | 0.83 J/tok | $1.18/1M output tok (est) | vRAM 77/80GB (peak 79GB)      |
 |                                                                                                                            |
 |vLLM =&gt;                                                                                                                     |
-|REQUESTS             run 345 (100%) | wait 149 | max 345                                                                     |
+|REQUESTS             run 345 (100%) | wait 149 | max 345                                                                    |
 |LATENCY              ttft 52.9s (p95 129.2s) | tpot 199ms (p95 295ms)                                                       |
 |CACHE                kv_cache 81.5% avg | pfix_cache 61.6%                                                                  |
 |THROUGHPUT           470 tok/s                                                                                              |
@@ -458,9 +458,9 @@ ECONOMICS:
         <tr><td>R1</td><td>0.80 (known GPU) / 0.50 (unknown)</td><td>Fixed per GPU-knowledge path</td></tr>
         <tr><td>R2 / R2b</td><td><code>windows_fired / total_evaluable</code></td><td>Density: rises as more windows confirm the signal</td></tr>
         <tr><td>R3</td><td>0.95 (caching off) / 0.90 (caching on, low hit rate)</td><td>Fixed per caching path</td></tr>
-        <tr><td>R4</td><td>0.95</td><td>dtype from env var</td></tr>
-        <tr><td>R4</td><td>0.90</td><td>dtype from <code>kv_cache_dtype</code>, catalog, or vLLM config</td></tr>
-        <tr><td>R4</td><td>Not fired</td><td>dtype is bf16 fallback</td></tr>
+        <tr><td>R4</td><td>0.95</td><td>dtype or quantization from env var (<code>DTYPE</code>/<code>VLLM_DTYPE</code>, <code>QUANTIZATION</code>/<code>VLLM_QUANTIZATION</code>)</td></tr>
+        <tr><td>R4</td><td>0.90</td><td>vLLM-reported dtype or quantization, or catalog default</td></tr>
+        <tr><td>R4</td><td>Not fired</td><td>weight dtype is bf16 fallback</td></tr>
         <tr><td>R5</td><td>0.50</td><td>Empirical KV bound used</td></tr>
         <tr><td>R5</td><td>0.90</td><td>TTFT and KV cache both present</td></tr>
         <tr><td>R5</td><td>0.60</td><td>One or both absent</td></tr>
@@ -579,7 +579,7 @@ num_requests_running  is Some (even if zero)</code></pre>
       <tbody>
         <tr><td><code>peak_flops_tc_tflops</code>, <code>peak_bw_gbps</code></td><td>GPU catalog. BF16 Tensor Core dense throughput, physics roofline input.</td><td>Ceilings not computed</td></tr>
         <tr><td><code>param_count</code>, <code>active_param_count</code></td><td>Model catalog. MoE: total for weight/OOM; active for roofline.</td><td>Roofline skipped</td></tr>
-        <tr><td><code>bytes_per_param</code></td><td><code>DTYPE</code> / <code>VLLM_DTYPE</code> env &rarr; <code>kv_cache_dtype</code> &rarr; catalog default &rarr; bf16 (2 bytes)</td><td>bf16 fallback, labeled in output</td></tr>
+        <tr><td><code>bytes_per_param</code> (weights)</td><td>vLLM-reported quantization &rarr; <code>QUANTIZATION</code>/<code>VLLM_QUANTIZATION</code> env &rarr; vLLM-reported dtype &rarr; <code>DTYPE</code>/<code>VLLM_DTYPE</code> env &rarr; catalog default &rarr; bf16 (2 bytes). <code>kv_cache_dtype</code> is not in this chain; it sets KV element bytes only.</td><td>bf16 fallback, labeled in output</td></tr>
       </tbody>
     </table>
     <div class="callout">All catalog-derived numbers are labeled <code>(est)</code> in output. Upper-bound approximations, not measured values.</div>
@@ -591,7 +591,7 @@ num_requests_running  is Some (even if zero)</code></pre>
         <tr><td><code>max_num_seqs</code></td><td><code>vllm:max_num_seqs</code> gauge</td><td><code>-m</code> CLI flag</td><td>R1 and R5 silent</td></tr>
         <tr><td><code>tensor_parallel_size</code></td><td><code>--tensor-parallel-size</code> CLI flag</td><td>Treated as 1. Values above 1 are refused at launch; multi-GPU is not supported.</td><td>Ceilings and kv_headroom unscaled</td></tr>
         <tr><td>TPOT histogram</td><td><code>request_time_per_output_token</code></td><td><code>time_per_output_token</code></td><td><code>None</code></td></tr>
-        <tr><td><code>bytes_per_param</code></td><td><code>DTYPE</code> / <code>VLLM_DTYPE</code> env var</td><td><code>kv_cache_dtype</code> &rarr; catalog &rarr; bf16</td><td>bf16, labeled in output</td></tr>
+        <tr><td><code>bytes_per_param</code> (weights)</td><td>vLLM-reported quantization</td><td><code>QUANTIZATION</code>/<code>VLLM_QUANTIZATION</code> env &rarr; vLLM-reported dtype &rarr; <code>DTYPE</code>/<code>VLLM_DTYPE</code> env &rarr; catalog &rarr; bf16. KV width uses <code>kv_cache_dtype</code> only.</td><td>bf16, labeled in output</td></tr>
         <tr><td>All windows non-evaluable</td><td>-</td><td>Chronologically last raw window</td><td>Labeled as non-evaluable</td></tr>
       </tbody>
     </table>
@@ -686,7 +686,7 @@ num_requests_running  is Some (even if zero)</code></pre>
       <tbody>
         <tr><td><code>roofline_params</code></td><td><code>active_param_count</code> if present, else <code>param_count</code>. Decode and prefill ceilings, efficiency %, ridge batch size.</td></tr>
         <tr><td><code>weight_params</code></td><td><code>param_count</code> if present, else <code>active_param_count</code>. <code>weight_gb</code> and <code>kv_headroom_gb</code> (OOM check).</td></tr>
-        <tr><td><code>bytes_per_param</code></td><td><code>DTYPE</code> / <code>VLLM_DTYPE</code> env &rarr; <code>kv_cache_dtype</code> &rarr; catalog default &rarr; bf16 (2 bytes). fp8 = 1, fp16/bf16 = 2, fp32 = 4. Source labeled in output when fallback is used.</td></tr>
+        <tr><td><code>bytes_per_param</code> (weights)</td><td>vLLM-reported quantization &rarr; <code>QUANTIZATION</code>/<code>VLLM_QUANTIZATION</code> env &rarr; vLLM-reported dtype &rarr; <code>DTYPE</code>/<code>VLLM_DTYPE</code> env &rarr; catalog default &rarr; bf16 (2 bytes). fp8 = 1, fp16/bf16 = 2, fp32 = 4. <code>kv_cache_dtype</code> sets KV element bytes only, never weight width. Source labeled in output when fallback is used.</td></tr>
         <tr><td><code>tensor_parallel_size</code></td><td><code>--tensor-parallel-size</code> CLI flag only in practice (TP &gt;1 is refused at launch). Defaults to 1. Scales both ceilings and per-GPU KV headroom.</td></tr>
         <tr><td><code>seq_len</code> (prefill only)</td><td><code>prompt_tokens_mean</code> rounded &rarr; <code>max_model_len</code> &rarr; absent: prefill ceiling skipped.</td></tr>
       </tbody>
@@ -723,7 +723,7 @@ num_requests_running  is Some (even if zero)</code></pre>
     <h2>Efficiency % (<code>decode_eff</code>)</h2>
     <pre><code>absolute_ceiling = decode_ceiling_tps &times; ridge_batch_size
 efficiency_pct   = actual_tps / absolute_ceiling &times; 100</code></pre>
-    <p><code>decode_ceiling_tps</code> is TP-scaled (<code>peak_bw &times; tp</code> from the roofline above). The denominator is the absolute hardware ceiling, independent of current traffic. An idle server reads low, correctly. Requires <code>generation_tokens_per_sec &gt; 0</code>. Not shown if <code>actual_tps &gt; absolute_ceiling</code> (catalog or measurement mismatch). Values derived from this ceiling carry a tilde (<code>~</code>) in output.</p>
+    <p><code>decode_ceiling_tps</code> is TP-scaled (<code>peak_bw &times; tp</code> from the roofline above). The denominator is the absolute hardware ceiling, independent of current traffic. An idle server reads low, correctly. Requires <code>generation_tokens_per_sec &gt; 0</code>. When <code>actual_tps</code> exceeds <code>absolute_ceiling</code>, <code>decode_eff</code> is clamped to 100% (catalog or measurement mismatch). Values derived from the estimated ceiling carry a tilde (<code>~</code>) in output.</p>
     <div class="callout warn">Calibrated for decode-bound workloads. Prefill-heavy workloads (long prompts, short outputs) show artificially low efficiency %. The prefill ceiling is the relevant constraint there, not decode.</div>
 
     <h2>Weight footprint and headroom</h2>
@@ -761,15 +761,15 @@ ECONOMICS:
       <tbody>
         <tr><td>Throughput</td><td>Drop &ge;5%</td></tr>
         <tr><td>Efficiency (pp)</td><td>Drop &ge;1.0pp</td></tr>
-        <tr><td>Cost/1M output tok</td><td>Rise &ge;$0.01</td></tr>
-        <tr><td>J/tok</td><td>Rise &ge;0.02</td></tr>
-        <tr><td>TTFT avg</td><td>Rise &ge;5ms</td></tr>
-        <tr><td>TPOT avg</td><td>Rise &ge;0.5ms</td></tr>
+        <tr><td>Cost/1M output tok</td><td>Rise &gt;$0.01</td></tr>
+        <tr><td>J/tok</td><td>Rise &gt;0.02</td></tr>
+        <tr><td>TTFT avg</td><td>Rise &gt;5ms</td></tr>
+        <tr><td>TPOT avg</td><td>Rise &gt;0.5ms</td></tr>
       </tbody>
     </table>
 
     <h2>Per-window collection</h2>
-    <p>Window size: 2s when <code>--duration</code> is 30s or less; 10s otherwise. Each window polls GPU (NVML) and vLLM in parallel at ~250ms intervals. These formulas produce one snapshot before multi-window aggregation.</p>
+    <p>Window size: 2s when <code>--duration</code> is 30s or less; 10s otherwise. Each window polls GPU (NVML, or AMD via <code>libamdgpu_top</code>) and vLLM in parallel at ~250ms intervals. These formulas produce one snapshot before multi-window aggregation.</p>
     <table>
       <thead><tr><th>Metric type</th><th>Formula</th><th>On failure</th></tr></thead>
       <tbody>
@@ -777,7 +777,7 @@ ECONOMICS:
         <tr><td>Histogram p99</td><td>Delta buckets, then linear interpolation at q=0.99. If target falls in +Inf bucket, returns last finite bucket's upper bound.</td><td><code>None</code>. No cumulative fallback (stale p99 is worse than none)</td></tr>
         <tr><td>Counter rate (tok/s, req/s, preemptions/s)</td><td><code>(last &minus; first) / window_duration_secs</code></td><td><code>None</code> on negative delta or zero duration. Zero delta is valid idle, not missing</td></tr>
         <tr><td>Prefix cache hit rate</td><td><code>&Delta;hits / &Delta;queries</code></td><td><code>None</code> when <code>&Delta;queries &le; 0</code> (never divide by zero)</td></tr>
-        <tr><td>GPU util, power</td><td>Mean across window polls</td><td>Poll skipped if NVML field absent</td></tr>
+        <tr><td>GPU util, power</td><td>Mean across window polls</td><td>Poll skipped if GPU field absent</td></tr>
         <tr><td>VRAM, temp (current)</td><td>Last poll</td><td>Peaks (<code>vram_peak_mb</code>, <code>temperature_peak_c</code>, <code>kv_cache_peak_perc</code>): max across polls/scrapes</td></tr>
       </tbody>
     </table>
@@ -1050,7 +1050,7 @@ ECONOMICS:
   document.querySelectorAll('pre').forEach(pre => {
     if (!pre.querySelector('code')) return;
     const text = pre.querySelector('code').innerText.trim();
-    if (text.startsWith('+---') || text.startsWith('Apply the fix')) return;
+    if (text.startsWith('+---') || text.startsWith('Apply the fix') || text.startsWith('Throughput') || text.startsWith('Config changed.')) return;
     const btn = document.createElement('button');
     btn.className = 'copy-btn'; btn.textContent = 'copy';
     btn.onclick = () => {

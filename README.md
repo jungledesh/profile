@@ -4,6 +4,8 @@
 
 **Inference diagnostics for production vLLM servers.**
 
+*Less words. Less noise. More signal. More value.*
+
 [Website](https://jungledesh.github.io/profile/index.html) · [Docs](https://jungledesh.github.io/profile/docs.html) · [Install](#install-and-run) · [Proof](#proof) · [Roadmap](#roadmap) · [Contributing](#contributing)
 
 </div>
