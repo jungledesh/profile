@@ -245,7 +245,7 @@ decode_ceiling_tps = (peak_bandwidth_gbps x 1e9) / (params x bytes_per_param)
 
 Efficiency is measured throughput against the decode ceiling times the ridge batch size, the batch size where decode stops being limited by memory and starts being limited by compute.
 
-Ceilings are coarse upper bounds from published specifications, not a hardware simulation. They are marked `(est)`, and values derived from them carry a tilde. An uncatalogued GPU gets `Hardware ceiling unknown` with the reason, rather than a wrong number.
+Ceilings are coarse upper bounds from published specifications, not a hardware simulation. They are marked `(est)`, and values derived from them carry a tilde. An uncatalogued GPU or model gets `Hardware ceiling unknown` with the reason, rather than a wrong number.
 
 Cost works differently. Dollars per million output tokens is `cost_per_hr × 1e6 / (tok/s × 3600)`, so it holds even where the ceiling is uncertain.
 
@@ -253,38 +253,9 @@ Cost works differently. Dollars per million output tokens is `cost_per_hr × 1e6
 
 One cause at a time. Eight rules watch eight failure modes, and on a struggling server several fire at once. A wall of alerts carries the same information as no alert at all, so two filters cut them to one: a mutual exclusivity table removes symptoms another cause already explains, and a priority DAG keeps a tuning suggestion from ever outranking an active bottleneck.
 
-```text
-                          rules evaluate
-                                |
-        R2 KV pressure    R5 saturation    R1 under-batching
-        R2b admission     R6 prefill-bound R7 headroom
-        R3 low prefix     R4 OOM risk
-                                |
-                                v
-                    mutual exclusivity table
-        R4 OOM risk (weights-alone overflow)  silences  R2 KV cache pressure
-        R4 OOM risk (weights-alone overflow)  silences  R2b KV admission backlog
-        R6 prefill-bound                      silences  R1 under-batching
-                                |
-                                v
-                      DAG priority layers
-        L2  OOM risk, KV pressure, KV admission backlog     broken
-        L3  concurrency saturation                            |
-        L4  under-batching                                    |
-        L5  low prefix reuse, prefill-bound                   |
-        L6  config headroom                                 healthy
-                    keep only the highest surviving layer
-                                |
-                                v
-                     rank by impact x confidence
-                                |
-                    +-----------+------------+
-                    |                        |
-                 primary                   held
-             one cause, shown       released when the same
-                                     cause returns with no
-                                     material improvement
-```
+<p align="center">
+  <img src="docs/assets/rule-engine.svg" width="880" alt="Profile's rule engine: eight rules on DAG priority layers L2 to L6. Mutual exclusivity: R4 weights-alone overflow silences R2 and R2b, R6 silences R1. Highest surviving layer wins, ranked by impact x confidence, one primary shown, losers held.">
+</p>
 
 **Mutual exclusivity** removes symptoms another cause already explains. If the model weights alone overflow VRAM, your KV cache is under pressure because of that. Telling you to shrink the KV pool would be treating a symptom. A buffer squeeze without weights overflow does not silence R2.
 
@@ -356,7 +327,7 @@ The research came last. We found it after the design had settled, and it agreed 
 - **vLLM only.** The engine boundary is clean, but SGLang is not built.
 - **Ceilings are uncalibrated.** Published specifications overestimate. Every ceiling-derived number is marked.
 - **The overhead-bound regime is named, not measured.** Profile can say the GPU is idling on CPU work but cannot quantify it.
-- **Unknown GPUs get no ceiling.** Profile reports `Hardware ceiling unknown` with the reason, rather than guessing.
+- **Unknown GPU or model gets no ceiling.** Profile reports `Hardware ceiling unknown` with the reason, rather than guessing.
 - **No load, no answer.** Idle windows are skipped. There is nothing to diagnose on a server at rest.
 - **You apply the fix.** Profile never changes your server.
 
@@ -388,7 +359,7 @@ Profile is not heuristics. Each part is the field's validated answer to a questi
 
 *Its weakness:* a raw spec-sheet roofline overestimates. Real servers have a third regime, overhead-bound, where the GPU idles on CPU work. The proven fix is calibration: a fitted overhead constant cut error up to 80% on a vLLM server ([NeurIPS 2024 MLforSystems](https://mlforsystems.org/assets/papers/neurips2024/paper28.pdf)), and GenZ ([arXiv 2406.01698](https://arxiv.org/abs/2406.01698)) reaches 5.82% geomean error with calibrated efficiency factors. Nobody accurate uses peak specs raw.
 
-*Where Profile stands:* uncalibrated, and it says so. Ceilings are marked `(est)`, derived values carry a tilde, and an uncatalogued GPU gets no ceiling at all. Cost per million output tokens is `cost_per_hr × 1e6 / (tok/s × 3600)`, so the dollar figure never inherits the ceiling's error. Calibration is on the roadmap.
+*Where Profile stands:* uncalibrated, and it says so. Ceilings are marked `(est)`, derived values carry a tilde, and an uncatalogued GPU or model gets no ceiling at all. Cost per million output tokens is `cost_per_hr × 1e6 / (tok/s × 3600)`, so the dollar figure never inherits the ceiling's error. Calibration is on the roadmap.
 
 **The engine: DAG and mutual exclusivity.** Intel's Top-down Microarchitecture Analysis ([Yasin, ISPASS 2014](https://ieeexplore.ieee.org/document/6844459)) has shipped in VTune and Linux `perf` for a decade: mutually exclusive failure categories under a hierarchical-safety rule, which is a suppression table. TMA exists because printing every issue at once breaks down when stalls overlap.
 
