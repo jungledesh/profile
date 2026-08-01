@@ -865,12 +865,13 @@ ECONOMICS:
 
     <h2>Code Hygiene &amp; Security</h2>
     <p>rustls only, no OpenSSL. Read-only GPU telemetry. No third-party telemetry leaving the machine; Profile only talks to the configured vLLM endpoint (and best-effort <code>/v1/models</code> / <code>/info</code> on that host).</p>
-    <p>Every pull request and merge to <code>main</code> runs the same gate (see <code>.github/workflows/build.yml</code> and <a href="https://github.com/jungledesh/profile/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener">CONTRIBUTING.md</a>). Never mask a scanner with <code>|| true</code>; allowlist real false positives in <code>deny.toml</code>.</p>
+    <p>Every pull request and merge to <code>main</code> runs the same gate (see <code>.github/workflows/build.yml</code> and <a href="https://github.com/jungledesh/profile/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener">CONTRIBUTING.md</a>). <a href="https://socket.dev/" target="_blank" rel="noopener">Socket</a> reports supply-chain risk on the same events. Never mask a scanner with <code>|| true</code>; allowlist real false positives in <code>deny.toml</code>.</p>
     <ul>
       <li><strong>cargo audit:</strong> RustSec Advisory Database against the dependency tree.</li>
       <li><strong>cargo deny:</strong> license, advisory, and ban policy via <code>cargo deny check --all-features</code> (<code>deny.toml</code>).</li>
       <li><strong>OSV-Scanner:</strong> fails on HIGH or CRITICAL vulnerabilities in <code>Cargo.lock</code> (CVSS v3 &ge; 7.0).</li>
       <li><strong>Semgrep SAST:</strong> static application security testing on the source.</li>
+      <li><strong>Socket:</strong> supply-chain scanning on pull requests and merges to <code>main</code> (malware, typo-squatting, risky dependency behavior). GitHub App check: <code>Socket Sec: Project Report</code>.</li>
       <li><strong>cargo fmt -- --check:</strong> standard Rust formatting.</li>
       <li><strong>cargo clippy --locked --all-targets --all-features -- -D warnings:</strong> zero-tolerance lint hygiene.</li>
       <li><strong>cargo test --locked:</strong> unit tests for rules, physics math, and mock payloads.</li>
