@@ -20,7 +20,7 @@ One GPU, NVIDIA or AMD. Reads live `/metrics` and NVML or amdgpu.
 
 **[Website](https://jungledesh.github.io/profile/index.html)** | **[Docs](https://jungledesh.github.io/profile/docs.html)** | **[Demo](#proof)** | **[Release](https://github.com/jungledesh/profile/releases/latest)**
 
-[Install](#install-and-run) · [What is Profile](#what-is-profile) · [What you get](#what-you-get) · [Proof](#proof) · [The loop](#the-loop) · [How it works](#how-it-works) · [Where Profile sits](#where-profile-sits) · [Limitations](#limitations) · [Roadmap](#roadmap) · [Research foundation](#research-foundation) · [Principles](#principles)
+[Install](#install-and-run) · [What is Profile](#what-is-profile) · [What you get](#what-you-get) · [Proof](#proof) · [The loop](#the-loop) · [How it works](#how-it-works) · [Where Profile sits](#where-profile-sits) · [Limitations](#limitations) · [Roadmap](#roadmap) · [Research foundation](#research-foundation) · [Principles](#principles) · [Contributing](#contributing)
 
 ---
 
@@ -45,20 +45,20 @@ Prefer not to pipe curl into sh? Download the binary from the [releases page](ht
 - **vLLM** with `/metrics` reachable. Default `http://localhost:8000/metrics`.
 - **Live traffic** during the window. An idle server has no waste to find, and Profile says so rather than invent a number. Trying Profile without production traffic? Drive load with vLLM's own `vllm bench serve`, or any load generator.
 
-Launch scope is a single GPU. `--tensor-parallel-size` is accepted and scales the physics ceiling, but KV and weight sharding math stays single-GPU. Multi-GPU is on the [roadmap](#roadmap). Profile still tells you when a model needs tensor parallelism to fit at all.
+Launch scope is a single GPU. `--tensor-parallel-size` greater than 1 is refused today. Multi-GPU is on the [roadmap](#roadmap). Profile still tells you when a model needs tensor parallelism to fit at all.
 
 <details>
 <summary><b>Profile CLI flags</b> (these configure Profile, not vLLM)</summary>
 <br>
 
-| Flag                     | Default                         | Description                                                          |
-| ------------------------ | ------------------------------- | -------------------------------------------------------------------- |
-| `-u, --url`              | `http://localhost:8000/metrics` | vLLM metrics endpoint                                                |
-| `--duration`             | `30s`                           | Sampling window. Minimum `30s`, maximum `30m`. Units are `s` or `m`. |
-| `-m, --max-num-seqs`     | Prompted if absent              | Pass to skip the prompt. Read from `/metrics` when available.        |
-| `--tensor-parallel-size` | Unset                           | TP degree used in the ceiling math                                   |
-| `--cost-per-hour`        | Catalog estimate                | GPU cost in USD/hr                                                   |
-| `-v`                     | Off                             | Show rules that did not fire, and the physics limits                 |
+| Flag                     | Default                         | Description                                                                               |
+| ------------------------ | ------------------------------- | ----------------------------------------------------------------------------------------- |
+| `-u, --url`              | `http://localhost:8000/metrics` | vLLM metrics endpoint                                                                     |
+| `--duration`             | `30s`                           | Sampling window. Minimum `30s`, maximum `30m`. Units are `s` or `m`.                      |
+| `-m, --max-num-seqs`     | Prompted if absent              | Pass to skip the prompt. Read from `/metrics` when available.                             |
+| `--tensor-parallel-size` | Unset                           | Must be 1 today. Values above 1 are refused until multi-GPU ships                         |
+| `--cost-per-hour`        | Catalog estimate                | GPU cost in USD/hr                                                                        |
+| `-v`                     | Off                             | Show rules that did not fire, physics limits, and expanded GPU/latency/CACHE detail       |
 
 </details>
 
@@ -181,7 +181,7 @@ New --max-num-seqs [current: 345]: 170
 
 Measuring delta...
 
-  Config changed. Baseline reset.
+  Config changed.
 
   Throughput          163 → 328 tok/s
   TTFT                8720 → 495ms (p95 19185 → 950ms)
@@ -197,7 +197,7 @@ ECONOMICS:
   Throughput          610 → 545 tok/s  worse
   TTFT                1024 → 6067ms (p95 2407 → 16687ms)  worse
   TPOT                118.4 → 147.0ms (p95 147.7 → 195.9ms)  worse
-  Decode eff. -0.4pp
+  Decode eff.         -0.4pp
 
 ECONOMICS:
   Cost/1M output tok  $1.36 → $1.52 (est)  worse
@@ -207,10 +207,10 @@ A tool that only reports improvements cannot be trusted when it reports one.
 
 Four things the loop will not do to you:
 
-- **Repeat itself.** When the same cause returns, Profile releases the issues it was holding behind it. The next hypothesis is already on screen.
-- **Dead-end you.** A rule with no fix left releases what it suppressed immediately, without waiting for another round.
-- **Tell you to do what you already did.** Fixes are checked against your running config. No suggestion to enable a flag that is on, or to set a value you already exceed.
-- **Ping-pong you.** When two rules alternate and pull the same knob in opposite directions, Profile detects the cycle, names the bracket it has tried, and suggests the midpoint. It offers this at most three times, then names the wall instead of guessing again.
+- **Repeat itself.** When the same cause returns without a material improvement, Profile releases the issues it was holding behind it. The next hypothesis is already on screen.
+- **Dead-end you.** When no config lever remains, Profile names the wall and points at scale-out instead of inventing another flag.
+- **Tell you to do what you already did.** Where Profile can read your running config, it skips levers you already set (prefix caching on, fp8 KV already active, seats already at the target, and the like).
+- **Ping-pong you.** When KV pressure and concurrency saturation alternate on `--max-num-seqs`, Profile detects the cycle, names the bracket it has tried, and suggests the midpoint. It offers this at most three times, then names the wall instead of guessing again.
 
 **Scale out.** Eventually no flag helps. Profile says the scheduler is at its cap with the pool full, that no config change helps, and that the next move is a replica. That is the answer, not a failure.
 
@@ -228,10 +228,11 @@ Profile does three things:
 
 Physics gives two hard limits. Profile derives both from your GPU and model.
 
-**Prefill** is compute-bound:
+**Prefill** is compute-bound (prompts/s):
 
 ```text
-prefill_ceiling_tps = (peak_flops x 1e12) / (2 x params x seq_len + attn_coeff x layers x seq_len^2)
+prefill_ceiling = (peak_flops x 1e12)
+                / (2 x params x seq_len + attn_coeff x layers x seq_len^2)
 ```
 
 The first term is the weight math, linear in sequence length. The second is attention, quadratic in it. That is why the prefill ceiling falls as context grows, and why a linear-only roofline overstates long-context capability.
@@ -246,7 +247,7 @@ Efficiency is measured throughput against the decode ceiling times the ridge bat
 
 Ceilings are coarse upper bounds from published specifications, not a hardware simulation. They are marked `(est)`, and values derived from them carry a tilde. An uncatalogued GPU gets `Hardware ceiling unknown` with the reason, rather than a wrong number.
 
-Cost works differently. Dollars per million output tokens is GPU price divided by measured throughput, so it holds even where the ceiling is uncertain.
+Cost works differently. Dollars per million output tokens is `cost_per_hr × 1e6 / (tok/s × 3600)`, so it holds even where the ceiling is uncertain.
 
 ### The rule engine
 
@@ -257,12 +258,13 @@ One cause at a time. Eight rules watch eight failure modes, and on a struggling 
                                 |
         R2 KV pressure    R5 saturation    R1 under-batching
         R6 prefill-bound  R7 headroom      R4 OOM risk
+        R3 low prefix reuse
                                 |
                                 v
                     mutual exclusivity table
-        R4 OOM risk      silences   R2 KV cache pressure
-        R4 OOM risk      silences   R2b KV admission backlog
-        R6 prefill-bound silences   R1 under-batching
+        R4 OOM risk (weights-alone overflow)  silences  R2 KV cache pressure
+        R4 OOM risk (weights-alone overflow)  silences  R2b KV admission backlog
+        R6 prefill-bound                      silences  R1 under-batching
                                 |
                                 v
                       DAG priority layers
@@ -280,14 +282,15 @@ One cause at a time. Eight rules watch eight failure modes, and on a struggling 
                     |                        |
                  primary                   held
              one cause, shown       released when the same
-                                     cause fires again
+                                     cause returns with no
+                                     material improvement
 ```
 
-**Mutual exclusivity** removes symptoms another cause already explains. If the model does not fit in VRAM, your KV cache is under pressure because of that. Telling you to shrink the KV pool would be treating a symptom.
+**Mutual exclusivity** removes symptoms another cause already explains. If the model weights alone overflow VRAM, your KV cache is under pressure because of that. Telling you to shrink the KV pool would be treating a symptom. A buffer squeeze without weights overflow does not silence R2.
 
 **The DAG layers** encode one rule: fix what is broken before tuning what is healthy. A tuning suggestion sits structurally below an active bottleneck and can never outrank it.
 
-**Nothing is discarded.** Losing rules are held and released when the same cause fires again, so you get the next hypothesis without ever seeing five at once.
+**Nothing is discarded.** Losing rules are held and released when the same cause returns without a material improvement, so you get the next hypothesis without ever seeing five at once.
 
 Rules fire on evidence of harm, never on heat. A server at 95% KV cache with no evictions and no queue is healthy and busy, and Profile stays quiet.
 
@@ -296,12 +299,12 @@ Rules fire on evidence of harm, never on heat. A server at 95% KV cache with no 
 | Rule                          | Fires when                                                                                                                               | Prescribes                                                                                                                                                                |
 | ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **R1 Under-batching**         | Known GPU: config-relative efficiency under 60% with occupancy under 75% and no backlog. Uncatalogued GPU: occupancy under 25%.          | Batch more requests or raise client concurrency, naming the binding wall: config, compute ridge, or memory                                                                |
-| **R2 KV cache pressure**      | KV at or above 88%, **and** either preemptions active or queue backpressure                                                              | Split by cost. Cuts throughput: lower `--max-model-len` or `--max-num-seqs`. Safe: prefix caching, raise `--gpu-memory-utilization`, fp8 KV cache, `--kv-offloading-size` |
+| **R2 KV cache pressure**      | KV at or above 88%, and either an eviction signal (preemptions or swapped ≥ 2) or queue backpressure (waiting > 2)                       | Split by cost. Cuts throughput: lower `--max-model-len` or `--max-num-seqs`. Safe: prefix caching, raise `--gpu-memory-utilization`, fp8 KV cache, `--kv-offloading-size` |
 | **R2b KV admission backlog**  | Queue ratio at or above 0.30 with KV near full, scheduler not at the seat cap, and estimated free KV below demand                        | Same family, without the eviction signal                                                                                                                                  |
-| **R3 Low prefix reuse**       | Prefix caching off: on prompt-token and traffic volume alone. Prefix caching on: hit rate under 35% with at least 20 mean prompt tokens. | `--enable-prefix-caching`, or restructure prompts if already on                                                                                                           |
+| **R3 Low prefix reuse**       | Active traffic (running > 0.75), mean prompt ≥ 20, and qps × mean prompt ≥ 1000. Caching off: fires on that volume. Caching on: hit rate under 35%. | `--enable-prefix-caching`, or restructure prompts if already on                                                                                                           |
 | **R4 OOM risk**               | Weights overflow VRAM, or weights fit but free VRAM cannot hold one worst-case request                                                   | `--tensor-parallel-size` at the computed minimum, raise `--gpu-memory-utilization`, a smaller model, or the model does not fit on this hardware                           |
 | **R5 Concurrency saturation** | Scheduler at `--max-num-seqs`, at least 2 waiting, queue ratio at or above 0.30                                                          | Below 80% KV, raise `--max-num-seqs` to a bounded target. Above it, name the wall or add a replica                                                                        |
-| **R6 Prefill-bound**          | Prompt to generation ratio elevated with decode efficiency low. Muted only when TPOT is measured and under 4x its floor.                 | Chunked prefill, `--max-num-batched-tokens`, shorter prompts; at the compute wall, disaggregate or add a replica                                                          |
+| **R6 Prefill-bound**          | Prompt/gen ratio ≥ 5 with decode efficiency under 40%. Muted when TPOT is measured and under 4x its floor.                               | Chunked prefill, `--max-num-batched-tokens`, shorter prompts; at the compute wall, disaggregate or add a replica                                                          |
 | **R7 Config headroom**        | `--max-num-seqs` below 90% of the recommended target, with occupancy at or above 50% and at most 1 waiting                               | Raise it, and name what binds the target                                                                                                                                  |
 
 When nothing fires but efficiency is still low, a fallback names the shape of the underuse. When nothing fires at all, Profile names the boundary capping the server: capacity, traffic, physics, prefill interference, or framework overhead. Where the ceiling itself is unknown, it says that instead of naming a boundary it cannot prove. Full thresholds, confidence scoring, and edge cases are in the [rules documentation](https://jungledesh.github.io/profile/docs.html#rules).
@@ -329,7 +332,7 @@ Every layer above and below optimises something. None measures whether the resul
 | Prescribes the change            | yes     | no         | no               | config only | config only |
 | Measures the delta after the fix | yes     | no         | no               | partial     | no          |
 | Cost per million tokens          | yes     | no         | no               | no          | no          |
-| No restarts, no synthetic load   | yes     | yes        | yes              | no          | n/a         |
+| No auto-restart, no synthetic load | yes     | yes        | yes              | no          | n/a         |
 
 Dashboards: Grafana, Datadog, vLLM `/metrics`. Kernel profilers: Nsight Systems, Nsight Compute. Autotuners: vLLM `auto_tune`, SCOOT. Simulators: Vidur, LLMCompass, GenZ.
 
@@ -349,7 +352,7 @@ The research came last. We found it after the design had settled, and it agreed 
 
 ## Limitations
 
-- **One GPU.** KV and weight sharding math is single-GPU only.
+- **One GPU.** `--tensor-parallel-size` greater than 1 is refused. KV and weight sharding math is single-GPU only.
 - **vLLM only.** The engine boundary is clean, but SGLang is not built.
 - **Ceilings are uncalibrated.** Published specifications overestimate. Every ceiling-derived number is marked.
 - **The overhead-bound regime is named, not measured.** Profile can say the GPU is idling on CPU work but cannot quantify it.
@@ -385,7 +388,7 @@ Profile is not heuristics. Each part is the field's validated answer to a questi
 
 *Its weakness:* a raw spec-sheet roofline overestimates. Real servers have a third regime, overhead-bound, where the GPU idles on CPU work. The proven fix is calibration: a fitted overhead constant cut error up to 80% on a vLLM server ([NeurIPS 2024 MLforSystems](https://mlforsystems.org/assets/papers/neurips2024/paper28.pdf)), and GenZ ([arXiv 2406.01698](https://arxiv.org/abs/2406.01698)) reaches 5.82% geomean error with calibrated efficiency factors. Nobody accurate uses peak specs raw.
 
-*Where Profile stands:* uncalibrated, and it says so. Ceilings are marked `(est)`, derived values carry a tilde, and an uncatalogued GPU gets no ceiling at all. Cost per million tokens is measured throughput against GPU price, so the dollar figure never inherits the ceiling's error. Calibration is on the roadmap.
+*Where Profile stands:* uncalibrated, and it says so. Ceilings are marked `(est)`, derived values carry a tilde, and an uncatalogued GPU gets no ceiling at all. Cost per million output tokens is `cost_per_hr × 1e6 / (tok/s × 3600)`, so the dollar figure never inherits the ceiling's error. Calibration is on the roadmap.
 
 **The engine: DAG and mutual exclusivity.** Intel's Top-down Microarchitecture Analysis ([Yasin, ISPASS 2014](https://ieeexplore.ieee.org/document/6844459)) has shipped in VTune and Linux `perf` for a decade: mutually exclusive failure categories under a hierarchical-safety rule, which is a suppression table. TMA exists because printing every issue at once breaks down when stalls overlap.
 
@@ -399,7 +402,7 @@ Profile is not heuristics. Each part is the field's validated answer to a questi
 
 **Not an autotuner.** [SCOOT](https://arxiv.org/abs/2408.04323) (WWW 2025) and SLO-Guard ([arXiv 2604.17627](https://arxiv.org/abs/2604.17627)) search config space with Bayesian optimisation, and [vLLM `auto_tune`](https://github.com/vllm-project/vllm/blob/main/benchmarks/auto_tune/README.md) grid-searches under a latency cap. All need dozens of restarts, with crashes as training data. Not something to run against production, and they emit a config, not a cause.
 
-*Profile:* reads the live server under its own traffic. No restarts, no synthetic load, no crash trials. Autotuners explore configs nobody tried; you explore at your own pace, with a cause and a measured delta attached to each step.
+*Profile:* reads the live server under its own traffic. It does not restart your process or inject load, and it does not use crashes as training data. Autotuners explore configs nobody tried; you explore at your own pace, with a cause and a measured delta attached to each step.
 
 **Not a simulator.** [Vidur](https://arxiv.org/abs/2405.05465) (MLSys 2024) found the best LLaMA2-70B config in one CPU-hour against an estimated 42,000 GPU-hours of sweep, and [LLMCompass](https://arxiv.org/abs/2312.03134) (ISCA 2024) reports 4.1% error. But those figures are author-reported on narrow validation sets, and simulators lag serving features by generations: the Frontier critique ([arXiv 2605.21312](https://arxiv.org/abs/2605.21312)) finds Vidur missing chunked prefill, CUDA graphs, speculative decoding, disaggregation and MoE, with attention-predictor error up to 376% at p95. Each also needs per-hardware profiling upfront.
 
@@ -432,6 +435,14 @@ Start with the Workflow, then Rules. The rest is reference.
 - **[Catalog](https://jungledesh.github.io/profile/docs.html#catalog)**: GPU bandwidth, FLOPs, and prices.
 - **[Limitations](https://jungledesh.github.io/profile/docs.html#limitations)**: where the math is approximate.
 - **[Design](https://jungledesh.github.io/profile/docs.html#design)**: engine design philosophy.
+
+---
+
+## Contributing
+
+Accepted: a new rule, an engine port, a GPU catalog entry, or a bug report from a real server.
+
+Start with [ARCHITECTURE.md](ARCHITECTURE.md) for where code lives and what owns what. [CONTRIBUTING.md](CONTRIBUTING.md) has the build, the merge gate, and the checklist for adding a rule. If the entry point is unclear, [open an issue](https://github.com/jungledesh/profile/issues) with what you run and what is missing.
 
 ---
 
