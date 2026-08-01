@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 2048 1142" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" role="img" aria-label="A 2 minute run is 12 windows: 8 active, 3 idle with no requests or tokens, 1 dropped where telemetry failed. Throughput of 377 tok per second is computed from the 8 active windows only.">
+  <style>
+    .fade { animation: f 4s ease-in-out infinite; }
+    @keyframes f { 0%,100% { opacity: .55; } 50% { opacity: .95; } }
+  </style>
+
+  <rect width="2048" height="1142" fill="#05060a"/>
+
+  <text x="48" y="66" font-size="30" letter-spacing="9" fill="#ffffff">PROFILE</text>
+
+  <text x="1024" y="283" font-size="24" letter-spacing="5" fill="#8a8f99" text-anchor="middle">2 MINUTES = 12 WINDOWS</text>
+
+  <!-- frame -->
+  <rect x="108" y="302" width="1832" height="278" fill="none" stroke="#1c2029" stroke-width="1.5"/>
+  <text x="72" y="500" font-size="22" fill="#7d838f" text-anchor="end">0s</text>
+  <text x="1976" y="500" font-size="22" fill="#7d838f">120s</text>
+
+  <!-- group labels + rules -->
+  <text x="720" y="378" font-size="24" letter-spacing="6" fill="#ffffff" text-anchor="middle">ACTIVE</text>
+  <line x1="124" y1="400" x2="1290" y2="400" stroke="#2b303b" stroke-width="1.5"/>
+  <text x="1553" y="378" font-size="24" letter-spacing="6" fill="#c3c8d2" text-anchor="middle">IDLE</text>
+  <line x1="1308" y1="400" x2="1768" y2="400" stroke="#2b303b" stroke-width="1.5"/>
+  <text x="1855" y="378" font-size="24" letter-spacing="6" fill="#c3c8d2" text-anchor="middle">DROPPED</text>
+  <line x1="1786" y1="400" x2="1924" y2="400" stroke="#2b303b" stroke-width="1.5"/>
+
+  <!-- windows: 8 active -->
+  <g fill="#f2f3f5">
+    <rect x="124" y="428" width="138" height="132" rx="10"/>
+    <rect x="272" y="428" width="138" height="132" rx="10"/>
+    <rect x="420" y="428" width="138" height="132" rx="10"/>
+    <rect x="568" y="428" width="138" height="132" rx="10"/>
+    <rect x="716" y="428" width="138" height="132" rx="10"/>
+    <rect x="864" y="428" width="138" height="132" rx="10"/>
+    <rect x="1012" y="428" width="138" height="132" rx="10"/>
+    <rect x="1160" y="428" width="138" height="132" rx="10"/>
+  </g>
+  <!-- 3 idle -->
+  <g fill="#6b7280">
+    <rect x="1308" y="428" width="138" height="132" rx="10"/>
+    <rect x="1456" y="428" width="138" height="132" rx="10"/>
+    <rect x="1604" y="428" width="138" height="132" rx="10"/>
+  </g>
+  <!-- 1 dropped -->
+  <rect class="fade" x="1752" y="428" width="138" height="132" rx="10" fill="none" stroke="#8a8f99" stroke-width="2" stroke-dasharray="9 9"/>
+
+  <!-- ticks -->
+  <g stroke="#2b303b" stroke-width="1.5">
+    <line x1="193" y1="560" x2="193" y2="580"/><line x1="341" y1="560" x2="341" y2="580"/>
+    <line x1="489" y1="560" x2="489" y2="580"/><line x1="637" y1="560" x2="637" y2="580"/>
+    <line x1="785" y1="560" x2="785" y2="580"/><line x1="933" y1="560" x2="933" y2="580"/>
+    <line x1="1081" y1="560" x2="1081" y2="580"/><line x1="1229" y1="560" x2="1229" y2="580"/>
+  </g>
+
+  <!-- legend -->
+  <g font-size="23" fill="#c3c8d2">
+    <rect x="124" y="608" width="22" height="22" rx="4" fill="#f2f3f5"/>
+    <text x="158" y="627">active - server working</text>
+    <rect x="576" y="608" width="22" height="22" rx="4" fill="#6b7280"/>
+    <text x="610" y="627">idle - no requests, no tokens</text>
+    <rect x="1112" y="608" width="22" height="22" rx="4" fill="none" stroke="#8a8f99" stroke-width="1.6" stroke-dasharray="5 5"/>
+    <text x="1146" y="627">dropped - telemetry failed</text>
+  </g>
+
+  <!-- funnels from the 8 active windows -->
+  <g fill="none" stroke="#5a6070" stroke-width="1.6">
+    <path d="M 193 660 C 193 780, 830 800, 862 890"/>
+    <path d="M 341 660 C 341 780, 872 800, 894 890"/>
+    <path d="M 489 660 C 489 780, 914 800, 926 890"/>
+    <path d="M 637 660 C 637 780, 956 800, 958 890"/>
+    <path d="M 785 660 C 785 780, 998 800, 990 890"/>
+    <path d="M 933 660 C 933 780, 1040 800, 1022 890"/>
+    <path d="M 1081 660 C 1081 780, 1082 800, 1054 890"/>
+    <path d="M 1229 660 C 1229 780, 1124 800, 1086 890"/>
+  </g>
+
+  <!-- result -->
+  <rect x="784" y="892" width="480" height="112" rx="12" fill="#05060a" stroke="#3a4050" stroke-width="1.8"/>
+  <text x="820" y="948" font-size="32" font-weight="700" fill="#ffffff">THROUGHPUT 377 tok/s</text>
+  <text x="820" y="984" font-size="23" fill="#a8adb8">Captured: 8 (1 dropped, 3 idle).</text>
+
+  <text x="1976" y="1078" font-size="23" fill="#5a6070" text-anchor="end">averages use active windows only.</text>
+</svg>
