@@ -452,7 +452,7 @@ Start with the Workflow, then Rules. The rest is reference.
 
 Accepted: a new rule, an engine port, a GPU catalog entry, or a bug report from a real server.
 
-Start with [ARCHITECTURE.md](ARCHITECTURE.md) for where code lives and what owns what. [CONTRIBUTING.md](CONTRIBUTING.md) has the build, the merge gate (`cargo fmt`, `clippy`, `audit`, `deny`, `test`, plus OSV-Scanner and Semgrep in CI), and the checklist for adding a rule. If the entry point is unclear, [open an issue](https://github.com/jungledesh/profile/issues) with what you run and what is missing.
+Start with [ARCHITECTURE.md](ARCHITECTURE.md) for where code lives and what owns what. [CONTRIBUTING.md](CONTRIBUTING.md) has the build, the merge gate (`cargo fmt`, `clippy`, `audit`, `deny`, `test`, plus OSV-Scanner, Semgrep, and [Socket](https://socket.dev/) supply-chain scanning in CI), and the checklist for adding a rule. If the entry point is unclear, [open an issue](https://github.com/jungledesh/profile/issues) with what you run and what is missing.
 
 ---
 
