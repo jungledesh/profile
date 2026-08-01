@@ -219,9 +219,9 @@ A tool that only reports improvements cannot be trusted when it reports one.
 
 Four things the loop will not do to you:
 
-- **Repeat itself.** When the same cause returns without a material improvement, Profile releases the issues it was holding behind it. The next hypothesis is already on screen.
-- **Dead-end you.** When no config lever remains, Profile names the wall and points at scale-out instead of inventing another flag.
-- **Tell you to do what you already did.** Where Profile can read your running config, it skips levers you already set (prefix caching on, fp8 KV already active, seats already at the target, and the like).
+- **Repeat itself.** When the same primary fires again, Profile lists the rules it was holding behind it. Re-fire alone is enough; there is no flat-delta gate, whether or not you applied a fix in between.
+- **Dead-end you.** When no config lever remains, Profile names the wall, points at scale-out, and surfaces the suppressed alternatives under that block instead of inventing another flag.
+- **Tell you to do what you already did.** Where Profile can read your running config, it skips levers you already set (prefix caching on, fp8 KV already active, chunked prefill on, `--max-num-batched-tokens` already at or above the suggestion, seats already at the target). Exception: `--kv-offloading-size` is re-derived on each R2 fire; if the new size differs from what is set, the flag is offered again.
 - **Ping-pong you.** When KV pressure and concurrency saturation alternate on `--max-num-seqs`, Profile detects the cycle, names the bracket it has tried, and suggests the midpoint. It offers this at most three times, then names the wall instead of guessing again.
 
 **Scale out.** Eventually no flag helps. Profile says the scheduler is at its cap with the pool full, that no config change helps, and that the next move is a replica. That is the answer, not a failure.
@@ -247,23 +247,23 @@ Physics gives two hard limits. Profile derives both from your GPU and model.
 **Prefill** is compute-bound (prompts/s):
 
 ```text
-prefill_ceiling = (peak_flops x 1e12)
+prefill_ceiling = (peak_flops x tp x 1e12)
                 / (2 x params x seq_len + attn_coeff x layers x seq_len^2)
 ```
 
-The first term is the weight math, linear in sequence length. The second is attention, quadratic in it. That is why the prefill ceiling falls as context grows, and why a linear-only roofline overstates long-context capability.
+The first term is the weight math, linear in sequence length. The second is attention, quadratic in it. That is why the prefill ceiling falls as context grows, and why a linear-only roofline overstates long-context capability. TP scales FLOPs the same way decode scales bandwidth; Profile refuses TP > 1 at launch today.
 
-**Decode** is memory-bandwidth-bound:
+**Decode** is memory-bandwidth-bound (TP scales bandwidth; Profile refuses TP > 1 at launch today, so runtime TP is 1):
 
 ```text
-decode_ceiling_tps = (peak_bandwidth_gbps x 1e9) / (params x bytes_per_param)
+decode_ceiling_tps = (peak_bandwidth_gbps x tp x 1e9) / (params x bytes_per_param)
 ```
 
 Efficiency is measured throughput against the decode ceiling times the ridge batch size, the batch size where decode stops being limited by memory and starts being limited by compute.
 
 Ceilings are coarse upper bounds from published specifications, not a hardware simulation. They are marked `(est)`, and values derived from them carry a tilde. An uncatalogued GPU or model gets `Hardware ceiling unknown` with the reason, rather than a wrong number.
 
-Cost works differently. Dollars per million output tokens is `cost_per_hr × 1e6 / (tok/s × 3600)`, so it holds even where the ceiling is uncertain.
+Cost works differently. Dollars per million output tokens is `cost_per_hr × 1e6 / (tok/s × 3600)` when enough completions cover mean running (turnover gate); otherwise the cost line is omitted. That keeps the dollar figure independent of the ceiling.
 
 ### The rule engine
 
@@ -277,7 +277,7 @@ One cause at a time. Eight rules watch eight failure modes, and on a struggling 
 
 **The DAG layers** encode one rule: fix what is broken before tuning what is healthy. A tuning suggestion sits structurally below an active bottleneck and can never outrank it.
 
-**Nothing is discarded.** Losing rules are held and released when the same cause returns without a material improvement, so you get the next hypothesis without ever seeing five at once.
+**Nothing is discarded.** Losing rules are held. They surface when the same primary re-fires, or immediately when the primary has no fix left to offer, so you get the next hypothesis without ever seeing five at once.
 
 Rules fire on evidence of harm, never on heat. A server at 95% KV cache with no evictions and no queue is healthy and busy, and Profile stays quiet.
 
@@ -386,9 +386,9 @@ Profile is not heuristics. Each part is the field's validated answer to a questi
 <br>
 
 
-**The ceiling: roofline.** The standard model for LLM inference analysis. The 2024 survey *LLM Inference Unveiled* ([arXiv 2402.16363](https://arxiv.org/abs/2402.16363)) organises the field around it, and RooflineBench ([arXiv 2602.11506](https://arxiv.org/abs/2602.11506)) still builds on it. Physics offers compute and bandwidth, and time is the maximum of the two. There is no tighter limit to derive.
+**The ceiling: roofline.** The standard model for LLM inference analysis. The 2024 survey *LLM Inference Unveiled* ([arXiv 2402.16363](https://arxiv.org/abs/2402.16363)) organises the field around it, and RooflineBench ([arXiv 2602.11506](https://arxiv.org/abs/2602.11506)) still builds on it. On a single accelerator, physics offers compute and bandwidth, and time is the maximum of the two. There is no tighter on-device limit to derive. Distributed serving also faces interconnect bandwidth and latency ([GenZ, arXiv 2406.01698](https://arxiv.org/abs/2406.01698)).
 
-*Its weakness:* a raw spec-sheet roofline overestimates. Real servers have a third regime, overhead-bound, where the GPU idles on CPU work. The proven fix is calibration: a fitted overhead constant cut error up to 80% on a vLLM server ([NeurIPS 2024 MLforSystems](https://mlforsystems.org/assets/papers/neurips2024/paper28.pdf)), and GenZ ([arXiv 2406.01698](https://arxiv.org/abs/2406.01698)) reaches 5.82% geomean error with calibrated efficiency factors. Nobody accurate uses peak specs raw.
+*Its weakness:* a raw spec-sheet roofline overestimates. Real servers have a third regime, overhead-bound, where the GPU idles on CPU work. The proven fix is calibration: a fitted overhead constant cut error up to 80% on vLLM and improved fits on Triton in the cited experiments ([NeurIPS 2024 MLforSystems](https://mlforsystems.org/assets/papers/neurips2024/paper28.pdf)), and GenZ reaches 5.82% geomean error among the platforms it evaluated with calibrated efficiency factors. Raw peak specifications can overestimate production performance.
 
 *Where Profile stands:* uncalibrated, and it says so. Ceilings are marked `(est)`, derived values carry a tilde, and an uncatalogued GPU or model gets no ceiling at all. Cost per million output tokens is `cost_per_hr × 1e6 / (tok/s × 3600)`, so the dollar figure never inherits the ceiling's error. Calibration is on the roadmap.
 
@@ -452,7 +452,7 @@ Start with the Workflow, then Rules. The rest is reference.
 
 Accepted: a new rule, an engine port, a GPU catalog entry, or a bug report from a real server.
 
-Start with [ARCHITECTURE.md](ARCHITECTURE.md) for where code lives and what owns what. [CONTRIBUTING.md](CONTRIBUTING.md) has the build, the merge gate, and the checklist for adding a rule. If the entry point is unclear, [open an issue](https://github.com/jungledesh/profile/issues) with what you run and what is missing.
+Start with [ARCHITECTURE.md](ARCHITECTURE.md) for where code lives and what owns what. [CONTRIBUTING.md](CONTRIBUTING.md) has the build, the merge gate (`cargo fmt`, `clippy`, `audit`, `deny`, `test`, plus OSV-Scanner and Semgrep in CI), and the checklist for adding a rule. If the entry point is unclear, [open an issue](https://github.com/jungledesh/profile/issues) with what you run and what is missing.
 
 ---
 

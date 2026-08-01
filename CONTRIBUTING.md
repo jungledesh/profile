@@ -26,7 +26,7 @@ End-to-end validation is manual, on a live vLLM server with a GPU (e.g. RunPod).
 
 ## The gate
 
-Required before merge (matches CI):
+Required before merge (matches CI in `.github/workflows/build.yml`):
 
 ```bash
 cargo fmt -- --check
@@ -35,6 +35,8 @@ cargo audit
 cargo deny check --all-features
 cargo test --locked
 ```
+
+CI also runs OSV-Scanner (fail on HIGH/CRITICAL in `Cargo.lock`) and Semgrep SAST on every pull request and merge to `main`.
 
 Fix clippy findings, do not silence them. Never mask CI security scanners; `|| true` after a scanner is a rejection. Allowlist real false positives in `deny.toml`.
 

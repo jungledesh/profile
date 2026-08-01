@@ -345,7 +345,7 @@ ECONOMICS:
         <tr><td>Known GPU: config-relative efficiency</td><td>&lt;60% of config capacity (decode ceiling &times; min(max_num_seqs, ridge))</td></tr>
         <tr><td>Known GPU: occupancy</td><td>&lt;75% of effective max</td></tr>
         <tr><td>No backlog</td><td>waiting &lt; 2</td></tr>
-        <tr><td>Unknown GPU fallback: occupancy</td><td>&lt;25% of max_num_seqs</td></tr>
+        <tr><td>Unknown GPU fallback: occupancy</td><td>&lt;25% of effective max (same binder as known-GPU: min of config, ridge, observed KV)</td></tr>
       </tbody>
     </table>
     <p>R1 still evaluates when R6 (Prefill-bound) fires on the same window; R6 then suppresses it via the mutual exclusivity table so the under-batching recommendation is held for reveal, not silently deferred. Fix names the binding wall: config cap, compute ridge, or memory limit.</p>
@@ -378,7 +378,7 @@ ECONOMICS:
     </table>
     <p>Fires when KV is near full and the scheduler is holding requests in queue to protect KV memory, without the R2 eviction/harm fire. The fix is to expand the KV pool, not reduce concurrency.</p>
     <p><strong>Fix:</strong> Raise <code>--gpu-memory-utilization</code> if VRAM headroom exists; switch to fp8 KV cache; or reduce <code>--max-model-len</code>.</p>
-    <div class="callout">R2 evaluates against <code>kv_cache_peak_perc</code>, the maximum KV usage across all polls in the window, not the average. A window that averaged 70% but peaked at 92% will still fire. The spike is what causes preemptions. The average hides it.</div>
+    <div class="callout">KV near-full uses avg <strong>or</strong> peak &ge;88%. Peak matters because a window can average 70% and still spike to 92%: the spike is what causes preemptions; the average alone can hide it. Peak is also what the header shows when it exceeds avg by &ge;10pp or reaches 95%.</div>
 
     <h2>R3: Low prefix reuse</h2>
     <table>
@@ -472,7 +472,7 @@ ECONOMICS:
 
     <h2>Rule significance gate</h2>
     <pre><code>rule_is_significant = fired &gt;= 3  AND  fired / total_evaluable_windows &gt;= 25%</code></pre>
-    <p>Shared by all rules. A rule that fired once is noise. All rules use this same gate; there are no per-rule exceptions.</p>
+    <p>Shared by windowed rules (R1&ndash;R3, R5&ndash;R7, R2b). A rule that fired once is noise. <strong>R4 is exempt:</strong> it is a config-fact path from baseline headroom, not a per-window fire count, so it skips this gate.</p>
 
     <h2>Ranking</h2>
     <pre><code>score = impact × confidence  // impact: 1-5, confidence: 0.0-1.0</code></pre>
@@ -541,7 +541,7 @@ num_requests_running  is Some (even if zero)</code></pre>
         <tr><td><code>gpu_util_pct</code></td><td>Gauge</td><td>Fraction of time any kernel was executing. Not SM occupancy.</td><td>Mean across window polls</td></tr>
         <tr><td><code>mem_util_pct</code></td><td>Gauge</td><td>Fraction of time the memory controller was busy</td><td>Mean across window polls</td></tr>
         <tr><td><code>power_watts</code></td><td>Gauge</td><td>Power draw (W)</td><td>Mean across window polls</td></tr>
-        <tr><td><code>power_limit_watts</code></td><td>Gauge</td><td>Driver-set TDP limit (W)</td><td>Once at startup</td></tr>
+        <tr><td><code>power_limit_watts</code></td><td>Gauge</td><td>Driver-set TDP limit (W)</td><td>Read when assembling each window's GPU row</td></tr>
         <tr><td><code>vram_used_mb</code></td><td>Gauge</td><td>VRAM in use (MiB)</td><td>Last poll</td></tr>
         <tr><td><code>vram_total_mb</code></td><td>Gauge</td><td>Total device VRAM (MiB)</td><td>Last poll</td></tr>
         <tr><td><code>temperature_c</code></td><td>Gauge</td><td>GPU core temp (&deg;C)</td><td>Last poll</td></tr>
@@ -609,28 +609,29 @@ num_requests_running  is Some (even if zero)</code></pre>
     <p><a href="#home" data-page="home" style="font-size: 0.85rem; color: #666; text-decoration: none;">&larr; Back to Workflow</a></p>
 
     <h2>GPUs</h2>
-    <p>BF16 Tensor Core dense TFLOPs and memory bandwidth feed the roofline math. Prices are market-average estimates as of 2026-06. Use <code>--cost-per-hour</code> for exact rates.</p>
+    <p>BF16 Tensor Core dense TFLOPs and memory bandwidth feed the roofline math. Prices from <code>src/context/gpu_prices.json</code> (updated 2026-07-23). Use <code>--cost-per-hour</code> for exact rates. Table is a common subset; full list including AMD Instinct and additional Blackwell SKUs is in <code>gpu_catalog.rs</code>.</p>
     <table>
       <thead><tr><th>GPU</th><th>Arch</th><th>BF16 TC Dense TFLOPs</th><th>Mem BW GB/s</th><th>On-demand $/hr</th><th>Spot $/hr</th></tr></thead>
       <tbody>
-        <tr><td>H100 PCIe</td><td>Hopper</td><td>756.0</td><td>2,000</td><td>$2.20</td><td>$0.90</td></tr>
-        <tr><td>H100 SXM</td><td>Hopper</td><td>989.0</td><td>3,350</td><td>$2.80</td><td>$1.75</td></tr>
-        <tr><td>H200</td><td>Hopper</td><td>989.0</td><td>4,800</td><td>$3.50</td><td>$2.50</td></tr>
-        <tr><td>A100 80GB</td><td>Ampere</td><td>312.0</td><td>2,039</td><td>$1.50</td><td>$0.60</td></tr>
+        <tr><td>H100 PCIe</td><td>Hopper</td><td>756.0</td><td>2,000</td><td>$2.89</td><td>$0.90</td></tr>
+        <tr><td>H100 SXM</td><td>Hopper</td><td>989.0</td><td>3,350</td><td>$2.99</td><td>$1.75</td></tr>
+        <tr><td>H200</td><td>Hopper</td><td>989.0</td><td>4,800</td><td>$4.39</td><td>$2.50</td></tr>
+        <tr><td>A100 80GB</td><td>Ampere</td><td>312.0</td><td>2,039</td><td>$1.49</td><td>$0.60</td></tr>
         <tr><td>A100 40GB</td><td>Ampere</td><td>312.0</td><td>1,555</td><td>$1.50</td><td>$0.70</td></tr>
         <tr><td>A10G</td><td>Ampere</td><td>126.0</td><td>600</td><td>$1.00</td><td>$0.40</td></tr>
-        <tr><td>L40S</td><td>Ada</td><td>362.05</td><td>864</td><td>$1.80</td><td>$0.80</td></tr>
-        <tr><td>RTX 5090</td><td>Blackwell</td><td>209.5</td><td>1,792</td><td>$0.69</td><td>$0.40</td></tr>
-        <tr><td>RTX 4090</td><td>Ada</td><td>165.0</td><td>1,008</td><td>$0.44</td><td>$0.35</td></tr>
+        <tr><td>L40S</td><td>Ada</td><td>181.03</td><td>864</td><td>$0.99</td><td>$0.80</td></tr>
+        <tr><td>RTX 5090</td><td>Blackwell</td><td>209.5</td><td>1,792</td><td>$0.99</td><td>$0.40</td></tr>
+        <tr><td>RTX 4090</td><td>Ada</td><td>165.0</td><td>1,008</td><td>$0.69</td><td>$0.35</td></tr>
         <tr><td>RTX 3090 Ti</td><td>Ampere</td><td>80.0</td><td>1,008</td><td>$0.22</td><td>$0.13</td></tr>
-        <tr><td>RTX 3090</td><td>Ampere</td><td>71.16</td><td>936</td><td>$0.20</td><td>$0.14</td></tr>
-        <tr><td>RTX A6000</td><td>Ampere</td><td>77.4</td><td>768</td><td>$0.65</td><td>$0.40</td></tr>
-        <tr><td>RTX PRO 6000 Blackwell</td><td>Blackwell</td><td>250.0</td><td>1,792</td><td>$1.80</td><td>$0.90</td></tr>
-        <tr><td>B200</td><td>Blackwell</td><td>2,250.0</td><td>8,000</td><td>$3.50</td><td>$2.00</td></tr>
-        <tr><td>GB200</td><td>Blackwell</td><td>-</td><td>-</td><td>$8.50</td><td>$4.00</td></tr>
+        <tr><td>RTX 3090</td><td>Ampere</td><td>71.16</td><td>936</td><td>$0.46</td><td>$0.14</td></tr>
+        <tr><td>RTX A6000</td><td>Ampere</td><td>77.4</td><td>768</td><td>$0.49</td><td>$0.40</td></tr>
+        <tr><td>RTX PRO 6000 Blackwell</td><td>Blackwell</td><td>250.0</td><td>1,792</td><td>$1.99</td><td>$0.90</td></tr>
+        <tr><td>B200</td><td>Blackwell</td><td>2,250.0</td><td>7,700</td><td>$5.89</td><td>$2.00</td></tr>
+        <tr><td>B300</td><td>Blackwell</td><td>2,500.0</td><td>8,000</td><td>$7.39</td><td>$7.39</td></tr>
+        <tr><td>GB200</td><td>Blackwell</td><td>2,250.0</td><td>7,700</td><td>$8.50</td><td>$4.00</td></tr>
       </tbody>
     </table>
-    <div class="callout">BF16 TC Dense TFLOPs are tensor-core throughput; the physics roofline input. All values labeled <code>(est)</code> in output. GB200 has a price entry only; roofline is skipped. A plain "A100" without a size token (80GB or 40GB) in the NVML name will not match; Profile requires the size to disambiguate. Prices sampled across AWS, GCP, Azure, Lambda, Nebius, RunPod, CoreWeave, and GMI Cloud.</div>
+    <div class="callout">BF16 TC Dense TFLOPs are tensor-core throughput with FP32 accumulate where the catalog distinguishes it (L40S uses 181.03; datasheet 362.05 is FP16-accumulate). GB200 matches B200 physics (superchip name). B300 is Blackwell Ultra at 8 TB/s. A plain "A100" without a size token (80GB or 40GB) will not match. All catalog ceilings labeled <code>(est)</code> in output.</div>
 
     <h2>Models</h2>
     <p>Matched by token against the model name vLLM reports at startup.</p>
@@ -743,7 +744,7 @@ prefill_floor_ms = 1000 / prefill_ceiling_tps</code></pre>
       <tbody>
         <tr><td>tok / W</td><td><code>generation_tokens_per_sec / power_watts</code></td></tr>
         <tr><td>J / token</td><td><code>power_watts / generation_tokens_per_sec</code></td></tr>
-        <tr><td>$ / 1M output tok</td><td><code>cost_per_hr &times; 1e6 / (generation_tokens_per_sec &times; 3600)</code></td></tr>
+        <tr><td>$ / 1M output tok</td><td><code>cost_per_hr &times; 1e6 / (generation_tokens_per_sec &times; 3600)</code>. Omitted when the turnover gate fails (<code>generation_tokens_completed &lt; mean running</code>): not enough completions to trust the rate.</td></tr>
       </tbody>
     </table>
     <p>Cost priority: <code>--cost-per-hour</code> flag, then GPU catalog on-demand price, then absent. Catalog-derived $/1M output tok is labeled <code>(est)</code> in output; user-provided rates are not. Energy metrics (J/tok, tok/W) use energy-pair windows only (aligned GPU power and vLLM tok/s in the same window).</p>
@@ -759,7 +760,7 @@ prefill_floor_ms = 1000 / prefill_ceiling_tps</code></pre>
 ECONOMICS:
   Cost/1M output tok  $5.09 &rarr; $2.53 (est)</code></pre>
     <p>When config drifted between windows (vLLM restart detected), the line reads <code>Config changed. Baseline reset.</code> and the efficiency arm of the delta is discounted; throughput alone decides improvement direction after a reset.</p>
-    <p>On regression: the degraded state becomes the new baseline and is pushed to the history stack. The loop continues without pausing for confirmation, since you apply the changes manually.</p>
+    <p>On regression: the degraded state becomes the new baseline and is pushed to the history stack. The loop continues through the normal apply/remeasure wait; there is no extra confirmation step beyond that.</p>
     <table>
       <thead><tr><th>Field</th><th><code>worse</code> threshold</th></tr></thead>
       <tbody>
@@ -842,35 +843,37 @@ ECONOMICS:
     <p>Each iteration reports what changed since the last: before &rarr; after values with <code>worse</code> labels on material regressions. A snapshot without temporal comparison is a status report, not a diagnosis.</p>
 
     <h2>Shared traffic gate</h2>
-    <p><code>window_is_evaluable</code> is one function, called once, used by all rules. Idle state has no waste to measure.</p>
+    <p><code>window_is_evaluable</code> is one shared helper, used by all rules. Idle state has no waste to measure.</p>
 
     <h2>Agnostic Telemetry Interfaces</h2>
-    <p>The <code>src/collectors</code> module abstracts raw Prometheus and NVML metrics into a standard <code>RawSnapshot</code> structure. The core diagnostic engine operates strictly on these snapshots. Adding support for a new inference framework requires writing a new collector; zero changes to the engine, mathematical models, or rules are necessary.</p>
+    <p>The <code>src/collectors</code> module abstracts raw Prometheus and GPU metrics into a standard <code>RawSnapshot</code> structure. The engine reasons on those snapshots. The collector boundary is the I/O seam; rules and the limiter still encode vLLM-shaped signals (<code>max_num_seqs</code>, KV gauges, preemption counters). A new inference framework needs a collector and rule/limiter work for its signals.</p>
 
     <h2>Deterministic Reasoning</h2>
     <p>The diagnostic engine is decoupled from CLI execution and network I/O. <code>run_diagnose</code> collects windows and builds the run-level aggregate; <code>engine::build_report_for_diagnose</code> takes that aggregate and produces the <code>Report</code>; <code>output::stdout</code> formats it. The loop runner (<code>profiler::loop_runner</code>) runs conditionally only when there are sufficient evaluable, non-idle windows. This separation means the reasoning layer is deterministic and historical telemetry can be replayed for exact regression testing.</p>
 
     <h2>250ms collection interval</h2>
-    <p>Fast enough to catch GPU utilization transients that a 1s or 5s poll would average away. Slow enough that scrapes per window add no meaningful load to the vLLM endpoint or NVML.</p>
+    <p>Fast enough to catch GPU utilization transients that a 1s or 5s poll would average away. Slow enough that scrapes per window add no meaningful load to the vLLM endpoint or GPU telemetry path.</p>
 
     <h2>Peak over average for KV cache</h2>
-    <p>KV cache usage is tracked as the maximum across all scrapes in a window, not the last value. A spike that causes preemptions and latency degradation can recover before the window ends. The last scrape reports a safe number while the damage already happened. The peak is the signal. The average buries it.</p>
+    <p>KV cache usage is tracked as the maximum across all scrapes in a window, not only the last value. Near-full for rules is avg <strong>or</strong> peak at the pressure bar. A spike that causes preemptions can recover before the window ends; last scrape alone can bury it.</p>
 
-    <h2>Zero allocation in the hot loop</h2>
-    <p>The diagnostic pipeline uses <code>AnalysisInput&lt;'a&gt;</code> to borrow contexts across the execution graph. This ensures the profiler runs efficiently without allocating memory on every 250ms scrape window. A profiler that consumes its target's memory bandwidth is worse than no profiler.</p>
+    <h2>Borrowing in the engine hot path</h2>
+    <p>The diagnostic pipeline uses <code>AnalysisInput&lt;'a&gt;</code> to borrow contexts across the engine without copying static context every window. Collectors still allocate per-window snapshots and histogram vectors. A profiler that eats its target's memory bandwidth is worse than no profiler.</p>
 
     <h2>Graceful degradation over Panics</h2>
-    <p>When integrating parallel telemetry sources (vLLM and NVML), mismatches occur. Version skew can change bucket boundaries in histograms; instead of panicking, the engine skips the corrupted merge and degrades gracefully. One bad scrape window should never destroy the entire session's dataset.</p>
+    <p>When integrating parallel telemetry sources (vLLM and GPU), mismatches occur. Version skew can change bucket boundaries in histograms; instead of panicking, the engine skips the corrupted merge and degrades gracefully. One bad scrape window should never destroy the entire session's dataset.</p>
 
     <h2>Code Hygiene &amp; Security</h2>
-    <p>rustls only, no OpenSSL. Read-only NVML. No external API calls. No telemetry.</p>
-    <p>The CI pipeline rigorously enforces engineering standards on every pull request and merge:</p>
+    <p>rustls only, no OpenSSL. Read-only GPU telemetry. No third-party telemetry leaving the machine; Profile only talks to the configured vLLM endpoint (and best-effort <code>/v1/models</code> / <code>/info</code> on that host).</p>
+    <p>Every pull request and merge to <code>main</code> runs the same gate (see <code>.github/workflows/build.yml</code> and <a href="https://github.com/jungledesh/profile/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener">CONTRIBUTING.md</a>). Never mask a scanner with <code>|| true</code>; allowlist real false positives in <code>deny.toml</code>.</p>
     <ul>
-      <li><strong>OSV-Scanner:</strong> Fails the build immediately on any HIGH or CRITICAL vulnerabilities (CVSS v3 &ge; 7.0) in dependencies.</li>
-      <li><strong>Semgrep SAST:</strong> Static application security testing scans the source code for strict security practices.</li>
-      <li><strong>cargo audit:</strong> Validates the crate dependency tree against the RustSec Advisory Database.</li>
-      <li><strong>cargo clippy:</strong> Fails the build on any compiler warnings (<code>-D warnings</code>), ensuring zero-tolerance code hygiene.</li>
-      <li><strong>cargo fmt:</strong> Enforces standard Rust formatting strictly.</li>
+      <li><strong>cargo audit:</strong> RustSec Advisory Database against the dependency tree.</li>
+      <li><strong>cargo deny:</strong> license, advisory, and ban policy via <code>cargo deny check --all-features</code> (<code>deny.toml</code>).</li>
+      <li><strong>OSV-Scanner:</strong> fails on HIGH or CRITICAL vulnerabilities in <code>Cargo.lock</code> (CVSS v3 &ge; 7.0).</li>
+      <li><strong>Semgrep SAST:</strong> static application security testing on the source.</li>
+      <li><strong>cargo fmt -- --check:</strong> standard Rust formatting.</li>
+      <li><strong>cargo clippy --locked --all-targets --all-features -- -D warnings:</strong> zero-tolerance lint hygiene.</li>
+      <li><strong>cargo test --locked:</strong> unit tests for rules, physics math, and mock payloads.</li>
     </ul>
   </article>
 
