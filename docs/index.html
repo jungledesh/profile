@@ -41,6 +41,9 @@
   .stat b { display: block; font-family: var(--mono); font-size: 30px; font-weight: 600; color: #fff; }
   .stat span { font-family: var(--mono); font-size: 12px; color: var(--ink-3); letter-spacing: 0.05em; }
 
+  .hero-fig { margin-top: 56px; }
+  .hero-fig img { width: 100%; height: auto; display: block; border-radius: 12px; }
+
   /* sections */
   section { padding: 80px 0; border-bottom: 1px solid var(--line); }
   h2 { font-size: clamp(24px, 3.2vw, 34px); font-weight: 600; letter-spacing: -0.01em; color: #fff; }
@@ -136,6 +139,9 @@
       <div class="stat"><b>3.9x</b><span>throughput, H100 run</span></div>
       <div class="stat"><b>93%</b><span>lower $/1M tok, A100 run</span></div>
       <div class="stat"><b>1</b><span>binary, nothing leaves the machine</span></div>
+    </div>
+    <div class="hero-fig">
+      <img src="assets/ceiling-gap.svg" alt="Schematic: the physics ceiling sits far above where your inference server actually runs. The gap has a cause, and Profile names it.">
     </div>
   </div>
 </div>
