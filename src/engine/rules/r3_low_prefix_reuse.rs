@@ -102,6 +102,7 @@ pub fn r3_recommendation(snapshot: &RawSnapshot) -> Option<Recommendation> {
         confidence,
         // Single-window path has no session context - use hit rate from this window only.
         display_lines: format_low_prefix_hit_rate_fired(&d, enable_prefix, None),
+        terminal: false,
     })
 }
 

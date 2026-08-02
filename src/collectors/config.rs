@@ -5,6 +5,9 @@ use crate::collectors::RawSnapshot;
 
 // 2s is enough for a local vLLM; longer hangs are user-visible at startup.
 const API_TIMEOUT: Duration = Duration::from_secs(2);
+/// Enrichment probes (`/info`, `/server_info`): short so three fallbacks cannot
+/// stack to 3× `API_TIMEOUT` when endpoints are missing or hang.
+const INFO_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// vLLM default when --gpu-memory-utilization is not set.
 pub const DEFAULT_GPU_MEMORY_UTILIZATION: f64 = 0.90;
@@ -116,6 +119,8 @@ pub fn build_config(
         cfg.model_root = api.model_root.or(cfg.model_root);
         cfg.max_model_len = api.max_model_len.or(cfg.max_model_len);
         let info = fetch_info(&client, &base);
+        // Scrape label/gauge often missing on modern vLLM (SchedulerConfig-only).
+        apply_info_scheduler_gaps(&mut cfg, &info);
         if (cfg.vllm_reported_dtype.as_deref() == Some("auto") || cfg.vllm_reported_dtype.is_none())
             && let Some(resolved) = info.dtype
         {
@@ -125,6 +130,16 @@ pub fn build_config(
         cfg.vllm_reported_quantization = info.quantization;
     }
     cfg
+}
+
+/// Fill scheduler knobs from `/info` enrichment only when scrape/env left them unset.
+fn apply_info_scheduler_gaps(cfg: &mut VllmConfig, info: &InfoData) {
+    if cfg.enable_chunked_prefill.is_none() {
+        cfg.enable_chunked_prefill = info.enable_chunked_prefill;
+    }
+    if cfg.max_num_batched_tokens.is_none() {
+        cfg.max_num_batched_tokens = info.max_num_batched_tokens;
+    }
 }
 
 /// Strip `/metrics` suffix to get the vLLM server base URL.
@@ -202,27 +217,201 @@ fn blocking_api_client() -> Option<reqwest::blocking::Client> {
 struct InfoData {
     dtype: Option<String>,
     quantization: Option<String>,
+    /// Scheduler: chunked prefill. Absent from modern `cache_config_info`.
+    enable_chunked_prefill: Option<bool>,
+    /// Scheduler: `--max-num-batched-tokens`. Often missing from Prometheus gauges.
+    max_num_batched_tokens: Option<u32>,
 }
 
-fn fetch_info(client: &reqwest::blocking::Client, base_url: &str) -> InfoData {
-    let url = format!("{}/info", base_url.trim_end_matches('/'));
-    let text = match client.get(&url).send().and_then(|r| r.text()) {
-        Ok(t) => t,
-        Err(_) => {
-            return InfoData {
-                dtype: None,
-                quantization: None,
-            };
+impl InfoData {
+    fn empty() -> Self {
+        Self {
+            dtype: None,
+            quantization: None,
+            enable_chunked_prefill: None,
+            max_num_batched_tokens: None,
         }
-    };
-    parse_info_body(&text)
+    }
+
+    fn merge_from(&mut self, other: InfoData) {
+        if self.dtype.is_none() {
+            self.dtype = other.dtype;
+        }
+        if self.quantization.is_none() {
+            self.quantization = other.quantization;
+        }
+        if self.enable_chunked_prefill.is_none() {
+            self.enable_chunked_prefill = other.enable_chunked_prefill;
+        }
+        if self.max_num_batched_tokens.is_none() {
+            self.max_num_batched_tokens = other.max_num_batched_tokens;
+        }
+    }
+
+    /// Both scheduler knobs known: no need to probe further endpoints.
+    fn scheduler_complete(&self) -> bool {
+        self.enable_chunked_prefill.is_some() && self.max_num_batched_tokens.is_some()
+    }
+}
+
+/// Best-effort: GET `/info`, then `/server_info` (+ `?config_format=json`).
+/// Modern vLLM puts chunked-prefill / batched-tokens on `SchedulerConfig`, which
+/// is not exported on `cache_config_info`. These endpoints are the fallback.
+///
+/// Graceful across versions: 404 / DEV_MODE-gated `/server_info` / HTML error
+/// pages / empty bodies are ignored. Missing fields stay `None` (unknown), never
+/// fabricated. Scrape/env values already on `VllmConfig` are never overwritten.
+/// Stops once both scheduler fields are filled so later probes are not paid.
+fn fetch_info(client: &reqwest::blocking::Client, base_url: &str) -> InfoData {
+    let base = base_url.trim_end_matches('/');
+    let mut out = InfoData::empty();
+    for path in ["/info", "/server_info?config_format=json", "/server_info"] {
+        if out.scheduler_complete() {
+            break;
+        }
+        let url = format!("{base}{path}");
+        // Per-request timeout overrides the client default so missing endpoints
+        // cannot burn three full `API_TIMEOUT` waits at diagnose startup.
+        let Ok(resp) = client.get(&url).timeout(INFO_PROBE_TIMEOUT).send() else {
+            continue;
+        };
+        if !resp.status().is_success() {
+            continue;
+        }
+        let Ok(text) = resp.text() else {
+            continue;
+        };
+        if text.trim().is_empty() {
+            continue;
+        }
+        out.merge_from(parse_info_body(&text));
+    }
+    out
+}
+
+fn looks_like_html(text: &str) -> bool {
+    let t = text.trim_start();
+    t.starts_with('<')
+        || t.get(..15)
+            .is_some_and(|s| s.eq_ignore_ascii_case("<!doctype html"))
 }
 
 fn parse_info_body(text: &str) -> InfoData {
-    InfoData {
+    let mut data = InfoData {
         dtype: parse_dtype_from_info_body(text),
         quantization: parse_quantization_from_info_body(text),
+        enable_chunked_prefill: None,
+        max_num_batched_tokens: None,
+    };
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(text) {
+        data.enable_chunked_prefill = parse_chunked_prefill_from_json(&val);
+        data.max_num_batched_tokens = parse_max_num_batched_tokens_from_json(&val);
+        // `server_info` sometimes wraps the snapshot as a string under vllm_config.
+        if (data.enable_chunked_prefill.is_none() || data.max_num_batched_tokens.is_none())
+            && let Some(s) = val.get("vllm_config").and_then(|v| v.as_str())
+        {
+            if data.enable_chunked_prefill.is_none() {
+                data.enable_chunked_prefill = parse_chunked_prefill_from_text(s);
+            }
+            if data.max_num_batched_tokens.is_none() {
+                data.max_num_batched_tokens = parse_max_num_batched_tokens_from_text(s);
+            }
+        }
+    } else if !looks_like_html(text) {
+        // Plain-text config dump only. Never scrape HTML error pages for knobs.
+        data.enable_chunked_prefill = parse_chunked_prefill_from_text(text);
+        data.max_num_batched_tokens = parse_max_num_batched_tokens_from_text(text);
     }
+    data
+}
+
+fn json_bool_field(v: &serde_json::Value, key: &str) -> Option<bool> {
+    match v.get(key)? {
+        serde_json::Value::Bool(b) => Some(*b),
+        serde_json::Value::String(s) => parse_bool(s),
+        _ => None,
+    }
+}
+
+fn json_u32_field(v: &serde_json::Value, key: &str) -> Option<u32> {
+    match v.get(key)? {
+        serde_json::Value::Number(n) => {
+            if let Some(u) = n.as_u64() {
+                return u32::try_from(u).ok();
+            }
+            // Some dumps emit floats (2048.0). Accept only finite whole numbers.
+            let f = n.as_f64()?;
+            if f.is_finite() && f > 0.0 && f.fract() == 0.0 && f <= f64::from(u32::MAX) {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                return Some(f as u32);
+            }
+            None
+        }
+        serde_json::Value::String(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+/// Nested objects that may hold scheduler knobs across vLLM /info shapes.
+const SCHEDULER_JSON_PATHS: &[&[&str]] = &[
+    &["scheduler_config"],
+    &["scheduler"],
+    &["vllm_config", "scheduler_config"],
+    &["vllm_config", "scheduler"],
+];
+
+fn json_at_path<'a>(val: &'a serde_json::Value, path: &[&str]) -> Option<&'a serde_json::Value> {
+    let mut cur = val;
+    for key in path {
+        cur = cur.get(*key)?;
+    }
+    Some(cur)
+}
+
+fn parse_chunked_prefill_from_json(val: &serde_json::Value) -> Option<bool> {
+    for path in SCHEDULER_JSON_PATHS {
+        if let Some(node) = json_at_path(val, path)
+            && let Some(b) = json_bool_field(node, "enable_chunked_prefill")
+                .or_else(|| json_bool_field(node, "chunked_prefill_enabled"))
+        {
+            return Some(b);
+        }
+    }
+    json_bool_field(val, "enable_chunked_prefill")
+        .or_else(|| json_bool_field(val, "chunked_prefill_enabled"))
+}
+
+fn parse_max_num_batched_tokens_from_json(val: &serde_json::Value) -> Option<u32> {
+    for path in SCHEDULER_JSON_PATHS {
+        if let Some(node) = json_at_path(val, path)
+            && let Some(n) = json_u32_field(node, "max_num_batched_tokens")
+        {
+            return Some(n);
+        }
+    }
+    json_u32_field(val, "max_num_batched_tokens")
+}
+
+fn parse_chunked_prefill_from_text(text: &str) -> Option<bool> {
+    for key in ["enable_chunked_prefill=", "chunked_prefill_enabled="] {
+        if let Some(rest) = text.split(key).nth(1) {
+            let token = rest.split([',', ' ', '\n', '\'', '"']).next().unwrap_or("");
+            if let Some(b) = parse_bool(token) {
+                return Some(b);
+            }
+        }
+    }
+    None
+}
+
+fn parse_max_num_batched_tokens_from_text(text: &str) -> Option<u32> {
+    let key = "max_num_batched_tokens=";
+    let rest = text.split(key).nth(1)?;
+    let token = rest
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .unwrap_or("");
+    token.parse().ok()
 }
 
 fn parse_quantization_from_info_body(text: &str) -> Option<String> {
@@ -442,6 +631,150 @@ mod tests {
         let info = parse_info_body(body);
         assert_eq!(info.dtype.as_deref(), Some("bfloat16"));
         assert_eq!(info.quantization.as_deref(), Some("awq"));
+        assert!(info.enable_chunked_prefill.is_none());
+        assert!(info.max_num_batched_tokens.is_none());
+    }
+
+    #[test]
+    fn parse_info_body_reads_scheduler_config() {
+        let body = r#"{
+            "dtype":"bfloat16",
+            "scheduler_config":{
+                "enable_chunked_prefill":true,
+                "max_num_batched_tokens":2048
+            }
+        }"#;
+        let info = parse_info_body(body);
+        assert_eq!(info.enable_chunked_prefill, Some(true));
+        assert_eq!(info.max_num_batched_tokens, Some(2048));
+    }
+
+    #[test]
+    fn parse_info_body_reads_scheduler_nested_alias() {
+        let body = r#"{
+            "scheduler":{
+                "chunked_prefill_enabled":false,
+                "max_num_batched_tokens":"8192"
+            }
+        }"#;
+        let info = parse_info_body(body);
+        assert_eq!(info.enable_chunked_prefill, Some(false));
+        assert_eq!(info.max_num_batched_tokens, Some(8192));
+    }
+
+    #[test]
+    fn parse_info_body_reads_server_info_text_vllm_config() {
+        let body = r#"{
+            "vllm_config":"model='x', enable_chunked_prefill=True, max_num_batched_tokens=2048, dtype=torch.bfloat16"
+        }"#;
+        let info = parse_info_body(body);
+        assert_eq!(info.enable_chunked_prefill, Some(true));
+        assert_eq!(info.max_num_batched_tokens, Some(2048));
+    }
+
+    #[test]
+    fn parse_chunked_prefill_from_plain_text() {
+        assert_eq!(
+            parse_chunked_prefill_from_text("foo chunked_prefill_enabled=False bar"),
+            Some(false)
+        );
+        assert_eq!(
+            parse_max_num_batched_tokens_from_text("max_num_batched_tokens=4096,"),
+            Some(4096)
+        );
+    }
+
+    #[test]
+    fn parse_info_body_html_error_page_yields_unknown_scheduler() {
+        // 404 / DEV_MODE-gated pages must not invent knobs.
+        let body = r#"<!DOCTYPE html><html><body>Not Found
+        enable_chunked_prefill=True max_num_batched_tokens=2048
+        </body></html>"#;
+        let info = parse_info_body(body);
+        assert!(info.enable_chunked_prefill.is_none());
+        assert!(info.max_num_batched_tokens.is_none());
+    }
+
+    #[test]
+    fn parse_info_body_json_without_scheduler_stays_unknown() {
+        let info = parse_info_body(r#"{"detail":"Not Found"}"#);
+        assert!(info.enable_chunked_prefill.is_none());
+        assert!(info.max_num_batched_tokens.is_none());
+        let info = parse_info_body("{}");
+        assert!(info.enable_chunked_prefill.is_none());
+        assert!(info.max_num_batched_tokens.is_none());
+    }
+
+    #[test]
+    fn parse_info_body_accepts_float_batched_tokens() {
+        let body = r#"{"scheduler_config":{"max_num_batched_tokens":2048.0}}"#;
+        let info = parse_info_body(body);
+        assert_eq!(info.max_num_batched_tokens, Some(2048));
+    }
+
+    #[test]
+    fn info_merge_fills_gaps_only() {
+        let mut a = InfoData {
+            dtype: Some("bf16".into()),
+            quantization: None,
+            enable_chunked_prefill: Some(true),
+            max_num_batched_tokens: None,
+        };
+        a.merge_from(InfoData {
+            dtype: Some("fp16".into()),
+            quantization: Some("awq".into()),
+            enable_chunked_prefill: Some(false),
+            max_num_batched_tokens: Some(4096),
+        });
+        assert_eq!(a.dtype.as_deref(), Some("bf16"));
+        assert_eq!(a.quantization.as_deref(), Some("awq"));
+        assert_eq!(a.enable_chunked_prefill, Some(true));
+        assert_eq!(a.max_num_batched_tokens, Some(4096));
+    }
+
+    #[test]
+    fn scheduler_complete_only_when_both_knobs_known() {
+        let mut d = InfoData::empty();
+        assert!(!d.scheduler_complete());
+        d.enable_chunked_prefill = Some(true);
+        assert!(!d.scheduler_complete());
+        d.max_num_batched_tokens = Some(2048);
+        assert!(d.scheduler_complete());
+    }
+
+    #[test]
+    fn scrape_chunked_flag_not_clobbered_when_info_absent() {
+        // Older builds: label on cache_config_info. Enrichment None must not clear it.
+        let mut s = mk_snap(None, None);
+        s.vllm.cache_config.enable_chunked_prefill = Some(false);
+        s.vllm.max_num_batched_tokens = Some(2048);
+        let cfg = config_from_snapshot(&s, None);
+        assert_eq!(cfg.enable_chunked_prefill, Some(false));
+        assert_eq!(cfg.max_num_batched_tokens, Some(2048));
+        let mut enriched = cfg.clone();
+        apply_info_scheduler_gaps(&mut enriched, &InfoData::empty());
+        assert_eq!(enriched.enable_chunked_prefill, Some(false));
+        assert_eq!(enriched.max_num_batched_tokens, Some(2048));
+    }
+
+    #[test]
+    fn apply_info_scheduler_gaps_fills_only_unset() {
+        let mut cfg = VllmConfig {
+            enable_chunked_prefill: Some(true),
+            max_num_batched_tokens: None,
+            ..VllmConfig::default()
+        };
+        apply_info_scheduler_gaps(
+            &mut cfg,
+            &InfoData {
+                dtype: None,
+                quantization: None,
+                enable_chunked_prefill: Some(false),
+                max_num_batched_tokens: Some(4096),
+            },
+        );
+        assert_eq!(cfg.enable_chunked_prefill, Some(true));
+        assert_eq!(cfg.max_num_batched_tokens, Some(4096));
     }
 
     /// Live vLLM only: `cargo test build_config_resolves_auto_dtype_via_info -- --ignored --nocapture`

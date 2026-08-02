@@ -158,6 +158,7 @@ fn maybe_add_massive_underutilization(
         impact: 5,
         confidence,
         display_lines: rules::mu_diagnose_lines(eff, running, waiting, max_num_seqs, variant),
+        terminal: false,
     });
 }
 

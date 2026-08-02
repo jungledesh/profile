@@ -103,15 +103,23 @@ fn r5_confidence_label(empirical: bool, d: &ConcurrencySaturationDetail) -> &'st
     }
 }
 
+const R5_TERMINAL_VERIFY: &str = "      • Verify max-num-seqs and max-model-len took effect.";
+
+fn push_r5_replica_terminal(safe: &mut Vec<String>) {
+    safe.push(R5_TERMINAL_VERIFY.to_string());
+    safe.push("      • Add a replica to scale out.".to_string());
+}
+
 /// Build cause findings plus safe/cuts fix bullets from the resolved walls.
 /// `kv_usage` is the known KV usage percent (A path) or `None` when unavailable.
+/// Fourth return is `terminal`: true when only scale-out remains (no server-local knob).
 fn walls_fix_lines(
     d: &ConcurrencySaturationDetail,
     rec: Option<&super::RecommendedSeqs>,
     kv_usage: Option<f64>,
     max_model_len: Option<u32>,
     snapshot: &RawSnapshot,
-) -> (Vec<String>, Vec<String>, Vec<super::CutBullet>) {
+) -> (Vec<String>, Vec<String>, Vec<super::CutBullet>, bool) {
     use super::{BindingWall, KvBoundSource};
 
     let mut cause = Vec::new();
@@ -135,13 +143,13 @@ fn walls_fix_lines(
                 "      • Raise --max-num-seqs if KV headroom confirmed (no ceiling known)".to_string(),
             ),
         }
-        return (cause, safe, cuts);
+        return (cause, safe, cuts, false);
     };
     let Some(cur) = cur else {
         safe.push(
             "      • Raise --max-num-seqs if KV headroom confirmed (no ceiling known)".to_string(),
         );
-        return (cause, safe, cuts);
+        return (cause, safe, cuts, false);
     };
 
     if rec.target > cur {
@@ -152,7 +160,7 @@ fn walls_fix_lines(
                 "      • Raise --max-num-seqs above {cur} (KV {pct:.0}% peak, pool has room)"
             ));
             safe.push(super::KV_SCALE_CAUTION.to_string());
-            return (cause, safe, cuts);
+            return (cause, safe, cuts, false);
         }
         // Bounded raise. Floor-capped targets are not 80% of the named wall.
         let reason = if rec.floor_capped {
@@ -172,7 +180,7 @@ fn walls_fix_lines(
         if rec.empirical {
             safe.push(super::KV_SCALE_CAUTION.to_string());
         }
-        return (cause, safe, cuts);
+        return (cause, safe, cuts, false);
     }
 
     // target <= current: no knob. Floor-capped findings are not ridge-zone claims.
@@ -180,13 +188,13 @@ fn walls_fix_lines(
         cause.push(format!(
             "      • --max-num-seqs={cur} is at the estimated KV limit (est, from live traffic)"
         ));
-        safe.push("      • Add a replica to scale out.".to_string());
-        return (cause, safe, cuts);
+        push_r5_replica_terminal(&mut safe);
+        return (cause, safe, cuts, true);
     }
 
     // "at" only when current >= wall.
     let at_wall = f64::from(cur) >= rec.wall;
-    match rec.binder {
+    let terminal = match rec.binder {
         BindingWall::Ridge | BindingWall::Config => {
             let zone = if at_wall {
                 format!("at the compute ridge (~{:.0})", rec.wall)
@@ -199,7 +207,8 @@ fn walls_fix_lines(
             cause.push(format!(
                 "      • --max-num-seqs={cur} is {zone}; raising adds TPOT, not throughput"
             ));
-            safe.push("      • Add a replica to scale out.".to_string());
+            push_r5_replica_terminal(&mut safe);
+            true
         }
         BindingWall::Memory { .. } => {
             let wall = match rec.source {
@@ -223,19 +232,32 @@ fn walls_fix_lines(
                 super::model_len_shrink_suggestion_lines(max_model_len, &evidence, "      ", false);
             super::extend_with_shrink_suggestion(&mut cuts, shrink);
             if cuts.is_empty() {
-                safe.push("      • Add a replica to scale out.".to_string());
+                push_r5_replica_terminal(&mut safe);
+                true
+            } else {
+                false
             }
         }
-    }
-    (cause, safe, cuts)
+    };
+    (cause, safe, cuts, terminal)
 }
 
+#[cfg(test)]
 pub(super) fn format_concurrency_saturation_issue(
     d: &ConcurrencySaturationDetail,
     max_model_len: Option<u32>,
     rec: Option<&super::RecommendedSeqs>,
     snapshot: &RawSnapshot,
 ) -> Vec<String> {
+    format_concurrency_saturation_issue_with_terminal(d, max_model_len, rec, snapshot).0
+}
+
+pub(super) fn format_concurrency_saturation_issue_with_terminal(
+    d: &ConcurrencySaturationDetail,
+    max_model_len: Option<u32>,
+    rec: Option<&super::RecommendedSeqs>,
+    snapshot: &RawSnapshot,
+) -> (Vec<String>, bool) {
     let max_str = d
         .max_num_seqs
         .map(|n| n.to_string())
@@ -312,18 +334,21 @@ pub(super) fn format_concurrency_saturation_issue(
         (None, Some(avg)) => lines.push(format!("      • TTFT {}", fmt_seconds_from_ms(avg))),
         (None, None) => {}
     }
-    let (walls_cause, safe, cuts) = match gate_kv {
+    let (walls_cause, safe, cuts, terminal) = match gate_kv {
         Some(pct) if pct < KV_CACHE_SAFE_TO_SCALE_PCT => {
             walls_fix_lines(d, rec, Some(pct), max_model_len, snapshot)
         }
         Some(pct) => {
             // KV >= safe-to-scale gate: pool full, no config change helps. Scale out.
+            let mut safe = Vec::new();
+            push_r5_replica_terminal(&mut safe);
             (
                 vec![format!(
                     "      • KV at {pct:.0}%: scheduler at cap, pool full; no config change helps"
                 )],
-                vec!["      • Add a replica to scale out.".to_string()],
+                safe,
                 Vec::new(),
+                true,
             )
         }
         None => walls_fix_lines(d, rec, None, max_model_len, snapshot),
@@ -337,7 +362,7 @@ pub(super) fn format_concurrency_saturation_issue(
         "    Confidence: {}",
         r5_confidence_label(empirical, d)
     ));
-    lines
+    (lines, terminal)
 }
 
 pub(super) fn format_concurrency_saturation_window_issue(
@@ -346,11 +371,10 @@ pub(super) fn format_concurrency_saturation_window_issue(
     max_model_len: Option<u32>,
     rec: Option<&super::RecommendedSeqs>,
     snapshot: &RawSnapshot,
-) -> Vec<String> {
-    super::with_seen_pct(
-        format_concurrency_saturation_issue(d, max_model_len, rec, snapshot),
-        seen_pct,
-    )
+) -> (Vec<String>, bool) {
+    let (lines, terminal) =
+        format_concurrency_saturation_issue_with_terminal(d, max_model_len, rec, snapshot);
+    (super::with_seen_pct(lines, seen_pct), terminal)
 }
 
 #[cfg(test)]
@@ -363,17 +387,19 @@ pub fn r5_recommendation(
 ) -> Option<Recommendation> {
     let d = rule5_concurrency_saturation(snapshot, kv_cache_usage_perc, config_max_num_seqs)?;
     let empirical = rec.is_some_and(|r| r.empirical);
+    let (display_lines, terminal) = format_concurrency_saturation_issue_with_terminal(
+        &d,
+        max_model_len,
+        rec.as_ref(),
+        snapshot,
+    );
     Some(Recommendation {
         rule_name: rule_names::CONCURRENCY_SATURATION,
         layer: 3,
         impact: 4,
         confidence: r5_confidence(&d, empirical),
-        display_lines: format_concurrency_saturation_issue(
-            &d,
-            max_model_len,
-            rec.as_ref(),
-            snapshot,
-        ),
+        display_lines,
+        terminal,
     })
 }
 
@@ -909,7 +935,7 @@ mod tests {
 
     #[test]
     fn window_issue_inserts_seen_pct() {
-        let lines = format_concurrency_saturation_window_issue(
+        let (lines, _) = format_concurrency_saturation_window_issue(
             &fired_detail(None, None),
             40,
             None,
@@ -1170,19 +1196,36 @@ mod tests {
     #[test]
     fn spec_ridge_at_wall() {
         let rec = rec_for(Some(153.0), None, None, 153);
-        let text = format_concurrency_saturation_issue(
+        let (text, terminal) = format_concurrency_saturation_issue_with_terminal(
             &detail_at(153, Some(50.0), None),
             None,
             Some(&rec),
             &blank_snap(),
-        )
-        .join("\n");
+        );
+        let text = text.join("\n");
+        assert!(terminal);
         assert!(text.contains(
             "--max-num-seqs=153 is at the compute ridge (~153); raising adds TPOT, not throughput"
         ));
         finding_before_fix(&text, "raising adds TPOT, not throughput");
+        assert!(text.contains(R5_TERMINAL_VERIFY.trim_start()));
         fix_line_after_header(&text, "Add a replica to scale out");
+        let verify_at = text.find("Verify max-num-seqs").expect("verify");
+        let replica_at = text.find("Add a replica to scale out").expect("replica");
+        assert!(verify_at < replica_at, "verify before replica");
         assert!(!text.contains("at the compute ridge (~153). Raising"));
+    }
+
+    #[test]
+    fn raise_path_not_terminal() {
+        let rec = rec_for(Some(153.0), None, None, 64);
+        let (_, terminal) = format_concurrency_saturation_issue_with_terminal(
+            &detail_at(64, Some(50.0), None),
+            None,
+            Some(&rec),
+            &blank_snap(),
+        );
+        assert!(!terminal);
     }
 
     // 6. memory margin Observed / derived labels; shrink under Cuts.
@@ -1465,9 +1508,10 @@ mod tests {
         let fix_body = &text[fix_start..expected_start];
         assert_eq!(
             fix_body.matches("      • ").count(),
-            1,
-            "empty shrink must fall back to replica only: {fix_body}"
+            2,
+            "empty shrink: verify + replica only: {fix_body}"
         );
+        assert!(fix_body.contains("Verify max-num-seqs"));
     }
 
     #[test]
@@ -1552,9 +1596,10 @@ mod tests {
         let fix_body = &text[fix_start..expected_start];
         assert_eq!(
             fix_body.matches("      • ").count(),
-            1,
-            "Fix must contain only the replica action: {fix_body}"
+            2,
+            "Fix must be verify + replica only: {fix_body}"
         );
+        assert!(fix_body.contains("Verify max-num-seqs"));
     }
 
     #[test]

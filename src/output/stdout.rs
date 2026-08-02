@@ -1963,6 +1963,7 @@ mod tests {
                 impact: 5,
                 confidence: 0.9,
                 display_lines: vec!["[!] OOM".to_string()],
+                terminal: false,
             }],
             suppressed_rules: Vec::new(),
             suppressed_recs: Vec::new(),

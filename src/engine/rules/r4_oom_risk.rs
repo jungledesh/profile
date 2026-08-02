@@ -128,20 +128,27 @@ pub(super) fn r4_recommendation_with_request_floor(
             impact: 5,
             confidence,
             display_lines,
+            // Raise util is a server knob; smaller model / more VRAM is not.
+            terminal: !can_raise_utilization,
         });
     }
     let overflow = h.abs();
     let confidence = confidence_for_source(weight_dtype_source);
     let gpu_util = gpu_memory_utilization.unwrap_or(DEFAULT_GPU_MEMORY_UTILIZATION);
-    let unrunnable = weight_gb
-        .zip(vram_gb)
-        .is_some_and(|(_, v)| (v * gpu_util) - ACTIVATION_KV_BUFFER_GB <= 0.0);
+    // Hardware wall: even at util 1.0 the card cannot hold the activation buffer.
+    // Config wall: current util starves the buffer, but raising util would free it.
+    let hardware_unrunnable = vram_gb.is_some_and(|v| v - ACTIVATION_KV_BUFFER_GB <= 0.0);
+    let util_blocks_activation = vram_gb
+        .is_some_and(|v| !hardware_unrunnable && (v * gpu_util) - ACTIVATION_KV_BUFFER_GB <= 0.0);
     let computed_min_tp = weight_gb
         .zip(vram_gb)
         .and_then(|(w, v)| min_tp(w, v, gpu_util));
 
-    let fix_line = if unrunnable {
+    let fix_line = if hardware_unrunnable {
         "      • This GPU has insufficient VRAM for activation memory alone. This model cannot run on this hardware.".to_string()
+    } else if util_blocks_activation {
+        "      • Raise --gpu-memory-utilization; current setting leaves no room for activation memory."
+            .to_string()
     } else {
         match (tensor_parallel_size, computed_min_tp) {
             (Some(current), Some(needed)) if current < needed => format!(
@@ -177,6 +184,8 @@ pub(super) fn r4_recommendation_with_request_floor(
             "    Expected: Model fits in VRAM; eliminates OOM risk.".to_string(),
             format!("    Confidence: {}", super::confidence_label(confidence)),
         ],
+        // Hardware wall only. Util raise / TP / max-model-len are still knobs.
+        terminal: hardware_unrunnable,
     })
 }
 
@@ -295,6 +304,7 @@ mod tests {
         assert!(text.contains("Raise --gpu-memory-utilization"));
         assert!(!text.contains("tensor-parallel"));
         assert!(!text.contains("KV cache dtype unrecognized"));
+        assert!(!with_whiteboard.terminal, "raise util is a server knob");
 
         let without_whiteboard = r4_recommendation_with_request_floor(
             Some(0.05),
@@ -309,6 +319,81 @@ mod tests {
             },
         );
         assert!(without_whiteboard.is_none());
+    }
+
+    #[test]
+    fn request_floor_terminal_when_only_hardware_change_helps() {
+        // util already 1.0 → cannot raise; smaller model / more VRAM is the fix.
+        let r = r4_recommendation_with_request_floor(
+            Some(0.05),
+            Some(1),
+            Some(20.0),
+            Some(24.0),
+            Some(1.0),
+            WeightDtypeSource::Catalog,
+            R4FloorEvidence {
+                request_bytes: Some(60_000_000),
+                kv_cache_dtype_source: KvCacheDtypeSource::Auto,
+            },
+        )
+        .expect("one request should not fit");
+        let text = r.display_lines.join("\n");
+        assert!(text.contains("smaller model or a GPU with more VRAM"));
+        assert!(r.terminal);
+    }
+
+    #[test]
+    fn weights_overflow_terminal_when_unrunnable() {
+        // 3GB physical < 3GB activation buffer even at util 1.0 → hardware wall.
+        let r = r4_recommendation(
+            Some(-12.5),
+            Some(1),
+            Some(140.0),
+            Some(3.0),
+            Some(0.9),
+            WeightDtypeSource::EnvVar,
+        )
+        .expect("fired");
+        let text = r.display_lines.join("\n");
+        assert!(text.contains("cannot run on this hardware"));
+        assert!(r.terminal);
+    }
+
+    #[test]
+    fn weights_overflow_util_blocks_activation_not_terminal() {
+        // 8GB × 0.3 = 2.4GB < 3GB buffer; at util 1.0 the card can hold it.
+        let r = r4_recommendation(
+            Some(-12.5),
+            Some(1),
+            Some(140.0),
+            Some(8.0),
+            Some(0.3),
+            WeightDtypeSource::EnvVar,
+        )
+        .expect("fired");
+        let text = r.display_lines.join("\n");
+        assert!(text.contains("Raise --gpu-memory-utilization"));
+        assert!(!text.contains("cannot run on this hardware"));
+        assert!(
+            !text.contains("tensor-parallel"),
+            "TP is not the fix when util starves activation: {text}"
+        );
+        assert!(!r.terminal);
+    }
+
+    #[test]
+    fn weights_overflow_not_terminal_when_tp_can_help() {
+        let r = r4_recommendation(
+            Some(-12.5),
+            Some(1),
+            Some(140.0),
+            Some(80.0),
+            Some(0.9),
+            WeightDtypeSource::EnvVar,
+        )
+        .expect("fired");
+        assert!(r.display_lines.join("\n").contains("tensor-parallel-size"));
+        assert!(!r.terminal);
     }
 
     #[test]

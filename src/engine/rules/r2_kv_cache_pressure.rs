@@ -104,10 +104,16 @@ fn push_kv_offload_fix_last(
     model: Option<&crate::context::ModelArch>,
     tp: Option<u32>,
 ) {
-    if snapshot.vllm.cache_config.kv_offloading != crate::collectors::KvOffloadState::Off {
+    use crate::collectors::KvOffloadState;
+
+    if matches!(
+        snapshot.vllm.cache_config.kv_offloading,
+        KvOffloadState::Unsupported | KvOffloadState::Unreadable
+    ) {
         return;
     }
-    let size = resolve_kv_offload_size_gib(KvOffloadSizeInput {
+
+    let size_input = KvOffloadSizeInput {
         host_memory: snapshot.host_memory,
         pool_bytes: super::resolve_kv_pool_bytes(
             kv_headroom_gb,
@@ -120,10 +126,32 @@ fn push_kv_offload_fix_last(
         preempt_per_sec: snapshot.vllm.num_preemptions_per_sec,
         run_duration_secs: snapshot.vllm.window_duration_secs,
         peak_waiting: peak_waiting(snapshot),
-    });
-    let bullet = kv_offload_fix_bullet(size);
-    let subline = format_kv_offload_subline(snapshot.host_memory);
-    super::push_bullet_with_subline(safe, bullet, Some(&subline));
+    };
+
+    match snapshot.vllm.cache_config.kv_offloading {
+        KvOffloadState::Off => {
+            let size = resolve_kv_offload_size_gib(size_input);
+            let bullet = kv_offload_fix_bullet(size);
+            let subline = format_kv_offload_subline(snapshot.host_memory);
+            super::push_bullet_with_subline(safe, bullet, Some(&subline));
+        }
+        KvOffloadState::Enabled(v) => {
+            let Some(derived) = resolve_kv_offload_size_gib(size_input) else {
+                return;
+            };
+            // Same whole-GiB rounding as derived; equality at GiB granularity is a no-op.
+            let Some(set) = ceil_bytes_to_whole_gib(v * GIB_BYTES) else {
+                return;
+            };
+            if derived <= set {
+                return;
+            }
+            let bullet = kv_offload_fix_bullet(Some(derived));
+            let subline = format_kv_offload_subline(snapshot.host_memory);
+            super::push_bullet_with_subline(safe, bullet, Some(&subline));
+        }
+        KvOffloadState::Unsupported | KvOffloadState::Unreadable => {}
+    }
 }
 
 fn peak_waiting(snapshot: &RawSnapshot) -> Option<f64> {
@@ -263,7 +291,7 @@ fn push_dead_end_fixes(safe: &mut Vec<String>) {
     safe.push(replica_kv_wall_bullet());
 }
 
-/// Suggest KV offload when the build exposes the label and size is off.
+/// Suggest KV offload size (Off path, or Enabled re-offer when derived > set).
 fn kv_offload_fix_bullet(size_gib: Option<u64>) -> String {
     match size_gib {
         Some(n) => format!(
@@ -466,28 +494,30 @@ pub fn r2_recommendation(input: R2RecommendationInput<'_>) -> Option<Recommendat
     } else {
         0.5
     };
+    let (display_lines, terminal) = format_kv_cache_pressure_fired_with_terminal(
+        &d,
+        &KvFormatCtx {
+            snapshot,
+            max_model_len,
+            kv_headroom_gb,
+            kv_max_seqs,
+            config_max_num_seqs: snapshot.vllm.max_num_seqs,
+            capacity_label,
+            fp8_compiler_available,
+            model: None,
+            tp: None,
+            kv_cache_dtype: snapshot.vllm.cache_config.cache_dtype.as_deref(),
+        },
+        windows_fired,
+        total_evaluable,
+    );
     Some(Recommendation {
         rule_name: rule_names::KV_CACHE_PRESSURE,
         layer: 2,
         impact: 5,
         confidence,
-        display_lines: format_kv_cache_pressure_fired(
-            &d,
-            &KvFormatCtx {
-                snapshot,
-                max_model_len,
-                kv_headroom_gb,
-                kv_max_seqs,
-                config_max_num_seqs: snapshot.vllm.max_num_seqs,
-                capacity_label,
-                fp8_compiler_available,
-                model: None,
-                tp: None,
-                kv_cache_dtype: snapshot.vllm.cache_config.cache_dtype.as_deref(),
-            },
-            windows_fired,
-            total_evaluable,
-        ),
+        display_lines,
+        terminal,
     })
 }
 
@@ -609,12 +639,22 @@ fn kv_cause_line(avg_s: &str, peak_s: &str, burst: bool) -> String {
     }
 }
 
+#[cfg(test)]
 pub(super) fn format_kv_cache_pressure_fired(
     d: &KvCachePressureDetail,
     ctx: &KvFormatCtx<'_>,
     windows_fired: usize,
     total_evaluable: usize,
 ) -> Vec<String> {
+    format_kv_cache_pressure_fired_with_terminal(d, ctx, windows_fired, total_evaluable).0
+}
+
+pub(super) fn format_kv_cache_pressure_fired_with_terminal(
+    d: &KvCachePressureDetail,
+    ctx: &KvFormatCtx<'_>,
+    windows_fired: usize,
+    total_evaluable: usize,
+) -> (Vec<String>, bool) {
     let hyp = ctx.hyp_capacity();
     let snapshot = ctx.snapshot;
     let max_model_len = ctx.max_model_len;
@@ -727,8 +767,8 @@ pub(super) fn format_kv_cache_pressure_fired(
         }
     }
 
-    let has_fix = !safe.is_empty() || !cuts.is_empty();
-    if !has_fix {
+    let terminal = safe.is_empty() && cuts.is_empty();
+    if terminal {
         push_dead_end_fixes(&mut safe);
     }
 
@@ -779,9 +819,10 @@ pub(super) fn format_kv_cache_pressure_fired(
             super::confidence_label(confidence)
         ));
     }
-    out
+    (out, terminal)
 }
 
+#[cfg(test)]
 pub(super) fn format_kv_admission_backlog_issue(
     d: &KvAdmissionBacklogDetail,
     seen_pct: u32,
@@ -789,6 +830,23 @@ pub(super) fn format_kv_admission_backlog_issue(
     windows_fired: usize,
     total_evaluable: usize,
 ) -> Vec<String> {
+    format_kv_admission_backlog_issue_with_terminal(
+        d,
+        seen_pct,
+        ctx,
+        windows_fired,
+        total_evaluable,
+    )
+    .0
+}
+
+pub(super) fn format_kv_admission_backlog_issue_with_terminal(
+    d: &KvAdmissionBacklogDetail,
+    seen_pct: u32,
+    ctx: &KvFormatCtx<'_>,
+    windows_fired: usize,
+    total_evaluable: usize,
+) -> (Vec<String>, bool) {
     let kv_cache_dtype = ctx.kv_cache_dtype;
     let mut out = vec![
         "[!] KV Cache Pressure: Admission Backlog".to_string(),
@@ -834,7 +892,8 @@ pub(super) fn format_kv_admission_backlog_issue(
     }
     super::extend_with_shrink_suggestion(&mut cuts, shrink);
 
-    if safe.is_empty() && cuts.is_empty() {
+    let terminal = safe.is_empty() && cuts.is_empty();
+    if terminal {
         push_dead_end_fixes(&mut safe);
     }
 
@@ -850,7 +909,7 @@ pub(super) fn format_kv_admission_backlog_issue(
             super::confidence_label(confidence)
         ));
     }
-    super::with_seen_pct(out, seen_pct)
+    (super::with_seen_pct(out, seen_pct), terminal)
 }
 
 pub(super) fn aggregate_backlog_detail(
@@ -889,11 +948,10 @@ pub(super) fn format_kv_cache_window_issue(
     ctx: &KvFormatCtx<'_>,
     windows_fired: usize,
     total_evaluable: usize,
-) -> Vec<String> {
-    super::with_seen_pct(
-        format_kv_cache_pressure_fired(d, ctx, windows_fired, total_evaluable),
-        seen_pct,
-    )
+) -> (Vec<String>, bool) {
+    let (lines, terminal) =
+        format_kv_cache_pressure_fired_with_terminal(d, ctx, windows_fired, total_evaluable);
+    (super::with_seen_pct(lines, seen_pct), terminal)
 }
 
 pub(super) fn aggregate_r2_detail(details: &[KvCachePressureDetail]) -> KvCachePressureDetail {
@@ -985,6 +1043,60 @@ mod tests {
         assert!(text.contains("Add a replica to scale out."));
         assert!(text.contains("No config change on this GPU moves the KV wall."));
         assert!(text.contains("Expected:"));
+    }
+
+    #[test]
+    fn dead_end_path_is_terminal_pressure_and_backlog() {
+        use crate::collectors::KvOffloadState;
+        let (snap, m) = dead_end_snap(
+            KvOffloadState::Enabled(16.0),
+            10000,
+            5000.0,
+            4600.0,
+            Some(1),
+        );
+        let (_, pressure_term) = format_kv_cache_pressure_fired_with_terminal(
+            &detail(98.0, true),
+            &kv_ctx_config(&snap, Some(m), None, None, None),
+            3,
+            4,
+        );
+        assert!(pressure_term);
+        let (_, backlog_term) = format_kv_admission_backlog_issue_with_terminal(
+            &sample_backlog_detail(),
+            50,
+            &kv_ctx_config(&snap, Some(m), None, None, None),
+            3,
+            4,
+        );
+        assert!(backlog_term);
+    }
+
+    #[test]
+    fn lever_path_not_terminal() {
+        use crate::collectors::KvOffloadState;
+        let (_, terminal) = format_kv_cache_pressure_fired_with_terminal(
+            &detail(90.0, true),
+            &kv_ctx(
+                &snap_vram(
+                    VllmRawMetrics {
+                        kv_cache_usage_perc: Some(90.0),
+                        num_preemptions_per_sec: Some(0.05),
+                        cache_config: offload_cache(KvOffloadState::Off),
+                        max_num_seqs: Some(256),
+                        ..Default::default()
+                    },
+                    VRAM_AMPLY_FREE_USED_MB,
+                    VRAM_AMPLY_FREE_TOTAL_MB,
+                ),
+                None,
+                Some(30.0),
+                None,
+            ),
+            3,
+            4,
+        );
+        assert!(!terminal);
     }
 
     fn assert_no_dead_end_pair(text: &str) {
@@ -3576,13 +3688,273 @@ mod tests {
         assert_offload_block(&b);
     }
 
-    #[test]
-    fn kv_offload_size_16_no_bullet() {
-        use crate::collectors::KvOffloadState;
-        let (c, n, b) = format_offload_three_paths(offload_cache(KvOffloadState::Enabled(16.0)));
-        for text in [c.join("\n"), n.join("\n"), b.join("\n")] {
-            assert!(!text.contains("kv-offloading-size"), "already on: {text}");
+    /// Journey-shaped scrape with host memory so derivation can resolve.
+    /// `host` sets the supply side (`0.5 * usable`); keep preempt on all paths.
+    fn format_offload_three_paths_derived(
+        state: crate::collectors::KvOffloadState,
+        host: crate::collectors::HostMemoryFacts,
+        headroom_si: f64,
+    ) -> (Vec<String>, Vec<String>, Vec<String>) {
+        use crate::collectors::RawSnapshotFixture;
+        let vllm = |preempt: Option<f64>| VllmRawMetrics {
+            kv_cache_usage_perc: Some(97.0),
+            num_requests_running: Some(34.0),
+            num_requests_waiting: Some(36.0),
+            num_requests_waiting_peak: Some(36.0),
+            kv_frac_per_running_peak: Some(0.97 / 34.0),
+            num_preemptions_per_sec: preempt,
+            window_duration_secs: Some(120.0),
+            max_num_seqs: Some(175),
+            prompt_tokens_mean: Some(64.0),
+            cache_config: CacheConfigLabels {
+                num_gpu_blocks: Some(1000),
+                block_size: Some(16),
+                ..offload_cache(state)
+            },
+            ..Default::default()
+        };
+        let snap = |preempt: Option<f64>| {
+            RawSnapshotFixture::default()
+                .vllm(vllm(preempt))
+                .host_memory(Some(host))
+                .build()
+        };
+        let crisis_snap = snap(Some(0.27));
+        let crisis = format_kv_cache_pressure_fired(
+            &detail(97.0, true),
+            &kv_ctx(&crisis_snap, None, Some(headroom_si), None),
+            3,
+            4,
+        );
+        // Keep preempt rate for derivation even when the detail is non-crisis.
+        let non_crisis_snap = snap(Some(0.27));
+        let non_crisis = format_kv_cache_pressure_fired(
+            &KvCachePressureDetail {
+                kv_cache_usage_perc: Some(97.0),
+                kv_peak_pct: Some(100.0),
+                preemptions_active: false,
+                queue_backpressure: true,
+            },
+            &kv_ctx(&non_crisis_snap, None, Some(headroom_si), None),
+            3,
+            4,
+        );
+        let backlog_snap = snap(Some(0.27));
+        let backlog = format_kv_admission_backlog_issue(
+            &KvAdmissionBacklogDetail {
+                kv_cache_usage_perc: 97.0,
+                kv_peak_pct: Some(100.0),
+                admission_ratio: 36.0 / 70.0,
+                requests_waiting: 36.0,
+                requests_running: 34.0,
+                free_kv_tokens: 100.0,
+                demand_tokens: 200.0,
+            },
+            75,
+            &kv_ctx(&backlog_snap, None, Some(headroom_si), None),
+            3,
+            4,
+        );
+        (crisis, non_crisis, backlog)
+    }
+
+    fn assert_no_offload_bullet(texts: &[String]) {
+        for text in texts {
+            assert!(
+                !text.contains("kv-offloading-size"),
+                "expected quiet offload arm:\n{text}"
+            );
         }
+    }
+
+    #[test]
+    fn kv_offload_enabled_derived_below_set_quiet_all_paths() {
+        use crate::collectors::KvOffloadState;
+        // Journey derives 23; set 64 -> never prescribe a shrink.
+        let headroom_si = 24.8 * super::GIB_BYTES / 1e9;
+        let (c, n, b) = format_offload_three_paths_derived(
+            KvOffloadState::Enabled(64.0),
+            journey_host_memory(),
+            headroom_si,
+        );
+        assert_no_offload_bullet(&[c.join("\n"), n.join("\n"), b.join("\n")]);
+    }
+
+    #[test]
+    fn kv_offload_enabled_4_reoffers_12_all_paths() {
+        use crate::collectors::{HostMemoryFacts, KvOffloadState};
+        // Supply = 0.5 * 24 GiB = 12; journey demand > 12 -> derived 12.
+        let host = HostMemoryFacts {
+            available_bytes: 24 << 30,
+            container_limit_bytes: None,
+        };
+        let headroom_si = 24.8 * super::GIB_BYTES / 1e9;
+        assert_eq!(
+            super::resolve_kv_offload_size_gib(super::KvOffloadSizeInput {
+                host_memory: Some(host),
+                pool_bytes: Some(journey_pool_bytes()),
+                kv_frac_per_running_peak: Some(0.97 / 34.0),
+                preempt_per_sec: Some(0.27),
+                run_duration_secs: Some(120.0),
+                peak_waiting: Some(36.0),
+            }),
+            Some(12)
+        );
+        let (c, n, b) =
+            format_offload_three_paths_derived(KvOffloadState::Enabled(4.0), host, headroom_si);
+        for text in [c.join("\n"), n.join("\n"), b.join("\n")] {
+            assert!(
+                text.contains("Set --kv-offloading-size 12 (est) to hold evicted KV"),
+                "re-offer 12:\n{text}"
+            );
+            assert!(text.contains("Host RAM available: 24 GiB, container limit none."));
+            assert!(!text.contains("Set --kv-offloading-size (GiB)"));
+            let idx = text
+                .lines()
+                .position(|l| l.contains("Set --kv-offloading-size 12 (est)"))
+                .expect("sized bullet");
+            let lines: Vec<&str> = text.lines().collect();
+            if let Some(safe_idx) = lines.iter().position(|l| *l == "    Safe to apply:") {
+                let cuts_idx = lines
+                    .iter()
+                    .position(|l| *l == "    Cuts throughput:")
+                    .expect("cuts group");
+                assert!(safe_idx < idx && idx < cuts_idx, "last in safe group");
+            }
+        }
+    }
+
+    #[test]
+    fn kv_offload_enabled_equal_derived_quiet() {
+        use crate::collectors::{HostMemoryFacts, KvOffloadState};
+        // Supply clips to 12; set 12 -> equality is a no-op.
+        let host = HostMemoryFacts {
+            available_bytes: 24 << 30,
+            container_limit_bytes: None,
+        };
+        let headroom_si = 24.8 * super::GIB_BYTES / 1e9;
+        let (c, n, b) =
+            format_offload_three_paths_derived(KvOffloadState::Enabled(12.0), host, headroom_si);
+        assert_no_offload_bullet(&[c.join("\n"), n.join("\n"), b.join("\n")]);
+    }
+
+    #[test]
+    fn kv_offload_enabled_missing_preempt_quiet_no_numberless() {
+        use crate::collectors::{KvOffloadState, RawSnapshotFixture};
+        let headroom_si = 24.8 * super::GIB_BYTES / 1e9;
+        let snap = RawSnapshotFixture::default()
+            .vllm(VllmRawMetrics {
+                kv_cache_usage_perc: Some(97.0),
+                num_requests_running: Some(34.0),
+                num_requests_waiting_peak: Some(36.0),
+                kv_frac_per_running_peak: Some(0.97 / 34.0),
+                num_preemptions_per_sec: None,
+                window_duration_secs: Some(120.0),
+                max_num_seqs: Some(175),
+                cache_config: offload_cache(KvOffloadState::Enabled(4.0)),
+                ..Default::default()
+            })
+            .host_memory(Some(journey_host_memory()))
+            .build();
+        let text = format_kv_cache_pressure_fired(
+            &detail(97.0, true),
+            &kv_ctx(&snap, None, Some(headroom_si), None),
+            3,
+            4,
+        )
+        .join("\n");
+        assert!(
+            !text.contains("kv-offloading-size"),
+            "underivable Enabled must not emit numberless bullet:\n{text}"
+        );
+    }
+
+    #[test]
+    fn kv_offload_enabled_4_5_whole_gib_equality_quiet() {
+        use crate::collectors::{HostMemoryFacts, KvOffloadState, RawSnapshotFixture};
+        // Demand 4.1 GiB -> derived ceil 5; set ceil(4.5)=5 -> quiet.
+        let host = HostMemoryFacts {
+            available_bytes: 1921 << 30,
+            container_limit_bytes: Some(234 << 30),
+        };
+        let pool = journey_pool_bytes();
+        let demand_gib = 4.1;
+        let parked = 1.0_f64;
+        let frac = (demand_gib * super::GIB_BYTES) / ((pool as f64) * parked);
+        assert_eq!(
+            super::resolve_kv_offload_size_gib(super::KvOffloadSizeInput {
+                host_memory: Some(host),
+                pool_bytes: Some(pool),
+                kv_frac_per_running_peak: Some(frac),
+                preempt_per_sec: Some(1.0),
+                run_duration_secs: Some(1.0),
+                peak_waiting: Some(1.0),
+            }),
+            Some(5)
+        );
+        assert_eq!(
+            super::ceil_bytes_to_whole_gib(4.5 * super::GIB_BYTES),
+            Some(5)
+        );
+        let headroom_si = 24.8 * super::GIB_BYTES / 1e9;
+        let snap = RawSnapshotFixture::default()
+            .vllm(VllmRawMetrics {
+                kv_cache_usage_perc: Some(97.0),
+                num_requests_running: Some(34.0),
+                num_requests_waiting_peak: Some(1.0),
+                kv_frac_per_running_peak: Some(frac),
+                num_preemptions_per_sec: Some(1.0),
+                window_duration_secs: Some(1.0),
+                max_num_seqs: Some(175),
+                cache_config: offload_cache(KvOffloadState::Enabled(4.5)),
+                ..Default::default()
+            })
+            .host_memory(Some(host))
+            .build();
+        let text = format_kv_cache_pressure_fired(
+            &detail(97.0, true),
+            &kv_ctx(&snap, None, Some(headroom_si), None),
+            3,
+            4,
+        )
+        .join("\n");
+        assert!(
+            !text.contains("kv-offloading-size"),
+            "whole-GiB equality must stay quiet:\n{text}"
+        );
+    }
+
+    #[test]
+    fn kv_offload_enabled_underivable_quiet_no_numberless() {
+        use crate::collectors::KvOffloadState;
+        // No host memory -> derivation None; Enabled must not emit numberless bullet.
+        let (c, n, b) = format_offload_three_paths(offload_cache(KvOffloadState::Enabled(4.0)));
+        assert_no_offload_bullet(&[c.join("\n"), n.join("\n"), b.join("\n")]);
+    }
+
+    #[test]
+    fn kv_offload_enabled_supply_clip_at_or_below_set_quiet() {
+        use crate::collectors::{HostMemoryFacts, KvOffloadState};
+        // Supply = 0.5 * 8 GiB = 4; journey demand >> 4 -> derived 4 == set 4.
+        let host = HostMemoryFacts {
+            available_bytes: 8 << 30,
+            container_limit_bytes: None,
+        };
+        let headroom_si = 24.8 * super::GIB_BYTES / 1e9;
+        assert_eq!(
+            super::resolve_kv_offload_size_gib(super::KvOffloadSizeInput {
+                host_memory: Some(host),
+                pool_bytes: Some(journey_pool_bytes()),
+                kv_frac_per_running_peak: Some(0.97 / 34.0),
+                preempt_per_sec: Some(0.27),
+                run_duration_secs: Some(120.0),
+                peak_waiting: Some(36.0),
+            }),
+            Some(4)
+        );
+        let (c, n, b) =
+            format_offload_three_paths_derived(KvOffloadState::Enabled(4.0), host, headroom_si);
+        assert_no_offload_bullet(&[c.join("\n"), n.join("\n"), b.join("\n")]);
     }
 
     #[test]

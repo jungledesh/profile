@@ -173,6 +173,7 @@ mod tests {
             impact: 1,
             confidence: 1.0,
             display_lines: Vec::new(),
+            terminal: false,
         }
     }
 

@@ -3,7 +3,6 @@ use crate::collectors::RawSnapshot;
 #[cfg(test)]
 use super::Recommendation;
 use super::effective_max_and_binder;
-use super::r6_prefill_bound::{PROMPT_GEN_RATIO_MILD, effective_prompt_tps};
 #[cfg(test)]
 use super::rule_names;
 use super::usable_kv_concurrency;
@@ -55,13 +54,7 @@ pub struct R1EvalInput<'a> {
     pub config_max_num_seqs: Option<u32>,
     pub efficiency_pct: Option<f64>,
     pub config_relative_efficiency_pct: Option<f64>,
-    pub prompt_tokens_per_sec: Option<f64>,
-    pub generation_tokens_per_sec: Option<f64>,
-    pub prefix_cache_hit_rate: Option<f64>,
     pub ridge_batch_size: Option<f64>,
-    /// True when R6 already fired on this window. Defer prompt/gen only then;
-    /// TPOT-muted or unknown-GPU R6 must not silence under-batching.
-    pub r6_fired: bool,
 }
 
 pub(super) fn rule1_under_batching_with_efficiency(input: R1EvalInput<'_>) -> Rule1Outcome {
@@ -70,11 +63,7 @@ pub(super) fn rule1_under_batching_with_efficiency(input: R1EvalInput<'_>) -> Ru
         config_max_num_seqs,
         efficiency_pct,
         config_relative_efficiency_pct,
-        prompt_tokens_per_sec,
-        generation_tokens_per_sec,
-        prefix_cache_hit_rate,
         ridge_batch_size,
-        r6_fired,
     } = input;
     let running = snapshot.vllm.num_requests_running;
 
@@ -114,26 +103,6 @@ pub(super) fn rule1_under_batching_with_efficiency(input: R1EvalInput<'_>) -> Ru
         return Rule1Outcome::NotFired;
     }
     let efficiency_pct = efficiency_pct.filter(|e| e.is_finite());
-
-    // Prefill gate: if R6 already owns this window, do not also fire under-batching.
-    // Defer only on actual R6 fire (not "R6 could fire"): a TPOT-muted prefill window
-    // with low occupancy is still under-batching.
-    if r6_fired
-        && let (Some(p_tps), Some(g_tps)) = (
-            prompt_tokens_per_sec.filter(|v| v.is_finite() && *v > 0.0),
-            generation_tokens_per_sec.filter(|v| v.is_finite() && *v >= 0.0),
-        )
-    {
-        let p_tps = effective_prompt_tps(p_tps, prefix_cache_hit_rate);
-        let ratio = if g_tps > 0.0 {
-            p_tps / g_tps
-        } else {
-            f64::INFINITY
-        };
-        if ratio >= PROMPT_GEN_RATIO_MILD {
-            return Rule1Outcome::NotFired;
-        }
-    }
 
     let known_gpu = config_relative_efficiency_pct.is_some();
 
@@ -246,6 +215,7 @@ pub fn r1_recommendation(input: R1EvalInput<'_>) -> Option<Recommendation> {
             kv_warning,
             &R1FormatCtx::default(),
         ),
+        terminal: false,
     })
 }
 
@@ -401,12 +371,7 @@ mod tests {
         config_max_num_seqs: Option<u32>,
         efficiency_pct: Option<f64>,
         config_relative_efficiency_pct: Option<f64>,
-        prompt_tokens_per_sec: Option<f64>,
-        generation_tokens_per_sec: Option<f64>,
-        prefix_cache_hit_rate: Option<f64>,
         ridge_batch_size: Option<f64>,
-        /// Defaults false via Default; set true in tests that exercise R6 defer.
-        r6_fired: bool,
     }
 
     fn r1_input(snapshot: &RawSnapshot, opts: R1InputOpts) -> R1EvalInput<'_> {
@@ -415,11 +380,7 @@ mod tests {
             config_max_num_seqs: opts.config_max_num_seqs,
             efficiency_pct: opts.efficiency_pct,
             config_relative_efficiency_pct: opts.config_relative_efficiency_pct,
-            prompt_tokens_per_sec: opts.prompt_tokens_per_sec,
-            generation_tokens_per_sec: opts.generation_tokens_per_sec,
-            prefix_cache_hit_rate: opts.prefix_cache_hit_rate,
             ridge_batch_size: opts.ridge_batch_size,
-            r6_fired: opts.r6_fired,
         }
     }
 
@@ -732,95 +693,21 @@ mod tests {
     }
 
     #[test]
-    fn prefill_ratio_gate_suppresses_before_occupancy_check() {
-        let s = snap(Some(5.0), Some(256), Some(0.0));
+    fn fires_on_prefill_shaped_under_batching_window() {
+        // High prompt/gen ratio used to defer R1 when R6 fired. Gate is gone:
+        // under-batching evidence alone must still fire so ME can suppress.
+        let mut s = snap(Some(5.0), Some(256), Some(0.0));
+        s.vllm.prompt_tokens_per_sec = Some(600.0);
+        s.vllm.generation_tokens_per_sec = Some(100.0);
         match rule1_under_batching_with_efficiency(r1_input(
             &s,
             R1InputOpts {
                 config_relative_efficiency_pct: Some(15.0),
-                prompt_tokens_per_sec: Some(600.0),
-                generation_tokens_per_sec: Some(100.0),
-                r6_fired: true,
-                ..Default::default()
-            },
-        )) {
-            Rule1Outcome::NotFired => {}
-            Rule1Outcome::Fired(_) => panic!("expected suppressed by prefill gate"),
-        }
-    }
-
-    #[test]
-    fn prefill_gate_not_suppressed_when_prefix_cache_deflates_ratio() {
-        let s = snap(Some(5.0), Some(256), Some(0.0));
-        // Raw ratio 600/100 = 6.0x would suppress. Effective: 600*(1-0.90) = 60/100 = 0.6x.
-        match rule1_under_batching_with_efficiency(r1_input(
-            &s,
-            R1InputOpts {
-                config_relative_efficiency_pct: Some(15.0),
-                prompt_tokens_per_sec: Some(600.0),
-                generation_tokens_per_sec: Some(100.0),
-                prefix_cache_hit_rate: Some(0.90),
-                r6_fired: true,
-                ..Default::default()
-            },
-        )) {
-            Rule1Outcome::Fired(_) => {}
-            Rule1Outcome::NotFired => panic!("prefix cache should prevent suppression"),
-        }
-    }
-
-    #[test]
-    fn prefill_gate_suppresses_on_pure_prefill_zero_gen() {
-        let s = snap(Some(5.0), Some(256), Some(0.0));
-        match rule1_under_batching_with_efficiency(r1_input(
-            &s,
-            R1InputOpts {
-                config_relative_efficiency_pct: Some(15.0),
-                prompt_tokens_per_sec: Some(600.0),
-                generation_tokens_per_sec: Some(0.0),
-                r6_fired: true,
-                ..Default::default()
-            },
-        )) {
-            Rule1Outcome::NotFired => {}
-            Rule1Outcome::Fired(_) => panic!("R1 should suppress on pure prefill"),
-        }
-    }
-
-    #[test]
-    fn high_ratio_still_fires_when_r6_did_not() {
-        // R6 muted (or never fired): R1 must not defer into silence.
-        let s = snap(Some(5.0), Some(256), Some(0.0));
-        match rule1_under_batching_with_efficiency(r1_input(
-            &s,
-            R1InputOpts {
-                prompt_tokens_per_sec: Some(600.0),
-                generation_tokens_per_sec: Some(100.0),
-                r6_fired: false,
-                ..Default::default()
-            },
-        )) {
-            Rule1Outcome::Fired(d) => assert!(!d.known_gpu),
-            Rule1Outcome::NotFired => panic!("expected R1 fire when R6 did not"),
-        }
-    }
-
-    #[test]
-    fn known_gpu_high_ratio_fires_when_r6_muted() {
-        // TPOT-muted R6 leaves r6_fired=false; known-GPU under-batching must still surface.
-        let s = snap(Some(5.0), Some(256), Some(0.0));
-        match rule1_under_batching_with_efficiency(r1_input(
-            &s,
-            R1InputOpts {
-                config_relative_efficiency_pct: Some(15.0),
-                prompt_tokens_per_sec: Some(600.0),
-                generation_tokens_per_sec: Some(100.0),
-                r6_fired: false,
                 ..Default::default()
             },
         )) {
             Rule1Outcome::Fired(d) => assert!(d.known_gpu),
-            Rule1Outcome::NotFired => panic!("expected R1 when R6 TPOT-muted"),
+            Rule1Outcome::NotFired => panic!("expected R1 fire on prefill-shaped under-batching"),
         }
     }
 
@@ -1191,15 +1078,12 @@ mod tests {
 
     #[test]
     fn full_and_gate_fires_when_all_conditions_met() {
-        // All four gates pass: config_eff=15% < 60%, occupancy=1.95% < 75%,
-        // prefill=0.20 < 0.30, waiting=0 < 2.
+        // Known-GPU path: config_eff=15% < 60%, occupancy=1.95% < 75%, waiting=0 < 2.
         let s = snap(Some(5.0), Some(256), Some(0.0));
         match rule1_under_batching_with_efficiency(r1_input(
             &s,
             R1InputOpts {
                 config_relative_efficiency_pct: Some(15.0),
-                prompt_tokens_per_sec: Some(400.0),
-                generation_tokens_per_sec: Some(100.0),
                 ..Default::default()
             },
         )) {
