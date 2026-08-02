@@ -178,13 +178,9 @@ fn resolve_batch_token_prescription(d: &PrefillBoundDetail) -> BatchTokenPrescri
 }
 
 /// Second return is whether a named Set/lower budget knob was emitted (structural;
-/// do not re-read printed text to decide Expected). Named bullets use the shared
-/// subline helper. No "unread" apology: unread falls back to Enable+Set (Option B).
-fn batch_token_budget_bullets(
-    d: &PrefillBoundDetail,
-    verb: &str,
-    dependency: Option<&str>,
-) -> (Vec<String>, bool) {
+/// do not re-read printed text to decide Expected). No "unread" apology: unread
+/// falls back to Enable+Set (Option B).
+fn batch_token_budget_bullets(d: &PrefillBoundDetail, verb: &str) -> (Vec<String>, bool) {
     match resolve_batch_token_prescription(d) {
         BatchTokenPrescription::Ideal { value, est_paren } => {
             if super::already_set_u32(d.max_num_batched_tokens, value) {
@@ -199,27 +195,21 @@ fn batch_token_budget_bullets(
                         .to_string()
                 }
             };
-            let mut lines = Vec::new();
-            super::push_bullet_with_subline(
-                &mut lines,
-                format!("      • {verb} --max-num-batched-tokens to {value}{tail}"),
-                dependency,
-            );
-            (lines, true)
+            (
+                vec![format!("      • {verb} --max-num-batched-tokens to {value}{tail}")],
+                true,
+            )
         }
         BatchTokenPrescription::FloorLimited { value } => {
             if super::already_set_u32(d.max_num_batched_tokens, value) {
                 return (Vec::new(), false);
             }
-            let mut lines = Vec::new();
-            super::push_bullet_with_subline(
-                &mut lines,
-                format!(
+            (
+                vec![format!(
                     "      • {verb} --max-num-batched-tokens to {value} (floor-limited; page alignment) to shrink prefill chunk size. Lower for smoother TPOT, raise for lower TTFT."
-                ),
-                dependency,
-            );
-            (lines, true)
+                )],
+                true,
+            )
         }
         BatchTokenPrescription::TerminalAtFloor { floor } => (
             vec![format!(
@@ -234,17 +224,12 @@ fn batch_token_budget_bullets(
             ],
             false,
         ),
-        BatchTokenPrescription::DirectionOnly { floor } => {
-            let mut lines = Vec::new();
-            super::push_bullet_with_subline(
-                &mut lines,
-                format!(
-                    "      • {verb} --max-num-batched-tokens lower to shrink prefill chunk size (not below {floor}). Lower for smoother TPOT, raise for lower TTFT."
-                ),
-                dependency,
-            );
-            (lines, true)
-        }
+        BatchTokenPrescription::DirectionOnly { floor } => (
+            vec![format!(
+                "      • {verb} --max-num-batched-tokens lower to shrink prefill chunk size (not below {floor}). Lower for smoother TPOT, raise for lower TTFT."
+            )],
+            true,
+        ),
     }
 }
 
@@ -302,7 +287,7 @@ fn knob_fix_lines(d: &PrefillBoundDetail) -> (Vec<String>, String, bool) {
         resolve_batch_token_prescription(d),
         BatchTokenPrescription::TerminalAtFloor { .. }
     );
-    let (mut bullets, named_set) = batch_token_budget_bullets(d, "Set", None);
+    let (mut bullets, named_set) = batch_token_budget_bullets(d, "Set");
     if terminal {
         bullets.push(R6_TERMINAL_VERIFY.to_string());
     }
@@ -584,7 +569,7 @@ fn chunked_budget_fix_lines(
         bullets.push("      • Enable chunked prefill (--enable-chunked-prefill).".to_string());
     }
     // No "Takes effect only with chunked" / unread sublines (Option B).
-    let (budget, named_set) = batch_token_budget_bullets(d, "Set", None);
+    let (budget, named_set) = batch_token_budget_bullets(d, "Set");
     bullets.extend(budget);
     if at_floor {
         bullets.push(R6_TERMINAL_VERIFY.to_string());
