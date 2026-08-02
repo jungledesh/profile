@@ -3713,6 +3713,85 @@ mod tests {
         assert_no_offload_bullet(&[n.join("\n"), b.join("\n")]);
     }
 
+    /// Journey-shaped scrape with host memory so derivation can resolve.
+    /// `host` sets the supply side (`0.5 * usable`); keep preempt on all paths.
+    fn format_offload_three_paths_derived(
+        state: crate::collectors::KvOffloadState,
+        host: crate::collectors::HostMemoryFacts,
+        headroom_si: f64,
+    ) -> (Vec<String>, Vec<String>, Vec<String>) {
+        use crate::collectors::RawSnapshotFixture;
+        let vllm = |preempt: Option<f64>| VllmRawMetrics {
+            kv_cache_usage_perc: Some(97.0),
+            num_requests_running: Some(34.0),
+            num_requests_waiting: Some(36.0),
+            num_requests_waiting_peak: Some(36.0),
+            kv_frac_per_running_peak: Some(0.97 / 34.0),
+            num_preemptions_per_sec: preempt,
+            window_duration_secs: Some(120.0),
+            max_num_seqs: Some(175),
+            prompt_tokens_mean: Some(64.0),
+            cache_config: CacheConfigLabels {
+                num_gpu_blocks: Some(1000),
+                block_size: Some(16),
+                ..offload_cache(state)
+            },
+            ..Default::default()
+        };
+        let snap = |preempt: Option<f64>| {
+            RawSnapshotFixture::default()
+                .vllm(vllm(preempt))
+                .host_memory(Some(host))
+                .build()
+        };
+        let crisis_snap = snap(Some(0.27));
+        let crisis = format_kv_cache_pressure_fired(
+            &detail(97.0, true),
+            &kv_ctx(&crisis_snap, None, Some(headroom_si), None),
+            3,
+            4,
+        );
+        // Keep preempt rate for derivation even when the detail is non-crisis.
+        let non_crisis_snap = snap(Some(0.27));
+        let non_crisis = format_kv_cache_pressure_fired(
+            &KvCachePressureDetail {
+                kv_cache_usage_perc: Some(97.0),
+                kv_peak_pct: Some(100.0),
+                preemptions_active: false,
+                queue_backpressure: true,
+            },
+            &kv_ctx(&non_crisis_snap, None, Some(headroom_si), None),
+            3,
+            4,
+        );
+        let backlog_snap = snap(Some(0.27));
+        let backlog = format_kv_admission_backlog_issue(
+            &KvAdmissionBacklogDetail {
+                kv_cache_usage_perc: 97.0,
+                kv_peak_pct: Some(100.0),
+                admission_ratio: 36.0 / 70.0,
+                requests_waiting: 36.0,
+                requests_running: 34.0,
+                free_kv_tokens: 100.0,
+                demand_tokens: 200.0,
+            },
+            75,
+            &kv_ctx(&backlog_snap, None, Some(headroom_si), None),
+            3,
+            4,
+        );
+        (crisis, non_crisis, backlog)
+    }
+
+    fn assert_no_offload_bullet(texts: &[String]) {
+        for text in texts {
+            assert!(
+                !text.contains("kv-offloading-size"),
+                "expected quiet offload arm:\n{text}"
+            );
+        }
+    }
+
     #[test]
     fn kv_offload_absent_when_eviction_quiet() {
         use crate::collectors::KvOffloadState;

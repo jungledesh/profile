@@ -1330,7 +1330,10 @@ mod tests {
             model_in_catalog: true,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
-        assert!(text.contains("Enable chunked prefill (--enable-chunked-prefill)."));
+        assert!(
+            !text.contains("Enable chunked prefill (--enable-chunked-prefill)."),
+            "unknown must not Enable: {text}"
+        );
         assert!(text.contains("Set --max-num-batched-tokens"));
         assert!(!text.contains("Takes effect only with chunked prefill on."));
         assert!(!text.contains("could not verify this differs from what's running"));
@@ -2019,6 +2022,8 @@ mod tests {
                 "Decode batches interleave with prefill, reducing head-of-line blocking."
             )
         );
+        assert!(text.contains(R6_TERMINAL_VERIFY.trim_start()));
+        assert!(text.contains("No setting on this server makes prefill chunks smaller"));
     }
 
     #[test]
