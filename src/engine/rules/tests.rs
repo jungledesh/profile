@@ -155,11 +155,7 @@ fn r1_test_input(snapshot: &RawSnapshot) -> R1EvalInput<'_> {
         config_max_num_seqs: None,
         efficiency_pct: None,
         config_relative_efficiency_pct: None,
-        prompt_tokens_per_sec: None,
-        generation_tokens_per_sec: None,
-        prefix_cache_hit_rate: None,
         ridge_batch_size: None,
-        r6_fired: false,
     }
 }
 
@@ -2178,12 +2174,11 @@ fn format_diagnose_verbose_shows_kv_pressure_suppressed_when_r4_fires() {
 
 #[test]
 fn not_triggered_shows_plain_label() {
+    // High occupancy: R1 does not fire. Verbose must use the plain form.
     let t = SystemTime::UNIX_EPOCH;
     let mut v = vllm_base();
-    v.model_name = Some("meta-llama/Llama-3.1-8B-Instruct".to_string());
-    v.prompt_tokens_per_sec = Some(600.0);
+    v.num_requests_running = Some(200.0);
     v.generation_tokens_per_sec = Some(100.0);
-    v.prefix_cache_hit_rate = None;
     let mut g = gpu_busy();
     g.gpu_name = Some("NVIDIA H100 80GB HBM3".to_string());
     let s = snap(t, t, v, g);
@@ -2237,22 +2232,24 @@ fn suppression_table_shows_suppressor_in_verbose() {
 }
 
 #[test]
-fn format_diagnose_verbose_r1_shows_plain_not_triggered_when_gate_suppresses() {
-    let t = SystemTime::UNIX_EPOCH;
-    let mut v = vllm_base();
-    v.model_name = Some("meta-llama/Llama-3.1-8B-Instruct".to_string());
-    v.prompt_tokens_per_sec = Some(600.0);
-    v.generation_tokens_per_sec = Some(100.0);
-    v.prefix_cache_hit_rate = None;
-    let mut g = gpu_busy();
-    g.gpu_name = Some("NVIDIA H100 80GB HBM3".to_string());
-    let s = snap(t, t, v, g);
-    let ctx = mk_llama8b_h100_ctx(&s);
-    let win = mk_win(s);
-    let text =
-        format_diagnose_rules_test(&ctx, &win, true, "http://127.0.0.1:8000/metrics").join("\n");
-    assert!(text.contains("Under-batching: not triggered"));
+fn format_diagnose_verbose_r1_suppressed_by_r6_when_both_fire() {
+    // Prefill-shaped under-batching: R1 evaluates and ME suppresses it under R6.
+    // Verbose must show "suppressed by", not a defer / prompt-gen parenthetical.
+    let windows: Vec<_> = (0..10)
+        .map(|_| mk_r6_prefill_window(12.0, 10.0, 5.0, Some(50.0)))
+        .collect();
+    let ctx = mk_llama8b_h100_ctx(&windows[0].snapshot);
+    let summary = ai(&ctx, windows.last().expect("windows"));
+    let text = format_diagnose_rules_for_windows_test(
+        &windows,
+        summary,
+        true,
+        "http://127.0.0.1:8000/metrics",
+    )
+    .join("\n");
+    assert!(text.contains("Under-batching: suppressed by Prefill-Bound"));
     assert!(!text.contains("prompt/gen ratio"));
+    assert!(!text.contains("Under-batching: not triggered"));
 }
 
 #[test]
@@ -2944,11 +2941,9 @@ fn mixed_run_r6_suppresses_r1() {
     let ctx = mk_llama8b_h100_ctx(&windows[0].snapshot);
     let summary = ai(&ctx, windows.last().expect("windows"));
     let report = build_report_for_windows(&windows, summary);
-    assert!(
-        report
-            .recommendations
-            .iter()
-            .any(|g| g.rule_name == rule_names::PREFILL_BOUND)
+    assert_eq!(
+        report.recommendations.first().map(|g| g.rule_name),
+        Some(rule_names::PREFILL_BOUND)
     );
     assert!(
         !report
@@ -2965,6 +2960,14 @@ fn mixed_run_r6_suppresses_r1() {
                     && *suppressor == rule_names::PREFILL_BOUND
             })
     );
+    assert!(
+        report
+            .suppressed_recs
+            .iter()
+            .any(|r| r.rule_name == rule_names::UNDER_BATCHING)
+    );
+    // ME runs before the min-layer filter: winning layer is R6's L5, not R1's L4.
+    assert_eq!(report.recommendations.first().map(|g| g.layer), Some(5));
 }
 
 #[test]
@@ -2998,19 +3001,41 @@ fn r1_fires_when_r6_muted_by_tpot() {
 }
 
 #[test]
-fn r6_fires_when_r1_prefill_gate_suppresses_r1() {
+fn r6_and_r1_both_significant_r1_lands_in_suppressed_recs() {
+    // Prefill-shaped under-batching windows: R1 fires (no defer gate) and R6
+    // fires; ME moves R1 into suppressed_recs for same-primary reveal.
     let windows: Vec<_> = (0..10)
         .map(|_| mk_r6_prefill_window(12.0, 10.0, 5.0, Some(50.0)))
         .collect();
     let ctx = mk_llama8b_h100_ctx(&windows[0].snapshot);
     let summary = ai(&ctx, windows.last().expect("windows"));
     let report = build_report_for_windows(&windows, summary);
+    assert_eq!(
+        report.recommendations.first().map(|g| g.rule_name),
+        Some(rule_names::PREFILL_BOUND)
+    );
     assert!(
-        report
+        !report
             .recommendations
             .iter()
-            .any(|g| g.rule_name == rule_names::PREFILL_BOUND)
+            .any(|g| g.rule_name == rule_names::UNDER_BATCHING)
     );
+    assert!(
+        report
+            .suppressed_recs
+            .iter()
+            .any(|r| r.rule_name == rule_names::UNDER_BATCHING && !r.display_lines.is_empty())
+    );
+    assert!(
+        report
+            .suppressed_rules
+            .iter()
+            .any(|(suppressed, suppressor)| {
+                *suppressed == rule_names::UNDER_BATCHING
+                    && *suppressor == rule_names::PREFILL_BOUND
+            })
+    );
+    assert_eq!(report.recommendations.first().map(|g| g.layer), Some(5));
 }
 
 #[test]

@@ -1,6 +1,6 @@
 # Architecture
 
-Structure of the `profile` binary: data flow, module boundaries, key types. How to change the code, and the merge gate (`fmt`, `clippy`, `audit`, `deny`, `test`, plus OSV, Semgrep, and Socket in CI), is in [CONTRIBUTING.md](CONTRIBUTING.md). What the tool does and why is in the [README](README.md).
+Structure of the `profile` binary: data flow, module boundaries, key types. How to change the code, and the merge gate (`fmt`, `clippy`, `audit`, `deny`, `test`, plus OSV and Semgrep in CI), is in [CONTRIBUTING.md](CONTRIBUTING.md). What the tool does and why is in the [README](README.md).
 
 Single Rust binary. `profile diagnose` runs an interactive closed loop: collect, analyze, recommend, wait for the operator to apply the fix, re-collect, compute delta, repeat.
 
@@ -51,7 +51,7 @@ CLI flags
 - `AnalysisInput<'a>` (`context/types.rs`): `{ ctx: &StaticContext, window: &RuntimeWindow }`. The engine's input; no copies in the hot loop.
 - `RawSnapshot` (`collectors/types.rs`): result of one collection window. Collectors sample at 250ms inside the window; `run_diagnose` keeps one `RawSnapshot` per window and aggregates them into the run-level reporting snapshot.
 - `PhysicsBaseline` (`engine/baseline/roofline.rs`): decode ceiling as `CeilingEstimate { lower, expected, upper }`; prefill ceiling in prompts/s (`Option`); efficiency and headroom percentages; weight footprint with dtype provenance; KV element width. Physics only, no causality. The struct's doc comments are canonical for the full field list.
-- `Recommendation` (`engine/rules/`): rule name, DAG layer (2-6), impact (1-5), confidence, pre-formatted display lines. Ranked by impact x confidence within the winning layer; the layer filter and suppression table enforce one signal per root cause.
+- `Recommendation` (`engine/rules/`): rule name, DAG layer (2-6), impact (1-5), confidence, pre-formatted display lines, `terminal` (no server-local knob left). Ranked by impact x confidence within the winning layer; the layer filter and suppression table enforce one signal per root cause.
 - `LimiterVerdict` (`engine/limiter.rs`): the no-issue path. When no rule fires, names the boundary capping a healthy server (capacity, traffic, physics, prefill interference, framework overhead) from run-level aggregates, or reports the ceiling unknown rather than guessing.
 - `Report` (`engine/mod.rs`): recommendations plus baseline and skip counts; produced by `engine::build_report_for_diagnose`, which wraps `rules::build_report_for_windows` and may append post-DAG recommendations; input to stdout formatting.
 - `window_is_evaluable` / `window_is_idle` (`collectors/types.rs`): shared gates. Evaluable means the window has a positive duration and the metrics endpoint answered. Idle means evaluable with no meaningful traffic. Rules skip idle windows; idle is valid telemetry, not a collection failure.
@@ -62,6 +62,6 @@ CLI flags
 - **A new metric source:** `src/collectors/`. I/O only; no reasoning.
 - **A new GPU or model:** `src/context/gpu_catalog.rs`, `src/context/model_catalog.rs`, `src/context/gpu_prices.json`.
 - **Closed-loop behavior:** `src/profiler/` (loop_runner, delta, drift, state). Orchestrates collection; implements no collector logic and no rules.
-- **Config enrichment:** `src/collectors/config.rs` (`build_config`). Runs after collection inside `run_diagnose`; snapshot fields + CLI, then best-effort `/v1/models` and `/info`.
+- **Config enrichment:** `src/collectors/config.rs` (`build_config`). Runs after collection inside `run_diagnose`; snapshot fields + CLI, then best-effort `/v1/models`, `/info`, and `/server_info`. Scheduler knobs (`enable_chunked_prefill`, `max_num_batched_tokens`) are filled from those JSON/text endpoints when Prometheus omits them (modern vLLM keeps them on `SchedulerConfig`, not `cache_config_info`).
 - **Output formatting:** `src/output/stdout.rs`. Convention: `~` marks values derived from estimated ceilings; measured values carry no tilde.
 - **Rule thresholds:** named constants at the top of each rule file in `src/engine/rules/`. Semantics and edge cases are in the [rules documentation](https://jungledesh.github.io/profile/docs.html#rules).

@@ -44,6 +44,10 @@ pub struct CacheConfigLabels {
     /// KV cache element dtype (e.g. "auto", "fp8", "fp16").
     pub cache_dtype: Option<String>,
     pub enable_prefix_caching: Option<bool>,
+    /// Chunked prefill flag. On modern vLLM this lives on `SchedulerConfig`, not
+    /// `CacheConfig`, so `cache_config_info` usually omits it (`None`). Older
+    /// builds that still label it here parse as before. Prefer
+    /// `VllmConfig.enable_chunked_prefill` after `/info` / `/server_info` enrichment.
     pub enable_chunked_prefill: Option<bool>,
     /// Fraction of GPU memory reserved for the engine (cache_config_info label).
     pub gpu_memory_utilization: Option<f64>,
@@ -167,7 +171,9 @@ pub struct VllmRawMetrics {
 
     // Not always available
     pub max_num_seqs: Option<u32>,
-    /// From `vllm_max_num_batched_tokens` gauge when present.
+    /// From `vllm_max_num_batched_tokens` gauge when present. Often absent on
+    /// modern vLLM (value lives on `SchedulerConfig`); filled from `/info` /
+    /// `/server_info` in `build_config` when the gauge is missing.
     pub max_num_batched_tokens: Option<u32>,
 
     // Memory pressure / offload state

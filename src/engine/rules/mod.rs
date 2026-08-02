@@ -942,6 +942,13 @@ pub(super) fn with_seen_pct(mut lines: Vec<String>, seen_pct: u32) -> Vec<String
     lines
 }
 
+/// True when a named target equals the configured value (equality only).
+/// `None` configured → false: cannot claim a no-op against an unread value.
+/// Configured above target → false: lowering is still a prescription.
+pub(super) fn already_set_u32(configured: Option<u32>, target: u64) -> bool {
+    configured.is_some_and(|c| u64::from(c) == target)
+}
+
 pub(super) fn trim_group_trailing_blanks(lines: &mut Vec<String>) {
     while lines.last().is_some_and(|l| l.is_empty()) {
         lines.pop();
@@ -1069,6 +1076,9 @@ pub struct Recommendation {
     /// facts) if rule-file growth becomes painful. Tracked in
     /// `architecture_audit_specs.md`.
     pub display_lines: Vec<String>,
+    /// True when the fix branch has no server-local knob (wall / scale-out only).
+    /// Set by the rule formatter from the branch it took; never inferred from text.
+    pub terminal: bool,
 }
 
 /// Mean of present `f64` values. Empty iterator → `None`.
@@ -1110,6 +1120,19 @@ pub mod rule_names {
             MASSIVE_UNDERUTILIZATION => "Massive Under-utilization",
             _ => rule_name,
         }
+    }
+}
+
+#[cfg(test)]
+mod already_set_tests {
+    use super::already_set_u32;
+
+    #[test]
+    fn equality_only() {
+        assert!(already_set_u32(Some(2048), 2048));
+        assert!(!already_set_u32(Some(4096), 2048));
+        assert!(!already_set_u32(Some(1024), 2048));
+        assert!(!already_set_u32(None, 2048));
     }
 }
 

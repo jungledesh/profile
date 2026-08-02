@@ -128,6 +128,7 @@ pub(super) fn r4_recommendation_with_request_floor(
             impact: 5,
             confidence,
             display_lines,
+            terminal: false,
         });
     }
     let overflow = h.abs();
@@ -177,6 +178,7 @@ pub(super) fn r4_recommendation_with_request_floor(
             "    Expected: Model fits in VRAM; eliminates OOM risk.".to_string(),
             format!("    Confidence: {}", super::confidence_label(confidence)),
         ],
+        terminal: false,
     })
 }
 

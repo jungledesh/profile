@@ -623,13 +623,19 @@ pub fn format_diagnose_rules_for_windows(
         warnings.push(String::new());
     }
 
-    // Stuck-fix reveal: same primary as last iteration, no material improvement.
-    // Primary blocks print first; alternatives follow the column-0 warning.
-    if reveal_suppressed && !report.suppressed_recs.is_empty() {
+    // Reveal suppressed alternatives: same-primary re-fire, or terminal primary
+    // on first fire (no server-local knob left).
+    let primary_terminal = report.recommendations.first().is_some_and(|r| r.terminal);
+    if (reveal_suppressed || primary_terminal) && !report.suppressed_recs.is_empty() {
         if !warnings.last().is_some_and(|l| l.is_empty()) {
             warnings.push(String::new());
         }
-        warnings.push("Same issue after remeasure. Other possible causes shown below.".to_string());
+        let header = if primary_terminal {
+            "The primary issue has no tuning fix on this server. Other possible causes shown below."
+        } else {
+            "Same issue after remeasure. Other possible causes shown below."
+        };
+        warnings.push(header.to_string());
         warnings.push(String::new());
         for rec in &report.suppressed_recs {
             warnings.extend(rule_display_block(rec));
@@ -1103,12 +1109,23 @@ mod stuck_fix_reveal_tests {
     }
 
     fn rec(name: &'static str, impact: u8, confidence: f64, header: &str) -> Recommendation {
+        rec_terminal(name, impact, confidence, header, false)
+    }
+
+    fn rec_terminal(
+        name: &'static str,
+        impact: u8,
+        confidence: f64,
+        header: &str,
+        terminal: bool,
+    ) -> Recommendation {
         Recommendation {
             rule_name: name,
             layer: 2,
             impact,
             confidence,
             display_lines: vec![header.to_string(), "    body".to_string()],
+            terminal,
         }
     }
 
@@ -1223,5 +1240,52 @@ mod stuck_fix_reveal_tests {
         let text = render(&report, false);
         assert!(!text.contains("Same issue after remeasure"));
         assert!(!text.contains("[!] KV Cache Pressure"));
+    }
+
+    #[test]
+    fn terminal_primary_reveals_on_first_fire() {
+        let report = report_with(
+            rec_terminal(rule_names::PREFILL_BOUND, 5, 0.9, "[!] Prefill-Bound", true),
+            vec![rec(
+                rule_names::UNDER_BATCHING,
+                3,
+                0.5,
+                "[!] Under-batching",
+            )],
+        );
+        let text = render(&report, false);
+        let header = "The primary issue has no tuning fix on this server. Other possible causes shown below.";
+        assert!(text.contains(header));
+        assert!(text.contains("[!] Under-batching"));
+        assert!(!text.contains("Same issue after remeasure"));
+    }
+
+    #[test]
+    fn terminal_primary_empty_suppressed_no_header() {
+        let report = report_with(
+            rec_terminal(rule_names::PREFILL_BOUND, 5, 0.9, "[!] Prefill-Bound", true),
+            vec![],
+        );
+        let text = render(&report, false);
+        assert!(!text.contains("Other possible causes shown below"));
+        assert!(text.contains("[!] Prefill-Bound"));
+    }
+
+    #[test]
+    fn terminal_plus_reveal_true_one_section_terminal_header() {
+        let report = report_with(
+            rec_terminal(rule_names::PREFILL_BOUND, 5, 0.9, "[!] Prefill-Bound", true),
+            vec![rec(
+                rule_names::UNDER_BATCHING,
+                3,
+                0.5,
+                "[!] Under-batching",
+            )],
+        );
+        let text = render(&report, true);
+        let terminal_header = "The primary issue has no tuning fix on this server. Other possible causes shown below.";
+        assert_eq!(text.matches(terminal_header).count(), 1);
+        assert!(!text.contains("Same issue after remeasure"));
+        assert!(text.contains("[!] Under-batching"));
     }
 }

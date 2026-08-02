@@ -19,8 +19,6 @@ const JTOK_WORSE_THRESHOLD: f64 = 0.02;
 const TTFT_WORSE_MIN_MS: f64 = 5.0;
 /// TPOT avg materiality gate (ms).
 const TPOT_WORSE_MIN_MS: f64 = 0.5;
-/// Absolute efficiency rise (pp) that counts as material improvement (reveal gate).
-const EFFICIENCY_MATERIAL_MIN_PP: f64 = 2.0;
 /// Left label width for remeasure before→after lines (excludes leading `"  "`).
 /// Sized for the longest label so Throughput, latency, and economics share one value column.
 const DELTA_LABEL_WIDTH: usize = 18; // "Cost/1M output tok"
@@ -29,38 +27,20 @@ fn worse_suffix(material_regression: bool) -> &'static str {
     if material_regression { "  worse" } else { "" }
 }
 
-/// Shared gate for efficiency pp: the remeasure printed line and the reveal
-/// material-improvement efficiency arm both call this. Keep them on one predicate.
+/// Whether the remeasure path prints an efficiency delta line after a baseline reset.
 fn include_efficiency_delta(config_drifted: bool) -> bool {
     !config_drifted
 }
 
-/// True when efficiency or throughput moved up by at least the material gates.
-/// Symmetric to the regression labels: material pp for eff, worse % for throughput.
-/// After a baseline reset the efficiency arm is discounted; throughput alone decides.
-pub(crate) fn delta_shows_material_improvement(d: &delta::Delta) -> bool {
-    let eff_improved = include_efficiency_delta(d.config_drifted)
-        && d.efficiency_delta_pp
-            .is_some_and(|pp| pp.is_finite() && pp >= EFFICIENCY_MATERIAL_MIN_PP);
-    let tput_improved = match (d.throughput_before, d.throughput_after) {
-        (Some(before), Some(after)) if before.is_finite() && after.is_finite() && before > 0.0 => {
-            ((after - before) / before) * 100.0 >= THROUGHPUT_WORSE_MIN_PCT
-        }
-        _ => false,
-    };
-    eff_improved || tput_improved
-}
-
-/// Reveal suppressed alternatives when the same primary re-fires with a flat delta.
+/// Reveal suppressed alternatives when the same primary re-fires.
+/// No delta condition: the operator applied a fix and the same diagnosis
+/// returned; the alternatives are information regardless of what moved.
 pub(crate) fn should_reveal_suppressed(
     previous_recommendation: &'static str,
     new_primary: Option<&'static str>,
-    d: &delta::Delta,
     suppressed_recs_non_empty: bool,
 ) -> bool {
-    suppressed_recs_non_empty
-        && new_primary == Some(previous_recommendation)
-        && !delta_shows_material_improvement(d)
+    suppressed_recs_non_empty && new_primary == Some(previous_recommendation)
 }
 
 /// Inputs for the interactive diagnose closed loop.
@@ -97,7 +77,7 @@ pub fn run(input: LoopRunnerInput<'_>) -> anyhow::Result<()> {
     let mut current_max_num_seqs = max_num_seqs;
 
     loop {
-        let (rule_name, prev_result, prev_report) = {
+        let (rule_name, prev_result, prev_report, primary_terminal, suppressed_empty) = {
             let Some(last_state) = state.last() else {
                 break;
             };
@@ -124,12 +104,34 @@ pub fn run(input: LoopRunnerInput<'_>) -> anyhow::Result<()> {
                 println!("\n{msg}");
                 break;
             };
+            let primary_terminal = last_state
+                .report
+                .recommendations
+                .first()
+                .is_some_and(|r| r.terminal);
+            let suppressed_empty = last_state.report.suppressed_recs.is_empty();
             (
                 rule_name,
                 last_state.result.clone(),
                 last_state.report.clone(),
+                primary_terminal,
+                suppressed_empty,
             )
         };
+
+        if should_exit_terminal_wall(primary_terminal, suppressed_empty) {
+            // Terminal wall with no alternatives: table already printed; exit.
+            // No operator prompt: there is no server-local knob to apply.
+            println!();
+            let limiter = prev_report
+                .limiter_evidence
+                .as_ref()
+                .and_then(crate::engine::limiter::limiter_line);
+            for line in terminal_wall_close_lines(limiter.as_deref()) {
+                println!("{line}");
+            }
+            break;
+        }
 
         if state.is_oscillating() {
             match state.oscillating_pair() {
@@ -210,7 +212,6 @@ pub fn run(input: LoopRunnerInput<'_>) -> anyhow::Result<()> {
         let reveal_suppressed = should_reveal_suppressed(
             rule_name,
             new_primary,
-            &d,
             !new_report.suppressed_recs.is_empty(),
         );
         output::stdout::print_diagnose_table_with_report(
@@ -260,6 +261,25 @@ fn iteration_limit_message() -> String {
         "\nIteration limit ({}) reached.",
         super::state::MAX_LOOP_ITERATIONS
     )
+}
+
+pub(crate) fn terminal_exit_message() -> &'static str {
+    "Exiting: the primary bottleneck has no tuning fix on this server. Scale out or accept the ceiling."
+}
+
+/// Terminal primary with no suppressed alternatives: exit; do not prompt.
+pub(crate) fn should_exit_terminal_wall(primary_terminal: bool, suppressed_empty: bool) -> bool {
+    primary_terminal && suppressed_empty
+}
+
+/// Limiter line (context) then exit close (conclusion). No fabricated "Capped by".
+pub(crate) fn terminal_wall_close_lines(limiter_line: Option<&str>) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(line) = limiter_line {
+        lines.push(line.to_string());
+    }
+    lines.push(terminal_exit_message().to_string());
+    lines
 }
 
 fn is_kv_r5_oscillation_pair(a: &str, b: &str) -> bool {
@@ -718,6 +738,39 @@ mod tests {
         let msg = iteration_limit_message();
         assert!(msg.contains("Iteration limit (20) reached."));
         assert!(!msg.contains("No further improvement"));
+    }
+
+    #[test]
+    fn terminal_exit_message_snapshot() {
+        assert_eq!(
+            terminal_exit_message(),
+            "Exiting: the primary bottleneck has no tuning fix on this server. Scale out or accept the ceiling."
+        );
+    }
+
+    #[test]
+    fn terminal_wall_exits_only_when_terminal_and_no_alternatives() {
+        assert!(should_exit_terminal_wall(true, true));
+        assert!(
+            !should_exit_terminal_wall(true, false),
+            "alternatives present: keep looping to the prompt"
+        );
+        assert!(!should_exit_terminal_wall(false, true));
+        assert!(!should_exit_terminal_wall(false, false));
+    }
+
+    #[test]
+    fn terminal_wall_close_lines_limiter_then_exit() {
+        let lines = terminal_wall_close_lines(Some("Capped by Physics (Hardware Ceiling)."));
+        assert_eq!(
+            lines,
+            vec![
+                "Capped by Physics (Hardware Ceiling).".to_string(),
+                terminal_exit_message().to_string(),
+            ]
+        );
+        let lines = terminal_wall_close_lines(None);
+        assert_eq!(lines, vec![terminal_exit_message().to_string()]);
     }
 
     #[test]
@@ -1342,68 +1395,14 @@ mod tests {
     }
 
     #[test]
-    fn material_improvement_false_on_flat_delta() {
-        assert!(!delta_shows_material_improvement(&flat_delta()));
+    fn reveal_when_same_primary_and_has_suppressed() {
+        assert!(should_reveal_suppressed("oom_risk", Some("oom_risk"), true));
     }
 
     #[test]
-    fn material_improvement_true_on_eff_gain() {
-        let mut d = flat_delta();
-        d.efficiency_delta_pp = Some(EFFICIENCY_MATERIAL_MIN_PP);
-        assert!(delta_shows_material_improvement(&d));
-    }
-
-    #[test]
-    fn material_improvement_true_on_throughput_gain() {
-        let mut d = flat_delta();
-        d.throughput_before = Some(100.0);
-        d.throughput_after = Some(106.0); // 6% >= 5%
-        assert!(delta_shows_material_improvement(&d));
-    }
-
-    #[test]
-    fn reveal_when_same_primary_flat_and_has_suppressed() {
-        assert!(should_reveal_suppressed(
-            "oom_risk",
-            Some("oom_risk"),
-            &flat_delta(),
-            true
-        ));
-    }
-
-    #[test]
-    fn no_reveal_when_improved() {
-        let mut d = flat_delta();
-        d.efficiency_delta_pp = Some(3.0);
-        assert!(!should_reveal_suppressed(
-            "oom_risk",
-            Some("oom_risk"),
-            &d,
-            true
-        ));
-    }
-
-    #[test]
-    fn reveal_fires_when_config_drifted_eff_gain_is_discounted() {
-        let mut d = flat_delta();
-        d.config_drifted = true;
-        d.efficiency_delta_pp = Some(5.0);
-        assert!(!delta_shows_material_improvement(&d));
-        assert!(should_reveal_suppressed(
-            "oom_risk",
-            Some("oom_risk"),
-            &d,
-            true
-        ));
-    }
-
-    #[test]
-    fn throughput_arm_survives_baseline_reset() {
-        let mut d = flat_delta();
-        d.config_drifted = true;
-        d.throughput_before = Some(100.0);
-        d.throughput_after = Some(140.0);
-        assert!(delta_shows_material_improvement(&d));
+    fn reveal_even_when_improved() {
+        // Delta is no longer a parameter; same primary + suppressed is enough.
+        assert!(should_reveal_suppressed("oom_risk", Some("oom_risk"), true));
     }
 
     #[test]
@@ -1411,7 +1410,6 @@ mod tests {
         assert!(!should_reveal_suppressed(
             "oom_risk",
             Some("kv_cache_pressure"),
-            &flat_delta(),
             true
         ));
     }
@@ -1421,7 +1419,6 @@ mod tests {
         assert!(!should_reveal_suppressed(
             "oom_risk",
             Some("oom_risk"),
-            &flat_delta(),
             false
         ));
     }
@@ -1451,6 +1448,7 @@ mod tests {
             impact: 5,
             confidence: 0.9,
             display_lines: Vec::new(),
+            terminal: false,
         });
         report
     }

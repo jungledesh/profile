@@ -9,7 +9,7 @@ use super::r1_under_batching::{
 };
 use super::r2_kv_cache_pressure::{
     KvAdmissionBacklogDetail, KvCachePressureDetail, KvFormatCtx, Rule2Outcome,
-    aggregate_backlog_detail, aggregate_r2_detail, format_kv_admission_backlog_issue,
+    aggregate_backlog_detail, aggregate_r2_detail, format_kv_admission_backlog_issue_with_terminal,
     format_kv_cache_window_issue, kv_pressure_confidence, model_is_hybrid, resolve_r2_kv_capacity,
     rule2_kv_admission_backlog, rule2_kv_cache_pressure,
 };
@@ -25,7 +25,7 @@ use super::r5_concurrency_saturation::{
 use super::r6_prefill_bound::{
     PrefillBoundDetail, PrefillBoundEvalInput, Rule6Outcome, TPOT_UNVERIFIED_CONFIDENCE_CAP,
     aggregate_r6_detail, confidence as r6_confidence, effective_prompt_tps,
-    evaluate as r6_evaluate, format_prefill_bound_window_issue, impact as r6_impact,
+    evaluate as r6_evaluate, format_prefill_bound_window_issue_with_terminal, impact as r6_impact,
     severity as r6_severity,
 };
 use super::r7_config_headroom::{
@@ -270,7 +270,6 @@ fn eval_window_rules(
         let win_input = AnalysisInput::new(summary.ctx, w);
         let win_baseline = baseline::compute(&win_input);
 
-        // R6 before R1 so R1 can defer only when R6 actually fired this window.
         let r6_outcome = r6_evaluate(PrefillBoundEvalInput {
             prompt_tokens_per_sec: snap.vllm.prompt_tokens_per_sec,
             generation_tokens_per_sec: snap.vllm.generation_tokens_per_sec,
@@ -288,7 +287,6 @@ fn eval_window_rules(
             is_hybrid: model_is_hybrid(&summary.ctx.model),
             model_in_catalog: summary.ctx.model.param_count.is_some(),
         });
-        let r6_fired = matches!(r6_outcome, Rule6Outcome::Fired(_));
         match r6_outcome {
             Rule6Outcome::Fired(d) => {
                 eval.r6_fired += 1;
@@ -304,11 +302,7 @@ fn eval_window_rules(
             config_relative_efficiency_pct: win_baseline
                 .as_ref()
                 .and_then(|b| b.config_relative_efficiency_pct),
-            prompt_tokens_per_sec: snap.vllm.prompt_tokens_per_sec,
-            generation_tokens_per_sec: snap.vllm.generation_tokens_per_sec,
-            prefix_cache_hit_rate: snap.vllm.prefix_cache_hit_rate,
             ridge_batch_size: win_baseline.as_ref().map(|b| b.ridge_batch_size),
-            r6_fired,
         }) {
             Rule1Outcome::Fired(d) => {
                 eval.r1_fired += 1;
@@ -515,13 +509,14 @@ fn build_report_from_eval(
             impact: 4,
             confidence,
             display_lines,
+            terminal: false,
         });
     }
 
     if r2_significant {
         let r2_agg = aggregate_r2_detail(&eval.r2_details);
         let conf = kv_pressure_confidence(eval.r2_fired, eval.n_eval);
-        let display_lines = format_kv_cache_window_issue(
+        let (display_lines, terminal) = format_kv_cache_window_issue(
             &r2_agg,
             pct(eval.r2_fired, eval.n_eval),
             &KvFormatCtx {
@@ -545,10 +540,11 @@ fn build_report_from_eval(
             impact: 5,
             confidence: conf,
             display_lines,
+            terminal,
         });
     } else if r2_backlog_significant {
         let agg = aggregate_backlog_detail(&eval.r2_backlog_details);
-        let display_lines = format_kv_admission_backlog_issue(
+        let (display_lines, terminal) = format_kv_admission_backlog_issue_with_terminal(
             &agg,
             pct(eval.r2_backlog_fired, eval.n_eval),
             &KvFormatCtx {
@@ -572,6 +568,7 @@ fn build_report_from_eval(
             impact: 5,
             confidence: kv_pressure_confidence(eval.r2_backlog_fired, eval.n_eval),
             display_lines,
+            terminal,
         });
     }
 
@@ -579,7 +576,7 @@ fn build_report_from_eval(
         && let Some(agg) =
             aggregate_concurrency_saturation_detail(&eval.r5_details, eval.session_kv_peak)
     {
-        let display_lines = format_concurrency_saturation_window_issue(
+        let (display_lines, terminal) = format_concurrency_saturation_window_issue(
             &agg,
             pct(eval.r5_fired, eval.n_eval),
             max_model_len,
@@ -593,6 +590,7 @@ fn build_report_from_eval(
             impact: 4,
             confidence: r5_confidence(&agg, empirical),
             display_lines,
+            terminal,
         });
     }
 
@@ -635,6 +633,7 @@ fn build_report_from_eval(
                 impact: 3,
                 confidence: conf,
                 display_lines,
+                terminal: false,
             });
         }
     }
@@ -658,6 +657,7 @@ fn build_report_from_eval(
                 enable_prefix,
                 session_hit_rate,
             ),
+            terminal: false,
         });
     }
 
@@ -670,13 +670,15 @@ fn build_report_from_eval(
             r6_confidence(sev)
         };
         let imp = r6_impact(sev);
-        let display_lines = format_prefill_bound_window_issue(&d, pct(eval.r6_fired, eval.n_eval));
+        let (display_lines, terminal) =
+            format_prefill_bound_window_issue_with_terminal(&d, pct(eval.r6_fired, eval.n_eval));
         recs.push(Recommendation {
             rule_name: rule_names::PREFILL_BOUND,
             layer: 5,
             impact: imp,
             confidence: conf,
             display_lines,
+            terminal,
         });
     }
 
@@ -887,6 +889,7 @@ mod tests {
             impact: 5,
             confidence: 0.9,
             display_lines: vec![rule_name.to_string()],
+            terminal: false,
         }
     }
 

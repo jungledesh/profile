@@ -1354,6 +1354,22 @@ vllm:cache_config_info{block_size="16",cache_dtype="auto",cpu_offload_gb="0",ena
         );
     }
 
+    #[test]
+    fn modern_cache_config_info_omits_chunked_prefill_label() {
+        // Current vLLM CacheConfig.metrics_info() has no enable_chunked_prefill
+        // (that flag lives on SchedulerConfig). Absent label → None, not false.
+        let body = r#"
+vllm:cache_config_info{block_size="16",cache_dtype="auto",enable_prefix_caching="True",gpu_memory_utilization="0.9",num_gpu_blocks="4096",kv_cache_max_concurrency="24.64"} 1.0
+"#;
+        let scrape = scrape_from_body(body).unwrap();
+        let cc = parse_cache_config_labels(&scrape);
+        assert_eq!(cc.enable_prefix_caching, Some(true));
+        assert!(
+            cc.enable_chunked_prefill.is_none(),
+            "missing label must stay unknown"
+        );
+    }
+
     /// Ground truth from H100 boot log Jul 16: concurrency 24.64x at max_model_len 8192.
     #[test]
     fn cache_config_info_allocator_labels_parsed() {
