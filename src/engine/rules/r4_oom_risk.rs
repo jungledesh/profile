@@ -128,7 +128,8 @@ pub(super) fn r4_recommendation_with_request_floor(
             impact: 5,
             confidence,
             display_lines,
-            terminal: false,
+            // Raise util is a server knob; smaller model / more VRAM is not.
+            terminal: !can_raise_utilization,
         });
     }
     let overflow = h.abs();
@@ -178,7 +179,8 @@ pub(super) fn r4_recommendation_with_request_floor(
             "    Expected: Model fits in VRAM; eliminates OOM risk.".to_string(),
             format!("    Confidence: {}", super::confidence_label(confidence)),
         ],
-        terminal: false,
+        // Unrunnable has no server knob; TP / max-model-len / util still do.
+        terminal: unrunnable,
     })
 }
 
@@ -297,6 +299,7 @@ mod tests {
         assert!(text.contains("Raise --gpu-memory-utilization"));
         assert!(!text.contains("tensor-parallel"));
         assert!(!text.contains("KV cache dtype unrecognized"));
+        assert!(!with_whiteboard.terminal, "raise util is a server knob");
 
         let without_whiteboard = r4_recommendation_with_request_floor(
             Some(0.05),
@@ -311,6 +314,59 @@ mod tests {
             },
         );
         assert!(without_whiteboard.is_none());
+    }
+
+    #[test]
+    fn request_floor_terminal_when_only_hardware_change_helps() {
+        // util already 1.0 → cannot raise; smaller model / more VRAM is the fix.
+        let r = r4_recommendation_with_request_floor(
+            Some(0.05),
+            Some(1),
+            Some(20.0),
+            Some(24.0),
+            Some(1.0),
+            WeightDtypeSource::Catalog,
+            R4FloorEvidence {
+                request_bytes: Some(60_000_000),
+                kv_cache_dtype_source: KvCacheDtypeSource::Auto,
+            },
+        )
+        .expect("one request should not fit");
+        let text = r.display_lines.join("\n");
+        assert!(text.contains("smaller model or a GPU with more VRAM"));
+        assert!(r.terminal);
+    }
+
+    #[test]
+    fn weights_overflow_terminal_when_unrunnable() {
+        // 3GB × 0.9 = 2.7GB < 3GB activation buffer → cannot run.
+        let r = r4_recommendation(
+            Some(-12.5),
+            Some(1),
+            Some(140.0),
+            Some(3.0),
+            Some(0.9),
+            WeightDtypeSource::EnvVar,
+        )
+        .expect("fired");
+        let text = r.display_lines.join("\n");
+        assert!(text.contains("cannot run on this hardware"));
+        assert!(r.terminal);
+    }
+
+    #[test]
+    fn weights_overflow_not_terminal_when_tp_can_help() {
+        let r = r4_recommendation(
+            Some(-12.5),
+            Some(1),
+            Some(140.0),
+            Some(80.0),
+            Some(0.9),
+            WeightDtypeSource::EnvVar,
+        )
+        .expect("fired");
+        assert!(r.display_lines.join("\n").contains("tensor-parallel-size"));
+        assert!(!r.terminal);
     }
 
     #[test]

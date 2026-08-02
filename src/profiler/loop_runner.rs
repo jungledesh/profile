@@ -1400,9 +1400,8 @@ mod tests {
     }
 
     #[test]
-    fn reveal_even_when_improved() {
-        // Delta is no longer a parameter; same primary + suppressed is enough.
-        assert!(should_reveal_suppressed("oom_risk", Some("oom_risk"), true));
+    fn no_reveal_when_new_primary_none() {
+        assert!(!should_reveal_suppressed("oom_risk", None, true));
     }
 
     #[test]

@@ -5,6 +5,9 @@ use crate::collectors::RawSnapshot;
 
 // 2s is enough for a local vLLM; longer hangs are user-visible at startup.
 const API_TIMEOUT: Duration = Duration::from_secs(2);
+/// Enrichment probes (`/info`, `/server_info`): short so three fallbacks cannot
+/// stack to 3× `API_TIMEOUT` when endpoints are missing or hang.
+const INFO_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// vLLM default when --gpu-memory-utilization is not set.
 pub const DEFAULT_GPU_MEMORY_UTILIZATION: f64 = 0.90;
@@ -116,6 +119,8 @@ pub fn build_config(
         cfg.model_root = api.model_root.or(cfg.model_root);
         cfg.max_model_len = api.max_model_len.or(cfg.max_model_len);
         let info = fetch_info(&client, &base);
+        // Scrape label/gauge often missing on modern vLLM (SchedulerConfig-only).
+        apply_info_scheduler_gaps(&mut cfg, &info);
         if (cfg.vllm_reported_dtype.as_deref() == Some("auto") || cfg.vllm_reported_dtype.is_none())
             && let Some(resolved) = info.dtype
         {
@@ -123,16 +128,18 @@ pub fn build_config(
             cfg.vllm_reported_dtype_resolved = true;
         }
         cfg.vllm_reported_quantization = info.quantization;
-        // Scrape label/gauge often missing on modern vLLM (SchedulerConfig-only).
-        // Fill gaps only; never overwrite a confirmed scrape/env value.
-        if cfg.enable_chunked_prefill.is_none() {
-            cfg.enable_chunked_prefill = info.enable_chunked_prefill;
-        }
-        if cfg.max_num_batched_tokens.is_none() {
-            cfg.max_num_batched_tokens = info.max_num_batched_tokens;
-        }
     }
     cfg
+}
+
+/// Fill scheduler knobs from `/info` enrichment only when scrape/env left them unset.
+fn apply_info_scheduler_gaps(cfg: &mut VllmConfig, info: &InfoData) {
+    if cfg.enable_chunked_prefill.is_none() {
+        cfg.enable_chunked_prefill = info.enable_chunked_prefill;
+    }
+    if cfg.max_num_batched_tokens.is_none() {
+        cfg.max_num_batched_tokens = info.max_num_batched_tokens;
+    }
 }
 
 /// Strip `/metrics` suffix to get the vLLM server base URL.
@@ -263,7 +270,9 @@ fn fetch_info(client: &reqwest::blocking::Client, base_url: &str) -> InfoData {
             break;
         }
         let url = format!("{base}{path}");
-        let Ok(resp) = client.get(&url).send() else {
+        // Per-request timeout overrides the client default so missing endpoints
+        // cannot burn three full `API_TIMEOUT` waits at diagnose startup.
+        let Ok(resp) = client.get(&url).timeout(INFO_PROBE_TIMEOUT).send() else {
             continue;
         };
         if !resp.status().is_success() {
@@ -742,17 +751,30 @@ mod tests {
         let cfg = config_from_snapshot(&s, None);
         assert_eq!(cfg.enable_chunked_prefill, Some(false));
         assert_eq!(cfg.max_num_batched_tokens, Some(2048));
-        // Simulates build_config gap-fill when fetch_info returned empty.
         let mut enriched = cfg.clone();
-        let info = InfoData::empty();
-        if enriched.enable_chunked_prefill.is_none() {
-            enriched.enable_chunked_prefill = info.enable_chunked_prefill;
-        }
-        if enriched.max_num_batched_tokens.is_none() {
-            enriched.max_num_batched_tokens = info.max_num_batched_tokens;
-        }
+        apply_info_scheduler_gaps(&mut enriched, &InfoData::empty());
         assert_eq!(enriched.enable_chunked_prefill, Some(false));
         assert_eq!(enriched.max_num_batched_tokens, Some(2048));
+    }
+
+    #[test]
+    fn apply_info_scheduler_gaps_fills_only_unset() {
+        let mut cfg = VllmConfig {
+            enable_chunked_prefill: Some(true),
+            max_num_batched_tokens: None,
+            ..VllmConfig::default()
+        };
+        apply_info_scheduler_gaps(
+            &mut cfg,
+            &InfoData {
+                dtype: None,
+                quantization: None,
+                enable_chunked_prefill: Some(false),
+                max_num_batched_tokens: Some(4096),
+            },
+        );
+        assert_eq!(cfg.enable_chunked_prefill, Some(true));
+        assert_eq!(cfg.max_num_batched_tokens, Some(4096));
     }
 
     /// Live vLLM only: `cargo test build_config_resolves_auto_dtype_via_info -- --ignored --nocapture`
