@@ -613,6 +613,24 @@ fn full_window_seat_bullet(
 /// bullet is built; never inferred from printed text.
 const CRISIS_THROTTLE_SUBLINE: &str = "Cuts throughput. Revert after pressure clears.";
 
+/// Demand-side lever when the landing (or backlog) wait clears the queue bar.
+/// Not a server config change; sits in the safe group (does not cut throughput).
+pub(super) const CLIENT_OVERSUB_BULLET: &str =
+    "      • Cap concurrent in-flight requests at --max-num-seqs";
+pub(super) const CLIENT_OVERSUB_SUBLINE: &str =
+    "Sustained wait: more in-flight than seats. Cap demand to drain the queue and cut TTFT.";
+
+fn push_client_oversubscription_fix(safe: &mut Vec<String>, wait_sustained: bool) {
+    if !wait_sustained {
+        return;
+    }
+    super::push_bullet_with_subline(
+        safe,
+        CLIENT_OVERSUB_BULLET.to_string(),
+        Some(CLIENT_OVERSUB_SUBLINE),
+    );
+}
+
 pub(super) struct KvFormatCtx<'a> {
     pub snapshot: &'a RawSnapshot,
     pub max_model_len: Option<u32>,
@@ -747,6 +765,8 @@ pub(super) fn format_kv_cache_pressure_fired_with_terminal(
     let lead_with_shrink = !shrink.lines.is_empty() && would_lead_if_shrink;
 
     let mut safe = Vec::new();
+    // Demand first when wait is sustained; config idle seats are not KV capacity.
+    push_client_oversubscription_fix(&mut safe, queue_backpressure(snapshot));
     push_kv_pressure_safe_levers(
         &mut safe,
         snapshot,
@@ -896,6 +916,8 @@ pub(super) fn format_kv_admission_backlog_issue_with_terminal(
         super::model_len_shrink_suggestion_lines(ctx.max_model_len, &evidence, "      ", false);
 
     let mut safe = Vec::new();
+    // Same landing gate as pressure (`queue_backpressure`); not averaged detail wait.
+    push_client_oversubscription_fix(&mut safe, queue_backpressure(ctx.snapshot));
     push_kv_pressure_safe_levers(
         &mut safe,
         ctx.snapshot,
@@ -1091,6 +1113,7 @@ mod tests {
             4,
         );
         assert!(pressure_term);
+        // dead_end_snap wait is 0 → no client oversub; true hardware wall.
         let (_, backlog_term) = format_kv_admission_backlog_issue_with_terminal(
             &sample_backlog_detail(),
             50,
@@ -1211,6 +1234,8 @@ mod tests {
             4600.0,
             snap_max_num_seqs,
         );
+        // dead_end_snap wait is 0 so seat/dead-end asserts are not mixed with
+        // the client-oversub line (covered in dedicated wait-gate tests).
         format_kv_admission_backlog_issue(
             &sample_backlog_detail(),
             50,
@@ -1858,6 +1883,203 @@ mod tests {
             .join("\n");
         assert!(text.contains("Wait queue drains"));
         assert!(!text.contains("evictions stop"));
+    }
+
+    #[test]
+    fn client_oversub_on_queue_pressure_and_backlog_not_eviction_only() {
+        let oversub = CLIENT_OVERSUB_BULLET;
+        let sub = CLIENT_OVERSUB_SUBLINE;
+
+        // Queue-only pressure (wait > 2): emit under Safe.
+        let queue = format_kv_cache_pressure_fired(
+            &KvCachePressureDetail {
+                kv_cache_usage_perc: Some(90.0),
+                kv_peak_pct: Some(90.0),
+                preemptions_active: false,
+                queue_backpressure: true,
+            },
+            &kv_ctx(
+                &snap(VllmRawMetrics {
+                    kv_cache_usage_perc: Some(90.0),
+                    num_requests_waiting: Some(5.0),
+                    max_num_seqs: Some(256),
+                    ..Default::default()
+                }),
+                None,
+                Some(30.0),
+                None,
+            ),
+            3,
+            4,
+        );
+        let queue_text = queue.join("\n");
+        assert!(queue_text.contains(oversub), "queue path:\n{queue_text}");
+        assert!(queue_text.contains(sub), "queue subline:\n{queue_text}");
+        let safe = queue
+            .iter()
+            .position(|l| l == "    Safe to apply:")
+            .expect("Safe");
+        let over = queue
+            .iter()
+            .position(|l| l.contains(oversub))
+            .expect("oversub");
+        assert!(safe < over, "client oversub under Safe to apply");
+
+        // Crisis + sustained wait: flat Fix list still gets the bullet.
+        let crisis = format_kv_cache_pressure_fired(
+            &detail(90.0, true),
+            &kv_ctx(
+                &snap(VllmRawMetrics {
+                    kv_cache_usage_perc: Some(90.0),
+                    num_requests_waiting: Some(57.0),
+                    num_preemptions_per_sec: Some(0.05),
+                    max_num_seqs: Some(145),
+                    ..Default::default()
+                }),
+                None,
+                Some(30.0),
+                None,
+            ),
+            3,
+            4,
+        )
+        .join("\n");
+        assert!(crisis.contains(oversub), "crisis+wait:\n{crisis}");
+        assert!(crisis.contains(sub));
+
+        // Eviction only, wait quiet: no client line.
+        let eviction_only = format_kv_cache_pressure_fired(
+            &detail(90.0, true),
+            &kv_ctx(
+                &snap(VllmRawMetrics {
+                    kv_cache_usage_perc: Some(90.0),
+                    num_requests_waiting: Some(0.0),
+                    num_preemptions_per_sec: Some(0.05),
+                    max_num_seqs: Some(145),
+                    ..Default::default()
+                }),
+                None,
+                Some(30.0),
+                None,
+            ),
+            3,
+            4,
+        )
+        .join("\n");
+        assert!(
+            !eviction_only.contains(oversub),
+            "eviction-only must not invite client cut:\n{eviction_only}"
+        );
+
+        // Wait at the fire-gate floor (≤ 2): no client line on landing.
+        let wait_two = format_kv_cache_pressure_fired(
+            &KvCachePressureDetail {
+                kv_cache_usage_perc: Some(90.0),
+                kv_peak_pct: Some(90.0),
+                preemptions_active: false,
+                queue_backpressure: true,
+            },
+            &kv_ctx(
+                &snap(VllmRawMetrics {
+                    kv_cache_usage_perc: Some(90.0),
+                    num_requests_waiting: Some(2.0),
+                    ..Default::default()
+                }),
+                None,
+                None,
+                None,
+            ),
+            1,
+            1,
+        )
+        .join("\n");
+        assert!(
+            !wait_two.contains(oversub),
+            "wait≤2 must not emit oversub:\n{wait_two}"
+        );
+
+        // Landing lost waiting after queue-fired windows: no invent.
+        let lost = format_kv_cache_pressure_fired(
+            &KvCachePressureDetail {
+                kv_cache_usage_perc: Some(90.0),
+                kv_peak_pct: Some(92.0),
+                preemptions_active: false,
+                queue_backpressure: true,
+            },
+            &kv_ctx(
+                &snap(VllmRawMetrics {
+                    kv_cache_usage_perc: Some(90.0),
+                    num_requests_waiting: None,
+                    ..Default::default()
+                }),
+                None,
+                None,
+                None,
+            ),
+            1,
+            1,
+        )
+        .join("\n");
+        assert!(!lost.contains(oversub), "missing wait:\n{lost}");
+
+        // Admission backlog with sustained wait: same landing gate as pressure.
+        let backlog = format_kv_admission_backlog_issue(
+            &sample_backlog_detail(),
+            50,
+            &kv_ctx(
+                &snap(VllmRawMetrics {
+                    kv_cache_usage_perc: Some(90.0),
+                    num_requests_waiting: Some(10.0),
+                    max_num_seqs: Some(256),
+                    ..Default::default()
+                }),
+                None,
+                Some(30.0),
+                None,
+            ),
+            3,
+            4,
+        );
+        let backlog_text = backlog.join("\n");
+        assert!(
+            backlog_text.contains(oversub),
+            "backlog path:\n{backlog_text}"
+        );
+        let b_safe = backlog
+            .iter()
+            .position(|l| l == "    Safe to apply:")
+            .expect("Safe");
+        let b_over = backlog
+            .iter()
+            .position(|l| l.contains(oversub))
+            .expect("oversub");
+        assert!(b_safe < b_over);
+    }
+
+    #[test]
+    fn client_oversub_keeps_pressure_non_terminal_when_wait_sustained() {
+        use crate::collectors::KvOffloadState;
+        // Otherwise dead-end geometry, but wait > 2 → client lever → not terminal.
+        let (snap, m) = dead_end_snap(
+            KvOffloadState::Enabled(16.0),
+            10000,
+            5000.0,
+            4600.0,
+            Some(1),
+        );
+        let mut v = snap.vllm.clone();
+        v.num_requests_waiting = Some(5.0);
+        let snap = crate::collectors::snap_vllm(v);
+        let (lines, terminal) = format_kv_cache_pressure_fired_with_terminal(
+            &detail(98.0, true),
+            &kv_ctx_config(&snap, Some(m), None, None, None),
+            3,
+            4,
+        );
+        let text = lines.join("\n");
+        assert!(text.contains(CLIENT_OVERSUB_BULLET), "{text}");
+        assert!(!terminal, "client oversub is a remaining lever:\n{text}");
+        assert!(!text.contains("No config change on this GPU moves the KV wall."));
     }
 
     #[test]
@@ -3104,14 +3326,22 @@ mod tests {
         assert!(!text.contains("unavailable"));
     }
 
-    /// Count `--max-num-seqs` mentions in the Fix block only (not Cause).
+    /// Count seat-throttle `--max-num-seqs` bullets in the Fix block only (not Cause,
+    /// not the client in-flight oversub line which also names the flag).
     fn seat_lines_in_fix(text: &str) -> usize {
         let Some(fix_at) = text.find("    Fix:") else {
             return 0;
         };
         let fix = &text[fix_at..];
         let end = fix.find("\n    Expected:").unwrap_or(fix.len());
-        fix[..end].matches("--max-num-seqs").count()
+        fix[..end]
+            .lines()
+            .filter(|l| {
+                l.starts_with("      •")
+                    && (l.contains("Lower --max-num-seqs")
+                        || l.contains("Then lower --max-num-seqs"))
+            })
+            .count()
     }
 
     #[test]
@@ -4471,6 +4701,8 @@ mod tests {
 
     /// Crisis dead end: shrink no-op (<5%), cap contradicted, every safe lever already set
     /// or unavailable. Verify then replica bullets under Fix:, with Expected.
+    /// Waiting is quiet (≤ queue bar) so the client-oversub line stays gated off; otherwise
+    /// demand control would correctly keep the path non-terminal.
     fn dead_end_snap(
         offload: crate::collectors::KvOffloadState,
         max_model_len: u32,
@@ -4481,7 +4713,7 @@ mod tests {
         let v = VllmRawMetrics {
             kv_cache_usage_perc: Some(98.0),
             num_requests_running_peak: Some(16.0),
-            num_requests_waiting: Some(4.0),
+            num_requests_waiting: Some(0.0),
             num_preemptions_per_sec: Some(0.05),
             generation_tokens_completed: Some(150.0),
             prompt_tokens_p99: Some(prompt_p99),

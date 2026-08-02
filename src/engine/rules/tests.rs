@@ -2503,6 +2503,60 @@ fn r2_backlog_suppressed_when_standard_r2_fires() {
 }
 
 #[test]
+fn r2_client_oversub_in_default_and_verbose_when_wait_sustained() {
+    let oversub = super::r2_kv_cache_pressure::CLIENT_OVERSUB_BULLET;
+    let sub = super::r2_kv_cache_pressure::CLIENT_OVERSUB_SUBLINE;
+    // Summary/landing snap is windows.last(); wait must clear the bar there too
+    // (format gates on landing wait, same as production aggregate summary).
+    let windows: Vec<_> = (0..15)
+        .map(|_| mk_evaluable_backlog_window(89.0, 15.0, 15.0, 20.0, 100, 16))
+        .collect();
+    let ctx = mk_ctx();
+    let summary = ai(&ctx, windows.last().expect("windows"));
+    for verbose in [false, true] {
+        let text = format_diagnose_rules_for_windows_test(
+            &windows,
+            summary,
+            verbose,
+            "http://127.0.0.1:8000/metrics",
+        )
+        .join("\n");
+        assert!(
+            text.contains("[!] KV Cache Pressure"),
+            "verbose={verbose}: {text}"
+        );
+        assert!(
+            text.contains(oversub),
+            "client oversub missing verbose={verbose}: {text}"
+        );
+        assert!(
+            text.contains(sub),
+            "oversub subline missing verbose={verbose}: {text}"
+        );
+    }
+
+    // Eviction-only windows: no client oversub in either mode.
+    let evict: Vec<_> = (0..15)
+        .map(|_| mk_evaluable_kv_window(89.0, true))
+        .collect();
+    let summary = ai(&ctx, evict.last().expect("windows"));
+    for verbose in [false, true] {
+        let text = format_diagnose_rules_for_windows_test(
+            &evict,
+            summary,
+            verbose,
+            "http://127.0.0.1:8000/metrics",
+        )
+        .join("\n");
+        assert!(text.contains("[!] KV Cache Pressure"), "verbose={verbose}");
+        assert!(
+            !text.contains(oversub),
+            "eviction-only must omit client oversub verbose={verbose}: {text}"
+        );
+    }
+}
+
+#[test]
 fn r5_concurrency_saturation_fires_on_sustained_saturation() {
     let mut windows: Vec<_> = (0..15)
         .map(|_| mk_evaluable_kv_window(50.0, false))
