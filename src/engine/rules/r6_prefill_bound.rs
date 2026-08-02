@@ -528,7 +528,9 @@ pub(super) fn aggregate_r6_detail(details: &[PrefillBoundDetail]) -> PrefillBoun
         ridge_batch_size: details.first().and_then(|d| d.ridge_batch_size),
         max_num_batched_tokens: details.last().and_then(|d| d.max_num_batched_tokens),
         is_hybrid: details.first().is_some_and(|d| d.is_hybrid),
-        chunk_floor: details.last().and_then(|d| d.chunk_floor),
+        // Newest known floor: last non-None wins so an unread final window
+        // keeps the latest earlier scrape (not last().and_then → None).
+        chunk_floor: details.iter().rev().find_map(|d| d.chunk_floor),
         model_in_catalog: details.first().is_some_and(|d| d.model_in_catalog),
     }
 }
@@ -646,7 +648,11 @@ pub(super) fn format_prefill_bound_window_issue_with_terminal(
         confidence(sev)
     };
     let (fix_bullets, expected_normal, terminal) = prefill_fix_lines(d, sev);
-    let skewed = skewed_mode(d);
+    let prompt_p99 = d.prompt_tokens_p99.filter(|v| v.is_finite() && *v > 0.0);
+    let prompt_mean = d.prompt_tokens_mean.filter(|v| v.is_finite() && *v > 0.0);
+    // Skew UI + routing only with both ends of the length distribution.
+    // Ratio alone with missing p99/mean is normal path (title, cause, Fix).
+    let skewed = skewed_mode(d) && prompt_p99.is_some() && prompt_mean.is_some();
 
     let ratio_display = if d.prompt_gen_ratio.is_finite() {
         format!("{:.1}x", d.prompt_gen_ratio)
@@ -678,10 +684,10 @@ pub(super) fn format_prefill_bound_window_issue_with_terminal(
     ];
 
     if skewed {
-        if let Some(pm) = d.prompt_tokens_mean.filter(|v| v.is_finite() && *v > 0.0) {
+        if let Some(pm) = prompt_mean {
             lines.push(r6_metric_line("Prompt mean", &format!("{pm:.0} tok")));
         }
-        if let Some(p99) = d.prompt_tokens_p99.filter(|v| v.is_finite() && *v > 0.0) {
+        if let Some(p99) = prompt_p99 {
             let ratio = d.prompt_skew_ratio.unwrap_or(0.0);
             if ratio > 0.0 && ratio.is_finite() {
                 lines.push(r6_metric_line(
@@ -692,29 +698,19 @@ pub(super) fn format_prefill_bound_window_issue_with_terminal(
                 lines.push(r6_metric_line("Prompt p99", &format!("{p99:.0} tok")));
             }
         }
-    } else if let Some(pm) = d.prompt_tokens_mean.filter(|v| v.is_finite() && *v > 0.0) {
+    } else if let Some(pm) = prompt_mean {
         lines.push(r6_metric_line("Avg prompt", &format!("{pm:.0} tok")));
     }
 
     lines.push(String::new());
     lines.push("    Cause:".to_string());
-    if skewed {
-        if let (Some(pm), Some(p99)) = (
-            d.prompt_tokens_mean.filter(|v| v.is_finite() && *v > 0.0),
-            d.prompt_tokens_p99.filter(|v| v.is_finite() && *v > 0.0),
-        ) {
-            lines.push(format!(
-                "      Outlier prompts (p99: {p99:.0} tok) are monopolizing prefill compute."
-            ));
-            lines.push(format!(
-                "      Short requests ({pm:.0} tok mean) are blocked behind long-tail prefills."
-            ));
-        } else {
-            lines.push(
-                "      Prompt length outliers are monopolizing prefill compute and blocking shorter requests."
-                    .to_string(),
-            );
-        }
+    if let (true, Some(p99), Some(pm)) = (skewed, prompt_p99, prompt_mean) {
+        lines.push(format!(
+            "      Outlier prompts (p99: {p99:.0} tok) are monopolizing prefill compute."
+        ));
+        lines.push(format!(
+            "      Short requests ({pm:.0} tok mean) are blocked behind long-tail prefills."
+        ));
     } else {
         lines.push(format!(
             "      Prompt input rate is {ratio_display} generation output rate, starving decode throughput."
@@ -736,12 +732,7 @@ pub(super) fn format_prefill_bound_window_issue_with_terminal(
     }
 
     lines.push(String::new());
-    let prompt_p99 = d.prompt_tokens_p99.filter(|v| v.is_finite() && *v > 0.0);
-    let prompt_mean = d.prompt_tokens_mean.filter(|v| v.is_finite() && *v > 0.0);
-    // Routing Fix only when skew has both ends of the length distribution.
-    // Skew without p99/mean falls through to prefill_fix_lines (may be terminal).
-    let routing = skewed && prompt_p99.is_some() && prompt_mean.is_some();
-    let expected = match (routing, prompt_p99, prompt_mean) {
+    let expected = match (skewed, prompt_p99, prompt_mean) {
         (true, Some(p99), Some(mean)) => {
             let mut safe = Vec::new();
             // Enable only on confirmed off. Unknown is not off.
@@ -769,17 +760,15 @@ pub(super) fn format_prefill_bound_window_issue_with_terminal(
         _ => {
             lines.push("    Fix:".to_string());
             lines.extend(fix_bullets);
-            if !skewed {
-                lines.push("      • Reduce prompt length where possible.".to_string());
-            }
+            lines.push("      • Reduce prompt length where possible.".to_string());
             expected_normal
         }
     };
     lines.push(String::new());
     lines.push(format!("    Expected: {expected}"));
     lines.push(format!("    Confidence: {}", super::confidence_label(conf)));
-    // Wall terminal applies only when the prefill_fix_lines branch rendered.
-    let terminal = !routing && terminal;
+    // Wall terminal applies only when the normal (non-routing) Fix branch rendered.
+    let terminal = !skewed && terminal;
     (super::with_seen_pct(lines, seen_pct), terminal)
 }
 
@@ -1157,6 +1146,34 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_chunk_floor_falls_back_when_last_unread() {
+        let known = PrefillBoundDetail {
+            prompt_gen_ratio: 6.0,
+            decode_efficiency_pct: 10.0,
+            tpot_ms: None,
+            tpot_floor_ms: None,
+            tpot_unverified: false,
+            prefix_caching_enabled: Some(true),
+            chunked_prefill_enabled: Some(true),
+            prompt_tokens_mean: None,
+            prompt_tokens_p99: None,
+            prompt_skew_ratio: None,
+            running_count: None,
+            ridge_batch_size: None,
+            max_num_batched_tokens: Some(2048),
+            is_hybrid: false,
+            chunk_floor: Some(16),
+            model_in_catalog: true,
+        };
+        let unread_last = PrefillBoundDetail {
+            chunk_floor: None,
+            ..known.clone()
+        };
+        let agg = aggregate_r6_detail(&[known, unread_last]);
+        assert_eq!(agg.chunk_floor, Some(16));
+    }
+
+    #[test]
     fn impact_scales_with_severity() {
         assert!(impact(Severity::Severe) > impact(Severity::Moderate));
         assert!(impact(Severity::Moderate) > impact(Severity::Mild));
@@ -1497,7 +1514,7 @@ mod tests {
 
     #[test]
     fn skewed_mode_without_p99_falls_back_to_normal_fix() {
-        // Skew signal without p99: render prefill_fix_lines, keep wall terminal.
+        // Skew signal without p99: full normal path (title/cause/Fix), keep wall terminal.
         let mut d = wall_path_base(Some(2048), Some(1638.4), Some(true), 12.0);
         d.prompt_skew_ratio = Some(25.0);
         d.prompt_tokens_p99 = None;
@@ -1506,10 +1523,21 @@ mod tests {
         assert!(on_compute_wall(&d));
         let (lines, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100);
         let text = lines.join("\n");
+        assert!(
+            text.contains("High Prompt Processing Time"),
+            "incomplete skew must use normal title: {text}"
+        );
+        assert!(!text.contains("Skewed Prompt Distribution"));
+        assert!(text.contains(
+            "Prompt input rate is 12.0x generation output rate, starving decode throughput."
+        ));
+        assert!(!text.contains("Prompt length outliers are monopolizing"));
         assert!(!text.contains("Route long-context requests"));
         assert!(!text.contains("    Rejects requests:"));
         assert!(text.contains("    Fix:"));
         assert!(text.contains("no single-GPU knob adds FLOPs"));
+        assert!(text.contains("Reduce prompt length where possible"));
+        assert!(text.contains("Avg prompt"));
         assert!(terminal);
         assert!(!text.contains(SKEWED_EXPECTED));
     }
