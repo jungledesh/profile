@@ -36,7 +36,7 @@ cargo deny check --all-features
 cargo test --locked
 ```
 
-CI also runs OSV-Scanner (fail on HIGH/CRITICAL in `Cargo.lock`) and Semgrep SAST on every pull request and merge to `main`. [Socket](https://socket.dev/) supply-chain scanning also runs on those events via the Socket for GitHub App (`Socket Security: Project Report`); it is not a required status check.
+CI also runs OSV-Scanner (fail on HIGH/CRITICAL in `Cargo.lock`), Semgrep SAST, and [Socket](https://socket.dev/) supply-chain scanning on every pull request and merge to `main`. Socket runs as the Socket for GitHub App and reports as the `Socket Sec: Project Report` check.
 
 Fix clippy findings, do not silence them. Never mask CI security scanners; `|| true` after a scanner is a rejection. Allowlist real false positives in `deny.toml`.
 

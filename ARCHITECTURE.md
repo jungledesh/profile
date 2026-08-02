@@ -1,6 +1,6 @@
 # Architecture
 
-Structure of the `profile` binary: data flow, module boundaries, key types. How to change the code, and the merge gate (`fmt`, `clippy`, `audit`, `deny`, `test`, plus OSV and Semgrep in CI), is in [CONTRIBUTING.md](CONTRIBUTING.md). What the tool does and why is in the [README](README.md).
+Structure of the `profile` binary: data flow, module boundaries, key types. How to change the code, and the merge gate (`fmt`, `clippy`, `audit`, `deny`, `test`, plus OSV, Semgrep, and Socket in CI), is in [CONTRIBUTING.md](CONTRIBUTING.md). What the tool does and why is in the [README](README.md).
 
 Single Rust binary. `profile diagnose` runs an interactive closed loop: collect, analyze, recommend, wait for the operator to apply the fix, re-collect, compute delta, repeat.
 

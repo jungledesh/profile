@@ -928,6 +928,7 @@ pub(super) fn format_kv_admission_backlog_issue_with_terminal(
     super::push_grouped_fixes(&mut out, safe, cuts, Vec::new(), false);
     emit_last_resort_offload(&mut out, last_resort);
 
+    super::trim_group_trailing_blanks(&mut out);
     out.push(String::new());
     out.push("    Expected: Wait queue drains, TTFT recovers.".to_string());
     if super::rule_is_significant(windows_fired, total_evaluable) {
@@ -1125,6 +1126,25 @@ mod tests {
             4,
         );
         assert!(!terminal);
+    }
+
+    #[test]
+    fn offload_only_path_is_not_terminal() {
+        use crate::collectors::KvOffloadState;
+        // Dead-end geometry (no safe/cuts) but Off + eviction → Last resort is a knob.
+        let (snap, m) = dead_end_snap(KvOffloadState::Off, 10000, 5000.0, 4600.0, Some(1));
+        let (lines, terminal) = format_kv_cache_pressure_fired_with_terminal(
+            &detail(98.0, true),
+            &kv_ctx_config(&snap, Some(m), None, None, None),
+            3,
+            4,
+        );
+        let text = lines.join("\n");
+        assert!(
+            text.contains(LAST_RESORT_HEADER),
+            "expected Last resort offload:\n{text}"
+        );
+        assert!(!terminal, "offload-only must not be terminal:\n{text}");
     }
 
     fn assert_no_dead_end_pair(text: &str) {
@@ -4365,6 +4385,13 @@ mod tests {
         assert!(pressure.contains(LAST_RESORT_HEADER));
         assert!(backlog.contains(LAST_RESORT_HEADER));
         assert!(pressure.contains(KV_OFFLOAD_DOWNSIDE));
+        let backlog_lines: Vec<&str> = backlog.lines().collect();
+        assert!(
+            !backlog_lines
+                .windows(2)
+                .any(|w| w[0].is_empty() && w[1].is_empty()),
+            "no consecutive blank lines in backlog block:\n{backlog}"
+        );
     }
 
     #[test]

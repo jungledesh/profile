@@ -177,18 +177,9 @@ fn resolve_batch_token_prescription(d: &PrefillBoundDetail) -> BatchTokenPrescri
     }
 }
 
-/// Named Set/lower bullet. No "unread" subline: when scrape cannot see the
-/// knob we fall back to Enable+Set (Option B), not an apology under Set.
-fn push_named_budget_bullet(out: &mut Vec<String>, bullet: String, dependency: Option<&str>) {
-    out.push(bullet);
-    if let Some(dep) = dependency {
-        out.push(format!("        {}", dep.trim_start()));
-        out.push(String::new());
-    }
-}
-
 /// Second return is whether a named Set/lower budget knob was emitted (structural;
-/// do not re-read printed text to decide Expected).
+/// do not re-read printed text to decide Expected). Named bullets use the shared
+/// subline helper. No "unread" apology: unread falls back to Enable+Set (Option B).
 fn batch_token_budget_bullets(
     d: &PrefillBoundDetail,
     verb: &str,
@@ -209,7 +200,7 @@ fn batch_token_budget_bullets(
                 }
             };
             let mut lines = Vec::new();
-            push_named_budget_bullet(
+            super::push_bullet_with_subline(
                 &mut lines,
                 format!("      • {verb} --max-num-batched-tokens to {value}{tail}"),
                 dependency,
@@ -221,7 +212,7 @@ fn batch_token_budget_bullets(
                 return (Vec::new(), false);
             }
             let mut lines = Vec::new();
-            push_named_budget_bullet(
+            super::push_bullet_with_subline(
                 &mut lines,
                 format!(
                     "      • {verb} --max-num-batched-tokens to {value} (floor-limited; page alignment) to shrink prefill chunk size. Lower for smoother TPOT, raise for lower TTFT."
@@ -245,7 +236,7 @@ fn batch_token_budget_bullets(
         ),
         BatchTokenPrescription::DirectionOnly { floor } => {
             let mut lines = Vec::new();
-            push_named_budget_bullet(
+            super::push_bullet_with_subline(
                 &mut lines,
                 format!(
                     "      • {verb} --max-num-batched-tokens lower to shrink prefill chunk size (not below {floor}). Lower for smoother TPOT, raise for lower TTFT."
@@ -1224,6 +1215,35 @@ mod tests {
             .expect("reject bullet");
         assert!(fix < chunked && chunked < route && route < rejects && rejects < cap);
         assert!(!text.contains("Set --max-num-batched-tokens to shrink prefill chunk size"));
+    }
+
+    #[test]
+    fn fix_recommends_routing_when_skewed_chunked_unknown_skips_enable() {
+        // Routing arm: unknown chunked is not off → no Enable bullet (Option B
+        // lives only in prefill_fix_lines, which routing does not use).
+        let d = PrefillBoundDetail {
+            prompt_gen_ratio: 15.0,
+            decode_efficiency_pct: 6.7,
+            tpot_ms: Some(130.0),
+            tpot_floor_ms: Some(7.85),
+            tpot_unverified: false,
+            prefix_caching_enabled: Some(true),
+            chunked_prefill_enabled: None,
+            prompt_tokens_mean: Some(2048.0),
+            prompt_tokens_p99: Some(51_200.0),
+            prompt_skew_ratio: Some(25.0),
+            running_count: None,
+            ridge_batch_size: None,
+            max_num_batched_tokens: None,
+            is_hybrid: false,
+            chunk_floor: None,
+            model_in_catalog: true,
+        };
+        let (lines, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100);
+        let text = lines.join("\n");
+        assert!(text.contains("Route long-context requests"));
+        assert!(!text.contains("Enable --enable-chunked-prefill"));
+        assert!(!terminal, "routing path is never terminal:\n{text}");
     }
 
     #[test]
