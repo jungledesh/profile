@@ -81,8 +81,6 @@ fn push_kv_pressure_safe_levers(
     kv_headroom_gb: Option<f64>,
     kv_cache_dtype: Option<&str>,
     fp8_compiler_available: bool,
-    model: Option<&crate::context::ModelArch>,
-    tp: Option<u32>,
 ) {
     if let Some(bullet) = prefix_caching_fix_bullet(snapshot) {
         safe.push(bullet);
@@ -93,24 +91,27 @@ fn push_kv_pressure_safe_levers(
     if let Some(bullet) = fp8_kv_cache_fix_bullet(kv_cache_dtype, fp8_compiler_available) {
         safe.push(bullet);
     }
-    push_kv_offload_fix_last(safe, snapshot, kv_headroom_gb, kv_cache_dtype, model, tp);
 }
 
-fn push_kv_offload_fix_last(
-    safe: &mut Vec<String>,
+/// Last-resort offload lines (bullet + downside + host RAM), or empty when gated off.
+/// Caller owns the `Last resort:` header. Only when eviction is active.
+fn kv_offload_last_resort_lines(
     snapshot: &RawSnapshot,
     kv_headroom_gb: Option<f64>,
     kv_cache_dtype: Option<&str>,
     model: Option<&crate::context::ModelArch>,
     tp: Option<u32>,
-) {
+) -> Vec<String> {
     use crate::collectors::KvOffloadState;
 
+    if !eviction_signal_active(snapshot) {
+        return Vec::new();
+    }
     if matches!(
         snapshot.vllm.cache_config.kv_offloading,
         KvOffloadState::Unsupported | KvOffloadState::Unreadable
     ) {
-        return;
+        return Vec::new();
     }
 
     let size_input = KvOffloadSizeInput {
@@ -128,30 +129,43 @@ fn push_kv_offload_fix_last(
         peak_waiting: peak_waiting(snapshot),
     };
 
-    match snapshot.vllm.cache_config.kv_offloading {
-        KvOffloadState::Off => {
-            let size = resolve_kv_offload_size_gib(size_input);
-            let bullet = kv_offload_fix_bullet(size);
-            let subline = format_kv_offload_subline(snapshot.host_memory);
-            super::push_bullet_with_subline(safe, bullet, Some(&subline));
-        }
+    let size = match snapshot.vllm.cache_config.kv_offloading {
+        KvOffloadState::Off => resolve_kv_offload_size_gib(size_input),
         KvOffloadState::Enabled(v) => {
             let Some(derived) = resolve_kv_offload_size_gib(size_input) else {
-                return;
+                return Vec::new();
             };
-            // Same whole-GiB rounding as derived; equality at GiB granularity is a no-op.
             let Some(set) = ceil_bytes_to_whole_gib(v * GIB_BYTES) else {
-                return;
+                return Vec::new();
             };
             if derived <= set {
-                return;
+                return Vec::new();
             }
-            let bullet = kv_offload_fix_bullet(Some(derived));
-            let subline = format_kv_offload_subline(snapshot.host_memory);
-            super::push_bullet_with_subline(safe, bullet, Some(&subline));
+            Some(derived)
         }
-        KvOffloadState::Unsupported | KvOffloadState::Unreadable => {}
+        KvOffloadState::Unsupported | KvOffloadState::Unreadable => return Vec::new(),
+    };
+
+    vec![
+        kv_offload_fix_bullet(size),
+        format!("        {KV_OFFLOAD_DOWNSIDE}"),
+        format!(
+            "        {}",
+            format_kv_offload_subline(snapshot.host_memory).trim_start()
+        ),
+        String::new(),
+    ]
+}
+
+fn emit_last_resort_offload(out: &mut Vec<String>, lines: Vec<String>) {
+    if lines.is_empty() {
+        return;
     }
+    if !out.last().is_some_and(|l| l.is_empty()) && !out.last().is_some_and(|l| l == "    Fix:") {
+        out.push(String::new());
+    }
+    out.push(LAST_RESORT_HEADER.to_string());
+    out.extend(lines);
 }
 
 fn peak_waiting(snapshot: &RawSnapshot) -> Option<f64> {
@@ -251,9 +265,12 @@ pub(super) fn resolve_kv_offload_size_gib(input: KvOffloadSizeInput) -> Option<u
 }
 
 const KV_OFFLOAD_FIX: &str = "      • Set --kv-offloading-size (GiB) to hold evicted KV in host memory instead of recomputing it";
-/// Fallback when host memory reads fail; rendered via [`super::push_bullet_with_subline`].
+/// Fallback when host memory reads fail; rendered as the second last-resort subline.
 const KV_OFFLOAD_SUBLINE_FALLBACK: &str =
     "Check host RAM and your container memory limit before allocating.";
+const KV_OFFLOAD_DOWNSIDE: &str =
+    "Spills KV to host so more sequences can stay admitted; can starve decode under long prompts.";
+const LAST_RESORT_HEADER: &str = "    Last resort:";
 
 pub(super) fn format_kv_offload_subline(
     facts: Option<crate::collectors::HostMemoryFacts>,
@@ -736,8 +753,6 @@ pub(super) fn format_kv_cache_pressure_fired_with_terminal(
         kv_headroom_gb,
         kv_cache_dtype,
         fp8_compiler_available,
-        ctx.model,
-        ctx.tp,
     );
 
     // Lowering seats always reduces KV demand, down to 1. At 1 there is nothing
@@ -767,13 +782,17 @@ pub(super) fn format_kv_cache_pressure_fired_with_terminal(
         }
     }
 
-    let terminal = safe.is_empty() && cuts.is_empty();
+    let last_resort =
+        kv_offload_last_resort_lines(snapshot, kv_headroom_gb, kv_cache_dtype, ctx.model, ctx.tp);
+
+    let terminal = safe.is_empty() && cuts.is_empty() && last_resort.is_empty();
     if terminal {
         push_dead_end_fixes(&mut safe);
     }
 
     if preemptions_active {
-        // Crisis: flat Fix list, no group labels. Cuts before safe when shrink leads.
+        // Crisis: flat Fix list for cuts/safe, no group labels. Offload is still
+        // labeled Last resort so operators never read it as safe.
         let lead_with_cuts = lead_with_shrink;
         out.push("    Fix:".to_string());
         let emit_cuts = |out: &mut Vec<String>, cuts: Vec<super::CutBullet>| {
@@ -786,7 +805,6 @@ pub(super) fn format_kv_cache_pressure_fired_with_terminal(
         let cuts_nonempty = !cuts.is_empty();
         if lead_with_cuts {
             emit_cuts(&mut out, cuts);
-            // Subline already leaves one blank; do not add a second separator.
             if cuts_nonempty && safe_nonempty && !out.last().is_some_and(|l| l.is_empty()) {
                 out.push(String::new());
             }
@@ -798,10 +816,12 @@ pub(super) fn format_kv_cache_pressure_fired_with_terminal(
             }
             emit_cuts(&mut out, cuts);
         }
+        emit_last_resort_offload(&mut out, last_resort);
     } else {
         let lead_with_cuts = lead_with_shrink;
         super::trim_group_trailing_blanks(&mut safe);
         super::push_grouped_fixes(&mut out, safe, cuts, Vec::new(), lead_with_cuts);
+        emit_last_resort_offload(&mut out, last_resort);
     }
 
     let expected = if preemptions_active {
@@ -882,8 +902,6 @@ pub(super) fn format_kv_admission_backlog_issue_with_terminal(
         ctx.kv_headroom_gb,
         kv_cache_dtype,
         ctx.fp8_compiler_available,
-        ctx.model,
-        ctx.tp,
     );
 
     let mut cuts: Vec<super::CutBullet> = Vec::new();
@@ -892,13 +910,23 @@ pub(super) fn format_kv_admission_backlog_issue_with_terminal(
     }
     super::extend_with_shrink_suggestion(&mut cuts, shrink);
 
-    let terminal = safe.is_empty() && cuts.is_empty();
+    // Same eviction gate as pressure: Last resort only when eviction is active.
+    let last_resort = kv_offload_last_resort_lines(
+        ctx.snapshot,
+        ctx.kv_headroom_gb,
+        kv_cache_dtype,
+        ctx.model,
+        ctx.tp,
+    );
+
+    let terminal = safe.is_empty() && cuts.is_empty() && last_resort.is_empty();
     if terminal {
         push_dead_end_fixes(&mut safe);
     }
 
     super::trim_group_trailing_blanks(&mut safe);
     super::push_grouped_fixes(&mut out, safe, cuts, Vec::new(), false);
+    emit_last_resort_offload(&mut out, last_resort);
 
     out.push(String::new());
     out.push("    Expected: Wait queue drains, TTFT recovers.".to_string());
@@ -3479,24 +3507,45 @@ mod tests {
     }
 
     fn assert_offload_block(lines: &[String]) {
+        let header_idx = lines
+            .iter()
+            .position(|l| l.as_str() == LAST_RESORT_HEADER)
+            .expect("Last resort header");
         let idx = lines
             .iter()
             .position(|l| l.contains("Set --kv-offloading-size"))
             .expect("offload bullet");
-        let gpu_idx = lines
+        assert_eq!(idx, header_idx + 1, "bullet immediately under Last resort");
+        if let Some(gpu_idx) = lines
             .iter()
             .position(|l| l.contains("Raise --gpu-memory-utilization"))
-            .expect("gpu-mem bullet");
-        let fp8_idx = lines
+        {
+            assert!(gpu_idx < header_idx, "offload after safe gpu-mem lever");
+        }
+        if let Some(fp8_idx) = lines
             .iter()
             .position(|l| l.contains("Switch --kv-cache-dtype fp8"))
-            .expect("fp8 bullet");
-        assert!(gpu_idx < idx, "offload must follow gpu-memory-utilization");
-        assert!(fp8_idx < idx, "offload must follow fp8");
+        {
+            assert!(fp8_idx < header_idx, "offload after safe fp8 lever");
+        }
         if let Some(safe_idx) = lines.iter().position(|l| l == "    Safe to apply:") {
-            assert!(safe_idx < idx, "offload must sit inside the safe group");
+            assert!(
+                safe_idx < header_idx,
+                "Last resort must follow Safe to apply"
+            );
+            let safe_end = lines
+                .iter()
+                .position(|l| l == "    Cuts throughput:")
+                .or_else(|| lines.iter().position(|l| l.as_str() == LAST_RESORT_HEADER))
+                .unwrap_or(lines.len());
+            for line in &lines[safe_idx + 1..safe_end] {
+                assert!(
+                    !line.contains("kv-offloading-size"),
+                    "offload must never sit inside Safe to apply: {line:?}"
+                );
+            }
             if let Some(cuts_idx) = lines.iter().position(|l| l == "    Cuts throughput:") {
-                assert!(idx < cuts_idx, "offload must precede the cuts group");
+                assert!(cuts_idx < header_idx, "Last resort after Cuts throughput");
             }
         }
         assert!(
@@ -3505,16 +3554,17 @@ mod tests {
             lines[idx]
         );
         assert_eq!(
-            lines[idx + 1].trim_start(),
-            "Check host RAM and your container memory limit before allocating."
+            lines[idx + 1],
+            format!("        {KV_OFFLOAD_DOWNSIDE}"),
+            "downside subline"
         );
         assert_eq!(
-            lines[idx + 1],
+            lines[idx + 2],
             format!("        {}", KV_OFFLOAD_SUBLINE_FALLBACK.trim_start()),
-            "offload subline must match push_bullet_with_subline indent"
+            "host RAM subline indent"
         );
-        if lines.get(idx + 2).is_some_and(|l| l.is_empty()) {
-            assert_eq!(lines[idx + 2], String::new(), "blank after subline");
+        if lines.get(idx + 3).is_some_and(|l| l.is_empty()) {
+            assert_eq!(lines[idx + 3], String::new(), "blank after host subline");
         }
         let fix_idx = lines
             .iter()
@@ -3524,54 +3574,21 @@ mod tests {
             .iter()
             .position(|l| l.starts_with("    Expected:"))
             .unwrap_or(lines.len());
-        if lines.iter().any(|l| l == "    Safe to apply:") {
-            let cuts_idx = lines
-                .iter()
-                .position(|l| l == "    Cuts throughput:")
-                .expect("labeled safe requires cuts group in offload test fixture");
-            let safe_end = lines[fix_idx + 1..cuts_idx]
-                .iter()
-                .rfind(|l| l.starts_with("      •") || l.starts_with("        "))
-                .expect("safe group content");
-            assert!(
-                safe_end.contains("Set --kv-offloading-size")
-                    || lines[idx + 1].trim_start() == KV_OFFLOAD_SUBLINE_FALLBACK,
-                "offload must be the last safe-group item"
-            );
-            for line in &lines[cuts_idx + 1..section_end] {
-                assert!(
-                    line.is_empty()
-                        || line.starts_with("    Cuts throughput:")
-                        || line.starts_with("      •")
-                        || line.starts_with("        "),
-                    "no unlabeled fix line after labeled groups: {line:?}"
-                );
-            }
-        } else {
-            // Crisis: flat Fix list (no group labels). Safe bullets precede cut bullets.
-            let bullets: Vec<&String> = lines[fix_idx + 1..section_end]
-                .iter()
-                .filter(|l| l.starts_with("      •"))
-                .collect();
-            let offload_pos = bullets
-                .iter()
-                .position(|l| l.contains("Set --kv-offloading-size"))
-                .expect("offload bullet in crisis fix list");
-            let fp8_pos = bullets
-                .iter()
-                .position(|l| l.contains("Switch --kv-cache-dtype fp8"))
-                .expect("fp8 bullet in crisis fix list");
-            assert!(
-                fp8_pos < offload_pos,
-                "offload must follow fp8 in crisis list"
-            );
-            if let Some(after) = bullets.get(offload_pos + 1) {
-                assert!(
-                    after.contains("max-num-seqs") || after.contains("max-model-len"),
-                    "only cut bullets may follow offload in crisis list: {after:?}"
-                );
-            }
-        }
+        assert!(fix_idx < header_idx, "Last resort under Fix");
+        // Offload is last among fix bullets (after safe/cuts).
+        let bullets: Vec<&String> = lines[fix_idx + 1..section_end]
+            .iter()
+            .filter(|l| l.starts_with("      •"))
+            .collect();
+        let offload_pos = bullets
+            .iter()
+            .position(|l| l.contains("Set --kv-offloading-size"))
+            .expect("offload bullet in fix list");
+        assert_eq!(
+            offload_pos,
+            bullets.len() - 1,
+            "offload must be the last fix bullet"
+        );
     }
 
     fn format_offload_three_paths(
@@ -3639,15 +3656,15 @@ mod tests {
     #[test]
     fn kv_offload_subline_matches_dead_end_subline_convention() {
         use crate::collectors::KvOffloadState;
-        let (_, non_crisis, _) = format_offload_three_paths(offload_cache(KvOffloadState::Off));
-        let offload_idx = non_crisis
+        let (crisis, _, _) = format_offload_three_paths(offload_cache(KvOffloadState::Off));
+        let offload_idx = crisis
             .iter()
             .position(|l| l.contains("Set --kv-offloading-size"))
             .expect("offload bullet");
-        let offload_subline = &non_crisis[offload_idx + 1];
+        let host_subline = &crisis[offload_idx + 2];
         let verify_subline = format!("        {}", DEAD_END_VERIFY_SUBLINE.trim_start());
         assert_eq!(
-            offload_subline
+            host_subline
                 .chars()
                 .take_while(|c| *c == ' ')
                 .collect::<String>(),
@@ -3655,10 +3672,14 @@ mod tests {
                 .chars()
                 .take_while(|c| *c == ' ')
                 .collect::<String>(),
-            "offload and dead-end sublines must share push_bullet_with_subline indent"
+            "offload host and dead-end sublines must share indent"
         );
         assert_eq!(
-            *offload_subline,
+            crisis[offload_idx + 1],
+            format!("        {KV_OFFLOAD_DOWNSIDE}")
+        );
+        assert_eq!(
+            *host_subline,
             format!("        {}", KV_OFFLOAD_SUBLINE_FALLBACK.trim_start())
         );
         assert_eq!(
@@ -3676,6 +3697,10 @@ mod tests {
                 !text.contains("kv-offloading-size"),
                 "absent label must not suggest offload: {text}"
             );
+            assert!(
+                !text.contains(LAST_RESORT_HEADER),
+                "absent label must not emit Last resort: {text}"
+            );
         }
     }
 
@@ -3683,9 +3708,21 @@ mod tests {
     fn kv_offload_none_literal_bullet_all_paths() {
         use crate::collectors::KvOffloadState;
         let (c, n, b) = format_offload_three_paths(offload_cache(KvOffloadState::Off));
+        // Eviction only on the crisis fixture; queue-only paths stay quiet.
         assert_offload_block(&c);
-        assert_offload_block(&n);
-        assert_offload_block(&b);
+        assert_no_offload_bullet(&[n.join("\n"), b.join("\n")]);
+    }
+
+    #[test]
+    fn kv_offload_absent_when_eviction_quiet() {
+        use crate::collectors::KvOffloadState;
+        let (_, n, b) = format_offload_three_paths(offload_cache(KvOffloadState::Off));
+        for text in [n.join("\n"), b.join("\n")] {
+            assert!(
+                !text.contains("kv-offloading-size") && !text.contains(LAST_RESORT_HEADER),
+                "no offload without eviction:\n{text}"
+            );
+        }
     }
 
     /// Journey-shaped scrape with host memory so derivation can resolve.
@@ -3807,19 +3844,34 @@ mod tests {
                 text.contains("Set --kv-offloading-size 12 (est) to hold evicted KV"),
                 "re-offer 12:\n{text}"
             );
+            assert!(
+                text.contains(LAST_RESORT_HEADER),
+                "Last resort header:\n{text}"
+            );
+            assert!(
+                text.contains(KV_OFFLOAD_DOWNSIDE),
+                "downside subline:\n{text}"
+            );
             assert!(text.contains("Host RAM available: 24 GiB, container limit none."));
             assert!(!text.contains("Set --kv-offloading-size (GiB)"));
-            let idx = text
-                .lines()
+            let lines: Vec<&str> = text.lines().collect();
+            let header_idx = lines
+                .iter()
+                .position(|l| *l == LAST_RESORT_HEADER)
+                .expect("Last resort");
+            let idx = lines
+                .iter()
                 .position(|l| l.contains("Set --kv-offloading-size 12 (est)"))
                 .expect("sized bullet");
-            let lines: Vec<&str> = text.lines().collect();
+            assert_eq!(idx, header_idx + 1);
             if let Some(safe_idx) = lines.iter().position(|l| *l == "    Safe to apply:") {
-                let cuts_idx = lines
-                    .iter()
-                    .position(|l| *l == "    Cuts throughput:")
-                    .expect("cuts group");
-                assert!(safe_idx < idx && idx < cuts_idx, "last in safe group");
+                assert!(safe_idx < header_idx, "never inside Safe");
+                for line in &lines[safe_idx + 1..header_idx] {
+                    assert!(
+                        !line.contains("kv-offloading-size"),
+                        "offload leaked into Safe: {line:?}"
+                    );
+                }
             }
         }
     }
@@ -3963,8 +4015,7 @@ mod tests {
         // Zero parses to Off.
         let (c, n, b) = format_offload_three_paths(offload_cache(KvOffloadState::Off));
         assert_offload_block(&c);
-        assert_offload_block(&n);
-        assert_offload_block(&b);
+        assert_no_offload_bullet(&[n.join("\n"), b.join("\n")]);
     }
 
     #[test]
@@ -4022,6 +4073,7 @@ mod tests {
             .vllm(VllmRawMetrics {
                 kv_cache_usage_perc: Some(90.0),
                 num_requests_waiting: Some(5.0),
+                num_preemptions_per_sec: Some(0.05),
                 cache_config: offload_cache(KvOffloadState::Off),
                 max_num_seqs: Some(256),
                 ..Default::default()
@@ -4029,17 +4081,14 @@ mod tests {
             .host_memory(Some(facts))
             .build();
         let text = format_kv_cache_pressure_fired(
-            &KvCachePressureDetail {
-                kv_cache_usage_perc: Some(90.0),
-                kv_peak_pct: Some(90.0),
-                preemptions_active: false,
-                queue_backpressure: true,
-            },
+            &detail(90.0, true),
             &kv_ctx(&snap, None, Some(30.0), None),
             3,
             4,
         )
         .join("\n");
+        assert!(text.contains(LAST_RESORT_HEADER));
+        assert!(text.contains(KV_OFFLOAD_DOWNSIDE));
         assert!(text.contains("Host RAM available: 1921 GiB, container limit 234 GiB."));
         assert!(!text.contains(KV_OFFLOAD_SUBLINE_FALLBACK));
     }
@@ -4219,36 +4268,48 @@ mod tests {
             text.contains("Set --kv-offloading-size 23 (est) to hold evicted KV"),
             "journey render:\n{text}"
         );
+        assert!(text.contains(LAST_RESORT_HEADER));
+        assert!(text.contains(KV_OFFLOAD_DOWNSIDE));
         assert!(text.contains("Host RAM available: 1921 GiB, container limit 234 GiB."));
         assert!(!text.contains("Set --kv-offloading-size (GiB)"));
+        let last = text.find(LAST_RESORT_HEADER).expect("Last resort");
+        let off = text
+            .find("Set --kv-offloading-size 23")
+            .expect("sized offload");
+        assert!(off > last, "bullet under Last resort");
+        if let Some(safe) = text.find("    Safe to apply:") {
+            assert!(safe < last, "Last resort after Safe");
+        }
     }
 
     #[test]
     fn kv_offload_degrade_renders_directionless_bullet() {
         use crate::collectors::{KvOffloadState, RawSnapshotFixture};
+        // Eviction active so Last resort emits; no host/pool so size is None.
         let snap = RawSnapshotFixture::default()
             .vllm(VllmRawMetrics {
                 kv_cache_usage_perc: Some(97.0),
                 num_requests_running: Some(34.0),
                 num_requests_waiting_peak: Some(36.0),
-                num_preemptions_per_sec: Some(0.0),
+                num_preemptions_per_sec: Some(0.05),
                 window_duration_secs: Some(120.0),
                 max_num_seqs: Some(175),
                 cache_config: offload_cache(KvOffloadState::Off),
                 ..Default::default()
             })
-            .host_memory(Some(journey_host_memory()))
             .build();
         let text = format_kv_cache_pressure_fired(
             &detail(97.0, true),
-            &kv_ctx(&snap, None, Some(24.8), None),
+            &kv_ctx(&snap, None, None, None),
             1,
             1,
         )
         .join("\n");
+        assert!(text.contains(LAST_RESORT_HEADER));
         assert!(text.contains("Set --kv-offloading-size (GiB) to hold evicted KV"));
         assert!(!text.contains("(est)"));
-        assert!(text.contains("Host RAM available: 1921 GiB, container limit 234 GiB."));
+        assert!(text.contains(KV_OFFLOAD_DOWNSIDE));
+        assert!(text.contains(KV_OFFLOAD_SUBLINE_FALLBACK));
     }
 
     #[test]
@@ -4301,6 +4362,9 @@ mod tests {
         };
         assert_eq!(extract(&pressure), extract(&backlog));
         assert!(extract(&pressure).contains("23 (est)"));
+        assert!(pressure.contains(LAST_RESORT_HEADER));
+        assert!(backlog.contains(LAST_RESORT_HEADER));
+        assert!(pressure.contains(KV_OFFLOAD_DOWNSIDE));
     }
 
     #[test]
@@ -4638,7 +4702,9 @@ mod tests {
         )
         .join("\n");
         assert!(text.contains("    Fix:"));
+        assert!(text.contains(LAST_RESORT_HEADER));
         assert!(text.contains("Set --kv-offloading-size"));
+        assert!(text.contains(KV_OFFLOAD_DOWNSIDE));
         assert!(!text.contains("took effect"));
         assert!(!text.contains("No config change on this GPU moves the KV wall."));
         assert!(text.contains("Expected:"));
@@ -4685,6 +4751,7 @@ mod tests {
         )
         .join("\n");
         assert!(text.contains("    Fix:"));
+        assert!(text.contains(LAST_RESORT_HEADER));
         assert!(text.contains("Set --kv-offloading-size"));
         assert!(!text.contains("took effect"));
         assert!(!text.contains("No config change on this GPU moves the KV wall."));
