@@ -265,6 +265,9 @@ fn on_compute_wall(d: &PrefillBoundDetail) -> bool {
 const R6_TERMINAL_VERIFY: &str =
     "      • Verify prefix caching, chunked prefill and max-num-batched-tokens took effect.";
 
+const SEVERE_FLOPS_WALL_EXPECTED: &str =
+    "No large decode recovery on this GPU until prompt work drops or prefill scales out.";
+
 fn compute_wall_fix_lines(_d: &PrefillBoundDetail) -> (Vec<String>, String, bool) {
     // Unknown prefix caching must not get an Enable bullet (unknown is not off).
     // R6_TERMINAL_VERIFY already asks the operator to confirm prefix caching.
@@ -279,6 +282,29 @@ fn compute_wall_fix_lines(_d: &PrefillBoundDetail) -> (Vec<String>, String, bool
         bullets,
         "Scale out prefill compute; single-GPU retunes cannot add FLOPs.".to_string(),
         true,
+    )
+}
+
+/// Severe: FLOPs wall first. Chunked/batched knobs do not add prefill compute.
+/// Trailing Enable only when chunked is confirmed off (unknown → omit, no guess).
+/// "Reduce prompt length" is appended by the uniform format path.
+fn severe_flops_wall_fix_lines(d: &PrefillBoundDetail) -> (Vec<String>, String, bool) {
+    let mut bullets = vec![
+        "      • Prefill FLOPs dominate this mix; single-GPU retunes cannot add prefill compute."
+            .to_string(),
+        "      • Disaggregate prefill and decode onto separate workers (vLLM disaggregated serving, requires 2+ nodes).".to_string(),
+        "      • Add a replica to scale out.".to_string(),
+    ];
+    let chunked_off = d.chunked_prefill_enabled == Some(false);
+    if chunked_off {
+        bullets.push("      • Enable chunked prefill (--enable-chunked-prefill).".to_string());
+    }
+    // Enable is not a FLOPs lever; keep the loop open only while that trailing
+    // config action remains (same posture as mild Enable → non-terminal).
+    (
+        bullets,
+        SEVERE_FLOPS_WALL_EXPECTED.to_string(),
+        !chunked_off,
     )
 }
 
@@ -597,6 +623,7 @@ pub(super) fn prefill_fix_lines(
     let chunked_on = d.chunked_prefill_enabled == Some(true);
     let chunked_off = d.chunked_prefill_enabled == Some(false);
 
+    // Prefix caching cuts FLOPs; keep ahead of severity / chunked knobs.
     if prefix_off {
         (
             vec![
@@ -606,17 +633,11 @@ pub(super) fn prefill_fix_lines(
             "20-40% reduction in prefill time for workloads with shared prefixes.".to_string(),
             false,
         )
+    } else if sev == Severity::Severe {
+        // Severity alone: do not wait for chunked scrape. Unread cannot trap Enable+Set.
+        severe_flops_wall_fix_lines(d)
     } else if chunked_off {
         chunked_budget_fix_lines(d, true)
-    } else if sev == Severity::Severe && d.prefix_caching_enabled == Some(true) && chunked_on {
-        (
-            vec![
-                R6_TERMINAL_VERIFY.to_string(),
-                "      • Disaggregate prefill and decode onto separate workers (vLLM disaggregated serving, requires 2+ nodes).".to_string(),
-            ],
-            "Full separation of prefill and decode compute paths.".to_string(),
-            true,
-        )
     } else if chunked_on {
         if on_compute_wall(d) {
             compute_wall_fix_lines(d)
@@ -624,7 +645,7 @@ pub(super) fn prefill_fix_lines(
             knob_fix_lines(d)
         }
     } else {
-        // Can't read chunked: Option B — Enable + Set (same as confirmed off).
+        // Can't read chunked (mild/moderate only): Option B — Enable + Set.
         chunked_budget_fix_lines(d, true)
     }
 }
@@ -1435,7 +1456,10 @@ mod tests {
             model_in_catalog: true,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
+        assert!(text.contains("Prefill FLOPs dominate this mix"));
         assert!(text.contains("Disaggregate prefill and decode"));
+        assert!(text.contains(SEVERE_FLOPS_WALL_EXPECTED));
+        assert!(!text.contains("Set --max-num-batched-tokens"));
     }
 
     #[test]
@@ -1917,14 +1941,46 @@ mod tests {
     }
 
     #[test]
-    fn severe_prefix_on_chunked_disagg_unchanged_when_within_band() {
-        // Severe branch stays above the wall gate; byte-identical single disagg bullet.
+    fn severe_flops_wall_when_chunked_on() {
+        // Severity alone names the FLOPs wall; no Enable+Set theater.
         let d = wall_path_base(Some(2048), Some(1638.4), Some(true), 22.0);
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
+        assert!(text.contains("Prefill FLOPs dominate this mix"));
         assert!(text.contains("Disaggregate prefill and decode onto separate workers"));
-        assert!(!text.contains("no single-GPU knob adds FLOPs"));
-        assert!(!text.contains("Add a replica to scale out."));
-        assert!(!text.contains("--max-num-batched-tokens"));
+        assert!(text.contains("Add a replica to scale out."));
+        assert!(text.contains(SEVERE_FLOPS_WALL_EXPECTED));
+        assert!(text.contains("Reduce prompt length where possible"));
+        assert!(!text.contains("Enable chunked prefill"));
+        assert!(!text.contains("Set --max-num-batched-tokens"));
+        assert!(!text.contains("Decode batches interleave with prefill"));
+    }
+
+    #[test]
+    fn severe_unread_chunked_still_names_flops_wall() {
+        // Unread must not trap Enable+Set at severe.
+        let mut d = wall_path_base(Some(2048), Some(1638.4), Some(true), 22.0);
+        d.chunked_prefill_enabled = None;
+        let text = format_prefill_bound_window_issue(&d, 100).join("\n");
+        assert!(text.contains("Prefill FLOPs dominate this mix"));
+        assert!(text.contains(SEVERE_FLOPS_WALL_EXPECTED));
+        assert!(!text.contains("Enable chunked prefill"));
+        assert!(!text.contains("Set --max-num-batched-tokens"));
+    }
+
+    #[test]
+    fn severe_chunked_off_trails_enable_not_set_budget() {
+        let mut d = wall_path_base(Some(2048), Some(1638.4), Some(true), 22.0);
+        d.chunked_prefill_enabled = Some(false);
+        let (lines, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100);
+        let text = lines.join("\n");
+        assert!(text.contains("Prefill FLOPs dominate this mix"));
+        let wall = text.find("Prefill FLOPs dominate").expect("wall");
+        let enable = text
+            .find("Enable chunked prefill")
+            .expect("trailing Enable");
+        assert!(wall < enable, "Enable trails the wall: {text}");
+        assert!(!text.contains("Set --max-num-batched-tokens"));
+        assert!(!terminal, "trailing Enable keeps a config action open");
     }
 
     #[test]
@@ -2218,22 +2274,33 @@ mod tests {
     }
 
     #[test]
-    fn terminal_flag_true_on_severe_disaggregate() {
+    fn terminal_flag_true_on_severe_flops_wall() {
         let d = wall_path_base(Some(8192), Some(1638.4), Some(true), 25.0);
-        let (_, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100);
+        let (text, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100);
+        let text = text.join("\n");
         assert!(terminal);
-        let (bullets, _, term) = prefill_fix_lines(&d, Severity::Severe);
+        assert!(text.contains("Prefill FLOPs dominate this mix"));
+        assert!(text.contains("Disaggregate"));
+        assert!(text.contains(SEVERE_FLOPS_WALL_EXPECTED));
+        let (bullets, expected, term) = prefill_fix_lines(&d, Severity::Severe);
         assert!(term);
+        assert_eq!(expected, SEVERE_FLOPS_WALL_EXPECTED);
         assert!(bullets.iter().any(|l| l.contains("Disaggregate")));
-        assert!(bullets.iter().any(|l| l.contains("Verify prefix caching")));
+        assert!(bullets.iter().any(|l| l.contains("Add a replica")));
+        assert!(!bullets.iter().any(|l| l.contains("Verify prefix caching")));
     }
 
     #[test]
     fn terminal_flag_false_on_enable_chunked_knob() {
+        // Mild/moderate + chunked off: Enable path (budget may already match), not severe wall.
         let mut d = wall_path_base(Some(2048), Some(1638.4), Some(true), 12.0);
         d.chunked_prefill_enabled = Some(false);
-        let (_, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100);
+        let (text, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100);
+        let text = text.join("\n");
         assert!(!terminal);
+        assert!(text.contains("Enable chunked prefill"));
+        assert!(!text.contains("Prefill FLOPs dominate"));
+        assert!(text.contains("Decode batches interleave with prefill"));
     }
 
     #[test]

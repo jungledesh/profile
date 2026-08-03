@@ -16,6 +16,10 @@ const SWAPPED_REQUESTS_MIN: f64 = 2.0;
 /// Low floor avoids firing on transient scheduling jitter; keeps R2 from co-firing
 /// with R5 when 1–2 requests queue at the concurrency cap.
 const QUEUE_BACKPRESSURE_MIN_WAITING: f64 = 2.0;
+/// Judgment: seat wall when running is this fraction of `--max-num-seqs`.
+/// Not physics; calibrate like R5's queue ratio. Do not reuse R5's absolute gap
+/// (0.5 seats): that does not scale across small vs large max.
+const CLIENT_OVERSUB_SEAT_OCCUPANCY: f64 = 0.90;
 /// 30% of active requests waiting signals the scheduler is consistently holding
 /// requests for KV capacity, not just transient batching delay.
 const KV_ADMISSION_BACKLOG_QUEUE_RATIO_MIN: f64 = 0.30;
@@ -161,7 +165,11 @@ fn emit_last_resort_offload(out: &mut Vec<String>, lines: Vec<String>) {
     if lines.is_empty() {
         return;
     }
-    if !out.last().is_some_and(|l| l.is_empty()) && !out.last().is_some_and(|l| l == "    Fix:") {
+    // Blank before Last resort unless already under Fix: or a blank.
+    if out
+        .last()
+        .is_none_or(|l| !l.is_empty() && l.as_str() != "    Fix:")
+    {
         out.push(String::new());
     }
     out.push(LAST_RESORT_HEADER.to_string());
@@ -449,6 +457,32 @@ fn queue_backpressure(snapshot: &RawSnapshot) -> bool {
         .is_some_and(|w| w.is_finite() && w > QUEUE_BACKPRESSURE_MIN_WAITING)
 }
 
+/// Scrape gauge, else launch/config `--max-num-seqs`. Shared by seat lever and oversub.
+fn effective_max_num_seqs(snapshot: &RawSnapshot, config_max_num_seqs: Option<u32>) -> Option<u32> {
+    snapshot.vllm.max_num_seqs.or(config_max_num_seqs)
+}
+
+/// True when landing running presses the config seat knob (not merely KV wait).
+fn seats_pressed(snapshot: &RawSnapshot, config_max_num_seqs: Option<u32>) -> bool {
+    let Some(max) = effective_max_num_seqs(snapshot, config_max_num_seqs).filter(|&m| m > 0) else {
+        return false;
+    };
+    let Some(running) = snapshot
+        .vllm
+        .num_requests_running
+        .filter(|r| r.is_finite() && *r >= 0.0)
+    else {
+        return false;
+    };
+    running / f64::from(max) >= CLIENT_OVERSUB_SEAT_OCCUPANCY
+}
+
+/// Cap-at-max client lever: sustained wait and seats pressed. Wait alone is KV
+/// admission noise when run << max (omit). Unknown max → Humble, omit.
+fn client_oversub_applies(snapshot: &RawSnapshot, config_max_num_seqs: Option<u32>) -> bool {
+    queue_backpressure(snapshot) && seats_pressed(snapshot, config_max_num_seqs)
+}
+
 pub fn rule2_kv_cache_pressure(snapshot: &RawSnapshot) -> Rule2Outcome {
     if !super::kv_near_full(snapshot) {
         return Rule2Outcome::NotFired;
@@ -595,11 +629,7 @@ pub(super) fn kv_pressure_confidence(windows_fired: usize, total_evaluable: usiz
 
 /// True when `--max-num-seqs` is known and above the floor of 1.
 fn seat_lever_available(snapshot: &RawSnapshot, config_max_num_seqs: Option<u32>) -> bool {
-    snapshot
-        .vllm
-        .max_num_seqs
-        .or(config_max_num_seqs)
-        .is_some_and(|n| n > 1)
+    effective_max_num_seqs(snapshot, config_max_num_seqs).is_some_and(|n| n > 1)
 }
 
 fn full_window_seat_bullet(
@@ -613,15 +643,19 @@ fn full_window_seat_bullet(
 /// bullet is built; never inferred from printed text.
 const CRISIS_THROTTLE_SUBLINE: &str = "Cuts throughput. Revert after pressure clears.";
 
-/// Demand-side lever when the landing (or backlog) wait clears the queue bar.
+/// Demand-side lever when wait is sustained and config seats are pressed.
 /// Not a server config change; sits in the safe group (does not cut throughput).
 pub(super) const CLIENT_OVERSUB_BULLET: &str =
     "      • Cap concurrent in-flight requests at --max-num-seqs";
 pub(super) const CLIENT_OVERSUB_SUBLINE: &str =
     "Sustained wait: more in-flight than seats. Cap demand to drain the queue and cut TTFT.";
 
-fn push_client_oversubscription_fix(safe: &mut Vec<String>, wait_sustained: bool) {
-    if !wait_sustained {
+fn push_client_oversubscription_fix(
+    safe: &mut Vec<String>,
+    snapshot: &RawSnapshot,
+    config_max_num_seqs: Option<u32>,
+) {
+    if !client_oversub_applies(snapshot, config_max_num_seqs) {
         return;
     }
     super::push_bullet_with_subline(
@@ -765,8 +799,8 @@ pub(super) fn format_kv_cache_pressure_fired_with_terminal(
     let lead_with_shrink = !shrink.lines.is_empty() && would_lead_if_shrink;
 
     let mut safe = Vec::new();
-    // Demand first when wait is sustained; config idle seats are not KV capacity.
-    push_client_oversubscription_fix(&mut safe, queue_backpressure(snapshot));
+    // Demand first when seats are pressed; config idle seats are not KV capacity.
+    push_client_oversubscription_fix(&mut safe, snapshot, config_max_num_seqs);
     push_kv_pressure_safe_levers(
         &mut safe,
         snapshot,
@@ -916,8 +950,8 @@ pub(super) fn format_kv_admission_backlog_issue_with_terminal(
         super::model_len_shrink_suggestion_lines(ctx.max_model_len, &evidence, "      ", false);
 
     let mut safe = Vec::new();
-    // Same landing gate as pressure (`queue_backpressure`); not averaged detail wait.
-    push_client_oversubscription_fix(&mut safe, queue_backpressure(ctx.snapshot));
+    // Same landing gate as pressure (wait + seat occupancy); not averaged detail.
+    push_client_oversubscription_fix(&mut safe, ctx.snapshot, ctx.config_max_num_seqs);
     push_kv_pressure_safe_levers(
         &mut safe,
         ctx.snapshot,
@@ -1890,7 +1924,7 @@ mod tests {
         let oversub = CLIENT_OVERSUB_BULLET;
         let sub = CLIENT_OVERSUB_SUBLINE;
 
-        // Queue-only pressure (wait > 2): emit under Safe.
+        // Queue-only pressure: wait > 2 and seats pressed → emit under Safe.
         let queue = format_kv_cache_pressure_fired(
             &KvCachePressureDetail {
                 kv_cache_usage_perc: Some(90.0),
@@ -1902,6 +1936,7 @@ mod tests {
                 &snap(VllmRawMetrics {
                     kv_cache_usage_perc: Some(90.0),
                     num_requests_waiting: Some(5.0),
+                    num_requests_running: Some(240.0),
                     max_num_seqs: Some(256),
                     ..Default::default()
                 }),
@@ -1925,13 +1960,43 @@ mod tests {
             .expect("oversub");
         assert!(safe < over, "client oversub under Safe to apply");
 
-        // Crisis + sustained wait: flat Fix list still gets the bullet.
+        // Wait with seats idle (KV admission, not seat wall): omit.
+        let seats_idle = format_kv_cache_pressure_fired(
+            &KvCachePressureDetail {
+                kv_cache_usage_perc: Some(90.0),
+                kv_peak_pct: Some(90.0),
+                preemptions_active: false,
+                queue_backpressure: true,
+            },
+            &kv_ctx(
+                &snap(VllmRawMetrics {
+                    kv_cache_usage_perc: Some(90.0),
+                    num_requests_waiting: Some(5.0),
+                    num_requests_running: Some(12.0),
+                    max_num_seqs: Some(345),
+                    ..Default::default()
+                }),
+                None,
+                Some(30.0),
+                None,
+            ),
+            3,
+            4,
+        )
+        .join("\n");
+        assert!(
+            !seats_idle.contains(oversub),
+            "run<<max must not invite cap-at-max:\n{seats_idle}"
+        );
+
+        // Crisis + wait + seats pressed: flat Fix list still gets the bullet.
         let crisis = format_kv_cache_pressure_fired(
             &detail(90.0, true),
             &kv_ctx(
                 &snap(VllmRawMetrics {
                     kv_cache_usage_perc: Some(90.0),
                     num_requests_waiting: Some(57.0),
+                    num_requests_running: Some(140.0),
                     num_preemptions_per_sec: Some(0.05),
                     max_num_seqs: Some(145),
                     ..Default::default()
@@ -1944,7 +2009,7 @@ mod tests {
             4,
         )
         .join("\n");
-        assert!(crisis.contains(oversub), "crisis+wait:\n{crisis}");
+        assert!(crisis.contains(oversub), "crisis+wait+seats:\n{crisis}");
         assert!(crisis.contains(sub));
 
         // Eviction only, wait quiet: no client line.
@@ -1954,6 +2019,7 @@ mod tests {
                 &snap(VllmRawMetrics {
                     kv_cache_usage_perc: Some(90.0),
                     num_requests_waiting: Some(0.0),
+                    num_requests_running: Some(140.0),
                     num_preemptions_per_sec: Some(0.05),
                     max_num_seqs: Some(145),
                     ..Default::default()
@@ -1983,6 +2049,8 @@ mod tests {
                 &snap(VllmRawMetrics {
                     kv_cache_usage_perc: Some(90.0),
                     num_requests_waiting: Some(2.0),
+                    num_requests_running: Some(240.0),
+                    max_num_seqs: Some(256),
                     ..Default::default()
                 }),
                 None,
@@ -2010,6 +2078,8 @@ mod tests {
                 &snap(VllmRawMetrics {
                     kv_cache_usage_perc: Some(90.0),
                     num_requests_waiting: None,
+                    num_requests_running: Some(240.0),
+                    max_num_seqs: Some(256),
                     ..Default::default()
                 }),
                 None,
@@ -2022,7 +2092,36 @@ mod tests {
         .join("\n");
         assert!(!lost.contains(oversub), "missing wait:\n{lost}");
 
-        // Admission backlog with sustained wait: same landing gate as pressure.
+        // Unknown max: Humble, omit even with wait + high running.
+        let no_max = format_kv_cache_pressure_fired(
+            &KvCachePressureDetail {
+                kv_cache_usage_perc: Some(90.0),
+                kv_peak_pct: Some(90.0),
+                preemptions_active: false,
+                queue_backpressure: true,
+            },
+            &kv_ctx(
+                &snap(VllmRawMetrics {
+                    kv_cache_usage_perc: Some(90.0),
+                    num_requests_waiting: Some(5.0),
+                    num_requests_running: Some(240.0),
+                    max_num_seqs: None,
+                    ..Default::default()
+                }),
+                None,
+                Some(30.0),
+                None,
+            ),
+            3,
+            4,
+        )
+        .join("\n");
+        assert!(
+            !no_max.contains(oversub),
+            "unknown max must omit:\n{no_max}"
+        );
+
+        // Admission backlog with wait + seats pressed.
         let backlog = format_kv_admission_backlog_issue(
             &sample_backlog_detail(),
             50,
@@ -2030,6 +2129,7 @@ mod tests {
                 &snap(VllmRawMetrics {
                     kv_cache_usage_perc: Some(90.0),
                     num_requests_waiting: Some(10.0),
+                    num_requests_running: Some(240.0),
                     max_num_seqs: Some(256),
                     ..Default::default()
                 }),
@@ -2057,9 +2157,10 @@ mod tests {
     }
 
     #[test]
-    fn client_oversub_keeps_pressure_non_terminal_when_wait_sustained() {
+    fn client_oversub_keeps_pressure_non_terminal_when_seats_pressed() {
         use crate::collectors::KvOffloadState;
-        // Otherwise dead-end geometry, but wait > 2 → client lever → not terminal.
+        // Dead-end seat geometry (max=1 → no Lower seat), but wait + full seat
+        // occupancy → client oversub remains a lever.
         let (snap, m) = dead_end_snap(
             KvOffloadState::Enabled(16.0),
             10000,
@@ -2069,6 +2170,8 @@ mod tests {
         );
         let mut v = snap.vllm.clone();
         v.num_requests_waiting = Some(5.0);
+        v.num_requests_running = Some(1.0);
+        v.max_num_seqs = Some(1);
         let snap = crate::collectors::snap_vllm(v);
         let (lines, terminal) = format_kv_cache_pressure_fired_with_terminal(
             &detail(98.0, true),

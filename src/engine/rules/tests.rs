@@ -2503,13 +2503,12 @@ fn r2_backlog_suppressed_when_standard_r2_fires() {
 }
 
 #[test]
-fn r2_client_oversub_in_default_and_verbose_when_wait_sustained() {
+fn r2_client_oversub_in_default_and_verbose_when_seats_pressed() {
     let oversub = super::r2_kv_cache_pressure::CLIENT_OVERSUB_BULLET;
     let sub = super::r2_kv_cache_pressure::CLIENT_OVERSUB_SUBLINE;
-    // Summary/landing snap is windows.last(); wait must clear the bar there too
-    // (format gates on landing wait, same as production aggregate summary).
+    // Landing: wait > 2 and run/max >= 0.90 (seats pressed).
     let windows: Vec<_> = (0..15)
-        .map(|_| mk_evaluable_backlog_window(89.0, 15.0, 15.0, 20.0, 100, 16))
+        .map(|_| mk_evaluable_backlog_window(89.0, 15.0, 240.0, 20.0, 100, 16))
         .collect();
     let ctx = mk_ctx();
     let summary = ai(&ctx, windows.last().expect("windows"));
@@ -2532,6 +2531,26 @@ fn r2_client_oversub_in_default_and_verbose_when_wait_sustained() {
         assert!(
             text.contains(sub),
             "oversub subline missing verbose={verbose}: {text}"
+        );
+    }
+
+    // Wait with seats idle: omit in both modes.
+    let idle_seats: Vec<_> = (0..15)
+        .map(|_| mk_evaluable_backlog_window(89.0, 5.0, 12.0, 20.0, 100, 16))
+        .collect();
+    let summary = ai(&ctx, idle_seats.last().expect("windows"));
+    for verbose in [false, true] {
+        let text = format_diagnose_rules_for_windows_test(
+            &idle_seats,
+            summary,
+            verbose,
+            "http://127.0.0.1:8000/metrics",
+        )
+        .join("\n");
+        assert!(text.contains("[!] KV Cache Pressure"), "verbose={verbose}");
+        assert!(
+            !text.contains(oversub),
+            "run<<max must omit client oversub verbose={verbose}: {text}"
         );
     }
 
