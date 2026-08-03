@@ -165,10 +165,11 @@ fn emit_last_resort_offload(out: &mut Vec<String>, lines: Vec<String>) {
     if lines.is_empty() {
         return;
     }
-    // Blank before Last resort unless already under Fix: or a blank.
+    // Blank before Last resort only when content already follows Fix: (not when
+    // out is empty, last is blank, or last is the Fix: header itself).
     if out
         .last()
-        .is_none_or(|l| !l.is_empty() && l.as_str() != "    Fix:")
+        .is_some_and(|l| !l.is_empty() && l.as_str() != "    Fix:")
     {
         out.push(String::new());
     }
