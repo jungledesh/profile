@@ -581,37 +581,25 @@ fn cause_tpot_line(d: &PrefillBoundDetail) -> Option<String> {
     ))
 }
 
-/// Budget knob path. `enable_chunked`: emit Enable bullet (confirmed off, or
-/// can't-read fallback Option B).
-fn chunked_budget_fix_lines(
-    d: &PrefillBoundDetail,
-    enable_chunked: bool,
-) -> (Vec<String>, String, bool) {
+/// Budget knob path for confirmed-off or unread chunked (Option B): always Enable
+/// + Set. Enable is a knob → never terminal. No unread apology sublines.
+fn chunked_budget_fix_lines(d: &PrefillBoundDetail) -> (Vec<String>, String, bool) {
     let at_floor = matches!(
         resolve_batch_token_prescription(d),
         BatchTokenPrescription::TerminalAtFloor { .. }
     );
     let mut bullets = Vec::new();
-    if enable_chunked {
-        // Enable is a knob even when the budget line is TerminalAtFloor.
-        bullets.push("      • Enable chunked prefill (--enable-chunked-prefill).".to_string());
-    }
-    // No "Takes effect only with chunked" / unread sublines (Option B).
-    let (budget, named_set) = batch_token_budget_bullets(d, "Set");
+    // Enable is a knob even when the budget line is TerminalAtFloor.
+    bullets.push("      • Enable chunked prefill (--enable-chunked-prefill).".to_string());
+    let (budget, _named_set) = batch_token_budget_bullets(d, "Set");
     bullets.extend(budget);
     if at_floor {
         bullets.push(R6_TERMINAL_VERIFY.to_string());
     }
-    let expected = if named_set || enable_chunked {
-        "Decode batches interleave with prefill, reducing head-of-line blocking.".to_string()
-    } else {
-        batch_token_prescription_expected(d, named_set).to_string()
-    };
     (
         bullets,
-        expected,
-        // Enable is a knob → never terminal.
-        !enable_chunked && at_floor,
+        "Decode batches interleave with prefill, reducing head-of-line blocking.".to_string(),
+        false,
     )
 }
 
@@ -637,7 +625,7 @@ pub(super) fn prefill_fix_lines(
         // Severity alone: do not wait for chunked scrape. Unread cannot trap Enable+Set.
         severe_flops_wall_fix_lines(d)
     } else if chunked_off {
-        chunked_budget_fix_lines(d, true)
+        chunked_budget_fix_lines(d)
     } else if chunked_on {
         if on_compute_wall(d) {
             compute_wall_fix_lines(d)
@@ -646,7 +634,7 @@ pub(super) fn prefill_fix_lines(
         }
     } else {
         // Can't read chunked (mild/moderate only): Option B — Enable + Set.
-        chunked_budget_fix_lines(d, true)
+        chunked_budget_fix_lines(d)
     }
 }
 

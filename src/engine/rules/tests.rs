@@ -2503,12 +2503,12 @@ fn r2_backlog_suppressed_when_standard_r2_fires() {
 }
 
 #[test]
-fn r2_client_oversub_in_default_and_verbose_when_seats_pressed() {
+fn r2_client_oversub_in_default_and_verbose_when_wait_to_run_gate() {
     let oversub = super::r2_kv_cache_pressure::CLIENT_OVERSUB_BULLET;
     let sub = super::r2_kv_cache_pressure::CLIENT_OVERSUB_SUBLINE;
-    // Landing: wait > 2 and run/max >= 0.90 (seats pressed).
+    // Landing: wait > 2 and wait/run >= 0.5.
     let windows: Vec<_> = (0..15)
-        .map(|_| mk_evaluable_backlog_window(89.0, 15.0, 240.0, 20.0, 100, 16))
+        .map(|_| mk_evaluable_backlog_window(89.0, 15.0, 20.0, 20.0, 100, 16))
         .collect();
     let ctx = mk_ctx();
     let summary = ai(&ctx, windows.last().expect("windows"));
@@ -2534,9 +2534,9 @@ fn r2_client_oversub_in_default_and_verbose_when_seats_pressed() {
         );
     }
 
-    // Wait with seats idle: omit in both modes.
+    // Wait below half-of-run gate: omit in both modes.
     let idle_seats: Vec<_> = (0..15)
-        .map(|_| mk_evaluable_backlog_window(89.0, 5.0, 12.0, 20.0, 100, 16))
+        .map(|_| mk_evaluable_backlog_window(89.0, 6.0, 51.0, 20.0, 100, 16))
         .collect();
     let summary = ai(&ctx, idle_seats.last().expect("windows"));
     for verbose in [false, true] {
@@ -2550,7 +2550,7 @@ fn r2_client_oversub_in_default_and_verbose_when_seats_pressed() {
         assert!(text.contains("[!] KV Cache Pressure"), "verbose={verbose}");
         assert!(
             !text.contains(oversub),
-            "run<<max must omit client oversub verbose={verbose}: {text}"
+            "wait/run below gate must omit client oversub verbose={verbose}: {text}"
         );
     }
 
