@@ -16,6 +16,9 @@ const SWAPPED_REQUESTS_MIN: f64 = 2.0;
 /// Low floor avoids firing on transient scheduling jitter; keeps R2 from co-firing
 /// with R5 when 1–2 requests queue at the concurrency cap.
 const QUEUE_BACKPRESSURE_MIN_WAITING: f64 = 2.0;
+/// Queue at half of sustained running: demand exceeds what the server holds;
+/// server knobs relocate the queue, only the client removes work.
+const CLIENT_OVERSUB_WAIT_TO_RUN: f64 = 0.5;
 /// 30% of active requests waiting signals the scheduler is consistently holding
 /// requests for KV capacity, not just transient batching delay.
 const KV_ADMISSION_BACKLOG_QUEUE_RATIO_MIN: f64 = 0.30;
@@ -81,8 +84,6 @@ fn push_kv_pressure_safe_levers(
     kv_headroom_gb: Option<f64>,
     kv_cache_dtype: Option<&str>,
     fp8_compiler_available: bool,
-    model: Option<&crate::context::ModelArch>,
-    tp: Option<u32>,
 ) {
     if let Some(bullet) = prefix_caching_fix_bullet(snapshot) {
         safe.push(bullet);
@@ -93,24 +94,27 @@ fn push_kv_pressure_safe_levers(
     if let Some(bullet) = fp8_kv_cache_fix_bullet(kv_cache_dtype, fp8_compiler_available) {
         safe.push(bullet);
     }
-    push_kv_offload_fix_last(safe, snapshot, kv_headroom_gb, kv_cache_dtype, model, tp);
 }
 
-fn push_kv_offload_fix_last(
-    safe: &mut Vec<String>,
+/// Last-resort offload lines (bullet + downside + host RAM), or empty when gated off.
+/// Caller owns the `Last resort:` header. Only when eviction is active.
+fn kv_offload_last_resort_lines(
     snapshot: &RawSnapshot,
     kv_headroom_gb: Option<f64>,
     kv_cache_dtype: Option<&str>,
     model: Option<&crate::context::ModelArch>,
     tp: Option<u32>,
-) {
+) -> Vec<String> {
     use crate::collectors::KvOffloadState;
 
+    if !eviction_signal_active(snapshot) {
+        return Vec::new();
+    }
     if matches!(
         snapshot.vllm.cache_config.kv_offloading,
         KvOffloadState::Unsupported | KvOffloadState::Unreadable
     ) {
-        return;
+        return Vec::new();
     }
 
     let size_input = KvOffloadSizeInput {
@@ -128,30 +132,48 @@ fn push_kv_offload_fix_last(
         peak_waiting: peak_waiting(snapshot),
     };
 
-    match snapshot.vllm.cache_config.kv_offloading {
-        KvOffloadState::Off => {
-            let size = resolve_kv_offload_size_gib(size_input);
-            let bullet = kv_offload_fix_bullet(size);
-            let subline = format_kv_offload_subline(snapshot.host_memory);
-            super::push_bullet_with_subline(safe, bullet, Some(&subline));
-        }
+    let size = match snapshot.vllm.cache_config.kv_offloading {
+        KvOffloadState::Off => resolve_kv_offload_size_gib(size_input),
         KvOffloadState::Enabled(v) => {
             let Some(derived) = resolve_kv_offload_size_gib(size_input) else {
-                return;
+                return Vec::new();
             };
-            // Same whole-GiB rounding as derived; equality at GiB granularity is a no-op.
             let Some(set) = ceil_bytes_to_whole_gib(v * GIB_BYTES) else {
-                return;
+                return Vec::new();
             };
             if derived <= set {
-                return;
+                return Vec::new();
             }
-            let bullet = kv_offload_fix_bullet(Some(derived));
-            let subline = format_kv_offload_subline(snapshot.host_memory);
-            super::push_bullet_with_subline(safe, bullet, Some(&subline));
+            Some(derived)
         }
-        KvOffloadState::Unsupported | KvOffloadState::Unreadable => {}
+        KvOffloadState::Unsupported | KvOffloadState::Unreadable => return Vec::new(),
+    };
+
+    vec![
+        kv_offload_fix_bullet(size),
+        format!("        {KV_OFFLOAD_DOWNSIDE}"),
+        format!(
+            "        {}",
+            format_kv_offload_subline(snapshot.host_memory).trim_start()
+        ),
+        String::new(),
+    ]
+}
+
+fn emit_last_resort_offload(out: &mut Vec<String>, lines: Vec<String>) {
+    if lines.is_empty() {
+        return;
     }
+    // Blank before Last resort only when content already follows Fix: (not when
+    // out is empty, last is blank, or last is the Fix: header itself).
+    if out
+        .last()
+        .is_some_and(|l| !l.is_empty() && l.as_str() != "    Fix:")
+    {
+        out.push(String::new());
+    }
+    out.push(LAST_RESORT_HEADER.to_string());
+    out.extend(lines);
 }
 
 fn peak_waiting(snapshot: &RawSnapshot) -> Option<f64> {
@@ -251,9 +273,12 @@ pub(super) fn resolve_kv_offload_size_gib(input: KvOffloadSizeInput) -> Option<u
 }
 
 const KV_OFFLOAD_FIX: &str = "      • Set --kv-offloading-size (GiB) to hold evicted KV in host memory instead of recomputing it";
-/// Fallback when host memory reads fail; rendered via [`super::push_bullet_with_subline`].
+/// Fallback when host memory reads fail; rendered as the second last-resort subline.
 const KV_OFFLOAD_SUBLINE_FALLBACK: &str =
     "Check host RAM and your container memory limit before allocating.";
+const KV_OFFLOAD_DOWNSIDE: &str =
+    "Spills KV to host so more sequences can stay admitted; can starve decode under long prompts.";
+const LAST_RESORT_HEADER: &str = "    Last resort:";
 
 pub(super) fn format_kv_offload_subline(
     facts: Option<crate::collectors::HostMemoryFacts>,
@@ -425,11 +450,37 @@ fn eviction_signal_active(snapshot: &RawSnapshot) -> bool {
             .is_some_and(|s| s.is_finite() && s >= SWAPPED_REQUESTS_MIN)
 }
 
-fn queue_backpressure(snapshot: &RawSnapshot) -> bool {
+fn queued_waiting_over_floor(snapshot: &RawSnapshot) -> Option<f64> {
     snapshot
         .vllm
         .num_requests_waiting
-        .is_some_and(|w| w.is_finite() && w > QUEUE_BACKPRESSURE_MIN_WAITING)
+        .filter(|w| w.is_finite() && *w > QUEUE_BACKPRESSURE_MIN_WAITING)
+}
+
+fn queue_backpressure(snapshot: &RawSnapshot) -> bool {
+    queued_waiting_over_floor(snapshot).is_some()
+}
+
+/// Scrape gauge, else launch/config `--max-num-seqs`. Shared by seat lever and oversub.
+fn effective_max_num_seqs(snapshot: &RawSnapshot, config_max_num_seqs: Option<u32>) -> Option<u32> {
+    snapshot.vllm.max_num_seqs.or(config_max_num_seqs)
+}
+
+/// Demand-side oversubscription gate on measured traffic shape, not configured seats.
+/// Fires only when waiting clears the floor and queue pressure is at least half of
+/// sustained running. Sub-1 sustained running (rounds to 0) is omitted entirely.
+fn client_oversub_applies(snapshot: &RawSnapshot) -> bool {
+    let Some(wait) = queued_waiting_over_floor(snapshot) else {
+        return false;
+    };
+    let Some(run) = snapshot
+        .vllm
+        .num_requests_running
+        .filter(|r| r.is_finite() && *r > 0.0)
+    else {
+        return false;
+    };
+    wait >= CLIENT_OVERSUB_WAIT_TO_RUN * run
 }
 
 pub fn rule2_kv_cache_pressure(snapshot: &RawSnapshot) -> Rule2Outcome {
@@ -578,11 +629,7 @@ pub(super) fn kv_pressure_confidence(windows_fired: usize, total_evaluable: usiz
 
 /// True when `--max-num-seqs` is known and above the floor of 1.
 fn seat_lever_available(snapshot: &RawSnapshot, config_max_num_seqs: Option<u32>) -> bool {
-    snapshot
-        .vllm
-        .max_num_seqs
-        .or(config_max_num_seqs)
-        .is_some_and(|n| n > 1)
+    effective_max_num_seqs(snapshot, config_max_num_seqs).is_some_and(|n| n > 1)
 }
 
 fn full_window_seat_bullet(
@@ -595,6 +642,56 @@ fn full_window_seat_bullet(
 /// Crisis-only risk subline on the full-window seat throttle. Attached when the
 /// bullet is built; never inferred from printed text.
 const CRISIS_THROTTLE_SUBLINE: &str = "Cuts throughput. Revert after pressure clears.";
+
+/// Demand-side lever when queue pressure exceeds sustained running.
+/// Renders inside cuts below the seat line; head of Safe only when no seat bullet.
+pub(super) const CLIENT_OVERSUB_BULLET: &str =
+    "      • Reduce client concurrency toward sustained running";
+pub(super) const CLIENT_OVERSUB_SUBLINE: &str =
+    "Cuts queue wait, not throughput. Demand exceeds admitted capacity.";
+
+fn client_oversub_target_running(snapshot: &RawSnapshot) -> Option<String> {
+    snapshot
+        .vllm
+        .num_requests_running
+        .filter(|r| r.is_finite() && r.round() >= 1.0)
+        .map(|r| format!("{:.0}", r.round()))
+}
+
+fn client_oversub_cutbullet(snapshot: &RawSnapshot) -> Option<super::CutBullet> {
+    if !client_oversub_applies(snapshot) {
+        return None;
+    }
+    let run = client_oversub_target_running(snapshot)?;
+    Some((
+        format!("{CLIENT_OVERSUB_BULLET} ({run} in-flight)"),
+        Some(CLIENT_OVERSUB_SUBLINE),
+    ))
+}
+
+fn place_client_oversub_fix(
+    safe: &mut Vec<String>,
+    cuts: &mut Vec<super::CutBullet>,
+    snapshot: &RawSnapshot,
+) {
+    let Some(client) = client_oversub_cutbullet(snapshot) else {
+        return;
+    };
+    // Place directly below the seat line in every layout. If seat is absent,
+    // keep the demand lever at the head of Safe.
+    if let Some(seat_idx) = cuts
+        .iter()
+        .position(|(b, _)| b == SEAT_BULLET || b == FOLLOW_ON_SEAT_BULLET)
+    {
+        cuts.insert(seat_idx + 1, client);
+        return;
+    }
+    let mut lines = Vec::new();
+    super::push_bullet_with_subline(&mut lines, client.0, client.1);
+    for (idx, line) in lines.into_iter().enumerate() {
+        safe.insert(idx, line);
+    }
+}
 
 pub(super) struct KvFormatCtx<'a> {
     pub snapshot: &'a RawSnapshot,
@@ -736,8 +833,6 @@ pub(super) fn format_kv_cache_pressure_fired_with_terminal(
         kv_headroom_gb,
         kv_cache_dtype,
         fp8_compiler_available,
-        ctx.model,
-        ctx.tp,
     );
 
     // Lowering seats always reduces KV demand, down to 1. At 1 there is nothing
@@ -766,14 +861,20 @@ pub(super) fn format_kv_cache_pressure_fired_with_terminal(
             }
         }
     }
+    // Client demand lever: fires when queue >= half of sustained running.
+    place_client_oversub_fix(&mut safe, &mut cuts, snapshot);
 
-    let terminal = safe.is_empty() && cuts.is_empty();
+    let last_resort =
+        kv_offload_last_resort_lines(snapshot, kv_headroom_gb, kv_cache_dtype, ctx.model, ctx.tp);
+
+    let terminal = safe.is_empty() && cuts.is_empty() && last_resort.is_empty();
     if terminal {
         push_dead_end_fixes(&mut safe);
     }
 
     if preemptions_active {
-        // Crisis: flat Fix list, no group labels. Cuts before safe when shrink leads.
+        // Crisis: flat Fix list for cuts/safe, no group labels. Offload is still
+        // labeled Last resort so operators never read it as safe.
         let lead_with_cuts = lead_with_shrink;
         out.push("    Fix:".to_string());
         let emit_cuts = |out: &mut Vec<String>, cuts: Vec<super::CutBullet>| {
@@ -786,7 +887,6 @@ pub(super) fn format_kv_cache_pressure_fired_with_terminal(
         let cuts_nonempty = !cuts.is_empty();
         if lead_with_cuts {
             emit_cuts(&mut out, cuts);
-            // Subline already leaves one blank; do not add a second separator.
             if cuts_nonempty && safe_nonempty && !out.last().is_some_and(|l| l.is_empty()) {
                 out.push(String::new());
             }
@@ -798,10 +898,12 @@ pub(super) fn format_kv_cache_pressure_fired_with_terminal(
             }
             emit_cuts(&mut out, cuts);
         }
+        emit_last_resort_offload(&mut out, last_resort);
     } else {
         let lead_with_cuts = lead_with_shrink;
         super::trim_group_trailing_blanks(&mut safe);
         super::push_grouped_fixes(&mut out, safe, cuts, Vec::new(), lead_with_cuts);
+        emit_last_resort_offload(&mut out, last_resort);
     }
 
     let expected = if preemptions_active {
@@ -876,14 +978,13 @@ pub(super) fn format_kv_admission_backlog_issue_with_terminal(
         super::model_len_shrink_suggestion_lines(ctx.max_model_len, &evidence, "      ", false);
 
     let mut safe = Vec::new();
+    // Same landing gate as pressure; not averaged detail.
     push_kv_pressure_safe_levers(
         &mut safe,
         ctx.snapshot,
         ctx.kv_headroom_gb,
         kv_cache_dtype,
         ctx.fp8_compiler_available,
-        ctx.model,
-        ctx.tp,
     );
 
     let mut cuts: Vec<super::CutBullet> = Vec::new();
@@ -891,15 +992,28 @@ pub(super) fn format_kv_admission_backlog_issue_with_terminal(
         cuts.push((seat, None));
     }
     super::extend_with_shrink_suggestion(&mut cuts, shrink);
+    // Client demand lever: fires when queue >= half of sustained running.
+    place_client_oversub_fix(&mut safe, &mut cuts, ctx.snapshot);
 
-    let terminal = safe.is_empty() && cuts.is_empty();
+    // Same eviction gate as pressure: Last resort only when eviction is active.
+    let last_resort = kv_offload_last_resort_lines(
+        ctx.snapshot,
+        ctx.kv_headroom_gb,
+        kv_cache_dtype,
+        ctx.model,
+        ctx.tp,
+    );
+
+    let terminal = safe.is_empty() && cuts.is_empty() && last_resort.is_empty();
     if terminal {
         push_dead_end_fixes(&mut safe);
     }
 
     super::trim_group_trailing_blanks(&mut safe);
     super::push_grouped_fixes(&mut out, safe, cuts, Vec::new(), false);
+    emit_last_resort_offload(&mut out, last_resort);
 
+    super::trim_group_trailing_blanks(&mut out);
     out.push(String::new());
     out.push("    Expected: Wait queue drains, TTFT recovers.".to_string());
     if super::rule_is_significant(windows_fired, total_evaluable) {
@@ -1062,6 +1176,7 @@ mod tests {
             4,
         );
         assert!(pressure_term);
+        // dead_end_snap wait is 0 → no client oversub; true hardware wall.
         let (_, backlog_term) = format_kv_admission_backlog_issue_with_terminal(
             &sample_backlog_detail(),
             50,
@@ -1097,6 +1212,25 @@ mod tests {
             4,
         );
         assert!(!terminal);
+    }
+
+    #[test]
+    fn offload_only_path_is_not_terminal() {
+        use crate::collectors::KvOffloadState;
+        // Dead-end geometry (no safe/cuts) but Off + eviction → Last resort is a knob.
+        let (snap, m) = dead_end_snap(KvOffloadState::Off, 10000, 5000.0, 4600.0, Some(1));
+        let (lines, terminal) = format_kv_cache_pressure_fired_with_terminal(
+            &detail(98.0, true),
+            &kv_ctx_config(&snap, Some(m), None, None, None),
+            3,
+            4,
+        );
+        let text = lines.join("\n");
+        assert!(
+            text.contains(LAST_RESORT_HEADER),
+            "expected Last resort offload:\n{text}"
+        );
+        assert!(!terminal, "offload-only must not be terminal:\n{text}");
     }
 
     fn assert_no_dead_end_pair(text: &str) {
@@ -1163,6 +1297,8 @@ mod tests {
             4600.0,
             snap_max_num_seqs,
         );
+        // dead_end_snap wait is 0 so seat/dead-end asserts are not mixed with
+        // the client-oversub line (covered in dedicated wait-gate tests).
         format_kv_admission_backlog_issue(
             &sample_backlog_detail(),
             50,
@@ -1810,6 +1946,422 @@ mod tests {
             .join("\n");
         assert!(text.contains("Wait queue drains"));
         assert!(!text.contains("evictions stop"));
+    }
+
+    #[test]
+    fn client_oversub_on_queue_pressure_and_backlog_not_eviction_only() {
+        let oversub = CLIENT_OVERSUB_BULLET;
+        let sub = CLIENT_OVERSUB_SUBLINE;
+
+        // Queue-only pressure: wait > 2 and wait/run >= 0.5 → emit under Safe.
+        let queue = format_kv_cache_pressure_fired(
+            &KvCachePressureDetail {
+                kv_cache_usage_perc: Some(90.0),
+                kv_peak_pct: Some(90.0),
+                preemptions_active: false,
+                queue_backpressure: true,
+            },
+            &kv_ctx(
+                &snap(VllmRawMetrics {
+                    kv_cache_usage_perc: Some(90.0),
+                    num_requests_waiting: Some(5.0),
+                    num_requests_running: Some(8.0),
+                    max_num_seqs: Some(256),
+                    ..Default::default()
+                }),
+                None,
+                Some(30.0),
+                None,
+            ),
+            3,
+            4,
+        );
+        let queue_text = queue.join("\n");
+        assert!(queue_text.contains(oversub), "queue path:\n{queue_text}");
+        assert!(queue_text.contains(sub), "queue subline:\n{queue_text}");
+        let safe = queue
+            .iter()
+            .position(|l| l == "    Safe to apply:")
+            .expect("Safe");
+        let over = queue
+            .iter()
+            .position(|l| l.contains(oversub))
+            .expect("oversub");
+        assert!(safe < over, "client oversub under Safe to apply");
+        let seat = queue
+            .iter()
+            .position(|l| l.contains("Lower --max-num-seqs"))
+            .expect("seat");
+        assert!(seat < over, "seat must precede client bullet");
+
+        // Wait with queue pressure below half-of-run gate: omit.
+        let seats_idle = format_kv_cache_pressure_fired(
+            &KvCachePressureDetail {
+                kv_cache_usage_perc: Some(90.0),
+                kv_peak_pct: Some(90.0),
+                preemptions_active: false,
+                queue_backpressure: true,
+            },
+            &kv_ctx(
+                &snap(VllmRawMetrics {
+                    kv_cache_usage_perc: Some(90.0),
+                    num_requests_waiting: Some(30.0),
+                    num_requests_running: Some(80.0),
+                    max_num_seqs: Some(345),
+                    ..Default::default()
+                }),
+                None,
+                Some(30.0),
+                None,
+            ),
+            3,
+            4,
+        )
+        .join("\n");
+        assert!(
+            !seats_idle.contains(oversub),
+            "wait/run below gate must stay quiet:\n{seats_idle}"
+        );
+
+        // High oversub with low run/max (iter 3 shape): must still fire.
+        let low_occupancy_high_queue = format_kv_cache_pressure_fired(
+            &detail(90.0, true),
+            &kv_ctx(
+                &snap(VllmRawMetrics {
+                    kv_cache_usage_perc: Some(95.0),
+                    num_requests_waiting: Some(107.0),
+                    num_requests_running: Some(48.0),
+                    num_preemptions_per_sec: Some(0.22),
+                    max_num_seqs: Some(165),
+                    ..Default::default()
+                }),
+                None,
+                Some(30.0),
+                None,
+            ),
+            3,
+            4,
+        )
+        .join("\n");
+        assert!(
+            low_occupancy_high_queue.contains(oversub),
+            "low-occupancy high-queue must fire:\n{low_occupancy_high_queue}"
+        );
+
+        // High oversub after lowering seats (iter 4 shape): must fire.
+        let post_seat_cut_queue = format_kv_cache_pressure_fired(
+            &detail(90.0, true),
+            &kv_ctx(
+                &snap(VllmRawMetrics {
+                    kv_cache_usage_perc: Some(95.0),
+                    num_requests_waiting: Some(102.0),
+                    num_requests_running: Some(48.0),
+                    num_preemptions_per_sec: Some(1.87),
+                    max_num_seqs: Some(65),
+                    ..Default::default()
+                }),
+                None,
+                Some(30.0),
+                None,
+            ),
+            3,
+            4,
+        )
+        .join("\n");
+        assert!(
+            post_seat_cut_queue.contains(oversub),
+            "post-seat-cut high-queue must fire:\n{post_seat_cut_queue}"
+        );
+
+        // Crisis + wait + gate met: flat Fix list still gets the bullet.
+        let crisis = format_kv_cache_pressure_fired(
+            &detail(90.0, true),
+            &kv_ctx(
+                &snap(VllmRawMetrics {
+                    kv_cache_usage_perc: Some(90.0),
+                    num_requests_waiting: Some(57.0),
+                    num_requests_running: Some(80.0),
+                    num_preemptions_per_sec: Some(0.05),
+                    max_num_seqs: Some(145),
+                    ..Default::default()
+                }),
+                None,
+                Some(30.0),
+                None,
+            ),
+            3,
+            4,
+        )
+        .join("\n");
+        assert!(crisis.contains(oversub), "crisis+wait+gate:\n{crisis}");
+        assert!(crisis.contains(sub));
+        let crisis_seat = crisis.find("Lower --max-num-seqs").expect("seat");
+        let crisis_client = crisis.find(oversub).expect("client");
+        assert!(crisis_seat < crisis_client, "seat before client in crisis");
+
+        // Eviction only, wait quiet: no client line.
+        let eviction_only = format_kv_cache_pressure_fired(
+            &detail(90.0, true),
+            &kv_ctx(
+                &snap(VllmRawMetrics {
+                    kv_cache_usage_perc: Some(90.0),
+                    num_requests_waiting: Some(0.0),
+                    num_requests_running: Some(140.0),
+                    num_preemptions_per_sec: Some(0.05),
+                    max_num_seqs: Some(145),
+                    ..Default::default()
+                }),
+                None,
+                Some(30.0),
+                None,
+            ),
+            3,
+            4,
+        )
+        .join("\n");
+        assert!(
+            !eviction_only.contains(oversub),
+            "eviction-only must not invite client cut:\n{eviction_only}"
+        );
+
+        // Wait at the fire-gate floor (≤ 2): no client line on landing.
+        let wait_two = format_kv_cache_pressure_fired(
+            &KvCachePressureDetail {
+                kv_cache_usage_perc: Some(90.0),
+                kv_peak_pct: Some(90.0),
+                preemptions_active: false,
+                queue_backpressure: true,
+            },
+            &kv_ctx(
+                &snap(VllmRawMetrics {
+                    kv_cache_usage_perc: Some(90.0),
+                    num_requests_waiting: Some(2.0),
+                    num_requests_running: Some(20.0),
+                    max_num_seqs: Some(256),
+                    ..Default::default()
+                }),
+                None,
+                None,
+                None,
+            ),
+            1,
+            1,
+        )
+        .join("\n");
+        assert!(
+            !wait_two.contains(oversub),
+            "wait≤2 must not emit oversub:\n{wait_two}"
+        );
+
+        // Landing lost waiting after queue-fired windows: no invent.
+        let lost = format_kv_cache_pressure_fired(
+            &KvCachePressureDetail {
+                kv_cache_usage_perc: Some(90.0),
+                kv_peak_pct: Some(92.0),
+                preemptions_active: false,
+                queue_backpressure: true,
+            },
+            &kv_ctx(
+                &snap(VllmRawMetrics {
+                    kv_cache_usage_perc: Some(90.0),
+                    num_requests_waiting: None,
+                    num_requests_running: Some(20.0),
+                    max_num_seqs: Some(256),
+                    ..Default::default()
+                }),
+                None,
+                None,
+                None,
+            ),
+            1,
+            1,
+        )
+        .join("\n");
+        assert!(!lost.contains(oversub), "missing wait:\n{lost}");
+
+        // Missing wait/running gauges: Humble, omit.
+        let no_max = format_kv_cache_pressure_fired(
+            &KvCachePressureDetail {
+                kv_cache_usage_perc: Some(90.0),
+                kv_peak_pct: Some(90.0),
+                preemptions_active: false,
+                queue_backpressure: true,
+            },
+            &kv_ctx(
+                &snap(VllmRawMetrics {
+                    kv_cache_usage_perc: Some(90.0),
+                    num_requests_waiting: None,
+                    num_requests_running: None,
+                    max_num_seqs: Some(256),
+                    ..Default::default()
+                }),
+                None,
+                Some(30.0),
+                None,
+            ),
+            3,
+            4,
+        )
+        .join("\n");
+        assert!(
+            !no_max.contains(oversub),
+            "missing gauges must omit:\n{no_max}"
+        );
+
+        // Admission backlog with wait/run gate met.
+        let backlog = format_kv_admission_backlog_issue(
+            &sample_backlog_detail(),
+            50,
+            &kv_ctx(
+                &snap(VllmRawMetrics {
+                    kv_cache_usage_perc: Some(90.0),
+                    num_requests_waiting: Some(10.0),
+                    num_requests_running: Some(16.0),
+                    max_num_seqs: Some(256),
+                    ..Default::default()
+                }),
+                None,
+                Some(30.0),
+                None,
+            ),
+            3,
+            4,
+        );
+        let backlog_text = backlog.join("\n");
+        assert!(
+            backlog_text.contains(oversub),
+            "backlog path:\n{backlog_text}"
+        );
+        let b_safe = backlog
+            .iter()
+            .position(|l| l == "    Safe to apply:")
+            .expect("Safe");
+        let b_over = backlog
+            .iter()
+            .position(|l| l.contains(oversub))
+            .expect("oversub");
+        assert!(b_safe < b_over);
+    }
+
+    #[test]
+    fn client_oversub_keeps_pressure_non_terminal_when_wait_to_run_gate_met() {
+        use crate::collectors::KvOffloadState;
+        // Dead-end seat geometry (max=1 → no Lower seat), but wait/run gate
+        // met → client oversub remains a lever.
+        let (snap, m) = dead_end_snap(
+            KvOffloadState::Enabled(16.0),
+            10000,
+            5000.0,
+            4600.0,
+            Some(1),
+        );
+        let mut v = snap.vllm.clone();
+        v.num_requests_waiting = Some(5.0);
+        v.num_requests_running = Some(1.0);
+        v.max_num_seqs = Some(1);
+        let snap = crate::collectors::snap_vllm(v);
+        let (lines, terminal) = format_kv_cache_pressure_fired_with_terminal(
+            &detail(98.0, true),
+            &kv_ctx_config(&snap, Some(m), None, None, None),
+            3,
+            4,
+        );
+        let text = lines.join("\n");
+        assert!(text.contains(CLIENT_OVERSUB_BULLET), "{text}");
+        assert!(!terminal, "client oversub is a remaining lever:\n{text}");
+        assert!(!text.contains("No config change on this GPU moves the KV wall."));
+    }
+
+    #[test]
+    fn client_oversub_omits_when_run_zero_even_with_large_wait() {
+        let text = format_kv_cache_pressure_fired(
+            &detail(90.0, true),
+            &kv_ctx(
+                &snap(VllmRawMetrics {
+                    kv_cache_usage_perc: Some(90.0),
+                    num_requests_waiting: Some(50.0),
+                    num_requests_running: Some(0.0),
+                    max_num_seqs: Some(256),
+                    ..Default::default()
+                }),
+                None,
+                Some(30.0),
+                None,
+            ),
+            3,
+            4,
+        )
+        .join("\n");
+        assert!(
+            !text.contains(CLIENT_OVERSUB_BULLET),
+            "run==0 must stay quiet:\n{text}"
+        );
+    }
+
+    #[test]
+    fn client_oversub_omits_when_run_rounds_below_one() {
+        // run 0.4 rounds to 0 → no number → no bullet, even with wait clear.
+        let text = format_kv_cache_pressure_fired(
+            &detail(90.0, false),
+            &kv_ctx(
+                &snap(VllmRawMetrics {
+                    kv_cache_usage_perc: Some(90.0),
+                    num_requests_waiting: Some(5.0),
+                    num_requests_running: Some(0.4),
+                    max_num_seqs: Some(256),
+                    ..Default::default()
+                }),
+                None,
+                Some(30.0),
+                None,
+            ),
+            3,
+            4,
+        )
+        .join("\n");
+        assert!(
+            !text.contains(CLIENT_OVERSUB_BULLET),
+            "sub-1 run must omit client oversub entirely:\n{text}"
+        );
+        assert!(
+            !text.contains("in-flight"),
+            "no numberless client oversub residue:\n{text}"
+        );
+    }
+
+    #[test]
+    fn client_oversub_rounds_half_up_to_one_in_flight() {
+        // run 0.6 rounds to 1 → bullet carries "(1 in-flight)".
+        let text = format_kv_cache_pressure_fired(
+            &detail(90.0, false),
+            &kv_ctx(
+                &snap(VllmRawMetrics {
+                    kv_cache_usage_perc: Some(90.0),
+                    num_requests_waiting: Some(5.0),
+                    num_requests_running: Some(0.6),
+                    max_num_seqs: Some(256),
+                    ..Default::default()
+                }),
+                None,
+                Some(30.0),
+                None,
+            ),
+            3,
+            4,
+        )
+        .join("\n");
+        assert!(
+            text.contains(CLIENT_OVERSUB_BULLET),
+            "run 0.6 must emit client oversub:\n{text}"
+        );
+        assert!(
+            text.contains("(1 in-flight)"),
+            "run 0.6 must format as 1 in-flight:\n{text}"
+        );
+        assert!(
+            text.contains(CLIENT_OVERSUB_SUBLINE),
+            "subline must accompany numbered bullet:\n{text}"
+        );
     }
 
     #[test]
@@ -3056,14 +3608,22 @@ mod tests {
         assert!(!text.contains("unavailable"));
     }
 
-    /// Count `--max-num-seqs` mentions in the Fix block only (not Cause).
+    /// Count seat-throttle `--max-num-seqs` bullets in the Fix block only (not Cause,
+    /// not the client in-flight oversub line which also names the flag).
     fn seat_lines_in_fix(text: &str) -> usize {
         let Some(fix_at) = text.find("    Fix:") else {
             return 0;
         };
         let fix = &text[fix_at..];
         let end = fix.find("\n    Expected:").unwrap_or(fix.len());
-        fix[..end].matches("--max-num-seqs").count()
+        fix[..end]
+            .lines()
+            .filter(|l| {
+                l.starts_with("      •")
+                    && (l.contains("Lower --max-num-seqs")
+                        || l.contains("Then lower --max-num-seqs"))
+            })
+            .count()
     }
 
     #[test]
@@ -3479,24 +4039,45 @@ mod tests {
     }
 
     fn assert_offload_block(lines: &[String]) {
+        let header_idx = lines
+            .iter()
+            .position(|l| l.as_str() == LAST_RESORT_HEADER)
+            .expect("Last resort header");
         let idx = lines
             .iter()
             .position(|l| l.contains("Set --kv-offloading-size"))
             .expect("offload bullet");
-        let gpu_idx = lines
+        assert_eq!(idx, header_idx + 1, "bullet immediately under Last resort");
+        if let Some(gpu_idx) = lines
             .iter()
             .position(|l| l.contains("Raise --gpu-memory-utilization"))
-            .expect("gpu-mem bullet");
-        let fp8_idx = lines
+        {
+            assert!(gpu_idx < header_idx, "offload after safe gpu-mem lever");
+        }
+        if let Some(fp8_idx) = lines
             .iter()
             .position(|l| l.contains("Switch --kv-cache-dtype fp8"))
-            .expect("fp8 bullet");
-        assert!(gpu_idx < idx, "offload must follow gpu-memory-utilization");
-        assert!(fp8_idx < idx, "offload must follow fp8");
+        {
+            assert!(fp8_idx < header_idx, "offload after safe fp8 lever");
+        }
         if let Some(safe_idx) = lines.iter().position(|l| l == "    Safe to apply:") {
-            assert!(safe_idx < idx, "offload must sit inside the safe group");
+            assert!(
+                safe_idx < header_idx,
+                "Last resort must follow Safe to apply"
+            );
+            let safe_end = lines
+                .iter()
+                .position(|l| l == "    Cuts throughput:")
+                .or_else(|| lines.iter().position(|l| l.as_str() == LAST_RESORT_HEADER))
+                .unwrap_or(lines.len());
+            for line in &lines[safe_idx + 1..safe_end] {
+                assert!(
+                    !line.contains("kv-offloading-size"),
+                    "offload must never sit inside Safe to apply: {line:?}"
+                );
+            }
             if let Some(cuts_idx) = lines.iter().position(|l| l == "    Cuts throughput:") {
-                assert!(idx < cuts_idx, "offload must precede the cuts group");
+                assert!(cuts_idx < header_idx, "Last resort after Cuts throughput");
             }
         }
         assert!(
@@ -3505,16 +4086,17 @@ mod tests {
             lines[idx]
         );
         assert_eq!(
-            lines[idx + 1].trim_start(),
-            "Check host RAM and your container memory limit before allocating."
+            lines[idx + 1],
+            format!("        {KV_OFFLOAD_DOWNSIDE}"),
+            "downside subline"
         );
         assert_eq!(
-            lines[idx + 1],
+            lines[idx + 2],
             format!("        {}", KV_OFFLOAD_SUBLINE_FALLBACK.trim_start()),
-            "offload subline must match push_bullet_with_subline indent"
+            "host RAM subline indent"
         );
-        if lines.get(idx + 2).is_some_and(|l| l.is_empty()) {
-            assert_eq!(lines[idx + 2], String::new(), "blank after subline");
+        if lines.get(idx + 3).is_some_and(|l| l.is_empty()) {
+            assert_eq!(lines[idx + 3], String::new(), "blank after host subline");
         }
         let fix_idx = lines
             .iter()
@@ -3524,54 +4106,21 @@ mod tests {
             .iter()
             .position(|l| l.starts_with("    Expected:"))
             .unwrap_or(lines.len());
-        if lines.iter().any(|l| l == "    Safe to apply:") {
-            let cuts_idx = lines
-                .iter()
-                .position(|l| l == "    Cuts throughput:")
-                .expect("labeled safe requires cuts group in offload test fixture");
-            let safe_end = lines[fix_idx + 1..cuts_idx]
-                .iter()
-                .rfind(|l| l.starts_with("      •") || l.starts_with("        "))
-                .expect("safe group content");
-            assert!(
-                safe_end.contains("Set --kv-offloading-size")
-                    || lines[idx + 1].trim_start() == KV_OFFLOAD_SUBLINE_FALLBACK,
-                "offload must be the last safe-group item"
-            );
-            for line in &lines[cuts_idx + 1..section_end] {
-                assert!(
-                    line.is_empty()
-                        || line.starts_with("    Cuts throughput:")
-                        || line.starts_with("      •")
-                        || line.starts_with("        "),
-                    "no unlabeled fix line after labeled groups: {line:?}"
-                );
-            }
-        } else {
-            // Crisis: flat Fix list (no group labels). Safe bullets precede cut bullets.
-            let bullets: Vec<&String> = lines[fix_idx + 1..section_end]
-                .iter()
-                .filter(|l| l.starts_with("      •"))
-                .collect();
-            let offload_pos = bullets
-                .iter()
-                .position(|l| l.contains("Set --kv-offloading-size"))
-                .expect("offload bullet in crisis fix list");
-            let fp8_pos = bullets
-                .iter()
-                .position(|l| l.contains("Switch --kv-cache-dtype fp8"))
-                .expect("fp8 bullet in crisis fix list");
-            assert!(
-                fp8_pos < offload_pos,
-                "offload must follow fp8 in crisis list"
-            );
-            if let Some(after) = bullets.get(offload_pos + 1) {
-                assert!(
-                    after.contains("max-num-seqs") || after.contains("max-model-len"),
-                    "only cut bullets may follow offload in crisis list: {after:?}"
-                );
-            }
-        }
+        assert!(fix_idx < header_idx, "Last resort under Fix");
+        // Offload is last among fix bullets (after safe/cuts).
+        let bullets: Vec<&String> = lines[fix_idx + 1..section_end]
+            .iter()
+            .filter(|l| l.starts_with("      •"))
+            .collect();
+        let offload_pos = bullets
+            .iter()
+            .position(|l| l.contains("Set --kv-offloading-size"))
+            .expect("offload bullet in fix list");
+        assert_eq!(
+            offload_pos,
+            bullets.len() - 1,
+            "offload must be the last fix bullet"
+        );
     }
 
     fn format_offload_three_paths(
@@ -3639,15 +4188,15 @@ mod tests {
     #[test]
     fn kv_offload_subline_matches_dead_end_subline_convention() {
         use crate::collectors::KvOffloadState;
-        let (_, non_crisis, _) = format_offload_three_paths(offload_cache(KvOffloadState::Off));
-        let offload_idx = non_crisis
+        let (crisis, _, _) = format_offload_three_paths(offload_cache(KvOffloadState::Off));
+        let offload_idx = crisis
             .iter()
             .position(|l| l.contains("Set --kv-offloading-size"))
             .expect("offload bullet");
-        let offload_subline = &non_crisis[offload_idx + 1];
+        let host_subline = &crisis[offload_idx + 2];
         let verify_subline = format!("        {}", DEAD_END_VERIFY_SUBLINE.trim_start());
         assert_eq!(
-            offload_subline
+            host_subline
                 .chars()
                 .take_while(|c| *c == ' ')
                 .collect::<String>(),
@@ -3655,10 +4204,14 @@ mod tests {
                 .chars()
                 .take_while(|c| *c == ' ')
                 .collect::<String>(),
-            "offload and dead-end sublines must share push_bullet_with_subline indent"
+            "offload host and dead-end sublines must share indent"
         );
         assert_eq!(
-            *offload_subline,
+            crisis[offload_idx + 1],
+            format!("        {KV_OFFLOAD_DOWNSIDE}")
+        );
+        assert_eq!(
+            *host_subline,
             format!("        {}", KV_OFFLOAD_SUBLINE_FALLBACK.trim_start())
         );
         assert_eq!(
@@ -3676,6 +4229,10 @@ mod tests {
                 !text.contains("kv-offloading-size"),
                 "absent label must not suggest offload: {text}"
             );
+            assert!(
+                !text.contains(LAST_RESORT_HEADER),
+                "absent label must not emit Last resort: {text}"
+            );
         }
     }
 
@@ -3683,9 +4240,9 @@ mod tests {
     fn kv_offload_none_literal_bullet_all_paths() {
         use crate::collectors::KvOffloadState;
         let (c, n, b) = format_offload_three_paths(offload_cache(KvOffloadState::Off));
+        // Eviction only on the crisis fixture; queue-only paths stay quiet.
         assert_offload_block(&c);
-        assert_offload_block(&n);
-        assert_offload_block(&b);
+        assert_no_offload_bullet(&[n.join("\n"), b.join("\n")]);
     }
 
     /// Journey-shaped scrape with host memory so derivation can resolve.
@@ -3768,6 +4325,18 @@ mod tests {
     }
 
     #[test]
+    fn kv_offload_absent_when_eviction_quiet() {
+        use crate::collectors::KvOffloadState;
+        let (_, n, b) = format_offload_three_paths(offload_cache(KvOffloadState::Off));
+        for text in [n.join("\n"), b.join("\n")] {
+            assert!(
+                !text.contains("kv-offloading-size") && !text.contains(LAST_RESORT_HEADER),
+                "no offload without eviction:\n{text}"
+            );
+        }
+    }
+
+    #[test]
     fn kv_offload_enabled_derived_below_set_quiet_all_paths() {
         use crate::collectors::KvOffloadState;
         // Journey derives 23; set 64 -> never prescribe a shrink.
@@ -3807,19 +4376,34 @@ mod tests {
                 text.contains("Set --kv-offloading-size 12 (est) to hold evicted KV"),
                 "re-offer 12:\n{text}"
             );
+            assert!(
+                text.contains(LAST_RESORT_HEADER),
+                "Last resort header:\n{text}"
+            );
+            assert!(
+                text.contains(KV_OFFLOAD_DOWNSIDE),
+                "downside subline:\n{text}"
+            );
             assert!(text.contains("Host RAM available: 24 GiB, container limit none."));
             assert!(!text.contains("Set --kv-offloading-size (GiB)"));
-            let idx = text
-                .lines()
+            let lines: Vec<&str> = text.lines().collect();
+            let header_idx = lines
+                .iter()
+                .position(|l| *l == LAST_RESORT_HEADER)
+                .expect("Last resort");
+            let idx = lines
+                .iter()
                 .position(|l| l.contains("Set --kv-offloading-size 12 (est)"))
                 .expect("sized bullet");
-            let lines: Vec<&str> = text.lines().collect();
+            assert_eq!(idx, header_idx + 1);
             if let Some(safe_idx) = lines.iter().position(|l| *l == "    Safe to apply:") {
-                let cuts_idx = lines
-                    .iter()
-                    .position(|l| *l == "    Cuts throughput:")
-                    .expect("cuts group");
-                assert!(safe_idx < idx && idx < cuts_idx, "last in safe group");
+                assert!(safe_idx < header_idx, "never inside Safe");
+                for line in &lines[safe_idx + 1..header_idx] {
+                    assert!(
+                        !line.contains("kv-offloading-size"),
+                        "offload leaked into Safe: {line:?}"
+                    );
+                }
             }
         }
     }
@@ -3963,8 +4547,7 @@ mod tests {
         // Zero parses to Off.
         let (c, n, b) = format_offload_three_paths(offload_cache(KvOffloadState::Off));
         assert_offload_block(&c);
-        assert_offload_block(&n);
-        assert_offload_block(&b);
+        assert_no_offload_bullet(&[n.join("\n"), b.join("\n")]);
     }
 
     #[test]
@@ -4022,6 +4605,7 @@ mod tests {
             .vllm(VllmRawMetrics {
                 kv_cache_usage_perc: Some(90.0),
                 num_requests_waiting: Some(5.0),
+                num_preemptions_per_sec: Some(0.05),
                 cache_config: offload_cache(KvOffloadState::Off),
                 max_num_seqs: Some(256),
                 ..Default::default()
@@ -4029,17 +4613,14 @@ mod tests {
             .host_memory(Some(facts))
             .build();
         let text = format_kv_cache_pressure_fired(
-            &KvCachePressureDetail {
-                kv_cache_usage_perc: Some(90.0),
-                kv_peak_pct: Some(90.0),
-                preemptions_active: false,
-                queue_backpressure: true,
-            },
+            &detail(90.0, true),
             &kv_ctx(&snap, None, Some(30.0), None),
             3,
             4,
         )
         .join("\n");
+        assert!(text.contains(LAST_RESORT_HEADER));
+        assert!(text.contains(KV_OFFLOAD_DOWNSIDE));
         assert!(text.contains("Host RAM available: 1921 GiB, container limit 234 GiB."));
         assert!(!text.contains(KV_OFFLOAD_SUBLINE_FALLBACK));
     }
@@ -4219,36 +4800,48 @@ mod tests {
             text.contains("Set --kv-offloading-size 23 (est) to hold evicted KV"),
             "journey render:\n{text}"
         );
+        assert!(text.contains(LAST_RESORT_HEADER));
+        assert!(text.contains(KV_OFFLOAD_DOWNSIDE));
         assert!(text.contains("Host RAM available: 1921 GiB, container limit 234 GiB."));
         assert!(!text.contains("Set --kv-offloading-size (GiB)"));
+        let last = text.find(LAST_RESORT_HEADER).expect("Last resort");
+        let off = text
+            .find("Set --kv-offloading-size 23")
+            .expect("sized offload");
+        assert!(off > last, "bullet under Last resort");
+        if let Some(safe) = text.find("    Safe to apply:") {
+            assert!(safe < last, "Last resort after Safe");
+        }
     }
 
     #[test]
     fn kv_offload_degrade_renders_directionless_bullet() {
         use crate::collectors::{KvOffloadState, RawSnapshotFixture};
+        // Eviction active so Last resort emits; no host/pool so size is None.
         let snap = RawSnapshotFixture::default()
             .vllm(VllmRawMetrics {
                 kv_cache_usage_perc: Some(97.0),
                 num_requests_running: Some(34.0),
                 num_requests_waiting_peak: Some(36.0),
-                num_preemptions_per_sec: Some(0.0),
+                num_preemptions_per_sec: Some(0.05),
                 window_duration_secs: Some(120.0),
                 max_num_seqs: Some(175),
                 cache_config: offload_cache(KvOffloadState::Off),
                 ..Default::default()
             })
-            .host_memory(Some(journey_host_memory()))
             .build();
         let text = format_kv_cache_pressure_fired(
             &detail(97.0, true),
-            &kv_ctx(&snap, None, Some(24.8), None),
+            &kv_ctx(&snap, None, None, None),
             1,
             1,
         )
         .join("\n");
+        assert!(text.contains(LAST_RESORT_HEADER));
         assert!(text.contains("Set --kv-offloading-size (GiB) to hold evicted KV"));
         assert!(!text.contains("(est)"));
-        assert!(text.contains("Host RAM available: 1921 GiB, container limit 234 GiB."));
+        assert!(text.contains(KV_OFFLOAD_DOWNSIDE));
+        assert!(text.contains(KV_OFFLOAD_SUBLINE_FALLBACK));
     }
 
     #[test]
@@ -4301,6 +4894,16 @@ mod tests {
         };
         assert_eq!(extract(&pressure), extract(&backlog));
         assert!(extract(&pressure).contains("23 (est)"));
+        assert!(pressure.contains(LAST_RESORT_HEADER));
+        assert!(backlog.contains(LAST_RESORT_HEADER));
+        assert!(pressure.contains(KV_OFFLOAD_DOWNSIDE));
+        let backlog_lines: Vec<&str> = backlog.lines().collect();
+        assert!(
+            !backlog_lines
+                .windows(2)
+                .any(|w| w[0].is_empty() && w[1].is_empty()),
+            "no consecutive blank lines in backlog block:\n{backlog}"
+        );
     }
 
     #[test]
@@ -4380,6 +4983,8 @@ mod tests {
 
     /// Crisis dead end: shrink no-op (<5%), cap contradicted, every safe lever already set
     /// or unavailable. Verify then replica bullets under Fix:, with Expected.
+    /// Waiting is quiet (≤ queue bar) so the client-oversub line stays gated off; otherwise
+    /// demand control would correctly keep the path non-terminal.
     fn dead_end_snap(
         offload: crate::collectors::KvOffloadState,
         max_model_len: u32,
@@ -4390,7 +4995,7 @@ mod tests {
         let v = VllmRawMetrics {
             kv_cache_usage_perc: Some(98.0),
             num_requests_running_peak: Some(16.0),
-            num_requests_waiting: Some(4.0),
+            num_requests_waiting: Some(0.0),
             num_preemptions_per_sec: Some(0.05),
             generation_tokens_completed: Some(150.0),
             prompt_tokens_p99: Some(prompt_p99),
@@ -4638,7 +5243,9 @@ mod tests {
         )
         .join("\n");
         assert!(text.contains("    Fix:"));
+        assert!(text.contains(LAST_RESORT_HEADER));
         assert!(text.contains("Set --kv-offloading-size"));
+        assert!(text.contains(KV_OFFLOAD_DOWNSIDE));
         assert!(!text.contains("took effect"));
         assert!(!text.contains("No config change on this GPU moves the KV wall."));
         assert!(text.contains("Expected:"));
@@ -4685,6 +5292,7 @@ mod tests {
         )
         .join("\n");
         assert!(text.contains("    Fix:"));
+        assert!(text.contains(LAST_RESORT_HEADER));
         assert!(text.contains("Set --kv-offloading-size"));
         assert!(!text.contains("took effect"));
         assert!(!text.contains("No config change on this GPU moves the KV wall."));

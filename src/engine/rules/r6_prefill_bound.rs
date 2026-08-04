@@ -23,10 +23,6 @@ const DECODE_EFFICIENCY_GATE: f64 = 40.0;
 const PROMPT_SKEW_RATIO: f64 = 5.0;
 const SKEWED_EXPECTED: &str = "Eliminates head-of-line blocking from long-tail prompts.";
 
-/// Subline on the budget bullet when chunked prefill is off or unknown.
-/// 8-space caution indent via [`super::push_bullet_with_subline`].
-const CHUNKED_PREFILL_BUDGET_DEPENDENCY: &str = "Takes effect only with chunked prefill on.";
-
 /// Fixed label column width for R6 metric rows (longest label: "Prefill ratio").
 const R6_METRIC_LABEL_W: usize = 20;
 
@@ -181,39 +177,10 @@ fn resolve_batch_token_prescription(d: &PrefillBoundDetail) -> BatchTokenPrescri
     }
 }
 
-/// When the gauge/enrichment could not read the running value: still prescribe,
-/// but say so. Equality skip only applies when the value is known.
-const CONFIGURED_BATCHED_TOKENS_UNREAD: &str = "Configured --max-num-batched-tokens unread; could not verify this differs from what's running.";
-
-/// Named Set/lower bullet plus optional sublines (dependency, unread).
-fn push_named_budget_bullet(
-    out: &mut Vec<String>,
-    d: &PrefillBoundDetail,
-    bullet: String,
-    dependency: Option<&str>,
-) {
-    out.push(bullet);
-    let mut had_sub = false;
-    if let Some(dep) = dependency {
-        out.push(format!("        {}", dep.trim_start()));
-        had_sub = true;
-    }
-    if d.max_num_batched_tokens.is_none() {
-        out.push(format!("        {CONFIGURED_BATCHED_TOKENS_UNREAD}"));
-        had_sub = true;
-    }
-    if had_sub {
-        out.push(String::new());
-    }
-}
-
 /// Second return is whether a named Set/lower budget knob was emitted (structural;
-/// do not re-read printed text to decide Expected).
-fn batch_token_budget_bullets(
-    d: &PrefillBoundDetail,
-    verb: &str,
-    dependency: Option<&str>,
-) -> (Vec<String>, bool) {
+/// do not re-read printed text to decide Expected). No "unread" apology: unread
+/// falls back to Enable+Set (Option B).
+fn batch_token_budget_bullets(d: &PrefillBoundDetail, verb: &str) -> (Vec<String>, bool) {
     match resolve_batch_token_prescription(d) {
         BatchTokenPrescription::Ideal { value, est_paren } => {
             if super::already_set_u32(d.max_num_batched_tokens, value) {
@@ -228,29 +195,21 @@ fn batch_token_budget_bullets(
                         .to_string()
                 }
             };
-            let mut lines = Vec::new();
-            push_named_budget_bullet(
-                &mut lines,
-                d,
-                format!("      • {verb} --max-num-batched-tokens to {value}{tail}"),
-                dependency,
-            );
-            (lines, true)
+            (
+                vec![format!("      • {verb} --max-num-batched-tokens to {value}{tail}")],
+                true,
+            )
         }
         BatchTokenPrescription::FloorLimited { value } => {
             if super::already_set_u32(d.max_num_batched_tokens, value) {
                 return (Vec::new(), false);
             }
-            let mut lines = Vec::new();
-            push_named_budget_bullet(
-                &mut lines,
-                d,
-                format!(
+            (
+                vec![format!(
                     "      • {verb} --max-num-batched-tokens to {value} (floor-limited; page alignment) to shrink prefill chunk size. Lower for smoother TPOT, raise for lower TTFT."
-                ),
-                dependency,
-            );
-            (lines, true)
+                )],
+                true,
+            )
         }
         BatchTokenPrescription::TerminalAtFloor { floor } => (
             vec![format!(
@@ -265,18 +224,12 @@ fn batch_token_budget_bullets(
             ],
             false,
         ),
-        BatchTokenPrescription::DirectionOnly { floor } => {
-            let mut lines = Vec::new();
-            push_named_budget_bullet(
-                &mut lines,
-                d,
-                format!(
-                    "      • {verb} --max-num-batched-tokens lower to shrink prefill chunk size (not below {floor}). Lower for smoother TPOT, raise for lower TTFT."
-                ),
-                dependency,
-            );
-            (lines, true)
-        }
+        BatchTokenPrescription::DirectionOnly { floor } => (
+            vec![format!(
+                "      • {verb} --max-num-batched-tokens lower to shrink prefill chunk size (not below {floor}). Lower for smoother TPOT, raise for lower TTFT."
+            )],
+            true,
+        ),
     }
 }
 
@@ -312,6 +265,9 @@ fn on_compute_wall(d: &PrefillBoundDetail) -> bool {
 const R6_TERMINAL_VERIFY: &str =
     "      • Verify prefix caching, chunked prefill and max-num-batched-tokens took effect.";
 
+const SEVERE_FLOPS_WALL_EXPECTED: &str =
+    "No large decode recovery on this GPU until prompt work drops or prefill scales out.";
+
 fn compute_wall_fix_lines(_d: &PrefillBoundDetail) -> (Vec<String>, String, bool) {
     // Unknown prefix caching must not get an Enable bullet (unknown is not off).
     // R6_TERMINAL_VERIFY already asks the operator to confirm prefix caching.
@@ -329,12 +285,35 @@ fn compute_wall_fix_lines(_d: &PrefillBoundDetail) -> (Vec<String>, String, bool
     )
 }
 
+/// Severe: FLOPs wall first. Chunked/batched knobs do not add prefill compute.
+/// Trailing Enable only when chunked is confirmed off (unknown → omit, no guess).
+/// "Reduce prompt length" is appended by the uniform format path.
+fn severe_flops_wall_fix_lines(d: &PrefillBoundDetail) -> (Vec<String>, String, bool) {
+    let mut bullets = vec![
+        "      • Prefill FLOPs dominate this mix; single-GPU retunes cannot add prefill compute."
+            .to_string(),
+        "      • Disaggregate prefill and decode onto separate workers (vLLM disaggregated serving, requires 2+ nodes).".to_string(),
+        "      • Add a replica to scale out.".to_string(),
+    ];
+    let chunked_off = d.chunked_prefill_enabled == Some(false);
+    if chunked_off {
+        bullets.push("      • Enable chunked prefill (--enable-chunked-prefill).".to_string());
+    }
+    // Enable is not a FLOPs lever; keep the loop open only while that trailing
+    // config action remains (same posture as mild Enable → non-terminal).
+    (
+        bullets,
+        SEVERE_FLOPS_WALL_EXPECTED.to_string(),
+        !chunked_off,
+    )
+}
+
 fn knob_fix_lines(d: &PrefillBoundDetail) -> (Vec<String>, String, bool) {
     let terminal = matches!(
         resolve_batch_token_prescription(d),
         BatchTokenPrescription::TerminalAtFloor { .. }
     );
-    let (mut bullets, named_set) = batch_token_budget_bullets(d, "Set", None);
+    let (mut bullets, named_set) = batch_token_budget_bullets(d, "Set");
     if terminal {
         bullets.push(R6_TERMINAL_VERIFY.to_string());
     }
@@ -575,7 +554,9 @@ pub(super) fn aggregate_r6_detail(details: &[PrefillBoundDetail]) -> PrefillBoun
         ridge_batch_size: details.first().and_then(|d| d.ridge_batch_size),
         max_num_batched_tokens: details.last().and_then(|d| d.max_num_batched_tokens),
         is_hybrid: details.first().is_some_and(|d| d.is_hybrid),
-        chunk_floor: details.first().and_then(|d| d.chunk_floor),
+        // Newest known floor: last non-None wins so an unread final window
+        // keeps the latest earlier scrape (not last().and_then → None).
+        chunk_floor: details.iter().rev().find_map(|d| d.chunk_floor),
         model_in_catalog: details.first().is_some_and(|d| d.model_in_catalog),
     }
 }
@@ -600,40 +581,25 @@ fn cause_tpot_line(d: &PrefillBoundDetail) -> Option<String> {
     ))
 }
 
-/// Budget knob path with optional chunked-prefill dependency subline.
-/// Used when chunked is confirmed off (with Enable) or unknown (no Enable).
-fn chunked_budget_fix_lines(
-    d: &PrefillBoundDetail,
-    enable_chunked: bool,
-) -> (Vec<String>, String, bool) {
+/// Budget knob path for confirmed-off or unread chunked (Option B): always Enable
+/// + Set. Enable is a knob → never terminal. No unread apology sublines.
+fn chunked_budget_fix_lines(d: &PrefillBoundDetail) -> (Vec<String>, String, bool) {
     let at_floor = matches!(
         resolve_batch_token_prescription(d),
         BatchTokenPrescription::TerminalAtFloor { .. }
     );
     let mut bullets = Vec::new();
-    if enable_chunked {
-        // Enable is a knob even when the budget line is TerminalAtFloor.
-        bullets.push("      • Enable chunked prefill (--enable-chunked-prefill).".to_string());
-    }
-    let dependency = (!at_floor).then_some(CHUNKED_PREFILL_BUDGET_DEPENDENCY);
-    let (budget, named_set) = batch_token_budget_bullets(d, "Set", dependency);
+    // Enable is a knob even when the budget line is TerminalAtFloor.
+    bullets.push("      • Enable chunked prefill (--enable-chunked-prefill).".to_string());
+    let (budget, _named_set) = batch_token_budget_bullets(d, "Set");
     bullets.extend(budget);
-    // Unknown + floor: terminal (no Enable), so verify before exit.
-    // Chunked-off + floor: Enable is a knob → not terminal; still verify.
     if at_floor {
         bullets.push(R6_TERMINAL_VERIFY.to_string());
     }
-    // Knob present (Enable or named Set) wins over floor Expected wording.
-    let expected = if named_set || enable_chunked {
-        "Decode batches interleave with prefill, reducing head-of-line blocking.".to_string()
-    } else {
-        batch_token_prescription_expected(d, named_set).to_string()
-    };
     (
         bullets,
-        expected,
-        // Enable is a knob → never terminal. Unknown + floor is terminal.
-        !enable_chunked && at_floor,
+        "Decode batches interleave with prefill, reducing head-of-line blocking.".to_string(),
+        false,
     )
 }
 
@@ -645,6 +611,7 @@ pub(super) fn prefill_fix_lines(
     let chunked_on = d.chunked_prefill_enabled == Some(true);
     let chunked_off = d.chunked_prefill_enabled == Some(false);
 
+    // Prefix caching cuts FLOPs; keep ahead of severity / chunked knobs.
     if prefix_off {
         (
             vec![
@@ -654,18 +621,11 @@ pub(super) fn prefill_fix_lines(
             "20-40% reduction in prefill time for workloads with shared prefixes.".to_string(),
             false,
         )
+    } else if sev == Severity::Severe {
+        // Severity alone: do not wait for chunked scrape. Unread cannot trap Enable+Set.
+        severe_flops_wall_fix_lines(d)
     } else if chunked_off {
-        // Confirmed off only. Unknown (`None`) is not off.
-        chunked_budget_fix_lines(d, true)
-    } else if sev == Severity::Severe && d.prefix_caching_enabled == Some(true) && chunked_on {
-        (
-            vec![
-                R6_TERMINAL_VERIFY.to_string(),
-                "      • Disaggregate prefill and decode onto separate workers (vLLM disaggregated serving, requires 2+ nodes).".to_string(),
-            ],
-            "Full separation of prefill and decode compute paths.".to_string(),
-            true,
-        )
+        chunked_budget_fix_lines(d)
     } else if chunked_on {
         if on_compute_wall(d) {
             compute_wall_fix_lines(d)
@@ -673,9 +633,8 @@ pub(super) fn prefill_fix_lines(
             knob_fix_lines(d)
         }
     } else {
-        // Unknown chunked state: prescribe the budget with a dependency subline,
-        // never an Enable bullet (unknown is not off).
-        chunked_budget_fix_lines(d, false)
+        // Can't read chunked (mild/moderate only): Option B — Enable + Set.
+        chunked_budget_fix_lines(d)
     }
 }
 
@@ -698,7 +657,11 @@ pub(super) fn format_prefill_bound_window_issue_with_terminal(
         confidence(sev)
     };
     let (fix_bullets, expected_normal, terminal) = prefill_fix_lines(d, sev);
-    let skewed = skewed_mode(d);
+    let prompt_p99 = d.prompt_tokens_p99.filter(|v| v.is_finite() && *v > 0.0);
+    let prompt_mean = d.prompt_tokens_mean.filter(|v| v.is_finite() && *v > 0.0);
+    // Skew UI + routing only with both ends of the length distribution.
+    // Ratio alone with missing p99/mean is normal path (title, cause, Fix).
+    let skewed = skewed_mode(d) && prompt_p99.is_some() && prompt_mean.is_some();
 
     let ratio_display = if d.prompt_gen_ratio.is_finite() {
         format!("{:.1}x", d.prompt_gen_ratio)
@@ -730,10 +693,10 @@ pub(super) fn format_prefill_bound_window_issue_with_terminal(
     ];
 
     if skewed {
-        if let Some(pm) = d.prompt_tokens_mean.filter(|v| v.is_finite() && *v > 0.0) {
+        if let Some(pm) = prompt_mean {
             lines.push(r6_metric_line("Prompt mean", &format!("{pm:.0} tok")));
         }
-        if let Some(p99) = d.prompt_tokens_p99.filter(|v| v.is_finite() && *v > 0.0) {
+        if let Some(p99) = prompt_p99 {
             let ratio = d.prompt_skew_ratio.unwrap_or(0.0);
             if ratio > 0.0 && ratio.is_finite() {
                 lines.push(r6_metric_line(
@@ -744,29 +707,19 @@ pub(super) fn format_prefill_bound_window_issue_with_terminal(
                 lines.push(r6_metric_line("Prompt p99", &format!("{p99:.0} tok")));
             }
         }
-    } else if let Some(pm) = d.prompt_tokens_mean.filter(|v| v.is_finite() && *v > 0.0) {
+    } else if let Some(pm) = prompt_mean {
         lines.push(r6_metric_line("Avg prompt", &format!("{pm:.0} tok")));
     }
 
     lines.push(String::new());
     lines.push("    Cause:".to_string());
-    if skewed {
-        if let (Some(pm), Some(p99)) = (
-            d.prompt_tokens_mean.filter(|v| v.is_finite() && *v > 0.0),
-            d.prompt_tokens_p99.filter(|v| v.is_finite() && *v > 0.0),
-        ) {
-            lines.push(format!(
-                "      Outlier prompts (p99: {p99:.0} tok) are monopolizing prefill compute."
-            ));
-            lines.push(format!(
-                "      Short requests ({pm:.0} tok mean) are blocked behind long-tail prefills."
-            ));
-        } else {
-            lines.push(
-                "      Prompt length outliers are monopolizing prefill compute and blocking shorter requests."
-                    .to_string(),
-            );
-        }
+    if let (true, Some(p99), Some(pm)) = (skewed, prompt_p99, prompt_mean) {
+        lines.push(format!(
+            "      Outlier prompts (p99: {p99:.0} tok) are monopolizing prefill compute."
+        ));
+        lines.push(format!(
+            "      Short requests ({pm:.0} tok mean) are blocked behind long-tail prefills."
+        ));
     } else {
         lines.push(format!(
             "      Prompt input rate is {ratio_display} generation output rate, starving decode throughput."
@@ -788,46 +741,42 @@ pub(super) fn format_prefill_bound_window_issue_with_terminal(
     }
 
     lines.push(String::new());
-    let expected = if let (true, Some(p99), Some(mean)) = (
-        skewed,
-        d.prompt_tokens_p99.filter(|v| v.is_finite() && *v > 0.0),
-        d.prompt_tokens_mean.filter(|v| v.is_finite() && *v > 0.0),
-    ) {
-        let mut safe = Vec::new();
-        // Enable only on confirmed off. Unknown is not off.
-        if d.chunked_prefill_enabled == Some(false) {
-            safe.push(
-                "      • Enable --enable-chunked-prefill to interleave short requests with long-prompt chunks."
-                    .to_string(),
+    let expected = match (skewed, prompt_p99, prompt_mean) {
+        (true, Some(p99), Some(mean)) => {
+            let mut safe = Vec::new();
+            // Enable only on confirmed off. Unknown is not off.
+            if d.chunked_prefill_enabled == Some(false) {
+                safe.push(
+                    "      • Enable --enable-chunked-prefill to interleave short requests with long-prompt chunks."
+                        .to_string(),
+                );
+            }
+            super::push_bullet_with_subline(
+                &mut safe,
+                format!(
+                    "      • Route long-context requests (p99: {p99:.0} tok) to a dedicated vLLM instance."
+                ),
+                Some(&format!(
+                    "Short requests ({mean:.0} tok mean) are blocked by outlier prefills."
+                )),
             );
+            let rejects = vec![
+                "      • Cap --max-model-len at p99 prompt length to reject outlier prompts, or truncate them at app layer.".to_string(),
+            ];
+            super::push_grouped_fixes(&mut lines, safe, Vec::new(), rejects, false);
+            SKEWED_EXPECTED.to_string()
         }
-        super::push_bullet_with_subline(
-            &mut safe,
-            format!(
-                "      • Route long-context requests (p99: {p99:.0} tok) to a dedicated vLLM instance."
-            ),
-            Some(&format!(
-                "Short requests ({mean:.0} tok mean) are blocked by outlier prefills."
-            )),
-        );
-        let rejects = vec![
-            "      • Cap --max-model-len at p99 prompt length to reject outlier prompts, or truncate them at app layer.".to_string(),
-        ];
-        super::push_grouped_fixes(&mut lines, safe, Vec::new(), rejects, false);
-        SKEWED_EXPECTED.to_string()
-    } else {
-        lines.push("    Fix:".to_string());
-        lines.extend(fix_bullets);
-        if !skewed {
+        _ => {
+            lines.push("    Fix:".to_string());
+            lines.extend(fix_bullets);
             lines.push("      • Reduce prompt length where possible.".to_string());
+            expected_normal
         }
-        expected_normal
     };
     lines.push(String::new());
     lines.push(format!("    Expected: {expected}"));
     lines.push(format!("    Confidence: {}", super::confidence_label(conf)));
-    // Skewed mode builds its own knob path; wall terminal applies only to the
-    // prefill_fix_lines branch that actually rendered.
+    // Wall terminal applies only when the normal (non-routing) Fix branch rendered.
     let terminal = !skewed && terminal;
     (super::with_seen_pct(lines, seen_pct), terminal)
 }
@@ -1188,19 +1137,49 @@ mod tests {
             ridge_batch_size: None,
             max_num_batched_tokens: Some(1024),
             is_hybrid: false,
-            chunk_floor: None,
+            chunk_floor: Some(16),
             model_in_catalog: true,
         };
         let last = PrefillBoundDetail {
             prefix_caching_enabled: Some(true),
             chunked_prefill_enabled: Some(true),
             max_num_batched_tokens: Some(2048),
+            chunk_floor: Some(112),
             ..first.clone()
         };
         let agg = aggregate_r6_detail(&[first, last]);
         assert_eq!(agg.prefix_caching_enabled, Some(true));
         assert_eq!(agg.chunked_prefill_enabled, Some(true));
         assert_eq!(agg.max_num_batched_tokens, Some(2048));
+        assert_eq!(agg.chunk_floor, Some(112));
+    }
+
+    #[test]
+    fn aggregate_chunk_floor_falls_back_when_last_unread() {
+        let known = PrefillBoundDetail {
+            prompt_gen_ratio: 6.0,
+            decode_efficiency_pct: 10.0,
+            tpot_ms: None,
+            tpot_floor_ms: None,
+            tpot_unverified: false,
+            prefix_caching_enabled: Some(true),
+            chunked_prefill_enabled: Some(true),
+            prompt_tokens_mean: None,
+            prompt_tokens_p99: None,
+            prompt_skew_ratio: None,
+            running_count: None,
+            ridge_batch_size: None,
+            max_num_batched_tokens: Some(2048),
+            is_hybrid: false,
+            chunk_floor: Some(16),
+            model_in_catalog: true,
+        };
+        let unread_last = PrefillBoundDetail {
+            chunk_floor: None,
+            ..known.clone()
+        };
+        let agg = aggregate_r6_detail(&[known, unread_last]);
+        assert_eq!(agg.chunk_floor, Some(16));
     }
 
     #[test]
@@ -1247,6 +1226,35 @@ mod tests {
             .expect("reject bullet");
         assert!(fix < chunked && chunked < route && route < rejects && rejects < cap);
         assert!(!text.contains("Set --max-num-batched-tokens to shrink prefill chunk size"));
+    }
+
+    #[test]
+    fn fix_recommends_routing_when_skewed_chunked_unknown_skips_enable() {
+        // Routing arm: unknown chunked is not off → no Enable bullet (Option B
+        // lives only in prefill_fix_lines, which routing does not use).
+        let d = PrefillBoundDetail {
+            prompt_gen_ratio: 15.0,
+            decode_efficiency_pct: 6.7,
+            tpot_ms: Some(130.0),
+            tpot_floor_ms: Some(7.85),
+            tpot_unverified: false,
+            prefix_caching_enabled: Some(true),
+            chunked_prefill_enabled: None,
+            prompt_tokens_mean: Some(2048.0),
+            prompt_tokens_p99: Some(51_200.0),
+            prompt_skew_ratio: Some(25.0),
+            running_count: None,
+            ridge_batch_size: None,
+            max_num_batched_tokens: None,
+            is_hybrid: false,
+            chunk_floor: None,
+            model_in_catalog: true,
+        };
+        let (lines, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100);
+        let text = lines.join("\n");
+        assert!(text.contains("Route long-context requests"));
+        assert!(!text.contains("Enable --enable-chunked-prefill"));
+        assert!(!terminal, "routing path is never terminal:\n{text}");
     }
 
     #[test]
@@ -1326,25 +1334,14 @@ mod tests {
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
         assert!(text.contains("--enable-chunked-prefill"));
         assert!(text.contains("Set --max-num-batched-tokens"));
-        assert!(text.contains(CHUNKED_PREFILL_BUDGET_DEPENDENCY));
+        assert!(!text.contains("Takes effect only with chunked prefill on."));
+        assert!(!text.contains("could not verify this differs from what's running"));
         assert!(!text.contains("Disaggregate prefill and decode"));
-        // Subline sits under the budget bullet, not the enable bullet.
-        let lines: Vec<&str> = text.lines().collect();
-        let budget_idx = lines
-            .iter()
-            .position(|l| l.contains("Set --max-num-batched-tokens"))
-            .expect("budget bullet");
-        assert!(
-            lines[budget_idx + 1].contains(CHUNKED_PREFILL_BUDGET_DEPENDENCY),
-            "dependency subline under budget: {}",
-            lines[budget_idx + 1]
-        );
-        assert!(lines[budget_idx + 1].starts_with("        "));
     }
 
     #[test]
-    fn chunked_unknown_budget_bullet_carries_dependency_subline_no_enable() {
-        // Unknown is not off: never Enable; budget still speaks with dependency.
+    fn chunked_unknown_falls_back_to_enable_and_set() {
+        // Can't read → Option B: Enable + Set, no unread / dependency noise.
         let d = PrefillBoundDetail {
             prompt_gen_ratio: 10.0,
             decode_efficiency_pct: 8.0,
@@ -1365,15 +1362,16 @@ mod tests {
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
         assert!(
-            !text.contains("Enable chunked prefill (--enable-chunked-prefill)."),
-            "unknown must not Enable: {text}"
+            text.contains("Enable chunked prefill (--enable-chunked-prefill)."),
+            "unknown falls back to Enable: {text}"
         );
         assert!(text.contains("Set --max-num-batched-tokens"));
-        assert!(text.contains(CHUNKED_PREFILL_BUDGET_DEPENDENCY));
+        assert!(!text.contains("Takes effect only with chunked prefill on."));
+        assert!(!text.contains("could not verify this differs from what's running"));
     }
 
     #[test]
-    fn chunked_on_budget_bullet_has_no_dependency_subline() {
+    fn chunked_on_budget_bullet_has_no_enable() {
         let d = PrefillBoundDetail {
             prompt_gen_ratio: 12.0,
             decode_efficiency_pct: 8.0,
@@ -1395,7 +1393,8 @@ mod tests {
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
         assert!(!text.contains("Enable chunked prefill (--enable-chunked-prefill)."));
         assert!(text.contains("Set --max-num-batched-tokens to 2048"));
-        assert!(!text.contains(CHUNKED_PREFILL_BUDGET_DEPENDENCY));
+        assert!(!text.contains("Takes effect only with chunked prefill on."));
+        assert!(!text.contains("could not verify this differs from what's running"));
     }
 
     #[test]
@@ -1445,7 +1444,10 @@ mod tests {
             model_in_catalog: true,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
+        assert!(text.contains("Prefill FLOPs dominate this mix"));
         assert!(text.contains("Disaggregate prefill and decode"));
+        assert!(text.contains(SEVERE_FLOPS_WALL_EXPECTED));
+        assert!(!text.contains("Set --max-num-batched-tokens"));
     }
 
     #[test]
@@ -1524,30 +1526,31 @@ mod tests {
 
     #[test]
     fn skewed_mode_without_p99_falls_back_to_normal_fix() {
-        let d = PrefillBoundDetail {
-            prompt_gen_ratio: 15.0,
-            decode_efficiency_pct: 6.7,
-            tpot_ms: Some(130.0),
-            tpot_floor_ms: Some(7.85),
-            tpot_unverified: false,
-            prefix_caching_enabled: Some(true),
-            chunked_prefill_enabled: Some(true),
-            prompt_tokens_mean: Some(2048.0),
-            prompt_tokens_p99: None,
-            prompt_skew_ratio: Some(25.0),
-            running_count: None,
-            ridge_batch_size: None,
-            max_num_batched_tokens: None,
-            is_hybrid: false,
-            chunk_floor: None,
-            model_in_catalog: true,
-        };
+        // Skew signal without p99: full normal path (title/cause/Fix), keep wall terminal.
+        let mut d = wall_path_base(Some(2048), Some(1638.4), Some(true), 12.0);
+        d.prompt_skew_ratio = Some(25.0);
+        d.prompt_tokens_p99 = None;
+        d.prompt_tokens_mean = Some(2048.0);
         assert!(skewed_mode(&d));
-        let text = format_prefill_bound_window_issue(&d, 100).join("\n");
+        assert!(on_compute_wall(&d));
+        let (lines, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100);
+        let text = lines.join("\n");
+        assert!(
+            text.contains("High Prompt Processing Time"),
+            "incomplete skew must use normal title: {text}"
+        );
+        assert!(!text.contains("Skewed Prompt Distribution"));
+        assert!(text.contains(
+            "Prompt input rate is 12.0x generation output rate, starving decode throughput."
+        ));
+        assert!(!text.contains("Prompt length outliers are monopolizing"));
         assert!(!text.contains("Route long-context requests"));
         assert!(!text.contains("    Rejects requests:"));
         assert!(text.contains("    Fix:"));
-        assert!(text.contains("--max-num-batched-tokens"));
+        assert!(text.contains("no single-GPU knob adds FLOPs"));
+        assert!(text.contains("Reduce prompt length where possible"));
+        assert!(text.contains("Avg prompt"));
+        assert!(terminal);
         assert!(!text.contains(SKEWED_EXPECTED));
     }
 
@@ -1830,7 +1833,7 @@ mod tests {
         let d = wall_path_base(None, Some(1638.4), Some(true), 12.0);
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
         assert!(text.contains("Set --max-num-batched-tokens to 2048"));
-        assert!(text.contains(CONFIGURED_BATCHED_TOKENS_UNREAD));
+        assert!(!text.contains("could not verify this differs from what's running"));
         assert!(!text.contains("no single-GPU knob adds FLOPs"));
     }
 
@@ -1890,11 +1893,11 @@ mod tests {
     }
 
     #[test]
-    fn unread_configured_still_prescribes_with_truth_subline() {
+    fn unread_configured_still_prescribes_set() {
         let d = wall_path_base(None, Some(1638.4), Some(true), 12.0);
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
         assert!(text.contains("Set --max-num-batched-tokens to 2048"));
-        assert!(text.contains(CONFIGURED_BATCHED_TOKENS_UNREAD));
+        assert!(!text.contains("could not verify this differs from what's running"));
     }
 
     #[test]
@@ -1926,14 +1929,46 @@ mod tests {
     }
 
     #[test]
-    fn severe_prefix_on_chunked_disagg_unchanged_when_within_band() {
-        // Severe branch stays above the wall gate; byte-identical single disagg bullet.
+    fn severe_flops_wall_when_chunked_on() {
+        // Severity alone names the FLOPs wall; no Enable+Set theater.
         let d = wall_path_base(Some(2048), Some(1638.4), Some(true), 22.0);
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
+        assert!(text.contains("Prefill FLOPs dominate this mix"));
         assert!(text.contains("Disaggregate prefill and decode onto separate workers"));
-        assert!(!text.contains("no single-GPU knob adds FLOPs"));
-        assert!(!text.contains("Add a replica to scale out."));
-        assert!(!text.contains("--max-num-batched-tokens"));
+        assert!(text.contains("Add a replica to scale out."));
+        assert!(text.contains(SEVERE_FLOPS_WALL_EXPECTED));
+        assert!(text.contains("Reduce prompt length where possible"));
+        assert!(!text.contains("Enable chunked prefill"));
+        assert!(!text.contains("Set --max-num-batched-tokens"));
+        assert!(!text.contains("Decode batches interleave with prefill"));
+    }
+
+    #[test]
+    fn severe_unread_chunked_still_names_flops_wall() {
+        // Unread must not trap Enable+Set at severe.
+        let mut d = wall_path_base(Some(2048), Some(1638.4), Some(true), 22.0);
+        d.chunked_prefill_enabled = None;
+        let text = format_prefill_bound_window_issue(&d, 100).join("\n");
+        assert!(text.contains("Prefill FLOPs dominate this mix"));
+        assert!(text.contains(SEVERE_FLOPS_WALL_EXPECTED));
+        assert!(!text.contains("Enable chunked prefill"));
+        assert!(!text.contains("Set --max-num-batched-tokens"));
+    }
+
+    #[test]
+    fn severe_chunked_off_trails_enable_not_set_budget() {
+        let mut d = wall_path_base(Some(2048), Some(1638.4), Some(true), 22.0);
+        d.chunked_prefill_enabled = Some(false);
+        let (lines, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100);
+        let text = lines.join("\n");
+        assert!(text.contains("Prefill FLOPs dominate this mix"));
+        let wall = text.find("Prefill FLOPs dominate").expect("wall");
+        let enable = text
+            .find("Enable chunked prefill")
+            .expect("trailing Enable");
+        assert!(wall < enable, "Enable trails the wall: {text}");
+        assert!(!text.contains("Set --max-num-batched-tokens"));
+        assert!(!terminal, "trailing Enable keeps a config action open");
     }
 
     #[test]
@@ -2044,24 +2079,30 @@ mod tests {
             "Expected must not contradict Enable: {text}"
         );
         assert!(
-            !text.contains(CHUNKED_PREFILL_BUDGET_DEPENDENCY),
-            "floor statement has nothing to take effect: {text}"
+            !text.contains("Takes effect only with chunked prefill on."),
+            "no dependency subline: {text}"
         );
     }
 
     #[test]
-    fn chunked_unknown_at_floor_is_terminal_with_verify() {
+    fn chunked_unknown_at_floor_enable_not_terminal() {
+        // Can't-read fallback still offers Enable → not a wall exit.
         let mut d = hybrid_align_floor_detail(Some(HYBRID_ALIGN_FLOOR_EXAMPLE));
         d.chunked_prefill_enabled = None;
         let (lines, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100);
         let text = lines.join("\n");
-        assert!(terminal, "unknown + floor must exit: {text}");
-        assert!(
-            !text.contains("Enable chunked prefill (--enable-chunked-prefill)."),
-            "unknown must not Enable: {text}"
-        );
+        assert!(!terminal, "Enable is a knob: {text}");
+        assert!(text.contains("Enable chunked prefill (--enable-chunked-prefill)."));
         assert!(text.contains(R6_TERMINAL_VERIFY.trim_start()));
-        assert!(text.contains("No setting on this server makes prefill chunks smaller"));
+        assert!(
+            text.contains(
+                "Decode batches interleave with prefill, reducing head-of-line blocking."
+            )
+        );
+        assert!(
+            !text.contains("No setting on this server makes prefill chunks smaller"),
+            "Expected must not contradict Enable: {text}"
+        );
     }
 
     #[test]
@@ -2221,22 +2262,33 @@ mod tests {
     }
 
     #[test]
-    fn terminal_flag_true_on_severe_disaggregate() {
+    fn terminal_flag_true_on_severe_flops_wall() {
         let d = wall_path_base(Some(8192), Some(1638.4), Some(true), 25.0);
-        let (_, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100);
+        let (text, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100);
+        let text = text.join("\n");
         assert!(terminal);
-        let (bullets, _, term) = prefill_fix_lines(&d, Severity::Severe);
+        assert!(text.contains("Prefill FLOPs dominate this mix"));
+        assert!(text.contains("Disaggregate"));
+        assert!(text.contains(SEVERE_FLOPS_WALL_EXPECTED));
+        let (bullets, expected, term) = prefill_fix_lines(&d, Severity::Severe);
         assert!(term);
+        assert_eq!(expected, SEVERE_FLOPS_WALL_EXPECTED);
         assert!(bullets.iter().any(|l| l.contains("Disaggregate")));
-        assert!(bullets.iter().any(|l| l.contains("Verify prefix caching")));
+        assert!(bullets.iter().any(|l| l.contains("Add a replica")));
+        assert!(!bullets.iter().any(|l| l.contains("Verify prefix caching")));
     }
 
     #[test]
     fn terminal_flag_false_on_enable_chunked_knob() {
+        // Mild/moderate + chunked off: Enable path (budget may already match), not severe wall.
         let mut d = wall_path_base(Some(2048), Some(1638.4), Some(true), 12.0);
         d.chunked_prefill_enabled = Some(false);
-        let (_, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100);
+        let (text, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100);
+        let text = text.join("\n");
         assert!(!terminal);
+        assert!(text.contains("Enable chunked prefill"));
+        assert!(!text.contains("Prefill FLOPs dominate"));
+        assert!(text.contains("Decode batches interleave with prefill"));
     }
 
     #[test]

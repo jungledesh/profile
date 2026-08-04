@@ -290,10 +290,7 @@ fn fetch_info(client: &reqwest::blocking::Client, base_url: &str) -> InfoData {
 }
 
 fn looks_like_html(text: &str) -> bool {
-    let t = text.trim_start();
-    t.starts_with('<')
-        || t.get(..15)
-            .is_some_and(|s| s.eq_ignore_ascii_case("<!doctype html"))
+    text.trim_start().starts_with('<')
 }
 
 fn parse_info_body(text: &str) -> InfoData {
