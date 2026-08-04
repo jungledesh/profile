@@ -277,7 +277,7 @@ const KV_OFFLOAD_FIX: &str = "      • Set --kv-offloading-size (GiB) to hold e
 const KV_OFFLOAD_SUBLINE_FALLBACK: &str =
     "Check host RAM and your container memory limit before allocating.";
 const KV_OFFLOAD_DOWNSIDE: &str =
-    "Can starve decode; newer vLLM path, watch stability after enabling.";
+    "Spills KV to host RAM; can starve decode under long prompts. Watch stability after enabling.";
 const LAST_RESORT_HEADER: &str = "    Last resort:";
 
 pub(super) fn format_kv_offload_subline(
