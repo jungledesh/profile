@@ -9,7 +9,9 @@
 #   CONCURRENCY=N   concurrent workers (default: 4)
 #   LAMBDA=N        mean think time in seconds per worker (default: 4)
 #   MAX_TOKENS=N    max output tokens per request (default: random 80-480)
-#   MODEL=NAME      served model name (default: Qwen3.6-27B)
+#   PROFILE_MODEL=gemma|qwen   selects default MODEL (default: gemma, matches
+#                              Dockerfile nvidia CMD / start-gemma.sh)
+#   MODEL=NAME      served model name override (default from PROFILE_MODEL)
 #   VLLM_URL=URL    vLLM endpoint (default: http://localhost:8000)
 #
 # Each request = ~3K-token shared system prompt + ~900-token doc + ~30-token instruction
@@ -20,7 +22,16 @@
 set -euo pipefail
 
 VLLM_URL="${VLLM_URL:-http://localhost:8000}"
-MODEL="${MODEL:-Qwen3.6-27B}"
+PROFILE_MODEL="${PROFILE_MODEL:-gemma}"
+case "$PROFILE_MODEL" in
+  gemma) DEFAULT_MODEL="gemma-4-26b-a4b" ;;
+  qwen)  DEFAULT_MODEL="Qwen3.6-27B" ;;
+  *)
+    echo "PROFILE_MODEL must be gemma or qwen (got: $PROFILE_MODEL)" >&2
+    exit 1
+    ;;
+esac
+MODEL="${MODEL:-$DEFAULT_MODEL}"
 MODE="${MODE:-rag}"
 
 post() {

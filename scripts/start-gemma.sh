@@ -81,11 +81,29 @@ fi
 #                           eat the KV pool before the comparison says anything.
 #   --trust-remote-code     permit model-shipped code (harmless if unused).
 #   (no --max-num-seqs)     let vLLM pick; Profile observes and prescribes.
-# Wiring the agent swarm against this model needs tool-call flags. Per the
-# vLLM Gemma 4 recipe (docs.vllm.ai/projects/recipes .. Google/Gemma4):
-#   --enable-auto-tool-choice --tool-call-parser gemma4 --reasoning-parser gemma4
-#   --chat-template examples/tool_chat_template_gemma4.jinja
-# Pass via EXTRA_ARGS when the swarm lands.
+#
+# Tool-call wiring for agent-swarm.sh (vLLM Gemma 4 recipe). Disable with
+# ENABLE_GEMMA_TOOLS=0. EXTRA_ARGS still appends after these defaults.
+ENABLE_GEMMA_TOOLS="${ENABLE_GEMMA_TOOLS:-1}"
+TOOL_ARGS=""
+if [[ "$ENABLE_GEMMA_TOOLS" == "1" ]]; then
+    GEMMA4_TEMPLATE="$(
+        python -c "
+import pathlib
+import vllm
+root = pathlib.Path(vllm.__file__).resolve().parent
+cands = list(root.rglob('tool_chat_template_gemma4.jinja'))
+print(cands[0] if cands else '')
+" 2>/dev/null || true
+    )"
+    if [[ -z "$GEMMA4_TEMPLATE" ]]; then
+        echo "WARN: tool_chat_template_gemma4.jinja not found in vLLM install;"
+        echo "      swarm tool calls may fail. Override with EXTRA_ARGS."
+    else
+        TOOL_ARGS="--enable-auto-tool-choice --tool-call-parser gemma4 --reasoning-parser gemma4 --chat-template ${GEMMA4_TEMPLATE}"
+        echo "Gemma tool-call template: $GEMMA4_TEMPLATE"
+    fi
+fi
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 tmux new-session -d -s "$TMUX_SESSION" \
 "bash -lc 'source \"$VENV_DIR/bin/activate\" && \
@@ -94,11 +112,13 @@ vllm serve \"$MODEL_PATH\" \
   --served-model-name $SERVED_NAME \
   --max-model-len 32768 \
   --trust-remote-code \
+  $TOOL_ARGS \
   $EXTRA_ARGS \
   2>&1 | tee \"$LOG_FILE\"'"
 
 echo
 echo "vLLM running (Gemma 4 26B-A4B) in tmux session '$TMUX_SESSION'"
+echo "Served as: $SERVED_NAME  (load/swarm: PROFILE_MODEL=gemma)"
 echo "Attach with: tmux attach -t $TMUX_SESSION"
 echo "Check: curl -s localhost:8000/metrics | grep cache_config_info"
 echo "Expect: kv_cache_max_concurrency label present (Profile's Observed capacity)."

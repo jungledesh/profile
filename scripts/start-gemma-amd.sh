@@ -50,7 +50,29 @@ fi
 #   --max-model-len 32768   same as the NVIDIA run so numbers compare 1:1.
 #   --trust-remote-code     permit model-shipped code (harmless if unused).
 #   (no --max-num-seqs, no --gpu-memory-utilization) let vLLM pick.
-# If ROCm graph capture misbehaves on this arch, add --enforce-eager via EXTRA_ARGS.
+# Tool-call wiring for agent swarm (same as start-gemma.sh). Disable with
+# ENABLE_GEMMA_TOOLS=0. If ROCm graph capture misbehaves, add --enforce-eager
+# via EXTRA_ARGS.
+ENABLE_GEMMA_TOOLS="${ENABLE_GEMMA_TOOLS:-1}"
+TOOL_ARGS=""
+if [[ "$ENABLE_GEMMA_TOOLS" == "1" ]]; then
+    GEMMA4_TEMPLATE="$(
+        python -c "
+import pathlib
+import vllm
+root = pathlib.Path(vllm.__file__).resolve().parent
+cands = list(root.rglob('tool_chat_template_gemma4.jinja'))
+print(cands[0] if cands else '')
+" 2>/dev/null || true
+    )"
+    if [[ -z "$GEMMA4_TEMPLATE" ]]; then
+        echo "WARN: tool_chat_template_gemma4.jinja not found in vLLM install;"
+        echo "      swarm tool calls may fail. Override with EXTRA_ARGS."
+    else
+        TOOL_ARGS="--enable-auto-tool-choice --tool-call-parser gemma4 --reasoning-parser gemma4 --chat-template ${GEMMA4_TEMPLATE}"
+        echo "Gemma tool-call template: $GEMMA4_TEMPLATE"
+    fi
+fi
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 tmux new-session -d -s "$TMUX_SESSION" \
 "bash -lc 'python -m vllm.entrypoints.openai.api_server \
@@ -60,11 +82,13 @@ tmux new-session -d -s "$TMUX_SESSION" \
   --port 8000 \
   --max-model-len 32768 \
   --trust-remote-code \
+  $TOOL_ARGS \
   $EXTRA_ARGS \
   2>&1 | tee \"$LOG_FILE\"'"
 
 echo
 echo "vLLM running (Gemma 4 26B-A4B) in tmux session '$TMUX_SESSION'"
+echo "Served as: $SERVED_NAME  (load/swarm: PROFILE_MODEL=gemma)"
 echo "Attach with: tmux attach -t $TMUX_SESSION"
 echo "Check: curl -s localhost:8000/metrics | grep cache_config_info"
 

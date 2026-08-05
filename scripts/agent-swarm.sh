@@ -25,13 +25,21 @@
 #   PHASE_SPREAD=600   seconds across which worker start phases are evenly spread
 #   TIMEOUT_JITTER=90  per-task timeout ± seconds when STABLE=1
 #   SWARM_HOME=/workspace/swarm   scratch area (clones, checkouts, venvs, log)
-#   MODEL_ALIAS=qwen-local        grok model alias (see config below)
+#   PROFILE_MODEL=gemma|qwen      which served model the swarm targets (default: gemma,
+#                                 matches Dockerfile nvidia CMD / start-gemma.sh)
+#   MODEL_ALIAS=...               grok alias (default: gemma-local or qwen-local)
+#   SERVED_NAME=...               vLLM --served-model-name override
 #
 # Profile demo (steady traffic, no cohort ramp):
 #   STABLE=1 AGENTS=16 TASK_TIMEOUT=600 DURATION=0 ./agent-swarm.sh run
 #   Wait ~2 min after launch for phase spread to fill, then run profile diagnose.
 #
-# Requires: vLLM serving Qwen3.6-27B on localhost:8000 (see start.sh); jq; git.
+# Switch to Qwen (must match start.sh):
+#   PROFILE_MODEL=qwen ./agent-swarm.sh run
+#
+# Requires: vLLM on localhost:8000 serving the PROFILE_MODEL target
+# (start-gemma.sh or start.sh); jq; git. Gemma needs tool-call flags
+# (start-gemma.sh enables them by default).
 #
 # Smoke gate (non-negotiable, from the plan): on the pod, run ONE agent on ONE
 # instance end to end before AGENTS=16:
@@ -48,7 +56,24 @@ STABLE="${STABLE:-1}"
 PHASE_SPREAD="${PHASE_SPREAD:-$TASK_TIMEOUT}"
 TIMEOUT_JITTER="${TIMEOUT_JITTER:-90}"
 SWARM_HOME="${SWARM_HOME:-/workspace/swarm}"
-MODEL_ALIAS="${MODEL_ALIAS:-qwen-local}"
+PROFILE_MODEL="${PROFILE_MODEL:-gemma}"
+
+case "$PROFILE_MODEL" in
+    gemma)
+        SERVED_MODEL_NAME="${SERVED_NAME:-gemma-4-26b-a4b}"
+        MODEL_ALIAS="${MODEL_ALIAS:-gemma-local}"
+        MODEL_DISPLAY="Gemma 4 26B-A4B (vLLM)"
+        ;;
+    qwen)
+        SERVED_MODEL_NAME="${SERVED_NAME:-Qwen3.6-27B}"
+        MODEL_ALIAS="${MODEL_ALIAS:-qwen-local}"
+        MODEL_DISPLAY="Qwen3.6-27B (vLLM)"
+        ;;
+    *)
+        echo "PROFILE_MODEL must be gemma or qwen (got: $PROFILE_MODEL)" >&2
+        exit 1
+        ;;
+esac
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TASKS_JSON="${TASKS_JSON:-$SCRIPT_DIR/swarm-tasks.json}"
@@ -90,24 +115,25 @@ install_grok() {
 }
 
 # ── Config (validated on H100, Jul 16 2026; see demo_setup_validated.md §5) ─
+# Rewritten every setup/run so PROFILE_MODEL switches take effect.
 write_grok_config() {
     mkdir -p "$HOME/.grok"
-    cat > "$HOME/.grok/config.toml" <<'EOF'
+    cat > "$HOME/.grok/config.toml" <<EOF
 [models]
-default = "qwen-local"
+default = "${MODEL_ALIAS}"
 
-[model.qwen-local]
-model = "Qwen3.6-27B"
+[model.${MODEL_ALIAS}]
+model = "${SERVED_MODEL_NAME}"
 base_url = "http://localhost:8000/v1"
 api_key = "none"
-name = "Qwen3.6-27B (vLLM)"
+name = "${MODEL_DISPLAY}"
 context_window = 32768
 
 # Internal harness calls request the model named "grok-build" explicitly.
 # Redirect it locally. api_backend must be chat_completions: the built-in
 # defaults to the Responses API, which crashes on vLLM reasoning stream events.
 [model.grok-build]
-model = "Qwen3.6-27B"
+model = "${SERVED_MODEL_NAME}"
 base_url = "http://localhost:8000/v1"
 api_key = "none"
 api_backend = "chat_completions"
@@ -116,7 +142,7 @@ context_window = 32768
 # grok 0.2.111 also requests "grok-4.5" for auxiliary calls (observed 404 in
 # vLLM log, Jul 24). Same redirect.
 [model."grok-4.5"]
-model = "Qwen3.6-27B"
+model = "${SERVED_MODEL_NAME}"
 base_url = "http://localhost:8000/v1"
 api_key = "none"
 api_backend = "chat_completions"
@@ -125,7 +151,8 @@ context_window = 32768
 [features]
 telemetry = false
 EOF
-    echo "Grok Build ready. Config written to ~/.grok/config.toml"
+    echo "Grok Build ready (${PROFILE_MODEL} → ${SERVED_MODEL_NAME}, alias ${MODEL_ALIAS})."
+    echo "Config written to ~/.grok/config.toml"
 }
 
 # ── Repos, checkouts, venvs ─────────────────────────────────────────────────
