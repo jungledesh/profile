@@ -48,7 +48,14 @@ if [[ -n "${HF_TOKEN:-}" ]]; then
     export HF_TOKEN
 fi
 
+# DOWNLOAD_MODEL=0 skips the ~58GB pull (weights must already be at MODEL_PATH).
+DOWNLOAD_MODEL="${DOWNLOAD_MODEL:-1}"
 if [[ ! -d "$MODEL_PATH" ]] || [[ -z "$(ls -A "$MODEL_PATH" 2>/dev/null)" ]]; then
+    if [[ "$DOWNLOAD_MODEL" != "1" ]]; then
+        echo "ERROR: DOWNLOAD_MODEL=0 but no weights at $MODEL_PATH."
+        echo "Set DOWNLOAD_MODEL=1 or mount weights at MODEL_PATH."
+        exit 1
+    fi
     echo "Downloading ${MODEL_REPO}..."
     mkdir -p "$MODEL_PATH"
     hf download "$MODEL_REPO" --local-dir "$MODEL_PATH"
@@ -74,9 +81,11 @@ fi
 #                           eat the KV pool before the comparison says anything.
 #   --trust-remote-code     permit model-shipped code (harmless if unused).
 #   (no --max-num-seqs)     let vLLM pick; Profile observes and prescribes.
-# Wiring the agent swarm against this model needs tool-call flags
-# (--enable-auto-tool-choice + the right --tool-call-parser for Gemma; check
-# vLLM docs for the parser name) — pass them via EXTRA_ARGS when that lands.
+# Wiring the agent swarm against this model needs tool-call flags. Per the
+# vLLM Gemma 4 recipe (docs.vllm.ai/projects/recipes .. Google/Gemma4):
+#   --enable-auto-tool-choice --tool-call-parser gemma4 --reasoning-parser gemma4
+#   --chat-template examples/tool_chat_template_gemma4.jinja
+# Pass via EXTRA_ARGS when the swarm lands.
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 tmux new-session -d -s "$TMUX_SESSION" \
 "bash -lc 'source \"$VENV_DIR/bin/activate\" && \

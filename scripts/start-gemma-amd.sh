@@ -26,7 +26,14 @@ if [[ -n "${HF_TOKEN:-}" ]]; then
     export HF_TOKEN
 fi
 
+# DOWNLOAD_MODEL=0 skips the ~58GB pull (weights must already be at MODEL_PATH).
+DOWNLOAD_MODEL="${DOWNLOAD_MODEL:-1}"
 if [[ ! -d "$MODEL_PATH" ]] || [[ -z "$(ls -A "$MODEL_PATH" 2>/dev/null)" ]]; then
+    if [[ "$DOWNLOAD_MODEL" != "1" ]]; then
+        echo "ERROR: DOWNLOAD_MODEL=0 but no weights at $MODEL_PATH."
+        echo "Set DOWNLOAD_MODEL=1 or mount weights at MODEL_PATH."
+        exit 1
+    fi
     echo "Downloading ${MODEL_REPO}..."
     mkdir -p "$MODEL_PATH"
     hf download "$MODEL_REPO" --local-dir "$MODEL_PATH"
