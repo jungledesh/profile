@@ -87,6 +87,9 @@ fi
 ENABLE_GEMMA_TOOLS="${ENABLE_GEMMA_TOOLS:-1}"
 TOOL_ARGS=""
 if [[ "$ENABLE_GEMMA_TOOLS" == "1" ]]; then
+    # Parsers never depend on the recipe jinja: the model ships its own chat
+    # template with the HF weights. The jinja is a bonus if the install has it.
+    TOOL_ARGS="--enable-auto-tool-choice --tool-call-parser gemma4 --reasoning-parser gemma4"
     GEMMA4_TEMPLATE="$(
         python -c "
 import pathlib
@@ -96,12 +99,12 @@ cands = list(root.rglob('tool_chat_template_gemma4.jinja'))
 print(cands[0] if cands else '')
 " 2>/dev/null || true
     )"
-    if [[ -z "$GEMMA4_TEMPLATE" ]]; then
-        echo "WARN: tool_chat_template_gemma4.jinja not found in vLLM install;"
-        echo "      swarm tool calls may fail. Override with EXTRA_ARGS."
-    else
-        TOOL_ARGS="--enable-auto-tool-choice --tool-call-parser gemma4 --reasoning-parser gemma4 --chat-template ${GEMMA4_TEMPLATE}"
+    if [[ -n "$GEMMA4_TEMPLATE" ]]; then
+        TOOL_ARGS="$TOOL_ARGS --chat-template ${GEMMA4_TEMPLATE}"
         echo "Gemma tool-call template: $GEMMA4_TEMPLATE"
+    else
+        echo "Using model-bundled chat template (recipe jinja not in this vLLM install)."
+        echo "If swarm tool calls misparse, download it and pass via EXTRA_ARGS --chat-template."
     fi
 fi
 EXTRA_ARGS="${EXTRA_ARGS:-}"
