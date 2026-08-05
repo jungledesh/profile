@@ -90,6 +90,7 @@ WORKDIR ${APP_DIR}
 COPY --chown=appuser:appuser scripts/load.sh ./load.sh
 COPY --chown=appuser:appuser scripts/start.sh ./start.sh
 COPY --chown=appuser:appuser scripts/start-gemma.sh ./start-gemma.sh
+COPY --chown=appuser:appuser scripts/tool_chat_template_gemma4.jinja ./tool_chat_template_gemma4.jinja
 COPY --chown=appuser:appuser scripts/agent-swarm.sh ./agent-swarm.sh
 # Swarm task list: agent-swarm.sh reads swarm-tasks.json next to itself.
 # fetch-swarm-tasks.py regenerates it if needed (requires internet).
@@ -100,6 +101,15 @@ COPY --from=profile-builder --chown=appuser:appuser /build/target/release/profil
 RUN chmod 0755 ./load.sh ./start.sh ./start-gemma.sh ./agent-swarm.sh ./profile
 
 USER appuser
+
+# Default stack is Gemma 4. Consumers resolve MODEL as:
+#   MODEL > SERVED_NAME > PROFILE_MODEL family default.
+# Switch the whole stack with:
+#   docker run ... profile:nvidia bash -lc './start.sh'   # Qwen
+#   PROFILE_MODEL=qwen SERVED_NAME=Qwen3.6-27B ./load.sh
+#   PROFILE_MODEL=qwen SERVED_NAME=Qwen3.6-27B ./agent-swarm.sh run
+ENV PROFILE_MODEL=gemma
+ENV SERVED_NAME=gemma-4-26b-a4b
 
 CMD ["bash", "-lc", "/home/appuser/app/start-gemma.sh"]
 
@@ -172,12 +182,20 @@ WORKDIR ${APP_DIR}
 COPY --chown=appuser:appuser scripts/load.sh ./load.sh
 COPY --chown=appuser:appuser scripts/start-amd.sh ./start.sh
 COPY --chown=appuser:appuser scripts/start-gemma-amd.sh ./start-gemma.sh
+COPY --chown=appuser:appuser scripts/tool_chat_template_gemma4.jinja ./tool_chat_template_gemma4.jinja
 
 COPY --from=profile-builder --chown=appuser:appuser /build/target/release/profile ./profile
 
 RUN chmod 0755 ./load.sh ./start.sh ./start-gemma.sh ./profile
 
 USER appuser
+
+# Default AMD stack is Llama 3 (start-amd.sh). load.sh resolves
+# MODEL > SERVED_NAME > PROFILE_MODEL family default.
+# Gemma on AMD: bash -lc './start-gemma.sh' and PROFILE_MODEL=gemma
+# (SERVED_NAME already defaults to gemma-4-26b-a4b in start-gemma-amd.sh).
+ENV PROFILE_MODEL=llama
+ENV SERVED_NAME=llama3
 
 ENTRYPOINT []
 CMD ["bash", "-lc", "/home/appuser/app/start.sh"]
