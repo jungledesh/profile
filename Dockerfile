@@ -101,7 +101,7 @@ RUN chmod 0755 ./load.sh ./start.sh ./start-gemma.sh ./agent-swarm.sh ./profile
 
 USER appuser
 
-CMD ["bash", "-lc", "/home/appuser/app/start.sh"]
+CMD ["bash", "-lc", "/home/appuser/app/start-gemma.sh"]
 
 # AMD runtime: official vLLM ROCm image (includes ROCm + Python 3.12 + vLLM + PyTorch).
 # Build: docker build --target amd -t profile:amd .
@@ -171,10 +171,11 @@ WORKDIR ${APP_DIR}
 
 COPY --chown=appuser:appuser scripts/load.sh ./load.sh
 COPY --chown=appuser:appuser scripts/start-amd.sh ./start.sh
+COPY --chown=appuser:appuser scripts/start-gemma-amd.sh ./start-gemma.sh
 
 COPY --from=profile-builder --chown=appuser:appuser /build/target/release/profile ./profile
 
-RUN chmod 0755 ./load.sh ./start.sh ./profile
+RUN chmod 0755 ./load.sh ./start.sh ./start-gemma.sh ./profile
 
 USER appuser
 
