@@ -87,24 +87,30 @@ fi
 ENABLE_GEMMA_TOOLS="${ENABLE_GEMMA_TOOLS:-1}"
 TOOL_ARGS=""
 if [[ "$ENABLE_GEMMA_TOOLS" == "1" ]]; then
-    # Parsers never depend on the recipe jinja: the model ships its own chat
-    # template with the HF weights. The jinja is a bonus if the install has it.
     TOOL_ARGS="--enable-auto-tool-choice --tool-call-parser gemma4 --reasoning-parser gemma4"
-    GEMMA4_TEMPLATE="$(
-        python -c "
+    # Vendored template (repo scripts/, copied next to this script by the
+    # Dockerfile). Gemma's model-bundled template rejects the system role the
+    # swarm sends (400 on every request); the recipe jinja handles system +
+    # tools. Fall back to the vLLM install, then to model-bundled.
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    GEMMA4_TEMPLATE="${GEMMA4_TEMPLATE:-$SCRIPT_DIR/tool_chat_template_gemma4.jinja}"
+    if [[ ! -f "$GEMMA4_TEMPLATE" ]]; then
+        GEMMA4_TEMPLATE="$(
+            python -c "
 import pathlib
 import vllm
 root = pathlib.Path(vllm.__file__).resolve().parent
 cands = list(root.rglob('tool_chat_template_gemma4.jinja'))
 print(cands[0] if cands else '')
 " 2>/dev/null || true
-    )"
-    if [[ -n "$GEMMA4_TEMPLATE" ]]; then
+        )"
+    fi
+    if [[ -n "$GEMMA4_TEMPLATE" && -f "$GEMMA4_TEMPLATE" ]]; then
         TOOL_ARGS="$TOOL_ARGS --chat-template ${GEMMA4_TEMPLATE}"
         echo "Gemma tool-call template: $GEMMA4_TEMPLATE"
     else
-        echo "Using model-bundled chat template (recipe jinja not in this vLLM install)."
-        echo "If swarm tool calls misparse, download it and pass via EXTRA_ARGS --chat-template."
+        echo "Using model-bundled chat template (no recipe jinja found)."
+        echo "System-role requests will 400; vendored template missing from image."
     fi
 fi
 EXTRA_ARGS="${EXTRA_ARGS:-}"
