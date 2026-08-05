@@ -8,6 +8,7 @@ trap 'echo "FAILED at line $LINENO"' ERR
 APP_DIR="${APP_DIR:-/home/appuser/app}"
 MODELS_DIR="${MODELS_DIR:-/workspace/models}"
 MODEL_PATH="${MODEL_PATH:-$MODELS_DIR/llama3-8b}"
+SERVED_NAME="${SERVED_NAME:-llama3}"
 TMUX_SESSION="${TMUX_SESSION:-vllm}"
 LOG_FILE="${APP_DIR}/vllm.log"
 
@@ -41,7 +42,7 @@ fi
 tmux new-session -d -s "$TMUX_SESSION" \
 "bash -lc 'python -m vllm.entrypoints.openai.api_server \
   --model \"$MODEL_PATH\" \
-  --served-model-name llama3 \
+  --served-model-name $SERVED_NAME \
   --host 0.0.0.0 \
   --port 8000 \
   --dtype auto \
