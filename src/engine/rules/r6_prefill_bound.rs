@@ -178,8 +178,7 @@ fn resolve_batch_token_prescription(d: &PrefillBoundDetail) -> BatchTokenPrescri
 }
 
 /// Second return is whether a named Set/lower budget knob was emitted (structural;
-/// do not re-read printed text to decide Expected). No "unread" apology: unread
-/// falls back to Enable+Set (Option B).
+/// do not re-read printed text to decide Expected).
 fn batch_token_budget_bullets(d: &PrefillBoundDetail, verb: &str) -> (Vec<String>, bool) {
     match resolve_batch_token_prescription(d) {
         BatchTokenPrescription::Ideal { value, est_paren } => {
@@ -581,9 +580,13 @@ fn cause_tpot_line(d: &PrefillBoundDetail) -> Option<String> {
     ))
 }
 
-/// Budget knob path for confirmed-off or unread chunked (Option B): always Enable
-/// + Set. Enable is a knob → never terminal. No unread apology sublines.
-fn chunked_budget_fix_lines(d: &PrefillBoundDetail) -> (Vec<String>, String, bool) {
+const CONFIRM_CHUNKED_BULLET: &str =
+    "      • Confirm chunked prefill is enabled (--enable-chunked-prefill).";
+
+const UNREAD_WITHIN_BAND_EXPECTED: &str = "No budget change; --max-num-batched-tokens already sits at the derived target. Re-measure after confirming.";
+
+/// Confirmed-off only: Enable + Set. Enable is a knob → never terminal.
+fn chunked_off_fix_lines(d: &PrefillBoundDetail) -> (Vec<String>, String, bool) {
     let at_floor = matches!(
         resolve_batch_token_prescription(d),
         BatchTokenPrescription::TerminalAtFloor { .. }
@@ -601,6 +604,23 @@ fn chunked_budget_fix_lines(d: &PrefillBoundDetail) -> (Vec<String>, String, boo
         "Decode batches interleave with prefill, reducing head-of-line blocking.".to_string(),
         false,
     )
+}
+
+/// Unread chunked (mild/moderate): Confirm (never Enable), then budget if a real
+/// move exists. Within-band → Confirm only, non-terminal, no FLOPs wall. At page
+/// floor → Confirm + floor + verify, terminal. Confirm keeps the loop open except
+/// the floor geometry case (boots regardless of chunked state).
+fn unread_chunked_fix_lines(d: &PrefillBoundDetail) -> (Vec<String>, String, bool) {
+    if on_compute_wall(d) {
+        return (
+            vec![CONFIRM_CHUNKED_BULLET.to_string()],
+            UNREAD_WITHIN_BAND_EXPECTED.to_string(),
+            false,
+        );
+    }
+    let (mut bullets, expected, terminal) = knob_fix_lines(d);
+    bullets.insert(0, CONFIRM_CHUNKED_BULLET.to_string());
+    (bullets, expected, terminal)
 }
 
 pub(super) fn prefill_fix_lines(
@@ -625,7 +645,7 @@ pub(super) fn prefill_fix_lines(
         // Severity alone: do not wait for chunked scrape. Unread cannot trap Enable+Set.
         severe_flops_wall_fix_lines(d)
     } else if chunked_off {
-        chunked_budget_fix_lines(d)
+        chunked_off_fix_lines(d)
     } else if chunked_on {
         if on_compute_wall(d) {
             compute_wall_fix_lines(d)
@@ -633,8 +653,8 @@ pub(super) fn prefill_fix_lines(
             knob_fix_lines(d)
         }
     } else {
-        // Can't read chunked (mild/moderate only): Option B — Enable + Set.
-        chunked_budget_fix_lines(d)
+        // Unread: Confirm + budget rules. Never Enable. Never FLOPs wall.
+        unread_chunked_fix_lines(d)
     }
 }
 
@@ -1230,8 +1250,8 @@ mod tests {
 
     #[test]
     fn fix_recommends_routing_when_skewed_chunked_unknown_skips_enable() {
-        // Routing arm: unknown chunked is not off → no Enable bullet (Option B
-        // lives only in prefill_fix_lines, which routing does not use).
+        // Routing arm: unknown chunked is not off → no Enable. Confirm lives in
+        // prefill_fix_lines only; routing does not use that path.
         let d = PrefillBoundDetail {
             prompt_gen_ratio: 15.0,
             decode_efficiency_pct: 6.7,
@@ -1254,6 +1274,7 @@ mod tests {
         let text = lines.join("\n");
         assert!(text.contains("Route long-context requests"));
         assert!(!text.contains("Enable --enable-chunked-prefill"));
+        assert!(!text.contains("Confirm chunked prefill"));
         assert!(!terminal, "routing path is never terminal:\n{text}");
     }
 
@@ -1340,8 +1361,8 @@ mod tests {
     }
 
     #[test]
-    fn chunked_unknown_falls_back_to_enable_and_set() {
-        // Can't read → Option B: Enable + Set, no unread / dependency noise.
+    fn chunked_unknown_confirm_then_set_no_enable() {
+        // Unread → Confirm + Set when a budget move exists. Never Enable.
         let d = PrefillBoundDetail {
             prompt_gen_ratio: 10.0,
             decode_efficiency_pct: 8.0,
@@ -1360,12 +1381,22 @@ mod tests {
             chunk_floor: None,
             model_in_catalog: true,
         };
-        let text = format_prefill_bound_window_issue(&d, 100).join("\n");
+        let (lines, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100);
+        let text = lines.join("\n");
         assert!(
-            text.contains("Enable chunked prefill (--enable-chunked-prefill)."),
-            "unknown falls back to Enable: {text}"
+            text.contains(CONFIRM_CHUNKED_BULLET.trim_start()),
+            "unread must Confirm: {text}"
+        );
+        assert!(
+            !text.contains("Enable chunked prefill (--enable-chunked-prefill)."),
+            "unread must not Enable: {text}"
         );
         assert!(text.contains("Set --max-num-batched-tokens"));
+        let confirm = text.find("Confirm chunked prefill").expect("Confirm");
+        let set = text.find("Set --max-num-batched-tokens").expect("Set");
+        assert!(confirm < set, "Confirm leads Set: {text}");
+        assert!(!terminal, "Confirm keeps loop open: {text}");
+        assert!(!text.contains("no single-GPU knob adds FLOPs"));
         assert!(!text.contains("Takes effect only with chunked prefill on."));
         assert!(!text.contains("could not verify this differs from what's running"));
     }
@@ -2085,24 +2116,50 @@ mod tests {
     }
 
     #[test]
-    fn chunked_unknown_at_floor_enable_not_terminal() {
-        // Can't-read fallback still offers Enable → not a wall exit.
+    fn chunked_unknown_at_floor_confirm_terminal_with_verify() {
+        // Floor geometry is true regardless of chunked; Confirm + floor + verify,
+        // terminal. Confirm does not keep the loop open here.
         let mut d = hybrid_align_floor_detail(Some(HYBRID_ALIGN_FLOOR_EXAMPLE));
         d.chunked_prefill_enabled = None;
         let (lines, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100);
         let text = lines.join("\n");
-        assert!(!terminal, "Enable is a knob: {text}");
-        assert!(text.contains("Enable chunked prefill (--enable-chunked-prefill)."));
+        assert!(terminal, "floor + unread is terminal: {text}");
+        assert!(text.contains(CONFIRM_CHUNKED_BULLET.trim_start()));
+        assert!(!text.contains("Enable chunked prefill (--enable-chunked-prefill)."));
+        assert!(text.contains(&format!(
+            "Prefill chunk size is at the page floor ({HYBRID_ALIGN_FLOOR_EXAMPLE}); no smaller value boots on this server."
+        )));
         assert!(text.contains(R6_TERMINAL_VERIFY.trim_start()));
+        let confirm = text.find("Confirm chunked prefill").expect("Confirm");
+        let floor = text.find("page floor").expect("floor");
+        let verify = text.find("Verify prefix caching").expect("verify");
         assert!(
-            text.contains(
-                "Decode batches interleave with prefill, reducing head-of-line blocking."
-            )
+            confirm < floor && floor < verify,
+            "order Confirm→floor→verify: {text}"
         );
+        assert!(!text.contains("no single-GPU knob adds FLOPs"));
         assert!(
-            !text.contains("No setting on this server makes prefill chunks smaller"),
-            "Expected must not contradict Enable: {text}"
+            text.contains("No setting on this server makes prefill chunks smaller"),
+            "floor Expected: {text}"
         );
+    }
+
+    #[test]
+    fn chunked_unknown_within_band_confirm_only_non_terminal() {
+        // Within-band unread: Confirm only. No wall, no verify, non-terminal.
+        let mut d = wall_path_base(Some(2048), Some(1638.4), Some(true), 12.0);
+        d.chunked_prefill_enabled = None;
+        assert!(on_compute_wall(&d));
+        let (lines, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100);
+        let text = lines.join("\n");
+        assert!(!terminal, "Confirm keeps loop open: {text}");
+        assert!(text.contains(CONFIRM_CHUNKED_BULLET.trim_start()));
+        assert!(!text.contains("Enable chunked prefill"));
+        assert!(!text.contains("no single-GPU knob adds FLOPs"));
+        assert!(!text.contains("Disaggregate"));
+        assert!(!text.contains("Verify prefix caching"));
+        assert!(!text.contains("Set --max-num-batched-tokens"));
+        assert!(text.contains(UNREAD_WITHIN_BAND_EXPECTED));
     }
 
     #[test]
