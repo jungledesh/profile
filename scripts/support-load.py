@@ -758,8 +758,8 @@ def main() -> None:
     p.add_argument("--request-timeout", type=float, default=600.0)
     args = p.parse_args()
     args.qps = [float(x) for x in args.qps.split(",") if x.strip()]
-    if not args.qps or any(q <= 0 for q in args.qps):
-        p.error("--qps needs positive comma-separated rates")
+    if not args.qps or any(not 0 < q < float("inf") for q in args.qps):
+        p.error("--qps needs finite positive comma-separated rates")
     lo, hi = (float(x) for x in args.think_secs.split(","))
     args.think_secs = (lo, hi)
 
