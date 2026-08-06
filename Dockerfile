@@ -96,9 +96,10 @@ COPY --chown=appuser:appuser scripts/agent-swarm.sh ./agent-swarm.sh
 # fetch-swarm-tasks.py regenerates it if needed (requires internet).
 COPY --chown=appuser:appuser scripts/swarm-tasks.json ./swarm-tasks.json
 COPY --chown=appuser:appuser scripts/fetch-swarm-tasks.py ./fetch-swarm-tasks.py
+COPY --chown=appuser:appuser scripts/support-load.py ./support-load.py
 COPY --from=profile-builder --chown=appuser:appuser /build/target/release/profile ./profile
 
-RUN chmod 0755 ./load.sh ./start.sh ./start-gemma.sh ./agent-swarm.sh ./profile
+RUN chmod 0755 ./load.sh ./start.sh ./start-gemma.sh ./agent-swarm.sh ./support-load.py ./profile
 
 USER appuser
 
@@ -181,10 +182,11 @@ COPY --chown=appuser:appuser scripts/load.sh ./load.sh
 COPY --chown=appuser:appuser scripts/start-amd.sh ./start.sh
 COPY --chown=appuser:appuser scripts/start-gemma-amd.sh ./start-gemma.sh
 COPY --chown=appuser:appuser scripts/tool_chat_template_gemma4.jinja ./tool_chat_template_gemma4.jinja
+COPY --chown=appuser:appuser scripts/support-load.py ./support-load.py
 
 COPY --from=profile-builder --chown=appuser:appuser /build/target/release/profile ./profile
 
-RUN chmod 0755 ./load.sh ./start.sh ./start-gemma.sh ./profile
+RUN chmod 0755 ./load.sh ./start.sh ./start-gemma.sh ./support-load.py ./profile
 
 USER appuser
 
