@@ -10,6 +10,89 @@ use crate::engine::baseline::WeightDtypeSource;
 use super::r4_oom_risk::r4_advisory;
 use super::{ENGINE_MIN_PERSISTENT_WINDOWS, NO_ISSUES_LINE, Recommendation, rule_names};
 
+/// Revealed secondary whose Fix fights the primary. Rank ME already suppresses;
+/// this annotates Fix when that secondary is shown under reveal.
+/// One-directional by design: DAG layer order means prefill_bound is always the
+/// primary of this pair; a reverse reveal cannot occur.
+const REVEAL_FIX_CONFLICT_TABLE: &[(&str, &str)] =
+    &[(rule_names::PREFILL_BOUND, rule_names::UNDER_BATCHING)];
+
+/// Subline under the revealed Fix bullet (R6 wall vs R1 add-load).
+const REVEAL_FIX_CONFLICT_SUBLINE: &str =
+    "        Conflicts with primary above: adds load to a server at its compute wall.";
+
+fn reveal_fix_conflicts(primary: &'static str, secondary: &'static str) -> bool {
+    REVEAL_FIX_CONFLICT_TABLE
+        .iter()
+        .any(|&(p, s)| p == primary && s == secondary)
+}
+
+/// Keep Cause and Fix bullets; mark header `[?]`; attach conflict subline under Fix.
+/// Drop Expected (it describes the conflicting action).
+fn neutralize_revealed_fix(display_lines: &[String]) -> Vec<String> {
+    let Some(fix_at) = display_lines.iter().position(|l| l == "    Fix:") else {
+        return display_lines.to_vec();
+    };
+    let after_fix = fix_at + 1;
+    let resume_at = display_lines[after_fix..]
+        .iter()
+        .position(|l| {
+            l.starts_with("    Expected:")
+                || l.starts_with("    Confidence:")
+                || l.starts_with("    Note:")
+        })
+        .map(|i| after_fix + i)
+        .unwrap_or(display_lines.len());
+
+    let mut out = Vec::with_capacity(display_lines.len() + 2);
+    for (i, line) in display_lines.iter().enumerate() {
+        if i > fix_at {
+            break;
+        }
+        if i == 0 && line.starts_with("[!] ") {
+            out.push(format!(
+                "[?] {}",
+                line.trim_start_matches("[!] ").trim_start()
+            ));
+        } else {
+            out.push(line.clone());
+        }
+    }
+    // Fix bullets (skip trailing blanks before Expected/Confidence).
+    let mut fix_end = resume_at;
+    while fix_end > after_fix && display_lines[fix_end - 1].is_empty() {
+        fix_end -= 1;
+    }
+    out.extend_from_slice(&display_lines[after_fix..fix_end]);
+    out.push(REVEAL_FIX_CONFLICT_SUBLINE.to_string());
+
+    let mut i = resume_at;
+    if i < display_lines.len() && display_lines[i].starts_with("    Expected:") {
+        i += 1;
+        if i < display_lines.len() && display_lines[i].is_empty() {
+            i += 1;
+        }
+    }
+    if i < display_lines.len() {
+        if !out.last().is_some_and(|l| l.is_empty())
+            && (display_lines[i].starts_with("    Confidence:")
+                || display_lines[i].starts_with("    Note:"))
+        {
+            out.push(String::new());
+        }
+        out.extend_from_slice(&display_lines[i..]);
+    }
+    out
+}
+
+fn revealed_secondary_block(primary_name: &'static str, rec: &Recommendation) -> Vec<String> {
+    if reveal_fix_conflicts(primary_name, rec.rule_name) {
+        neutralize_revealed_fix(&rec.display_lines)
+    } else {
+        rec.display_lines.clone()
+    }
+}
+
 const KV_RULE_NAMES: &[&str] = &[
     rule_names::KV_CACHE_PRESSURE,
     rule_names::KV_ADMISSION_BACKLOG,
@@ -626,6 +709,7 @@ pub fn format_diagnose_rules_for_windows(
     // Reveal suppressed alternatives: same-primary re-fire, or terminal primary
     // on first fire (no server-local knob left).
     let primary_terminal = report.recommendations.first().is_some_and(|r| r.terminal);
+    let primary_name = report.recommendations.first().map(|r| r.rule_name);
     if (reveal_suppressed || primary_terminal) && !report.suppressed_recs.is_empty() {
         if !warnings.last().is_some_and(|l| l.is_empty()) {
             warnings.push(String::new());
@@ -638,7 +722,11 @@ pub fn format_diagnose_rules_for_windows(
         warnings.push(header.to_string());
         warnings.push(String::new());
         for rec in &report.suppressed_recs {
-            warnings.extend(rule_display_block(rec));
+            let block = match primary_name {
+                Some(p) => revealed_secondary_block(p, rec),
+                None => rec.display_lines.clone(),
+            };
+            warnings.extend(block);
             warnings.push(String::new());
         }
     }
@@ -1082,7 +1170,9 @@ mod catalog_mismatch_note_tests {
 
 #[cfg(test)]
 mod stuck_fix_reveal_tests {
-    use super::format_diagnose_rules_for_windows;
+    use super::{
+        REVEAL_FIX_CONFLICT_SUBLINE, format_diagnose_rules_for_windows, neutralize_revealed_fix,
+    };
     use crate::collectors::RawSnapshot;
     use crate::collectors::{GpuRawMetrics, VllmRawMetrics};
     use crate::context::{AnalysisInput, RuntimeWindow, StaticContext};
@@ -1287,5 +1377,66 @@ mod stuck_fix_reveal_tests {
         assert_eq!(text.matches(terminal_header).count(), 1);
         assert!(!text.contains("Same issue after remeasure"));
         assert!(text.contains("[!] Under-batching"));
+    }
+
+    fn r1_style_rec() -> Recommendation {
+        Recommendation {
+            rule_name: rule_names::UNDER_BATCHING,
+            layer: 4,
+            impact: 3,
+            confidence: 0.8,
+            display_lines: vec![
+                "[!] Under-batching: Insufficient Concurrency".to_string(),
+                String::new(),
+                "    Cause:".to_string(),
+                "      Hardware capacity under-fed by client.".to_string(),
+                String::new(),
+                "    Fix:".to_string(),
+                "      • Batch more requests or increase client concurrency (107 slots idle)"
+                    .to_string(),
+                String::new(),
+                "    Expected: Higher throughput. TPOT stable until the GPU is fully fed, then it starts to rise."
+                    .to_string(),
+                "    Confidence: High".to_string(),
+            ],
+            terminal: false,
+        }
+    }
+
+    #[test]
+    fn r6_reveal_annotates_r1_fix_as_conflict() {
+        let report = report_with(
+            rec_terminal(rule_names::PREFILL_BOUND, 5, 0.9, "[!] Prefill-Bound", true),
+            vec![r1_style_rec()],
+        );
+        let text = render(&report, false);
+        assert!(text.contains("[?] Under-batching"));
+        assert!(!text.contains("[!] Under-batching"));
+        assert!(text.contains("Hardware capacity under-fed by client."));
+        assert!(text.contains("increase client concurrency"));
+        assert!(text.contains(REVEAL_FIX_CONFLICT_SUBLINE.trim_start()));
+        let fix = text.find("increase client concurrency").expect("fix");
+        let conflict = text.find("Conflicts with primary above").expect("conflict");
+        assert!(fix < conflict, "conflict subline trails the Fix bullet");
+        assert!(!text.contains("Expected: Higher throughput"));
+        assert!(text.contains("Confidence: High"));
+    }
+
+    #[test]
+    fn non_conflict_reveal_keeps_fix_bullets() {
+        let report = report_with(
+            rec(rule_names::OOM_RISK, 5, 0.9, "[!] OOM Risk"),
+            vec![r1_style_rec()],
+        );
+        let text = render(&report, true);
+        assert!(text.contains("[!] Under-batching"));
+        assert!(text.contains("increase client concurrency"));
+        assert!(!text.contains("Conflicts with primary above"));
+    }
+
+    #[test]
+    fn neutralize_without_fix_header_is_passthrough() {
+        let lines = vec!["[!] Under-batching".to_string(), "    body".to_string()];
+        assert_eq!(neutralize_revealed_fix(&lines), lines);
     }
 }

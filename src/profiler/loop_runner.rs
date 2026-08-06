@@ -197,6 +197,17 @@ pub fn run(input: LoopRunnerInput<'_>) -> anyhow::Result<()> {
         let drifted = drift::config_changed(&prev_result.static_ctx, &new_result.static_ctx);
         let non_baseline =
             drift::non_baseline_drifted(&prev_result.static_ctx, &new_result.static_ctx);
+        let prescribed_lines = prev_report
+            .recommendations
+            .first()
+            .map(|r| r.display_lines.as_slice());
+        let unverifiable = !drifted
+            && !non_baseline
+            && drift::change_unverifiable(
+                &prev_result.static_ctx.config,
+                &new_result.static_ctx.config,
+                prescribed_lines,
+            );
 
         let d = delta::compute(
             &prev_result,
@@ -205,6 +216,7 @@ pub fn run(input: LoopRunnerInput<'_>) -> anyhow::Result<()> {
             &new_report,
             drifted,
             non_baseline,
+            unverifiable,
         );
         print_delta(&d);
         println!();
@@ -648,11 +660,17 @@ fn format_cost_delta_line(before: f64, after: f64, est_suffix: &str) -> String {
 }
 
 /// One status line for the remeasure delta header.
-fn config_status_lines(config_drifted: bool, non_baseline_drifted: bool) -> Vec<String> {
+fn config_status_lines(
+    config_drifted: bool,
+    non_baseline_drifted: bool,
+    change_unverifiable: bool,
+) -> Vec<String> {
     let line = if config_drifted {
         "  Config changed. Baseline reset.".to_string()
     } else if non_baseline_drifted {
         "  Config changed.".to_string()
+    } else if change_unverifiable {
+        "  Change unverifiable; delta may include it.".to_string()
     } else {
         "  No change detected.".to_string()
     };
@@ -660,7 +678,11 @@ fn config_status_lines(config_drifted: bool, non_baseline_drifted: bool) -> Vec<
 }
 
 fn remeasure_delta_lines(d: &delta::Delta) -> Vec<String> {
-    let mut lines = config_status_lines(d.config_drifted, d.non_baseline_drifted);
+    let mut lines = config_status_lines(
+        d.config_drifted,
+        d.non_baseline_drifted,
+        d.change_unverifiable,
+    );
     if let (Some(before), Some(after)) = (d.throughput_before, d.throughput_after)
         && before.is_finite()
         && after.is_finite()
@@ -1137,20 +1159,26 @@ mod tests {
 
     #[test]
     fn config_status_lines_baseline_beats_non_baseline() {
-        let lines = config_status_lines(true, true);
+        let lines = config_status_lines(true, true, true);
         assert_eq!(lines[0], "  Config changed. Baseline reset.");
     }
 
     #[test]
     fn config_status_lines_non_baseline_beats_no_change() {
-        let lines = config_status_lines(false, true);
+        let lines = config_status_lines(false, true, true);
         assert_eq!(lines[0], "  Config changed.");
     }
 
     #[test]
     fn config_status_lines_no_changes() {
-        let lines = config_status_lines(false, false);
+        let lines = config_status_lines(false, false, false);
         assert_eq!(lines[0], "  No change detected.");
+    }
+
+    #[test]
+    fn config_status_lines_unverifiable_when_no_drift() {
+        let lines = config_status_lines(false, false, true);
+        assert_eq!(lines[0], "  Change unverifiable; delta may include it.");
     }
 
     #[test]
@@ -1161,6 +1189,15 @@ mod tests {
         let text = remeasure_delta_lines(&d).join("\n");
         assert!(text.starts_with("  No change detected."));
         assert!(text.contains("Throughput"));
+    }
+
+    #[test]
+    fn remeasure_delta_unverifiable_header() {
+        let mut d = flat_delta();
+        d.change_unverifiable = true;
+        let text = remeasure_delta_lines(&d).join("\n");
+        assert!(text.starts_with("  Change unverifiable; delta may include it."));
+        assert!(!text.contains("No change detected."));
     }
 
     #[test]
@@ -1322,6 +1359,7 @@ mod tests {
             tpot_p95_after_ms: None,
             config_drifted: false,
             non_baseline_drifted: false,
+            change_unverifiable: false,
         }
     }
 
@@ -1391,6 +1429,7 @@ mod tests {
             tpot_p95_after_ms: None,
             config_drifted: false,
             non_baseline_drifted: false,
+            change_unverifiable: false,
         }
     }
 

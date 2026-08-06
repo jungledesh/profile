@@ -9,8 +9,14 @@
 #   CONCURRENCY=N   concurrent workers (default: 4)
 #   LAMBDA=N        mean think time in seconds per worker (default: 4)
 #   MAX_TOKENS=N    max output tokens per request (default: random 80-480)
-#   MODEL=NAME      served model name (default: Qwen3.6-27B)
+#   PROFILE_MODEL=gemma|qwen|llama  family default when SERVED_NAME/MODEL unset
+#                              (nvidia image: gemma; amd image: llama)
+#   SERVED_NAME=NAME  vLLM --served-model-name (wins over PROFILE_MODEL default;
+#                     set this when you override the launcher served name)
+#   MODEL=NAME      request model id (wins over SERVED_NAME and PROFILE_MODEL)
 #   VLLM_URL=URL    vLLM endpoint (default: http://localhost:8000)
+#
+# Resolution: MODEL > SERVED_NAME > PROFILE_MODEL family default.
 #
 # Each request = ~3K-token shared system prompt + ~900-token doc + ~30-token instruction
 # ≈ 4,000 tokens total. System prompt is identical across all workers (prefix cache target).
@@ -20,7 +26,18 @@
 set -euo pipefail
 
 VLLM_URL="${VLLM_URL:-http://localhost:8000}"
-MODEL="${MODEL:-Qwen3.6-27B}"
+PROFILE_MODEL="${PROFILE_MODEL:-gemma}"
+case "$PROFILE_MODEL" in
+  gemma) FAMILY_DEFAULT="gemma-4-26b-a4b" ;;
+  qwen)  FAMILY_DEFAULT="Qwen3.6-27B" ;;
+  llama) FAMILY_DEFAULT="llama3" ;;
+  *)
+    echo "PROFILE_MODEL must be gemma, qwen, or llama (got: $PROFILE_MODEL)" >&2
+    exit 1
+    ;;
+esac
+# Prefer the launcher's served name when set (SERVED_NAME=... ./start-gemma.sh).
+MODEL="${MODEL:-${SERVED_NAME:-$FAMILY_DEFAULT}}"
 MODE="${MODE:-rag}"
 
 post() {

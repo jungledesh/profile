@@ -1,7 +1,82 @@
+use crate::collectors::VllmConfig;
 use crate::context::StaticContext;
 
 /// Absolute epsilon for `gpu_memory_utilization` baseline drift (fraction units).
 const GPU_MEM_UTIL_EPS: f64 = 1e-6;
+
+/// True when both sides lack a scraped value for `field` (None == None is not evidence).
+fn both_unread<T>(a: Option<T>, b: Option<T>) -> bool {
+    a.is_none() && b.is_none()
+}
+
+/// Non-baseline knobs used for the "no change" claim.
+fn non_baseline_knobs_visible(cfg: &VllmConfig) -> bool {
+    cfg.max_num_seqs.is_some()
+        || cfg.max_num_batched_tokens.is_some()
+        || cfg.enable_chunked_prefill.is_some()
+        || cfg.enable_prefix_caching.is_some()
+        || cfg.enforce_eager.is_some()
+}
+
+/// Fix text named a scrapeable knob that is unread on both windows.
+///
+/// Driven by primary `display_lines` flag names, not rule tables.
+pub fn prescribed_knob_unread(
+    prev: &VllmConfig,
+    curr: &VllmConfig,
+    display_lines: &[String],
+) -> bool {
+    let text = display_lines.join("\n");
+    let mut unread = false;
+    if text.contains("--max-num-batched-tokens") {
+        unread |= both_unread(prev.max_num_batched_tokens, curr.max_num_batched_tokens);
+    }
+    if text.contains("--enable-chunked-prefill") {
+        unread |= both_unread(prev.enable_chunked_prefill, curr.enable_chunked_prefill);
+    }
+    if text.contains("--max-num-seqs") {
+        unread |= both_unread(prev.max_num_seqs, curr.max_num_seqs);
+    }
+    if text.contains("--enable-prefix-caching") {
+        unread |= both_unread(prev.enable_prefix_caching, curr.enable_prefix_caching);
+    }
+    if text.contains("--enforce-eager") {
+        unread |= both_unread(prev.enforce_eager, curr.enforce_eager);
+    }
+    if text.contains("--max-model-len") {
+        unread |= both_unread(prev.max_model_len, curr.max_model_len);
+    }
+    if text.contains("--gpu-memory-utilization") {
+        unread |= both_unread(prev.gpu_memory_utilization, curr.gpu_memory_utilization);
+    }
+    if text.contains("--kv-cache-dtype") {
+        unread |= both_unread(
+            prev.kv_cache_dtype.as_deref(),
+            curr.kv_cache_dtype.as_deref(),
+        );
+    }
+    unread
+}
+
+/// When no config drift fired: whether "No change detected" would lie.
+///
+/// 1. Prior fix named a knob we still cannot read → unverifiable.
+/// 2. No prior fix (or none with scrapeable knobs): need a visible non-baseline
+///    knob to claim no change; otherwise unverifiable.
+pub fn change_unverifiable(
+    prev: &VllmConfig,
+    curr: &VllmConfig,
+    prescribed_display_lines: Option<&[String]>,
+) -> bool {
+    if let Some(lines) = prescribed_display_lines.filter(|l| !l.is_empty()) {
+        if prescribed_knob_unread(prev, curr, lines) {
+            return true;
+        }
+        // Prescription present; scrapeable knobs readable (or none named) → verifiable.
+        return false;
+    }
+    !non_baseline_knobs_visible(prev) && !non_baseline_knobs_visible(curr)
+}
 
 /// Returns true if any config field that affects the physics baseline changed.
 ///
@@ -47,7 +122,6 @@ fn f64_opt_changed(a: Option<f64>, b: Option<f64>, eps: f64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::collectors::VllmConfig;
     use crate::context::{GPUModel, ModelArch};
 
     fn ctx(cfg: VllmConfig) -> StaticContext {
@@ -214,5 +288,65 @@ mod tests {
     fn non_baseline_false_when_unchanged() {
         let c = base_cfg();
         assert!(!non_baseline_drifted(&ctx(c.clone()), &ctx(c)));
+    }
+
+    #[test]
+    fn prescribed_batched_tokens_unread_both_sides() {
+        let lines = vec![
+            "      • Set --max-num-batched-tokens to 384 (est) to shrink prefill chunk size."
+                .to_string(),
+        ];
+        let prev = VllmConfig::default();
+        let curr = VllmConfig::default();
+        assert!(prescribed_knob_unread(&prev, &curr, &lines));
+        assert!(change_unverifiable(&prev, &curr, Some(&lines)));
+    }
+
+    #[test]
+    fn prescribed_batched_tokens_readable_not_unverifiable() {
+        let lines = vec![
+            "      • Set --max-num-batched-tokens to 384 (est) to shrink prefill chunk size."
+                .to_string(),
+        ];
+        let prev = VllmConfig {
+            max_num_batched_tokens: Some(8192),
+            ..Default::default()
+        };
+        let curr = VllmConfig {
+            max_num_batched_tokens: Some(8192),
+            ..Default::default()
+        };
+        assert!(!prescribed_knob_unread(&prev, &curr, &lines));
+        assert!(!change_unverifiable(&prev, &curr, Some(&lines)));
+    }
+
+    #[test]
+    fn no_prescription_all_non_baseline_unread_is_unverifiable() {
+        let prev = VllmConfig::default();
+        let curr = VllmConfig::default();
+        assert!(change_unverifiable(&prev, &curr, None));
+        assert!(change_unverifiable(&prev, &curr, Some(&[])));
+    }
+
+    #[test]
+    fn no_prescription_visible_knob_allows_no_change_claim() {
+        let prev = VllmConfig {
+            max_num_seqs: Some(128),
+            ..Default::default()
+        };
+        let curr = VllmConfig {
+            max_num_seqs: Some(128),
+            ..Default::default()
+        };
+        assert!(!change_unverifiable(&prev, &curr, None));
+    }
+
+    #[test]
+    fn prescription_without_scrapeable_flags_not_forced_unverifiable() {
+        let lines = vec!["      • Reduce prompt length where possible.".to_string()];
+        let prev = VllmConfig::default();
+        let curr = VllmConfig::default();
+        assert!(!prescribed_knob_unread(&prev, &curr, &lines));
+        assert!(!change_unverifiable(&prev, &curr, Some(&lines)));
     }
 }

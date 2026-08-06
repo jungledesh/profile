@@ -13,6 +13,11 @@ APP_DIR="${APP_DIR:-/home/appuser/app}"
 VENV_DIR="${VENV_DIR:-/home/appuser/vllm-env}"
 MODELS_DIR="${MODELS_DIR:-/workspace/models}"
 MODEL_PATH="${MODEL_PATH:-$MODELS_DIR/qwen36-27b}"
+# Own the served identity for this launcher. Image must not bake SERVED_NAME=gemma
+# (see Dockerfile nvidia stage); ${SERVED_NAME:-} only helps when the env is unset.
+SERVED_NAME="${SERVED_NAME:-Qwen3.6-27B}"
+export SERVED_NAME
+export PROFILE_MODEL=qwen
 TMUX_SESSION="${TMUX_SESSION:-vllm}"
 LOG_FILE="${APP_DIR}/vllm.log"
 
@@ -69,7 +74,7 @@ tmux new-session -d -s "$TMUX_SESSION" \
 "bash -lc 'source \"$VENV_DIR/bin/activate\" && \
 export LD_LIBRARY_PATH=\"${CUDA13_LIB}:\${LD_LIBRARY_PATH:-}\" && \
 vllm serve \"$MODEL_PATH\" \
-  --served-model-name Qwen3.6-27B \
+  --served-model-name $SERVED_NAME \
   --max-num-seqs 345 \
   --trust-remote-code \
   --enable-auto-tool-choice \
@@ -79,6 +84,7 @@ vllm serve \"$MODEL_PATH\" \
 
 echo
 echo "vLLM running in tmux session '$TMUX_SESSION'"
+echo "Served as: $SERVED_NAME  (load/swarm: PROFILE_MODEL=qwen)"
 echo "Attach with: tmux attach -t $TMUX_SESSION"
 
 # Interactive shell when stdin is a TTY (e.g. docker run -it); otherwise keep container alive.

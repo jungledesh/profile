@@ -4,6 +4,8 @@ use crate::collectors::RawSnapshot;
 use super::Recommendation;
 use super::effective_max_and_binder;
 #[cfg(test)]
+use super::kv_full_context_cap_for_r1;
+#[cfg(test)]
 use super::rule_names;
 use super::usable_kv_concurrency;
 
@@ -140,31 +142,41 @@ pub(super) fn rule1_under_batching_with_efficiency(input: R1EvalInput<'_>) -> Ru
 
 fn r1_fix_lines(
     idle: f64,
+    running: f64,
     binding_wall: R1BindingWall,
-    max_model_len: Option<u32>,
-    prompt_mean: Option<f64>,
-    generation_mean: Option<f64>,
+    fmt: &R1FormatCtx,
 ) -> Vec<String> {
     match binding_wall {
-        R1BindingWall::Ridge => vec![format!(
-            "      • Batch more requests or increase client concurrency ({idle:.0} slots idle before hardware degrades TPOT)"
-        )],
-        R1BindingWall::Config => vec![format!(
-            "      • Batch more requests or increase client concurrency ({idle:.0} slots idle)"
-        )],
+        R1BindingWall::Ridge => {
+            let headroom = ridge_or_config_headroom(idle, running, fmt);
+            vec![format!(
+                "      • Batch more requests or increase client concurrency ({})",
+                headroom.ridge_clause()
+            )]
+        }
+        R1BindingWall::Config => {
+            let headroom = ridge_or_config_headroom(idle, running, fmt);
+            vec![format!(
+                "      • Batch more requests or increase client concurrency ({})",
+                headroom.config_clause()
+            )]
+        }
         // Memory wall: full-context count is a floor, not an action cap. Label the
         // assumption; never put the idle count in the action line.
         R1BindingWall::Memory { cap } => {
             let mut lines =
                 vec!["      • Batch more requests or increase client concurrency.".to_string()];
-            let Some(m) = max_model_len.filter(|&m| m > 0) else {
+            let Some(m) = fmt.max_model_len.filter(|&m| m > 0) else {
                 return lines;
             };
             let window = super::format_observed_context_tokens(f64::from(m));
             let mut sub = format!("        Fits {cap} at the full {window} window");
-            if let Some(obs) =
-                super::capacity_at_observed_request_sizes(cap, m, prompt_mean, generation_mean)
-            {
+            if let Some(obs) = super::capacity_at_observed_request_sizes(
+                cap,
+                m,
+                fmt.prompt_mean,
+                fmt.generation_mean,
+            ) {
                 sub.push_str(&format!("; ~{obs} at observed request sizes (est)"));
             }
             sub.push('.');
@@ -174,21 +186,114 @@ fn r1_fix_lines(
     }
 }
 
-/// Context for R1 Fix lines that need config / traffic means (memory-wall subline).
+/// Seat/ridge idle vs KV headroom at observed request sizes for Ridge/Config Fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RidgeConfigHeadroom {
+    /// Seat/ridge idle still binds after the min; config math, no `(est)`.
+    Plain { n: u64 },
+    /// KV headroom binds; scaled estimate.
+    KvEst { n: u64 },
+    /// No KV fit computable; seat count labeled as seats, not capacity.
+    SeatsKvUnknown { n: u64 },
+}
+
+/// Parenthetical when KV-bound headroom is zero (no idle slots to offer).
+const KV_ZERO_MORE_CLAUSE: &str = "KV fits ~0 more at observed request sizes (est)";
+
+impl RidgeConfigHeadroom {
+    fn config_clause(self) -> String {
+        match self {
+            Self::Plain { n } => format!("{n} slots idle"),
+            Self::KvEst { n: 0 } => KV_ZERO_MORE_CLAUSE.to_string(),
+            Self::KvEst { n } => format!("~{n} slots idle (est)"),
+            Self::SeatsKvUnknown { n } => format!("{n} seats idle; KV fit unknown"),
+        }
+    }
+
+    fn ridge_clause(self) -> String {
+        match self {
+            Self::Plain { n } => {
+                format!("{n} slots idle before hardware degrades TPOT")
+            }
+            Self::KvEst { n: 0 } => KV_ZERO_MORE_CLAUSE.to_string(),
+            Self::KvEst { n } => {
+                format!("~{n} slots idle before hardware degrades TPOT (est)")
+            }
+            Self::SeatsKvUnknown { n } => {
+                format!("{n} seats idle before hardware degrades TPOT; KV fit unknown")
+            }
+        }
+    }
+}
+
+fn round_nonneg_u64(v: f64) -> u64 {
+    let n = v.round().max(0.0);
+    if !n.is_finite() || n > u64::MAX as f64 {
+        return 0;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    {
+        n as u64
+    }
+}
+
+fn floor_nonneg_u64(v: f64) -> u64 {
+    let n = v.floor().max(0.0);
+    if !n.is_finite() || n > u64::MAX as f64 {
+        return 0;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    {
+        n as u64
+    }
+}
+
+fn ridge_or_config_headroom(idle: f64, running: f64, fmt: &R1FormatCtx) -> RidgeConfigHeadroom {
+    // Seat idle keeps historical `{:.0}` rounding; KV headroom floors (capacity).
+    let seat_idle = round_nonneg_u64(idle);
+    let Some(cap) = fmt.kv_full_context_cap.filter(|&c| c > 0) else {
+        return RidgeConfigHeadroom::SeatsKvUnknown { n: seat_idle };
+    };
+    let Some(m) = fmt.max_model_len.filter(|&m| m > 0) else {
+        return RidgeConfigHeadroom::SeatsKvUnknown { n: seat_idle };
+    };
+    let Some(kv_fit) =
+        super::capacity_at_observed_request_sizes(cap, m, fmt.prompt_mean, fmt.generation_mean)
+    else {
+        return RidgeConfigHeadroom::SeatsKvUnknown { n: seat_idle };
+    };
+    let kv_headroom = floor_nonneg_u64(f64::from(kv_fit) - running);
+    if kv_headroom < seat_idle {
+        RidgeConfigHeadroom::KvEst { n: kv_headroom }
+    } else {
+        RidgeConfigHeadroom::Plain { n: seat_idle }
+    }
+}
+
+/// Context for R1 Fix lines that need config / traffic means (memory-wall subline)
+/// and KV full-context capacity for Ridge/Config headroom capping.
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct R1FormatCtx {
     pub max_model_len: Option<u32>,
     pub prompt_mean: Option<f64>,
     pub generation_mean: Option<f64>,
+    /// Full-context KV concurrency from [`super::kv_full_context_cap_for_r1`].
+    /// `None` when Absent without derived, or Contradicted (KV fit unknown).
+    pub kv_full_context_cap: Option<u32>,
 }
 
 impl R1FormatCtx {
-    pub(super) fn from_snapshot(snapshot: &RawSnapshot, max_model_len: Option<u32>) -> Self {
+    pub(super) fn from_snapshot(
+        snapshot: &RawSnapshot,
+        max_model_len: Option<u32>,
+        kv_full_context_cap: Option<u32>,
+    ) -> Self {
         let ok = |v: Option<f64>| v.filter(|x| x.is_finite() && *x >= 0.0);
         Self {
             max_model_len,
             prompt_mean: ok(snapshot.vllm.prompt_tokens_mean),
             generation_mean: ok(snapshot.vllm.generation_tokens_mean),
+            kv_full_context_cap,
         }
     }
 }
@@ -204,6 +309,9 @@ pub fn r1_recommendation(input: R1EvalInput<'_>) -> Option<Recommendation> {
         .vllm
         .kv_cache_usage_perc
         .is_some_and(|kv| kv.is_finite() && kv >= KV_MONITOR_WARNING_PCT);
+    // Test helper has no derived catalog cap; Absent → None (same as Contradicted
+    // for formatting). Production window path passes kv_max_seqs via eval.rs.
+    let kv_full = kv_full_context_cap_for_r1(input.snapshot, None);
     Some(Recommendation {
         rule_name: rule_names::UNDER_BATCHING,
         layer: 4,
@@ -213,7 +321,10 @@ pub fn r1_recommendation(input: R1EvalInput<'_>) -> Option<Recommendation> {
             &d,
             confidence,
             kv_warning,
-            &R1FormatCtx::default(),
+            // Test-only path: max_model_len is not plumbed here, so Ridge/Config KV capping
+            // degrades to "KV fit unknown". Intentional; the production path (eval.rs) passes
+            // the real value.
+            &R1FormatCtx::from_snapshot(input.snapshot, None, kv_full),
         ),
         terminal: false,
     })
@@ -231,13 +342,7 @@ pub(super) fn format_under_batching_fired(
     };
     let max_str = max_n.to_string();
     let idle = (d.effective_max - d.running).max(0.0);
-    let fix_lines = r1_fix_lines(
-        idle,
-        d.binding_wall,
-        fmt.max_model_len,
-        fmt.prompt_mean,
-        fmt.generation_mean,
-    );
+    let fix_lines = r1_fix_lines(idle, d.running, d.binding_wall, fmt);
     let confidence_str = super::confidence_label(confidence);
 
     let mut lines = vec![
@@ -528,9 +633,9 @@ mod tests {
         let s = entry_fired_snap();
         let r = r1_recommendation(r1_input(&s, R1InputOpts::default())).expect("fired");
         let text = r.display_lines.join("\n");
-        assert!(
-            text.contains("Batch more requests or increase client concurrency (251 slots idle)")
-        );
+        assert!(text.contains(
+            "Batch more requests or increase client concurrency (251 seats idle; KV fit unknown)"
+        ));
     }
 
     #[test]
@@ -549,7 +654,7 @@ mod tests {
         let r = r1_recommendation(r1_input(&s, R1InputOpts::default())).expect("fired");
         let text = r.display_lines.join("\n");
         assert!(text.contains(
-            "      • Batch more requests or increase client concurrency (251 slots idle)"
+            "      • Batch more requests or increase client concurrency (251 seats idle; KV fit unknown)"
         ));
         assert!(!text.contains("hardware limit"));
         assert!(!text.contains("KV ceiling"));
@@ -773,6 +878,7 @@ mod tests {
                     max_model_len: Some(8192),
                     prompt_mean: Some(2000.0),
                     generation_mean: Some(2096.0),
+                    kv_full_context_cap: None,
                 };
                 // pool = 35 * 8192; mean = 4096 → floor(70) = 70
                 let text = format_under_batching_fired(&d, 0.8, false, &fmt).join("\n");
@@ -807,6 +913,65 @@ mod tests {
     }
 
     #[test]
+    fn kv_full_context_cap_tri_state() {
+        // Absent → derived.
+        let absent = snap(Some(6.0), Some(256), Some(0.0));
+        assert_eq!(kv_full_context_cap_for_r1(&absent, Some(20)), Some(20));
+        assert_eq!(kv_full_context_cap_for_r1(&absent, None), None);
+
+        // Observed → label, not derived.
+        let mut observed = snap(Some(6.0), Some(256), Some(0.0));
+        observed.vllm.cache_config.kv_cache_max_concurrency = Some(15.4);
+        assert_eq!(kv_full_context_cap_for_r1(&observed, Some(99)), Some(15));
+
+        // Contradicted → None even when derived is present (no invented capacity).
+        let mut contradicted = observed;
+        contradicted.vllm.num_requests_running_peak = Some(40.0);
+        assert_eq!(kv_full_context_cap_for_r1(&contradicted, Some(99)), None);
+    }
+
+    #[test]
+    fn contradicted_kv_cap_headroom_has_no_est_capacity_claim() {
+        // Label present, peak > floor(label), derived would have been the old bug path.
+        let mut s = snap(Some(14.0), Some(121), Some(0.0));
+        s.vllm.cache_config.kv_cache_max_concurrency = Some(15.0);
+        s.vllm.num_requests_running_peak = Some(40.0);
+        let cap = kv_full_context_cap_for_r1(&s, Some(99));
+        assert_eq!(cap, None);
+
+        let d = UnderBatchingDetail {
+            running: 14.0,
+            waiting: 0.0,
+            max_num_seqs: Some(121),
+            effective_max: 121.0,
+            binding_wall: R1BindingWall::Config,
+            occupancy_pct: (14.0 / 121.0) * 100.0,
+            efficiency_pct: Some(0.5),
+            config_relative_efficiency_pct: Some(10.0),
+            known_gpu: true,
+        };
+        let fmt = R1FormatCtx {
+            max_model_len: Some(32768),
+            prompt_mean: Some(18275.0),
+            generation_mean: Some(1000.0),
+            kv_full_context_cap: cap,
+        };
+        let text = format_under_batching_fired(&d, 0.8, false, &fmt).join("\n");
+        assert!(
+            text.contains("KV fit unknown"),
+            "contradicted must decline fit: {text}"
+        );
+        assert!(
+            !text.contains("(est)"),
+            "no estimated capacity claim after contradiction: {text}"
+        );
+        assert!(
+            !text.contains('~'),
+            "no tilde capacity claim after contradiction: {text}"
+        );
+    }
+
+    #[test]
     fn observed_absent_no_memory_claim() {
         let s = snap(Some(6.0), Some(256), Some(0.0));
         match rule1_under_batching_with_efficiency(r1_input(
@@ -822,7 +987,7 @@ mod tests {
                 assert_eq!(d.binding_wall, R1BindingWall::Ridge);
                 let text =
                     format_under_batching_fired(&d, 0.8, false, &R1FormatCtx::default()).join("\n");
-                assert!(text.contains("slots idle before hardware degrades TPOT"));
+                assert!(text.contains("before hardware degrades TPOT; KV fit unknown"));
                 assert!(!text.contains("worst-case"));
                 assert!(!text.contains("memory fits"));
             }
@@ -918,7 +1083,7 @@ mod tests {
         assert_eq!(agg.binding_wall, R1BindingWall::Ridge);
         let text =
             format_under_batching_fired(&agg, 0.8, false, &R1FormatCtx::default()).join("\n");
-        assert!(text.contains("slots idle before hardware degrades TPOT"));
+        assert!(text.contains("before hardware degrades TPOT; KV fit unknown"));
         assert!(!text.contains("worst-case"));
         assert!(!text.contains("memory fits"));
     }
@@ -937,7 +1102,7 @@ mod tests {
             known_gpu: true,
         };
         let text = format_under_batching_fired(&d, 0.8, false, &R1FormatCtx::default()).join("\n");
-        assert!(text.contains("(251 slots idle)"));
+        assert!(text.contains("(251 seats idle; KV fit unknown)"));
         assert!(!text.contains("degrades TPOT"));
         assert!(!text.contains("worst-case"));
     }
@@ -945,19 +1110,32 @@ mod tests {
     #[test]
     fn r1_fix_line_ridge_wall_includes_tpot_clause() {
         let idle = 147.0;
-        let ridge = r1_fix_lines(idle, R1BindingWall::Ridge, None, None, None).join("\n");
-        assert!(ridge.contains("degrades TPOT"));
+        let running = 6.0;
+        let ridge =
+            r1_fix_lines(idle, running, R1BindingWall::Ridge, &R1FormatCtx::default()).join("\n");
+        assert!(ridge.contains("seats idle before hardware degrades TPOT; KV fit unknown"));
         assert!(!ridge.contains("worst-case"));
-        let mem =
-            r1_fix_lines(idle, R1BindingWall::Memory { cap: 35 }, None, None, None).join("\n");
+        let mem = r1_fix_lines(
+            idle,
+            running,
+            R1BindingWall::Memory { cap: 35 },
+            &R1FormatCtx::default(),
+        )
+        .join("\n");
         assert!(!mem.contains("degrades TPOT"));
         assert!(!mem.contains("worst-case"));
         assert!(!mem.contains("slots idle"));
         assert!(mem.contains("Batch more requests or increase client concurrency."));
-        let cfg = r1_fix_lines(idle, R1BindingWall::Config, None, None, None).join("\n");
+        let cfg = r1_fix_lines(
+            idle,
+            running,
+            R1BindingWall::Config,
+            &R1FormatCtx::default(),
+        )
+        .join("\n");
         assert!(!cfg.contains("degrades TPOT"));
         assert!(!cfg.contains("worst-case"));
-        assert!(cfg.contains("slots idle"));
+        assert!(cfg.contains("seats idle; KV fit unknown"));
     }
 
     #[test]
@@ -978,7 +1156,7 @@ mod tests {
         let text =
             format_under_batching_fired(&agg, 0.8, false, &R1FormatCtx::default()).join("\n");
         assert!(!text.contains("memory fits"));
-        assert!(text.contains("slots idle before hardware degrades TPOT"));
+        assert!(text.contains("before hardware degrades TPOT; KV fit unknown"));
         assert!(!text.contains("worst-case"));
     }
 
@@ -1113,6 +1291,7 @@ mod tests {
             max_model_len: Some(18200),
             prompt_mean: Some(5000.0),
             generation_mean: Some(4100.0),
+            kv_full_context_cap: None,
         };
         let text = format_under_batching_fired(&d, 0.8, false, &fmt).join("\n");
         assert!(text.contains("Batch more requests or increase client concurrency."));
@@ -1139,6 +1318,7 @@ mod tests {
             max_model_len: Some(18200),
             prompt_mean: None,
             generation_mean: None,
+            kv_full_context_cap: None,
         };
         let text = format_under_batching_fired(&d, 0.8, false, &fmt).join("\n");
         assert!(text.contains("Fits 15 at the full 18.2k window."));
@@ -1150,14 +1330,135 @@ mod tests {
     fn memory_wall_degrades_without_max_model_len() {
         let lines = r1_fix_lines(
             5.0,
+            10.0,
             R1BindingWall::Memory { cap: 15 },
-            None,
-            Some(1.0),
-            Some(1.0),
+            &R1FormatCtx {
+                max_model_len: None,
+                prompt_mean: Some(1.0),
+                generation_mean: Some(1.0),
+                kv_full_context_cap: None,
+            },
         );
         assert_eq!(
             lines,
             vec!["      • Batch more requests or increase client concurrency.".to_string()]
         );
+    }
+
+    #[test]
+    fn config_wall_kv_est_when_observed_fit_tighter_than_seats() {
+        // Gemma-shaped: 121 seats, 14 running → 107 seat idle; KV fit ~25 at obs sizes.
+        let d = UnderBatchingDetail {
+            running: 14.0,
+            waiting: 0.0,
+            max_num_seqs: Some(121),
+            effective_max: 121.0,
+            binding_wall: R1BindingWall::Config,
+            occupancy_pct: (14.0 / 121.0) * 100.0,
+            efficiency_pct: Some(0.5),
+            config_relative_efficiency_pct: Some(10.0),
+            known_gpu: true,
+        };
+        // full-context cap 15 @ 32768; mean req 18275+1000 → pool/mean ≈ 25.
+        let fmt = R1FormatCtx {
+            max_model_len: Some(32768),
+            prompt_mean: Some(18275.0),
+            generation_mean: Some(1000.0),
+            kv_full_context_cap: Some(15),
+        };
+        let text = format_under_batching_fired(&d, 0.8, false, &fmt).join("\n");
+        assert!(
+            text.contains("(~11 slots idle (est))"),
+            "kv headroom 25-14=11 binds: {text}"
+        );
+        assert!(!text.contains("107"));
+        assert!(!text.contains("slots idle)"));
+    }
+
+    #[test]
+    fn config_wall_kv_est_zero_when_running_equals_observed_fit() {
+        // Same geometry as above: KV fit ≈ 25 at obs sizes; running == fit → 0 headroom.
+        let d = UnderBatchingDetail {
+            running: 25.0,
+            waiting: 0.0,
+            max_num_seqs: Some(121),
+            effective_max: 121.0,
+            binding_wall: R1BindingWall::Config,
+            occupancy_pct: (25.0 / 121.0) * 100.0,
+            efficiency_pct: Some(0.5),
+            config_relative_efficiency_pct: Some(10.0),
+            known_gpu: true,
+        };
+        let fmt = R1FormatCtx {
+            max_model_len: Some(32768),
+            prompt_mean: Some(18275.0),
+            generation_mean: Some(1000.0),
+            kv_full_context_cap: Some(15),
+        };
+        let text = format_under_batching_fired(&d, 0.8, false, &fmt).join("\n");
+        assert!(
+            text.contains(&format!("({KV_ZERO_MORE_CLAUSE})")),
+            "zero KV headroom parenthetical: {text}"
+        );
+        assert!(
+            !text.contains("slots idle"),
+            "zero headroom must not claim idle slots: {text}"
+        );
+        assert!(
+            !text.contains("degrades TPOT"),
+            "zero headroom drops TPOT clause: {text}"
+        );
+
+        let ridge = r1_fix_lines(96.0, 25.0, R1BindingWall::Ridge, &fmt).join("\n");
+        assert!(
+            ridge.contains(&format!("({KV_ZERO_MORE_CLAUSE})")),
+            "ridge zero matches config: {ridge}"
+        );
+        assert!(!ridge.contains("slots idle"), "{ridge}");
+        assert!(!ridge.contains("degrades TPOT"), "{ridge}");
+    }
+
+    #[test]
+    fn config_wall_plain_when_seat_idle_tighter_than_kv() {
+        let d = UnderBatchingDetail {
+            running: 5.0,
+            waiting: 0.0,
+            max_num_seqs: Some(256),
+            effective_max: 256.0,
+            binding_wall: R1BindingWall::Config,
+            occupancy_pct: (5.0 / 256.0) * 100.0,
+            efficiency_pct: Some(12.0),
+            config_relative_efficiency_pct: Some(15.0),
+            known_gpu: true,
+        };
+        // Huge KV fit at short prompts → seat idle 251 binds, plain (no est).
+        let fmt = R1FormatCtx {
+            max_model_len: Some(8192),
+            prompt_mean: Some(100.0),
+            generation_mean: Some(100.0),
+            kv_full_context_cap: Some(200),
+        };
+        let text = format_under_batching_fired(&d, 0.8, false, &fmt).join("\n");
+        assert!(text.contains("(251 slots idle)"), "{text}");
+        assert!(!text.contains("(est)"));
+        assert!(!text.contains('~'));
+    }
+
+    #[test]
+    fn config_wall_unknown_kv_labels_seats_not_capacity() {
+        let d = UnderBatchingDetail {
+            running: 14.0,
+            waiting: 0.0,
+            max_num_seqs: Some(121),
+            effective_max: 121.0,
+            binding_wall: R1BindingWall::Config,
+            occupancy_pct: (14.0 / 121.0) * 100.0,
+            efficiency_pct: Some(0.5),
+            config_relative_efficiency_pct: Some(10.0),
+            known_gpu: true,
+        };
+        let text = format_under_batching_fired(&d, 0.8, false, &R1FormatCtx::default()).join("\n");
+        assert!(text.contains("(107 seats idle; KV fit unknown)"), "{text}");
+        assert!(!text.contains("107 slots idle"));
     }
 }

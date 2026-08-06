@@ -34,7 +34,8 @@ use super::r7_config_headroom::{
 };
 use super::{
     KvBoundSource, Recommendation, catalog_state_pages_mismatch, compute_kv_max_seqs_for_cache,
-    recommended_seqs, resolve_kv_bound, rule_is_significant, rule_names, usable_kv_concurrency,
+    kv_full_context_cap_for_r1, recommended_seqs, resolve_kv_bound, rule_is_significant,
+    rule_names, usable_kv_concurrency,
 };
 
 const SUPPRESSION_TABLE: &[(&str, &str)] = &[
@@ -495,7 +496,11 @@ fn build_report_from_eval(
         let d = aggregate_r1_detail(&eval.r1_details);
         let confidence = if d.known_gpu { 0.8 } else { 0.5 };
         let kv_warning = rule_is_significant(eval.r1_kv_warning_count, eval.r1_fired);
-        let r1_fmt = R1FormatCtx::from_snapshot(summary_snap, max_model_len);
+        let r1_fmt = R1FormatCtx::from_snapshot(
+            summary_snap,
+            max_model_len,
+            kv_full_context_cap_for_r1(summary_snap, kv_max_seqs),
+        );
         let display_lines = format_under_batching_window_issue(
             &d,
             pct(eval.r1_fired, eval.n_eval),

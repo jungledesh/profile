@@ -1,50 +1,30 @@
 #!/usr/bin/env bash
-# Gemma 4 26B-A4B (MoE) on NVIDIA — the demo comparison model against Qwen3.6-27B.
-# 25.2B total / 3.8B active params, interleaved local/global attention; ~58GB bf16,
-# fits one H100 80GB. Catalog has measured params; KV capacity comes from vLLM's
-# observed kv_cache_max_concurrency (KV geometry fields are deliberately None).
+# Gemma 4 26B-A4B (MoE) on AMD — counterpart to scripts/start-gemma.sh.
+# Runs inside vllm/vllm-openai-rocm base image which already has vLLM + PyTorch
+# + ROCm installed. No pip install needed. Same posture as start-amd.sh.
 #
-# Gemma 4 is Apache-2.0 and ungated on HuggingFace — no license click-through,
-# no HF_TOKEN required (a read token only helps with download rate limits).
-#
-# Other Gemma 4 sizes via override, e.g. the 31B validation run:
-#   MODEL_REPO=google/gemma-4-31B-it MODEL_PATH=/workspace/models/gemma4-31b \
-#   SERVED_NAME=gemma-4-31b ./start-gemma.sh
-#
-# OS packages installed in the Dockerfile; runs as appuser, no apt-get.
+# Gemma 4 is Apache-2.0 and ungated — no HF_TOKEN required (a read token only
+# helps with download rate limits). 25.2B total / 3.8B active; ~58GB bf16.
 
 set -Eeuo pipefail
 trap 'echo "FAILED at line $LINENO"' ERR
 
-PIP_VERSION="${PIP_VERSION:-26.0.1}"
-UV_VERSION="${UV_VERSION:-0.11.1}"
-VLLM_VERSION="${VLLM_VERSION:-0.25.1}"
-
 MODEL_REPO="${MODEL_REPO:-google/gemma-4-26B-A4B-it}"
+# Own the served identity for this launcher. Image must not bake SERVED_NAME=llama3
+# (see Dockerfile amd stage); ${SERVED_NAME:-} only helps when the env is unset.
 SERVED_NAME="${SERVED_NAME:-gemma-4-26b-a4b}"
 export SERVED_NAME
-export PROFILE_MODEL="${PROFILE_MODEL:-gemma}"
+export PROFILE_MODEL=gemma
 
 APP_DIR="${APP_DIR:-/home/appuser/app}"
-VENV_DIR="${VENV_DIR:-/home/appuser/vllm-env}"
 MODELS_DIR="${MODELS_DIR:-/workspace/models}"
 MODEL_PATH="${MODEL_PATH:-$MODELS_DIR/gemma4-26b-a4b}"
 TMUX_SESSION="${TMUX_SESSION:-vllm}"
 LOG_FILE="${APP_DIR}/vllm.log"
 
-echo "Starting container (Gemma 4 26B-A4B)..."
+echo "Starting AMD container (Gemma 4 26B-A4B)..."
 
 mkdir -p "$APP_DIR" "$MODELS_DIR"
-
-if [[ ! -f "$VENV_DIR/bin/activate" ]]; then
-    rm -rf "$VENV_DIR"
-    python3 -m venv "$VENV_DIR"
-fi
-source "$VENV_DIR/bin/activate"
-
-python -m pip install "pip==${PIP_VERSION}"
-python -m pip install "uv==${UV_VERSION}"
-uv pip install "vllm==${VLLM_VERSION}"
 
 if [[ -n "${HF_TOKEN:-}" ]]; then
     export HF_TOKEN
@@ -65,27 +45,18 @@ else
     echo "Model already present."
 fi
 
-# vLLM 0.25.x ships nvidia-cuda-runtime 13.x as a pip package.
-# The dynamic linker needs the path to libcudart.so.13.
-CUDA13_LIB=$(find "$VENV_DIR" -path "*/nvidia/cu13/lib" -type d 2>/dev/null | head -1)
-if [[ -n "$CUDA13_LIB" ]]; then
-    export LD_LIBRARY_PATH="${CUDA13_LIB}:${LD_LIBRARY_PATH:-}"
-    echo "CUDA 13 libs: $CUDA13_LIB"
-fi
-
 if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
     echo "Killing existing tmux session: $TMUX_SESSION"
     tmux kill-session -t "$TMUX_SESSION"
 fi
 
-# Minimal flags; Profile diagnoses the rest. Same posture as start.sh.
-#   --max-model-len 32768   comparable to the Qwen demo run; native 256K would
-#                           eat the KV pool before the comparison says anything.
+# Minimal flags; Profile diagnoses the rest.
+#   --max-model-len 32768   same as the NVIDIA run so numbers compare 1:1.
 #   --trust-remote-code     permit model-shipped code (harmless if unused).
-#   (no --max-num-seqs)     let vLLM pick; Profile observes and prescribes.
-#
-# Tool-call wiring for agent-swarm.sh (vLLM Gemma 4 recipe). Disable with
-# ENABLE_GEMMA_TOOLS=0. EXTRA_ARGS still appends after these defaults.
+#   (no --max-num-seqs, no --gpu-memory-utilization) let vLLM pick.
+# Tool-call wiring for agent swarm (same as start-gemma.sh). Disable with
+# ENABLE_GEMMA_TOOLS=0. If ROCm graph capture misbehaves, add --enforce-eager
+# via EXTRA_ARGS.
 ENABLE_GEMMA_TOOLS="${ENABLE_GEMMA_TOOLS:-1}"
 TOOL_ARGS=""
 if [[ "$ENABLE_GEMMA_TOOLS" == "1" ]]; then
@@ -117,10 +88,11 @@ print(cands[0] if cands else '')
 fi
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 tmux new-session -d -s "$TMUX_SESSION" \
-"bash -lc 'source \"$VENV_DIR/bin/activate\" && \
-export LD_LIBRARY_PATH=\"${CUDA13_LIB}:\${LD_LIBRARY_PATH:-}\" && \
-vllm serve \"$MODEL_PATH\" \
+"bash -lc 'python -m vllm.entrypoints.openai.api_server \
+  --model \"$MODEL_PATH\" \
   --served-model-name $SERVED_NAME \
+  --host 0.0.0.0 \
+  --port 8000 \
   --max-model-len 32768 \
   --trust-remote-code \
   $TOOL_ARGS \
@@ -132,9 +104,8 @@ echo "vLLM running (Gemma 4 26B-A4B) in tmux session '$TMUX_SESSION'"
 echo "Served as: $SERVED_NAME  (load/swarm: PROFILE_MODEL=gemma)"
 echo "Attach with: tmux attach -t $TMUX_SESSION"
 echo "Check: curl -s localhost:8000/metrics | grep cache_config_info"
-echo "Expect: kv_cache_max_concurrency label present (Profile's Observed capacity)."
 
-# Interactive shell when stdin is a TTY (e.g. docker run -it); otherwise keep container alive.
+# Interactive shell when stdin is a TTY; otherwise keep container alive.
 if [[ -t 0 ]]; then
   exec bash -l
 else

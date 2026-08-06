@@ -90,6 +90,7 @@ WORKDIR ${APP_DIR}
 COPY --chown=appuser:appuser scripts/load.sh ./load.sh
 COPY --chown=appuser:appuser scripts/start.sh ./start.sh
 COPY --chown=appuser:appuser scripts/start-gemma.sh ./start-gemma.sh
+COPY --chown=appuser:appuser scripts/tool_chat_template_gemma4.jinja ./tool_chat_template_gemma4.jinja
 COPY --chown=appuser:appuser scripts/agent-swarm.sh ./agent-swarm.sh
 # Swarm task list: agent-swarm.sh reads swarm-tasks.json next to itself.
 # fetch-swarm-tasks.py regenerates it if needed (requires internet).
@@ -101,7 +102,14 @@ RUN chmod 0755 ./load.sh ./start.sh ./start-gemma.sh ./agent-swarm.sh ./profile
 
 USER appuser
 
-CMD ["bash", "-lc", "/home/appuser/app/start.sh"]
+# Default stack is Gemma 4 (CMD / start-gemma.sh). Do not bake SERVED_NAME: an
+# image-level gemma value would override start.sh's Qwen identity via
+# ${SERVED_NAME:-...}. Each launcher exports PROFILE_MODEL + SERVED_NAME;
+# load.sh uses MODEL > SERVED_NAME > PROFILE_MODEL family default.
+# Qwen: ./start.sh (exports PROFILE_MODEL=qwen + SERVED_NAME for that shell).
+ENV PROFILE_MODEL=gemma
+
+CMD ["bash", "-lc", "/home/appuser/app/start-gemma.sh"]
 
 # AMD runtime: official vLLM ROCm image (includes ROCm + Python 3.12 + vLLM + PyTorch).
 # Build: docker build --target amd -t profile:amd .
@@ -171,12 +179,21 @@ WORKDIR ${APP_DIR}
 
 COPY --chown=appuser:appuser scripts/load.sh ./load.sh
 COPY --chown=appuser:appuser scripts/start-amd.sh ./start.sh
+COPY --chown=appuser:appuser scripts/start-gemma-amd.sh ./start-gemma.sh
+COPY --chown=appuser:appuser scripts/tool_chat_template_gemma4.jinja ./tool_chat_template_gemma4.jinja
 
 COPY --from=profile-builder --chown=appuser:appuser /build/target/release/profile ./profile
 
-RUN chmod 0755 ./load.sh ./start.sh ./profile
+RUN chmod 0755 ./load.sh ./start.sh ./start-gemma.sh ./profile
 
 USER appuser
+
+# Default AMD stack is Llama 3 (start-amd.sh / CMD). Do not bake SERVED_NAME
+# here: an image-level llama3 value would override start-gemma-amd.sh's
+# gemma-4-26b-a4b default via ${SERVED_NAME:-...}. Each launcher sets its own
+# served name; load.sh uses MODEL > SERVED_NAME > PROFILE_MODEL family default.
+# Gemma on AMD: ./start-gemma.sh (exports PROFILE_MODEL=gemma + SERVED_NAME).
+ENV PROFILE_MODEL=llama
 
 ENTRYPOINT []
 CMD ["bash", "-lc", "/home/appuser/app/start.sh"]
