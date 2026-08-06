@@ -190,12 +190,12 @@ RUN chmod 0755 ./load.sh ./start.sh ./start-gemma.sh ./profile
 
 USER appuser
 
-# Default AMD stack is Llama 3 (start-amd.sh). load.sh resolves
-# MODEL > SERVED_NAME > PROFILE_MODEL family default.
-# Gemma on AMD: bash -lc './start-gemma.sh' and PROFILE_MODEL=gemma
-# (SERVED_NAME already defaults to gemma-4-26b-a4b in start-gemma-amd.sh).
+# Default AMD stack is Llama 3 (start-amd.sh / CMD). Do not bake SERVED_NAME
+# here: an image-level llama3 value would override start-gemma-amd.sh's
+# gemma-4-26b-a4b default via ${SERVED_NAME:-...}. Each launcher sets its own
+# served name; load.sh uses MODEL > SERVED_NAME > PROFILE_MODEL family default.
+# Gemma on AMD: ./start-gemma.sh (exports PROFILE_MODEL=gemma + SERVED_NAME).
 ENV PROFILE_MODEL=llama
-ENV SERVED_NAME=llama3
 
 ENTRYPOINT []
 CMD ["bash", "-lc", "/home/appuser/app/start.sh"]

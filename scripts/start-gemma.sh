@@ -22,6 +22,8 @@ VLLM_VERSION="${VLLM_VERSION:-0.25.1}"
 
 MODEL_REPO="${MODEL_REPO:-google/gemma-4-26B-A4B-it}"
 SERVED_NAME="${SERVED_NAME:-gemma-4-26b-a4b}"
+export SERVED_NAME
+export PROFILE_MODEL="${PROFILE_MODEL:-gemma}"
 
 APP_DIR="${APP_DIR:-/home/appuser/app}"
 VENV_DIR="${VENV_DIR:-/home/appuser/vllm-env}"

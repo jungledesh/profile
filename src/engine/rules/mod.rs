@@ -97,6 +97,57 @@ pub(super) fn observed_kv_cap_contradicted(snapshot: &crate::collectors::RawSnap
     kv_cap_positive_after_floor(snapshot).is_some() && usable_kv_concurrency(snapshot).is_none()
 }
 
+/// Tri-state for the Observed KV concurrency label (seat/headroom paths).
+///
+/// Peak running above `floor(label)` falsifies that full-context promise.
+/// Derived catalog math makes the same class of claim; when the label is
+/// [`Contradicted`](ObservedKvResolution::Contradicted), do not substitute
+/// derived for R1 headroom (see [`kv_full_context_cap_for_r1`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ObservedKvResolution {
+    Observed(u32),
+    Absent,
+    Contradicted,
+}
+
+fn floor_positive_concurrency_u32(c: f64) -> Option<u32> {
+    let f = c.floor();
+    (f > 0.0 && f <= f64::from(u32::MAX)).then_some({
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        {
+            f as u32
+        }
+    })
+}
+
+pub(super) fn resolve_observed_kv(
+    snapshot: &crate::collectors::RawSnapshot,
+) -> ObservedKvResolution {
+    if observed_kv_cap_contradicted(snapshot) {
+        return ObservedKvResolution::Contradicted;
+    }
+    match usable_kv_concurrency(snapshot).and_then(floor_positive_concurrency_u32) {
+        Some(n) => ObservedKvResolution::Observed(n),
+        None => ObservedKvResolution::Absent,
+    }
+}
+
+/// Full-context KV cap for R1 Ridge/Config headroom formatting.
+///
+/// - Observed → use the label
+/// - Absent → fall back to derived `kv_max_seqs`
+/// - Contradicted → `None` (renders "seats idle; KV fit unknown")
+pub(super) fn kv_full_context_cap_for_r1(
+    snapshot: &crate::collectors::RawSnapshot,
+    derived: Option<u32>,
+) -> Option<u32> {
+    match resolve_observed_kv(snapshot) {
+        ObservedKvResolution::Observed(n) => Some(n),
+        ObservedKvResolution::Absent => derived.filter(|&d| d > 0),
+        ObservedKvResolution::Contradicted => None,
+    }
+}
+
 /// Minimum bootable `--max-num-batched-tokens` from scraped page alignment.
 /// Boot fact from `cache_config.block_size` only; never from catalog or constants.
 pub(super) fn chunk_batched_tokens_floor(

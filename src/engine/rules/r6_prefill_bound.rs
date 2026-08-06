@@ -177,59 +177,76 @@ fn resolve_batch_token_prescription(d: &PrefillBoundDetail) -> BatchTokenPrescri
     }
 }
 
+/// Model-specific boot floors (e.g. Gemma 4 multimodal 2496) are not scraped.
+/// Named Set targets can still sit below that floor; this subline is the backstop.
+const BATCH_TOKEN_BOOT_REJECT_SUBLINE: &str =
+    "If vLLM rejects this at boot, its error names the model minimum; use that value.";
+
 /// Second return is whether a named Set/lower budget knob was emitted (structural;
 /// do not re-read printed text to decide Expected).
 fn batch_token_budget_bullets(d: &PrefillBoundDetail, verb: &str) -> (Vec<String>, bool) {
-    match resolve_batch_token_prescription(d) {
+    let mut out = Vec::new();
+    let named_set = match resolve_batch_token_prescription(d) {
         BatchTokenPrescription::Ideal { value, est_paren } => {
             if super::already_set_u32(d.max_num_batched_tokens, value) {
-                return (Vec::new(), false);
+                false
+            } else {
+                let tail = match est_paren {
+                    Some(paren) => format!(
+                        " {paren} to shrink prefill chunk size. Lower for smoother TPOT, raise for lower TTFT."
+                    ),
+                    None => {
+                        " to shrink prefill chunk size. Lower for smoother TPOT, raise for lower TTFT."
+                            .to_string()
+                    }
+                };
+                super::push_bullet_with_subline(
+                    &mut out,
+                    format!("      • {verb} --max-num-batched-tokens to {value}{tail}"),
+                    Some(BATCH_TOKEN_BOOT_REJECT_SUBLINE),
+                );
+                true
             }
-            let tail = match est_paren {
-                Some(paren) => format!(
-                    " {paren} to shrink prefill chunk size. Lower for smoother TPOT, raise for lower TTFT."
-                ),
-                None => {
-                    " to shrink prefill chunk size. Lower for smoother TPOT, raise for lower TTFT."
-                        .to_string()
-                }
-            };
-            (
-                vec![format!("      • {verb} --max-num-batched-tokens to {value}{tail}")],
-                true,
-            )
         }
         BatchTokenPrescription::FloorLimited { value } => {
             if super::already_set_u32(d.max_num_batched_tokens, value) {
-                return (Vec::new(), false);
+                false
+            } else {
+                super::push_bullet_with_subline(
+                    &mut out,
+                    format!(
+                        "      • {verb} --max-num-batched-tokens to {value} (floor-limited; page alignment) to shrink prefill chunk size. Lower for smoother TPOT, raise for lower TTFT."
+                    ),
+                    Some(BATCH_TOKEN_BOOT_REJECT_SUBLINE),
+                );
+                true
             }
-            (
-                vec![format!(
-                    "      • {verb} --max-num-batched-tokens to {value} (floor-limited; page alignment) to shrink prefill chunk size. Lower for smoother TPOT, raise for lower TTFT."
-                )],
-                true,
-            )
         }
-        BatchTokenPrescription::TerminalAtFloor { floor } => (
-            vec![format!(
+        BatchTokenPrescription::TerminalAtFloor { floor } => {
+            out.push(format!(
                 "      • Prefill chunk size is at the page floor ({floor}); no smaller value boots on this server."
-            )],
-            false,
-        ),
-        BatchTokenPrescription::HybridFloorUnknown => (
-            vec![
+            ));
+            false
+        }
+        BatchTokenPrescription::HybridFloorUnknown => {
+            out.push(
                 "      • Confirm page size in vLLM boot logs, then set --max-num-batched-tokens manually."
                     .to_string(),
-            ],
-            false,
-        ),
-        BatchTokenPrescription::DirectionOnly { floor } => (
-            vec![format!(
-                "      • {verb} --max-num-batched-tokens lower to shrink prefill chunk size (not below {floor}). Lower for smoother TPOT, raise for lower TTFT."
-            )],
-            true,
-        ),
-    }
+            );
+            false
+        }
+        BatchTokenPrescription::DirectionOnly { floor } => {
+            super::push_bullet_with_subline(
+                &mut out,
+                format!(
+                    "      • {verb} --max-num-batched-tokens lower to shrink prefill chunk size (not below {floor}). Lower for smoother TPOT, raise for lower TTFT."
+                ),
+                Some(BATCH_TOKEN_BOOT_REJECT_SUBLINE),
+            );
+            true
+        }
+    };
+    (out, named_set)
 }
 
 fn batch_token_prescription_expected(d: &PrefillBoundDetail, named_set: bool) -> &'static str {
@@ -1719,6 +1736,10 @@ mod tests {
             )
         );
         assert!(text.contains("Lower for smoother TPOT, raise for lower TTFT"));
+        assert!(
+            text.contains(BATCH_TOKEN_BOOT_REJECT_SUBLINE),
+            "named Set must carry boot-reject subline: {text}"
+        );
         assert!(!text.contains("decode stretch"));
     }
 
@@ -2071,6 +2092,10 @@ mod tests {
         assert!(text.contains(&format!(
             "Set --max-num-batched-tokens to {HYBRID_ALIGN_FLOOR_EXAMPLE} (floor-limited; page alignment)"
         )));
+        assert!(
+            text.contains(BATCH_TOKEN_BOOT_REJECT_SUBLINE),
+            "floor-limited Set must carry boot-reject subline: {text}"
+        );
         assert!(!text.contains("to 384"));
     }
 
@@ -2083,6 +2108,10 @@ mod tests {
         assert!(text.contains(&format!(
             "Prefill chunk size is at the page floor ({HYBRID_ALIGN_FLOOR_EXAMPLE}); no smaller value boots on this server."
         )));
+        assert!(
+            !text.contains(BATCH_TOKEN_BOOT_REJECT_SUBLINE),
+            "no Set bullet → no boot-reject subline: {text}"
+        );
         assert!(text.contains(R6_TERMINAL_VERIFY.trim_start()));
         assert!(!text.contains("disable prefix"));
         assert!(prescription_numbers(&text).is_empty());

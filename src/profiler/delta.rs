@@ -29,6 +29,8 @@ pub struct Delta {
     pub config_drifted: bool,
     /// Non-baseline config knobs changed (max_num_seqs, batched tokens, caching, eager).
     pub non_baseline_drifted: bool,
+    /// Prior fix touched an unread knob, or no-change claim has no visible knobs.
+    pub change_unverifiable: bool,
 }
 
 pub fn compute(
@@ -38,6 +40,7 @@ pub fn compute(
     curr_report: &Report,
     config_drifted: bool,
     non_baseline_drifted: bool,
+    change_unverifiable: bool,
 ) -> Delta {
     let throughput_before = prev_result.snapshot.vllm.generation_tokens_per_sec;
     let throughput_after = curr_result.snapshot.vllm.generation_tokens_per_sec;
@@ -109,6 +112,7 @@ pub fn compute(
         tpot_p95_after_ms,
         config_drifted,
         non_baseline_drifted,
+        change_unverifiable,
     }
 }
 
@@ -206,6 +210,7 @@ mod tests {
             &report_eff(Some(55.0), None, None),
             false,
             false,
+            false,
         );
         assert!((d.efficiency_delta_pp.unwrap() - 5.0).abs() < 1e-9);
         assert_eq!(d.throughput_before, Some(100.0));
@@ -221,6 +226,7 @@ mod tests {
             &report_eff(Some(50.0), None, None),
             true,
             true,
+            false,
         );
         assert!(d.config_drifted);
         assert!(d.non_baseline_drifted);
@@ -233,6 +239,7 @@ mod tests {
             &report_eff(Some(40.0), Some(2.50), Some(0.31)),
             &diagnose(Some(120.0)),
             &report_eff(Some(55.0), Some(2.00), Some(0.28)),
+            false,
             false,
             false,
         );
@@ -253,6 +260,7 @@ mod tests {
             &report_eff(Some(45.0), None, Some(0.28)),
             false,
             false,
+            false,
         );
         assert_eq!(d.joules_per_token_before, Some(0.31));
         assert_eq!(d.joules_per_token_after, Some(0.28));
@@ -271,6 +279,7 @@ mod tests {
             &report_eff(Some(40.0), None, None),
             &curr,
             &report_eff(Some(45.0), None, None),
+            false,
             false,
             false,
         );

@@ -1984,7 +1984,9 @@ fn format_under_batching_fired_matches_template() {
     let text =
         format_diagnose_rules_test(&ctx, &win, false, "http://127.0.0.1:8000/metrics").join("\n");
     assert!(text.contains("[!] Under-batching: Insufficient Concurrency"));
-    assert!(text.contains("Batch more requests or increase client concurrency (251 slots idle)"));
+    assert!(text.contains(
+        "Batch more requests or increase client concurrency (251 seats idle; KV fit unknown)"
+    ));
     assert!(!text.contains("/hr "));
 }
 
@@ -3638,7 +3640,9 @@ fn format_diagnose_rules_for_windows_matches_requested_style_when_some_rules_fir
     assert!(text.contains("Requests"));
     assert!(text.contains("running"));
     assert!(text.contains("    Cause:"));
-    assert!(text.contains("Batch more requests or increase client concurrency (253 slots idle)"));
+    assert!(text.contains(
+        "Batch more requests or increase client concurrency (253 seats idle; KV fit unknown)"
+    ));
     assert!(!text.contains("KV Cache Pressure: not triggered"));
     assert!(!text.contains("Low Prefix Reuse: not triggered"));
     assert!(!text.contains("Concurrency Saturation: not triggered"));

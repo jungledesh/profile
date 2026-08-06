@@ -9,6 +9,8 @@ APP_DIR="${APP_DIR:-/home/appuser/app}"
 MODELS_DIR="${MODELS_DIR:-/workspace/models}"
 MODEL_PATH="${MODEL_PATH:-$MODELS_DIR/llama3-8b}"
 SERVED_NAME="${SERVED_NAME:-llama3}"
+export SERVED_NAME
+export PROFILE_MODEL=llama
 TMUX_SESSION="${TMUX_SESSION:-vllm}"
 LOG_FILE="${APP_DIR}/vllm.log"
 

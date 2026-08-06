@@ -114,10 +114,11 @@ do this (it reports once and never checks itself). Simulators cannot (they
 predict instead of measure). This is the structural answer to the rule engine's
 known misattribution failure mode.
 
-The loop also acts on a flat response: when the same primary re-fires with no
-material improvement after a fix, profile reveals the full bodies of the
-issues it had suppressed, under one warning line, so the operator has the next
-hypothesis without losing the one-primary discipline on healthy iterations.
+The loop also acts on a stuck diagnosis: when the same primary re-fires,
+profile reveals the full bodies of the issues it had suppressed, under one
+warning line, so the operator has the next hypothesis without losing the
+one-primary discipline on healthy iterations. Re-fire alone is enough; there
+is no flat-delta gate.
 
 ### 2.3 Passive diagnosis is a feature
 
