@@ -102,14 +102,12 @@ RUN chmod 0755 ./load.sh ./start.sh ./start-gemma.sh ./agent-swarm.sh ./profile
 
 USER appuser
 
-# Default stack is Gemma 4. Consumers resolve MODEL as:
-#   MODEL > SERVED_NAME > PROFILE_MODEL family default.
-# Switch the whole stack with:
-#   docker run ... profile:nvidia bash -lc './start.sh'   # Qwen
-#   PROFILE_MODEL=qwen SERVED_NAME=Qwen3.6-27B ./load.sh
-#   PROFILE_MODEL=qwen SERVED_NAME=Qwen3.6-27B ./agent-swarm.sh run
+# Default stack is Gemma 4 (CMD / start-gemma.sh). Do not bake SERVED_NAME: an
+# image-level gemma value would override start.sh's Qwen identity via
+# ${SERVED_NAME:-...}. Each launcher exports PROFILE_MODEL + SERVED_NAME;
+# load.sh uses MODEL > SERVED_NAME > PROFILE_MODEL family default.
+# Qwen: ./start.sh (exports PROFILE_MODEL=qwen + SERVED_NAME for that shell).
 ENV PROFILE_MODEL=gemma
-ENV SERVED_NAME=gemma-4-26b-a4b
 
 CMD ["bash", "-lc", "/home/appuser/app/start-gemma.sh"]
 

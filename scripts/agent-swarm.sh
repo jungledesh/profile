@@ -34,7 +34,8 @@
 #   STABLE=1 AGENTS=16 TASK_TIMEOUT=600 DURATION=0 ./agent-swarm.sh run
 #   Wait ~2 min after launch for phase spread to fill, then run profile diagnose.
 #
-# Switch to Qwen (must match start.sh):
+# Switch to Qwen (must match start.sh). After ./start.sh in this shell, PROFILE_MODEL
+# and SERVED_NAME are already exported; a fresh shell needs:
 #   PROFILE_MODEL=qwen ./agent-swarm.sh run
 #
 # Requires: vLLM on localhost:8000 serving the PROFILE_MODEL target
