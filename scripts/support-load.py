@@ -577,7 +577,10 @@ def read_knobs(path: str) -> dict:
         knobs["turns_min"] = max(1, int(knobs["turns_min"]))
         knobs["turns_max"] = max(knobs["turns_min"], int(knobs["turns_max"]))
         knobs["long_frac"] = min(1.0, max(0.0, float(knobs["long_frac"])))
-        knobs["qps_mult"] = max(0.01, float(knobs["qps_mult"]))
+        qps_mult = float(knobs["qps_mult"])
+        if not 0.0 < qps_mult < float("inf"):
+            raise ValueError("qps_mult must be finite and positive")
+        knobs["qps_mult"] = max(0.01, qps_mult)
     except (TypeError, ValueError):
         return dict(DEFAULT_KNOBS)
     return knobs
