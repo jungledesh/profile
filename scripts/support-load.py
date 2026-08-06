@@ -573,10 +573,13 @@ def read_knobs(path: str) -> dict:
                     knobs[k] = loaded[k]
     except (OSError, ValueError):
         pass
-    knobs["turns_min"] = max(1, int(knobs["turns_min"]))
-    knobs["turns_max"] = max(knobs["turns_min"], int(knobs["turns_max"]))
-    knobs["long_frac"] = min(1.0, max(0.0, float(knobs["long_frac"])))
-    knobs["qps_mult"] = max(0.01, float(knobs["qps_mult"]))
+    try:
+        knobs["turns_min"] = max(1, int(knobs["turns_min"]))
+        knobs["turns_max"] = max(knobs["turns_min"], int(knobs["turns_max"]))
+        knobs["long_frac"] = min(1.0, max(0.0, float(knobs["long_frac"])))
+        knobs["qps_mult"] = max(0.01, float(knobs["qps_mult"]))
+    except (TypeError, ValueError):
+        return dict(DEFAULT_KNOBS)
     return knobs
 
 
@@ -711,7 +714,12 @@ async def run(args: argparse.Namespace, model: str) -> None:
                 end = time.monotonic() + args.stage_secs
                 while time.monotonic() < end:
                     # Poisson arrivals: exponential gaps at the jittered rate.
-                    await asyncio.sleep(rng.expovariate(qps * stats.rate_mult))
+                    delay = rng.expovariate(qps * stats.rate_mult)
+                    remaining = end - time.monotonic()
+                    if delay >= remaining:
+                        await asyncio.sleep(max(0.0, remaining))
+                        break
+                    await asyncio.sleep(delay)
                     t = asyncio.create_task(
                         conversation(session, args, model, rng, stats))
                     tasks.add(t)
@@ -729,8 +737,11 @@ async def run(args: argparse.Namespace, model: str) -> None:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     p.add_argument("--url", default=os.environ.get("VLLM_URL", "http://localhost:8000"))
-    p.add_argument("--model", default=None,
-                   help="request model id (default: SERVED_NAME, else PROFILE_MODEL family default)")
+    p.add_argument(
+        "--model",
+        default=None,
+        help="request model id (default: MODEL, else SERVED_NAME, else PROFILE_MODEL family default)",
+    )
     p.add_argument("--qps", default=DEFAULT_QPS,
                    help="comma-separated conversation arrival rates per stage "
                         f"(default {DEFAULT_QPS}; ~2.5 turns each → ~0.8/3.2/12.8 req/s)")
@@ -752,7 +763,12 @@ def main() -> None:
     profile_model = os.environ.get("PROFILE_MODEL", "gemma")
     if profile_model not in FAMILY_DEFAULTS:
         p.error(f"PROFILE_MODEL must be one of {sorted(FAMILY_DEFAULTS)} (got: {profile_model})")
-    model = args.model or os.environ.get("SERVED_NAME") or FAMILY_DEFAULTS[profile_model]
+    model = (
+        args.model
+        or os.environ.get("MODEL")
+        or os.environ.get("SERVED_NAME")
+        or FAMILY_DEFAULTS[profile_model]
+    )
     print(f"target {args.url} model {model} conv-qps stages {args.qps} "
           f"stage {args.stage_secs}s knobs {args.knobs} {read_knobs(args.knobs)}",
           flush=True)
