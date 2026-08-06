@@ -103,14 +103,12 @@ RUN chmod 0755 ./load.sh ./start.sh ./start-gemma.sh ./agent-swarm.sh ./support-
 
 USER appuser
 
-# Default stack is Gemma 4 (CMD / start-gemma.sh). Do not bake SERVED_NAME: an
-# image-level gemma value would override start.sh's Qwen identity via
-# ${SERVED_NAME:-...}. Each launcher exports PROFILE_MODEL + SERVED_NAME;
-# load.sh uses MODEL > SERVED_NAME > PROFILE_MODEL family default.
-# Qwen: ./start.sh (exports PROFILE_MODEL=qwen + SERVED_NAME for that shell).
-ENV PROFILE_MODEL=gemma
+# Default NVIDIA stack is Qwen (CMD / start.sh) + agent-swarm load.
+# Do not bake SERVED_NAME: each launcher exports PROFILE_MODEL + SERVED_NAME.
+# Gemma on NVIDIA: ./start-gemma.sh
+ENV PROFILE_MODEL=qwen
 
-CMD ["bash", "-lc", "/home/appuser/app/start-gemma.sh"]
+CMD ["bash", "-lc", "/home/appuser/app/start.sh"]
 
 # AMD runtime: official vLLM ROCm image (includes ROCm + Python 3.12 + vLLM + PyTorch).
 # Build: docker build --target amd -t profile:amd .
@@ -190,12 +188,9 @@ RUN chmod 0755 ./load.sh ./start.sh ./start-gemma.sh ./support-load.py ./profile
 
 USER appuser
 
-# Default AMD stack is Llama 3 (start-amd.sh / CMD). Do not bake SERVED_NAME
-# here: an image-level llama3 value would override start-gemma-amd.sh's
-# gemma-4-26b-a4b default via ${SERVED_NAME:-...}. Each launcher sets its own
-# served name; load.sh uses MODEL > SERVED_NAME > PROFILE_MODEL family default.
-# Gemma on AMD: ./start-gemma.sh (exports PROFILE_MODEL=gemma + SERVED_NAME).
-ENV PROFILE_MODEL=llama
+# Default AMD stack is Gemma 4 (CMD / start-gemma.sh) + support-load.py.
+# Do not bake SERVED_NAME: each launcher exports its own. Llama: ./start.sh.
+ENV PROFILE_MODEL=gemma
 
 ENTRYPOINT []
-CMD ["bash", "-lc", "/home/appuser/app/start.sh"]
+CMD ["bash", "-lc", "/home/appuser/app/start-gemma.sh"]

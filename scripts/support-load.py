@@ -29,7 +29,7 @@ Model resolution matches load.sh: MODEL > SERVED_NAME > PROFILE_MODEL family
 default (gemma -> gemma-4-26b-a4b, qwen -> Qwen3.6-27B, llama -> llama3).
 
 Usage:
-  PROFILE_MODEL=gemma ./support-load.py
+  PROFILE_MODEL=gemma ./support-load.py   # AMD default journey
   PROFILE_MODEL=qwen ./support-load.py --qps 0.3,1.3,5 --stage-secs 600
 
 AMD Gemma (after ./start-gemma.sh): same command; needs the recipe chat

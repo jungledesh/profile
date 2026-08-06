@@ -25,8 +25,8 @@
 #   PHASE_SPREAD=600   seconds across which worker start phases are evenly spread
 #   TIMEOUT_JITTER=90  per-task timeout ± seconds when STABLE=1
 #   SWARM_HOME=/workspace/swarm   scratch area (clones, checkouts, venvs, log)
-#   PROFILE_MODEL=gemma|qwen      which served model the swarm targets (default: gemma,
-#                                 matches Dockerfile nvidia CMD / start-gemma.sh)
+#   PROFILE_MODEL=gemma|qwen      which served model the swarm targets (default: qwen,
+#                                 matches Dockerfile nvidia CMD / start.sh)
 #   MODEL_ALIAS=...               grok alias (default: gemma-local or qwen-local)
 #   SERVED_NAME=...               vLLM --served-model-name override
 #
@@ -34,12 +34,12 @@
 #   STABLE=1 AGENTS=16 TASK_TIMEOUT=600 DURATION=0 ./agent-swarm.sh run
 #   Wait ~2 min after launch for phase spread to fill, then run profile diagnose.
 #
-# Switch to Qwen (must match start.sh). After ./start.sh in this shell, PROFILE_MODEL
-# and SERVED_NAME are already exported; a fresh shell needs:
-#   PROFILE_MODEL=qwen ./agent-swarm.sh run
+# Switch to Gemma (must match start-gemma.sh). After ./start-gemma.sh in this shell,
+# PROFILE_MODEL and SERVED_NAME are already exported; a fresh shell needs:
+#   PROFILE_MODEL=gemma ./agent-swarm.sh run
 #
 # Requires: vLLM on localhost:8000 serving the PROFILE_MODEL target
-# (start-gemma.sh or start.sh); jq; git. Gemma needs tool-call flags
+# (start.sh or start-gemma.sh); jq; git. Gemma needs tool-call flags
 # (start-gemma.sh enables them by default).
 #
 # Smoke gate (non-negotiable, from the plan): on the pod, run ONE agent on ONE
@@ -57,7 +57,7 @@ STABLE="${STABLE:-1}"
 PHASE_SPREAD="${PHASE_SPREAD:-$TASK_TIMEOUT}"
 TIMEOUT_JITTER="${TIMEOUT_JITTER:-90}"
 SWARM_HOME="${SWARM_HOME:-/workspace/swarm}"
-PROFILE_MODEL="${PROFILE_MODEL:-gemma}"
+PROFILE_MODEL="${PROFILE_MODEL:-qwen}"
 
 case "$PROFILE_MODEL" in
     gemma)
