@@ -540,9 +540,50 @@ pub(crate) fn preflight_max_num_seqs(url: &str, timeout: Duration) -> Option<u32
     max_num_seqs_from_scrape(&scrape)
 }
 
+/// Tolerance for "running equals max_num_seqs" on a single scrape.
+/// Above `max + tolerance` is chunked cross-step batching, not a seat wall.
+pub(crate) const SEAT_WALL_CAP_TOLERANCE: f64 = 0.5;
+
+/// Waiting floor for same-sample seat-wall co-occurrence (matches R5 / R1 / R2).
+pub(crate) const SEAT_WALL_WAITING_MIN: f64 = 2.0;
+
+/// True when one scrape shows seats at the cap and a real wait line.
+/// `running > max + tolerance` does not match (chunked prefill).
+pub(crate) fn sample_seat_wall_cooccurred(running: f64, waiting: f64, max_num_seqs: u32) -> bool {
+    if !running.is_finite() || !waiting.is_finite() || max_num_seqs == 0 {
+        return false;
+    }
+    let max = f64::from(max_num_seqs);
+    let at_cap = (running - max).abs() <= SEAT_WALL_CAP_TOLERANCE;
+    at_cap && waiting >= SEAT_WALL_WAITING_MIN
+}
+
+/// Fold one scrape into the window seat-wall flag.
+/// `None` stays until max is known and both gauges are finite on a sample.
+/// A later sample with unread max does not erase a prior true/false.
+pub(crate) fn absorb_seat_wall_sample(
+    flag: Option<bool>,
+    running: Option<f64>,
+    waiting: Option<f64>,
+    max_num_seqs: Option<u32>,
+) -> Option<bool> {
+    let Some(max) = max_num_seqs.filter(|&n| n > 0) else {
+        return flag;
+    };
+    let (Some(run), Some(wait)) = (running, waiting) else {
+        return flag;
+    };
+    if !run.is_finite() || !wait.is_finite() {
+        return flag;
+    }
+    let hit = sample_seat_wall_cooccurred(run, wait, max);
+    Some(flag.unwrap_or(false) || hit)
+}
+
 pub fn collect_vllm_metrics_for(
     input: &str,
     window: Duration,
+    known_max_num_seqs: Option<u32>,
 ) -> Result<(VllmRawMetrics, SystemTime)> {
     let client = reqwest::blocking::Client::builder()
         .timeout(REQ_TIMEOUT)
@@ -557,6 +598,7 @@ pub fn collect_vllm_metrics_for(
     let mut kv_cache_peak_perc: Option<f64> = None;
     let mut num_requests_running_peak: Option<f64> = None;
     let mut num_requests_waiting_peak: Option<f64> = None;
+    let mut seat_wall_cooccurred: Option<bool> = None;
 
     run_sampling_loop(sample_count, |i| {
         let body = fetch_metrics_body(&client, &url)?;
@@ -564,14 +606,16 @@ pub fn collect_vllm_metrics_for(
         if let Some(k) = kv_cache_usage_perc_from_scrape(&scrape).filter(|x| x.is_finite()) {
             kv_cache_peak_perc = Some(kv_cache_peak_perc.map_or(k, |p| p.max(k)));
         }
-        if let Some(r) = first_gauge(&scrape, "vllm_num_requests_running").filter(|x| x.is_finite())
-        {
+        let run = first_gauge(&scrape, "vllm_num_requests_running").filter(|x| x.is_finite());
+        if let Some(r) = run {
             num_requests_running_peak = Some(num_requests_running_peak.map_or(r, |p| p.max(r)));
         }
-        if let Some(w) = first_gauge(&scrape, "vllm_num_requests_waiting").filter(|x| x.is_finite())
-        {
+        let wait = first_gauge(&scrape, "vllm_num_requests_waiting").filter(|x| x.is_finite());
+        if let Some(w) = wait {
             num_requests_waiting_peak = Some(num_requests_waiting_peak.map_or(w, |p| p.max(w)));
         }
+        let max_seqs = max_num_seqs_from_scrape(&scrape).or(known_max_num_seqs);
+        seat_wall_cooccurred = absorb_seat_wall_sample(seat_wall_cooccurred, run, wait, max_seqs);
         prefix_samples.push(prefix_scrape_sample(&scrape));
 
         if i == 0 {
@@ -595,6 +639,7 @@ pub fn collect_vllm_metrics_for(
     m.kv_cache_peak_perc = kv_cache_peak_perc;
     m.num_requests_running_peak = num_requests_running_peak;
     m.num_requests_waiting_peak = num_requests_waiting_peak;
+    m.seat_wall_cooccurred = seat_wall_cooccurred;
 
     let rates = compute_counter_rates(&first_scrape, &last_scrape, window_secs);
     m.generation_tokens_per_sec = rates.generation_tokens_per_sec;
@@ -742,6 +787,7 @@ fn parse_vllm_metrics(scrape: &Scrape) -> Result<VllmRawMetrics> {
         num_requests_running_peak: None,
         num_requests_waiting,
         num_requests_waiting_peak: None,
+        seat_wall_cooccurred: None,
         kv_frac_per_running_peak: None,
         kv_cache_usage_perc,
         kv_cache_avg_perc: None,
@@ -816,6 +862,68 @@ vllm:generation_tokens_total{model_name="llama3"} 99
             "parse-only must not set windowed counters"
         );
         assert!(m.prompt_tokens_mean.is_none());
+    }
+
+    #[test]
+    fn sample_seat_wall_at_cap_with_queue() {
+        assert!(sample_seat_wall_cooccurred(1024.0, 10.0, 1024));
+        assert!(sample_seat_wall_cooccurred(1023.6, 2.0, 1024));
+        assert!(!sample_seat_wall_cooccurred(1015.0, 10_535.0, 1024));
+        assert!(!sample_seat_wall_cooccurred(1024.0, 1.0, 1024));
+        assert!(!sample_seat_wall_cooccurred(1030.0, 10.0, 1024));
+    }
+
+    #[test]
+    fn absorb_seat_wall_oscillating_journey_sets_flag() {
+        let max = Some(1024u32);
+        let mut flag = None;
+        // Mean-like samples under the cap with a queue do not set the flag alone.
+        flag = absorb_seat_wall_sample(flag, Some(1010.0), Some(10_000.0), max);
+        assert_eq!(flag, Some(false));
+        flag = absorb_seat_wall_sample(flag, Some(1015.0), Some(10_535.0), max);
+        assert_eq!(flag, Some(false));
+        // One sample at the cap with a line outside.
+        flag = absorb_seat_wall_sample(flag, Some(1024.0), Some(10_535.0), max);
+        assert_eq!(flag, Some(true));
+    }
+
+    #[test]
+    fn absorb_seat_wall_timing_mismatch_never_sets() {
+        let max = Some(1024u32);
+        let mut flag = None;
+        flag = absorb_seat_wall_sample(flag, Some(1024.0), Some(1.0), max);
+        assert_eq!(flag, Some(false));
+        flag = absorb_seat_wall_sample(flag, Some(900.0), Some(200.0), max);
+        assert_eq!(flag, Some(false));
+    }
+
+    #[test]
+    fn absorb_seat_wall_chunked_above_max_ignored() {
+        let max = Some(32u32);
+        let flag = absorb_seat_wall_sample(None, Some(1030.0), Some(15.0), max);
+        assert_eq!(flag, Some(false));
+    }
+
+    #[test]
+    fn absorb_seat_wall_unread_max_preserves_prior_flag() {
+        let mut flag = absorb_seat_wall_sample(None, Some(32.0), Some(15.0), Some(32));
+        assert_eq!(flag, Some(true));
+        flag = absorb_seat_wall_sample(flag, Some(32.0), Some(15.0), None);
+        assert_eq!(flag, Some(true));
+        flag = absorb_seat_wall_sample(Some(false), Some(10.0), Some(15.0), None);
+        assert_eq!(flag, Some(false));
+    }
+
+    #[test]
+    fn absorb_seat_wall_unread_max_stays_none() {
+        let flag = absorb_seat_wall_sample(None, Some(32.0), Some(15.0), None);
+        assert_eq!(flag, None);
+    }
+
+    #[test]
+    fn absorb_seat_wall_uses_known_max_when_scrape_omits() {
+        let flag = absorb_seat_wall_sample(None, Some(32.0), Some(15.0), Some(32));
+        assert_eq!(flag, Some(true));
     }
 
     #[test]

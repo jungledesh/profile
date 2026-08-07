@@ -238,6 +238,7 @@ fn mk_evaluable_concurrency_saturation_window(
     v.num_requests_running = Some(run);
     v.num_requests_waiting = Some(wait);
     v.max_num_seqs = Some(max_num_seqs);
+    v.seat_wall_cooccurred = Some(true);
     v.generation_tokens_per_sec = Some(100.0);
     mk_win(snap(t, t, v, gpu_busy()))
 }
@@ -1541,6 +1542,7 @@ fn operator_text_has_no_capacity_numbers_in_r1_r2_r5_r7() {
                 num_requests_running: Some(32.0),
                 num_requests_waiting: Some(15.0),
                 max_num_seqs: Some(32),
+                seat_wall_cooccurred: Some(true),
                 kv_cache_usage_perc: Some(70.0),
                 generation_tokens_per_sec: Some(100.0),
                 ..Default::default()
@@ -3652,9 +3654,11 @@ fn format_diagnose_rules_for_windows_matches_requested_style_when_some_rules_fir
 fn format_diagnose_rules_for_windows_no_fires_is_single_no_issues_line() {
     let t = SystemTime::UNIX_EPOCH;
     let mut v = vllm_base();
-    v.num_requests_running = Some(20.0);
-    v.num_requests_waiting = Some(3.0);
-    v.kv_cache_usage_perc = Some(71.2);
+    // Healthy quiet path: hot batch (no R1), no queue (limiter may speak), no seat wall.
+    v.num_requests_running = Some(200.0);
+    v.num_requests_waiting = Some(0.0);
+    v.kv_cache_usage_perc = Some(50.0);
+    v.tpot_ms = Some(50.0);
     v.prefix_cache_hit_rate = Some(0.524);
     v.prompt_tokens_mean = Some(128.0);
     v.generation_tokens_per_sec = Some(100.0);
@@ -3686,6 +3690,50 @@ fn format_diagnose_rules_for_windows_no_fires_is_single_no_issues_line() {
     assert!(
         lines.get(1).is_some_and(|l| l.starts_with("Capped by ")),
         "expected limiter line, got: {lines:?}"
+    );
+}
+
+#[test]
+fn no_rules_with_queue_prints_no_capped_by_line() {
+    let t = SystemTime::UNIX_EPOCH;
+    let mut v = vllm_base();
+    // Case 3 shape: queue present, seats free, no R5 flag → silence, not healthy cap.
+    v.num_requests_running = Some(200.0);
+    v.num_requests_waiting = Some(10_000.0);
+    v.seat_wall_cooccurred = Some(false);
+    v.kv_cache_usage_perc = Some(50.0);
+    v.tpot_ms = Some(50.0);
+    v.prefix_cache_hit_rate = Some(0.524);
+    v.prompt_tokens_mean = Some(128.0);
+    v.generation_tokens_per_sec = Some(100.0);
+    v.model_name = Some("meta-llama/Llama-3.1-8B-Instruct".to_string());
+    let mut g = gpu_busy();
+    g.gpu_util_pct = Some(74.0);
+    g.gpu_name = Some("NVIDIA H100 80GB HBM3".to_string());
+    g.vram_total_mb = Some(80 * 1024);
+    let snap = snap(t, t, v, g);
+    let cfg = VllmConfig {
+        dtype: Some("bf16".to_string()),
+        max_model_len: Some(2048),
+        ..Default::default()
+    };
+    let ctx = StaticContext::from_snapshot(&snap, cfg);
+    let win = mk_win(snap);
+    let windows = vec![win.clone(), win.clone(), win];
+    let summary = ai(&ctx, windows.last().expect("windows"));
+    let lines = format_diagnose_rules_for_windows_test(
+        &windows,
+        summary,
+        false,
+        "http://127.0.0.1:8000/metrics",
+    );
+    assert_eq!(
+        lines.first().map(String::as_str),
+        Some("No issues detected.")
+    );
+    assert!(
+        lines.iter().all(|l| !l.starts_with("Capped by ")),
+        "queue present must not get healthy Capped by, got: {lines:?}"
     );
 }
 

@@ -99,6 +99,7 @@ pub(super) fn aggregate_windows(
     agg_v.num_requests_running_peak = num_requests_running_peak(&evaluable_pairs, last);
     agg_v.num_requests_waiting = weighted_mean(&active_pairs, |w| w.vllm.num_requests_waiting);
     agg_v.num_requests_waiting_peak = num_requests_waiting_peak(&evaluable_pairs, last);
+    agg_v.seat_wall_cooccurred = seat_wall_cooccurred_aggregate(&evaluable_pairs);
     agg_v.kv_frac_per_running_peak = kv_frac_per_running_peak(&active_pairs);
     let kv_avg = weighted_mean(&evaluable_pairs, |w| w.vllm.kv_cache_usage_perc);
     agg_v.kv_cache_usage_perc = kv_avg;
@@ -281,6 +282,19 @@ fn window_kv_frac_per_running(w: &collectors::RawSnapshot) -> Option<f64> {
     let kv = w.vllm.kv_cache_usage_perc.filter(|k| k.is_finite())?;
     let frac = (kv / 100.0) / running;
     frac.is_finite().then_some(frac)
+}
+
+/// OR across windows: any true wins; else any false → false; else None.
+fn seat_wall_cooccurred_aggregate(pairs: &[(&collectors::RawSnapshot, Duration)]) -> Option<bool> {
+    let mut saw_false = false;
+    for (w, _) in pairs {
+        match w.vllm.seat_wall_cooccurred {
+            Some(true) => return Some(true),
+            Some(false) => saw_false = true,
+            None => {}
+        }
+    }
+    if saw_false { Some(false) } else { None }
 }
 
 /// `max(per-window peaks, last-evaluable landing running)` - mean would hide the

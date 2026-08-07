@@ -31,14 +31,16 @@ pub struct ConcurrencySaturationDetail {
     pub kv_cache_usage_perc: Option<f64>,
 }
 
-/// Chunked prefill can batch `running` above `max_num_seqs` across steps; cap is not the constraint.
-const CHUNKED_PREFILL_TOLERANCE: f64 = 0.5;
-
 pub fn rule5_concurrency_saturation(
     snapshot: &RawSnapshot,
     kv_cache_usage_perc: Option<f64>,
     config_max_num_seqs: Option<u32>,
 ) -> Option<ConcurrencySaturationDetail> {
+    // Seat wall: same-sample co-occurrence during the window (collector flag).
+    // No fallback: uncomputable or never co-occurred → silent.
+    if snapshot.vllm.seat_wall_cooccurred != Some(true) {
+        return None;
+    }
     let run = snapshot
         .vllm
         .num_requests_running
@@ -48,11 +50,6 @@ pub fn rule5_concurrency_saturation(
         .max_num_seqs
         .or(config_max_num_seqs)
         .filter(|&n| n > 0)?;
-    // Exact equality: scheduler cap is the bottleneck.
-    // run > max_seqs means chunked prefill is batching across steps; cap is not the constraint.
-    if (run - f64::from(max_seqs)).abs() > CHUNKED_PREFILL_TOLERANCE {
-        return None;
-    }
     let wait = snapshot
         .vllm
         .num_requests_waiting
@@ -538,9 +535,21 @@ mod tests {
             num_requests_running: Some(run),
             num_requests_waiting: Some(wait),
             max_num_seqs,
+            seat_wall_cooccurred: Some(true),
             generation_tokens_per_sec: Some(100.0),
             ..Default::default()
         }
+    }
+
+    fn sat_vllm_flag(
+        run: f64,
+        wait: f64,
+        max_num_seqs: Option<u32>,
+        flag: Option<bool>,
+    ) -> VllmRawMetrics {
+        let mut v = sat_vllm(run, wait, max_num_seqs);
+        v.seat_wall_cooccurred = flag;
+        v
     }
 
     fn fired_detail(
@@ -570,10 +579,48 @@ mod tests {
     }
 
     #[test]
-    fn silent_when_run_below_max_num_seqs() {
+    fn fires_when_landing_below_max_if_seat_wall_flag_set() {
+        // Journey shape: window mean under cap, same-sample co-occurrence during window.
+        let d =
+            rule5_concurrency_saturation(&snap(sat_vllm(1015.0, 10_535.0, Some(1024))), None, None)
+                .expect("fired");
+        assert_eq!(d.max_num_seqs, Some(1024));
+    }
+
+    #[test]
+    fn silent_when_seat_wall_flag_false() {
         assert!(
-            rule5_concurrency_saturation(&snap(sat_vllm(31.0, 15.0, Some(32))), None, None)
-                .is_none()
+            rule5_concurrency_saturation(
+                &snap(sat_vllm_flag(32.0, 15.0, Some(32), Some(false))),
+                None,
+                None
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn silent_when_seat_wall_flag_unread() {
+        assert!(
+            rule5_concurrency_saturation(
+                &snap(sat_vllm_flag(32.0, 15.0, Some(32), None)),
+                None,
+                None
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn silent_when_timing_mismatch_flag_never_set() {
+        // Seats full early, queue only later: collector never saw both → flag false.
+        assert!(
+            rule5_concurrency_saturation(
+                &snap(sat_vllm_flag(900.0, 200.0, Some(1024), Some(false))),
+                None,
+                None
+            )
+            .is_none()
         );
     }
 
@@ -624,11 +671,28 @@ mod tests {
     }
 
     #[test]
-    fn silent_when_run_exceeds_max_num_seqs_chunked_prefill() {
+    fn silent_when_landing_above_max_without_flag() {
+        // Chunked samples above max never set the flag.
         assert!(
-            rule5_concurrency_saturation(&snap(sat_vllm(40.0, 15.0, Some(32))), None, None)
-                .is_none()
+            rule5_concurrency_saturation(
+                &snap(sat_vllm_flag(40.0, 15.0, Some(32), Some(false))),
+                None,
+                None
+            )
+            .is_none()
         );
+    }
+
+    #[test]
+    fn fires_when_landing_above_max_if_flag_set_earlier_in_window() {
+        // At-cap sample earlier set the flag; landing can show chunked > max.
+        let d = rule5_concurrency_saturation(
+            &snap(sat_vllm_flag(40.0, 30.0, Some(32), Some(true))),
+            None,
+            None,
+        )
+        .expect("flag owns seat check");
+        assert_eq!(d.max_num_seqs, Some(32));
     }
 
     #[test]
