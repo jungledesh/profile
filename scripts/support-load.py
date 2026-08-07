@@ -39,7 +39,9 @@ Soften live with knobs if the top stage overwhelms before profile can attach.
 Default stages 0.3/1.3/5 conversations/s; at ~2.5 turns per conversation
 that is ~0.8/3.2/12.8 requests/s (~16/64/256 expected in-flight at typical
 service times). Top stage is meant to hurt. Requires aiohttp (present in any
-vLLM environment). Ctrl-C stops.
+vLLM environment). Connection pool defaults to unlimited (aiohttp's stock
+limit of 100 would cap delivered concurrency and make the server look
+under-fed). Ctrl-C stops.
 """
 
 import argparse
@@ -715,7 +717,11 @@ async def run(args: argparse.Namespace, model: str) -> None:
     stats = Stats()
     stage_label = ["stage 0"]
     timeout = aiohttp.ClientTimeout(total=args.request_timeout)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    # aiohttp TCPConnector default limit=100. Tasks past that wait for a socket
+    # client-side while stats.inflight still climbs, so the server looks under-fed.
+    # limit=0 is unlimited (aiohttp docs).
+    connector = aiohttp.TCPConnector(limit=args.max_connections)
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         rep = asyncio.create_task(reporter(stats, stage_label))
         jit = asyncio.create_task(jitter_loop(stats, args, rng))
         tasks: set[asyncio.Task] = set()
@@ -765,10 +771,18 @@ def main() -> None:
                    help="min,max seconds of customer think time between turns")
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--request-timeout", type=float, default=600.0)
+    p.add_argument(
+        "--max-connections",
+        type=int,
+        default=0,
+        help="max concurrent TCP connections (0 = unlimited; aiohttp default is 100)",
+    )
     args = p.parse_args()
     args.qps = [float(x) for x in args.qps.split(",") if x.strip()]
     if not args.qps or any(not 0 < q < float("inf") for q in args.qps):
         p.error("--qps needs finite positive comma-separated rates")
+    if args.max_connections < 0:
+        p.error("--max-connections must be >= 0 (0 = unlimited)")
     lo, hi = (float(x) for x in args.think_secs.split(","))
     args.think_secs = (lo, hi)
 
@@ -781,9 +795,12 @@ def main() -> None:
         or os.environ.get("SERVED_NAME")
         or FAMILY_DEFAULTS[profile_model]
     )
-    print(f"target {args.url} model {model} conv-qps stages {args.qps} "
-          f"stage {args.stage_secs}s knobs {args.knobs} {read_knobs(args.knobs)}",
-          flush=True)
+    print(
+        f"target {args.url} model {model} conv-qps stages {args.qps} "
+        f"stage {args.stage_secs}s max_connections={args.max_connections} "
+        f"knobs {args.knobs} {read_knobs(args.knobs)}",
+        flush=True,
+    )
     try:
         asyncio.run(run(args, model))
     except KeyboardInterrupt:
