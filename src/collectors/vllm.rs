@@ -3,7 +3,7 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Context, Result};
 use prometheus_parse::{HistogramCount, Scrape, Value};
 
-use super::sampling::{run_sampling_loop, sample_count_for};
+use super::sampling::{SAMPLE_INTERVAL, run_sampling_loop, sample_count_for};
 use super::types::{
     CacheConfigLabels, HistogramWindowMass, PrefixCacheScrapeSample, VllmRawMetrics,
 };
@@ -540,44 +540,87 @@ pub(crate) fn preflight_max_num_seqs(url: &str, timeout: Duration) -> Option<u32
     max_num_seqs_from_scrape(&scrape)
 }
 
-/// Tolerance for "running equals max_num_seqs" on a single scrape.
-/// Above `max + tolerance` is chunked cross-step batching, not a seat wall.
-pub(crate) const SEAT_WALL_CAP_TOLERANCE: f64 = 0.5;
+/// Upper slack for "at the seat cap". Above `max + this` is chunked cross-step
+/// batching, not a seat wall. Still counts as an evaluated sample (not a hit).
+pub(crate) const SEAT_WALL_CHUNKED_ABOVE: f64 = 0.5;
 
 /// Waiting floor for same-sample seat-wall co-occurrence (matches R5 / R1 / R2).
 pub(crate) const SEAT_WALL_WAITING_MIN: f64 = 2.0;
 
-/// True when one scrape shows seats at the cap and a real wait line.
-/// `running > max + tolerance` does not match (chunked prefill).
-pub(crate) fn sample_seat_wall_cooccurred(running: f64, waiting: f64, max_num_seqs: u32) -> bool {
-    if !running.is_finite() || !waiting.is_finite() || max_num_seqs == 0 {
+/// Floor on churn slack (seats). Missing/NaN completion rate clamps here.
+pub(crate) const SEAT_WALL_SLACK_FLOOR: f64 = 1.0;
+
+/// Cap on churn slack as a fraction of `max_num_seqs` (1%).
+/// Calibrated on MI300X + Gemma flood: histogram gaps 2–7 seats at max 1024;
+/// 1% covers that cluster. Small max (e.g. 64) keeps floor/cap at 1 so deep
+/// under-cap queues (58/64) stay out.
+pub(crate) const SEAT_WALL_SLACK_CAP_FRAC: f64 = 0.01;
+
+/// One scrape eligible for seat-wall evaluation (max known, gauges finite).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SeatWallSample {
+    pub running: f64,
+    pub waiting: f64,
+    pub max_num_seqs: u32,
+}
+
+/// Churn slack for this window: expected seat turnover between scrapes.
+/// `raw = completions_per_sec × SAMPLE_INTERVAL`; clamp to `[floor, max(1%, max)]`.
+/// Cap is `(0.01 × max).max(floor)` so small `max` never panics the clamp.
+pub(crate) fn seat_wall_slack(completions_per_sec: Option<f64>, max_num_seqs: u32) -> f64 {
+    let cap = (SEAT_WALL_SLACK_CAP_FRAC * f64::from(max_num_seqs)).max(SEAT_WALL_SLACK_FLOOR);
+    let raw = completions_per_sec
+        .filter(|r| r.is_finite() && *r >= 0.0)
+        .map(|r| r * SAMPLE_INTERVAL.as_secs_f64())
+        .unwrap_or(0.0);
+    let raw = if raw.is_finite() { raw } else { 0.0 };
+    raw.clamp(SEAT_WALL_SLACK_FLOOR, cap)
+}
+
+/// True when one scrape shows seats in the churn band at the cap and a real wait line.
+/// `running > max + SEAT_WALL_CHUNKED_ABOVE` does not match (chunked prefill).
+pub(crate) fn sample_seat_wall_cooccurred(
+    running: f64,
+    waiting: f64,
+    max_num_seqs: u32,
+    slack: f64,
+) -> bool {
+    if !running.is_finite() || !waiting.is_finite() || max_num_seqs == 0 || !slack.is_finite() {
+        return false;
+    }
+    if waiting < SEAT_WALL_WAITING_MIN {
         return false;
     }
     let max = f64::from(max_num_seqs);
-    let at_cap = (running - max).abs() <= SEAT_WALL_CAP_TOLERANCE;
-    at_cap && waiting >= SEAT_WALL_WAITING_MIN
+    // Chunked cross-step: above the cap band → not a hit (still an evaluated sample upstream).
+    if running > max + SEAT_WALL_CHUNKED_ABOVE {
+        return false;
+    }
+    running >= max - slack
 }
 
-/// Fold one scrape into the window seat-wall flag.
-/// `None` stays until max is known and both gauges are finite on a sample.
-/// A later sample with unread max does not erase a prior true/false.
-pub(crate) fn absorb_seat_wall_sample(
-    flag: Option<bool>,
-    running: Option<f64>,
-    waiting: Option<f64>,
-    max_num_seqs: Option<u32>,
+/// End-of-window seat-wall flag from stored samples + this window's completion rate.
+///
+/// Truth table:
+/// - no evaluable samples → `None` (R5 silent)
+/// - any hit → `Some(true)`
+/// - only misses (including chunked-above) → `Some(false)`
+pub(crate) fn evaluate_seat_wall_cooccurred(
+    samples: &[SeatWallSample],
+    completions_per_sec: Option<f64>,
 ) -> Option<bool> {
-    let Some(max) = max_num_seqs.filter(|&n| n > 0) else {
-        return flag;
-    };
-    let (Some(run), Some(wait)) = (running, waiting) else {
-        return flag;
-    };
-    if !run.is_finite() || !wait.is_finite() {
-        return flag;
+    if samples.is_empty() {
+        return None;
     }
-    let hit = sample_seat_wall_cooccurred(run, wait, max);
-    Some(flag.unwrap_or(false) || hit)
+    let mut hit = false;
+    for s in samples {
+        let slack = seat_wall_slack(completions_per_sec, s.max_num_seqs);
+        if sample_seat_wall_cooccurred(s.running, s.waiting, s.max_num_seqs, slack) {
+            hit = true;
+            break;
+        }
+    }
+    Some(hit)
 }
 
 pub fn collect_vllm_metrics_for(
@@ -598,7 +641,7 @@ pub fn collect_vllm_metrics_for(
     let mut kv_cache_peak_perc: Option<f64> = None;
     let mut num_requests_running_peak: Option<f64> = None;
     let mut num_requests_waiting_peak: Option<f64> = None;
-    let mut seat_wall_cooccurred: Option<bool> = None;
+    let mut seat_wall_samples: Vec<SeatWallSample> = Vec::with_capacity(sample_count);
 
     run_sampling_loop(sample_count, |i| {
         let body = fetch_metrics_body(&client, &url)?;
@@ -615,7 +658,15 @@ pub fn collect_vllm_metrics_for(
             num_requests_waiting_peak = Some(num_requests_waiting_peak.map_or(w, |p| p.max(w)));
         }
         let max_seqs = max_num_seqs_from_scrape(&scrape).or(known_max_num_seqs);
-        seat_wall_cooccurred = absorb_seat_wall_sample(seat_wall_cooccurred, run, wait, max_seqs);
+        // Store only evaluable samples; unread max / non-finite gauges skip (no wipe).
+        if let (Some(max), Some(running), Some(waiting)) = (max_seqs.filter(|&n| n > 0), run, wait)
+        {
+            seat_wall_samples.push(SeatWallSample {
+                running,
+                waiting,
+                max_num_seqs: max,
+            });
+        }
         prefix_samples.push(prefix_scrape_sample(&scrape));
 
         if i == 0 {
@@ -639,7 +690,6 @@ pub fn collect_vllm_metrics_for(
     m.kv_cache_peak_perc = kv_cache_peak_perc;
     m.num_requests_running_peak = num_requests_running_peak;
     m.num_requests_waiting_peak = num_requests_waiting_peak;
-    m.seat_wall_cooccurred = seat_wall_cooccurred;
 
     let rates = compute_counter_rates(&first_scrape, &last_scrape, window_secs);
     m.generation_tokens_per_sec = rates.generation_tokens_per_sec;
@@ -656,6 +706,9 @@ pub fn collect_vllm_metrics_for(
         total_preemptions(&last_scrape),
         window_secs,
     );
+    // Slack needs this window's completion rate; evaluate after rates are known.
+    m.seat_wall_cooccurred =
+        evaluate_seat_wall_cooccurred(&seat_wall_samples, m.request_success_per_sec);
 
     apply_histogram_window(&first_scrape, &last_scrape, &mut m);
 
@@ -865,65 +918,153 @@ vllm:generation_tokens_total{model_name="llama3"} 99
     }
 
     #[test]
+    fn seat_wall_slack_floors_and_caps() {
+        // Missing rate → floor 1.
+        assert!((seat_wall_slack(None, 1024) - 1.0).abs() < 1e-12);
+        assert!((seat_wall_slack(Some(f64::NAN), 1024) - 1.0).abs() < 1e-12);
+        // Low rate clamps to floor.
+        assert!((seat_wall_slack(Some(0.0), 1024) - 1.0).abs() < 1e-12);
+        // 40 completions/s × 0.25s = 10 seats; cap at 1% of 1024 = 10.24.
+        assert!((seat_wall_slack(Some(40.0), 1024) - 10.0).abs() < 1e-12);
+        // High rate clamps to cap.
+        assert!((seat_wall_slack(Some(200.0), 1024) - 10.24).abs() < 1e-12);
+        // Small max: cap = max(0.01×64, 1) = 1; never below floor.
+        assert!((seat_wall_slack(Some(100.0), 64) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
     fn sample_seat_wall_at_cap_with_queue() {
-        assert!(sample_seat_wall_cooccurred(1024.0, 10.0, 1024));
-        assert!(sample_seat_wall_cooccurred(1023.6, 2.0, 1024));
-        assert!(!sample_seat_wall_cooccurred(1015.0, 10_535.0, 1024));
-        assert!(!sample_seat_wall_cooccurred(1024.0, 1.0, 1024));
-        assert!(!sample_seat_wall_cooccurred(1030.0, 10.0, 1024));
+        let slack = 1.0;
+        assert!(sample_seat_wall_cooccurred(1024.0, 10.0, 1024, slack));
+        assert!(sample_seat_wall_cooccurred(1023.6, 2.0, 1024, slack));
+        assert!(!sample_seat_wall_cooccurred(1015.0, 10_535.0, 1024, slack));
+        assert!(!sample_seat_wall_cooccurred(1024.0, 1.0, 1024, slack));
+        assert!(!sample_seat_wall_cooccurred(1030.0, 10.0, 1024, slack));
     }
 
     #[test]
-    fn absorb_seat_wall_oscillating_journey_sets_flag() {
-        let max = Some(1024u32);
-        let mut flag = None;
-        // Mean-like samples under the cap with a queue do not set the flag alone.
-        flag = absorb_seat_wall_sample(flag, Some(1010.0), Some(10_000.0), max);
-        assert_eq!(flag, Some(false));
-        flag = absorb_seat_wall_sample(flag, Some(1015.0), Some(10_535.0), max);
-        assert_eq!(flag, Some(false));
-        // One sample at the cap with a line outside.
-        flag = absorb_seat_wall_sample(flag, Some(1024.0), Some(10_535.0), max);
-        assert_eq!(flag, Some(true));
+    fn sample_seat_wall_churn_band_covers_near_miss() {
+        // MI300X flood mode ~1018 with slack ~10 (40 qps × 0.25s).
+        let slack = seat_wall_slack(Some(40.0), 1024);
+        assert!(slack >= 6.0);
+        assert!(sample_seat_wall_cooccurred(1018.0, 6740.0, 1024, slack));
+        assert!(sample_seat_wall_cooccurred(1017.0, 6740.0, 1024, slack));
+        // Still outside 1% band.
+        assert!(!sample_seat_wall_cooccurred(1000.0, 6740.0, 1024, slack));
     }
 
     #[test]
-    fn absorb_seat_wall_timing_mismatch_never_sets() {
-        let max = Some(1024u32);
-        let mut flag = None;
-        flag = absorb_seat_wall_sample(flag, Some(1024.0), Some(1.0), max);
-        assert_eq!(flag, Some(false));
-        flag = absorb_seat_wall_sample(flag, Some(900.0), Some(200.0), max);
-        assert_eq!(flag, Some(false));
+    fn evaluate_seat_wall_empty_is_none() {
+        assert_eq!(evaluate_seat_wall_cooccurred(&[], Some(40.0)), None);
     }
 
     #[test]
-    fn absorb_seat_wall_chunked_above_max_ignored() {
-        let max = Some(32u32);
-        let flag = absorb_seat_wall_sample(None, Some(1030.0), Some(15.0), max);
-        assert_eq!(flag, Some(false));
+    fn evaluate_seat_wall_mi300x_flood_cluster_sets_flag() {
+        let samples = [
+            SeatWallSample {
+                running: 1010.0,
+                waiting: 10_000.0,
+                max_num_seqs: 1024,
+            },
+            SeatWallSample {
+                running: 1015.0,
+                waiting: 10_535.0,
+                max_num_seqs: 1024,
+            },
+            SeatWallSample {
+                running: 1018.0,
+                waiting: 6_740.0,
+                max_num_seqs: 1024,
+            },
+        ];
+        // Floor-only slack (no completions) misses the cluster.
+        assert_eq!(evaluate_seat_wall_cooccurred(&samples, None), Some(false));
+        // Flood completion rate covers gaps of 2–7 seats.
+        assert_eq!(
+            evaluate_seat_wall_cooccurred(&samples, Some(40.0)),
+            Some(true)
+        );
     }
 
     #[test]
-    fn absorb_seat_wall_unread_max_preserves_prior_flag() {
-        let mut flag = absorb_seat_wall_sample(None, Some(32.0), Some(15.0), Some(32));
-        assert_eq!(flag, Some(true));
-        flag = absorb_seat_wall_sample(flag, Some(32.0), Some(15.0), None);
-        assert_eq!(flag, Some(true));
-        flag = absorb_seat_wall_sample(Some(false), Some(10.0), Some(15.0), None);
-        assert_eq!(flag, Some(false));
+    fn evaluate_seat_wall_timing_mismatch_never_sets() {
+        let samples = [
+            SeatWallSample {
+                running: 1024.0,
+                waiting: 1.0,
+                max_num_seqs: 1024,
+            },
+            SeatWallSample {
+                running: 900.0,
+                waiting: 200.0,
+                max_num_seqs: 1024,
+            },
+        ];
+        assert_eq!(
+            evaluate_seat_wall_cooccurred(&samples, Some(40.0)),
+            Some(false)
+        );
     }
 
     #[test]
-    fn absorb_seat_wall_unread_max_stays_none() {
-        let flag = absorb_seat_wall_sample(None, Some(32.0), Some(15.0), None);
-        assert_eq!(flag, None);
+    fn evaluate_seat_wall_chunked_above_max_is_evaluated_false() {
+        // Matches prior Some(false) semantics: sample counts, hit does not.
+        let samples = [SeatWallSample {
+            running: 1030.0,
+            waiting: 15.0,
+            max_num_seqs: 32,
+        }];
+        assert_eq!(
+            evaluate_seat_wall_cooccurred(&samples, Some(10.0)),
+            Some(false)
+        );
     }
 
     #[test]
-    fn absorb_seat_wall_uses_known_max_when_scrape_omits() {
-        let flag = absorb_seat_wall_sample(None, Some(32.0), Some(15.0), Some(32));
-        assert_eq!(flag, Some(true));
+    fn evaluate_seat_wall_small_max_keeps_deep_undercap_out() {
+        // Cap/floor → slack 1; 58/64 with a queue is not a seat wall.
+        let samples = [SeatWallSample {
+            running: 58.0,
+            waiting: 100.0,
+            max_num_seqs: 64,
+        }];
+        assert_eq!(
+            evaluate_seat_wall_cooccurred(&samples, Some(200.0)),
+            Some(false)
+        );
+        let at_cap = [SeatWallSample {
+            running: 64.0,
+            waiting: 100.0,
+            max_num_seqs: 64,
+        }];
+        assert_eq!(
+            evaluate_seat_wall_cooccurred(&at_cap, Some(200.0)),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn evaluate_seat_wall_unread_max_samples_omitted() {
+        // Collection only pushes when max is known; empty → None.
+        assert_eq!(evaluate_seat_wall_cooccurred(&[], None), None);
+        // Prior evaluable samples still decide; unread scrapes are simply absent.
+        let prior = [SeatWallSample {
+            running: 32.0,
+            waiting: 15.0,
+            max_num_seqs: 32,
+        }];
+        assert_eq!(evaluate_seat_wall_cooccurred(&prior, None), Some(true));
+    }
+
+    #[test]
+    fn evaluate_seat_wall_uses_known_max_when_scrape_omits() {
+        // known_max_num_seqs path: sample stored with diagnose-passed max.
+        let samples = [SeatWallSample {
+            running: 32.0,
+            waiting: 15.0,
+            max_num_seqs: 32,
+        }];
+        assert_eq!(evaluate_seat_wall_cooccurred(&samples, None), Some(true));
     }
 
     #[test]

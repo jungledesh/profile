@@ -36,7 +36,7 @@ pub fn rule5_concurrency_saturation(
     kv_cache_usage_perc: Option<f64>,
     config_max_num_seqs: Option<u32>,
 ) -> Option<ConcurrencySaturationDetail> {
-    // Seat wall: same-sample co-occurrence during the window (collector flag).
+    // Seat wall: end-of-window co-occurrence flag from the collector (churn slack).
     // No fallback: uncomputable or never co-occurred → silent.
     if snapshot.vllm.seat_wall_cooccurred != Some(true) {
         return None;
@@ -308,7 +308,9 @@ pub(super) fn format_concurrency_saturation_issue_with_terminal(
         "[!] Concurrency Saturation".to_string(),
         String::new(),
         "    Cause:".to_string(),
-        format!("      • --max-num-seqs={max_str} hit: scheduler won't admit more sequences"),
+        format!(
+            "      • --max-num-seqs={max_str} filled to the limit at least once; running below is averaged"
+        ),
         format!(
             "      • {:.0}% of requests waiting ({:.0} waiting, {:.0} running)",
             display_queue_pct, display_wait, display_run
@@ -804,6 +806,36 @@ mod tests {
         .join("\n");
         assert!(text.contains("Add a replica to scale out"));
         assert!(!text.contains("--max-model-len"));
+    }
+
+    #[test]
+    fn cause_seat_line_names_in_window_cap_not_hit() {
+        let mut d = fired_detail(None, Some(50.0));
+        d.max_num_seqs = Some(1024);
+        d.requests_running = 1015.0;
+        d.requests_waiting = 10_535.0;
+        let s = snap(VllmRawMetrics {
+            num_requests_running: Some(1015.0),
+            num_requests_waiting: Some(10_535.0),
+            max_num_seqs: Some(1024),
+            seat_wall_cooccurred: Some(true),
+            ..Default::default()
+        });
+        let text = format_concurrency_saturation_issue(&d, None, None, &s).join("\n");
+        assert!(
+            text.contains(
+                "--max-num-seqs=1024 filled to the limit at least once; running below is averaged"
+            ),
+            "must name in-window co-occurrence without overclaim: {text}"
+        );
+        assert!(
+            !text.contains("hit: scheduler won't admit"),
+            "old overclaim wording must be gone: {text}"
+        );
+        assert!(
+            !text.contains("scrape this window"),
+            "must stay plain language: {text}"
+        );
     }
 
     #[test]

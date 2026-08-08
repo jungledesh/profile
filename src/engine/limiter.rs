@@ -29,6 +29,9 @@ const LIMITER_PREFILL_RATIO_MIN: f64 = 0.5;
 /// Same floor as R5 waiting: a real queue means no healthy "Capped by" verdict.
 const LIMITER_QUEUE_SILENCE_WAITING_MIN: f64 = 2.0;
 
+/// Quiet-path note when the waiting gauge was never readable.
+pub(crate) const WAITING_UNREAD_LIMITER_LINE: &str = "Waiting unread; cannot name a healthy cap.";
+
 /// Aggregated run evidence, same courtroom as rule evaluation.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct LimiterEvidence {
@@ -39,8 +42,9 @@ pub struct LimiterEvidence {
     pub kv_cache_peak_perc: Option<f64>,
     pub mean_running: Option<f64>,
     /// Unweighted mean waiting across evaluable windows (sum/count, same as
-    /// `mean_running`). When >= 2, identify declines: silence over a healthy
-    /// verdict on a flood.
+    /// `mean_running`). `None` or non-finite → [`LimiterVerdict::WaitingUnread`]
+    /// (decline a healthy "Capped by"). When >= 2, identify declines with no
+    /// line: silence over a healthy verdict on a flood.
     pub mean_waiting: Option<f64>,
     pub ridge_batch_size: Option<f64>,
     pub mean_tpot_ms: Option<f64>,
@@ -64,6 +68,8 @@ pub struct CeilingUnknown;
 pub enum LimiterVerdict {
     Known(PrimaryLimiter),
     CeilingUnknown(CeilingUnknown),
+    /// Waiting gauge missing or non-finite. Not a cap: decline naming one.
+    WaitingUnread,
 }
 
 /// Outcome of the limiter cascade, including which earlier stages lacked evidence.
@@ -97,10 +103,18 @@ pub fn identify(e: &LimiterEvidence) -> IdentifyResult {
         };
     }
 
+    // Waiting unread / non-finite: cannot prove queue absence, so cannot name a
+    // healthy cap. Honest decline note (not "Capped by").
+    let Some(waiting) = e.mean_waiting.filter(|w| w.is_finite()) else {
+        return IdentifyResult {
+            verdict: Some(LimiterVerdict::WaitingUnread),
+            capacity_skipped,
+            traffic_skipped,
+        };
+    };
+
     // Queue present: rules own the story, or silence. Never "Capped by X" over a flood.
-    if e.mean_waiting
-        .is_some_and(|w| w.is_finite() && w >= LIMITER_QUEUE_SILENCE_WAITING_MIN)
-    {
+    if waiting >= LIMITER_QUEUE_SILENCE_WAITING_MIN {
         return IdentifyResult {
             verdict: None,
             capacity_skipped,
@@ -201,6 +215,7 @@ pub fn limiter_line(e: &LimiterEvidence) -> Option<String> {
                 .unwrap_or("hardware ceiling inputs incomplete");
             Some(format!("Hardware ceiling unknown ({reason})."))
         }
+        LimiterVerdict::WaitingUnread => Some(WAITING_UNREAD_LIMITER_LINE.to_string()),
         LimiterVerdict::Known(PrimaryLimiter::Capacity) => {
             let mean = e.kv_cache_mean_perc?;
             let peak = e.kv_cache_peak_perc;
@@ -296,7 +311,9 @@ mod tests {
             kv_cache_mean_perc: kv_mean,
             kv_cache_peak_perc: kv_peak,
             mean_running: running,
-            mean_waiting: None,
+            // Default: readable empty queue so cascade tests reach Named stages.
+            // Unread waiting is tested explicitly via WaitingUnread.
+            mean_waiting: Some(0.0),
             ridge_batch_size: ridge,
             mean_tpot_ms: tpot,
             tpot_floor_ms: floor,
@@ -827,6 +844,49 @@ mod tests {
         assert_eq!(
             identify(&e).verdict,
             Some(LimiterVerdict::Known(PrimaryLimiter::FrameworkOverhead))
+        );
+    }
+
+    #[test]
+    fn identify_waiting_unread_declines_with_honest_line() {
+        let mut e = ev(
+            Some(20.0),
+            Some(20.0),
+            Some(50.0),
+            Some(100.0),
+            Some(50.0),
+            Some(10.0),
+            Some(0.2),
+            Some(false),
+            None,
+        );
+        e.mean_waiting = None;
+        assert_eq!(identify(&e).verdict, Some(LimiterVerdict::WaitingUnread));
+        assert_eq!(
+            limiter_line(&e).as_deref(),
+            Some(WAITING_UNREAD_LIMITER_LINE)
+        );
+        assert!(!limiter_line(&e).unwrap().contains("Capped by"));
+    }
+
+    #[test]
+    fn identify_waiting_nan_treated_as_unread() {
+        let mut e = ev(
+            Some(20.0),
+            Some(20.0),
+            Some(50.0),
+            Some(100.0),
+            Some(50.0),
+            Some(10.0),
+            Some(0.2),
+            Some(false),
+            None,
+        );
+        e.mean_waiting = Some(f64::NAN);
+        assert_eq!(identify(&e).verdict, Some(LimiterVerdict::WaitingUnread));
+        assert_eq!(
+            limiter_line(&e).as_deref(),
+            Some(WAITING_UNREAD_LIMITER_LINE)
         );
     }
 
