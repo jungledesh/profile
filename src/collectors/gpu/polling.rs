@@ -1,6 +1,8 @@
 //! Shared polling aggregation for GPU backends.
 //! Vendor-neutral: no I/O, no driver calls.
 
+use super::super::GpuRawMetrics;
+
 /// Single-tick GPU sample. Populated by vendor-specific polling code.
 #[derive(Default)]
 pub(super) struct GpuPoll {
@@ -29,6 +31,37 @@ pub(super) struct AggregatedPolls {
     pub(super) temperature_c: Option<f64>,
     pub(super) temperature_peak_c: Option<f64>,
     pub(super) sm_clock_mhz: Option<u32>,
+}
+
+impl AggregatedPolls {
+    /// Fold window aggregates into [`GpuRawMetrics`]. Identity and power-limit
+    /// come from the vendor path; `aligned_power_watts` stays unset until energy fold.
+    pub(super) fn into_gpu_raw_metrics(
+        self,
+        gpu_name: Option<String>,
+        gpu_index: Option<u32>,
+        gpu_uuid: Option<String>,
+        pcie_bus_id: Option<String>,
+        power_limit_watts: Option<f64>,
+    ) -> GpuRawMetrics {
+        GpuRawMetrics {
+            gpu_name,
+            gpu_index,
+            gpu_uuid,
+            pcie_bus_id,
+            gpu_util_pct: self.gpu_util_pct,
+            mem_util_pct: self.mem_util_pct,
+            power_watts: self.power_watts,
+            aligned_power_watts: None,
+            power_limit_watts,
+            vram_used_mb: self.vram_used_mb,
+            vram_peak_mb: self.vram_peak_mb,
+            vram_total_mb: self.vram_total_mb,
+            temperature_c: self.temperature_c,
+            temperature_peak_c: self.temperature_peak_c,
+            sm_clock_mhz: self.sm_clock_mhz,
+        }
+    }
 }
 
 pub(super) fn aggregate_polls(polls: &[GpuPoll]) -> AggregatedPolls {

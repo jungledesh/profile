@@ -150,24 +150,13 @@ pub(super) fn collect(
                     .map(|mw| mw as f64 / 1000.0);
 
                 let agg = aggregate_polls(all_device_polls.get(&d).map_or(&[], |v| v));
-
-                results.push(GpuRawMetrics {
+                results.push(agg.into_gpu_raw_metrics(
                     gpu_name,
                     gpu_index,
                     gpu_uuid,
                     pcie_bus_id,
-                    gpu_util_pct: agg.gpu_util_pct,
-                    mem_util_pct: agg.mem_util_pct,
-                    power_watts: agg.power_watts,
-                    aligned_power_watts: None,
                     power_limit_watts,
-                    vram_used_mb: agg.vram_used_mb,
-                    vram_peak_mb: agg.vram_peak_mb,
-                    vram_total_mb: agg.vram_total_mb,
-                    temperature_c: agg.temperature_c,
-                    temperature_peak_c: agg.temperature_peak_c,
-                    sm_clock_mhz: agg.sm_clock_mhz,
-                });
+                ));
             }
             Err(_) => {
                 failed_indices.push(d);

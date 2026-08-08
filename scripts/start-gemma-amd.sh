@@ -10,7 +10,7 @@ set -Eeuo pipefail
 trap 'echo "FAILED at line $LINENO"' ERR
 
 MODEL_REPO="${MODEL_REPO:-google/gemma-4-26B-A4B-it}"
-# Own the served identity for this launcher. Image must not bake SERVED_NAME=llama3
+# Own the served identity for this launcher. Image must not bake SERVED_NAME=qwen
 # (see Dockerfile amd stage); ${SERVED_NAME:-} only helps when the env is unset.
 SERVED_NAME="${SERVED_NAME:-gemma-4-26b-a4b}"
 export SERVED_NAME

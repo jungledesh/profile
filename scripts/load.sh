@@ -10,7 +10,7 @@
 #   LAMBDA=N        mean think time in seconds per worker (default: 4)
 #   MAX_TOKENS=N    max output tokens per request (default: random 80-480)
 #   PROFILE_MODEL=gemma|qwen|llama  family default when SERVED_NAME/MODEL unset
-#                              (nvidia: qwen; amd: gemma)
+#                              (nvidia/amd default launchers: qwen)
 #   SERVED_NAME=NAME  vLLM --served-model-name (wins over PROFILE_MODEL default;
 #                     set this when you override the launcher served name)
 #   MODEL=NAME      request model id (wins over SERVED_NAME and PROFILE_MODEL)
@@ -26,7 +26,7 @@
 set -euo pipefail
 
 VLLM_URL="${VLLM_URL:-http://localhost:8000}"
-PROFILE_MODEL="${PROFILE_MODEL:-gemma}"
+PROFILE_MODEL="${PROFILE_MODEL:-qwen}"
 case "$PROFILE_MODEL" in
   gemma) FAMILY_DEFAULT="gemma-4-26b-a4b" ;;
   qwen)  FAMILY_DEFAULT="Qwen3.6-27B" ;;

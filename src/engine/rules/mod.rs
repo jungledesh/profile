@@ -1124,8 +1124,7 @@ pub struct Recommendation {
     /// NOTE (future work): `display_lines` couples presentation to the engine.
     /// Rules build terminal strings here, so wording changes grow rule files.
     /// Deferred decision: migrate formatting to `output/` (rules return structured
-    /// facts) if rule-file growth becomes painful. Tracked in
-    /// `architecture_audit_specs.md`.
+    /// facts) if rule-file growth becomes painful. Tracked in `deferred.md`.
     pub display_lines: Vec<String>,
     /// True when the fix branch has no server-local knob (wall / scale-out only).
     /// Set by the rule formatter from the branch it took; never inferred from text.
