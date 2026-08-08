@@ -91,6 +91,14 @@ pub struct VllmRawMetrics {
     /// Max `num_requests_waiting` across scrapes in this window. Multi-window: max over
     /// evaluable windows (not mean). Caps kv-offload parked-request demand.
     pub num_requests_waiting_peak: Option<f64>,
+    /// Same-sample seat wall, evaluated end-of-window: any scrape had running in
+    /// the churn band at `max_num_seqs` (`[max - slack, max + 0.5]`, slack =
+    /// clamp(completions/s × 250ms, 1, max(1% of max, 1))) and waiting >= 2.
+    /// Samples above max + 0.5 are evaluated-false (chunked), not skipped.
+    /// `None` = zero evaluable samples (max unread, or run/wait never both finite
+    /// while max was known). Per-window only; R5 significance counts windows that
+    /// fire. The diagnose summary leaves this `None` (no unused OR fold).
+    pub seat_wall_cooccurred: Option<bool>,
     /// Max over active windows of `(kv_cache_usage_perc / 100) / num_requests_running`
     /// for windows with `running >= 1`. Multi-window aggregate only; single-window
     /// resolve may fall back to the landing gauges. Used for kv-offload sizing.

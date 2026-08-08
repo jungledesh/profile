@@ -71,6 +71,8 @@ struct WindowRuleEval {
     // Run-level mean(running) across evaluable windows; feeds the empirical KV bound.
     sum_running: f64,
     count_running: usize,
+    sum_waiting: f64,
+    count_waiting: usize,
     // Run-level means for limiter evidence and prefill effective ratio.
     sum_tpot_ms: f64,
     count_tpot_ms: usize,
@@ -81,6 +83,10 @@ struct WindowRuleEval {
 impl WindowRuleEval {
     fn mean_running(&self) -> Option<f64> {
         (self.count_running > 0).then(|| self.sum_running / self.count_running as f64)
+    }
+
+    fn mean_waiting(&self) -> Option<f64> {
+        (self.count_waiting > 0).then(|| self.sum_waiting / self.count_waiting as f64)
     }
 
     fn mean_tpot_ms(&self) -> Option<f64> {
@@ -175,6 +181,8 @@ fn eval_window_rules(
         session_kv_peak: None,
         sum_running: 0.0,
         count_running: 0,
+        sum_waiting: 0.0,
+        count_waiting: 0,
         sum_tpot_ms: 0.0,
         count_tpot_ms: 0,
         sum_effective_ratio: 0.0,
@@ -246,6 +254,14 @@ fn eval_window_rules(
         {
             eval.sum_running += run;
             eval.count_running += 1;
+        }
+        if let Some(wait) = snap
+            .vllm
+            .num_requests_waiting
+            .filter(|v| v.is_finite() && *v >= 0.0)
+        {
+            eval.sum_waiting += wait;
+            eval.count_waiting += 1;
         }
         if let Some(tpot) = snap.vllm.tpot_ms.filter(|v| v.is_finite() && *v > 0.0) {
             eval.sum_tpot_ms += tpot;
@@ -478,6 +494,7 @@ fn build_report_from_eval(
             .filter(|v| v.is_finite()),
         kv_cache_peak_perc: eval.session_kv_peak,
         mean_running: eval.mean_running(),
+        mean_waiting: eval.mean_waiting(),
         ridge_batch_size: ridge_run.filter(|r| r.is_finite() && *r > 0.0),
         mean_tpot_ms: eval.mean_tpot_ms(),
         tpot_floor_ms: baseline.as_ref().map(|b| b.tpot_floor_ms),

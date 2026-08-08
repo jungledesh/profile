@@ -3,4 +3,6 @@ target/
 .DS_Store
 ROADMAP.md
 CLAUDE.md
-.agents/ 
+.agents/
+__pycache__/
+*.pyc

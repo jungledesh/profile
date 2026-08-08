@@ -32,12 +32,14 @@ pub fn collect_snapshot_for_window(
     window: Duration,
     tensor_parallel_size: u32,
     gpu_indices: &[u32],
+    known_max_num_seqs: Option<u32>,
 ) -> anyhow::Result<RawSnapshot> {
     let url = vllm_metrics_input.to_string();
     let indices = gpu_indices.to_vec();
 
     let gpu_handle = thread::spawn(move || gpu::collect_gpu_metrics_for(window, Some(&indices)));
-    let vllm_handle = thread::spawn(move || vllm::collect_vllm_metrics_for(&url, window));
+    let vllm_handle =
+        thread::spawn(move || vllm::collect_vllm_metrics_for(&url, window, known_max_num_seqs));
 
     let (mut gpus, gpu_observed_at, _) = gpu_handle
         .join()

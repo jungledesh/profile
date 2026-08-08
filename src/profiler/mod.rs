@@ -53,6 +53,7 @@ pub fn run_diagnose(
         &window_durations,
         tensor_parallel_size,
         &gpu_indices,
+        max_num_seqs,
     )?;
     let any_evaluable = raw_windows.iter().any(window_is_evaluable);
     let all_idle = any_evaluable
@@ -141,6 +142,7 @@ fn collect_windows(
     window_durations: &[Duration],
     tensor_parallel_size: u32,
     gpu_indices: &[u32],
+    known_max_num_seqs: Option<u32>,
 ) -> anyhow::Result<Vec<collectors::RawSnapshot>> {
     let mut out = Vec::new();
     let mut baseline_fingerprint: Option<collectors::GpuFingerprint> = None;
@@ -151,6 +153,7 @@ fn collect_windows(
             this_window,
             tensor_parallel_size,
             gpu_indices,
+            known_max_num_seqs,
         )?;
         track_window_topology(&mut baseline_fingerprint, &snap)?;
 

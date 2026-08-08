@@ -558,14 +558,20 @@ fn healthy_exit_message(input: HealthyExitInput) -> String {
                 "Hardware ceiling unknown (hardware ceiling inputs incomplete).".to_string()
             })
         }
+        Some(engine::limiter::LimiterVerdict::WaitingUnread) => {
+            limiter_line.unwrap_or_else(|| engine::limiter::WAITING_UNREAD_LIMITER_LINE.to_string())
+        }
         None => {
             format!("{eff_str} - insufficient data to identify primary limiter.")
         }
     };
 
     let prefix = match limiter {
-        Some(_) => "Rules clear. No actionable config fix identified.",
-        None => "Rules clear.",
+        Some(engine::limiter::LimiterVerdict::Known(_))
+        | Some(engine::limiter::LimiterVerdict::CeilingUnknown(_)) => {
+            "Rules clear. No actionable config fix identified."
+        }
+        Some(engine::limiter::LimiterVerdict::WaitingUnread) | None => "Rules clear.",
     };
     format!("{prefix}\n\n{limiter_block}")
 }
@@ -803,6 +809,7 @@ mod tests {
                 kv_cache_mean_perc: Some(50.0),
                 kv_cache_peak_perc: Some(50.0),
                 mean_running: Some(50.0),
+                mean_waiting: Some(0.0),
                 ridge_batch_size: Some(40.0),
                 mean_tpot_ms: Some(50.0),
                 tpot_floor_ms: Some(10.0),
@@ -829,6 +836,7 @@ mod tests {
                 kv_cache_mean_perc: Some(50.0),
                 kv_cache_peak_perc: Some(50.0),
                 mean_running: Some(50.0),
+                mean_waiting: Some(0.0),
                 ridge_batch_size: Some(40.0),
                 mean_tpot_ms: Some(50.0),
                 tpot_floor_ms: Some(10.0),
@@ -852,6 +860,7 @@ mod tests {
                 kv_cache_mean_perc: Some(85.0),
                 kv_cache_peak_perc: Some(85.0),
                 mean_running: Some(50.0),
+                mean_waiting: Some(0.0),
                 ridge_batch_size: Some(40.0),
                 mean_tpot_ms: Some(20.0),
                 tpot_floor_ms: Some(5.0),
@@ -875,6 +884,7 @@ mod tests {
                 kv_cache_mean_perc: Some(50.0),
                 kv_cache_peak_perc: Some(50.0),
                 mean_running: Some(50.0),
+                mean_waiting: Some(0.0),
                 ridge_batch_size: Some(40.0),
                 mean_tpot_ms: Some(11.0),
                 tpot_floor_ms: Some(10.0),
@@ -908,6 +918,7 @@ mod tests {
                 kv_cache_mean_perc: Some(50.0),
                 kv_cache_peak_perc: Some(50.0),
                 mean_running: Some(5.0),
+                mean_waiting: Some(0.0),
                 ridge_batch_size: Some(100.0),
                 mean_tpot_ms: Some(20.0),
                 tpot_floor_ms: Some(5.0),
@@ -937,6 +948,7 @@ mod tests {
                 kv_cache_mean_perc: Some(10.0),
                 kv_cache_peak_perc: Some(10.0),
                 mean_running: Some(10.0),
+                mean_waiting: Some(0.0),
                 ridge_batch_size: Some(100.0),
                 mean_tpot_ms: Some(20.0),
                 tpot_floor_ms: Some(5.0),
@@ -964,6 +976,7 @@ mod tests {
                 kv_cache_mean_perc: Some(50.0),
                 kv_cache_peak_perc: Some(50.0),
                 mean_running: Some(5.0),
+                mean_waiting: Some(0.0),
                 ridge_batch_size: Some(100.0),
                 mean_tpot_ms: Some(20.0),
                 tpot_floor_ms: Some(5.0),
@@ -998,6 +1011,7 @@ mod tests {
                 kv_cache_mean_perc: Some(50.0),
                 kv_cache_peak_perc: Some(50.0),
                 mean_running: Some(50.0),
+                mean_waiting: Some(0.0),
                 ridge_batch_size: Some(40.0),
                 mean_tpot_ms: Some(50.0),
                 tpot_floor_ms: Some(10.0),
@@ -1025,11 +1039,45 @@ mod tests {
     }
 
     #[test]
+    fn healthy_exit_waiting_unread_declines_without_capped_by() {
+        let ev = engine::limiter::LimiterEvidence {
+            kv_cache_mean_perc: Some(20.0),
+            kv_cache_peak_perc: Some(20.0),
+            mean_running: Some(50.0),
+            mean_waiting: None,
+            ridge_batch_size: Some(100.0),
+            mean_tpot_ms: Some(50.0),
+            tpot_floor_ms: Some(10.0),
+            effective_prompt_decode_ratio: Some(0.2),
+            chunked_prefill_enabled: Some(false),
+            headroom_pct: None,
+            n_eval: 3,
+            ceiling_unknown_reason: None,
+        };
+        let line = engine::limiter::limiter_line(&ev).expect("decline line");
+        assert_eq!(line, engine::limiter::WAITING_UNREAD_LIMITER_LINE);
+        let msg = healthy_exit_message(HealthyExitInput {
+            efficiency: Some(42.0),
+            limiter_evidence: ev,
+            n_eval: 3,
+            enforce_eager: None,
+            enable_prefix_caching: None,
+            quantization: None,
+        });
+        assert!(msg.contains(engine::limiter::WAITING_UNREAD_LIMITER_LINE));
+        assert!(msg.contains("Rules clear."));
+        assert!(!msg.contains("No actionable config fix identified."));
+        assert!(!msg.contains("Capped by"));
+        assert!(!msg.contains("Primary Limiter:"));
+    }
+
+    #[test]
     fn healthy_exit_reuses_same_limiter_line_as_quiet_report() {
         let ev = engine::limiter::LimiterEvidence {
             kv_cache_mean_perc: Some(84.0),
             kv_cache_peak_perc: Some(84.0),
             mean_running: Some(50.0),
+            mean_waiting: Some(0.0),
             ridge_batch_size: Some(153.0),
             mean_tpot_ms: Some(20.0),
             tpot_floor_ms: Some(10.0),

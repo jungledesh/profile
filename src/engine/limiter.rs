@@ -12,7 +12,7 @@ pub enum PrimaryLimiter {
     Physics,
     /// Chunked prefill is sharing decode memory bandwidth with prefill GEMMs.
     PrefillInterference,
-    /// Batch sizes healthy, VRAM available - GPU is waiting on framework/system.
+    /// Batch sizes healthy, VRAM available - GPU waits on vLLM/CPU work between steps.
     FrameworkOverhead,
 }
 
@@ -26,6 +26,11 @@ pub(crate) const HEADROOM_LIMITER_THRESHOLD_PCT: f64 = 10.0;
 /// Effective prompt/decode ratio where prefill begins to interfere even below R6.
 /// Provisional, calibrate on RunPod.
 const LIMITER_PREFILL_RATIO_MIN: f64 = 0.5;
+/// Same floor as R5 waiting: a real queue means no healthy "Capped by" verdict.
+const LIMITER_QUEUE_SILENCE_WAITING_MIN: f64 = 2.0;
+
+/// Quiet-path note when the waiting gauge was never readable.
+pub(crate) const WAITING_UNREAD_LIMITER_LINE: &str = "Waiting unread; cannot name a healthy cap.";
 
 /// Aggregated run evidence, same courtroom as rule evaluation.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -36,6 +41,11 @@ pub struct LimiterEvidence {
     pub kv_cache_mean_perc: Option<f64>,
     pub kv_cache_peak_perc: Option<f64>,
     pub mean_running: Option<f64>,
+    /// Unweighted mean waiting across evaluable windows (sum/count, same as
+    /// `mean_running`). `None` or non-finite → [`LimiterVerdict::WaitingUnread`]
+    /// (decline a healthy "Capped by"). When >= 2, identify declines with no
+    /// line: silence over a healthy verdict on a flood.
+    pub mean_waiting: Option<f64>,
     pub ridge_batch_size: Option<f64>,
     pub mean_tpot_ms: Option<f64>,
     pub tpot_floor_ms: Option<f64>,
@@ -58,6 +68,8 @@ pub struct CeilingUnknown;
 pub enum LimiterVerdict {
     Known(PrimaryLimiter),
     CeilingUnknown(CeilingUnknown),
+    /// Waiting gauge missing or non-finite. Not a cap: decline naming one.
+    WaitingUnread,
 }
 
 /// Outcome of the limiter cascade, including which earlier stages lacked evidence.
@@ -84,6 +96,25 @@ pub fn identify(e: &LimiterEvidence) -> IdentifyResult {
     // Sparse runs: decline before naming a boundary (healthy-exit and quiet report
     // share this gate; callers must not invent their own window thresholds).
     if e.n_eval < super::ENGINE_MIN_PERSISTENT_WINDOWS {
+        return IdentifyResult {
+            verdict: None,
+            capacity_skipped,
+            traffic_skipped,
+        };
+    }
+
+    // Waiting unread / non-finite: cannot prove queue absence, so cannot name a
+    // healthy cap. Honest decline note (not "Capped by").
+    let Some(waiting) = e.mean_waiting.filter(|w| w.is_finite()) else {
+        return IdentifyResult {
+            verdict: Some(LimiterVerdict::WaitingUnread),
+            capacity_skipped,
+            traffic_skipped,
+        };
+    };
+
+    // Queue present: rules own the story, or silence. Never "Capped by X" over a flood.
+    if waiting >= LIMITER_QUEUE_SILENCE_WAITING_MIN {
         return IdentifyResult {
             verdict: None,
             capacity_skipped,
@@ -184,6 +215,7 @@ pub fn limiter_line(e: &LimiterEvidence) -> Option<String> {
                 .unwrap_or("hardware ceiling inputs incomplete");
             Some(format!("Hardware ceiling unknown ({reason})."))
         }
+        LimiterVerdict::WaitingUnread => Some(WAITING_UNREAD_LIMITER_LINE.to_string()),
         LimiterVerdict::Known(PrimaryLimiter::Capacity) => {
             let mean = e.kv_cache_mean_perc?;
             let peak = e.kv_cache_peak_perc;
@@ -233,7 +265,7 @@ pub fn limiter_line(e: &LimiterEvidence) -> Option<String> {
             ))
         }
         LimiterVerdict::Known(PrimaryLimiter::FrameworkOverhead) => {
-            let mut line = String::from("Capped by framework: ");
+            let mut line = String::from("Capped by vLLM overhead: ");
             let mut cleared = Vec::new();
             if !result.traffic_skipped {
                 cleared.push("batch healthy");
@@ -245,7 +277,7 @@ pub fn limiter_line(e: &LimiterEvidence) -> Option<String> {
                 line.push_str(&cleared.join(", "));
                 line.push_str(". ");
             }
-            line.push_str("GPU is waiting on vLLM/CPU overhead.");
+            line.push_str("GPU waits on CPU work between steps.");
             if result.capacity_skipped {
                 line.push_str(" KV unmeasured.");
             }
@@ -279,6 +311,9 @@ mod tests {
             kv_cache_mean_perc: kv_mean,
             kv_cache_peak_perc: kv_peak,
             mean_running: running,
+            // Default: readable empty queue so cascade tests reach Named stages.
+            // Unread waiting is tested explicitly via WaitingUnread.
+            mean_waiting: Some(0.0),
             ridge_batch_size: ridge,
             mean_tpot_ms: tpot,
             tpot_floor_ms: floor,
@@ -769,6 +804,90 @@ mod tests {
         assert!(traffic_skipped.contains("memory free"));
         assert!(traffic_skipped.contains("Ridge unmeasured"));
         assert!(!traffic_skipped.contains("batch healthy"));
+        assert!(both_cleared.contains("Capped by vLLM overhead:"));
+        assert!(both_cleared.contains("GPU waits on CPU work between steps."));
+        assert!(!both_cleared.contains("Capped by framework:"));
+    }
+
+    #[test]
+    fn identify_silent_when_mean_waiting_at_queue_floor() {
+        let mut e = ev(
+            Some(20.0),
+            Some(20.0),
+            Some(50.0),
+            Some(100.0),
+            Some(50.0),
+            Some(10.0),
+            Some(0.2),
+            Some(false),
+            None,
+        );
+        e.mean_waiting = Some(2.0);
+        assert_eq!(identify(&e).verdict, None);
+        assert!(limiter_line(&e).is_none());
+    }
+
+    #[test]
+    fn identify_names_cap_when_waiting_below_queue_floor() {
+        let mut e = ev(
+            Some(20.0),
+            Some(20.0),
+            Some(50.0),
+            Some(100.0),
+            Some(50.0),
+            Some(10.0),
+            Some(0.2),
+            Some(false),
+            None,
+        );
+        e.mean_waiting = Some(1.5);
+        assert_eq!(
+            identify(&e).verdict,
+            Some(LimiterVerdict::Known(PrimaryLimiter::FrameworkOverhead))
+        );
+    }
+
+    #[test]
+    fn identify_waiting_unread_declines_with_honest_line() {
+        let mut e = ev(
+            Some(20.0),
+            Some(20.0),
+            Some(50.0),
+            Some(100.0),
+            Some(50.0),
+            Some(10.0),
+            Some(0.2),
+            Some(false),
+            None,
+        );
+        e.mean_waiting = None;
+        assert_eq!(identify(&e).verdict, Some(LimiterVerdict::WaitingUnread));
+        assert_eq!(
+            limiter_line(&e).as_deref(),
+            Some(WAITING_UNREAD_LIMITER_LINE)
+        );
+        assert!(!limiter_line(&e).unwrap().contains("Capped by"));
+    }
+
+    #[test]
+    fn identify_waiting_nan_treated_as_unread() {
+        let mut e = ev(
+            Some(20.0),
+            Some(20.0),
+            Some(50.0),
+            Some(100.0),
+            Some(50.0),
+            Some(10.0),
+            Some(0.2),
+            Some(false),
+            None,
+        );
+        e.mean_waiting = Some(f64::NAN);
+        assert_eq!(identify(&e).verdict, Some(LimiterVerdict::WaitingUnread));
+        assert_eq!(
+            limiter_line(&e).as_deref(),
+            Some(WAITING_UNREAD_LIMITER_LINE)
+        );
     }
 
     #[test]
