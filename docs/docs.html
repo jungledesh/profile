@@ -689,7 +689,7 @@ num_requests_running  is Some (even if zero)</code></pre>
     <table>
       <thead><tr><th>Input</th><th>Resolution</th></tr></thead>
       <tbody>
-        <tr><td><code>roofline_params</code></td><td><code>active_param_count</code> if present, else <code>param_count</code>. Decode and prefill ceilings, efficiency %, ridge batch size.</td></tr>
+        <tr><td><code>roofline_params</code></td><td><code>active_param_count</code> if present, else <code>param_count</code>. Decode and prefill ceilings, efficiency %. Not ridge: <code>ridge_batch_size</code> is GPU peak FLOPS, peak BW, and weight dtype bits only (param count cancels in the weight-decode intensity model).</td></tr>
         <tr><td><code>weight_params</code></td><td><code>param_count</code> if present, else <code>active_param_count</code>. <code>weight_gb</code> and <code>kv_headroom_gb</code> (OOM check).</td></tr>
         <tr><td><code>bytes_per_param</code> (weights)</td><td>vLLM-reported quantization &rarr; <code>QUANTIZATION</code>/<code>VLLM_QUANTIZATION</code> env &rarr; vLLM-reported dtype &rarr; <code>DTYPE</code>/<code>VLLM_DTYPE</code> env &rarr; catalog default &rarr; bf16 (2 bytes). fp8 = 1, fp16/bf16 = 2, fp32 = 4. <code>kv_cache_dtype</code> sets KV element bytes only, never weight width. Source labeled in output when fallback is used.</td></tr>
         <tr><td><code>tensor_parallel_size</code></td><td><code>--tensor-parallel-size</code> CLI flag only in practice (TP &gt;1 is refused at launch). Defaults to 1. Scales both ceilings and per-GPU KV headroom.</td></tr>
