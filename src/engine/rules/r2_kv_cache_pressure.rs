@@ -85,8 +85,12 @@ fn push_kv_pressure_safe_levers(
     kv_cache_dtype: Option<&str>,
     fp8_compiler_available: bool,
 ) {
-    if let Some(bullet) = prefix_caching_fix_bullet(snapshot) {
-        safe.push(bullet);
+    if prefix_caching_fix_applies(snapshot) {
+        super::push_bullet_with_subline(
+            safe,
+            super::ENABLE_PREFIX_CACHING_BULLET.to_string(),
+            Some("Share KV blocks across identical prompt prefixes."),
+        );
     }
     if let Some(bullet) = gpu_mem_utilization_fix_bullet(snapshot, kv_headroom_gb) {
         safe.push(bullet);
@@ -326,20 +330,12 @@ fn kv_offload_fix_bullet(size_gib: Option<u64>) -> String {
     }
 }
 
-fn prefix_caching_fix_bullet(snapshot: &RawSnapshot) -> Option<String> {
-    if snapshot.vllm.cache_config.enable_prefix_caching != Some(true)
+fn prefix_caching_fix_applies(snapshot: &RawSnapshot) -> bool {
+    snapshot.vllm.cache_config.enable_prefix_caching != Some(true)
         && snapshot
             .vllm
             .prompt_tokens_mean
             .is_some_and(|t| t >= PREFIX_CACHING_LONG_PROMPT_MIN_TOKENS)
-    {
-        Some(
-            "      • Enable --enable-prefix-caching to share KV blocks across identical prompt prefixes"
-                .to_string(),
-        )
-    } else {
-        None
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2518,13 +2514,14 @@ mod tests {
             1,
         )
         .join("\n");
-        assert!(with_bullet.contains("Enable --enable-prefix-caching"));
+        assert!(with_bullet.contains("Enable prefix caching: --enable-prefix-caching"));
+        assert!(with_bullet.contains("Share KV blocks across identical prompt prefixes."));
 
         v_long.prompt_tokens_mean = Some(150.0);
         let without_bullet =
             format_kv_cache_pressure_fired(&d, &kv_ctx(&snap(v_long), None, None, None), 1, 1)
                 .join("\n");
-        assert!(!without_bullet.contains("Enable --enable-prefix-caching"));
+        assert!(!without_bullet.contains("Enable prefix caching: --enable-prefix-caching"));
     }
 
     #[test]
@@ -3277,7 +3274,9 @@ mod tests {
         )
         .join("\n");
         let safe_pos = text.find("    Safe to apply:").expect("Safe to apply");
-        let prefix_pos = text.find("Enable --enable-prefix-caching").expect("prefix");
+        let prefix_pos = text
+            .find("Enable prefix caching: --enable-prefix-caching")
+            .expect("prefix");
         let gpu_pos = text
             .find("Raise --gpu-memory-utilization")
             .expect("gpu-mem");

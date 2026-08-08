@@ -500,15 +500,9 @@ pub fn evaluate(input: PrefillBoundEvalInput<'_>) -> Rule6Outcome {
     let tpot_unverified = !(tpot_ms.is_some_and(|v| v.is_finite() && v > 0.0)
         && tpot_floor_ms.is_some_and(|v| v.is_finite() && v > 0.0));
 
-    let prompt_skew_ratio = match (
-        snapshot.vllm.prompt_tokens_p99,
-        snapshot.vllm.prompt_tokens_mean,
-    ) {
-        (Some(p99), Some(mean)) if mean > 0.0 && p99.is_finite() && mean.is_finite() => {
-            Some(p99 / mean)
-        }
-        _ => None,
-    };
+    let prompt_tokens_mean = snapshot.vllm.prompt_tokens_mean;
+    let prompt_tokens_p99 = snapshot.vllm.prompt_tokens_p99;
+    let prompt_skew_ratio = skew_ratio_from_lengths(prompt_tokens_mean, prompt_tokens_p99);
 
     Rule6Outcome::Fired(PrefillBoundDetail {
         prompt_gen_ratio: ratio,
@@ -518,8 +512,8 @@ pub fn evaluate(input: PrefillBoundEvalInput<'_>) -> Rule6Outcome {
         tpot_unverified,
         prefix_caching_enabled: snapshot.vllm.cache_config.enable_prefix_caching,
         chunked_prefill_enabled,
-        prompt_tokens_mean: snapshot.vllm.prompt_tokens_mean,
-        prompt_tokens_p99: snapshot.vllm.prompt_tokens_p99,
+        prompt_tokens_mean,
+        prompt_tokens_p99,
         prompt_skew_ratio,
         running_count: snapshot.vllm.num_requests_running,
         ridge_batch_size,
@@ -532,6 +526,37 @@ pub fn evaluate(input: PrefillBoundEvalInput<'_>) -> Rule6Outcome {
 
 pub(super) fn aggregate_r6_detail(details: &[PrefillBoundDetail]) -> PrefillBoundDetail {
     let n = details.len() as f64;
+    // Prompt length triple must stay coherent: never mean-of-means + max-p99
+    // across windows (prints e.g. "19900 (11x mean)" next to mean 9337).
+    // Prefer the window with the highest finite p99/mean from that window's
+    // lengths. If no window has both ends, keep lengths from one window and
+    // leave ratio None (no invented ×).
+    let (prompt_tokens_mean, prompt_tokens_p99, prompt_skew_ratio) = {
+        let skew_winner = details
+            .iter()
+            .filter_map(|d| {
+                let ratio = skew_ratio_from_lengths(d.prompt_tokens_mean, d.prompt_tokens_p99)?;
+                Some((ratio, d))
+            })
+            .max_by(|a, b| a.0.total_cmp(&b.0));
+        if let Some((ratio, d)) = skew_winner {
+            (d.prompt_tokens_mean, d.prompt_tokens_p99, Some(ratio))
+        } else {
+            // Newest window that carries any length field; ratio only if both ends.
+            let solo = details
+                .iter()
+                .rev()
+                .find(|d| d.prompt_tokens_mean.is_some() || d.prompt_tokens_p99.is_some());
+            match solo {
+                Some(d) => (
+                    d.prompt_tokens_mean,
+                    d.prompt_tokens_p99,
+                    skew_ratio_from_lengths(d.prompt_tokens_mean, d.prompt_tokens_p99),
+                ),
+                None => (None, None, None),
+            }
+        }
+    };
     PrefillBoundDetail {
         prompt_gen_ratio: {
             let finite: Vec<f64> = details
@@ -555,17 +580,9 @@ pub(super) fn aggregate_r6_detail(details: &[PrefillBoundDetail]) -> PrefillBoun
         // Config fields: last window wins when config drifts mid-run.
         prefix_caching_enabled: details.last().and_then(|d| d.prefix_caching_enabled),
         chunked_prefill_enabled: details.last().and_then(|d| d.chunked_prefill_enabled),
-        prompt_tokens_mean: super::mean_of_present(
-            details.iter().filter_map(|d| d.prompt_tokens_mean),
-        ),
-        prompt_tokens_p99: details
-            .iter()
-            .filter_map(|d| d.prompt_tokens_p99)
-            .fold(None, |acc, v| Some(acc.map_or(v, |a: f64| a.max(v)))),
-        prompt_skew_ratio: details
-            .iter()
-            .filter_map(|d| d.prompt_skew_ratio)
-            .fold(None, |acc, v| Some(acc.map_or(v, |a: f64| a.max(v)))),
+        prompt_tokens_mean,
+        prompt_tokens_p99,
+        prompt_skew_ratio,
         running_count: super::mean_of_present(details.iter().filter_map(|d| d.running_count)),
         ridge_batch_size: details.first().and_then(|d| d.ridge_batch_size),
         max_num_batched_tokens: details.last().and_then(|d| d.max_num_batched_tokens),
@@ -577,9 +594,18 @@ pub(super) fn aggregate_r6_detail(details: &[PrefillBoundDetail]) -> PrefillBoun
     }
 }
 
+/// p99/mean when both ends are usable. Display and skew gate must use this (or a
+/// stored ratio from the same window), never a max-ratio glued onto other windows' lengths.
+fn skew_ratio_from_lengths(mean: Option<f64>, p99: Option<f64>) -> Option<f64> {
+    match (mean, p99) {
+        (Some(m), Some(p)) if m > 0.0 && m.is_finite() && p.is_finite() && p >= 0.0 => Some(p / m),
+        _ => None,
+    }
+}
+
 fn skewed_mode(d: &PrefillBoundDetail) -> bool {
-    d.prompt_skew_ratio
-        .filter(|r| r.is_finite())
+    skew_ratio_from_lengths(d.prompt_tokens_mean, d.prompt_tokens_p99)
+        .or(d.prompt_skew_ratio.filter(|r| r.is_finite()))
         .is_some_and(|r| r >= PROMPT_SKEW_RATIO)
 }
 
@@ -649,13 +675,17 @@ pub(super) fn prefill_fix_lines(
     let chunked_off = d.chunked_prefill_enabled == Some(false);
 
     // Prefix caching cuts FLOPs; keep ahead of severity / chunked knobs.
+    // Wording matches R3 (`Enable prefix caching: --flag`). No invented % Expected.
     if prefix_off {
+        let mut bullets = Vec::new();
+        super::push_bullet_with_subline(
+            &mut bullets,
+            super::ENABLE_PREFIX_CACHING_BULLET.to_string(),
+            Some("Repeated prompt prefixes are re-computed every request."),
+        );
         (
-            vec![
-                "      • Enable automatic prefix caching (--enable-prefix-caching).".to_string(),
-                "      Repeated prompt prefixes are re-computed every request.".to_string(),
-            ],
-            "20-40% reduction in prefill time for workloads with shared prefixes.".to_string(),
+            bullets,
+            super::ENABLE_PREFIX_CACHING_EXPECTED.to_string(),
             false,
         )
     } else if sev == Severity::Severe {
@@ -734,14 +764,15 @@ pub(super) fn format_prefill_bound_window_issue_with_terminal(
             lines.push(r6_metric_line("Prompt mean", &format!("{pm:.0} tok")));
         }
         if let Some(p99) = prompt_p99 {
-            let ratio = d.prompt_skew_ratio.unwrap_or(0.0);
-            if ratio > 0.0 && ratio.is_finite() {
-                lines.push(r6_metric_line(
+            // × only from the printed pair; never a stored ratio from elsewhere.
+            match skew_ratio_from_lengths(prompt_mean, prompt_p99)
+                .filter(|r| *r > 0.0 && r.is_finite())
+            {
+                Some(ratio) => lines.push(r6_metric_line(
                     "Prompt p99",
                     &format!("{p99:.0} tok  ({ratio:.0}x mean)"),
-                ));
-            } else {
-                lines.push(r6_metric_line("Prompt p99", &format!("{p99:.0} tok")));
+                )),
+                None => lines.push(r6_metric_line("Prompt p99", &format!("{p99:.0} tok"))),
             }
         }
     } else if let Some(pm) = prompt_mean {
@@ -781,12 +812,16 @@ pub(super) fn format_prefill_bound_window_issue_with_terminal(
     let expected = match (skewed, prompt_p99, prompt_mean) {
         (true, Some(p99), Some(mean)) => {
             let mut safe = Vec::new();
-            // Enable only on confirmed off. Unknown is not off.
-            if d.chunked_prefill_enabled == Some(false) {
-                safe.push(
-                    "      • Enable --enable-chunked-prefill to interleave short requests with long-prompt chunks."
-                        .to_string(),
-                );
+            // Enable only on confirmed off. Unread scrape → Confirm (never Enable).
+            match d.chunked_prefill_enabled {
+                Some(false) => {
+                    safe.push(
+                        "      • Enable --enable-chunked-prefill to interleave short requests with long-prompt chunks."
+                            .to_string(),
+                    );
+                }
+                None => safe.push(CONFIRM_CHUNKED_BULLET.to_string()),
+                Some(true) => {}
             }
             super::push_bullet_with_subline(
                 &mut safe,
@@ -1134,6 +1169,85 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_keeps_skew_mean_p99_from_same_window() {
+        // Mild window + extreme window. Old agg: mean≈(9337+1000)/2, max p99=19900,
+        // max ratio≈19.9 → "19900 (20x mean)" while 19900/mean_avg ≉ 20.
+        let mild = PrefillBoundDetail {
+            prompt_gen_ratio: 12.0,
+            decode_efficiency_pct: 5.0,
+            tpot_ms: Some(200.0),
+            tpot_floor_ms: Some(10.0),
+            tpot_unverified: false,
+            prefix_caching_enabled: Some(true),
+            chunked_prefill_enabled: Some(true),
+            prompt_tokens_mean: Some(9337.0),
+            prompt_tokens_p99: Some(12_000.0),
+            prompt_skew_ratio: Some(12_000.0 / 9337.0),
+            running_count: Some(100.0),
+            ridge_batch_size: None,
+            max_num_batched_tokens: None,
+            is_hybrid: false,
+            chunk_floor: None,
+            model_in_catalog: true,
+        };
+        let extreme = PrefillBoundDetail {
+            prompt_tokens_mean: Some(1000.0),
+            prompt_tokens_p99: Some(19_900.0),
+            prompt_skew_ratio: Some(19.9),
+            ..mild.clone()
+        };
+        let agg = aggregate_r6_detail(&[mild, extreme]);
+        assert_eq!(agg.prompt_tokens_mean, Some(1000.0));
+        assert_eq!(agg.prompt_tokens_p99, Some(19_900.0));
+        let ratio = agg.prompt_skew_ratio.expect("ratio");
+        assert!((ratio - 19.9).abs() < 1e-9);
+        assert!(skewed_mode(&agg));
+        let text = format_prefill_bound_window_issue(&agg, 100).join("\n");
+        assert!(
+            text.contains("19900 tok  (20x mean)"),
+            "printed × must match p99/mean: {text}"
+        );
+        assert!(text.contains("Prompt mean         1000 tok"));
+    }
+
+    #[test]
+    fn aggregate_fallback_same_window_no_frankenstein_ratio() {
+        // Split ends across windows: must not invent mean 9337 + p99 19900 + ×.
+        let only_mean = PrefillBoundDetail {
+            prompt_gen_ratio: 12.0,
+            decode_efficiency_pct: 5.0,
+            tpot_ms: Some(200.0),
+            tpot_floor_ms: Some(10.0),
+            tpot_unverified: false,
+            prefix_caching_enabled: Some(true),
+            chunked_prefill_enabled: Some(true),
+            prompt_tokens_mean: Some(9337.0),
+            prompt_tokens_p99: None,
+            prompt_skew_ratio: None,
+            running_count: Some(100.0),
+            ridge_batch_size: None,
+            max_num_batched_tokens: None,
+            is_hybrid: false,
+            chunk_floor: None,
+            model_in_catalog: true,
+        };
+        let only_p99 = PrefillBoundDetail {
+            prompt_tokens_mean: None,
+            prompt_tokens_p99: Some(19_900.0),
+            prompt_skew_ratio: None,
+            ..only_mean.clone()
+        };
+        let agg = aggregate_r6_detail(&[only_mean, only_p99]);
+        assert_eq!(agg.prompt_tokens_mean, None);
+        assert_eq!(agg.prompt_tokens_p99, Some(19_900.0));
+        assert!(
+            agg.prompt_skew_ratio.is_none(),
+            "cross-window lengths must not invent a skew ratio"
+        );
+        assert!(!skewed_mode(&agg));
+    }
+
+    #[test]
     fn aggregate_all_infinite_stays_infinite() {
         let d = PrefillBoundDetail {
             prompt_gen_ratio: f64::INFINITY,
@@ -1266,9 +1380,8 @@ mod tests {
     }
 
     #[test]
-    fn fix_recommends_routing_when_skewed_chunked_unknown_skips_enable() {
-        // Routing arm: unknown chunked is not off → no Enable. Confirm lives in
-        // prefill_fix_lines only; routing does not use that path.
+    fn fix_recommends_routing_when_skewed_chunked_unknown_confirms() {
+        // Unread chunked: Confirm (never Enable). Same humility as uniform unread.
         let d = PrefillBoundDetail {
             prompt_gen_ratio: 15.0,
             decode_efficiency_pct: 6.7,
@@ -1291,7 +1404,13 @@ mod tests {
         let text = lines.join("\n");
         assert!(text.contains("Route long-context requests"));
         assert!(!text.contains("Enable --enable-chunked-prefill"));
-        assert!(!text.contains("Confirm chunked prefill"));
+        assert!(
+            text.contains(CONFIRM_CHUNKED_BULLET.trim_start()),
+            "unread chunked must Confirm:\n{text}"
+        );
+        let confirm = text.find("Confirm chunked prefill").expect("Confirm");
+        let route = text.find("Route long-context requests").expect("route");
+        assert!(confirm < route, "Confirm before Route:\n{text}");
         assert!(!terminal, "routing path is never terminal:\n{text}");
     }
 
@@ -1346,7 +1465,14 @@ mod tests {
             model_in_catalog: true,
         };
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
-        assert!(text.contains("--enable-prefix-caching"));
+        assert!(text.contains("Enable prefix caching: --enable-prefix-caching"));
+        assert!(text.contains("        Repeated prompt prefixes are re-computed every request."));
+        assert!(text.contains(&format!(
+            "Expected: {}",
+            super::super::ENABLE_PREFIX_CACHING_EXPECTED
+        )));
+        assert!(!text.contains("20-40%"));
+        assert!(!text.contains("automatic prefix"));
     }
 
     #[test]
@@ -1938,10 +2064,10 @@ mod tests {
         let d = wall_path_base(Some(2048), Some(1638.4), None, 12.0);
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
         assert!(text.contains(R6_TERMINAL_VERIFY.trim_start()));
-        assert!(!text.contains("Enable --enable-prefix-caching"));
+        assert!(!text.contains("Enable prefix caching: --enable-prefix-caching"));
         let d_on = wall_path_base(Some(2048), Some(1638.4), Some(true), 12.0);
         let text_on = format_prefill_bound_window_issue(&d_on, 100).join("\n");
-        assert!(!text_on.contains("Enable --enable-prefix-caching"));
+        assert!(!text_on.contains("Enable prefix caching: --enable-prefix-caching"));
     }
 
     #[test]
