@@ -129,6 +129,7 @@ RUN export DEBIAN_FRONTEND=noninteractive \
     bash \
     curl \
     wget \
+    git \
     jq \
     gawk \
     tmux \
