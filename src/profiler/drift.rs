@@ -332,6 +332,19 @@ mod tests {
     }
 
     #[test]
+    fn prescribed_batched_tokens_unread_guide_form_still_detected() {
+        let lines = vec![
+            "      • --max-num-batched-tokens unread on this server.".to_string(),
+            "        Page floor is 1568 (do not go below). Lower for smoother TPOT, raise for lower TTFT."
+                .to_string(),
+        ];
+        let prev = VllmConfig::default();
+        let curr = VllmConfig::default();
+        assert!(prescribed_knob_unread(&prev, &curr, &lines));
+        assert!(change_unverifiable(&prev, &curr, Some(&lines)));
+    }
+
+    #[test]
     fn no_prescription_all_non_baseline_unread_is_unverifiable() {
         let prev = VllmConfig::default();
         let curr = VllmConfig::default();

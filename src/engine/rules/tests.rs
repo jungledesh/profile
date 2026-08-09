@@ -3946,6 +3946,47 @@ fn r6_primary_fix_sets_default_budget_with_scraped_floor() {
 }
 
 #[test]
+fn r6_primary_fix_guides_when_batched_tokens_unread() {
+    let mut windows: Vec<_> = (0..10)
+        .map(|_| mk_r6_prefill_window(12.0, 10.0, 50.0, Some(50.0)))
+        .collect();
+    for w in &mut windows {
+        w.snapshot.vllm.max_num_batched_tokens = None;
+        w.snapshot.vllm.cache_config.block_size = Some(1568);
+    }
+    let s = windows[0].snapshot.clone();
+    let cfg = VllmConfig {
+        dtype: Some("bf16".to_string()),
+        max_model_len: Some(8192),
+        max_num_seqs: Some(256),
+        enable_chunked_prefill: Some(true),
+        enable_prefix_caching: Some(true),
+        max_num_batched_tokens: None,
+        ..Default::default()
+    };
+    let ctx = StaticContext::from_snapshot(&s, cfg);
+    let summary = ai(&ctx, windows.last().expect("windows"));
+    let report = build_report_for_windows(&windows, summary);
+    assert_eq!(
+        report.recommendations[0].rule_name,
+        rule_names::PREFILL_BOUND
+    );
+    let text = report.recommendations[0].display_lines.join("\n");
+    assert!(
+        text.contains("--max-num-batched-tokens unread on this server."),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "Page floor is 1568 (do not go below). Lower for smoother TPOT, raise for lower TTFT."
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("Set --max-num-batched-tokens to 2048"));
+    assert!(text.contains("Steadier decode once prefill sharing is confirmed."));
+}
+
+#[test]
 fn r6_primary_fix_sets_default_budget_without_floor() {
     let mut windows: Vec<_> = (0..10)
         .map(|_| mk_r6_prefill_window(12.0, 10.0, 50.0, Some(50.0)))
