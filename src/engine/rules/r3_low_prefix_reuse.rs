@@ -129,7 +129,7 @@ pub(super) fn format_low_prefix_hit_rate_fired(
 
     let fix_lines: Vec<String> = if enable_prefix_caching == Some(false) {
         vec![
-            "      • Enable prefix caching: --enable-prefix-caching".to_string(),
+            super::ENABLE_PREFIX_CACHING_BULLET.to_string(),
             "      • Move shared instructions/system prompts to the very start".to_string(),
             "      • Standardize prompt templates across requests".to_string(),
         ]
@@ -147,7 +147,10 @@ pub(super) fn format_low_prefix_hit_rate_fired(
     lines.push("    Fix:".to_string());
     lines.extend(fix_lines);
     lines.push(String::new());
-    lines.push("    Expected: Higher prefix cache hit rate and lower TTFT.".to_string());
+    lines.push(format!(
+        "    Expected: {}",
+        super::ENABLE_PREFIX_CACHING_EXPECTED
+    ));
     lines.push("    Confidence: High".to_string());
     lines
 }

@@ -357,23 +357,13 @@ pub(super) fn collect(
         let agg = aggregate_polls(all_device_polls.get(&d).map_or(&[], |v| v));
         let power_limit_watts = device.sensors.as_ref().and_then(power_limit_watts);
 
-        results.push(GpuRawMetrics {
-            gpu_name: Some(device.device_path.device_name.clone()),
-            gpu_index: Some(d),
-            gpu_uuid: None,
-            pcie_bus_id: Some(device.device_path.pci.to_string()),
-            gpu_util_pct: agg.gpu_util_pct,
-            mem_util_pct: agg.mem_util_pct,
-            power_watts: agg.power_watts,
-            aligned_power_watts: None,
+        results.push(agg.into_gpu_raw_metrics(
+            Some(device.device_path.device_name.clone()),
+            Some(d),
+            None,
+            Some(device.device_path.pci.to_string()),
             power_limit_watts,
-            vram_used_mb: agg.vram_used_mb,
-            vram_peak_mb: agg.vram_peak_mb,
-            vram_total_mb: agg.vram_total_mb,
-            temperature_c: agg.temperature_c,
-            temperature_peak_c: agg.temperature_peak_c,
-            sm_clock_mhz: agg.sm_clock_mhz,
-        });
+        ));
     }
 
     Ok((results, SystemTime::now(), Some(host_count)))

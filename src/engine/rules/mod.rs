@@ -24,6 +24,13 @@ pub(crate) use r2_kv_cache_pressure::KV_CACHE_PRESSURE_MIN_PERC;
 /// KV cache usage below this means the pool has room to absorb new sequences safely.
 /// Shared by R5 raise gate and R7 headroom cause line.
 pub(super) const KV_CACHE_SAFE_TO_SCALE_PCT: f64 = 80.0;
+/// Canonical Fix bullet when prefix caching is confirmed off (`Some(false)`).
+/// Shared by R2 / R3 / R6 so Enable wording cannot drift.
+pub(super) const ENABLE_PREFIX_CACHING_BULLET: &str =
+    "      • Enable prefix caching: --enable-prefix-caching";
+/// Expected line after enabling prefix caching. Direction only; no invented %.
+pub(super) const ENABLE_PREFIX_CACHING_EXPECTED: &str =
+    "Higher prefix cache hit rate and lower TTFT.";
 #[cfg(test)]
 pub(crate) use r3_low_prefix_reuse::{LowPrefixReuseDetail, Rule3Outcome, r3_recommendation};
 pub use r4_oom_risk::{r4_advisory, r4_recommendation};
@@ -1124,8 +1131,7 @@ pub struct Recommendation {
     /// NOTE (future work): `display_lines` couples presentation to the engine.
     /// Rules build terminal strings here, so wording changes grow rule files.
     /// Deferred decision: migrate formatting to `output/` (rules return structured
-    /// facts) if rule-file growth becomes painful. Tracked in
-    /// `architecture_audit_specs.md`.
+    /// facts) if rule-file growth becomes painful. Tracked in `deferred.md`.
     pub display_lines: Vec<String>,
     /// True when the fix branch has no server-local knob (wall / scale-out only).
     /// Set by the rule formatter from the branch it took; never inferred from text.

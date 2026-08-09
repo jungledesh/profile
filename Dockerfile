@@ -115,7 +115,9 @@ CMD ["bash", "-lc", "/home/appuser/app/start.sh"]
 # Run (RunPod may set some of these automatically; verify on your pod):
 #   docker run --device=/dev/kfd --device=/dev/dri --group-add video \
 #     --shm-size 16G --security-opt seccomp=unconfined \
-#     -e HF_TOKEN="$HF_TOKEN" -p 8000:8000 -it profile:amd
+#     -p 8000:8000 -it profile:amd
+# start.sh downloads Qwen3.6-27B only (at runtime). Swarm: ./agent-swarm.sh
+# Optional: -e HF_TOKEN=... for Hugging Face rate limits (model is ungated).
 FROM vllm/vllm-openai-rocm:v0.25.1 AS amd
 
 ENV APP_DIR=/home/appuser/app
@@ -127,6 +129,7 @@ RUN export DEBIAN_FRONTEND=noninteractive \
     bash \
     curl \
     wget \
+    git \
     jq \
     gawk \
     tmux \
@@ -180,17 +183,24 @@ COPY --chown=appuser:appuser scripts/load.sh ./load.sh
 COPY --chown=appuser:appuser scripts/start-amd.sh ./start.sh
 COPY --chown=appuser:appuser scripts/start-gemma-amd.sh ./start-gemma.sh
 COPY --chown=appuser:appuser scripts/tool_chat_template_gemma4.jinja ./tool_chat_template_gemma4.jinja
+COPY --chown=appuser:appuser scripts/agent-swarm.sh ./agent-swarm.sh
+# Swarm task list: agent-swarm.sh reads swarm-tasks.json next to itself.
+# fetch-swarm-tasks.py regenerates it if needed (requires internet). Do not
+# run the fetcher at image build — no model or task downloads in the Dockerfile.
+COPY --chown=appuser:appuser scripts/swarm-tasks.json ./swarm-tasks.json
+COPY --chown=appuser:appuser scripts/fetch-swarm-tasks.py ./fetch-swarm-tasks.py
 COPY --chown=appuser:appuser scripts/support-load.py ./support-load.py
 
 COPY --from=profile-builder --chown=appuser:appuser /build/target/release/profile ./profile
 
-RUN chmod 0755 ./load.sh ./start.sh ./start-gemma.sh ./support-load.py ./profile
+RUN chmod 0755 ./load.sh ./start.sh ./start-gemma.sh ./agent-swarm.sh ./support-load.py ./profile
 
 USER appuser
 
-# Default AMD stack is Gemma 4 (CMD / start-gemma.sh) + support-load.py.
-# Do not bake SERVED_NAME: each launcher exports its own. Llama: ./start.sh.
-ENV PROFILE_MODEL=gemma
+# Default AMD stack is Qwen (CMD / start.sh) + agent-swarm load.
+# Do not bake SERVED_NAME: each launcher exports PROFILE_MODEL + SERVED_NAME.
+# Gemma on AMD: ./start-gemma.sh. No model weights are downloaded at build time.
+ENV PROFILE_MODEL=qwen
 
 ENTRYPOINT []
-CMD ["bash", "-lc", "/home/appuser/app/start-gemma.sh"]
+CMD ["bash", "-lc", "/home/appuser/app/start.sh"]
