@@ -3909,7 +3909,8 @@ fn r6_primary_fix_sets_default_budget_with_scraped_floor() {
         .map(|_| mk_r6_prefill_window(12.0, 10.0, 50.0, Some(50.0)))
         .collect();
     for w in &mut windows {
-        w.snapshot.vllm.max_num_batched_tokens = Some(8192);
+        // Below default so launch still Names a Set (never shrink from above).
+        w.snapshot.vllm.max_num_batched_tokens = Some(1024);
         w.snapshot.vllm.cache_config.block_size = Some(784);
     }
     let s = windows[0].snapshot.clone();
@@ -3919,7 +3920,7 @@ fn r6_primary_fix_sets_default_budget_with_scraped_floor() {
         max_num_seqs: Some(256),
         enable_chunked_prefill: Some(true),
         enable_prefix_caching: Some(true),
-        max_num_batched_tokens: Some(8192),
+        max_num_batched_tokens: Some(1024),
         ..Default::default()
     };
     let ctx = StaticContext::from_snapshot(&s, cfg);
@@ -3950,8 +3951,43 @@ fn r6_primary_fix_sets_default_budget_without_floor() {
         .map(|_| mk_r6_prefill_window(12.0, 10.0, 50.0, Some(50.0)))
         .collect();
     for w in &mut windows {
-        w.snapshot.vllm.max_num_batched_tokens = Some(8192);
+        w.snapshot.vllm.max_num_batched_tokens = Some(1024);
         w.snapshot.vllm.cache_config.block_size = None;
+    }
+    let s = windows[0].snapshot.clone();
+    let cfg = VllmConfig {
+        dtype: Some("bf16".to_string()),
+        max_model_len: Some(8192),
+        max_num_seqs: Some(256),
+        enable_chunked_prefill: Some(true),
+        enable_prefix_caching: Some(true),
+        max_num_batched_tokens: Some(1024),
+        ..Default::default()
+    };
+    let ctx = StaticContext::from_snapshot(&s, cfg);
+    let summary = ai(&ctx, windows.last().expect("windows"));
+    let report = build_report_for_windows(&windows, summary);
+    assert_eq!(
+        report.recommendations[0].rule_name,
+        rule_names::PREFILL_BOUND
+    );
+    let text = report.recommendations[0].display_lines.join("\n");
+    assert!(
+        text.contains("Set --max-num-batched-tokens to 2048 (default)."),
+        "no scraped floor → default Set only: {text}"
+    );
+    assert!(!text.contains("page floor"));
+    assert!(!text.contains("floor-limited"));
+}
+
+#[test]
+fn r6_primary_fix_skips_set_when_configured_above_default() {
+    let mut windows: Vec<_> = (0..10)
+        .map(|_| mk_r6_prefill_window(12.0, 10.0, 50.0, Some(50.0)))
+        .collect();
+    for w in &mut windows {
+        w.snapshot.vllm.max_num_batched_tokens = Some(8192);
+        w.snapshot.vllm.cache_config.block_size = Some(784);
     }
     let s = windows[0].snapshot.clone();
     let cfg = VllmConfig {
@@ -3972,11 +4008,19 @@ fn r6_primary_fix_sets_default_budget_without_floor() {
     );
     let text = report.recommendations[0].display_lines.join("\n");
     assert!(
-        text.contains("Set --max-num-batched-tokens to 2048 (default)."),
-        "no scraped floor → default Set only: {text}"
+        !text.contains("Set --max-num-batched-tokens to 2048"),
+        "must not shrink configured-above-default to 2048: {text}"
     );
-    assert!(!text.contains("page floor"));
-    assert!(!text.contains("floor-limited"));
+    assert!(
+        !text.contains("Default --max-num-batched-tokens is 2048"),
+        "no default/floor info when already above: {text}"
+    );
+    assert!(
+        text.contains(
+            "No --max-num-batched-tokens change; configured value is already above the default."
+        ),
+        "{text}"
+    );
 }
 
 #[test]
@@ -3985,7 +4029,8 @@ fn r6_primary_fix_names_floor_when_above_default() {
         .map(|_| mk_r6_prefill_window(12.0, 10.0, 50.0, Some(50.0)))
         .collect();
     for w in &mut windows {
-        w.snapshot.vllm.max_num_batched_tokens = Some(8192);
+        // Unread or below default so floor-above-default info path can fire.
+        w.snapshot.vllm.max_num_batched_tokens = Some(1024);
         w.snapshot.vllm.cache_config.block_size = Some(2496);
     }
     let s = windows[0].snapshot.clone();
@@ -3995,7 +4040,7 @@ fn r6_primary_fix_names_floor_when_above_default() {
         max_num_seqs: Some(256),
         enable_chunked_prefill: Some(true),
         enable_prefix_caching: Some(true),
-        max_num_batched_tokens: Some(8192),
+        max_num_batched_tokens: Some(1024),
         ..Default::default()
     };
     let ctx = StaticContext::from_snapshot(&s, cfg);
