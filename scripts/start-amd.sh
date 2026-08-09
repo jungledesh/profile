@@ -3,6 +3,10 @@
 # Runs inside vllm/vllm-openai-rocm base image which already has vLLM + PyTorch
 # + ROCm installed. No pip install needed.
 #
+# Demo load (enterprise RAG over real vLLM docs):
+#   ./rag-load.sh setup && WORKERS=32 LAMBDA=0.5 ./rag-load.sh run
+# SWE-swarm remains available for coding journeys: ./agent-swarm.sh
+#
 # Qwen is ungated — no HF_TOKEN required (a read token only helps with rate limits).
 
 set -Eeuo pipefail
@@ -49,9 +53,10 @@ fi
 
 # Model/client flags only. No scheduler/memory tuning; Profile diagnoses the rest.
 #   --trust-remote-code          custom arch; load fails without it
-#   --enable-auto-tool-choice    agent swarm must be allowed to call tools
+#   --enable-auto-tool-choice    keeps agent-swarm usable on the same server
 #   --tool-call-parser           qwen3_coder: XML tool calls (hermes mangles them)
 #   --reasoning-parser           qwen3: route <think> out of content or client breaks
+# RAG load (rag-load.sh) uses chat completions only; tool flags are harmless.
 # --max-num-seqs omitted: NVIDIA H100 needs 345 (Mamba cache); MI300X has more
 #   VRAM so vLLM picks. If boot fails on Mamba blocks, pass via EXTRA_ARGS.
 # --max-model-len omitted: vLLM derives model config max.
@@ -71,9 +76,10 @@ tmux new-session -d -s "$TMUX_SESSION" \
 
 echo
 echo "vLLM running (Qwen3.6-27B) in tmux session '$TMUX_SESSION'"
-echo "Served as: $SERVED_NAME  (load/swarm: PROFILE_MODEL=qwen)"
+echo "Served as: $SERVED_NAME  (load: PROFILE_MODEL=qwen)"
 echo "Attach with: tmux attach -t $TMUX_SESSION"
-echo "Swarm: ./agent-swarm.sh setup && ./agent-swarm.sh run"
+echo "RAG (AMD demo): ./rag-load.sh setup && WORKERS=32 LAMBDA=0.5 ./rag-load.sh run"
+echo "SWE-swarm:      ./agent-swarm.sh setup && ./agent-swarm.sh run"
 
 # Interactive shell when stdin is a TTY; otherwise keep container alive.
 if [[ -t 0 ]]; then
