@@ -27,7 +27,7 @@ pub(super) const KV_CACHE_SAFE_TO_SCALE_PCT: f64 = 80.0;
 /// Canonical Fix bullet when prefix caching is confirmed off (`Some(false)`).
 /// Shared by R2 / R3 / R6 so Enable wording cannot drift.
 pub(super) const ENABLE_PREFIX_CACHING_BULLET: &str =
-    "      • Enable prefix caching: --enable-prefix-caching";
+    "      • Enable prefix caching: --enable-prefix-caching.";
 /// Expected line after enabling prefix caching. Direction only; no invented %.
 pub(super) const ENABLE_PREFIX_CACHING_EXPECTED: &str =
     "Higher prefix cache hit rate and lower TTFT.";
@@ -1016,6 +1016,9 @@ pub(super) fn trim_group_trailing_blanks(lines: &mut Vec<String>) {
 /// Bullet plus optional continuation sub-line. After a sub-line, inserts one blank
 /// line before the next bullet (D5). Callers rely on group-end trimming so a
 /// trailing blank is not left when this bullet is last in its group.
+///
+/// Punctuation: Cause / Fix / Expected / Last resort body lines are sentences and
+/// end with `.`. Section headers end with `:`. Metric scoreboard rows stay bare.
 pub(super) fn push_bullet_with_subline(
     out: &mut Vec<String>,
     bullet: String,
@@ -1228,5 +1231,63 @@ mod confidence_tests {
                 "Rule file defines its own confidence_label; use super::confidence_label instead"
             );
         }
+    }
+}
+
+#[cfg(test)]
+/// Cause / Fix / Expected / Last resort / Watch body lines are sentences.
+/// They end with `.`. Section headers end with `:`. Scoreboard rows stay bare.
+pub(crate) fn assert_issue_prose_periods(lines: &[String]) {
+    const SECTION_HEADERS: &[&str] = &[
+        "    Cause:",
+        "    Fix:",
+        "    Safe to apply:",
+        "    Cuts throughput:",
+        "    Rejects requests:",
+        "    Last resort:",
+    ];
+    let mut in_prose = false;
+    for line in lines {
+        let t = line.as_str();
+        if SECTION_HEADERS.contains(&t) {
+            in_prose = true;
+            continue;
+        }
+        if t.starts_with("    Expected:") || t.starts_with("    Watch:") {
+            assert!(
+                t.ends_with('.'),
+                "Expected/Watch line must end with period: {t}"
+            );
+            in_prose = false;
+            continue;
+        }
+        if t.starts_with("    Confidence:")
+            || t.starts_with("[!")
+            || t.starts_with("[i]")
+            || t.starts_with("ISSUES:")
+        {
+            in_prose = false;
+            continue;
+        }
+        if !in_prose || t.is_empty() {
+            continue;
+        }
+        // Bullets and indented sublines under the active section.
+        if t.starts_with("      ") || t.starts_with("        ") {
+            assert!(
+                t.ends_with('.'),
+                "prose body must end with period: {t}\nfull:\n{}",
+                lines.join("\n")
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod prose_punctuation_tests {
+    #[test]
+    fn enable_prefix_bullet_is_punctuated() {
+        assert!(super::ENABLE_PREFIX_CACHING_BULLET.ends_with('.'));
+        assert!(super::ENABLE_PREFIX_CACHING_EXPECTED.ends_with('.'));
     }
 }

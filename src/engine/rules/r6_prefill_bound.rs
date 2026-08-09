@@ -687,9 +687,9 @@ pub(super) fn format_prefill_bound_window_issue_with_terminal(
             d.tpot_ms.filter(|v| v.is_finite() && *v > 0.0),
             d.tpot_floor_ms.filter(|v| v.is_finite() && *v > 0.0),
         ) {
-            (None, _) => "(low confidence, TPOT unavailable)",
-            (Some(_), None) => "(low confidence, TPOT floor unavailable)",
-            (Some(_), Some(_)) => "(low confidence, TPOT check unavailable)",
+            (None, _) => "(low confidence, TPOT unavailable).",
+            (Some(_), None) => "(low confidence, TPOT floor unavailable).",
+            (Some(_), Some(_)) => "(low confidence, TPOT check unavailable).",
         };
         lines.push(format!("      {note}"));
     }

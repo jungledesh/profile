@@ -1454,7 +1454,7 @@ mod stuck_fix_reveal_tests {
                 "      Hardware capacity under-fed by client.".to_string(),
                 String::new(),
                 "    Fix:".to_string(),
-                "      • Batch more requests or increase client concurrency (107 slots idle)"
+                "      • Batch more requests or increase client concurrency (107 slots idle)."
                     .to_string(),
                 String::new(),
                 "    Expected: Higher throughput. TPOT stable until the GPU is fully fed, then it starts to rise."

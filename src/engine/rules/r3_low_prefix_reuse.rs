@@ -130,14 +130,14 @@ pub(super) fn format_low_prefix_hit_rate_fired(
     let fix_lines: Vec<String> = if enable_prefix_caching == Some(false) {
         vec![
             super::ENABLE_PREFIX_CACHING_BULLET.to_string(),
-            "      • Move shared instructions/system prompts to the very start".to_string(),
-            "      • Standardize prompt templates across requests".to_string(),
+            "      • Move shared instructions/system prompts to the very start.".to_string(),
+            "      • Standardize prompt templates across requests.".to_string(),
         ]
     } else {
         vec![
-            "      • Move shared instructions/system prompts to the very start".to_string(),
-            "      • Standardize prompt templates across requests".to_string(),
-            "      • Avoid unique tokens (IDs, timestamps) at the beginning".to_string(),
+            "      • Move shared instructions/system prompts to the very start.".to_string(),
+            "      • Standardize prompt templates across requests.".to_string(),
+            "      • Avoid unique tokens (IDs, timestamps) at the beginning.".to_string(),
         ]
     };
 

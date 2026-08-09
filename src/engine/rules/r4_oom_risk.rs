@@ -93,10 +93,10 @@ pub(super) fn r4_recommendation_with_request_floor(
             gpu_util < 1.0 && (h + vram * (1.0 - gpu_util)) * 1e9 >= request_bytes as f64
         });
         let fix_line = if can_raise_utilization {
-            "      • Raise --gpu-memory-utilization enough to hold one worst-case request"
+            "      • Raise --gpu-memory-utilization enough to hold one worst-case request."
                 .to_string()
         } else {
-            "      • Use a smaller model or a GPU with more VRAM".to_string()
+            "      • Use a smaller model or a GPU with more VRAM.".to_string()
         };
         let mut display_lines = vec![
             "[!] OOM Risk".to_string(),
@@ -152,16 +152,16 @@ pub(super) fn r4_recommendation_with_request_floor(
     } else {
         match (tensor_parallel_size, computed_min_tp) {
             (Some(current), Some(needed)) if current < needed => format!(
-                "      • Increase --tensor-parallel-size to at least {needed} (currently {current})"
+                "      • Increase --tensor-parallel-size to at least {needed} (currently {current})."
             ),
             (Some(current), Some(needed)) if current >= needed => format!(
-                "      • TP={current} should fit weights, but KV cache or activation memory is exhausted. Reduce --max-model-len or lower --gpu-memory-utilization"
+                "      • TP={current} should fit weights, but KV cache or activation memory is exhausted. Reduce --max-model-len or lower --gpu-memory-utilization."
             ),
             (None, Some(needed)) => {
-                format!("      • Set --tensor-parallel-size to at least {needed}")
+                format!("      • Set --tensor-parallel-size to at least {needed}.")
             }
             _ => format!(
-                "      • Increase --tensor-parallel-size (weights overflow by ~{overflow:.0}GB)"
+                "      • Increase --tensor-parallel-size (weights overflow by ~{overflow:.0}GB)."
             ),
         }
     };
@@ -175,7 +175,7 @@ pub(super) fn r4_recommendation_with_request_floor(
             "[!] OOM Risk".to_string(),
             String::new(),
             "    Cause:".to_string(),
-            format!("      • Model weights exceed GPU VRAM by ~{overflow:.0}GB"),
+            format!("      • Model weights exceed GPU VRAM by ~{overflow:.0}GB."),
             "      • Server may OOM without tensor parallelism.".to_string(),
             String::new(),
             "    Fix:".to_string(),

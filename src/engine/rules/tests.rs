@@ -4267,3 +4267,124 @@ fn energy_skew_skipped_counted_on_report() {
     assert_eq!(report.n_eval, 3);
     assert_eq!(report.energy_skew_skipped, 1);
 }
+
+#[test]
+fn recommendation_prose_bodies_end_with_periods() {
+    // High-stakes UI: Cause/Fix/Expected/Last resort sentences always end with `.`.
+    let cases: Vec<(&str, Vec<RuntimeWindow>, StaticContext)> = vec![
+        {
+            let windows: Vec<_> = (0..ENGINE_MIN_PERSISTENT_WINDOWS)
+                .map(|_| mk_evaluable_kv_window(89.0, true))
+                .collect();
+            let s = windows[0].snapshot.clone();
+            (
+                "r2",
+                windows,
+                StaticContext::from_snapshot(
+                    &s,
+                    VllmConfig {
+                        dtype: Some("bf16".to_string()),
+                        max_model_len: Some(8192),
+                        max_num_seqs: Some(256),
+                        ..Default::default()
+                    },
+                ),
+            )
+        },
+        {
+            let windows: Vec<_> = (0..ENGINE_MIN_PERSISTENT_WINDOWS)
+                .map(|_| mk_r6_prefill_window(12.0, 10.0, 50.0, Some(50.0)))
+                .collect();
+            let s = windows[0].snapshot.clone();
+            (
+                "r6",
+                windows,
+                StaticContext::from_snapshot(
+                    &s,
+                    VllmConfig {
+                        dtype: Some("bf16".to_string()),
+                        max_model_len: Some(8192),
+                        max_num_seqs: Some(256),
+                        enable_chunked_prefill: Some(true),
+                        enable_prefix_caching: Some(true),
+                        max_num_batched_tokens: Some(1024),
+                        ..Default::default()
+                    },
+                ),
+            )
+        },
+        {
+            let windows: Vec<_> = (0..ENGINE_MIN_PERSISTENT_WINDOWS)
+                .map(|_| mk_evaluable_concurrency_saturation_window(32.0, 20.0, 32))
+                .collect();
+            let s = windows[0].snapshot.clone();
+            (
+                "r5",
+                windows,
+                StaticContext::from_snapshot(
+                    &s,
+                    VllmConfig {
+                        dtype: Some("bf16".to_string()),
+                        max_model_len: Some(8192),
+                        max_num_seqs: Some(32),
+                        ..Default::default()
+                    },
+                ),
+            )
+        },
+        {
+            let windows: Vec<_> = (0..ENGINE_MIN_PERSISTENT_WINDOWS)
+                .map(|_| mk_r7_headroom_window(10.0, 32, 0.0, 100.0))
+                .collect();
+            ("r7", windows, mk_r7_ctx(32))
+        },
+    ];
+
+    for (label, windows, ctx) in cases {
+        let summary = ai(&ctx, windows.last().expect("windows"));
+        let report = build_report_for_windows(&windows, summary);
+        assert!(
+            !report.recommendations.is_empty(),
+            "{label}: expected at least one recommendation"
+        );
+        for rec in &report.recommendations {
+            assert_issue_prose_periods(&rec.display_lines);
+        }
+        for rec in &report.suppressed_recs {
+            assert_issue_prose_periods(&rec.display_lines);
+        }
+    }
+
+    // Direct format paths not always primary in the aggregate cases above.
+    let r3 = format_low_prefix_hit_rate_fired(
+        &LowPrefixReuseDetail {
+            hit_rate: Some(0.1),
+            prompt_tokens_mean: Some(500.0),
+            queries_delta: None,
+        },
+        Some(false),
+        Some(0.1),
+    );
+    assert_issue_prose_periods(&r3);
+
+    let r4 = r4_recommendation(
+        Some(-12.0),
+        Some(1),
+        Some(92.0),
+        Some(80.0),
+        Some(0.9),
+        crate::engine::baseline::WeightDtypeSource::Catalog,
+    )
+    .expect("r4");
+    assert_issue_prose_periods(&r4.display_lines);
+
+    for variant in [
+        MuVariant::Starved,
+        MuVariant::BlockedAdmission { kv_pct: Some(10.0) },
+        MuVariant::BlockedAdmission { kv_pct: None },
+        MuVariant::GaugeMissing,
+    ] {
+        let lines = mu_diagnose_lines(2.5, Some(14.0), Some(0.0), Some(256), variant, Some(true));
+        assert_issue_prose_periods(&lines);
+    }
+}
