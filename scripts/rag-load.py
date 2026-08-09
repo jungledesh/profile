@@ -78,6 +78,31 @@ def build_user_message(template: str, question: str, excerpts: list[dict]) -> st
     )
 
 
+def _seconds_until(deadline: float | None) -> float | None:
+    """Seconds left until deadline, or None if unbounded / already expired."""
+    if deadline is None:
+        return None
+    remaining = deadline - time.time()
+    if remaining <= 0:
+        return None
+    # Floor avoids zero/negative aiohttp timeouts from race at the deadline edge.
+    return max(0.05, remaining)
+
+
+def _request_timeout(deadline: float | None):
+    """Per-request timeout so DURATION cannot leave workers stuck on sock_read=600."""
+    remaining = _seconds_until(deadline)
+    if remaining is None:
+        return None
+    if aiohttp is None:
+        return None
+    return aiohttp.ClientTimeout(
+        total=remaining,
+        sock_connect=min(30.0, remaining),
+        sock_read=remaining,
+    )
+
+
 async def chat_completion(
     session,  # aiohttp.ClientSession
     url: str,
@@ -85,6 +110,7 @@ async def chat_completion(
     messages: list[dict],
     max_tokens: int,
     stats: dict,
+    deadline: float | None = None,
 ) -> str | None:
     body = {
         "model": model,
@@ -93,8 +119,13 @@ async def chat_completion(
         "temperature": 0.2,
         "stream": False,
     }
+    remaining = _seconds_until(deadline)
+    if deadline is not None and remaining is None:
+        stats["deadline"] += 1
+        return None
+    req_timeout = _request_timeout(deadline)
     try:
-        async with session.post(url, json=body) as resp:
+        async with session.post(url, json=body, timeout=req_timeout) as resp:
             raw = await resp.read()
             if resp.status >= 400:
                 stats["http_err"] += 1
@@ -114,7 +145,11 @@ async def chat_completion(
                 return None
             return str(content)
     except (aiohttp.ClientError, asyncio.TimeoutError):
-        stats["transport_err"] += 1
+        # Deadline-bounded timeouts count separately from other transport errors.
+        if deadline is not None and time.time() >= deadline:
+            stats["deadline"] += 1
+        else:
+            stats["transport_err"] += 1
         return None
 
 
@@ -156,13 +191,18 @@ async def worker(
     i = 0
 
     async def think(bursting: bool) -> None:
+        if stop_at is not None and time.time() >= stop_at:
+            return
         if worker_lambda <= 0:
             return
         if bursting:
-            await asyncio.sleep(rng.uniform(0.01, 0.08))
-            return
-        delay = rng.expovariate(1.0 / worker_lambda)
-        await asyncio.sleep(min(delay, worker_lambda * 5))
+            delay = rng.uniform(0.01, 0.08)
+        else:
+            delay = min(rng.expovariate(1.0 / worker_lambda), worker_lambda * 5)
+        if stop_at is not None:
+            delay = min(delay, max(0.0, stop_at - time.time()))
+        if delay > 0:
+            await asyncio.sleep(delay)
 
     while True:
         if stop_at is not None and time.time() >= stop_at:
@@ -195,17 +235,25 @@ async def worker(
                 max_tokens = min(max_tokens, 180)
 
             content = await chat_completion(
-                session, url, model, messages, max_tokens, stats
+                session,
+                url,
+                model,
+                messages,
+                max_tokens,
+                stats,
+                deadline=stop_at,
             )
             stats["requests"] += 1
             if content:
                 messages.append({"role": "assistant", "content": content})
                 stats["sessions_turns"] += 1
             else:
-                # Broken turn: drop session, avoid poisoning history.
+                # Broken turn or deadline: drop session, avoid poisoning history.
                 break
 
         stats["sessions"] += 1
+        if stop_at is not None and time.time() >= stop_at:
+            return
         bursting = rng.random() < burst_frac
         # Small burst: start next session almost immediately (same worker).
         await think(bursting)
@@ -264,9 +312,11 @@ async def async_main(args: argparse.Namespace) -> int:
         "http_err": 0,
         "transport_err": 0,
         "parse_err": 0,
+        "deadline": 0,
         "sessions": 0,
         "sessions_turns": 0,
     }
+    # Session default is unbounded when DURATION=0; timed runs bound each POST.
     timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=600)
     connector = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300)
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
@@ -301,9 +351,18 @@ async def async_main(args: argparse.Namespace) -> int:
             for wid in range(workers)
         ]
         try:
-            await asyncio.gather(*jobs)
-        except asyncio.CancelledError:
-            pass
+            if stop_at is not None:
+                # Hard cap: cancel stragglers shortly after deadline-bounded requests end.
+                await asyncio.wait_for(
+                    asyncio.gather(*jobs),
+                    timeout=max(0.1, stop_at - time.time() + 2.0),
+                )
+            else:
+                await asyncio.gather(*jobs)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            for job in jobs:
+                job.cancel()
+            await asyncio.gather(*jobs, return_exceptions=True)
 
     print(
         "stats: "
@@ -312,6 +371,7 @@ async def async_main(args: argparse.Namespace) -> int:
         f"http_ok={stats['http_ok']} "
         f"http_err={stats['http_err']} "
         f"transport_err={stats['transport_err']} "
+        f"deadline={stats['deadline']} "
         f"parse_err={stats['parse_err']}"
     )
     return 0
