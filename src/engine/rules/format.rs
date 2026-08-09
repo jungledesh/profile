@@ -420,12 +420,16 @@ fn blocked_admission_kv_clause(kv_pct: f64) -> String {
 }
 
 /// Post-DAG traffic/admission safety net (massive under-utilization).
+///
+/// `chunked_prefill_enabled`: Enable only on `Some(false)`; Confirm on `None`;
+/// omit on `Some(true)`. Unknown is not off.
 pub(crate) fn mu_diagnose_lines(
     eff: f64,
     run: Option<f64>,
     wait: Option<f64>,
     max_num_seqs: Option<u32>,
     variant: MuVariant,
+    chunked_prefill_enabled: Option<bool>,
 ) -> Vec<String> {
     // Truncate (not round): mean waiting 0.6 must not print as "1 waiting".
     let count_str = |v: Option<f64>| {
@@ -455,12 +459,14 @@ pub(crate) fn mu_diagnose_lines(
             )
         }
     };
-    let (cause, fix, expected, confidence) = match variant {
+    let (cause, mut fix_bullets, expected, confidence) = match variant {
         MuVariant::Starved => (
             "      Server is under-fed. No config bottleneck detected - client traffic is too low to utilize the hardware."
                 .to_string(),
-            "      • Batch more requests or increase client concurrency until a wait queue forms."
-                .to_string(),
+            vec![
+                "      • Batch more requests or increase client concurrency until a wait queue forms."
+                    .to_string(),
+            ],
             "    Expected: Efficiency climbs as the GPU is fed more work.".to_string(),
             "    Confidence: Medium".to_string(),
         ),
@@ -468,30 +474,32 @@ pub(crate) fn mu_diagnose_lines(
             kv_pct: Some(pct),
         } => (
             format!(
-                "      Requests queue while seats are free and {}. Scheduler admission is blocked - likely the prefill token budget.",
+                "      Requests queue while seats are free and {}. Scheduler admission is blocked, likely the prefill token budget.",
                 blocked_admission_kv_clause(pct)
             ),
-            "      • Raise --max-num-batched-tokens or enable chunked prefill.".to_string(),
+            blocked_admission_fix_bullets(chunked_prefill_enabled),
             "    Expected: Queue drains as admission unblocks.".to_string(),
             "    Confidence: Low (cause inferred, token budget not observed)".to_string(),
         ),
         MuVariant::BlockedAdmission { kv_pct: None } => (
-            "      Requests queue while seats are free. Scheduler admission is blocked - likely the prefill token budget."
+            "      Requests queue while seats are free. Scheduler admission is blocked, likely the prefill token budget."
                 .to_string(),
-            "      • Raise --max-num-batched-tokens or enable chunked prefill.".to_string(),
+            blocked_admission_fix_bullets(chunked_prefill_enabled),
             "    Expected: Queue drains as admission unblocks.".to_string(),
             "    Confidence: Low (cause inferred; KV gauge unavailable)".to_string(),
         ),
         MuVariant::GaugeMissing => (
             "      Server is under-fed. No config bottleneck detected - client traffic is too low to utilize the hardware."
                 .to_string(),
-            "      • Batch more requests or increase client concurrency until a wait queue forms."
-                .to_string(),
+            vec![
+                "      • Batch more requests or increase client concurrency until a wait queue forms."
+                    .to_string(),
+            ],
             "    Expected: Efficiency climbs as the GPU is fed more work.".to_string(),
             "    Confidence: Low (waiting gauge unavailable)".to_string(),
         ),
     };
-    vec![
+    let mut out = vec![
         "[!] Massive Under-utilization".to_string(),
         String::new(),
         format!(
@@ -504,11 +512,29 @@ pub(crate) fn mu_diagnose_lines(
         cause,
         String::new(),
         "    Fix:".to_string(),
-        fix,
-        String::new(),
-        expected,
-        confidence,
-    ]
+    ];
+    out.append(&mut fix_bullets);
+    out.push(String::new());
+    out.push(expected);
+    out.push(confidence);
+    out
+}
+
+fn blocked_admission_fix_bullets(chunked_prefill_enabled: Option<bool>) -> Vec<String> {
+    let mut bullets = vec!["      • Raise --max-num-batched-tokens.".to_string()];
+    match chunked_prefill_enabled {
+        Some(false) => {
+            bullets.push("      • Enable chunked prefill (--enable-chunked-prefill).".to_string());
+        }
+        None => {
+            bullets.push(
+                "      • Confirm chunked prefill is enabled (--enable-chunked-prefill)."
+                    .to_string(),
+            );
+        }
+        Some(true) => {}
+    }
+    bullets
 }
 
 /// Idle server with working telemetry: show load-generation hint.
@@ -1033,14 +1059,28 @@ mod load_hint_tests {
 
     #[test]
     fn mu_diagnose_lines_starved_variant() {
-        let text = mu_diagnose_lines(12.5, Some(64.0), Some(0.0), Some(256), MuVariant::Starved)
-            .join("\n");
+        let text = mu_diagnose_lines(
+            12.5,
+            Some(64.0),
+            Some(0.0),
+            Some(256),
+            MuVariant::Starved,
+            None,
+        )
+        .join("\n");
         assert!(text.contains("Requests  64 running, 0 waiting  (server not saturated)"));
         assert!(text.contains("Server is under-fed"));
         assert!(text.contains("Confidence: Medium"));
         assert!(!text.contains("GPU is idle"));
-        let blip = mu_diagnose_lines(12.5, Some(64.0), Some(0.6), Some(256), MuVariant::Starved)
-            .join("\n");
+        let blip = mu_diagnose_lines(
+            12.5,
+            Some(64.0),
+            Some(0.6),
+            Some(256),
+            MuVariant::Starved,
+            None,
+        )
+        .join("\n");
         assert!(blip.contains("Requests  64 running, 0 waiting  (server not saturated)"));
         assert!(!blip.contains("1 waiting"));
     }
@@ -1053,12 +1093,16 @@ mod load_hint_tests {
             Some(5.0),
             Some(256),
             MuVariant::BlockedAdmission { kv_pct: Some(10.0) },
+            None,
         )
         .join("\n");
         assert!(measured_low.contains("Requests  10 running, 5 waiting  (246 of 256 seats free)"));
         assert!(measured_low.contains("seats are free and KV cache at 10% (low)"));
         assert!(measured_low.contains("Scheduler admission is blocked"));
-        assert!(measured_low.contains("Raise --max-num-batched-tokens"));
+        assert!(measured_low.contains("Raise --max-num-batched-tokens."));
+        assert!(measured_low.contains("Confirm chunked prefill is enabled"));
+        assert!(!measured_low.contains("or enable chunked prefill"));
+        assert!(!measured_low.contains("Enable chunked prefill (--enable-chunked-prefill)."));
         assert!(
             measured_low.contains("Confidence: Low (cause inferred, token budget not observed)")
         );
@@ -1071,9 +1115,12 @@ mod load_hint_tests {
             Some(5.0),
             Some(256),
             MuVariant::BlockedAdmission { kv_pct: Some(30.0) },
+            Some(true),
         )
         .join("\n");
         assert!(measured_mid_low.contains("KV cache at 30% (low)"));
+        assert!(measured_mid_low.contains("Raise --max-num-batched-tokens."));
+        assert!(!measured_mid_low.contains("chunked prefill"));
 
         let measured_near_full = mu_diagnose_lines(
             12.0,
@@ -1081,11 +1128,15 @@ mod load_hint_tests {
             Some(5.0),
             Some(256),
             MuVariant::BlockedAdmission { kv_pct: Some(85.0) },
+            Some(false),
         )
         .join("\n");
         assert!(measured_near_full.contains("KV cache at 85%"));
         assert!(!measured_near_full.contains("(low)"));
         assert!(!measured_near_full.contains("KV cache is low"));
+        assert!(measured_near_full.contains("Raise --max-num-batched-tokens."));
+        assert!(measured_near_full.contains("Enable chunked prefill (--enable-chunked-prefill)."));
+        assert!(!measured_near_full.contains("Confirm chunked prefill"));
 
         let unmeasured = mu_diagnose_lines(
             12.0,
@@ -1093,13 +1144,15 @@ mod load_hint_tests {
             Some(5.0),
             Some(256),
             MuVariant::BlockedAdmission { kv_pct: None },
+            None,
         )
         .join("\n");
         assert!(unmeasured.contains("Requests  10 running, 5 waiting  (246 of 256 seats free)"));
         assert!(unmeasured.contains("Requests queue while seats are free."));
         assert!(!unmeasured.contains("KV cache"));
         assert!(unmeasured.contains("Scheduler admission is blocked"));
-        assert!(unmeasured.contains("Raise --max-num-batched-tokens"));
+        assert!(unmeasured.contains("Raise --max-num-batched-tokens."));
+        assert!(unmeasured.contains("Confirm chunked prefill is enabled"));
         assert!(unmeasured.contains("Confidence: Low (cause inferred; KV gauge unavailable)"));
 
         let no_max = mu_diagnose_lines(
@@ -1108,16 +1161,25 @@ mod load_hint_tests {
             Some(5.0),
             None,
             MuVariant::BlockedAdmission { kv_pct: Some(10.0) },
+            Some(true),
         )
         .join("\n");
         assert!(no_max.contains("(seats free unknown)"));
         assert!(!no_max.contains("server not saturated"));
+        assert!(!no_max.contains("chunked prefill"));
     }
 
     #[test]
     fn mu_diagnose_lines_gauge_missing_variant() {
-        let text = mu_diagnose_lines(12.5, Some(64.0), None, Some(256), MuVariant::GaugeMissing)
-            .join("\n");
+        let text = mu_diagnose_lines(
+            12.5,
+            Some(64.0),
+            None,
+            Some(256),
+            MuVariant::GaugeMissing,
+            None,
+        )
+        .join("\n");
         assert!(text.contains("Requests  64 running, - waiting  (waiting gauge unavailable)"));
         assert!(text.contains("Server is under-fed"));
         assert!(text.contains("Confidence: Low (waiting gauge unavailable)"));

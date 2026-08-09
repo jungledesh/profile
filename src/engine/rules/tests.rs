@@ -3904,6 +3904,119 @@ fn r6_fires_as_primary_when_no_other_rules() {
 }
 
 #[test]
+fn r6_primary_fix_sets_default_budget_with_scraped_floor() {
+    let mut windows: Vec<_> = (0..10)
+        .map(|_| mk_r6_prefill_window(12.0, 10.0, 50.0, Some(50.0)))
+        .collect();
+    for w in &mut windows {
+        w.snapshot.vllm.max_num_batched_tokens = Some(8192);
+        w.snapshot.vllm.cache_config.block_size = Some(784);
+    }
+    let s = windows[0].snapshot.clone();
+    let cfg = VllmConfig {
+        dtype: Some("bf16".to_string()),
+        max_model_len: Some(8192),
+        max_num_seqs: Some(256),
+        enable_chunked_prefill: Some(true),
+        enable_prefix_caching: Some(true),
+        max_num_batched_tokens: Some(8192),
+        ..Default::default()
+    };
+    let ctx = StaticContext::from_snapshot(&s, cfg);
+    let summary = ai(&ctx, windows.last().expect("windows"));
+    let report = build_report_for_windows(&windows, summary);
+    assert_eq!(
+        report.recommendations[0].rule_name,
+        rule_names::PREFILL_BOUND
+    );
+    let text = report.recommendations[0].display_lines.join("\n");
+    assert!(
+        text.contains(
+            "Set --max-num-batched-tokens to 2048 (default); page floor is 784 (do not go below)."
+        ),
+        "R6 multi-window aggregate must use launch default+floor Set: {text}"
+    );
+    assert!(text.contains("Lower for smoother TPOT, raise for lower TTFT."));
+    assert!(text.contains(
+        "If vLLM rejects this at boot, its error names the model minimum; use that value."
+    ));
+    assert!(!text.contains("floor-limited"));
+    assert!(!text.contains("(est)"));
+}
+
+#[test]
+fn r6_primary_fix_sets_default_budget_without_floor() {
+    let mut windows: Vec<_> = (0..10)
+        .map(|_| mk_r6_prefill_window(12.0, 10.0, 50.0, Some(50.0)))
+        .collect();
+    for w in &mut windows {
+        w.snapshot.vllm.max_num_batched_tokens = Some(8192);
+        w.snapshot.vllm.cache_config.block_size = None;
+    }
+    let s = windows[0].snapshot.clone();
+    let cfg = VllmConfig {
+        dtype: Some("bf16".to_string()),
+        max_model_len: Some(8192),
+        max_num_seqs: Some(256),
+        enable_chunked_prefill: Some(true),
+        enable_prefix_caching: Some(true),
+        max_num_batched_tokens: Some(8192),
+        ..Default::default()
+    };
+    let ctx = StaticContext::from_snapshot(&s, cfg);
+    let summary = ai(&ctx, windows.last().expect("windows"));
+    let report = build_report_for_windows(&windows, summary);
+    assert_eq!(
+        report.recommendations[0].rule_name,
+        rule_names::PREFILL_BOUND
+    );
+    let text = report.recommendations[0].display_lines.join("\n");
+    assert!(
+        text.contains("Set --max-num-batched-tokens to 2048 (default)."),
+        "no scraped floor → default Set only: {text}"
+    );
+    assert!(!text.contains("page floor"));
+    assert!(!text.contains("floor-limited"));
+}
+
+#[test]
+fn r6_primary_fix_names_floor_when_above_default() {
+    let mut windows: Vec<_> = (0..10)
+        .map(|_| mk_r6_prefill_window(12.0, 10.0, 50.0, Some(50.0)))
+        .collect();
+    for w in &mut windows {
+        w.snapshot.vllm.max_num_batched_tokens = Some(8192);
+        w.snapshot.vllm.cache_config.block_size = Some(2496);
+    }
+    let s = windows[0].snapshot.clone();
+    let cfg = VllmConfig {
+        dtype: Some("bf16".to_string()),
+        max_model_len: Some(8192),
+        max_num_seqs: Some(256),
+        enable_chunked_prefill: Some(true),
+        enable_prefix_caching: Some(true),
+        max_num_batched_tokens: Some(8192),
+        ..Default::default()
+    };
+    let ctx = StaticContext::from_snapshot(&s, cfg);
+    let summary = ai(&ctx, windows.last().expect("windows"));
+    let report = build_report_for_windows(&windows, summary);
+    assert_eq!(
+        report.recommendations[0].rule_name,
+        rule_names::PREFILL_BOUND
+    );
+    let text = report.recommendations[0].display_lines.join("\n");
+    assert!(
+        text.contains(
+            "Default --max-num-batched-tokens is 2048; page floor is 2496 (do not go below)."
+        ),
+        "floor above default must not Set 2048: {text}"
+    );
+    assert!(!text.contains("Set --max-num-batched-tokens to 2048"));
+    assert!(!text.contains("Set --max-num-batched-tokens to 2496"));
+}
+
+#[test]
 fn r6_suppresses_r7_when_both_fire() {
     let mut windows: Vec<_> = (0..10)
         .map(|_| mk_r6_prefill_window(12.0, 10.0, 50.0, Some(50.0)))

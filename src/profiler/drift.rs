@@ -293,7 +293,7 @@ mod tests {
     #[test]
     fn prescribed_batched_tokens_unread_both_sides() {
         let lines = vec![
-            "      • Set --max-num-batched-tokens to 384 (est) to shrink prefill chunk size."
+            "      • Set --max-num-batched-tokens to 2048 (default); page floor is 784 (do not go below). Lower for smoother TPOT, raise for lower TTFT."
                 .to_string(),
         ];
         let prev = VllmConfig::default();
@@ -305,7 +305,7 @@ mod tests {
     #[test]
     fn prescribed_batched_tokens_readable_not_unverifiable() {
         let lines = vec![
-            "      • Set --max-num-batched-tokens to 384 (est) to shrink prefill chunk size."
+            "      • Set --max-num-batched-tokens to 2048 (default); page floor is 784 (do not go below). Lower for smoother TPOT, raise for lower TTFT."
                 .to_string(),
         ];
         let prev = VllmConfig {
@@ -318,6 +318,17 @@ mod tests {
         };
         assert!(!prescribed_knob_unread(&prev, &curr, &lines));
         assert!(!change_unverifiable(&prev, &curr, Some(&lines)));
+    }
+
+    #[test]
+    fn prescribed_batched_tokens_floor_above_default_form_still_detected() {
+        let lines = vec![
+            "      • Default --max-num-batched-tokens is 2048; page floor is 2496 (do not go below). Lower for smoother TPOT, raise for lower TTFT."
+                .to_string(),
+        ];
+        let prev = VllmConfig::default();
+        let curr = VllmConfig::default();
+        assert!(prescribed_knob_unread(&prev, &curr, &lines));
     }
 
     #[test]

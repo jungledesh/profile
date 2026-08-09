@@ -301,8 +301,6 @@ fn eval_window_rules(
                 .vllm
                 .max_num_batched_tokens
                 .or(summary.ctx.config.max_num_batched_tokens),
-            is_hybrid: model_is_hybrid(&summary.ctx.model),
-            model_in_catalog: summary.ctx.model.param_count.is_some(),
         });
         match r6_outcome {
             Rule6Outcome::Fired(d) => {
