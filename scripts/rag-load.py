@@ -316,16 +316,29 @@ async def async_main(args: argparse.Namespace) -> int:
         "sessions": 0,
         "sessions_turns": 0,
     }
-    # Session default is unbounded when DURATION=0; timed runs bound each POST.
+    # Session default is for unbounded runs; timed POSTs override per request.
+    # Preflight must not inherit sock_read=600 or a short DURATION stalls here.
     timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=600)
     connector = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300)
+    preflight_cap = 30.0
+    if stop_at is not None:
+        preflight_s = min(preflight_cap, max(0.05, stop_at - time.time()))
+    else:
+        preflight_s = preflight_cap
+    preflight_timeout = aiohttp.ClientTimeout(
+        total=preflight_s,
+        sock_connect=min(30.0, preflight_s),
+        sock_read=preflight_s,
+    )
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         try:
-            async with session.get(f"{base}/v1/models") as resp:
+            async with session.get(
+                f"{base}/v1/models", timeout=preflight_timeout
+            ) as resp:
                 if resp.status >= 400:
                     print(f"vLLM /v1/models status {resp.status}", file=sys.stderr)
                     return 1
-        except aiohttp.ClientError as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             print(f"vLLM not reachable at {base}: {e}", file=sys.stderr)
             return 1
 
