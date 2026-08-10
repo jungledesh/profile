@@ -190,14 +190,21 @@ COPY --chown=appuser:appuser scripts/agent-swarm.sh ./agent-swarm.sh
 COPY --chown=appuser:appuser scripts/swarm-tasks.json ./swarm-tasks.json
 COPY --chown=appuser:appuser scripts/fetch-swarm-tasks.py ./fetch-swarm-tasks.py
 COPY --chown=appuser:appuser scripts/support-load.py ./support-load.py
+# AMD demo load: enterprise RAG over pinned real vLLM docs (rag-tasks.json).
+# fetch-vllm-docs-rag.py regenerates the pack if needed (git + network).
+COPY --chown=appuser:appuser scripts/rag-load.sh ./rag-load.sh
+COPY --chown=appuser:appuser scripts/rag-load.py ./rag-load.py
+COPY --chown=appuser:appuser scripts/fetch-vllm-docs-rag.py ./fetch-vllm-docs-rag.py
+COPY --chown=appuser:appuser scripts/rag-tasks.json ./rag-tasks.json
 
 COPY --from=profile-builder --chown=appuser:appuser /build/target/release/profile ./profile
 
-RUN chmod 0755 ./load.sh ./start.sh ./start-gemma.sh ./agent-swarm.sh ./support-load.py ./profile
+RUN chmod 0755 ./load.sh ./start.sh ./start-gemma.sh ./agent-swarm.sh \
+    ./support-load.py ./rag-load.sh ./rag-load.py ./fetch-vllm-docs-rag.py ./profile
 
 USER appuser
 
-# Default AMD stack is Qwen (CMD / start.sh) + agent-swarm load.
+# Default AMD stack is Qwen (CMD / start.sh) + vLLM-docs RAG load (rag-load.sh).
 # Do not bake SERVED_NAME: each launcher exports PROFILE_MODEL + SERVED_NAME.
 # Gemma on AMD: ./start-gemma.sh. No model weights are downloaded at build time.
 ENV PROFILE_MODEL=qwen

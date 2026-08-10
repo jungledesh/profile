@@ -79,6 +79,7 @@ pub fn build_report_for_diagnose(windows: &[RuntimeWindow], input: AnalysisInput
             report.baseline.as_ref(),
             &input.window.snapshot,
             input.ctx.config.max_num_seqs,
+            input.ctx.config.enable_chunked_prefill,
         );
     }
     report
@@ -89,6 +90,7 @@ fn maybe_add_massive_underutilization(
     baseline: Option<&PhysicsBaseline>,
     snapshot: &crate::collectors::RawSnapshot,
     config_max_num_seqs: Option<u32>,
+    chunked_prefill_enabled: Option<bool>,
 ) {
     if !recommendations.is_empty() {
         return;
@@ -151,13 +153,22 @@ fn maybe_add_massive_underutilization(
         }
     };
 
+    let chunked = chunked_prefill_enabled.or(snapshot.vllm.cache_config.enable_chunked_prefill);
+
     recommendations.push(rules::Recommendation {
         rule_name: rule_names::MASSIVE_UNDERUTILIZATION,
         // Sentinel: post-DAG inject; not a DAG layer. Layer-min filtering does not apply.
         layer: 0,
         impact: 5,
         confidence,
-        display_lines: rules::mu_diagnose_lines(eff, running, waiting, max_num_seqs, variant),
+        display_lines: rules::mu_diagnose_lines(
+            eff,
+            running,
+            waiting,
+            max_num_seqs,
+            variant,
+            chunked,
+        ),
         terminal: false,
     });
 }
@@ -464,7 +475,10 @@ mod build_report_tests {
         assert!(text.contains("seats are free and KV cache at 10% (low)"));
         assert!(!text.contains("KV cache is low."));
         assert!(text.contains("Scheduler admission is blocked"));
-        assert!(text.contains("Raise --max-num-batched-tokens"));
+        assert!(text.contains("Raise --max-num-batched-tokens."));
+        assert!(text.contains("Confirm chunked prefill is enabled"));
+        assert!(!text.contains("or enable chunked prefill"));
+        assert!(!text.contains("Enable chunked prefill (--enable-chunked-prefill)."));
         assert!(!text.contains("server not saturated"));
         assert!(text.contains("Confidence: Low (cause inferred, token budget not observed)"));
     }

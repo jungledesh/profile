@@ -2115,10 +2115,10 @@ fn issue_blocks_r1_through_r7_have_no_waste_per_hr() {
         assert_no_waste("R5", &text);
     }
 
-    // R6
+    // R6 (bound running so Prefill stays primary; soft field would demote to R1)
     {
         let windows: Vec<_> = (0..10)
-            .map(|_| mk_r6_prefill_window(12.0, 10.0, 5.0, Some(50.0)))
+            .map(|_| mk_r6_prefill_window(12.0, 10.0, 100.0, Some(50.0)))
             .collect();
         let ctx = mk_llama8b_h100_ctx(&windows[0].snapshot);
         let summary = ai(&ctx, windows.last().expect("windows"));
@@ -2196,12 +2196,12 @@ fn not_triggered_shows_plain_label() {
 
 #[test]
 fn suppressed_rule_shows_suppressor_in_verbose() {
-    // Mixed run: both R1 and R6 significant → ME puts R6 over R1.
+    // Bound (running near ridge floor): both R1 and R6 significant → ME puts R6 over R1.
     let mut windows: Vec<_> = (0..10)
-        .map(|_| mk_r6_prefill_window(2.5, 10.0, 5.0, Some(50.0)))
+        .map(|_| mk_r6_prefill_window(2.5, 10.0, 100.0, Some(50.0)))
         .collect();
     for w in windows.iter_mut().skip(5) {
-        *w = mk_r6_prefill_window(12.0, 10.0, 5.0, Some(80.0));
+        *w = mk_r6_prefill_window(12.0, 10.0, 100.0, Some(80.0));
     }
     let ctx = mk_llama8b_h100_ctx(&windows[0].snapshot);
     let summary = ai(&ctx, windows.last().expect("windows"));
@@ -2237,10 +2237,10 @@ fn suppression_table_shows_suppressor_in_verbose() {
 
 #[test]
 fn format_diagnose_verbose_r1_suppressed_by_r6_when_both_fire() {
-    // Prefill-shaped under-batching: R1 evaluates and ME suppresses it under R6.
+    // Bound prefill + under-batching: R1 evaluates and ME suppresses it under R6.
     // Verbose must show "suppressed by", not a defer / prompt-gen parenthetical.
     let windows: Vec<_> = (0..10)
-        .map(|_| mk_r6_prefill_window(12.0, 10.0, 5.0, Some(50.0)))
+        .map(|_| mk_r6_prefill_window(12.0, 10.0, 100.0, Some(50.0)))
         .collect();
     let ctx = mk_llama8b_h100_ctx(&windows[0].snapshot);
     let summary = ai(&ctx, windows.last().expect("windows"));
@@ -3007,13 +3007,13 @@ fn r7_silent_when_waiting_nonzero_r5_territory() {
 
 #[test]
 fn mixed_run_r6_suppresses_r1() {
-    // Half under-batched (R1), half prefill-bound (R6). Both significant;
-    // ME before layer filter → R6 primary, R1 suppressed.
+    // Bound (running above soft-field ridge floor): half under-batched signal,
+    // half prefill-bound. Both significant; ME before layer filter → R6 primary.
     let mut windows: Vec<_> = (0..10)
-        .map(|_| mk_r6_prefill_window(2.5, 10.0, 5.0, Some(50.0)))
+        .map(|_| mk_r6_prefill_window(2.5, 10.0, 100.0, Some(50.0)))
         .collect();
     for w in windows.iter_mut().skip(5) {
-        *w = mk_r6_prefill_window(12.0, 10.0, 5.0, Some(80.0));
+        *w = mk_r6_prefill_window(12.0, 10.0, 100.0, Some(80.0));
     }
     let ctx = mk_llama8b_h100_ctx(&windows[0].snapshot);
     let summary = ai(&ctx, windows.last().expect("windows"));
@@ -3048,6 +3048,146 @@ fn mixed_run_r6_suppresses_r1() {
 }
 
 #[test]
+fn soft_field_r1_primary_demotes_r6_to_suppressed_recs() {
+    // Soft field (running ≪ ridge, wait≈0, KV cool): skip R6→R1 ME.
+    // R1 owns first fire; Prefill parked for remeasure reveal.
+    let windows: Vec<_> = (0..10)
+        .map(|_| mk_r6_prefill_window(12.0, 10.0, 5.0, Some(50.0)))
+        .collect();
+    let ctx = mk_llama8b_h100_ctx(&windows[0].snapshot);
+    let summary = ai(&ctx, windows.last().expect("windows"));
+    let report = build_report_for_windows(&windows, summary);
+    assert!(
+        report
+            .limiter_evidence
+            .as_ref()
+            .is_some_and(crate::engine::limiter::soft_field),
+        "fixture must classify soft field"
+    );
+    assert_eq!(
+        report.recommendations.first().map(|g| g.rule_name),
+        Some(rule_names::UNDER_BATCHING)
+    );
+    assert_eq!(report.recommendations.first().map(|g| g.layer), Some(4));
+    assert!(
+        !report
+            .recommendations
+            .iter()
+            .any(|g| g.rule_name == rule_names::PREFILL_BOUND)
+    );
+    assert!(
+        report
+            .suppressed_recs
+            .iter()
+            .any(|r| r.rule_name == rule_names::PREFILL_BOUND && !r.display_lines.is_empty())
+    );
+    assert!(
+        report
+            .suppressed_rules
+            .iter()
+            .any(|(suppressed, suppressor)| {
+                *suppressed == rule_names::PREFILL_BOUND
+                    && *suppressor == rule_names::UNDER_BATCHING
+            })
+    );
+    // Soft demotion must not mark R1 terminal, and must not exit via R6 wall.
+    assert!(!report.recommendations[0].terminal);
+}
+
+#[test]
+fn soft_field_verbose_shows_prefill_suppressed_by_under_batching() {
+    let windows: Vec<_> = (0..10)
+        .map(|_| mk_r6_prefill_window(12.0, 10.0, 5.0, Some(50.0)))
+        .collect();
+    let ctx = mk_llama8b_h100_ctx(&windows[0].snapshot);
+    let summary = ai(&ctx, windows.last().expect("windows"));
+    let text = format_diagnose_rules_for_windows_test(
+        &windows,
+        summary,
+        true,
+        "http://127.0.0.1:8000/metrics",
+    )
+    .join("\n");
+    assert!(text.contains("Prefill-Bound: suppressed by Under-batching"));
+    assert!(!text.contains("Under-batching: suppressed by Prefill-Bound"));
+}
+
+#[test]
+fn soft_field_high_kv_keeps_r6_over_r1_me() {
+    // Cool-queue under-fed running, but KV at capacity threshold → not soft;
+    // bind ME still parks R1 under Prefill.
+    let windows: Vec<_> = (0..10)
+        .map(|_| {
+            let mut w = mk_r6_prefill_window(12.0, 10.0, 5.0, Some(50.0));
+            w.snapshot.vllm.kv_cache_usage_perc = Some(80.0);
+            w
+        })
+        .collect();
+    let ctx = mk_llama8b_h100_ctx(&windows[0].snapshot);
+    let summary = ai(&ctx, windows.last().expect("windows"));
+    let report = build_report_for_windows(&windows, summary);
+    assert!(
+        !report
+            .limiter_evidence
+            .as_ref()
+            .is_some_and(crate::engine::limiter::soft_field)
+    );
+    assert_eq!(
+        report.recommendations.first().map(|g| g.rule_name),
+        Some(rule_names::PREFILL_BOUND)
+    );
+    assert!(
+        report
+            .suppressed_recs
+            .iter()
+            .any(|r| r.rule_name == rule_names::UNDER_BATCHING)
+    );
+}
+
+#[test]
+fn soft_field_demotes_r6_and_r3_under_r1() {
+    // Soft field + low prefix hit: R1 primary; Prefill and Prefix in suppressed_recs
+    // (page-1 silence; remeasure reveal path).
+    let windows: Vec<_> = (0..10)
+        .map(|_| {
+            let mut w = mk_r6_prefill_window(12.0, 10.0, 5.0, Some(50.0));
+            w.snapshot.vllm.prefix_cache_hit_rate = Some(0.10);
+            w.snapshot.vllm.cache_config.enable_prefix_caching = Some(true);
+            w
+        })
+        .collect();
+    let ctx = mk_llama8b_h100_ctx(&windows[0].snapshot);
+    let summary = ai(&ctx, windows.last().expect("windows"));
+    let report = build_report_for_windows(&windows, summary);
+    assert!(
+        report
+            .limiter_evidence
+            .as_ref()
+            .is_some_and(crate::engine::limiter::soft_field)
+    );
+    assert_eq!(
+        report.recommendations.first().map(|g| g.rule_name),
+        Some(rule_names::UNDER_BATCHING)
+    );
+    let suppressed: Vec<_> = report.suppressed_recs.iter().map(|r| r.rule_name).collect();
+    assert!(
+        suppressed.contains(&rule_names::PREFILL_BOUND),
+        "expected Prefill in suppressed: {suppressed:?}"
+    );
+    assert!(
+        suppressed.contains(&rule_names::LOW_PREFIX_REUSE),
+        "expected Prefix in suppressed: {suppressed:?}"
+    );
+    assert!(
+        !report
+            .recommendations
+            .iter()
+            .any(|g| g.rule_name == rule_names::PREFILL_BOUND
+                || g.rule_name == rule_names::LOW_PREFIX_REUSE)
+    );
+}
+
+#[test]
 fn r1_fires_when_r6_muted_by_tpot() {
     // High prompt/gen + low occupancy, but TPOT near floor so R6 declines.
     // Must not leave the window silent: R1 owns under-batching.
@@ -3079,14 +3219,21 @@ fn r1_fires_when_r6_muted_by_tpot() {
 
 #[test]
 fn r6_and_r1_both_significant_r1_lands_in_suppressed_recs() {
-    // Prefill-shaped under-batching windows: R1 fires (no defer gate) and R6
+    // Bound: Prefill-shaped under-batching at high running. R1 fires and R6
     // fires; ME moves R1 into suppressed_recs for same-primary reveal.
     let windows: Vec<_> = (0..10)
-        .map(|_| mk_r6_prefill_window(12.0, 10.0, 5.0, Some(50.0)))
+        .map(|_| mk_r6_prefill_window(12.0, 10.0, 100.0, Some(50.0)))
         .collect();
     let ctx = mk_llama8b_h100_ctx(&windows[0].snapshot);
     let summary = ai(&ctx, windows.last().expect("windows"));
     let report = build_report_for_windows(&windows, summary);
+    assert!(
+        !report
+            .limiter_evidence
+            .as_ref()
+            .is_some_and(crate::engine::limiter::soft_field),
+        "high running must not classify soft field"
+    );
     assert_eq!(
         report.recommendations.first().map(|g| g.rule_name),
         Some(rule_names::PREFILL_BOUND)
@@ -3118,7 +3265,7 @@ fn r6_and_r1_both_significant_r1_lands_in_suppressed_recs() {
 #[test]
 fn r6_not_primary_when_r2_outscores() {
     let mut windows: Vec<_> = (0..10)
-        .map(|_| mk_r6_prefill_window(12.0, 10.0, 50.0, Some(50.0)))
+        .map(|_| mk_r6_prefill_window(12.0, 10.0, 100.0, Some(50.0)))
         .collect();
     for w in windows.iter_mut().take(4) {
         *w = mk_evaluable_kv_window(89.0, true);
@@ -3891,7 +4038,7 @@ fn session_kv_peak_from_non_r5_window_reaches_build_report_from_eval() {
 #[test]
 fn r6_fires_as_primary_when_no_other_rules() {
     let windows: Vec<_> = (0..10)
-        .map(|_| mk_r6_prefill_window(12.0, 10.0, 50.0, Some(50.0)))
+        .map(|_| mk_r6_prefill_window(12.0, 10.0, 100.0, Some(50.0)))
         .collect();
     let s = windows[0].snapshot.clone();
     let ctx = mk_llama8b_h100_ctx(&s);
@@ -3904,9 +4051,208 @@ fn r6_fires_as_primary_when_no_other_rules() {
 }
 
 #[test]
+fn r6_primary_fix_sets_default_budget_with_scraped_floor() {
+    let mut windows: Vec<_> = (0..10)
+        .map(|_| mk_r6_prefill_window(12.0, 10.0, 100.0, Some(50.0)))
+        .collect();
+    for w in &mut windows {
+        // Below default so launch still Names a Set (never shrink from above).
+        w.snapshot.vllm.max_num_batched_tokens = Some(1024);
+        w.snapshot.vllm.cache_config.block_size = Some(784);
+    }
+    let s = windows[0].snapshot.clone();
+    let cfg = VllmConfig {
+        dtype: Some("bf16".to_string()),
+        max_model_len: Some(8192),
+        max_num_seqs: Some(256),
+        enable_chunked_prefill: Some(true),
+        enable_prefix_caching: Some(true),
+        max_num_batched_tokens: Some(1024),
+        ..Default::default()
+    };
+    let ctx = StaticContext::from_snapshot(&s, cfg);
+    let summary = ai(&ctx, windows.last().expect("windows"));
+    let report = build_report_for_windows(&windows, summary);
+    assert_eq!(
+        report.recommendations[0].rule_name,
+        rule_names::PREFILL_BOUND
+    );
+    let text = report.recommendations[0].display_lines.join("\n");
+    assert!(
+        text.contains(
+            "Set --max-num-batched-tokens to 2048 (default); page floor is 784 (do not go below)."
+        ),
+        "R6 multi-window aggregate must use launch default+floor Set: {text}"
+    );
+    assert!(text.contains("Lower for smoother TPOT, raise for lower TTFT."));
+    assert!(text.contains(
+        "If vLLM rejects this at boot, its error names the model minimum; use that value."
+    ));
+    assert!(!text.contains("floor-limited"));
+    assert!(!text.contains("(est)"));
+}
+
+#[test]
+fn r6_primary_fix_guides_when_batched_tokens_unread() {
+    let mut windows: Vec<_> = (0..10)
+        .map(|_| mk_r6_prefill_window(12.0, 10.0, 100.0, Some(50.0)))
+        .collect();
+    for w in &mut windows {
+        w.snapshot.vllm.max_num_batched_tokens = None;
+        w.snapshot.vllm.cache_config.block_size = Some(1568);
+    }
+    let s = windows[0].snapshot.clone();
+    let cfg = VllmConfig {
+        dtype: Some("bf16".to_string()),
+        max_model_len: Some(8192),
+        max_num_seqs: Some(256),
+        enable_chunked_prefill: Some(true),
+        enable_prefix_caching: Some(true),
+        max_num_batched_tokens: None,
+        ..Default::default()
+    };
+    let ctx = StaticContext::from_snapshot(&s, cfg);
+    let summary = ai(&ctx, windows.last().expect("windows"));
+    let report = build_report_for_windows(&windows, summary);
+    assert_eq!(
+        report.recommendations[0].rule_name,
+        rule_names::PREFILL_BOUND
+    );
+    let text = report.recommendations[0].display_lines.join("\n");
+    assert!(
+        text.contains("--max-num-batched-tokens unread on this server."),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "Page floor is 1568 (do not go below). Lower for smoother TPOT, raise for lower TTFT."
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("Set --max-num-batched-tokens to 2048"));
+    assert!(text.contains("Steadier decode once prefill sharing is confirmed."));
+}
+
+#[test]
+fn r6_primary_fix_sets_default_budget_without_floor() {
+    let mut windows: Vec<_> = (0..10)
+        .map(|_| mk_r6_prefill_window(12.0, 10.0, 100.0, Some(50.0)))
+        .collect();
+    for w in &mut windows {
+        w.snapshot.vllm.max_num_batched_tokens = Some(1024);
+        w.snapshot.vllm.cache_config.block_size = None;
+    }
+    let s = windows[0].snapshot.clone();
+    let cfg = VllmConfig {
+        dtype: Some("bf16".to_string()),
+        max_model_len: Some(8192),
+        max_num_seqs: Some(256),
+        enable_chunked_prefill: Some(true),
+        enable_prefix_caching: Some(true),
+        max_num_batched_tokens: Some(1024),
+        ..Default::default()
+    };
+    let ctx = StaticContext::from_snapshot(&s, cfg);
+    let summary = ai(&ctx, windows.last().expect("windows"));
+    let report = build_report_for_windows(&windows, summary);
+    assert_eq!(
+        report.recommendations[0].rule_name,
+        rule_names::PREFILL_BOUND
+    );
+    let text = report.recommendations[0].display_lines.join("\n");
+    assert!(
+        text.contains("Set --max-num-batched-tokens to 2048 (default)."),
+        "no scraped floor → default Set only: {text}"
+    );
+    assert!(!text.contains("page floor"));
+    assert!(!text.contains("floor-limited"));
+}
+
+#[test]
+fn r6_primary_fix_skips_set_when_configured_above_default() {
+    let mut windows: Vec<_> = (0..10)
+        .map(|_| mk_r6_prefill_window(12.0, 10.0, 100.0, Some(50.0)))
+        .collect();
+    for w in &mut windows {
+        w.snapshot.vllm.max_num_batched_tokens = Some(8192);
+        w.snapshot.vllm.cache_config.block_size = Some(784);
+    }
+    let s = windows[0].snapshot.clone();
+    let cfg = VllmConfig {
+        dtype: Some("bf16".to_string()),
+        max_model_len: Some(8192),
+        max_num_seqs: Some(256),
+        enable_chunked_prefill: Some(true),
+        enable_prefix_caching: Some(true),
+        max_num_batched_tokens: Some(8192),
+        ..Default::default()
+    };
+    let ctx = StaticContext::from_snapshot(&s, cfg);
+    let summary = ai(&ctx, windows.last().expect("windows"));
+    let report = build_report_for_windows(&windows, summary);
+    assert_eq!(
+        report.recommendations[0].rule_name,
+        rule_names::PREFILL_BOUND
+    );
+    let text = report.recommendations[0].display_lines.join("\n");
+    assert!(
+        !text.contains("Set --max-num-batched-tokens to 2048"),
+        "must not shrink configured-above-default to 2048: {text}"
+    );
+    assert!(
+        !text.contains("Default --max-num-batched-tokens is 2048"),
+        "no default/floor info when already above: {text}"
+    );
+    assert!(
+        text.contains(
+            "No --max-num-batched-tokens change; configured value is already above the default."
+        ),
+        "{text}"
+    );
+}
+
+#[test]
+fn r6_primary_fix_names_floor_when_above_default() {
+    let mut windows: Vec<_> = (0..10)
+        .map(|_| mk_r6_prefill_window(12.0, 10.0, 100.0, Some(50.0)))
+        .collect();
+    for w in &mut windows {
+        // Unread or below default so floor-above-default info path can fire.
+        w.snapshot.vllm.max_num_batched_tokens = Some(1024);
+        w.snapshot.vllm.cache_config.block_size = Some(2496);
+    }
+    let s = windows[0].snapshot.clone();
+    let cfg = VllmConfig {
+        dtype: Some("bf16".to_string()),
+        max_model_len: Some(8192),
+        max_num_seqs: Some(256),
+        enable_chunked_prefill: Some(true),
+        enable_prefix_caching: Some(true),
+        max_num_batched_tokens: Some(1024),
+        ..Default::default()
+    };
+    let ctx = StaticContext::from_snapshot(&s, cfg);
+    let summary = ai(&ctx, windows.last().expect("windows"));
+    let report = build_report_for_windows(&windows, summary);
+    assert_eq!(
+        report.recommendations[0].rule_name,
+        rule_names::PREFILL_BOUND
+    );
+    let text = report.recommendations[0].display_lines.join("\n");
+    assert!(
+        text.contains(
+            "Default --max-num-batched-tokens is 2048; page floor is 2496 (do not go below)."
+        ),
+        "floor above default must not Set 2048: {text}"
+    );
+    assert!(!text.contains("Set --max-num-batched-tokens to 2048"));
+    assert!(!text.contains("Set --max-num-batched-tokens to 2496"));
+}
+
+#[test]
 fn r6_suppresses_r7_when_both_fire() {
     let mut windows: Vec<_> = (0..10)
-        .map(|_| mk_r6_prefill_window(12.0, 10.0, 50.0, Some(50.0)))
+        .map(|_| mk_r6_prefill_window(12.0, 10.0, 100.0, Some(50.0)))
         .collect();
     for w in &mut windows {
         w.snapshot.vllm.max_num_seqs = Some(32);
@@ -4108,4 +4454,125 @@ fn energy_skew_skipped_counted_on_report() {
     let report = build_report_for_windows(&windows, summary);
     assert_eq!(report.n_eval, 3);
     assert_eq!(report.energy_skew_skipped, 1);
+}
+
+#[test]
+fn recommendation_prose_bodies_end_with_periods() {
+    // High-stakes UI: Cause/Fix/Expected/Last resort sentences always end with `.`.
+    let cases: Vec<(&str, Vec<RuntimeWindow>, StaticContext)> = vec![
+        {
+            let windows: Vec<_> = (0..ENGINE_MIN_PERSISTENT_WINDOWS)
+                .map(|_| mk_evaluable_kv_window(89.0, true))
+                .collect();
+            let s = windows[0].snapshot.clone();
+            (
+                "r2",
+                windows,
+                StaticContext::from_snapshot(
+                    &s,
+                    VllmConfig {
+                        dtype: Some("bf16".to_string()),
+                        max_model_len: Some(8192),
+                        max_num_seqs: Some(256),
+                        ..Default::default()
+                    },
+                ),
+            )
+        },
+        {
+            let windows: Vec<_> = (0..ENGINE_MIN_PERSISTENT_WINDOWS)
+                .map(|_| mk_r6_prefill_window(12.0, 10.0, 100.0, Some(50.0)))
+                .collect();
+            let s = windows[0].snapshot.clone();
+            (
+                "r6",
+                windows,
+                StaticContext::from_snapshot(
+                    &s,
+                    VllmConfig {
+                        dtype: Some("bf16".to_string()),
+                        max_model_len: Some(8192),
+                        max_num_seqs: Some(256),
+                        enable_chunked_prefill: Some(true),
+                        enable_prefix_caching: Some(true),
+                        max_num_batched_tokens: Some(1024),
+                        ..Default::default()
+                    },
+                ),
+            )
+        },
+        {
+            let windows: Vec<_> = (0..ENGINE_MIN_PERSISTENT_WINDOWS)
+                .map(|_| mk_evaluable_concurrency_saturation_window(32.0, 20.0, 32))
+                .collect();
+            let s = windows[0].snapshot.clone();
+            (
+                "r5",
+                windows,
+                StaticContext::from_snapshot(
+                    &s,
+                    VllmConfig {
+                        dtype: Some("bf16".to_string()),
+                        max_model_len: Some(8192),
+                        max_num_seqs: Some(32),
+                        ..Default::default()
+                    },
+                ),
+            )
+        },
+        {
+            let windows: Vec<_> = (0..ENGINE_MIN_PERSISTENT_WINDOWS)
+                .map(|_| mk_r7_headroom_window(10.0, 32, 0.0, 100.0))
+                .collect();
+            ("r7", windows, mk_r7_ctx(32))
+        },
+    ];
+
+    for (label, windows, ctx) in cases {
+        let summary = ai(&ctx, windows.last().expect("windows"));
+        let report = build_report_for_windows(&windows, summary);
+        assert!(
+            !report.recommendations.is_empty(),
+            "{label}: expected at least one recommendation"
+        );
+        for rec in &report.recommendations {
+            assert_issue_prose_periods(&rec.display_lines);
+        }
+        for rec in &report.suppressed_recs {
+            assert_issue_prose_periods(&rec.display_lines);
+        }
+    }
+
+    // Direct format paths not always primary in the aggregate cases above.
+    let r3 = format_low_prefix_hit_rate_fired(
+        &LowPrefixReuseDetail {
+            hit_rate: Some(0.1),
+            prompt_tokens_mean: Some(500.0),
+            queries_delta: None,
+        },
+        Some(false),
+        Some(0.1),
+    );
+    assert_issue_prose_periods(&r3);
+
+    let r4 = r4_recommendation(
+        Some(-12.0),
+        Some(1),
+        Some(92.0),
+        Some(80.0),
+        Some(0.9),
+        crate::engine::baseline::WeightDtypeSource::Catalog,
+    )
+    .expect("r4");
+    assert_issue_prose_periods(&r4.display_lines);
+
+    for variant in [
+        MuVariant::Starved,
+        MuVariant::BlockedAdmission { kv_pct: Some(10.0) },
+        MuVariant::BlockedAdmission { kv_pct: None },
+        MuVariant::GaugeMissing,
+    ] {
+        let lines = mu_diagnose_lines(2.5, Some(14.0), Some(0.0), Some(256), variant, Some(true));
+        assert_issue_prose_periods(&lines);
+    }
 }

@@ -128,23 +128,23 @@ fn walls_fix_lines(
     let Some(rec) = rec else {
         match (cur, kv_usage) {
             (Some(c), Some(pct)) => safe.push(format!(
-                "      • Raise --max-num-seqs above {c} (KV {pct:.0}% peak, pool has room; no ceiling known)"
+                "      • Raise --max-num-seqs above {c} (KV {pct:.0}% peak, pool has room; no ceiling known)."
             )),
             (Some(c), None) => safe.push(format!(
-                "      • Raise --max-num-seqs above {c} if KV headroom confirmed (no ceiling known)"
+                "      • Raise --max-num-seqs above {c} if KV headroom confirmed (no ceiling known)."
             )),
             (None, Some(pct)) => safe.push(format!(
-                "      • Raise --max-num-seqs (KV {pct:.0}% peak, pool has room; no ceiling known)"
+                "      • Raise --max-num-seqs (KV {pct:.0}% peak, pool has room; no ceiling known)."
             )),
             (None, None) => safe.push(
-                "      • Raise --max-num-seqs if KV headroom confirmed (no ceiling known)".to_string(),
+                "      • Raise --max-num-seqs if KV headroom confirmed (no ceiling known).".to_string(),
             ),
         }
         return (cause, safe, cuts, false);
     };
     let Some(cur) = cur else {
         safe.push(
-            "      • Raise --max-num-seqs if KV headroom confirmed (no ceiling known)".to_string(),
+            "      • Raise --max-num-seqs if KV headroom confirmed (no ceiling known).".to_string(),
         );
         return (cause, safe, cuts, false);
     };
@@ -154,7 +154,7 @@ fn walls_fix_lines(
             && let Some(pct) = kv_usage
         {
             safe.push(format!(
-                "      • Raise --max-num-seqs above {cur} (KV {pct:.0}% peak, pool has room)"
+                "      • Raise --max-num-seqs above {cur} (KV {pct:.0}% peak, pool has room)."
             ));
             safe.push(super::KV_SCALE_CAUTION.to_string());
             return (cause, safe, cuts, false);
@@ -171,7 +171,7 @@ fn walls_fix_lines(
             }
         };
         safe.push(format!(
-            "      • Raise --max-num-seqs to {} ({reason})",
+            "      • Raise --max-num-seqs to {} ({reason}).",
             rec.target
         ));
         if rec.empirical {
@@ -183,7 +183,7 @@ fn walls_fix_lines(
     // target <= current: no knob. Floor-capped findings are not ridge-zone claims.
     if rec.floor_capped {
         cause.push(format!(
-            "      • --max-num-seqs={cur} is at the estimated KV limit (est, from live traffic)"
+            "      • --max-num-seqs={cur} is at the estimated KV limit (est, from live traffic)."
         ));
         push_r5_replica_terminal(&mut safe);
         return (cause, safe, cuts, true);
@@ -202,7 +202,7 @@ fn walls_fix_lines(
                 )
             };
             cause.push(format!(
-                "      • --max-num-seqs={cur} is {zone}; raising adds TPOT, not throughput"
+                "      • --max-num-seqs={cur} is {zone}; raising adds TPOT, not throughput."
             ));
             push_r5_replica_terminal(&mut safe);
             true
@@ -217,11 +217,11 @@ fn walls_fix_lines(
             };
             if at_wall {
                 cause.push(format!(
-                    "      • --max-num-seqs={cur} is at the {wall}; more seats would evict"
+                    "      • --max-num-seqs={cur} is at the {wall}; more seats would evict."
                 ));
             } else {
                 cause.push(format!(
-                    "      • --max-num-seqs is within safety margin of the {wall}"
+                    "      • --max-num-seqs is within safety margin of the {wall}."
                 ));
             }
             let evidence = super::ShrinkEvidence::from_snapshot(snapshot);
@@ -309,28 +309,28 @@ pub(super) fn format_concurrency_saturation_issue_with_terminal(
         String::new(),
         "    Cause:".to_string(),
         format!(
-            "      • --max-num-seqs={max_str} filled to the limit at least once; running below is averaged"
+            "      • --max-num-seqs={max_str} filled to the limit at least once; running below is averaged."
         ),
         format!(
-            "      • {:.0}% of requests waiting ({:.0} waiting, {:.0} running)",
+            "      • {:.0}% of requests waiting ({:.0} waiting, {:.0} running).",
             display_queue_pct, display_wait, display_run
         ),
     ];
     match (display_p_x, display_avg) {
         (Some((px, label, clamped)), Some(avg)) => lines.push(format!(
-            "      • TTFT ({} {}) ({} avg)",
+            "      • TTFT ({} {}) ({} avg).",
             label,
             fmt_seconds_from_ms_maybe_floor(px, clamped),
             fmt_seconds_from_ms(avg)
         )),
         (Some((px, label, clamped)), None) => {
             lines.push(format!(
-                "      • TTFT ({} {})",
+                "      • TTFT ({} {}).",
                 label,
                 fmt_seconds_from_ms_maybe_floor(px, clamped)
             ));
         }
-        (None, Some(avg)) => lines.push(format!("      • TTFT {}", fmt_seconds_from_ms(avg))),
+        (None, Some(avg)) => lines.push(format!("      • TTFT {}.", fmt_seconds_from_ms(avg))),
         (None, None) => {}
     }
     let (walls_cause, safe, cuts, terminal) = match gate_kv {
@@ -343,7 +343,7 @@ pub(super) fn format_concurrency_saturation_issue_with_terminal(
             push_r5_replica_terminal(&mut safe);
             (
                 vec![format!(
-                    "      • KV at {pct:.0}%: scheduler at cap, pool full; no config change helps"
+                    "      • KV at {pct:.0}%: scheduler at cap, pool full; no config change helps."
                 )],
                 safe,
                 Vec::new(),

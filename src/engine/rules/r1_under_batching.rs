@@ -150,14 +150,14 @@ fn r1_fix_lines(
         R1BindingWall::Ridge => {
             let headroom = ridge_or_config_headroom(idle, running, fmt);
             vec![format!(
-                "      • Batch more requests or increase client concurrency ({})",
+                "      • Batch more requests or increase client concurrency ({}).",
                 headroom.ridge_clause()
             )]
         }
         R1BindingWall::Config => {
             let headroom = ridge_or_config_headroom(idle, running, fmt);
             vec![format!(
-                "      • Batch more requests or increase client concurrency ({})",
+                "      • Batch more requests or increase client concurrency ({}).",
                 headroom.config_clause()
             )]
         }
@@ -654,7 +654,7 @@ mod tests {
         let r = r1_recommendation(r1_input(&s, R1InputOpts::default())).expect("fired");
         let text = r.display_lines.join("\n");
         assert!(text.contains(
-            "      • Batch more requests or increase client concurrency (251 seats idle; KV fit unknown)"
+            "      • Batch more requests or increase client concurrency (251 seats idle; KV fit unknown)."
         ));
         assert!(!text.contains("hardware limit"));
         assert!(!text.contains("KV ceiling"));

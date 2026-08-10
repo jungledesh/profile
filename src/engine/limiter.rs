@@ -82,6 +82,39 @@ pub struct IdentifyResult {
     pub traffic_skipped: bool,
 }
 
+/// Soft field: box not pressed. Ranking uses this to skip R6→R1 ME so
+/// Under-batching owns first fire; Prefill/Prefix land in `suppressed_recs`
+/// for same-primary remeasure reveal.
+///
+/// All gates required. Any missing/non-finite input → false (humble: keep
+/// bind-path ME). Thresholds match the Traffic / Capacity cascade stages so
+/// "soft field" and "Capped by traffic" agree on under-fed.
+///
+/// Near ridge with wait≈0 and cool KV is **not** soft: real Prefill bind can
+/// look empty-queued; do not promote R1 there.
+pub(crate) fn soft_field(e: &LimiterEvidence) -> bool {
+    let Some(waiting) = e.mean_waiting.filter(|w| w.is_finite()) else {
+        return false;
+    };
+    if waiting >= LIMITER_QUEUE_SILENCE_WAITING_MIN {
+        return false;
+    }
+    let Some(kv) = e.kv_cache_mean_perc.filter(|k| k.is_finite()) else {
+        return false;
+    };
+    if kv >= KV_CAPACITY_LIMITER_PERC {
+        return false;
+    }
+    let (Some(running), Some(ridge)) = (
+        e.mean_running.filter(|r| r.is_finite()),
+        e.ridge_batch_size.filter(|r| r.is_finite() && *r > 0.0),
+    ) else {
+        return false;
+    };
+    let under_fed = (ridge * TRAFFIC_LIMITER_RIDGE_FRACTION).max(TRAFFIC_LIMITER_MIN_RUNNING);
+    running < under_fed
+}
+
 /// Identify the primary constraint when all rules pass.
 ///
 /// Returns `verdict: None` if insufficient data to determine any limiter
@@ -346,6 +379,97 @@ mod tests {
             identify(&e).verdict,
             Some(LimiterVerdict::Known(PrimaryLimiter::Capacity))
         );
+    }
+
+    #[test]
+    fn soft_field_true_when_under_fed_cool_kv_no_wait() {
+        let e = ev(
+            Some(50.0),
+            Some(50.0),
+            Some(5.0),
+            Some(100.0),
+            Some(20.0),
+            Some(5.0),
+            None,
+            Some(false),
+            None,
+        );
+        assert!(soft_field(&e));
+    }
+
+    #[test]
+    fn soft_field_false_near_ridge_even_if_wait_zero_kv_cool() {
+        // running at 30% of ridge (>= 25% Traffic floor): not soft.
+        let e = ev(
+            Some(50.0),
+            Some(50.0),
+            Some(30.0),
+            Some(100.0),
+            Some(20.0),
+            Some(5.0),
+            None,
+            Some(false),
+            None,
+        );
+        assert!(!soft_field(&e));
+    }
+
+    #[test]
+    fn soft_field_false_when_kv_at_capacity_threshold() {
+        let e = ev(
+            Some(80.0),
+            Some(80.0),
+            Some(5.0),
+            Some(100.0),
+            Some(20.0),
+            Some(5.0),
+            None,
+            Some(false),
+            None,
+        );
+        assert!(!soft_field(&e));
+    }
+
+    #[test]
+    fn soft_field_false_when_waiting_at_queue_floor() {
+        let mut e = ev(
+            Some(50.0),
+            Some(50.0),
+            Some(5.0),
+            Some(100.0),
+            Some(20.0),
+            Some(5.0),
+            None,
+            Some(false),
+            None,
+        );
+        e.mean_waiting = Some(2.0);
+        assert!(!soft_field(&e));
+    }
+
+    #[test]
+    fn soft_field_false_when_ridge_or_running_unread() {
+        let mut no_ridge = ev(
+            Some(50.0),
+            Some(50.0),
+            Some(5.0),
+            None,
+            Some(20.0),
+            Some(5.0),
+            None,
+            Some(false),
+            None,
+        );
+        assert!(!soft_field(&no_ridge));
+        no_ridge.ridge_batch_size = Some(100.0);
+        no_ridge.mean_running = None;
+        assert!(!soft_field(&no_ridge));
+        no_ridge.mean_running = Some(5.0);
+        no_ridge.kv_cache_mean_perc = None;
+        assert!(!soft_field(&no_ridge));
+        no_ridge.kv_cache_mean_perc = Some(50.0);
+        no_ridge.mean_waiting = None;
+        assert!(!soft_field(&no_ridge));
     }
 
     #[test]

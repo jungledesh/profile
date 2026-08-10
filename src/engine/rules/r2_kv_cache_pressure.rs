@@ -26,9 +26,9 @@ const KV_ADMISSION_BACKLOG_QUEUE_RATIO_MIN: f64 = 0.30;
 /// VRAM and the computed utilization budget must both exceed this value.
 const KV_HEADROOM_SAFE_MIN_GB: f64 = 2.0;
 const GPU_MEM_UTIL_FIX: &str =
-    "      • Raise --gpu-memory-utilization (check vRAM header for avail mem) to expand KV pool";
+    "      • Raise --gpu-memory-utilization (check vRAM header for avail mem) to expand KV pool.";
 const FP8_KV_CACHE_FIX: &str =
-    "      • Switch --kv-cache-dtype fp8 to halve KV memory footprint (affects output quality)";
+    "      • Switch --kv-cache-dtype fp8 to halve KV memory footprint (affects output quality).";
 /// Suggest prefix caching when mean prompt length exceeds this (tokens).
 const PREFIX_CACHING_LONG_PROMPT_MIN_TOKENS: f64 = 200.0;
 
@@ -47,10 +47,12 @@ pub(super) fn fp8_kv_cache_fix_bullet(
     Some(if fp8_compiler_available {
         FP8_KV_CACHE_FIX.to_string()
     } else {
+        // Const ends with `).`; reopen the parenthetical for the compiler note.
         let base = FP8_KV_CACHE_FIX
-            .strip_suffix(')')
+            .strip_suffix('.')
+            .and_then(|s| s.strip_suffix(')'))
             .unwrap_or(FP8_KV_CACHE_FIX);
-        format!("{base}; FP8 compiler not found)")
+        format!("{base}; FP8 compiler not found).")
     })
 }
 
@@ -276,7 +278,7 @@ pub(super) fn resolve_kv_offload_size_gib(input: KvOffloadSizeInput) -> Option<u
     ceil_bytes_to_whole_gib(demand.min(supply))
 }
 
-const KV_OFFLOAD_FIX: &str = "      • Set --kv-offloading-size (GiB) to hold evicted KV in host memory instead of recomputing it";
+const KV_OFFLOAD_FIX: &str = "      • Set --kv-offloading-size (GiB) to hold evicted KV in host memory instead of recomputing it.";
 /// Fallback when host memory reads fail; rendered as the second last-resort subline.
 const KV_OFFLOAD_SUBLINE_FALLBACK: &str =
     "Check host RAM and your container memory limit before allocating.";
@@ -324,7 +326,7 @@ fn push_dead_end_fixes(safe: &mut Vec<String>) {
 fn kv_offload_fix_bullet(size_gib: Option<u64>) -> String {
     match size_gib {
         Some(n) => format!(
-            "      • Set --kv-offloading-size {n} (est) to hold evicted KV in host memory instead of recomputing it"
+            "      • Set --kv-offloading-size {n} (est) to hold evicted KV in host memory instead of recomputing it."
         ),
         None => KV_OFFLOAD_FIX.to_string(),
     }
@@ -612,9 +614,9 @@ pub(super) fn resolve_r2_kv_capacity(
 }
 
 /// Follow-on seats after a named shrink target.
-const FOLLOW_ON_SEAT_BULLET: &str = "      • Then lower --max-num-seqs to reduce KV demand";
+const FOLLOW_ON_SEAT_BULLET: &str = "      • Then lower --max-num-seqs to reduce KV demand.";
 
-const SEAT_BULLET: &str = "      • Lower --max-num-seqs to reduce KV demand";
+const SEAT_BULLET: &str = "      • Lower --max-num-seqs to reduce KV demand.";
 
 pub(super) fn kv_pressure_confidence(windows_fired: usize, total_evaluable: usize) -> f64 {
     if total_evaluable == 0 {
@@ -660,7 +662,7 @@ fn client_oversub_cutbullet(snapshot: &RawSnapshot) -> Option<super::CutBullet> 
     }
     let run = client_oversub_target_running(snapshot)?;
     Some((
-        format!("{CLIENT_OVERSUB_BULLET} ({run} in-flight)"),
+        format!("{CLIENT_OVERSUB_BULLET} ({run} in-flight)."),
         Some(CLIENT_OVERSUB_SUBLINE),
     ))
 }
@@ -2533,7 +2535,7 @@ mod tests {
         assert!(!with_compiler.contains("FP8 compiler not found"));
         let without_compiler =
             fp8_kv_cache_fix_bullet(None, false).expect("bf16/auto should suggest fp8");
-        assert!(without_compiler.contains("(affects output quality; FP8 compiler not found)"));
+        assert!(without_compiler.contains("(affects output quality; FP8 compiler not found)."));
     }
 
     #[test]
@@ -3291,7 +3293,7 @@ mod tests {
             !text.contains("Cuts throughput. Revert after pressure clears."),
             "non-crisis seat under Cuts throughput: header needs no throttle subline"
         );
-        assert!(text.contains("(affects output quality; FP8 compiler not found)"));
+        assert!(text.contains("(affects output quality; FP8 compiler not found)."));
     }
 
     #[test]
