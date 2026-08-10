@@ -781,13 +781,25 @@ fn finalize_report_groups(
 
     // ME table BEFORE min-layer filter so cross-layer suppressions (R6→R1) land.
     // Same-layer rows (OOM→KV) are unchanged: both survive until ME, then KV drops.
+    // Soft field: skip R6→R1 so min-layer makes R1 primary; R6/R3 → suppressed_recs
+    // for remeasure reveal. Bound path keeps the ME row (and terminals on R6 primary).
     let mut recs = recs;
     let fired_names: Vec<&str> = recs.iter().map(|r| r.rule_name).collect();
     let oom_weights_alone_overflow =
         oom_weights_alone_overflow(baseline.as_ref().and_then(|b| b.kv_headroom_gb));
+    let soft_field = skips
+        .limiter_evidence
+        .as_ref()
+        .is_some_and(crate::engine::limiter::soft_field);
     for &(suppressor, suppressed) in SUPPRESSION_TABLE {
         if fired_names.contains(&suppressor) {
             if suppressor == rule_names::OOM_RISK && !oom_weights_alone_overflow {
+                continue;
+            }
+            if soft_field
+                && suppressor == rule_names::PREFILL_BOUND
+                && suppressed == rule_names::UNDER_BATCHING
+            {
                 continue;
             }
             let (removed, kept): (Vec<_>, Vec<_>) =

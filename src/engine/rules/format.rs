@@ -12,8 +12,9 @@ use super::{ENGINE_MIN_PERSISTENT_WINDOWS, NO_ISSUES_LINE, Recommendation, rule_
 
 /// Revealed secondary whose Fix fights the primary. Rank ME already suppresses;
 /// this annotates Fix when that secondary is shown under reveal.
-/// One-directional by design: DAG layer order means prefill_bound is always the
-/// primary of this pair; a reverse reveal cannot occur.
+/// Bound path: R6 primary, R1 revealed → neutralize R1 add-load.
+/// Soft field: R1 primary, R6 revealed → no row here (Prefill is informational;
+/// do not claim a compute-wall conflict on an under-fed box).
 const REVEAL_FIX_CONFLICT_TABLE: &[(&str, &str)] =
     &[(rule_names::PREFILL_BOUND, rule_names::UNDER_BATCHING)];
 
@@ -1482,6 +1483,20 @@ mod stuck_fix_reveal_tests {
         assert!(fix < conflict, "conflict subline trails the Fix bullet");
         assert!(!text.contains("Expected: Higher throughput"));
         assert!(text.contains("Confidence: High"));
+    }
+
+    #[test]
+    fn soft_field_reveal_r6_under_r1_does_not_claim_compute_wall_conflict() {
+        // Reverse of bound reveal: R1 primary, Prefill secondary. No conflict
+        // subline (under-fed box is not at a compute wall).
+        let report = report_with(
+            r1_style_rec(),
+            vec![rec(rule_names::PREFILL_BOUND, 5, 0.9, "[!] Prefill-Bound")],
+        );
+        let text = render(&report, true);
+        assert!(text.contains("[!] Prefill-Bound"));
+        assert!(!text.contains("Conflicts with primary above"));
+        assert!(!text.contains("[?] Prefill-Bound"));
     }
 
     #[test]

@@ -282,13 +282,13 @@ ECONOMICS:
     <table>
       <thead><tr><th>Diagnosis</th><th>When it fires</th><th>vLLM flags to change</th></tr></thead>
       <tbody>
-        <tr><td><strong>R1 Under-batching</strong></td><td>Known GPU: config-relative efficiency &lt;60% with occupancy &lt;75%, no backlog. Unknown GPU: occupancy &lt;25%.</td><td>Batch more requests or raise client concurrency</td></tr>
+        <tr><td><strong>R1 Under-batching</strong></td><td>Known GPU: config-relative efficiency &lt;60% with occupancy &lt;75%, no backlog. Unknown GPU: occupancy &lt;25%. Soft field: ranks above Prefill/Prefix on first fire.</td><td>Batch more requests or raise client concurrency</td></tr>
         <tr><td><strong>R2 KV cache pressure</strong></td><td>KV &ge;88% (avg or peak) AND (eviction: preempt/s &gt;0.02 or swapped &ge;2, OR waiting &gt;2)</td><td>Split Cuts/Safe. Cuts: lower <code>--max-model-len</code> or <code>--max-num-seqs</code>. Safe: <code>--enable-prefix-caching</code>, raise <code>--gpu-memory-utilization</code>, fp8 KV, <code>--kv-offloading-size</code></td></tr>
         <tr><td><strong>R2b KV admission backlog</strong></td><td>KV near full (&ge;88% avg or peak), queue ratio &ge;30%, scheduler not at seat cap, free KV below demand</td><td>Expand KV pool: raise <code>--gpu-memory-utilization</code>, fp8 KV, or reduce <code>--max-model-len</code></td></tr>
         <tr><td><strong>R3 Low prefix reuse</strong></td><td>Active traffic (running &gt;0.75), mean prompt &ge;20 tok, QPS &times; mean prompt &ge;1000. Caching off: fires on volume alone. Caching on: hit rate &lt;35%.</td><td><code>--enable-prefix-caching</code>; restructure prompts if already on</td></tr>
         <tr><td><strong>R4 OOM risk</strong></td><td>Weights overflow VRAM, or free VRAM cannot hold one worst-case request. Not fired when dtype is fallback (bf16 assumed).</td><td><code>--tensor-parallel-size</code> at minimum needed, raise <code>--gpu-memory-utilization</code>, or use a smaller model</td></tr>
         <tr><td><strong>R5 Concurrency saturation</strong></td><td>Running at <code>--max-num-seqs</code> cap, &ge;2 waiting, queue ratio &ge;30%</td><td>Below 80% KV: raise <code>--max-num-seqs</code> to bounded target. At/above 80% KV: name the wall or add a replica.</td></tr>
-        <tr><td><strong>R6 Prefill-bound</strong></td><td>Prompt/gen ratio &ge;5, decode efficiency &lt;40%. Muted when TPOT is measured and under 4&times; its floor.</td><td>Chunked prefill, <code>--max-num-batched-tokens</code>; at compute wall, disaggregate or add a replica</td></tr>
+        <tr><td><strong>R6 Prefill-bound</strong></td><td>Prompt/gen ratio &ge;5, decode efficiency &lt;40%. Muted when TPOT is measured and under 4&times; its floor. Bound path silences R1; soft field does not.</td><td>Chunked prefill; <code>--max-num-batched-tokens</code> (no blind Set when unread); at compute wall, disaggregate or add a replica</td></tr>
         <tr><td><strong>R7 Config headroom</strong></td><td><code>--max-num-seqs</code> below 90% of recommended target, occupancy &ge;50%, &le;1 waiting</td><td>Raise <code>--max-num-seqs</code>; output names the binding wall</td></tr>
       </tbody>
     </table>
@@ -348,11 +348,11 @@ ECONOMICS:
         <tr><td>Unknown GPU fallback: occupancy</td><td>&lt;25% of effective max (same binder as known-GPU: min of config, ridge, observed KV)</td></tr>
       </tbody>
     </table>
-    <p>R1 still evaluates when R6 (Prefill-bound) fires on the same window; R6 then suppresses it via the mutual exclusivity table so the under-batching recommendation is held for reveal, not silently deferred. Fix names the binding wall: config cap, compute ridge, or memory limit.</p>
+    <p>R1 still evaluates when R6 (Prefill-bound) fires on the same window. On a pressed box (bound path), R6 suppresses R1 via the mutual exclusivity table so under-batching is held for reveal, not silently deferred. Under soft field (waiting &lt; 2, KV mean &lt; 80%, running well below the decode ridge Traffic floor), that ME row is skipped: R1 owns first fire; Prefill/Prefix land in <code>suppressed_recs</code> for same-primary remeasure reveal only. Fix is client-side (batch more requests / raise concurrency) and names the binding wall: config cap, compute ridge, or memory limit.</p>
     <p><strong>Fix:</strong> Batch more requests or increase client concurrency.</p>
 
     <h2>R2: KV cache pressure</h2>
-    <p>R2 and R2b are sibling rules in the same DAG layer. Both surface KV-related pressure. When both would fire, eval takes R2 and skips R2b (<code>else if</code>), not the mutual exclusivity table. The ME table only silences R2/R2b under R4 weights-alone overflow, and R1 under R6.</p>
+    <p>R2 and R2b are sibling rules in the same DAG layer. Both surface KV-related pressure. When both would fire, eval takes R2 and skips R2b (<code>else if</code>), not the mutual exclusivity table. The ME table silences R2/R2b under R4 weights-alone overflow, and R1 under R6 on the bound path only (soft field skips that row; see Ranking).</p>
     <h3>Main path (R2)</h3>
     <table>
       <thead><tr><th>Condition</th><th>Threshold</th></tr></thead>
@@ -435,8 +435,8 @@ ECONOMICS:
         <tr><td>TPOT mute</td><td>Muted when TPOT is measured and under 4&times; its floor. Still fires when TPOT or floor is missing (confidence capped at 0.5).</td></tr>
       </tbody>
     </table>
-    <p>R6 fires at DAG layer 5 and, via the suppression table, silences R1 (Under-batching) when it fires. R1 still evaluates so it lands in <code>suppressed_recs</code> for reveal; it is not deferred. A server that looks under-batched but is actually prefill-bound should not receive under-batching as the primary.</p>
-    <p><strong>Fix:</strong> Enable chunked prefill only when it is off or unread as off; raise <code>--max-num-batched-tokens</code> only when the configured value is below the derived suggestion; route shorter prompts. At the compute wall (configured budget already near the derived recommendation, or no knob left): disaggregate or add a replica, and show any suppressed alternatives under the same block.</p>
+    <p>R6 fires at DAG layer 5. On the bound path, the suppression table silences R1 (Under-batching) so a pressed, prefill-bound server does not get &ldquo;send more traffic&rdquo; as primary; R1 still evaluates into <code>suppressed_recs</code> for reveal. Under soft field, that ME row is skipped so R1 owns first fire and Prefill is held for remeasure reveal (light-load Prefill is not the setup wall).</p>
+    <p><strong>Fix:</strong> Enable chunked prefill only when confirmed off (<code>Some(false)</code>); Confirm when unread (never Enable on unknown). When configured <code>--max-num-batched-tokens</code> is readable and below the launch default (2048), Set to 2048 plus optional page floor; never Set down when already above default; when unread, guide with floor/directions (no blind Set). At the compute wall or Severe FLOPs wall: disaggregate or add a replica (terminal when no local knob remains), and show suppressed alternatives under the same block when applicable.</p>
 
     <h2>R7: Config headroom</h2>
     <table>
@@ -478,7 +478,7 @@ ECONOMICS:
     <pre><code>score = impact × confidence  // impact: 1-5, confidence: 0.0-1.0</code></pre>
     <p>Rules are ranked by score within the winning DAG layer. The highest-scoring rule in the winning layer is the primary recommendation. All others are held. They surface when the same primary re-fires, or immediately when the primary has no fix left to offer.</p>
     <p><strong>DAG layers:</strong> R4, R2, R2b at layer 2 (highest priority). R5 at 3. R1 at 4. R3 and R6 at 5. R7 at 6 (lowest). The winning layer is the lowest-numbered layer that has a significant rule. Rules in higher-numbered layers are suppressed when a lower layer wins.</p>
-    <p><strong>Mutual exclusivity:</strong> R4 (weights overflow alone) silences R2 and R2b. R6 (Prefill-bound) silences R1 (Under-batching). These suppressions run before the layer filter. R2 vs R2b is handled separately in eval (<code>else if</code>), not this table.</p>
+    <p><strong>Mutual exclusivity:</strong> R4 (weights overflow alone) silences R2 and R2b. R6 (Prefill-bound) silences R1 (Under-batching) on the bound path. Soft field (waiting &lt; 2, KV mean &lt; 80%, running &lt; max(0.25 &times; ridge, 8), same floor as the Traffic limiter): skip that R6&rarr;R1 row so Under-batching owns first fire; Prefill and Prefix fall to <code>suppressed_recs</code> for same-primary remeasure reveal. Missing soft-field inputs keep bind-path ME. These suppressions run before the layer filter. R2 vs R2b is handled separately in eval (<code>else if</code>), not this table.</p>
 
     <h2>When no rule fires</h2>
     <p>If efficiency is still low, a fallback names the shape of the underuse. If nothing fires at all, Profile names the boundary capping a healthy server: capacity, traffic, physics, prefill interference, or framework overhead (<code>PrimaryLimiter</code>). When the GPU or model is uncatalogued and the ceiling itself is unknown, it says that instead of naming a boundary it cannot prove.</p>

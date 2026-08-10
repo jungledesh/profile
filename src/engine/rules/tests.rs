@@ -2115,10 +2115,10 @@ fn issue_blocks_r1_through_r7_have_no_waste_per_hr() {
         assert_no_waste("R5", &text);
     }
 
-    // R6
+    // R6 (bound running so Prefill stays primary; soft field would demote to R1)
     {
         let windows: Vec<_> = (0..10)
-            .map(|_| mk_r6_prefill_window(12.0, 10.0, 5.0, Some(50.0)))
+            .map(|_| mk_r6_prefill_window(12.0, 10.0, 100.0, Some(50.0)))
             .collect();
         let ctx = mk_llama8b_h100_ctx(&windows[0].snapshot);
         let summary = ai(&ctx, windows.last().expect("windows"));
@@ -2196,12 +2196,12 @@ fn not_triggered_shows_plain_label() {
 
 #[test]
 fn suppressed_rule_shows_suppressor_in_verbose() {
-    // Mixed run: both R1 and R6 significant → ME puts R6 over R1.
+    // Bound (running near ridge floor): both R1 and R6 significant → ME puts R6 over R1.
     let mut windows: Vec<_> = (0..10)
-        .map(|_| mk_r6_prefill_window(2.5, 10.0, 5.0, Some(50.0)))
+        .map(|_| mk_r6_prefill_window(2.5, 10.0, 100.0, Some(50.0)))
         .collect();
     for w in windows.iter_mut().skip(5) {
-        *w = mk_r6_prefill_window(12.0, 10.0, 5.0, Some(80.0));
+        *w = mk_r6_prefill_window(12.0, 10.0, 100.0, Some(80.0));
     }
     let ctx = mk_llama8b_h100_ctx(&windows[0].snapshot);
     let summary = ai(&ctx, windows.last().expect("windows"));
@@ -2237,10 +2237,10 @@ fn suppression_table_shows_suppressor_in_verbose() {
 
 #[test]
 fn format_diagnose_verbose_r1_suppressed_by_r6_when_both_fire() {
-    // Prefill-shaped under-batching: R1 evaluates and ME suppresses it under R6.
+    // Bound prefill + under-batching: R1 evaluates and ME suppresses it under R6.
     // Verbose must show "suppressed by", not a defer / prompt-gen parenthetical.
     let windows: Vec<_> = (0..10)
-        .map(|_| mk_r6_prefill_window(12.0, 10.0, 5.0, Some(50.0)))
+        .map(|_| mk_r6_prefill_window(12.0, 10.0, 100.0, Some(50.0)))
         .collect();
     let ctx = mk_llama8b_h100_ctx(&windows[0].snapshot);
     let summary = ai(&ctx, windows.last().expect("windows"));
@@ -3007,13 +3007,13 @@ fn r7_silent_when_waiting_nonzero_r5_territory() {
 
 #[test]
 fn mixed_run_r6_suppresses_r1() {
-    // Half under-batched (R1), half prefill-bound (R6). Both significant;
-    // ME before layer filter → R6 primary, R1 suppressed.
+    // Bound (running above soft-field ridge floor): half under-batched signal,
+    // half prefill-bound. Both significant; ME before layer filter → R6 primary.
     let mut windows: Vec<_> = (0..10)
-        .map(|_| mk_r6_prefill_window(2.5, 10.0, 5.0, Some(50.0)))
+        .map(|_| mk_r6_prefill_window(2.5, 10.0, 100.0, Some(50.0)))
         .collect();
     for w in windows.iter_mut().skip(5) {
-        *w = mk_r6_prefill_window(12.0, 10.0, 5.0, Some(80.0));
+        *w = mk_r6_prefill_window(12.0, 10.0, 100.0, Some(80.0));
     }
     let ctx = mk_llama8b_h100_ctx(&windows[0].snapshot);
     let summary = ai(&ctx, windows.last().expect("windows"));
@@ -3048,6 +3048,146 @@ fn mixed_run_r6_suppresses_r1() {
 }
 
 #[test]
+fn soft_field_r1_primary_demotes_r6_to_suppressed_recs() {
+    // Soft field (running ≪ ridge, wait≈0, KV cool): skip R6→R1 ME.
+    // R1 owns first fire; Prefill parked for remeasure reveal.
+    let windows: Vec<_> = (0..10)
+        .map(|_| mk_r6_prefill_window(12.0, 10.0, 5.0, Some(50.0)))
+        .collect();
+    let ctx = mk_llama8b_h100_ctx(&windows[0].snapshot);
+    let summary = ai(&ctx, windows.last().expect("windows"));
+    let report = build_report_for_windows(&windows, summary);
+    assert!(
+        report
+            .limiter_evidence
+            .as_ref()
+            .is_some_and(crate::engine::limiter::soft_field),
+        "fixture must classify soft field"
+    );
+    assert_eq!(
+        report.recommendations.first().map(|g| g.rule_name),
+        Some(rule_names::UNDER_BATCHING)
+    );
+    assert_eq!(report.recommendations.first().map(|g| g.layer), Some(4));
+    assert!(
+        !report
+            .recommendations
+            .iter()
+            .any(|g| g.rule_name == rule_names::PREFILL_BOUND)
+    );
+    assert!(
+        report
+            .suppressed_recs
+            .iter()
+            .any(|r| r.rule_name == rule_names::PREFILL_BOUND && !r.display_lines.is_empty())
+    );
+    assert!(
+        report
+            .suppressed_rules
+            .iter()
+            .any(|(suppressed, suppressor)| {
+                *suppressed == rule_names::PREFILL_BOUND
+                    && *suppressor == rule_names::UNDER_BATCHING
+            })
+    );
+    // Soft demotion must not mark R1 terminal, and must not exit via R6 wall.
+    assert!(!report.recommendations[0].terminal);
+}
+
+#[test]
+fn soft_field_verbose_shows_prefill_suppressed_by_under_batching() {
+    let windows: Vec<_> = (0..10)
+        .map(|_| mk_r6_prefill_window(12.0, 10.0, 5.0, Some(50.0)))
+        .collect();
+    let ctx = mk_llama8b_h100_ctx(&windows[0].snapshot);
+    let summary = ai(&ctx, windows.last().expect("windows"));
+    let text = format_diagnose_rules_for_windows_test(
+        &windows,
+        summary,
+        true,
+        "http://127.0.0.1:8000/metrics",
+    )
+    .join("\n");
+    assert!(text.contains("Prefill-Bound: suppressed by Under-batching"));
+    assert!(!text.contains("Under-batching: suppressed by Prefill-Bound"));
+}
+
+#[test]
+fn soft_field_high_kv_keeps_r6_over_r1_me() {
+    // Cool-queue under-fed running, but KV at capacity threshold → not soft;
+    // bind ME still parks R1 under Prefill.
+    let windows: Vec<_> = (0..10)
+        .map(|_| {
+            let mut w = mk_r6_prefill_window(12.0, 10.0, 5.0, Some(50.0));
+            w.snapshot.vllm.kv_cache_usage_perc = Some(80.0);
+            w
+        })
+        .collect();
+    let ctx = mk_llama8b_h100_ctx(&windows[0].snapshot);
+    let summary = ai(&ctx, windows.last().expect("windows"));
+    let report = build_report_for_windows(&windows, summary);
+    assert!(
+        !report
+            .limiter_evidence
+            .as_ref()
+            .is_some_and(crate::engine::limiter::soft_field)
+    );
+    assert_eq!(
+        report.recommendations.first().map(|g| g.rule_name),
+        Some(rule_names::PREFILL_BOUND)
+    );
+    assert!(
+        report
+            .suppressed_recs
+            .iter()
+            .any(|r| r.rule_name == rule_names::UNDER_BATCHING)
+    );
+}
+
+#[test]
+fn soft_field_demotes_r6_and_r3_under_r1() {
+    // Soft field + low prefix hit: R1 primary; Prefill and Prefix in suppressed_recs
+    // (page-1 silence; remeasure reveal path).
+    let windows: Vec<_> = (0..10)
+        .map(|_| {
+            let mut w = mk_r6_prefill_window(12.0, 10.0, 5.0, Some(50.0));
+            w.snapshot.vllm.prefix_cache_hit_rate = Some(0.10);
+            w.snapshot.vllm.cache_config.enable_prefix_caching = Some(true);
+            w
+        })
+        .collect();
+    let ctx = mk_llama8b_h100_ctx(&windows[0].snapshot);
+    let summary = ai(&ctx, windows.last().expect("windows"));
+    let report = build_report_for_windows(&windows, summary);
+    assert!(
+        report
+            .limiter_evidence
+            .as_ref()
+            .is_some_and(crate::engine::limiter::soft_field)
+    );
+    assert_eq!(
+        report.recommendations.first().map(|g| g.rule_name),
+        Some(rule_names::UNDER_BATCHING)
+    );
+    let suppressed: Vec<_> = report.suppressed_recs.iter().map(|r| r.rule_name).collect();
+    assert!(
+        suppressed.contains(&rule_names::PREFILL_BOUND),
+        "expected Prefill in suppressed: {suppressed:?}"
+    );
+    assert!(
+        suppressed.contains(&rule_names::LOW_PREFIX_REUSE),
+        "expected Prefix in suppressed: {suppressed:?}"
+    );
+    assert!(
+        !report
+            .recommendations
+            .iter()
+            .any(|g| g.rule_name == rule_names::PREFILL_BOUND
+                || g.rule_name == rule_names::LOW_PREFIX_REUSE)
+    );
+}
+
+#[test]
 fn r1_fires_when_r6_muted_by_tpot() {
     // High prompt/gen + low occupancy, but TPOT near floor so R6 declines.
     // Must not leave the window silent: R1 owns under-batching.
@@ -3079,14 +3219,21 @@ fn r1_fires_when_r6_muted_by_tpot() {
 
 #[test]
 fn r6_and_r1_both_significant_r1_lands_in_suppressed_recs() {
-    // Prefill-shaped under-batching windows: R1 fires (no defer gate) and R6
+    // Bound: Prefill-shaped under-batching at high running. R1 fires and R6
     // fires; ME moves R1 into suppressed_recs for same-primary reveal.
     let windows: Vec<_> = (0..10)
-        .map(|_| mk_r6_prefill_window(12.0, 10.0, 5.0, Some(50.0)))
+        .map(|_| mk_r6_prefill_window(12.0, 10.0, 100.0, Some(50.0)))
         .collect();
     let ctx = mk_llama8b_h100_ctx(&windows[0].snapshot);
     let summary = ai(&ctx, windows.last().expect("windows"));
     let report = build_report_for_windows(&windows, summary);
+    assert!(
+        !report
+            .limiter_evidence
+            .as_ref()
+            .is_some_and(crate::engine::limiter::soft_field),
+        "high running must not classify soft field"
+    );
     assert_eq!(
         report.recommendations.first().map(|g| g.rule_name),
         Some(rule_names::PREFILL_BOUND)
@@ -3118,7 +3265,7 @@ fn r6_and_r1_both_significant_r1_lands_in_suppressed_recs() {
 #[test]
 fn r6_not_primary_when_r2_outscores() {
     let mut windows: Vec<_> = (0..10)
-        .map(|_| mk_r6_prefill_window(12.0, 10.0, 50.0, Some(50.0)))
+        .map(|_| mk_r6_prefill_window(12.0, 10.0, 100.0, Some(50.0)))
         .collect();
     for w in windows.iter_mut().take(4) {
         *w = mk_evaluable_kv_window(89.0, true);
@@ -3891,7 +4038,7 @@ fn session_kv_peak_from_non_r5_window_reaches_build_report_from_eval() {
 #[test]
 fn r6_fires_as_primary_when_no_other_rules() {
     let windows: Vec<_> = (0..10)
-        .map(|_| mk_r6_prefill_window(12.0, 10.0, 50.0, Some(50.0)))
+        .map(|_| mk_r6_prefill_window(12.0, 10.0, 100.0, Some(50.0)))
         .collect();
     let s = windows[0].snapshot.clone();
     let ctx = mk_llama8b_h100_ctx(&s);
@@ -3906,7 +4053,7 @@ fn r6_fires_as_primary_when_no_other_rules() {
 #[test]
 fn r6_primary_fix_sets_default_budget_with_scraped_floor() {
     let mut windows: Vec<_> = (0..10)
-        .map(|_| mk_r6_prefill_window(12.0, 10.0, 50.0, Some(50.0)))
+        .map(|_| mk_r6_prefill_window(12.0, 10.0, 100.0, Some(50.0)))
         .collect();
     for w in &mut windows {
         // Below default so launch still Names a Set (never shrink from above).
@@ -3948,7 +4095,7 @@ fn r6_primary_fix_sets_default_budget_with_scraped_floor() {
 #[test]
 fn r6_primary_fix_guides_when_batched_tokens_unread() {
     let mut windows: Vec<_> = (0..10)
-        .map(|_| mk_r6_prefill_window(12.0, 10.0, 50.0, Some(50.0)))
+        .map(|_| mk_r6_prefill_window(12.0, 10.0, 100.0, Some(50.0)))
         .collect();
     for w in &mut windows {
         w.snapshot.vllm.max_num_batched_tokens = None;
@@ -3989,7 +4136,7 @@ fn r6_primary_fix_guides_when_batched_tokens_unread() {
 #[test]
 fn r6_primary_fix_sets_default_budget_without_floor() {
     let mut windows: Vec<_> = (0..10)
-        .map(|_| mk_r6_prefill_window(12.0, 10.0, 50.0, Some(50.0)))
+        .map(|_| mk_r6_prefill_window(12.0, 10.0, 100.0, Some(50.0)))
         .collect();
     for w in &mut windows {
         w.snapshot.vllm.max_num_batched_tokens = Some(1024);
@@ -4024,7 +4171,7 @@ fn r6_primary_fix_sets_default_budget_without_floor() {
 #[test]
 fn r6_primary_fix_skips_set_when_configured_above_default() {
     let mut windows: Vec<_> = (0..10)
-        .map(|_| mk_r6_prefill_window(12.0, 10.0, 50.0, Some(50.0)))
+        .map(|_| mk_r6_prefill_window(12.0, 10.0, 100.0, Some(50.0)))
         .collect();
     for w in &mut windows {
         w.snapshot.vllm.max_num_batched_tokens = Some(8192);
@@ -4067,7 +4214,7 @@ fn r6_primary_fix_skips_set_when_configured_above_default() {
 #[test]
 fn r6_primary_fix_names_floor_when_above_default() {
     let mut windows: Vec<_> = (0..10)
-        .map(|_| mk_r6_prefill_window(12.0, 10.0, 50.0, Some(50.0)))
+        .map(|_| mk_r6_prefill_window(12.0, 10.0, 100.0, Some(50.0)))
         .collect();
     for w in &mut windows {
         // Unread or below default so floor-above-default info path can fire.
@@ -4105,7 +4252,7 @@ fn r6_primary_fix_names_floor_when_above_default() {
 #[test]
 fn r6_suppresses_r7_when_both_fire() {
     let mut windows: Vec<_> = (0..10)
-        .map(|_| mk_r6_prefill_window(12.0, 10.0, 50.0, Some(50.0)))
+        .map(|_| mk_r6_prefill_window(12.0, 10.0, 100.0, Some(50.0)))
         .collect();
     for w in &mut windows {
         w.snapshot.vllm.max_num_seqs = Some(32);
@@ -4334,7 +4481,7 @@ fn recommendation_prose_bodies_end_with_periods() {
         },
         {
             let windows: Vec<_> = (0..ENGINE_MIN_PERSISTENT_WINDOWS)
-                .map(|_| mk_r6_prefill_window(12.0, 10.0, 50.0, Some(50.0)))
+                .map(|_| mk_r6_prefill_window(12.0, 10.0, 100.0, Some(50.0)))
                 .collect();
             let s = windows[0].snapshot.clone();
             (
