@@ -43,6 +43,25 @@ pub(crate) fn should_reveal_suppressed(
     suppressed_recs_non_empty && new_primary == Some(previous_recommendation)
 }
 
+/// Prefill unread budget path re-fired as primary: first fire kept the Confirm
+/// guide; second time with the same unread guide there is no new verifiable
+/// server lever. Exit the loop.
+pub(crate) fn should_exit_prefill_unread_refire(
+    previous_recommendation: &'static str,
+    new_primary: Option<&'static str>,
+    previous_display_lines: Option<&[String]>,
+    new_display_lines: Option<&[String]>,
+) -> bool {
+    new_primary == Some(previous_recommendation)
+        && previous_recommendation == rule_names::PREFILL_BOUND
+        && previous_display_lines.is_some_and(engine::fix_shows_unread_batched_tokens)
+        && new_display_lines.is_some_and(engine::fix_shows_unread_batched_tokens)
+}
+
+pub(crate) fn prefill_unread_exhausted_exit_message() -> &'static str {
+    "Exiting: no new server lever to apply. Scale out or accept the ceiling."
+}
+
 /// Inputs for the interactive diagnose closed loop.
 pub struct LoopRunnerInput<'a> {
     pub url: &'a str,
@@ -234,6 +253,30 @@ pub fn run(input: LoopRunnerInput<'_>) -> anyhow::Result<()> {
             reveal_suppressed,
         );
 
+        // Prefill unread guide shown again: no scrapeable knob left to apply.
+        if should_exit_prefill_unread_refire(
+            rule_name,
+            new_primary,
+            prev_report
+                .recommendations
+                .first()
+                .map(|r| r.display_lines.as_slice()),
+            new_report
+                .recommendations
+                .first()
+                .map(|r| r.display_lines.as_slice()),
+        ) {
+            println!();
+            let limiter = new_report
+                .limiter_evidence
+                .as_ref()
+                .and_then(crate::engine::limiter::limiter_line);
+            for line in prefill_unread_exhausted_close_lines(limiter.as_deref()) {
+                println!("{line}");
+            }
+            break;
+        }
+
         state.push(new_result, new_report, Some(rule_name));
     }
 
@@ -284,14 +327,23 @@ pub(crate) fn should_exit_terminal_wall(primary_terminal: bool, suppressed_empty
     primary_terminal && suppressed_empty
 }
 
-/// Limiter line (context) then exit close (conclusion). No fabricated "Capped by".
-pub(crate) fn terminal_wall_close_lines(limiter_line: Option<&str>) -> Vec<String> {
+fn close_lines_with_exit(limiter_line: Option<&str>, exit: &'static str) -> Vec<String> {
     let mut lines = Vec::new();
     if let Some(line) = limiter_line {
         lines.push(line.to_string());
     }
-    lines.push(terminal_exit_message().to_string());
+    lines.push(exit.to_string());
     lines
+}
+
+/// Limiter line (context) then exit close (conclusion). No fabricated "Capped by".
+pub(crate) fn terminal_wall_close_lines(limiter_line: Option<&str>) -> Vec<String> {
+    close_lines_with_exit(limiter_line, terminal_exit_message())
+}
+
+/// Limiter line (optional) then unread-exhausted close.
+pub(crate) fn prefill_unread_exhausted_close_lines(limiter_line: Option<&str>) -> Vec<String> {
+    close_lines_with_exit(limiter_line, prefill_unread_exhausted_exit_message())
 }
 
 fn is_kv_r5_oscillation_pair(a: &str, b: &str) -> bool {
@@ -785,6 +837,80 @@ mod tests {
         );
         assert!(!should_exit_terminal_wall(false, true));
         assert!(!should_exit_terminal_wall(false, false));
+    }
+
+    #[test]
+    fn prefill_unread_refire_exits_only_on_same_primary_with_unread_guide() {
+        let unread = vec![
+            "      • Confirm chunked prefill is enabled (--enable-chunked-prefill).".to_string(),
+            "      • --max-num-batched-tokens unread on this server.".to_string(),
+        ];
+        let set_path = vec![
+            "      • Set --max-num-batched-tokens to 2048 (default). Lower for smoother TPOT, raise for lower TTFT."
+                .to_string(),
+        ];
+        let enable_only =
+            vec!["      • Enable prefix caching: --enable-prefix-caching.".to_string()];
+        assert!(should_exit_prefill_unread_refire(
+            rule_names::PREFILL_BOUND,
+            Some(rule_names::PREFILL_BOUND),
+            Some(unread.as_slice()),
+            Some(unread.as_slice()),
+        ));
+        assert!(
+            !should_exit_prefill_unread_refire(
+                rule_names::PREFILL_BOUND,
+                Some(rule_names::PREFILL_BOUND),
+                Some(enable_only.as_slice()),
+                Some(unread.as_slice()),
+            ),
+            "first unread after Enable is still a first show of that guide"
+        );
+        assert!(
+            !should_exit_prefill_unread_refire(
+                rule_names::PREFILL_BOUND,
+                Some(rule_names::PREFILL_BOUND),
+                Some(unread.as_slice()),
+                Some(set_path.as_slice()),
+            ),
+            "named Set still has a lever"
+        );
+        assert!(!should_exit_prefill_unread_refire(
+            rule_names::UNDER_BATCHING,
+            Some(rule_names::UNDER_BATCHING),
+            Some(unread.as_slice()),
+            Some(unread.as_slice()),
+        ));
+        assert!(!should_exit_prefill_unread_refire(
+            rule_names::PREFILL_BOUND,
+            Some(rule_names::UNDER_BATCHING),
+            Some(unread.as_slice()),
+            Some(unread.as_slice()),
+        ));
+        assert!(!should_exit_prefill_unread_refire(
+            rule_names::PREFILL_BOUND,
+            Some(rule_names::PREFILL_BOUND),
+            Some(unread.as_slice()),
+            None,
+        ));
+    }
+
+    #[test]
+    fn prefill_unread_exhausted_close_lines_limiter_then_exit() {
+        let lines = prefill_unread_exhausted_close_lines(Some(
+            "Capped by prefill: prompt work at 8.7x of decode (effective).",
+        ));
+        assert_eq!(
+            lines,
+            vec![
+                "Capped by prefill: prompt work at 8.7x of decode (effective).".to_string(),
+                prefill_unread_exhausted_exit_message().to_string(),
+            ]
+        );
+        assert_eq!(
+            prefill_unread_exhausted_close_lines(None),
+            vec![prefill_unread_exhausted_exit_message().to_string()]
+        );
     }
 
     #[test]

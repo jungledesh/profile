@@ -40,9 +40,12 @@ pub struct LimiterEvidence {
     /// reduces to requiring mean.
     pub kv_cache_mean_perc: Option<f64>,
     pub kv_cache_peak_perc: Option<f64>,
+    /// Duration-weighted mean running over evaluable non-idle windows (same
+    /// courtroom as the scoreboard active-window aggregate). Soft field and
+    /// Traffic limiter use this.
     pub mean_running: Option<f64>,
-    /// Unweighted mean waiting across evaluable windows (sum/count, same as
-    /// `mean_running`). `None` or non-finite → [`LimiterVerdict::WaitingUnread`]
+    /// Duration-weighted mean waiting over evaluable non-idle windows.
+    /// `None` or non-finite → [`LimiterVerdict::WaitingUnread`]
     /// (decline a healthy "Capped by"). When >= 2, identify declines with no
     /// line: silence over a healthy verdict on a flood.
     pub mean_waiting: Option<f64>,

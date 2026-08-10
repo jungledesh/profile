@@ -21,6 +21,7 @@ pub(crate) use format::{MuVariant, mu_diagnose_lines};
 #[cfg(test)]
 pub(crate) use r1_under_batching::{R1EvalInput, Rule1Outcome};
 pub(crate) use r2_kv_cache_pressure::KV_CACHE_PRESSURE_MIN_PERC;
+pub(crate) use r6_prefill_bound::fix_shows_unread_batched_tokens;
 /// KV cache usage below this means the pool has room to absorb new sequences safely.
 /// Shared by R5 raise gate and R7 headroom cause line.
 pub(super) const KV_CACHE_SAFE_TO_SCALE_PCT: f64 = 80.0;

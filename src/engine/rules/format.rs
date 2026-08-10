@@ -11,26 +11,36 @@ use super::r4_oom_risk::r4_advisory;
 use super::{ENGINE_MIN_PERSISTENT_WINDOWS, NO_ISSUES_LINE, Recommendation, rule_names};
 
 /// Revealed secondary whose Fix fights the primary. Rank ME already suppresses;
-/// this annotates Fix when that secondary is shown under reveal.
+/// this annotates Fix when that secondary is shown under reveal (2nd same primary).
 /// Bound path: R6 primary, R1 revealed → neutralize R1 add-load.
-/// Soft field: R1 primary, R6 revealed → no row here (Prefill is informational;
-/// do not claim a compute-wall conflict on an under-fed box).
-const REVEAL_FIX_CONFLICT_TABLE: &[(&str, &str)] =
-    &[(rule_names::PREFILL_BOUND, rule_names::UNDER_BATCHING)];
+/// Soft field: R1 primary, R6 revealed → neutralize Prefill scale-out; warn to
+/// read REQUESTS/CACHE in the header.
+const REVEAL_FIX_CONFLICT_TABLE: &[(&str, &str, &str)] = &[
+    (
+        rule_names::PREFILL_BOUND,
+        rule_names::UNDER_BATCHING,
+        "        Conflicts with primary above: adds load to a server at its compute wall.",
+    ),
+    (
+        rule_names::UNDER_BATCHING,
+        rule_names::PREFILL_BOUND,
+        "        Conflicts with primary above: scale-out while the box is still under-fed. Check REQUESTS and CACHE in the header.",
+    ),
+];
 
-/// Subline under the revealed Fix bullet (R6 wall vs R1 add-load).
-const REVEAL_FIX_CONFLICT_SUBLINE: &str =
-    "        Conflicts with primary above: adds load to a server at its compute wall.";
-
-fn reveal_fix_conflicts(primary: &'static str, secondary: &'static str) -> bool {
+fn reveal_fix_conflict_subline(
+    primary: &'static str,
+    secondary: &'static str,
+) -> Option<&'static str> {
     REVEAL_FIX_CONFLICT_TABLE
         .iter()
-        .any(|&(p, s)| p == primary && s == secondary)
+        .find(|&&(p, s, _)| p == primary && s == secondary)
+        .map(|&(_, _, sub)| sub)
 }
 
 /// Keep Cause and Fix bullets; mark header `[?]`; attach conflict subline under Fix.
 /// Drop Expected (it describes the conflicting action).
-fn neutralize_revealed_fix(display_lines: &[String]) -> Vec<String> {
+fn neutralize_revealed_fix(display_lines: &[String], conflict_subline: &str) -> Vec<String> {
     let Some(fix_at) = display_lines.iter().position(|l| l == "    Fix:") else {
         return display_lines.to_vec();
     };
@@ -65,7 +75,7 @@ fn neutralize_revealed_fix(display_lines: &[String]) -> Vec<String> {
         fix_end -= 1;
     }
     out.extend_from_slice(&display_lines[after_fix..fix_end]);
-    out.push(REVEAL_FIX_CONFLICT_SUBLINE.to_string());
+    out.push(conflict_subline.to_string());
 
     let mut i = resume_at;
     if i < display_lines.len() && display_lines[i].starts_with("    Expected:") {
@@ -87,10 +97,9 @@ fn neutralize_revealed_fix(display_lines: &[String]) -> Vec<String> {
 }
 
 fn revealed_secondary_block(primary_name: &'static str, rec: &Recommendation) -> Vec<String> {
-    if reveal_fix_conflicts(primary_name, rec.rule_name) {
-        neutralize_revealed_fix(&rec.display_lines)
-    } else {
-        rec.display_lines.clone()
+    match reveal_fix_conflict_subline(primary_name, rec.rule_name) {
+        Some(sub) => neutralize_revealed_fix(&rec.display_lines, sub),
+        None => rec.display_lines.clone(),
     }
 }
 
@@ -1234,7 +1243,7 @@ mod catalog_mismatch_note_tests {
 #[cfg(test)]
 mod stuck_fix_reveal_tests {
     use super::{
-        REVEAL_FIX_CONFLICT_SUBLINE, format_diagnose_rules_for_windows, neutralize_revealed_fix,
+        format_diagnose_rules_for_windows, neutralize_revealed_fix, reveal_fix_conflict_subline,
     };
     use crate::collectors::RawSnapshot;
     use crate::collectors::{GpuRawMetrics, VllmRawMetrics};
@@ -1477,7 +1486,10 @@ mod stuck_fix_reveal_tests {
         assert!(!text.contains("[!] Under-batching"));
         assert!(text.contains("Hardware capacity under-fed by client."));
         assert!(text.contains("increase client concurrency"));
-        assert!(text.contains(REVEAL_FIX_CONFLICT_SUBLINE.trim_start()));
+        let bound_sub =
+            reveal_fix_conflict_subline(rule_names::PREFILL_BOUND, rule_names::UNDER_BATCHING)
+                .expect("bound conflict subline");
+        assert!(text.contains(bound_sub.trim_start()));
         let fix = text.find("increase client concurrency").expect("fix");
         let conflict = text.find("Conflicts with primary above").expect("conflict");
         assert!(fix < conflict, "conflict subline trails the Fix bullet");
@@ -1486,17 +1498,41 @@ mod stuck_fix_reveal_tests {
     }
 
     #[test]
-    fn soft_field_reveal_r6_under_r1_does_not_claim_compute_wall_conflict() {
-        // Reverse of bound reveal: R1 primary, Prefill secondary. No conflict
-        // subline (under-fed box is not at a compute wall).
-        let report = report_with(
-            r1_style_rec(),
-            vec![rec(rule_names::PREFILL_BOUND, 5, 0.9, "[!] Prefill-Bound")],
-        );
+    fn soft_field_reveal_r6_under_r1_warns_scale_out_conflict() {
+        // Soft reveal: R1 primary, Prefill secondary. Neutralize scale-out and
+        // warn to read REQUESTS/CACHE before acting.
+        let prefill = Recommendation {
+            rule_name: rule_names::PREFILL_BOUND,
+            layer: 5,
+            impact: 5,
+            confidence: 0.9,
+            display_lines: vec![
+                "[!] Prefill-Bound: Decode Starved by Prefill".to_string(),
+                String::new(),
+                "    Cause:".to_string(),
+                "      Prefill FLOPs dominate.".to_string(),
+                String::new(),
+                "    Fix:".to_string(),
+                "      • Disaggregate prefill and decode onto separate workers.".to_string(),
+                "      • Add a replica to scale out.".to_string(),
+                String::new(),
+                "    Expected: Scale out.".to_string(),
+                "    Confidence: High".to_string(),
+            ],
+            terminal: true,
+        };
+        let report = report_with(r1_style_rec(), vec![prefill]);
         let text = render(&report, true);
-        assert!(text.contains("[!] Prefill-Bound"));
-        assert!(!text.contains("Conflicts with primary above"));
-        assert!(!text.contains("[?] Prefill-Bound"));
+        assert!(text.contains("[?] Prefill-Bound"));
+        assert!(!text.contains("[!] Prefill-Bound"));
+        let soft_sub =
+            reveal_fix_conflict_subline(rule_names::UNDER_BATCHING, rule_names::PREFILL_BOUND)
+                .expect("soft conflict subline");
+        assert!(text.contains(soft_sub.trim_start()));
+        assert!(text.contains("REQUESTS and CACHE"));
+        assert!(text.contains("Disaggregate prefill and decode"));
+        assert!(!text.contains("Expected: Scale out"));
+        assert!(!text.contains("adds load to a server at its compute wall"));
     }
 
     #[test]
@@ -1514,6 +1550,6 @@ mod stuck_fix_reveal_tests {
     #[test]
     fn neutralize_without_fix_header_is_passthrough() {
         let lines = vec!["[!] Under-batching".to_string(), "    body".to_string()];
-        assert_eq!(neutralize_revealed_fix(&lines), lines);
+        assert_eq!(neutralize_revealed_fix(&lines, "        conflict"), lines);
     }
 }

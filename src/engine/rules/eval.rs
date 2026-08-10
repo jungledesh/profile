@@ -6,6 +6,7 @@ use crate::engine::baseline::{self, WeightDtypeSource, effective_kv_cache_dtype}
 use super::r1_under_batching::{
     KV_MONITOR_WARNING_PCT, R1EvalInput, R1FormatCtx, Rule1Outcome, UnderBatchingDetail,
     aggregate_r1_detail, format_under_batching_window_issue, rule1_under_batching_with_efficiency,
+    soft_underfed_recommendation,
 };
 use super::r2_kv_cache_pressure::{
     KvAdmissionBacklogDetail, KvCachePressureDetail, KvFormatCtx, Rule2Outcome,
@@ -68,11 +69,14 @@ struct WindowRuleEval {
     r7_fired: usize,
     r7_details: Vec<ConfigHeadroomDetail>,
     session_kv_peak: Option<f64>,
-    // Run-level mean(running) across evaluable windows; feeds the empirical KV bound.
-    sum_running: f64,
-    count_running: usize,
-    sum_waiting: f64,
-    count_waiting: usize,
+    // Run-level duration-weighted means across evaluable non-idle windows
+    // (same courtroom as scoreboard active-window aggregates).
+    sum_running_w: f64,
+    weight_running: f64,
+    sum_waiting_w: f64,
+    weight_waiting: f64,
+    sum_kv_w: f64,
+    weight_kv: f64,
     // Run-level means for limiter evidence and prefill effective ratio.
     sum_tpot_ms: f64,
     count_tpot_ms: usize,
@@ -82,11 +86,15 @@ struct WindowRuleEval {
 
 impl WindowRuleEval {
     fn mean_running(&self) -> Option<f64> {
-        (self.count_running > 0).then(|| self.sum_running / self.count_running as f64)
+        (self.weight_running > 0.0).then(|| self.sum_running_w / self.weight_running)
     }
 
     fn mean_waiting(&self) -> Option<f64> {
-        (self.count_waiting > 0).then(|| self.sum_waiting / self.count_waiting as f64)
+        (self.weight_waiting > 0.0).then(|| self.sum_waiting_w / self.weight_waiting)
+    }
+
+    fn mean_kv_perc(&self) -> Option<f64> {
+        (self.weight_kv > 0.0).then(|| self.sum_kv_w / self.weight_kv)
     }
 
     fn mean_tpot_ms(&self) -> Option<f64> {
@@ -179,10 +187,12 @@ fn eval_window_rules(
         r7_fired: 0,
         r7_details: Vec::new(),
         session_kv_peak: None,
-        sum_running: 0.0,
-        count_running: 0,
-        sum_waiting: 0.0,
-        count_waiting: 0,
+        sum_running_w: 0.0,
+        weight_running: 0.0,
+        sum_waiting_w: 0.0,
+        weight_waiting: 0.0,
+        sum_kv_w: 0.0,
+        weight_kv: 0.0,
         sum_tpot_ms: 0.0,
         count_tpot_ms: 0,
         sum_effective_ratio: 0.0,
@@ -247,21 +257,35 @@ fn eval_window_rules(
             eval.session_kv_peak = Some(eval.session_kv_peak.map_or(kv, |peak| peak.max(kv)));
         }
 
+        // Duration weight: match scoreboard active-window means (idle already skipped).
+        let dur = snap
+            .vllm
+            .window_duration_secs
+            .filter(|d| d.is_finite() && *d > 0.0)
+            .unwrap_or(1.0);
         if let Some(run) = snap
             .vllm
             .num_requests_running
             .filter(|v| v.is_finite() && *v >= 0.0)
         {
-            eval.sum_running += run;
-            eval.count_running += 1;
+            eval.sum_running_w += run * dur;
+            eval.weight_running += dur;
         }
         if let Some(wait) = snap
             .vllm
             .num_requests_waiting
             .filter(|v| v.is_finite() && *v >= 0.0)
         {
-            eval.sum_waiting += wait;
-            eval.count_waiting += 1;
+            eval.sum_waiting_w += wait * dur;
+            eval.weight_waiting += dur;
+        }
+        if let Some(kv) = snap
+            .vllm
+            .kv_cache_usage_perc
+            .filter(|v| v.is_finite() && *v >= 0.0)
+        {
+            eval.sum_kv_w += kv * dur;
+            eval.weight_kv += dur;
         }
         if let Some(tpot) = snap.vllm.tpot_ms.filter(|v| v.is_finite() && *v > 0.0) {
             eval.sum_tpot_ms += tpot;
@@ -486,10 +510,9 @@ fn build_report_from_eval(
     let r2_significant = eval.r2_significant();
     let r2_backlog_significant = eval.r2_backlog_significant();
     let limiter_evidence = Some(crate::engine::limiter::LimiterEvidence {
-        kv_cache_mean_perc: summary_snap
-            .vllm
-            .kv_cache_usage_perc
-            .filter(|v| v.is_finite()),
+        // Same courtroom as scoreboard active-window means: duration-weighted
+        // over evaluable non-idle windows (idle never enters eval).
+        kv_cache_mean_perc: eval.mean_kv_perc(),
         kv_cache_peak_perc: eval.session_kv_peak,
         mean_running: eval.mean_running(),
         mean_waiting: eval.mean_waiting(),
@@ -531,6 +554,26 @@ fn build_report_from_eval(
             display_lines,
             terminal: false,
         });
+    } else if limiter_evidence
+        .as_ref()
+        .is_some_and(crate::engine::limiter::soft_field)
+        && eval.r6_significant()
+    {
+        // Soft field, R1 gates did not fire, Prefill would own the page: still
+        // tell under-fed. Reuse R1 Fix; Cause/requests use soft (scoreboard)
+        // numbers. Do not bend R1 thresholds. Quiet soft (no Prefill) stays
+        // on the no-issues / limiter path.
+        if let Some(rec) = soft_underfed_recommendation(
+            summary_snap,
+            summary.ctx.config.max_num_seqs,
+            ridge_run,
+            baseline.as_ref(),
+            max_model_len,
+            kv_max_seqs,
+            limiter_evidence.as_ref(),
+        ) {
+            recs.push(rec);
+        }
     }
 
     if r2_significant {
@@ -860,6 +903,18 @@ fn finalize_report_groups(
         let sb = b.impact as f64 * b.confidence;
         sb.total_cmp(&sa)
     });
+
+    // Soft field: Prefill FLOPs / compute-wall must not terminal-exit. Under-fed
+    // owns the page; scale-out copy may still appear as reveal secondary only.
+    if soft_field {
+        for r in primary_recs
+            .iter_mut()
+            .chain(suppressed_recs.iter_mut())
+            .filter(|r| r.rule_name == rule_names::PREFILL_BOUND)
+        {
+            r.terminal = false;
+        }
+    }
 
     Report {
         baseline,
