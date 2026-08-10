@@ -109,9 +109,29 @@ const BATCH_TOKEN_ALREADY_SET_EXPECTED: &str =
 const BATCH_TOKEN_ALREADY_ABOVE_DEFAULT_EXPECTED: &str =
     "No --max-num-batched-tokens change; configured value is already above the default.";
 
+/// Distinctive Fix marker when `--max-num-batched-tokens` is unread (no verifiable Set).
+/// Loop exit detects this marker; the Fix bullet must contain it (see unit test).
+pub(crate) const UNREAD_BATCHED_TOKENS_MARKER: &str =
+    "--max-num-batched-tokens unread on this server.";
+
 const BATCH_TOKEN_UNREAD_BULLET: &str = "      • --max-num-batched-tokens unread on this server.";
 
-const BATCH_TOKEN_UNREAD_EXPECTED: &str = "Steadier decode once prefill sharing is confirmed.";
+const BATCH_TOKEN_UNREAD_EXPECTED: &str =
+    "Steadier decode once prefill sharing is confirmed and --max-num-batched-tokens is set.";
+
+/// Unread budget when chunked is already on: do not claim "confirm sharing."
+const BATCH_TOKEN_UNREAD_CHUNKED_ON_EXPECTED: &str =
+    "Steadier decode once --max-num-batched-tokens is set; chunked prefill is already on.";
+
+/// Floor sits above launch default: Fix names floor/directions only (no Set).
+const BATCH_TOKEN_FLOOR_ABOVE_DEFAULT_EXPECTED: &str = "No --max-num-batched-tokens Set; page floor sits above the launch default. Tune at or above the floor.";
+
+/// True when Fix names the unread batched-tokens guide (no verifiable Set).
+pub(crate) fn fix_shows_unread_batched_tokens(lines: &[String]) -> bool {
+    lines
+        .iter()
+        .any(|l| l.contains(UNREAD_BATCHED_TOKENS_MARKER))
+}
 
 /// Launch prescription: when configured is readable, Set 2048 (default) + optional
 /// scraped page floor. No ridge/workload Set target (those tiers still feed
@@ -182,7 +202,11 @@ fn batch_token_prescription_expected(d: &PrefillBoundDetail, named_set: bool) ->
         return BATCH_TOKEN_SET_EXPECTED;
     }
     if d.max_num_batched_tokens.is_none() {
-        return BATCH_TOKEN_UNREAD_EXPECTED;
+        return if d.chunked_prefill_enabled == Some(true) {
+            BATCH_TOKEN_UNREAD_CHUNKED_ON_EXPECTED
+        } else {
+            BATCH_TOKEN_UNREAD_EXPECTED
+        };
     }
     if d.max_num_batched_tokens
         .is_some_and(|c| u64::from(c) > DEFAULT_BATCH_TOKEN_BUDGET)
@@ -192,8 +216,8 @@ fn batch_token_prescription_expected(d: &PrefillBoundDetail, named_set: bool) ->
     if let Some(f) = d.chunk_floor.filter(|f| *f > 0)
         && DEFAULT_BATCH_TOKEN_BUDGET < u64::from(f)
     {
-        // Readable configured, floor above default: operator still tunes at/above floor.
-        return BATCH_TOKEN_SET_EXPECTED;
+        // Readable configured, floor above default: Fix has no Set bullet.
+        return BATCH_TOKEN_FLOOR_ABOVE_DEFAULT_EXPECTED;
     }
     BATCH_TOKEN_ALREADY_SET_EXPECTED
 }
@@ -1933,11 +1957,19 @@ mod tests {
     fn unread_configured_guides_without_blind_set() {
         let d = wall_path_base(None, Some(1638.4), Some(true), 12.0);
         let text = format_prefill_bound_window_issue(&d, 100).join("\n");
+        assert!(
+            BATCH_TOKEN_UNREAD_BULLET.contains(UNREAD_BATCHED_TOKENS_MARKER),
+            "Fix bullet and loop-exit marker must share one string"
+        );
         assert!(text.contains(BATCH_TOKEN_UNREAD_BULLET.trim_start()));
+        assert!(fix_shows_unread_batched_tokens(
+            &text.lines().map(str::to_string).collect::<Vec<_>>()
+        ));
         assert!(!text.contains("Set --max-num-batched-tokens to 2048"));
         assert!(text.contains(BATCH_TOKEN_DIRECTIONS));
         assert!(text.contains(BATCH_TOKEN_BOOT_REJECT_SUBLINE));
-        assert!(text.contains(BATCH_TOKEN_UNREAD_EXPECTED));
+        assert!(text.contains(BATCH_TOKEN_UNREAD_CHUNKED_ON_EXPECTED));
+        assert!(!text.contains("once prefill sharing is confirmed"));
         assert!(!text.contains("could not verify this differs from what's running"));
     }
 
@@ -2169,7 +2201,17 @@ mod tests {
                             Some(_) => unreachable!(),
                         }
                         if chunked_prefill_enabled != Some(false) {
-                            assert!(text.contains(BATCH_TOKEN_UNREAD_EXPECTED), "{case}: {text}");
+                            let expected = if chunked_prefill_enabled == Some(true) {
+                                BATCH_TOKEN_UNREAD_CHUNKED_ON_EXPECTED
+                            } else {
+                                BATCH_TOKEN_UNREAD_EXPECTED
+                            };
+                            assert!(text.contains(expected), "{case}: {text}");
+                            assert!(
+                                !text.contains("once prefill sharing is confirmed")
+                                    || chunked_prefill_enabled != Some(true),
+                                "{case}: chunked-on must not claim confirm sharing: {text}"
+                            );
                         }
                     } else {
                         match floor {
@@ -2187,6 +2229,16 @@ mod tests {
                                 assert!(prescription_numbers(&text).is_empty(), "{case}: {text}");
                                 assert!(text.contains(BATCH_TOKEN_DIRECTIONS), "{case}");
                                 assert!(text.contains(BATCH_TOKEN_BOOT_REJECT_SUBLINE), "{case}");
+                                if chunked_prefill_enabled != Some(false) {
+                                    assert!(
+                                        text.contains(BATCH_TOKEN_FLOOR_ABOVE_DEFAULT_EXPECTED),
+                                        "{case}: floor-above Expected must match Fix (no Set): {text}"
+                                    );
+                                    assert!(
+                                        !text.contains(BATCH_TOKEN_SET_EXPECTED),
+                                        "{case}: must not promise Set outcome: {text}"
+                                    );
+                                }
                             }
                             Some(784) => {
                                 assert!(
@@ -2461,7 +2513,8 @@ mod tests {
         ));
         assert!(text.contains(BATCH_TOKEN_DIRECTIONS));
         assert!(text.contains(BATCH_TOKEN_BOOT_REJECT_SUBLINE));
-        assert!(text.contains(BATCH_TOKEN_SET_EXPECTED));
+        assert!(text.contains(BATCH_TOKEN_FLOOR_ABOVE_DEFAULT_EXPECTED));
+        assert!(!text.contains(BATCH_TOKEN_SET_EXPECTED));
         assert!(!text.contains("Set --max-num-batched-tokens to 2048 (default)"));
         assert!(!text.contains("Set --max-num-batched-tokens to 2496"));
         assert!(prescription_numbers(&text).is_empty());

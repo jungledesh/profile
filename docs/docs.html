@@ -245,6 +245,7 @@ ECONOMICS:
     <h3>Loop behavior</h3>
     <ul>
       <li><strong>Same-primary reveal.</strong> When the same primary fires again, Profile lists the rules it suppressed under that block. No flat-delta gate: re-fire alone is enough, whether or not you applied a fix in between.</li>
+      <li><strong>Prefill unread re-fire exit.</strong> When Prefill is primary twice in a row and both Fix blocks include the unread <code>--max-num-batched-tokens</code> guide (common when vLLM never emits the gauge), the second table still prints, then the loop exits: no new server lever to apply. First unread show stays open (Confirm + guide). Bound Severe/compute-wall terminals are unchanged.</li>
       <li><strong>Empty-fix reveal.</strong> When the primary has no lever left (fix list empty or exhausted), Profile shows the suppressed alternatives under that same block immediately, without waiting for a second fire.</li>
       <li><strong>Dead-end.</strong> When no config lever remains, Profile names the wall (replica, or the physics boundary), points at scale-out, and surfaces what it was holding.</li>
       <li><strong>Oscillation escape.</strong> When R2 (KV pressure) and R5 (concurrency saturation) alternate on <code>--max-num-seqs</code>, Profile names the bracket tried and suggests the midpoint. It offers this at most three times, then names the wall.</li>

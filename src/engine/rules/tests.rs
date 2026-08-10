@@ -3092,6 +3092,82 @@ fn soft_field_r1_primary_demotes_r6_to_suppressed_recs() {
     );
     // Soft demotion must not mark R1 terminal, and must not exit via R6 wall.
     assert!(!report.recommendations[0].terminal);
+    assert!(
+        report
+            .suppressed_recs
+            .iter()
+            .filter(|r| r.rule_name == rule_names::PREFILL_BOUND)
+            .all(|r| !r.terminal),
+        "soft field clears Prefill terminal so FLOPs cannot exit"
+    );
+}
+
+#[test]
+fn soft_field_without_r1_injects_underfed_and_clears_prefill_terminal() {
+    // Soft (running ≪ ridge) but R1 occupancy gate fails: seats tiny so
+    // occupancy looks "full." Soft inject still names under-fed with R1 Fix.
+    // Severe Prefill must not terminal-exit.
+    let windows: Vec<_> = (0..10)
+        .map(|_| {
+            let mut w = mk_r6_prefill_window(25.0, 10.0, 5.0, Some(80.0));
+            w.snapshot.vllm.max_num_seqs = Some(6);
+            w.snapshot.vllm.kv_cache_usage_perc = Some(20.0);
+            w.snapshot.vllm.cache_config.enable_chunked_prefill = Some(true);
+            w
+        })
+        .collect();
+    let mut ctx = mk_llama8b_h100_ctx(&windows[0].snapshot);
+    ctx.config.max_num_seqs = Some(6);
+    ctx.config.enable_chunked_prefill = Some(true);
+    let summary = ai(&ctx, windows.last().expect("windows"));
+    let report = build_report_for_windows(&windows, summary);
+    assert!(
+        report
+            .limiter_evidence
+            .as_ref()
+            .is_some_and(crate::engine::limiter::soft_field),
+        "fixture must classify soft field"
+    );
+    assert!(
+        !report.recommendations.is_empty()
+            || report
+                .suppressed_recs
+                .iter()
+                .any(|r| r.rule_name == rule_names::UNDER_BATCHING),
+        "soft inject or R1 must surface under-fed"
+    );
+    let primary = report.recommendations.first().expect("primary");
+    assert_eq!(primary.rule_name, rule_names::UNDER_BATCHING);
+    assert!(!primary.terminal);
+    let text = primary.display_lines.join("\n");
+    assert!(
+        text.contains("Hardware capacity under-fed by client."),
+        "Cause required: {text}"
+    );
+    assert!(
+        text.contains("Running ") && text.contains(" vs ridge "),
+        "soft numbers in Cause: {text}"
+    );
+    assert!(
+        !text.to_lowercase().contains("soft field"),
+        "no soft-field jargon: {text}"
+    );
+    assert!(
+        !text.contains("R1 fire gates"),
+        "no inject provenance Note: {text}"
+    );
+    assert!(
+        text.contains("Batch more requests or increase client concurrency"),
+        "R1 Fix body required: {text}"
+    );
+    // If Prefill fired into suppressed, it must not be terminal under soft.
+    assert!(
+        report
+            .suppressed_recs
+            .iter()
+            .filter(|r| r.rule_name == rule_names::PREFILL_BOUND)
+            .all(|r| !r.terminal)
+    );
 }
 
 #[test]
@@ -4130,7 +4206,9 @@ fn r6_primary_fix_guides_when_batched_tokens_unread() {
         "{text}"
     );
     assert!(!text.contains("Set --max-num-batched-tokens to 2048"));
-    assert!(text.contains("Steadier decode once prefill sharing is confirmed."));
+    assert!(text.contains(
+        "Steadier decode once --max-num-batched-tokens is set; chunked prefill is already on."
+    ));
 }
 
 #[test]

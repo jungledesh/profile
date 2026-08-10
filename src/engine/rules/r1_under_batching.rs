@@ -391,6 +391,95 @@ pub(super) fn format_under_batching_window_issue(
     )
 }
 
+/// Soft field, R1 gates did not fire: still surface under-fed.
+/// Reuses R1 Fix/Expected; Requests/Cause use soft (scoreboard) numbers.
+/// Does not call R1 fire gates or change R1 thresholds.
+pub(super) fn soft_underfed_recommendation(
+    snapshot: &RawSnapshot,
+    config_max_num_seqs: Option<u32>,
+    ridge_batch_size: Option<f64>,
+    baseline: Option<&crate::engine::baseline::PhysicsBaseline>,
+    max_model_len: Option<u32>,
+    derived_kv_max_seqs: Option<u32>,
+    soft: Option<&crate::engine::limiter::LimiterEvidence>,
+) -> Option<super::Recommendation> {
+    let max_n = snapshot
+        .vllm
+        .max_num_seqs
+        .or(config_max_num_seqs)
+        .filter(|&n| n > 0)?;
+    // Prefer soft/limiter courtroom (duration-weighted active means).
+    let running = soft.and_then(|e| e.mean_running).or_else(|| {
+        snapshot
+            .vllm
+            .num_requests_running
+            .filter(|v| v.is_finite() && *v >= 0.0)
+    })?;
+    let waiting = soft
+        .and_then(|e| e.mean_waiting)
+        .or_else(|| snapshot.vllm.num_requests_waiting.filter(|v| v.is_finite()))
+        .unwrap_or(0.0);
+    let kv = soft
+        .and_then(|e| e.kv_cache_mean_perc)
+        .or_else(|| snapshot.vllm.kv_cache_usage_perc.filter(|v| v.is_finite()));
+    let ridge_batch_size = soft.and_then(|e| e.ridge_batch_size).or(ridge_batch_size);
+    let (effective_max, binding_wall) =
+        super::effective_max_and_binder(max_n, ridge_batch_size, usable_kv_concurrency(snapshot));
+    let known_gpu = baseline.is_some_and(|b| b.config_relative_efficiency_pct.is_some());
+    let confidence = 0.5; // Soft inject: Medium/Low; R1 gates did not pass.
+    let fmt = R1FormatCtx::from_snapshot(
+        snapshot,
+        max_model_len,
+        super::kv_full_context_cap_for_r1(snapshot, derived_kv_max_seqs),
+    );
+    let idle = (effective_max - running).max(0.0);
+    let fix_lines = r1_fix_lines(idle, running, binding_wall, &fmt);
+    let confidence_str = super::confidence_label(confidence);
+    let ridge_s = ridge_batch_size
+        .filter(|r| r.is_finite() && *r > 0.0)
+        .map(|r| format!("~{r:.0}"))
+        .unwrap_or_else(|| "-".to_string());
+    let kv_s = kv
+        .map(|v| format!("{v:.0}%"))
+        .unwrap_or_else(|| "-".to_string());
+
+    let mut lines = vec![
+        "[!] Under-batching: Insufficient Concurrency".to_string(),
+        String::new(),
+        format!(
+            "    Requests (run avg)   {running:.0} running, {waiting:.0} waiting  (max: {max_n})"
+        ),
+        String::new(),
+        "    Cause:".to_string(),
+        format!(
+            "      Hardware capacity under-fed by client. Running {running:.0} vs ridge {ridge_s}, wait {waiting:.0}, KV {kv_s}."
+        ),
+        String::new(),
+        "    Fix:".to_string(),
+    ];
+    lines.extend(fix_lines);
+    lines.push(String::new());
+    lines.push(
+        "    Expected: Higher throughput. TPOT stable until the GPU is fully fed, then it starts to rise."
+            .to_string(),
+    );
+    lines.push(format!("    Confidence: {confidence_str}"));
+    if !known_gpu {
+        lines.push(
+            "    Note: GPU not in catalog. Diagnosis based on occupancy only (low confidence)."
+                .to_string(),
+        );
+    }
+    Some(super::Recommendation {
+        rule_name: super::rule_names::UNDER_BATCHING,
+        layer: 4,
+        impact: 4,
+        confidence,
+        display_lines: lines,
+        terminal: false,
+    })
+}
+
 pub(super) fn aggregate_r1_detail(details: &[UnderBatchingDetail]) -> UnderBatchingDetail {
     debug_assert!(
         !details.is_empty(),
