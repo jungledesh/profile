@@ -12,7 +12,8 @@ pub struct CatalogEntry {
     pub family: &'static str,
     /// Total parameter count.
     pub param_count: u64,
-    /// Active parameter count for MoE models; None for dense.
+    /// Active parameter count for MoE (experts on path) or multimodal LM-only
+    /// decode (e.g. Muse text stack). None for dense LM-only models.
     pub active_param_count: Option<u64>,
     pub num_layers: u32,
     pub hidden_dim: u32,
@@ -169,6 +170,31 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: Some(128),
             num_kv_layers: None,
             attn_flops_coeff: None,
+        },
+    },
+    // ── Muse Glimmer ─────────────────────────────────────────────────────────
+    // Dense multimodal (text + perception encoder). Text stack: 52 layers,
+    // GQA 32/2, sliding_window=2048, layer_types 3×sliding + 1×full repeating
+    // → 39 SWA + 13 full. Card total ~29.6B includes ~1.8B ViT; decode streams
+    // the text stack only, so active_param_count is LM-only (~27.8B) for the
+    // roof while param_count keeps the full footprint for weight/OOM.
+    // Source: https://huggingface.co/meta-models/Muse-Glimmer-30B/raw/main/config.json
+    // (text_config; accessed 2026-08-10). ViT ~1.8B from model card.
+    ModelEntry {
+        tokens: &["muse", "glimmer", "30b"],
+        entry: catalog_dense! {
+            family: "muse_glimmer",
+            param_count: 29_600_000_000,
+            active_param_count: Some(27_800_000_000),
+            num_layers: 52,
+            hidden_dim: 6656,
+            default_weight_dtype: "bf16",
+            num_kv_heads: Some(2),
+            head_dim: Some(128),
+            num_kv_layers: None,
+            attn_flops_coeff: None,
+            swa_window: 2048,
+            num_swa_layers: 39,
         },
     },
     // ── Llama 3.x ────────────────────────────────────────────────────────────
@@ -917,7 +943,7 @@ mod tests {
 
     #[test]
     fn launch_catalog_has_expected_entry_count() {
-        assert_eq!(CATALOG.len(), 37);
+        assert_eq!(CATALOG.len(), 38);
     }
 
     #[test]
@@ -1051,6 +1077,26 @@ mod tests {
         let e = lookup_model("google/gemma-4-26B-A4B-it").expect("no match");
         assert_eq!(e.param_count, 25_200_000_000);
         assert_eq!(e.active_param_count, Some(3_800_000_000));
+    }
+
+    #[test]
+    fn muse_glimmer_30b_from_hf_config() {
+        // Source: meta-models/Muse-Glimmer-30B text_config (2026-08-10).
+        let e = lookup_model("meta-models/Muse-Glimmer-30B").expect("no match");
+        assert_eq!(e.family, "muse_glimmer");
+        assert_eq!(e.param_count, 29_600_000_000);
+        assert_eq!(e.active_param_count, Some(27_800_000_000)); // LM-only; ViT out of decode roof
+        assert_eq!(e.num_layers, 52);
+        assert_eq!(e.hidden_dim, 6656);
+        assert_eq!(e.num_kv_heads, Some(2));
+        assert_eq!(e.head_dim, Some(128));
+        assert_eq!(e.swa_window, Some(2048));
+        assert_eq!(e.num_swa_layers, Some(39)); // 3/4 of 52 (layer_types 3×SWA + 1×full)
+        assert_eq!(e.default_weight_dtype, "bf16");
+        // SWA + full layers must price; full_layers = 52 - 39 = 13.
+        assert!(bytes_per_seq(&model_arch(e), 8192, 2).is_some());
+        assert!(lookup_model("Muse-Glimmer-30B-GGUF").is_some());
+        assert!(lookup_model("somevendor/muse-only-99B").is_none()); // needs all three tokens
     }
 
     #[test]

@@ -25,22 +25,23 @@
 #   PHASE_SPREAD=600   seconds across which worker start phases are evenly spread
 #   TIMEOUT_JITTER=90  per-task timeout ± seconds when STABLE=1
 #   SWARM_HOME=/workspace/swarm   scratch area (clones, checkouts, venvs, log)
-#   PROFILE_MODEL=gemma|qwen      which served model the swarm targets (default: qwen,
-#                                 matches Dockerfile nvidia CMD / start.sh)
-#   MODEL_ALIAS=...               grok alias (default: gemma-local or qwen-local)
+#   PROFILE_MODEL=muse|gemma|qwen  served model the swarm targets (default: muse,
+#                                  matches Dockerfile nvidia CMD / start-muse.sh)
+#   MODEL_ALIAS=...               grok alias (default: muse-local / gemma-local / qwen-local)
 #   SERVED_NAME=...               vLLM --served-model-name override
 #
 # Profile demo (steady traffic, no cohort ramp):
 #   STABLE=1 AGENTS=16 TASK_TIMEOUT=600 DURATION=0 ./agent-swarm.sh run
 #   Wait ~2 min after launch for phase spread to fill, then run profile diagnose.
+# On RTX 5090 start with AGENTS=1, then raise concurrency.
 #
-# Switch to Gemma (must match start-gemma.sh). After ./start-gemma.sh in this shell,
-# PROFILE_MODEL and SERVED_NAME are already exported; a fresh shell needs:
-#   PROFILE_MODEL=gemma ./agent-swarm.sh run
+# Switch model (must match the start-*.sh that launched vLLM). After that
+# launcher runs, PROFILE_MODEL and SERVED_NAME are already exported; a fresh
+# shell needs e.g. PROFILE_MODEL=gemma ./agent-swarm.sh run
 #
 # Requires: vLLM on localhost:8000 serving the PROFILE_MODEL target
-# (start.sh or start-gemma.sh); jq; git. Gemma needs tool-call flags
-# (start-gemma.sh enables them by default).
+# (start-muse.sh / start.sh / start-gemma.sh); jq; git. Tool-call flags come
+# from the matching start script.
 #
 # Smoke gate (non-negotiable, from the plan): on the pod, run ONE agent on ONE
 # instance end to end before AGENTS=16:
@@ -57,9 +58,15 @@ STABLE="${STABLE:-1}"
 PHASE_SPREAD="${PHASE_SPREAD:-$TASK_TIMEOUT}"
 TIMEOUT_JITTER="${TIMEOUT_JITTER:-90}"
 SWARM_HOME="${SWARM_HOME:-/workspace/swarm}"
-PROFILE_MODEL="${PROFILE_MODEL:-qwen}"
+PROFILE_MODEL="${PROFILE_MODEL:-muse}"
 
 case "$PROFILE_MODEL" in
+    muse|muse_glimmer|glimmer)
+        PROFILE_MODEL=muse
+        SERVED_MODEL_NAME="${SERVED_NAME:-muse-glimmer-30b}"
+        MODEL_ALIAS="${MODEL_ALIAS:-muse-local}"
+        MODEL_DISPLAY="Muse Glimmer 30B (vLLM)"
+        ;;
     gemma)
         SERVED_MODEL_NAME="${SERVED_NAME:-gemma-4-26b-a4b}"
         MODEL_ALIAS="${MODEL_ALIAS:-gemma-local}"
@@ -71,7 +78,7 @@ case "$PROFILE_MODEL" in
         MODEL_DISPLAY="Qwen3.6-27B (vLLM)"
         ;;
     *)
-        echo "PROFILE_MODEL must be gemma or qwen (got: $PROFILE_MODEL)" >&2
+        echo "PROFILE_MODEL must be muse, gemma, or qwen (got: $PROFILE_MODEL)" >&2
         exit 1
         ;;
 esac

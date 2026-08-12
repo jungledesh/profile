@@ -623,6 +623,15 @@ pub(crate) fn evaluate_seat_wall_cooccurred(
     Some(hit)
 }
 
+/// Intra-window mean of finite running scrapes (same samples as peak).
+fn mean_of_scrape_gauges(sum: f64, n: usize) -> Option<f64> {
+    if n == 0 {
+        return None;
+    }
+    let mean = sum / n as f64;
+    mean.is_finite().then_some(mean)
+}
+
 pub fn collect_vllm_metrics_for(
     input: &str,
     window: Duration,
@@ -640,6 +649,8 @@ pub fn collect_vllm_metrics_for(
     let mut last_scrape: Option<Scrape> = None;
     let mut kv_cache_peak_perc: Option<f64> = None;
     let mut num_requests_running_peak: Option<f64> = None;
+    let mut num_requests_running_sum = 0.0_f64;
+    let mut num_requests_running_n = 0usize;
     let mut num_requests_waiting_peak: Option<f64> = None;
     let mut seat_wall_samples: Vec<SeatWallSample> = Vec::with_capacity(sample_count);
 
@@ -652,6 +663,8 @@ pub fn collect_vllm_metrics_for(
         let run = first_gauge(&scrape, "vllm_num_requests_running").filter(|x| x.is_finite());
         if let Some(r) = run {
             num_requests_running_peak = Some(num_requests_running_peak.map_or(r, |p| p.max(r)));
+            num_requests_running_sum += r;
+            num_requests_running_n = num_requests_running_n.saturating_add(1);
         }
         let wait = first_gauge(&scrape, "vllm_num_requests_waiting").filter(|x| x.is_finite());
         if let Some(w) = wait {
@@ -689,6 +702,8 @@ pub fn collect_vllm_metrics_for(
     let mut m = parse_vllm_metrics(&last_scrape)?;
     m.kv_cache_peak_perc = kv_cache_peak_perc;
     m.num_requests_running_peak = num_requests_running_peak;
+    m.num_requests_running_mean =
+        mean_of_scrape_gauges(num_requests_running_sum, num_requests_running_n);
     m.num_requests_waiting_peak = num_requests_waiting_peak;
 
     let rates = compute_counter_rates(&first_scrape, &last_scrape, window_secs);
@@ -837,6 +852,7 @@ fn parse_vllm_metrics(scrape: &Scrape) -> Result<VllmRawMetrics> {
     Ok(VllmRawMetrics {
         model_name,
         num_requests_running,
+        num_requests_running_mean: None,
         num_requests_running_peak: None,
         num_requests_waiting,
         num_requests_waiting_peak: None,
@@ -1088,6 +1104,14 @@ vllm_max_num_seqs 256
         let m_early = parse_vllm_metrics(&early).unwrap();
         assert!((m_early.num_requests_running.unwrap() - 2.0).abs() < 1e-9);
         assert!((m_early.num_requests_waiting.unwrap() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mean_of_scrape_gauges_averages_finite_samples() {
+        assert_eq!(mean_of_scrape_gauges(0.0, 0), None);
+        assert!((mean_of_scrape_gauges(10.0, 1).unwrap() - 10.0).abs() < 1e-9);
+        // Drain path: scrapes 10,10,10,1 → mean 7.75 (not landing 1).
+        assert!((mean_of_scrape_gauges(31.0, 4).unwrap() - 7.75).abs() < 1e-9);
     }
 
     #[test]

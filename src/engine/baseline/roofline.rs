@@ -1,8 +1,58 @@
 use crate::collectors::config::DEFAULT_GPU_MEMORY_UTILIZATION;
 use crate::collectors::effective_tensor_parallel;
+use crate::collectors::{window_is_evaluable, window_is_idle};
 use crate::context::{AnalysisInput, gpu_prices};
 
 use super::math::{self, KvCacheDtypeSource};
+
+/// Body of the speculation-guard message (no `Note:` prefix).
+const SPEC_GUARD_BODY: &str = "Throughput above the decode ceiling (speculative decoding likely). Efficiency % does not apply.";
+
+/// Scoreboard line: `Note:` prefix (side note above metrics).
+pub const SPEC_GUARD_WARNING_LINE: &str = "Note: Throughput above the decode ceiling (speculative decoding likely). Efficiency % does not apply.";
+
+/// Limiter / healthy-exit decline: same fact, no `Note:` (stands alone under Rules clear).
+pub const SPEC_GUARD_LIMITER_LINE: &str = SPEC_GUARD_BODY;
+/// Which detector proved decode beat the one-token-per-read ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpecDetector {
+    /// Mean TPOT faster than `1000 / decode.upper`.
+    Tpot,
+    /// Generation tok/s per concurrent request above `decode.upper`.
+    /// Denom: intra-window mean running, else peak; never last-scrape landing.
+    PerStream,
+    /// Total generation tok/s above `decode.upper * ridge`.
+    Absolute,
+}
+
+impl SpecDetector {
+    fn preference_rank(self) -> u8 {
+        match self {
+            Self::Tpot => 0,
+            Self::PerStream => 1,
+            Self::Absolute => 2,
+        }
+    }
+}
+
+/// Evidence that measured decode beat the one-token-per-read ceiling.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpecEvidence {
+    pub detector: SpecDetector,
+    /// ms for [`SpecDetector::Tpot`], tok/s otherwise.
+    pub measured: f64,
+    /// Same unit as `measured`.
+    pub bound: f64,
+}
+
+/// Prefer D1 (TPOT) over D2 (per-stream) over D3 (absolute).
+pub(crate) fn stronger_spec_evidence(a: SpecEvidence, b: SpecEvidence) -> SpecEvidence {
+    if a.detector.preference_rank() <= b.detector.preference_rank() {
+        a
+    } else {
+        b
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CostEstimate {
@@ -70,6 +120,12 @@ pub struct PhysicsBaseline {
     /// Efficiency relative to max_num_seqs config ceiling (not ridge). None when GPU unknown or inputs missing.
     pub config_relative_efficiency_pct: Option<f64>,
     pub cost: Option<CostEstimate>,
+    /// Evidence that measured decode beat the one-token-per-read ceiling.
+    /// None: guard did not fire. Some: which detector, measured value, bound it beat.
+    pub spec_suspected: Option<SpecEvidence>,
+    /// When run-level speculation OR is set: `(flagged, active_total)` windows
+    /// for the verbose coverage line. Per-window compute leaves this None.
+    pub spec_window_counts: Option<(usize, usize)>,
 }
 
 /// Lower/upper band around roofline ceiling `expected` (conservative / optimistic).
@@ -138,42 +194,61 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
     });
 
     let ceiling = decode.expected;
+    let snap = &input.window.snapshot;
+
+    // Speculation guard: measured decode faster than one token per weight-read
+    // allows. Any detector clears efficiency claims (Humble). Compare to the
+    // UPPER ceiling band only; no extra margin (margining a measurement fabricates).
+    let spec_suspected = detect_speculation(snap, &decode, ridge_batch_size);
 
     // Fraction of the absolute hardware ceiling in use. Denominator is ceiling × ridge_batch_size
     // (the compute ceiling), independent of current traffic. An idle server reads low, correctly.
-    let efficiency_pct = input
-        .window
-        .snapshot
-        .vllm
-        .generation_tokens_per_sec
-        .filter(|v| v.is_finite() && *v > 0.0)
-        .map(|actual| {
-            let absolute_ceiling = ceiling * ridge_batch_size;
-            let pct = math::efficiency_pct(actual, absolute_ceiling);
-            pct.min(100.0) // clamp: actual cannot exceed compute ceiling in practice
-        })
-        .filter(|pct| pct.is_finite());
+    let (efficiency_pct, config_relative_efficiency_pct, headroom_pct) = if spec_suspected.is_some()
+    {
+        (None, None, None)
+    } else {
+        let efficiency_pct = snap
+            .vllm
+            .generation_tokens_per_sec
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .map(|actual| {
+                let absolute_ceiling = ceiling * ridge_batch_size;
+                let pct = math::efficiency_pct(actual, absolute_ceiling);
+                // Above expected×ridge but at or below upper×ridge: inside the
+                // estimate band. Clamp to 100. Above upper×ridge, D3 already
+                // flagged and this branch is not taken.
+                if pct.is_finite() && pct > 100.0 {
+                    100.0
+                } else {
+                    pct
+                }
+            })
+            .filter(|pct| pct.is_finite());
 
-    let config_relative_efficiency_pct = input
-        .window
-        .snapshot
-        .vllm
-        .generation_tokens_per_sec
-        .filter(|v| v.is_finite() && *v > 0.0)
-        .and_then(|actual| {
-            let max_seqs = ctx.config.max_num_seqs?;
-            Some(
-                math::config_relative_efficiency_pct(actual, ceiling, max_seqs, ridge_batch_size)
+        let config_relative_efficiency_pct = snap
+            .vllm
+            .generation_tokens_per_sec
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .and_then(|actual| {
+                let max_seqs = ctx.config.max_num_seqs?;
+                Some(
+                    math::config_relative_efficiency_pct(
+                        actual,
+                        ceiling,
+                        max_seqs,
+                        ridge_batch_size,
+                    )
                     .min(100.0),
-            )
-        })
-        .filter(|pct| pct.is_finite());
+                )
+            })
+            .filter(|pct| pct.is_finite());
 
-    let headroom_pct = efficiency_pct.map(|raw| 100.0 - raw.min(100.0));
+        let headroom_pct = efficiency_pct.map(|raw| 100.0 - raw.min(100.0));
+        (efficiency_pct, config_relative_efficiency_pct, headroom_pct)
+    };
 
     let weight_gb = math::weight_gb(weight_params, bits_per_param);
     let weight_bytes_per_param = (bits_per_param / 8).max(1);
-    let snap = &input.window.snapshot;
     let kv_dtype = math::effective_kv_cache_dtype(
         snap.vllm.cache_config.cache_dtype.as_deref(),
         ctx.config.kv_cache_dtype.as_deref(),
@@ -243,7 +318,108 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
         ridge_batch_size,
         config_relative_efficiency_pct,
         cost,
+        spec_suspected,
+        spec_window_counts: None,
     })
+}
+
+/// Detectors D1–D3 against `decode.upper`. Idle / non-evaluable: no flag.
+/// Missing input skips that detector only.
+fn detect_speculation(
+    snap: &crate::collectors::RawSnapshot,
+    decode: &CeilingEstimate,
+    ridge_batch_size: f64,
+) -> Option<SpecEvidence> {
+    if !window_is_evaluable(snap) || window_is_idle(snap) {
+        return None;
+    }
+    let upper = decode.upper;
+    if !(upper.is_finite() && upper > 0.0) {
+        return None;
+    }
+
+    let mut best: Option<SpecEvidence> = None;
+
+    if let Some(tpot) = snap.vllm.tpot_ms.filter(|v| v.is_finite() && *v > 0.0) {
+        let floor_ms = 1000.0 / upper;
+        if floor_ms.is_finite() && floor_ms > 0.0 && tpot < floor_ms {
+            let ev = SpecEvidence {
+                detector: SpecDetector::Tpot,
+                measured: tpot,
+                bound: floor_ms,
+            };
+            best = Some(best.map_or(ev, |b| stronger_spec_evidence(b, ev)));
+        }
+    }
+
+    let tps = snap
+        .vllm
+        .generation_tokens_per_sec
+        .filter(|v| v.is_finite() && *v > 0.0);
+    // D2: window-rate tok/s over window-average concurrency (averaged ÷ averaged).
+    // Landing (last scrape) is the wrong pair: a mid-window drain collapses the
+    // denom and false-fires ("speculation likely" with no drafter = a lie).
+    // Mean first; peak fallback when mean unread. Never landing.
+    if let (Some(tps), Some(running)) = (
+        tps,
+        snap.vllm
+            .num_requests_running_mean
+            .filter(|v| v.is_finite() && *v >= 1.0)
+            .or_else(|| {
+                snap.vllm
+                    .num_requests_running_peak
+                    .filter(|v| v.is_finite() && *v >= 1.0)
+            }),
+    ) {
+        let per = tps / running;
+        if per.is_finite() && per > upper {
+            let ev = SpecEvidence {
+                detector: SpecDetector::PerStream,
+                measured: per,
+                bound: upper,
+            };
+            best = Some(best.map_or(ev, |b| stronger_spec_evidence(b, ev)));
+        }
+    }
+
+    if let Some(tps) = tps {
+        let abs = upper * ridge_batch_size;
+        if abs.is_finite() && abs > 0.0 && tps > abs {
+            let ev = SpecEvidence {
+                detector: SpecDetector::Absolute,
+                measured: tps,
+                bound: abs,
+            };
+            best = Some(best.map_or(ev, |b| stronger_spec_evidence(b, ev)));
+        }
+    }
+
+    best
+}
+
+/// Apply run-level speculation OR onto the summary baseline.
+///
+/// One proven over-ceiling window poisons the run average, so OR is correct here.
+/// Opposite of the R5 seat-wall rule (summary does not OR that flag): that flag
+/// asserts a bottleneck; this one withdraws a claim. Withdrawing on any proof is
+/// Humble; asserting on any spike is not.
+pub(crate) fn apply_spec_run_or(
+    baseline: &mut Option<PhysicsBaseline>,
+    flagged: usize,
+    active_total: usize,
+    strongest: Option<SpecEvidence>,
+) {
+    if flagged == 0 {
+        return;
+    }
+    let Some(b) = baseline.as_mut() else {
+        return;
+    };
+    b.efficiency_pct = None;
+    b.config_relative_efficiency_pct = None;
+    b.headroom_pct = None;
+    b.spec_suspected = strongest.or(b.spec_suspected);
+    b.spec_window_counts = Some((flagged, active_total));
 }
 
 /// J/tok and tok/W from the energy-pair window set only.
@@ -403,6 +579,8 @@ fn dtype_to_bits(dtype: &str) -> Option<u8> {
 fn quantization_to_bits(scheme: &str) -> Option<u8> {
     match scheme.trim().to_ascii_lowercase().as_str() {
         "awq" | "awq_marlin" | "gptq" | "gptq_marlin" | "marlin" => Some(4),
+        // ModelOpt NVFP4 / FP4 (Muse Glimmer on Blackwell); /info may say modelopt.
+        "modelopt" | "modelopt_fp4" | "nvfp4" | "fp4" => Some(4),
         "int8" | "w8a8" | "fp8" => Some(8),
         _ => None,
     }
@@ -1650,7 +1828,7 @@ mod tests {
             ..Default::default()
         };
         let (ctx, win) = baseline_input(
-            Some(8_000_000_000),
+            Some(70_000_000_000),
             None,
             Some("bf16"),
             Some(67.0),
@@ -1660,6 +1838,35 @@ mod tests {
         );
         let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
         assert_eq!(b.weight_dtype_source, WeightDtypeSource::EnvVarQuantization);
+        assert!((b.weight_gb - 35.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn modelopt_nvfp4_env_quantization_prices_four_bit() {
+        let cfg = VllmConfig {
+            quantization: Some("modelopt".to_string()),
+            max_model_len: Some(2048),
+            ..Default::default()
+        };
+        let snap = VllmRawMetrics {
+            generation_tokens_per_sec: Some(50.0),
+            num_requests_running: Some(1.0),
+            ..Default::default()
+        };
+        let (ctx, win) = baseline_input(
+            Some(29_600_000_000),
+            None,
+            Some("bf16"),
+            Some(209.5),
+            Some(1792.0),
+            cfg,
+            snap,
+        );
+        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+        assert_eq!(b.weight_dtype_source, WeightDtypeSource::EnvVarQuantization);
+        assert!((b.weight_gb - 14.8).abs() < 1e-3);
+        let expected_decode = math::decode_ceiling_tps(1792.0, 29_600_000_000, 4);
+        assert!((b.decode.expected - expected_decode).abs() < 1e-6);
     }
 
     #[test]
@@ -1836,5 +2043,337 @@ mod tests {
         let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
         let expected = math::prefill_ops_per_sec(67.0, 8_000_000_000, 1024, 0, 0);
         assert!((b.prefill.expect("prefill").expected - expected).abs() < 1e-6);
+    }
+
+    fn active_snap(tps: Option<f64>, running: Option<f64>, tpot_ms: Option<f64>) -> VllmRawMetrics {
+        let run = running.or(Some(4.0));
+        VllmRawMetrics {
+            window_duration_secs: Some(2.0),
+            num_requests_running: run,
+            // Steady fixtures: mean = peak = landing. Drain cases set fields apart.
+            num_requests_running_mean: run,
+            num_requests_running_peak: run,
+            generation_tokens_per_sec: tps.or(Some(100.0)),
+            tpot_ms,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn spec_guard_below_ceiling_no_flag_efficiency_present() {
+        let (ctx, win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(312.0),
+            Some(2039.0),
+            VllmConfig {
+                max_num_seqs: Some(32),
+                ..Default::default()
+            },
+            active_snap(Some(100.0), Some(4.0), Some(50.0)),
+        );
+        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+        assert!(b.spec_suspected.is_none());
+        assert!(b.efficiency_pct.is_some());
+        assert!(b.headroom_pct.is_some());
+    }
+
+    #[test]
+    fn spec_guard_d1_tpot_clears_efficiency() {
+        let (ctx, win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(312.0),
+            Some(2039.0),
+            VllmConfig::default(),
+            active_snap(Some(100.0), Some(4.0), Some(0.01)),
+        );
+        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+        let ev = b.spec_suspected.expect("flag");
+        assert_eq!(ev.detector, SpecDetector::Tpot);
+        assert!(b.efficiency_pct.is_none());
+        assert!(b.config_relative_efficiency_pct.is_none());
+        assert!(b.headroom_pct.is_none());
+    }
+
+    #[test]
+    fn spec_guard_d2_per_stream_clears_efficiency() {
+        let (ctx, win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(312.0),
+            Some(2039.0),
+            VllmConfig::default(),
+            // Slow TPOT so D1 does not fire; per-stream rate above decode.upper.
+            active_snap(Some(50_000.0), Some(1.0), Some(100.0)),
+        );
+        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+        let ev = b.spec_suspected.expect("flag");
+        assert_eq!(ev.detector, SpecDetector::PerStream);
+        assert!(b.efficiency_pct.is_none());
+    }
+
+    #[test]
+    fn spec_guard_d3_absolute_clears_efficiency() {
+        let (ctx, win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(312.0),
+            Some(2039.0),
+            VllmConfig::default(),
+            active_snap(None, Some(4.0), Some(50.0)),
+        );
+        let probe = compute(&AnalysisInput::new(&ctx, &win)).expect("probe");
+        let abs = probe.decode.upper * probe.ridge_batch_size * 1.1;
+        // Keep per-stream under upper so D2 does not win preference over D3.
+        let running = (abs / probe.decode.upper).ceil() + 10.0;
+        let (ctx, win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(312.0),
+            Some(2039.0),
+            VllmConfig::default(),
+            active_snap(Some(abs), Some(running), Some(100.0)),
+        );
+        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+        let ev = b.spec_suspected.expect("flag");
+        assert_eq!(ev.detector, SpecDetector::Absolute);
+        assert!(b.efficiency_pct.is_none());
+    }
+
+    #[test]
+    fn spec_guard_inside_estimate_band_clamps_no_flag() {
+        let (ctx, win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(312.0),
+            Some(2039.0),
+            VllmConfig {
+                max_num_seqs: Some(256),
+                ..Default::default()
+            },
+            active_snap(None, Some(4.0), Some(50.0)),
+        );
+        let probe = compute(&AnalysisInput::new(&ctx, &win)).expect("probe");
+        // Just below upper×ridge so D3 does not fire; above expected×ridge → raw > 100.
+        let target = probe.decode.expected * probe.ridge_batch_size * 1.02;
+        assert!(target <= probe.decode.upper * probe.ridge_batch_size);
+        // High concurrency: per-stream stays under upper (D2 silent). Slow TPOT (D1 silent).
+        let running = (target / probe.decode.upper).ceil() + 10.0;
+        let (ctx, win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(312.0),
+            Some(2039.0),
+            VllmConfig {
+                max_num_seqs: Some(256),
+                ..Default::default()
+            },
+            active_snap(Some(target), Some(running), Some(50.0)),
+        );
+        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+        assert!(b.spec_suspected.is_none(), "inside band must not flag");
+        assert_eq!(b.efficiency_pct, Some(100.0));
+    }
+
+    #[test]
+    fn spec_guard_unknown_gpu_no_baseline() {
+        let (ctx, win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            None,
+            None,
+            VllmConfig::default(),
+            active_snap(Some(1_000_000.0), Some(1.0), Some(0.01)),
+        );
+        assert!(compute(&AnalysisInput::new(&ctx, &win)).is_none());
+    }
+
+    #[test]
+    fn spec_guard_idle_window_no_flag() {
+        let (ctx, win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(312.0),
+            Some(2039.0),
+            VllmConfig::default(),
+            VllmRawMetrics {
+                window_duration_secs: Some(2.0),
+                num_requests_running: Some(0.0),
+                generation_tokens_per_sec: Some(0.0),
+                tpot_ms: Some(0.01),
+                ..Default::default()
+            },
+        );
+        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+        assert!(b.spec_suspected.is_none());
+    }
+
+    #[test]
+    fn spec_guard_missing_tpot_still_evaluates_d2() {
+        let (ctx, win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(312.0),
+            Some(2039.0),
+            VllmConfig::default(),
+            active_snap(Some(50_000.0), Some(1.0), None),
+        );
+        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+        let ev = b.spec_suspected.expect("flag");
+        assert_eq!(ev.detector, SpecDetector::PerStream);
+    }
+
+    #[test]
+    fn spec_guard_d2_uses_mean_running_not_drained_landing() {
+        // Drain: landing=1, mean stays honest for the window. tok/s ÷ landing would
+        // false-fire; ÷ mean must not.
+        let (ctx, win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(312.0),
+            Some(2039.0),
+            VllmConfig::default(),
+            active_snap(None, Some(1.0), Some(100.0)),
+        );
+        let probe = compute(&AnalysisInput::new(&ctx, &win)).expect("probe");
+        let upper = probe.decode.upper;
+        let mean = 40.0;
+        let tps = upper * 10.0;
+        assert!(tps / 1.0 > upper);
+        assert!(tps / mean <= upper);
+
+        let mut snap = active_snap(Some(tps), Some(1.0), Some(100.0));
+        snap.num_requests_running = Some(1.0);
+        snap.num_requests_running_mean = Some(mean);
+        snap.num_requests_running_peak = Some(80.0);
+        let (ctx, win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(312.0),
+            Some(2039.0),
+            VllmConfig {
+                max_num_seqs: Some(256),
+                ..Default::default()
+            },
+            snap,
+        );
+        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+        assert!(
+            b.spec_suspected.is_none(),
+            "mean denom must block drain false-fire"
+        );
+        assert!(b.efficiency_pct.is_some());
+    }
+
+    #[test]
+    fn spec_guard_d2_falls_back_to_peak_when_mean_unread() {
+        let mut snap = active_snap(Some(50_000.0), Some(1.0), Some(100.0));
+        snap.num_requests_running_mean = None;
+        snap.num_requests_running_peak = Some(1.0);
+        snap.num_requests_running = Some(1.0);
+        let (ctx, win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(312.0),
+            Some(2039.0),
+            VllmConfig::default(),
+            snap,
+        );
+        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+        let ev = b.spec_suspected.expect("peak fallback");
+        assert_eq!(ev.detector, SpecDetector::PerStream);
+    }
+
+    #[test]
+    fn spec_guard_d2_never_uses_landing_alone() {
+        // Landing would fire; mean and peak unread → D2 silent (D3 may still fire).
+        let (ctx, win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(312.0),
+            Some(2039.0),
+            VllmConfig::default(),
+            active_snap(None, Some(1.0), Some(100.0)),
+        );
+        let probe = compute(&AnalysisInput::new(&ctx, &win)).expect("probe");
+        let upper = probe.decode.upper;
+        // Keep absolute under the ridge product so only D2 could have fired via landing.
+        let tps = upper * 2.0;
+        assert!(tps / 1.0 > upper);
+        assert!(tps < upper * probe.ridge_batch_size);
+
+        let mut snap = active_snap(Some(tps), Some(1.0), Some(100.0));
+        snap.num_requests_running = Some(1.0);
+        snap.num_requests_running_mean = None;
+        snap.num_requests_running_peak = None;
+        let (ctx, win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(312.0),
+            Some(2039.0),
+            VllmConfig {
+                max_num_seqs: Some(256),
+                ..Default::default()
+            },
+            snap,
+        );
+        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+        assert!(
+            b.spec_suspected
+                .as_ref()
+                .is_none_or(|e| e.detector != SpecDetector::PerStream),
+            "landing-only must not trip D2: {:?}",
+            b.spec_suspected
+        );
+        assert!(
+            b.spec_suspected.is_none(),
+            "fixture must stay under D3 as well: {:?}",
+            b.spec_suspected
+        );
+        assert!(b.efficiency_pct.is_some());
+    }
+
+    #[test]
+    fn apply_spec_run_or_poisons_summary_efficiency() {
+        let (ctx, win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(312.0),
+            Some(2039.0),
+            VllmConfig {
+                max_num_seqs: Some(32),
+                ..Default::default()
+            },
+            active_snap(Some(100.0), Some(4.0), Some(50.0)),
+        );
+        let mut baseline = compute(&AnalysisInput::new(&ctx, &win));
+        assert!(baseline.as_ref().unwrap().efficiency_pct.is_some());
+        let ev = SpecEvidence {
+            detector: SpecDetector::Tpot,
+            measured: 1.0,
+            bound: 10.0,
+        };
+        apply_spec_run_or(&mut baseline, 3, 12, Some(ev));
+        let b = baseline.expect("baseline");
+        assert!(b.efficiency_pct.is_none());
+        assert_eq!(b.spec_suspected, Some(ev));
+        assert_eq!(b.spec_window_counts, Some((3, 12)));
     }
 }

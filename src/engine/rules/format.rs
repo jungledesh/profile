@@ -652,6 +652,20 @@ fn not_triggered_from_fired_names(
     rules
 }
 
+/// Quiet no-issues path: scoreboard already printed [`SPEC_GUARD_WARNING_LINE`]
+/// when speculation is flagged. Skip the duplicate here. Healthy exit still uses
+/// [`crate::engine::limiter::limiter_line`] directly.
+fn limiter_line_for_quiet_report(ev: &crate::engine::limiter::LimiterEvidence) -> Option<String> {
+    let line = crate::engine::limiter::limiter_line(ev)?;
+    if matches!(
+        crate::engine::limiter::identify(ev).verdict,
+        Some(crate::engine::limiter::LimiterVerdict::SpecSuspected)
+    ) {
+        return None;
+    }
+    Some(line)
+}
+
 pub fn format_diagnose_rules_for_windows(
     windows: &[RuntimeWindow],
     summary: AnalysisInput<'_>,
@@ -720,7 +734,7 @@ pub fn format_diagnose_rules_for_windows(
         if !any_advisory {
             out.push(NO_ISSUES_LINE.to_string());
             if let Some(ev) = report.limiter_evidence.as_ref()
-                && let Some(line) = crate::engine::limiter::limiter_line(ev)
+                && let Some(line) = limiter_line_for_quiet_report(ev)
             {
                 out.push(line);
             }
@@ -1326,6 +1340,66 @@ mod stuck_fix_reveal_tests {
             reveal,
         )
         .join("\n")
+    }
+
+    #[test]
+    fn limiter_line_for_quiet_report_skips_spec_suspected() {
+        use crate::engine::limiter::{LimiterEvidence, SPEC_GUARD_LIMITER_LINE};
+        let mut e = LimiterEvidence {
+            kv_cache_mean_perc: Some(20.0),
+            kv_cache_peak_perc: Some(20.0),
+            mean_running: Some(50.0),
+            mean_waiting: Some(0.0),
+            ridge_batch_size: Some(100.0),
+            mean_tpot_ms: Some(50.0),
+            tpot_floor_ms: Some(10.0),
+            effective_prompt_decode_ratio: Some(0.2),
+            chunked_prefill_enabled: Some(false),
+            headroom_pct: Some(50.0),
+            n_eval: ENGINE_MIN_PERSISTENT_WINDOWS,
+            ceiling_unknown_reason: None,
+            spec_suspected: true,
+        };
+        assert!(super::limiter_line_for_quiet_report(&e).is_none());
+        assert_eq!(
+            crate::engine::limiter::limiter_line(&e).as_deref(),
+            Some(SPEC_GUARD_LIMITER_LINE),
+            "healthy exit / raw limiter_line still emits the decline line"
+        );
+        e.spec_suspected = false;
+        e.headroom_pct = Some(2.0);
+        let line = super::limiter_line_for_quiet_report(&e).expect("physics line");
+        assert!(line.contains("Capped by hardware"));
+    }
+
+    #[test]
+    fn rules_fired_path_does_not_print_spec_note_in_rules_block() {
+        use crate::engine::limiter::{LimiterEvidence, SPEC_GUARD_WARNING_LINE};
+        let mut report = report_with(
+            rec(rule_names::KV_CACHE_PRESSURE, 5, 0.9, "KV Cache Pressure"),
+            vec![],
+        );
+        report.limiter_evidence = Some(LimiterEvidence {
+            kv_cache_mean_perc: Some(20.0),
+            kv_cache_peak_perc: Some(20.0),
+            mean_running: Some(50.0),
+            mean_waiting: Some(0.0),
+            ridge_batch_size: Some(100.0),
+            mean_tpot_ms: Some(50.0),
+            tpot_floor_ms: Some(10.0),
+            effective_prompt_decode_ratio: Some(0.2),
+            chunked_prefill_enabled: Some(false),
+            headroom_pct: Some(50.0),
+            n_eval: ENGINE_MIN_PERSISTENT_WINDOWS,
+            ceiling_unknown_reason: None,
+            spec_suspected: true,
+        });
+        let text = render(&report, false);
+        assert!(text.contains("KV Cache Pressure"));
+        assert!(
+            !text.contains(SPEC_GUARD_WARNING_LINE),
+            "rules block never owned the note; scoreboard does: {text}"
+        );
     }
 
     #[test]

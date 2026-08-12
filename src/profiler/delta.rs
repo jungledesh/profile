@@ -186,6 +186,8 @@ mod tests {
                 ridge_batch_size: 1.0,
                 config_relative_efficiency_pct: None,
                 cost,
+                spec_suspected: None,
+                spec_window_counts: None,
             }),
             recommendations: Vec::new(),
             suppressed_rules: Vec::new(),
@@ -264,6 +266,40 @@ mod tests {
         );
         assert_eq!(d.joules_per_token_before, Some(0.31));
         assert_eq!(d.joules_per_token_after, Some(0.28));
+    }
+
+    #[test]
+    fn efficiency_delta_withdrawn_when_after_iteration_suspects_speculation() {
+        // Prior iteration had a real %. Spec OR cleared after. No invented pp delta.
+        let d = compute(
+            &diagnose(Some(100.0)),
+            &report_eff(Some(40.0), None, None),
+            &diagnose(Some(500.0)),
+            &report_eff(None, None, None),
+            false,
+            false,
+            false,
+        );
+        assert_eq!(d.efficiency_pct_before, Some(40.0));
+        assert_eq!(d.efficiency_pct_after, None);
+        assert!(
+            d.efficiency_delta_pp.is_none(),
+            "cannot subtract against a withdrawn efficiency claim"
+        );
+    }
+
+    #[test]
+    fn efficiency_delta_withdrawn_when_before_iteration_had_no_efficiency() {
+        let d = compute(
+            &diagnose(Some(500.0)),
+            &report_eff(None, None, None),
+            &diagnose(Some(100.0)),
+            &report_eff(Some(40.0), None, None),
+            false,
+            false,
+            false,
+        );
+        assert!(d.efficiency_delta_pp.is_none());
     }
 
     #[test]

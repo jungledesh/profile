@@ -90,6 +90,7 @@ WORKDIR ${APP_DIR}
 COPY --chown=appuser:appuser scripts/load.sh ./load.sh
 COPY --chown=appuser:appuser scripts/start.sh ./start.sh
 COPY --chown=appuser:appuser scripts/start-gemma.sh ./start-gemma.sh
+COPY --chown=appuser:appuser scripts/start-muse.sh ./start-muse.sh
 COPY --chown=appuser:appuser scripts/tool_chat_template_gemma4.jinja ./tool_chat_template_gemma4.jinja
 COPY --chown=appuser:appuser scripts/agent-swarm.sh ./agent-swarm.sh
 # Swarm task list: agent-swarm.sh reads swarm-tasks.json next to itself.
@@ -99,16 +100,17 @@ COPY --chown=appuser:appuser scripts/fetch-swarm-tasks.py ./fetch-swarm-tasks.py
 COPY --chown=appuser:appuser scripts/support-load.py ./support-load.py
 COPY --from=profile-builder --chown=appuser:appuser /build/target/release/profile ./profile
 
-RUN chmod 0755 ./load.sh ./start.sh ./start-gemma.sh ./agent-swarm.sh ./support-load.py ./profile
+RUN chmod 0755 ./load.sh ./start.sh ./start-gemma.sh ./start-muse.sh ./agent-swarm.sh ./support-load.py ./profile
 
 USER appuser
 
-# Default NVIDIA stack is Qwen (CMD / start.sh) + agent-swarm load.
+# Default NVIDIA stack is Muse Glimmer NVFP4 (CMD / start-muse.sh) for RTX 5090.
+# Same pattern as Qwen/Gemma: pip vLLM in start-*.sh, download weights, serve.
 # Do not bake SERVED_NAME: each launcher exports PROFILE_MODEL + SERVED_NAME.
-# Gemma on NVIDIA: ./start-gemma.sh
-ENV PROFILE_MODEL=qwen
+# Qwen: ./start.sh   Gemma: ./start-gemma.sh
+ENV PROFILE_MODEL=muse
 
-CMD ["bash", "-lc", "/home/appuser/app/start.sh"]
+CMD ["bash", "-lc", "/home/appuser/app/start-muse.sh"]
 
 # AMD runtime: official vLLM ROCm image (includes ROCm + Python 3.12 + vLLM + PyTorch).
 # Build: docker build --target amd -t profile:amd .

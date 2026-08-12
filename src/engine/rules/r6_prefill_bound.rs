@@ -642,12 +642,13 @@ pub(super) fn format_prefill_bound_window_issue(
     d: &PrefillBoundDetail,
     seen_pct: u32,
 ) -> Vec<String> {
-    format_prefill_bound_window_issue_with_terminal(d, seen_pct).0
+    format_prefill_bound_window_issue_with_terminal(d, seen_pct, true).0
 }
 
 pub(super) fn format_prefill_bound_window_issue_with_terminal(
     d: &PrefillBoundDetail,
     seen_pct: u32,
+    decode_efficiency_applies: bool,
 ) -> (Vec<String>, bool) {
     let sev = severity(d.prompt_gen_ratio);
     let conf = if d.tpot_unverified {
@@ -668,6 +669,12 @@ pub(super) fn format_prefill_bound_window_issue_with_terminal(
         "inf".to_string()
     };
 
+    let decode_eff_value = if decode_efficiency_applies && d.decode_efficiency_pct.is_finite() {
+        format!("{:.1}%", d.decode_efficiency_pct)
+    } else {
+        "-".to_string()
+    };
+
     let mut lines = vec![
         format!(
             "[!] {}: {}",
@@ -684,9 +691,8 @@ pub(super) fn format_prefill_bound_window_issue_with_terminal(
             &format!("{ratio_display}  prompt tok/s vs gen tok/s"),
         ),
         format!(
-            "    {:<width$}(avg when prefill-bound)   {:.1}%  of HW ceiling",
+            "    {:<width$}(avg when prefill-bound)   {decode_eff_value}  of HW ceiling",
             "Decode eff.",
-            d.decode_efficiency_pct,
             width = R6_METRIC_LABEL_W
         ),
     ];
@@ -1310,7 +1316,7 @@ mod tests {
             max_num_batched_tokens: None,
             chunk_floor: None,
         };
-        let (lines, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100);
+        let (lines, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100, true);
         let text = lines.join("\n");
         assert!(text.contains("Route long-context requests"));
         assert!(!text.contains("Enable --enable-chunked-prefill"));
@@ -1427,7 +1433,7 @@ mod tests {
             max_num_batched_tokens: None,
             chunk_floor: None,
         };
-        let (lines, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100);
+        let (lines, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100, true);
         let text = lines.join("\n");
         assert!(
             text.contains(CONFIRM_CHUNKED_BULLET.trim_start()),
@@ -1602,7 +1608,7 @@ mod tests {
         d.prompt_tokens_mean = Some(2048.0);
         assert!(skewed_mode(&d));
         assert!(on_compute_wall(&d));
-        let (lines, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100);
+        let (lines, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100, true);
         let text = lines.join("\n");
         assert!(
             text.contains("High Prompt Processing Time"),
@@ -2030,7 +2036,7 @@ mod tests {
     fn severe_chunked_off_trails_enable_not_set_budget() {
         let mut d = wall_path_base(Some(2048), Some(1638.4), Some(true), 22.0);
         d.chunked_prefill_enabled = Some(false);
-        let (lines, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100);
+        let (lines, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100, true);
         let text = lines.join("\n");
         assert!(text.contains("Prefill FLOPs dominate this mix"));
         let wall = text.find("Prefill FLOPs dominate").expect("wall");
@@ -2330,7 +2336,7 @@ mod tests {
     fn default_set_when_current_at_page_floor() {
         // Was TerminalAtFloor; launch path still offers default above floor.
         let d = hybrid_align_floor_detail(Some(HYBRID_ALIGN_FLOOR_EXAMPLE));
-        let (lines, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100);
+        let (lines, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100, true);
         let text = lines.join("\n");
         assert!(!terminal, "default Set is a knob: {text}");
         assert!(text.contains(&format!(
@@ -2345,7 +2351,7 @@ mod tests {
     fn chunked_off_with_floor_enable_then_default_set() {
         let mut d = hybrid_align_floor_detail(Some(HYBRID_ALIGN_FLOOR_EXAMPLE));
         d.chunked_prefill_enabled = Some(false);
-        let (lines, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100);
+        let (lines, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100, true);
         let text = lines.join("\n");
         assert!(!terminal, "Enable is a knob: {text}");
         assert!(text.contains("Enable chunked prefill (--enable-chunked-prefill)."));
@@ -2367,7 +2373,7 @@ mod tests {
     fn chunked_unknown_with_floor_confirm_then_default_set_non_terminal() {
         let mut d = hybrid_align_floor_detail(Some(HYBRID_ALIGN_FLOOR_EXAMPLE));
         d.chunked_prefill_enabled = None;
-        let (lines, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100);
+        let (lines, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100, true);
         let text = lines.join("\n");
         assert!(!terminal, "Confirm + default Set keeps loop open: {text}");
         assert!(text.contains(CONFIRM_CHUNKED_BULLET.trim_start()));
@@ -2389,7 +2395,7 @@ mod tests {
         let mut d = wall_path_base(Some(2048), Some(1638.4), Some(true), 12.0);
         d.chunked_prefill_enabled = None;
         assert!(on_compute_wall(&d));
-        let (lines, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100);
+        let (lines, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100, true);
         let text = lines.join("\n");
         assert!(!terminal, "Confirm keeps loop open: {text}");
         assert!(text.contains(CONFIRM_CHUNKED_BULLET.trim_start()));
@@ -2610,7 +2616,7 @@ mod tests {
     #[test]
     fn terminal_flag_true_on_compute_wall_with_verify() {
         let d = wall_path_base(Some(2048), Some(1638.4), Some(true), 12.0);
-        let (text, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100);
+        let (text, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100, true);
         let text = text.join("\n");
         assert!(terminal);
         assert!(text.contains(R6_TERMINAL_VERIFY.trim_start()));
@@ -2618,9 +2624,33 @@ mod tests {
     }
 
     #[test]
+    fn decode_efficiency_shows_dash_when_withdrawn_under_spec() {
+        let d = wall_path_base(Some(2048), Some(1638.4), Some(true), 12.0);
+        let (with_pct, _) = format_prefill_bound_window_issue_with_terminal(&d, 100, true);
+        let with_pct = with_pct.join("\n");
+        assert!(
+            with_pct.contains("of HW ceiling") && with_pct.contains('%'),
+            "{with_pct}"
+        );
+
+        let (withdrawn, _) = format_prefill_bound_window_issue_with_terminal(&d, 100, false);
+        let withdrawn = withdrawn.join("\n");
+        assert!(
+            withdrawn.contains("Decode eff.") && withdrawn.contains("-  of HW ceiling"),
+            "spec OR must not print a contradicting decode %: {withdrawn}"
+        );
+        assert!(
+            !withdrawn
+                .lines()
+                .any(|l| l.contains("Decode eff.") && l.contains('%')),
+            "{withdrawn}"
+        );
+    }
+
+    #[test]
     fn terminal_flag_true_on_severe_flops_wall() {
         let d = wall_path_base(Some(8192), Some(1638.4), Some(true), 25.0);
-        let (text, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100);
+        let (text, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100, true);
         let text = text.join("\n");
         assert!(terminal);
         assert!(text.contains("Prefill FLOPs dominate this mix"));
@@ -2639,7 +2669,7 @@ mod tests {
         // Mild/moderate + chunked off: Enable path (budget may already match), not severe wall.
         let mut d = wall_path_base(Some(2048), Some(1638.4), Some(true), 12.0);
         d.chunked_prefill_enabled = Some(false);
-        let (text, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100);
+        let (text, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100, true);
         let text = text.join("\n");
         assert!(!terminal);
         assert!(text.contains("Enable chunked prefill"));
@@ -2650,7 +2680,7 @@ mod tests {
     #[test]
     fn terminal_flag_false_on_budget_knob_path() {
         let d = wall_path_base(Some(1024), Some(1638.4), Some(true), 12.0);
-        let (text, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100);
+        let (text, terminal) = format_prefill_bound_window_issue_with_terminal(&d, 100, true);
         assert!(!terminal);
         assert!(!text.join("\n").contains("Verify prefix caching"));
     }

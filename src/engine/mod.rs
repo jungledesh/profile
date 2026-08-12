@@ -6,6 +6,7 @@ use crate::context::{AnalysisInput, RuntimeWindow};
 
 pub use baseline::{
     CeilingEstimate, CostEstimate, CostSource, KvCacheDtypeSource, PhysicsBaseline,
+    SPEC_GUARD_LIMITER_LINE, SPEC_GUARD_WARNING_LINE, SpecDetector, SpecEvidence,
     WeightDtypeSource, baseline_missing_reason, catalog_model_weight_gb,
 };
 pub use rules::*;

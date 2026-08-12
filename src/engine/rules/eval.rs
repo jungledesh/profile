@@ -82,6 +82,10 @@ struct WindowRuleEval {
     count_tpot_ms: usize,
     sum_effective_ratio: f64,
     count_effective_ratio: usize,
+    /// Speculation OR: windows that beat the one-token-per-read roof.
+    spec_flagged: usize,
+    /// Strongest evidence across flagged windows (D1 > D2 > D3).
+    spec_strongest: Option<crate::engine::baseline::SpecEvidence>,
 }
 
 impl WindowRuleEval {
@@ -157,7 +161,6 @@ pub(crate) fn aggregate_prefix_hit_rate_for_windows(windows: &[RuntimeWindow]) -
 fn eval_window_rules(
     windows: &[RuntimeWindow],
     summary: &AnalysisInput<'_>,
-    summary_efficiency_pct: Option<f64>,
 ) -> Option<WindowRuleEval> {
     if windows.is_empty() {
         return None;
@@ -197,6 +200,8 @@ fn eval_window_rules(
         count_tpot_ms: 0,
         sum_effective_ratio: 0.0,
         count_effective_ratio: 0,
+        spec_flagged: 0,
+        spec_strongest: None,
     };
 
     for w in windows {
@@ -310,6 +315,13 @@ fn eval_window_rules(
         // Per-window baseline: shared by R1 and R6.
         let win_input = AnalysisInput::new(summary.ctx, w);
         let win_baseline = baseline::compute(&win_input);
+        if let Some(ev) = win_baseline.as_ref().and_then(|b| b.spec_suspected) {
+            eval.spec_flagged += 1;
+            eval.spec_strongest = Some(match eval.spec_strongest {
+                Some(prev) => baseline::stronger_spec_evidence(prev, ev),
+                None => ev,
+            });
+        }
 
         let r6_outcome = r6_evaluate(PrefillBoundEvalInput {
             prompt_tokens_per_sec: snap.vllm.prompt_tokens_per_sec,
@@ -337,7 +349,10 @@ fn eval_window_rules(
         match rule1_under_batching_with_efficiency(R1EvalInput {
             snapshot: snap,
             config_max_num_seqs: summary.ctx.config.max_num_seqs,
-            efficiency_pct: summary_efficiency_pct,
+            // Per-window efficiency only. Summary average is not applied until
+            // after run-level speculation OR; stuffing it here leaked a pre-OR
+            // % into every R1 detail (Transparent: scoreboard `-` vs R1 Some).
+            efficiency_pct: win_baseline.as_ref().and_then(|b| b.efficiency_pct),
             config_relative_efficiency_pct: win_baseline
                 .as_ref()
                 .and_then(|b| b.config_relative_efficiency_pct),
@@ -418,7 +433,22 @@ fn eval_window_rules(
 
     eval.skipped_broken = skipped_broken;
     eval.skipped_idle = skipped_idle;
+    // Run-level speculation OR withdraws efficiency on the scoreboard. Align R1
+    // pockets with that withdrawal so mixed runs cannot retain a stale %.
+    scrub_r1_efficiency_under_spec(&mut eval.r1_details, eval.spec_flagged);
     Some(eval)
+}
+
+/// When any active window flags speculation, null R1 `efficiency_pct` evidence.
+/// Fire gates already ran on per-window `config_relative` / occupancy; this only
+/// keeps stored evidence honest after the run-level OR.
+fn scrub_r1_efficiency_under_spec(details: &mut [UnderBatchingDetail], spec_flagged: usize) {
+    if spec_flagged == 0 {
+        return;
+    }
+    for d in details {
+        d.efficiency_pct = None;
+    }
 }
 
 // session_hit_rate: all-evaluable-windows average hit rate for display in r3 recommendation body.
@@ -428,8 +458,17 @@ fn build_report_from_eval(
     eval: &WindowRuleEval,
     summary: AnalysisInput<'_>,
     session_hit_rate: Option<f64>,
-    baseline: Option<baseline::PhysicsBaseline>,
+    mut baseline: Option<baseline::PhysicsBaseline>,
 ) -> Report {
+    // Run-level speculation OR (see apply_spec_run_or). Must run before
+    // limiter_evidence / MU read efficiency or headroom.
+    baseline::apply_spec_run_or(
+        &mut baseline,
+        eval.spec_flagged,
+        eval.n_eval,
+        eval.spec_strongest,
+    );
+
     let summary_snap = &summary.window.snapshot;
     let tp = effective_tensor_parallel(
         summary.ctx.config.tensor_parallel_size,
@@ -526,6 +565,9 @@ fn build_report_from_eval(
         ceiling_unknown_reason: baseline
             .is_none()
             .then(|| baseline::baseline_missing_reason(summary.ctx)),
+        spec_suspected: baseline
+            .as_ref()
+            .is_some_and(|b| b.spec_suspected.is_some()),
     });
 
     let mut recs: Vec<Recommendation> = Vec::new();
@@ -733,8 +775,12 @@ fn build_report_from_eval(
             r6_confidence(sev)
         };
         let imp = r6_impact(sev);
-        let (display_lines, terminal) =
-            format_prefill_bound_window_issue_with_terminal(&d, pct(eval.r6_fired, eval.n_eval));
+        let (display_lines, terminal) = format_prefill_bound_window_issue_with_terminal(
+            &d,
+            pct(eval.r6_fired, eval.n_eval),
+            // Spec OR withdrew HW efficiency claims; do not print a contradicting %.
+            baseline.as_ref().is_none_or(|b| b.spec_suspected.is_none()),
+        );
         recs.push(Recommendation {
             rule_name: rule_names::PREFILL_BOUND,
             layer: 5,
@@ -935,8 +981,7 @@ fn finalize_report_groups(
 /// Multi-window rule evaluation, same significance gates as `format_diagnose_rules_for_windows`.
 pub fn build_report_for_windows(windows: &[RuntimeWindow], summary: AnalysisInput<'_>) -> Report {
     let baseline = baseline::compute(&summary);
-    let summary_efficiency_pct = baseline.as_ref().and_then(|b| b.efficiency_pct);
-    let Some(eval) = eval_window_rules(windows, &summary, summary_efficiency_pct) else {
+    let Some(eval) = eval_window_rules(windows, &summary) else {
         return Report {
             baseline,
             recommendations: Vec::new(),
@@ -1001,6 +1046,8 @@ mod tests {
             ridge_batch_size: 1.0,
             config_relative_efficiency_pct: None,
             cost: None,
+            spec_suspected: None,
+            spec_window_counts: None,
         }
     }
 
@@ -1072,5 +1119,230 @@ mod tests {
         )));
         assert!(oom_weights_alone_overflow(Some(-4.0)));
         assert!(!oom_weights_alone_overflow(None));
+    }
+
+    #[test]
+    fn scrub_r1_efficiency_nulls_only_when_spec_flagged() {
+        let detail = |eff: Option<f64>| UnderBatchingDetail {
+            running: 5.0,
+            waiting: 0.0,
+            max_num_seqs: Some(256),
+            effective_max: 256.0,
+            binding_wall: crate::engine::rules::BindingWall::Config,
+            occupancy_pct: 2.0,
+            efficiency_pct: eff,
+            config_relative_efficiency_pct: Some(15.0),
+            known_gpu: true,
+        };
+        let mut kept = [detail(Some(12.0))];
+        scrub_r1_efficiency_under_spec(&mut kept, 0);
+        assert_eq!(kept[0].efficiency_pct, Some(12.0));
+
+        let mut cleared = [detail(Some(12.0)), detail(Some(8.0))];
+        scrub_r1_efficiency_under_spec(&mut cleared, 1);
+        assert!(cleared.iter().all(|d| d.efficiency_pct.is_none()));
+        assert!(
+            cleared
+                .iter()
+                .all(|d| d.config_relative_efficiency_pct == Some(15.0)),
+            "scrub must not touch fire-gate config_relative"
+        );
+    }
+
+    #[test]
+    fn r1_efficiency_scrubbed_when_any_active_window_speculates() {
+        use crate::collectors::{GpuRawMetrics, RawSnapshot, VllmConfig, VllmRawMetrics};
+        use crate::context::{RuntimeWindow, StaticContext};
+        use std::time::SystemTime;
+
+        fn win(running: f64, tps: f64, tpot_ms: Option<f64>) -> RuntimeWindow {
+            let t = SystemTime::UNIX_EPOCH;
+            let v = VllmRawMetrics {
+                model_name: Some("meta-llama/Llama-3.1-8B-Instruct".to_string()),
+                num_requests_running: Some(running),
+                num_requests_waiting: Some(0.0),
+                max_num_seqs: Some(256),
+                kv_cache_usage_perc: Some(10.0),
+                generation_tokens_per_sec: Some(tps),
+                tpot_ms,
+                window_duration_secs: Some(2.0),
+                ..Default::default()
+            };
+            let g = GpuRawMetrics {
+                gpu_name: Some("NVIDIA H100 80GB HBM3".to_string()),
+                gpu_util_pct: Some(40.0),
+                vram_used_mb: Some(20 * 1024),
+                vram_total_mb: Some(80 * 1024),
+                ..Default::default()
+            };
+            RuntimeWindow::from_snapshot(RawSnapshot {
+                gpu_observed_at: t,
+                vllm_observed_at: t,
+                timestamp: t,
+                vllm: v,
+                gpus: vec![g],
+                host_memory: None,
+            })
+        }
+
+        // Eleven under-fed windows with ordinary TPOT (efficiency present),
+        // one over-ceiling TPOT window (spec flag). Summary average can still
+        // look "fine"; R1 pockets must not keep pre-OR efficiency.
+        let mut windows: Vec<_> = (0..11).map(|_| win(5.0, 80.0, Some(50.0))).collect();
+        windows.push(win(5.0, 80.0, Some(0.01)));
+
+        let cfg = VllmConfig {
+            dtype: Some("bf16".to_string()),
+            max_model_len: Some(8192),
+            max_num_seqs: Some(256),
+            ..Default::default()
+        };
+        let ctx = StaticContext::from_snapshot(&windows[0].snapshot, cfg);
+        let summary = AnalysisInput::new(&ctx, &windows[0]);
+        let eval = eval_window_rules(&windows, &summary).expect("eval");
+        assert!(
+            eval.spec_flagged >= 1,
+            "expected at least one speculation flag"
+        );
+        assert!(
+            !eval.r1_details.is_empty(),
+            "expected R1 fires so efficiency pockets exist to scrub"
+        );
+        assert!(
+            eval.r1_details.iter().all(|d| d.efficiency_pct.is_none()),
+            "run-level spec OR must null every R1 efficiency_pct"
+        );
+
+        let report = build_report_from_eval(&eval, summary, None, baseline::compute(&summary));
+        assert!(
+            report
+                .baseline
+                .as_ref()
+                .is_some_and(|b| b.spec_suspected.is_some() && b.efficiency_pct.is_none()),
+            "scoreboard baseline must clear efficiency under OR"
+        );
+    }
+
+    #[test]
+    fn r1_efficiency_kept_when_no_window_speculates() {
+        use crate::collectors::{GpuRawMetrics, RawSnapshot, VllmConfig, VllmRawMetrics};
+        use crate::context::{RuntimeWindow, StaticContext};
+        use std::time::SystemTime;
+
+        let t = SystemTime::UNIX_EPOCH;
+        let v = VllmRawMetrics {
+            model_name: Some("meta-llama/Llama-3.1-8B-Instruct".to_string()),
+            num_requests_running: Some(5.0),
+            num_requests_waiting: Some(0.0),
+            max_num_seqs: Some(256),
+            kv_cache_usage_perc: Some(10.0),
+            generation_tokens_per_sec: Some(80.0),
+            tpot_ms: Some(50.0),
+            window_duration_secs: Some(2.0),
+            ..Default::default()
+        };
+        let g = GpuRawMetrics {
+            gpu_name: Some("NVIDIA H100 80GB HBM3".to_string()),
+            gpu_util_pct: Some(40.0),
+            vram_used_mb: Some(20 * 1024),
+            vram_total_mb: Some(80 * 1024),
+            ..Default::default()
+        };
+        let windows: Vec<_> = (0..12)
+            .map(|_| {
+                RuntimeWindow::from_snapshot(RawSnapshot {
+                    gpu_observed_at: t,
+                    vllm_observed_at: t,
+                    timestamp: t,
+                    vllm: v.clone(),
+                    gpus: vec![g.clone()],
+                    host_memory: None,
+                })
+            })
+            .collect();
+        let cfg = VllmConfig {
+            dtype: Some("bf16".to_string()),
+            max_model_len: Some(8192),
+            max_num_seqs: Some(256),
+            ..Default::default()
+        };
+        let ctx = StaticContext::from_snapshot(&windows[0].snapshot, cfg);
+        let summary = AnalysisInput::new(&ctx, &windows[0]);
+        let eval = eval_window_rules(&windows, &summary).expect("eval");
+        assert_eq!(eval.spec_flagged, 0);
+        assert!(
+            eval.r1_details.iter().any(|d| d.efficiency_pct.is_some()),
+            "without speculation, per-window efficiency stays in R1 details"
+        );
+    }
+
+    #[test]
+    fn r1_still_fires_known_gpu_when_spec_flag_scrubs_efficiency() {
+        // Speculation clears absolute efficiency; R1 fire gates use config_relative
+        // / occupancy and must still degrade to a known-GPU under-batching call.
+        use crate::collectors::{GpuRawMetrics, RawSnapshot, VllmConfig, VllmRawMetrics};
+        use crate::context::{RuntimeWindow, StaticContext};
+        use std::time::SystemTime;
+
+        fn win(tpot_ms: f64) -> RuntimeWindow {
+            let t = SystemTime::UNIX_EPOCH;
+            RuntimeWindow::from_snapshot(RawSnapshot {
+                gpu_observed_at: t,
+                vllm_observed_at: t,
+                timestamp: t,
+                vllm: VllmRawMetrics {
+                    model_name: Some("meta-llama/Llama-3.1-8B-Instruct".to_string()),
+                    num_requests_running: Some(5.0),
+                    num_requests_waiting: Some(0.0),
+                    max_num_seqs: Some(256),
+                    kv_cache_usage_perc: Some(10.0),
+                    generation_tokens_per_sec: Some(80.0),
+                    tpot_ms: Some(tpot_ms),
+                    window_duration_secs: Some(2.0),
+                    ..Default::default()
+                },
+                gpus: vec![GpuRawMetrics {
+                    gpu_name: Some("NVIDIA H100 80GB HBM3".to_string()),
+                    gpu_util_pct: Some(40.0),
+                    vram_used_mb: Some(20 * 1024),
+                    vram_total_mb: Some(80 * 1024),
+                    ..Default::default()
+                }],
+                host_memory: None,
+            })
+        }
+
+        let mut windows: Vec<_> = (0..11).map(|_| win(50.0)).collect();
+        windows.push(win(0.01));
+        let cfg = VllmConfig {
+            dtype: Some("bf16".to_string()),
+            max_model_len: Some(8192),
+            max_num_seqs: Some(256),
+            ..Default::default()
+        };
+        let ctx = StaticContext::from_snapshot(&windows[0].snapshot, cfg);
+        let summary = AnalysisInput::new(&ctx, &windows[0]);
+        let report = build_report_for_windows(&windows, summary);
+        assert!(
+            report
+                .baseline
+                .as_ref()
+                .is_some_and(|b| b.spec_suspected.is_some() && b.efficiency_pct.is_none()),
+            "OR must clear scoreboard efficiency"
+        );
+        let r1 = report
+            .recommendations
+            .iter()
+            .find(|r| r.rule_name == rule_names::UNDER_BATCHING)
+            .expect("R1 must still fire under speculation");
+        let text = r1.display_lines.join("\n");
+        assert!(
+            !text.contains("GPU not in catalog"),
+            "config_relative still proves known GPU: {text}"
+        );
+        assert!(
+            !text.contains("% of ceiling") && !text.contains("decode_eff"),
+            "R1 must not print withdrawn efficiency: {text}"
+        );
     }
 }
