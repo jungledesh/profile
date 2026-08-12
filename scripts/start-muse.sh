@@ -11,8 +11,8 @@
 #   MODEL_REPO=RedHatAI/Muse-Glimmer-30B-FP8-block  # ~33 GB; tight on 32 GB
 #   MODEL_REPO=meta-models/Muse-Glimmer-30B         # BF16; needs ~>55 GB
 #
-# If stock vLLM rejects the Muse arch/parsers, bump VLLM_VERSION (same knob
-# as Qwen/Gemma). Do not swap the Docker base image.
+# If stock vLLM rejects the Muse arch/parsers, this script already installs from
+# the Muse support branch (VLLM_PIP_SPEC). Do not swap the Docker base image.
 #
 # OS packages installed in the Dockerfile; runs as appuser, no apt-get.
 
@@ -21,7 +21,10 @@ trap 'echo "FAILED at line $LINENO"' ERR
 
 PIP_VERSION="${PIP_VERSION:-26.0.1}"
 UV_VERSION="${UV_VERSION:-0.11.1}"
-VLLM_VERSION="${VLLM_VERSION:-0.25.1}"
+# Muse Glimmer is not in any PyPI wheel yet (PR vllm-project/vllm#51655 still open).
+# Same install path as Qwen/Gemma (uv pip into VENV_DIR); different package source.
+# Override with VLLM_PIP_SPEC=vllm==0.25.1 only for debugging non-Muse boots.
+VLLM_PIP_SPEC="${VLLM_PIP_SPEC:-git+https://github.com/xianbaoqian/vllm.git@tiezhen/new-model-support}"
 
 MODEL_REPO="${MODEL_REPO:-Inferact/Muse-Glimmer-30B-NVFP4-W4A4}"
 SERVED_NAME="${SERVED_NAME:-muse-glimmer-30b}"
@@ -49,7 +52,10 @@ source "$VENV_DIR/bin/activate"
 
 python -m pip install "pip==${PIP_VERSION}"
 python -m pip install "uv==${UV_VERSION}"
-uv pip install "vllm==${VLLM_VERSION}"
+# Precompiled kernels: avoid a full CUDA compile on the Muse git ref.
+export VLLM_USE_PRECOMPILED="${VLLM_USE_PRECOMPILED:-1}"
+echo "Installing vLLM from: ${VLLM_PIP_SPEC}"
+uv pip install "${VLLM_PIP_SPEC}"
 
 if [[ -n "${HF_TOKEN:-}" ]]; then
     export HF_TOKEN
