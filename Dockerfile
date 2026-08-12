@@ -24,24 +24,19 @@ COPY src ./src
 
 RUN touch src/main.rs && cargo build --release --locked
 
-# NVIDIA runtime: CUDA devel image + vLLM installed via pip at container start.
+# NVIDIA runtime: official Muse-capable vLLM image (Qwen / Gemma / Muse Glimmer).
 # Build: docker build --target nvidia -t profile:nvidia .
-FROM nvidia/cuda:12.9.0-devel-ubuntu22.04 AS nvidia
+# Muse parsers are not in stock vLLM 0.25.x; this tag carries day-0 Muse support.
+FROM vllm/vllm-openai:muse-glimmer-x86_64-cu129 AS nvidia
 
 ENV APP_DIR=/home/appuser/app
 ENV MODELS_DIR=/workspace/models
-ENV VENV_DIR=/home/appuser/vllm-env
-ENV PATH="${VENV_DIR}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-# noninteractive only for this layer so apt/debconf never prompts during build; omit from runtime ENV.
+# The vLLM image runs as root by default. Create appuser like the AMD stage.
+# noninteractive only for this layer so apt/debconf never prompts during build.
 RUN export DEBIAN_FRONTEND=noninteractive \
     && apt-get update && apt-get install -y --no-install-recommends \
     bash \
-    python3 \
-    python3-venv \
-    python3-pip \
-    python3-dev \
-    build-essential \
     curl \
     wget \
     git \
@@ -66,7 +61,7 @@ RUN export DEBIAN_FRONTEND=noninteractive \
     libasound2 \
     openssh-client \
     rsync \
-    && /usr/sbin/useradd -m -u 1000 -s /bin/bash appuser \
+    && (id -u appuser >/dev/null 2>&1 || /usr/sbin/useradd -m -u 1000 -s /bin/bash appuser) \
     && echo "appuser ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/appuser \
     && rm -rf /var/lib/apt/lists/*
 
@@ -81,7 +76,6 @@ RUN curl -fsSL https://github.com/charmbracelet/vhs/releases/download/v0.11.0/vh
     && find /tmp -name vhs -type f -exec mv {} /usr/local/bin/vhs \; \
     && chmod 0755 /usr/local/bin/vhs
 
-# Do not mkdir VENV_DIR: an empty dir breaks start.sh's "create venv if missing" check
 RUN mkdir -p "${APP_DIR}" "${MODELS_DIR}" /workspace && \
     chown -R appuser:appuser /home/appuser /workspace
 
@@ -90,6 +84,7 @@ WORKDIR ${APP_DIR}
 COPY --chown=appuser:appuser scripts/load.sh ./load.sh
 COPY --chown=appuser:appuser scripts/start.sh ./start.sh
 COPY --chown=appuser:appuser scripts/start-gemma.sh ./start-gemma.sh
+COPY --chown=appuser:appuser scripts/start-muse.sh ./start-muse.sh
 COPY --chown=appuser:appuser scripts/tool_chat_template_gemma4.jinja ./tool_chat_template_gemma4.jinja
 COPY --chown=appuser:appuser scripts/agent-swarm.sh ./agent-swarm.sh
 # Swarm task list: agent-swarm.sh reads swarm-tasks.json next to itself.
@@ -99,16 +94,18 @@ COPY --chown=appuser:appuser scripts/fetch-swarm-tasks.py ./fetch-swarm-tasks.py
 COPY --chown=appuser:appuser scripts/support-load.py ./support-load.py
 COPY --from=profile-builder --chown=appuser:appuser /build/target/release/profile ./profile
 
-RUN chmod 0755 ./load.sh ./start.sh ./start-gemma.sh ./agent-swarm.sh ./support-load.py ./profile
+RUN chmod 0755 ./load.sh ./start.sh ./start-gemma.sh ./start-muse.sh \
+    ./agent-swarm.sh ./support-load.py ./profile
 
 USER appuser
 
-# Default NVIDIA stack is Qwen (CMD / start.sh) + agent-swarm load.
+# Default NVIDIA stack is Muse Glimmer NVFP4 (CMD / start-muse.sh) for RTX 5090.
 # Do not bake SERVED_NAME: each launcher exports PROFILE_MODEL + SERVED_NAME.
-# Gemma on NVIDIA: ./start-gemma.sh
-ENV PROFILE_MODEL=qwen
+# Qwen: ./start.sh   Gemma: ./start-gemma.sh
+ENV PROFILE_MODEL=muse
 
-CMD ["bash", "-lc", "/home/appuser/app/start.sh"]
+ENTRYPOINT []
+CMD ["bash", "-lc", "/home/appuser/app/start-muse.sh"]
 
 # AMD runtime: official vLLM ROCm image (includes ROCm + Python 3.12 + vLLM + PyTorch).
 # Build: docker build --target amd -t profile:amd .

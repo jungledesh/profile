@@ -579,6 +579,8 @@ fn dtype_to_bits(dtype: &str) -> Option<u8> {
 fn quantization_to_bits(scheme: &str) -> Option<u8> {
     match scheme.trim().to_ascii_lowercase().as_str() {
         "awq" | "awq_marlin" | "gptq" | "gptq_marlin" | "marlin" => Some(4),
+        // ModelOpt NVFP4 / FP4 (Muse Glimmer on Blackwell); /info may say modelopt.
+        "modelopt" | "modelopt_fp4" | "nvfp4" | "fp4" => Some(4),
         "int8" | "w8a8" | "fp8" => Some(8),
         _ => None,
     }
@@ -1826,7 +1828,7 @@ mod tests {
             ..Default::default()
         };
         let (ctx, win) = baseline_input(
-            Some(8_000_000_000),
+            Some(70_000_000_000),
             None,
             Some("bf16"),
             Some(67.0),
@@ -1835,7 +1837,42 @@ mod tests {
             snap,
         );
         let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
-        assert_eq!(b.weight_dtype_source, WeightDtypeSource::EnvVarQuantization);
+        assert_eq!(
+            b.weight_dtype_source,
+            WeightDtypeSource::EnvVarQuantization
+        );
+        assert!((b.weight_gb - 35.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn modelopt_nvfp4_env_quantization_prices_four_bit() {
+        let cfg = VllmConfig {
+            quantization: Some("modelopt".to_string()),
+            max_model_len: Some(2048),
+            ..Default::default()
+        };
+        let snap = VllmRawMetrics {
+            generation_tokens_per_sec: Some(50.0),
+            num_requests_running: Some(1.0),
+            ..Default::default()
+        };
+        let (ctx, win) = baseline_input(
+            Some(29_600_000_000),
+            None,
+            Some("bf16"),
+            Some(209.5),
+            Some(1792.0),
+            cfg,
+            snap,
+        );
+        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+        assert_eq!(
+            b.weight_dtype_source,
+            WeightDtypeSource::EnvVarQuantization
+        );
+        assert!((b.weight_gb - 14.8).abs() < 1e-3);
+        let expected_decode = math::decode_ceiling_tps(1792.0, 29_600_000_000, 4);
+        assert!((b.decode.expected - expected_decode).abs() < 1e-6);
     }
 
     #[test]
