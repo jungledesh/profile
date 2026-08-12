@@ -24,21 +24,24 @@ COPY src ./src
 
 RUN touch src/main.rs && cargo build --release --locked
 
-# NVIDIA runtime: official Muse-capable vLLM image (Qwen / Gemma / Muse Glimmer).
+# NVIDIA runtime: CUDA devel image + vLLM installed via pip at container start.
 # Build: docker build --target nvidia -t profile:nvidia .
-# Muse parsers are not in stock vLLM 0.25.x; this tag carries day-0 Muse support.
-FROM vllm/vllm-openai:muse-glimmer-x86_64-cu129 AS nvidia
+FROM nvidia/cuda:12.9.0-devel-ubuntu22.04 AS nvidia
 
 ENV APP_DIR=/home/appuser/app
 ENV MODELS_DIR=/workspace/models
+ENV VENV_DIR=/home/appuser/vllm-env
+ENV PATH="${VENV_DIR}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-# The vLLM image runs as root by default. Create appuser like the AMD stage.
-# noninteractive only for this layer so apt/debconf never prompts during build.
-# Muse base may be Ubuntu 24.04: do not pin 22.04-only names (libasound2,
-# libatk1.0-0, … → t64). VHS browser libs are optional; install via fallback.
+# noninteractive only for this layer so apt/debconf never prompts during build; omit from runtime ENV.
 RUN export DEBIAN_FRONTEND=noninteractive \
     && apt-get update && apt-get install -y --no-install-recommends \
     bash \
+    python3 \
+    python3-venv \
+    python3-pip \
+    python3-dev \
+    build-essential \
     curl \
     wget \
     git \
@@ -49,36 +52,21 @@ RUN export DEBIAN_FRONTEND=noninteractive \
     vim \
     sudo \
     ca-certificates \
+    libnss3 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libdrm2 \
+    libxkbcommon0 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxrandr2 \
+    libgbm1 \
+    libasound2 \
     openssh-client \
     rsync \
-    && ( apt-get install -y --no-install-recommends \
-            libnss3 \
-            libatk1.0-0t64 \
-            libatk-bridge2.0-0t64 \
-            libcups2t64 \
-            libdrm2 \
-            libxkbcommon0 \
-            libxcomposite1 \
-            libxdamage1 \
-            libxfixes3 \
-            libxrandr2 \
-            libgbm1 \
-            libasound2t64 \
-        || apt-get install -y --no-install-recommends \
-            libnss3 \
-            libatk1.0-0 \
-            libatk-bridge2.0-0 \
-            libcups2 \
-            libdrm2 \
-            libxkbcommon0 \
-            libxcomposite1 \
-            libxdamage1 \
-            libxfixes3 \
-            libxrandr2 \
-            libgbm1 \
-            libasound2 \
-       ) \
-    && (id -u appuser >/dev/null 2>&1 || /usr/sbin/useradd -m -u 1000 -s /bin/bash appuser) \
+    && /usr/sbin/useradd -m -u 1000 -s /bin/bash appuser \
     && echo "appuser ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/appuser \
     && rm -rf /var/lib/apt/lists/*
 
@@ -93,6 +81,7 @@ RUN curl -fsSL https://github.com/charmbracelet/vhs/releases/download/v0.11.0/vh
     && find /tmp -name vhs -type f -exec mv {} /usr/local/bin/vhs \; \
     && chmod 0755 /usr/local/bin/vhs
 
+# Do not mkdir VENV_DIR: an empty dir breaks start.sh's "create venv if missing" check
 RUN mkdir -p "${APP_DIR}" "${MODELS_DIR}" /workspace && \
     chown -R appuser:appuser /home/appuser /workspace
 
@@ -111,17 +100,16 @@ COPY --chown=appuser:appuser scripts/fetch-swarm-tasks.py ./fetch-swarm-tasks.py
 COPY --chown=appuser:appuser scripts/support-load.py ./support-load.py
 COPY --from=profile-builder --chown=appuser:appuser /build/target/release/profile ./profile
 
-RUN chmod 0755 ./load.sh ./start.sh ./start-gemma.sh ./start-muse.sh \
-    ./agent-swarm.sh ./support-load.py ./profile
+RUN chmod 0755 ./load.sh ./start.sh ./start-gemma.sh ./start-muse.sh ./agent-swarm.sh ./support-load.py ./profile
 
 USER appuser
 
 # Default NVIDIA stack is Muse Glimmer NVFP4 (CMD / start-muse.sh) for RTX 5090.
+# Same pattern as Qwen/Gemma: pip vLLM in start-*.sh, download weights, serve.
 # Do not bake SERVED_NAME: each launcher exports PROFILE_MODEL + SERVED_NAME.
 # Qwen: ./start.sh   Gemma: ./start-gemma.sh
 ENV PROFILE_MODEL=muse
 
-ENTRYPOINT []
 CMD ["bash", "-lc", "/home/appuser/app/start-muse.sh"]
 
 # AMD runtime: official vLLM ROCm image (includes ROCm + Python 3.12 + vLLM + PyTorch).
