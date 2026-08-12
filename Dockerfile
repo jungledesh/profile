@@ -34,6 +34,8 @@ ENV MODELS_DIR=/workspace/models
 
 # The vLLM image runs as root by default. Create appuser like the AMD stage.
 # noninteractive only for this layer so apt/debconf never prompts during build.
+# Muse base may be Ubuntu 24.04: do not pin 22.04-only names (libasound2,
+# libatk1.0-0, … → t64). VHS browser libs are optional; install via fallback.
 RUN export DEBIAN_FRONTEND=noninteractive \
     && apt-get update && apt-get install -y --no-install-recommends \
     bash \
@@ -47,20 +49,35 @@ RUN export DEBIAN_FRONTEND=noninteractive \
     vim \
     sudo \
     ca-certificates \
-    libnss3 \
-    libatk1.0-0 \
-    libatk-bridge2.0-0 \
-    libcups2 \
-    libdrm2 \
-    libxkbcommon0 \
-    libxcomposite1 \
-    libxdamage1 \
-    libxfixes3 \
-    libxrandr2 \
-    libgbm1 \
-    libasound2 \
     openssh-client \
     rsync \
+    && ( apt-get install -y --no-install-recommends \
+            libnss3 \
+            libatk1.0-0t64 \
+            libatk-bridge2.0-0t64 \
+            libcups2t64 \
+            libdrm2 \
+            libxkbcommon0 \
+            libxcomposite1 \
+            libxdamage1 \
+            libxfixes3 \
+            libxrandr2 \
+            libgbm1 \
+            libasound2t64 \
+        || apt-get install -y --no-install-recommends \
+            libnss3 \
+            libatk1.0-0 \
+            libatk-bridge2.0-0 \
+            libcups2 \
+            libdrm2 \
+            libxkbcommon0 \
+            libxcomposite1 \
+            libxdamage1 \
+            libxfixes3 \
+            libxrandr2 \
+            libgbm1 \
+            libasound2 \
+       ) \
     && (id -u appuser >/dev/null 2>&1 || /usr/sbin/useradd -m -u 1000 -s /bin/bash appuser) \
     && echo "appuser ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/appuser \
     && rm -rf /var/lib/apt/lists/*
