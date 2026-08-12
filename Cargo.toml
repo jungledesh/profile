@@ -10,6 +10,8 @@ repository = "https://github.com/jungledesh/profile"
 [features]
 default = ["nvidia", "amd"]
 nvidia = ["dep:nvml-wrapper"]
+# Enables libamdgpu_top off Windows (target dep below). Windows release builds
+# stay nvidia-only: libdrm uses std::os::fd, which MSVC does not have.
 amd = ["dep:libamdgpu_top"]
 
 [[bin]]
@@ -20,11 +22,16 @@ path = "src/main.rs"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4.5", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 anyhow = "1.0.103"
-libamdgpu_top = { version = "=0.11.5", optional = true, default-features = false, features = ["libdrm_dynamic_loading"] }
 nvml-wrapper = { version = "0.12", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 serde_json = "1"
 prometheus-parse = "0.2"
+
+# libdrm/amdgpu: not Windows. Must not appear in the Windows dependency graph or
+# cargo-dist's x86_64-pc-windows-msvc job fails compiling std::os::fd. macOS can
+# compile the crate (Unix fd exists); runtime AMD telemetry still needs Linux DRM.
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+libamdgpu_top = { version = "=0.11.5", optional = true, default-features = false, features = ["libdrm_dynamic_loading"] }
 
 [dev-dependencies]
 assert_cmd = "2.0"

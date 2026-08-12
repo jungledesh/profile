@@ -24,7 +24,7 @@ fn session_nvml() -> Option<&'static Nvml> {
     NVML_SESSION.get()
 }
 
-#[cfg(feature = "amd")]
+#[cfg(all(feature = "amd", not(target_os = "windows")))]
 /// Raw host GPU count from NVML. No CVD filtering, no polling.
 /// Returns None if NVML unavailable.
 pub(super) fn host_gpu_count() -> Option<u32> {
