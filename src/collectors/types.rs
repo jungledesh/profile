@@ -84,8 +84,14 @@ pub struct VllmRawMetrics {
     /// Queue-depth style gauges: **last** `/metrics` scrape in the collection window.
     /// Multi-window diagnose: **time-weighted mean** across evaluable windows (same as `gpu_util_pct`).
     pub num_requests_running: Option<f64>,
+    /// Arithmetic mean of finite `num_requests_running` scrapes in this window (same
+    /// samples as peak). Multi-window: duration-weighted mean of per-window means
+    /// over active windows. Paired with window-rate tok/s for speculation D2
+    /// (averaged over averaged). `None` when no finite scrape in the window.
+    pub num_requests_running_mean: Option<f64>,
     /// Max `num_requests_running` across scrapes in this window. Multi-window: max over
     /// evaluable windows (not mean). Used to disprove full-context `kv_cache_max_concurrency`.
+    /// Speculation D2: fallback denom when mean is unread.
     pub num_requests_running_peak: Option<f64>,
     pub num_requests_waiting: Option<f64>,
     /// Max `num_requests_waiting` across scrapes in this window. Multi-window: max over

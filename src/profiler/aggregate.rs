@@ -96,6 +96,8 @@ pub(super) fn aggregate_windows(
 
     // Running / waiting: duration-weighted mean over active windows. None if no active windows.
     agg_v.num_requests_running = weighted_mean(&active_pairs, |w| w.vllm.num_requests_running);
+    agg_v.num_requests_running_mean =
+        weighted_mean(&active_pairs, |w| w.vllm.num_requests_running_mean);
     agg_v.num_requests_running_peak = num_requests_running_peak(&evaluable_pairs, last);
     agg_v.num_requests_waiting = weighted_mean(&active_pairs, |w| w.vllm.num_requests_waiting);
     agg_v.num_requests_waiting_peak = num_requests_waiting_peak(&evaluable_pairs, last);
@@ -557,6 +559,35 @@ mod tests {
         let mean_wait = agg.vllm.num_requests_waiting.unwrap();
         assert!((mean_wait - (4.0 + 36.0 + 9.0) / 3.0).abs() < 1e-9);
         assert_ne!(agg.vllm.num_requests_waiting_peak, Some(mean_wait));
+    }
+
+    #[test]
+    fn aggregate_running_mean_is_duration_weighted_across_windows() {
+        let g = GpuRawMetrics::default();
+        let mk = |mean: f64, landing: f64, dur_secs: f64| {
+            let mut s = mk_snap(
+                Some(landing),
+                Some(100.0),
+                None,
+                None,
+                None,
+                g.clone(),
+                None,
+            );
+            s.vllm.num_requests_running_mean = Some(mean);
+            s.vllm.num_requests_running_peak = Some(mean.max(landing));
+            s.vllm.window_duration_secs = Some(dur_secs);
+            s
+        };
+        // 2s @ mean 10, 10s @ mean 2 → (2*10 + 10*2) / 12 = 40/12.
+        let (agg, _) = aggregate_windows(
+            &[mk(10.0, 1.0, 2.0), mk(2.0, 2.0, 10.0)],
+            &[Duration::from_secs(2), Duration::from_secs(10)],
+            SystemTime::UNIX_EPOCH,
+        );
+        assert!((agg.vllm.num_requests_running_mean.unwrap() - (40.0 / 12.0)).abs() < 1e-9);
+        // Landing fold stays independent (duration-weighted landings).
+        assert!((agg.vllm.num_requests_running.unwrap() - (22.0 / 12.0)).abs() < 1e-9);
     }
 
     #[test]

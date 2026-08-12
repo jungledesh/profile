@@ -18,7 +18,8 @@ pub const SPEC_GUARD_LIMITER_LINE: &str = SPEC_GUARD_BODY;
 pub enum SpecDetector {
     /// Mean TPOT faster than `1000 / decode.upper`.
     Tpot,
-    /// Generation tok/s per running request above `decode.upper`.
+    /// Generation tok/s per concurrent request above `decode.upper`.
+    /// Denom: intra-window mean running, else peak; never last-scrape landing.
     PerStream,
     /// Total generation tok/s above `decode.upper * ridge`.
     Absolute,
@@ -355,11 +356,20 @@ fn detect_speculation(
         .vllm
         .generation_tokens_per_sec
         .filter(|v| v.is_finite() && *v > 0.0);
+    // D2: window-rate tok/s over window-average concurrency (averaged ÷ averaged).
+    // Landing (last scrape) is the wrong pair: a mid-window drain collapses the
+    // denom and false-fires ("speculation likely" with no drafter = a lie).
+    // Mean first; peak fallback when mean unread. Never landing.
     if let (Some(tps), Some(running)) = (
         tps,
         snap.vllm
-            .num_requests_running
-            .filter(|v| v.is_finite() && *v >= 1.0),
+            .num_requests_running_mean
+            .filter(|v| v.is_finite() && *v >= 1.0)
+            .or_else(|| {
+                snap.vllm
+                    .num_requests_running_peak
+                    .filter(|v| v.is_finite() && *v >= 1.0)
+            }),
     ) {
         let per = tps / running;
         if per.is_finite() && per > upper {
@@ -2005,9 +2015,13 @@ mod tests {
     }
 
     fn active_snap(tps: Option<f64>, running: Option<f64>, tpot_ms: Option<f64>) -> VllmRawMetrics {
+        let run = running.or(Some(4.0));
         VllmRawMetrics {
             window_duration_secs: Some(2.0),
-            num_requests_running: running.or(Some(4.0)),
+            num_requests_running: run,
+            // Steady fixtures: mean = peak = landing. Drain cases set fields apart.
+            num_requests_running_mean: run,
+            num_requests_running_peak: run,
             generation_tokens_per_sec: tps.or(Some(100.0)),
             tpot_ms,
             ..Default::default()
@@ -2187,6 +2201,121 @@ mod tests {
         let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
         let ev = b.spec_suspected.expect("flag");
         assert_eq!(ev.detector, SpecDetector::PerStream);
+    }
+
+    #[test]
+    fn spec_guard_d2_uses_mean_running_not_drained_landing() {
+        // Drain: landing=1, mean stays honest for the window. tok/s ÷ landing would
+        // false-fire; ÷ mean must not.
+        let (ctx, win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(312.0),
+            Some(2039.0),
+            VllmConfig::default(),
+            active_snap(None, Some(1.0), Some(100.0)),
+        );
+        let probe = compute(&AnalysisInput::new(&ctx, &win)).expect("probe");
+        let upper = probe.decode.upper;
+        let mean = 40.0;
+        let tps = upper * 10.0;
+        assert!(tps / 1.0 > upper);
+        assert!(tps / mean <= upper);
+
+        let mut snap = active_snap(Some(tps), Some(1.0), Some(100.0));
+        snap.num_requests_running = Some(1.0);
+        snap.num_requests_running_mean = Some(mean);
+        snap.num_requests_running_peak = Some(80.0);
+        let (ctx, win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(312.0),
+            Some(2039.0),
+            VllmConfig {
+                max_num_seqs: Some(256),
+                ..Default::default()
+            },
+            snap,
+        );
+        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+        assert!(
+            b.spec_suspected.is_none(),
+            "mean denom must block drain false-fire"
+        );
+        assert!(b.efficiency_pct.is_some());
+    }
+
+    #[test]
+    fn spec_guard_d2_falls_back_to_peak_when_mean_unread() {
+        let mut snap = active_snap(Some(50_000.0), Some(1.0), Some(100.0));
+        snap.num_requests_running_mean = None;
+        snap.num_requests_running_peak = Some(1.0);
+        snap.num_requests_running = Some(1.0);
+        let (ctx, win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(312.0),
+            Some(2039.0),
+            VllmConfig::default(),
+            snap,
+        );
+        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+        let ev = b.spec_suspected.expect("peak fallback");
+        assert_eq!(ev.detector, SpecDetector::PerStream);
+    }
+
+    #[test]
+    fn spec_guard_d2_never_uses_landing_alone() {
+        // Landing would fire; mean and peak unread → D2 silent (D3 may still fire).
+        let (ctx, win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(312.0),
+            Some(2039.0),
+            VllmConfig::default(),
+            active_snap(None, Some(1.0), Some(100.0)),
+        );
+        let probe = compute(&AnalysisInput::new(&ctx, &win)).expect("probe");
+        let upper = probe.decode.upper;
+        // Keep absolute under the ridge product so only D2 could have fired via landing.
+        let tps = upper * 2.0;
+        assert!(tps / 1.0 > upper);
+        assert!(tps < upper * probe.ridge_batch_size);
+
+        let mut snap = active_snap(Some(tps), Some(1.0), Some(100.0));
+        snap.num_requests_running = Some(1.0);
+        snap.num_requests_running_mean = None;
+        snap.num_requests_running_peak = None;
+        let (ctx, win) = baseline_input(
+            Some(8_000_000_000),
+            None,
+            Some("bf16"),
+            Some(312.0),
+            Some(2039.0),
+            VllmConfig {
+                max_num_seqs: Some(256),
+                ..Default::default()
+            },
+            snap,
+        );
+        let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
+        assert!(
+            b.spec_suspected
+                .as_ref()
+                .is_none_or(|e| e.detector != SpecDetector::PerStream),
+            "landing-only must not trip D2: {:?}",
+            b.spec_suspected
+        );
+        assert!(
+            b.spec_suspected.is_none(),
+            "fixture must stay under D3 as well: {:?}",
+            b.spec_suspected
+        );
+        assert!(b.efficiency_pct.is_some());
     }
 
     #[test]
