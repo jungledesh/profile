@@ -9,7 +9,7 @@ pub use math::{
 };
 pub use roofline::{
     CeilingEstimate, CostEstimate, CostSource, PhysicsBaseline, SPEC_GUARD_LIMITER_LINE,
-    SPEC_GUARD_WARNING_LINE, SpecDetector, SpecEvidence, WeightDtypeSource,
-    baseline_missing_reason, compute,
+    SPEC_GUARD_WARNING_LINE, SpecDetector, SpecEvidence, StaticBaselineSubset, WeightDtypeSource,
+    baseline_missing_reason, compute, compute_with_subset, static_baseline_subset,
 };
 pub(crate) use roofline::{apply_spec_run_or, stronger_spec_evidence};

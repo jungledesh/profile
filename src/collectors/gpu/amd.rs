@@ -1,4 +1,5 @@
 use std::panic::{self, AssertUnwindSafe};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
@@ -11,7 +12,7 @@ use libamdgpu_top::stat::{GpuActivity, Sensors};
 
 use super::super::GpuRawMetrics;
 use super::super::sampling::{run_sampling_loop, sample_count_for};
-use super::polling::{GpuPoll, aggregate_polls};
+use super::polling::{GpuPoll, PollAggregateState};
 
 const MIB: u64 = 1024 * 1024;
 
@@ -47,25 +48,54 @@ struct AmdFailedPath {
 
 struct AmdDeviceInventory {
     ready: Vec<AmdReadyPath>,
-    failed: Vec<AmdFailedPath>,
 }
 
-/// Single source of truth for scan and collect: paths that successfully init.
-/// Original path indices are preserved so assignment and telemetry agree.
-fn amd_device_inventory() -> Option<AmdDeviceInventory> {
-    let paths = amdgpu_device_paths()?;
-    let mut ready = Vec::new();
+struct SessionAmdState {
+    /// Render-node paths keyed by probe ordinal. Marketing name alone is not
+    /// identity (same-model swap would reuse a stale handle / PCI id).
+    signature: Vec<(u32, String)>,
+    /// Successfully initialized devices only. Init failures are not memoized;
+    /// the next window retries them.
+    ready: std::collections::HashMap<u32, AmdReadyPath>,
+}
+
+static AMD_SESSION: OnceLock<Mutex<Option<SessionAmdState>>> = OnceLock::new();
+
+fn session_state_cell() -> &'static Mutex<Option<SessionAmdState>> {
+    AMD_SESSION.get_or_init(|| Mutex::new(None))
+}
+
+fn path_signature(paths: &[DevicePath]) -> Vec<(u32, String)> {
+    paths
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (i as u32, p.render.display().to_string()))
+        .collect()
+}
+
+/// Try init for every path not already in `ready`. Failures stay out of `ready`
+/// so the next window retries (success-only cache).
+fn ensure_ready_devices(
+    paths: &[DevicePath],
+    ready: &mut std::collections::HashMap<u32, AmdReadyPath>,
+) -> Vec<AmdFailedPath> {
     let mut failed = Vec::new();
-    for (i, device_path) in paths.into_iter().enumerate() {
+    for (i, device_path) in paths.iter().enumerate() {
         let original_index = i as u32;
+        if ready.contains_key(&original_index) {
+            continue;
+        }
         let name = device_path.device_name.clone();
         match panic::catch_unwind(AssertUnwindSafe(|| device_path.init())) {
             Ok(Ok(device_handle)) => {
-                ready.push(AmdReadyPath {
+                ready.insert(
                     original_index,
-                    device_path,
-                    device_handle,
-                });
+                    AmdReadyPath {
+                        original_index,
+                        device_path: device_path.clone(),
+                        device_handle,
+                    },
+                );
             }
             Err(_) => {
                 eprintln!("Warning: AMD GPU {original_index} init panicked. Skipping device.");
@@ -82,10 +112,34 @@ fn amd_device_inventory() -> Option<AmdDeviceInventory> {
             }
         }
     }
+    failed
+}
+
+/// Single source of truth for scan and collect: paths that successfully init.
+/// Original path indices are preserved so assignment and telemetry agree.
+fn amd_device_inventory() -> Option<AmdDeviceInventory> {
+    let paths = amdgpu_device_paths()?;
+    let mut ready = Vec::new();
+    for (i, device_path) in paths.into_iter().enumerate() {
+        let original_index = i as u32;
+        match panic::catch_unwind(AssertUnwindSafe(|| device_path.init())) {
+            Ok(Ok(device_handle)) => {
+                ready.push(AmdReadyPath {
+                    original_index,
+                    device_path,
+                    device_handle,
+                });
+            }
+            Err(_) => {
+                eprintln!("Warning: AMD GPU {original_index} init panicked. Skipping device.");
+            }
+            Ok(Err(_)) => {}
+        }
+    }
     if ready.is_empty() {
         None
     } else {
-        Some(AmdDeviceInventory { ready, failed })
+        Some(AmdDeviceInventory { ready })
     }
 }
 
@@ -186,6 +240,7 @@ pub(super) fn fp8_compiler_available() -> bool {
 }
 
 struct AmdDevice {
+    original_index: u32,
     device_path: DevicePath,
     device_handle: DeviceHandle,
     sensors: Option<Sensors>,
@@ -214,6 +269,7 @@ fn init_amd_devices(
         let mut vram_usage = VramUsage::new(&mem_info);
         vram_usage.update_usable_heap_size(&device_handle);
         devices.push(AmdDevice {
+            original_index: idx,
             device_path,
             device_handle,
             sensors,
@@ -306,46 +362,62 @@ pub(super) fn collect(
     window: Duration,
     explicit_indices: Option<&[u32]>,
 ) -> Result<(Vec<GpuRawMetrics>, SystemTime, Option<u32>)> {
-    let Some(inventory) = amd_device_inventory() else {
+    let Some(paths) = amdgpu_device_paths() else {
         return Ok((vec![], SystemTime::now(), None));
     };
+    let signature = path_signature(&paths);
 
-    let host_count = inventory.ready.len() as u32;
-    let ready_meta: Vec<(u32, String)> = inventory
-        .ready
+    let mut ready = {
+        let mut guard = session_state_cell().lock().ok();
+        if let Some(g) = guard.as_mut() {
+            match g.take() {
+                Some(s) if s.signature == signature => s.ready,
+                _ => std::collections::HashMap::new(),
+            }
+        } else {
+            std::collections::HashMap::new()
+        }
+    };
+
+    let failed = ensure_ready_devices(&paths, &mut ready);
+    if ready.is_empty() {
+        return Ok((vec![], SystemTime::now(), None));
+    }
+
+    let host_count = ready.len() as u32;
+    let ready_meta: Vec<(u32, String)> = ready
         .iter()
-        .map(|e| (e.original_index, e.device_path.device_name.clone()))
+        .map(|(idx, e)| (*idx, e.device_path.device_name.clone()))
         .collect();
     let device_indices = select_amd_original_indices(
         explicit_indices,
         parse_amd_visible_devices(),
         &ready_meta,
-        &inventory.failed,
+        &failed,
     );
 
     if device_indices.is_empty() {
+        if let Ok(mut guard) = session_state_cell().lock() {
+            *guard = Some(SessionAmdState { signature, ready });
+        }
         return Ok((vec![], SystemTime::now(), Some(host_count)));
     }
 
-    let mut ready_by_idx: std::collections::HashMap<u32, AmdReadyPath> = inventory
-        .ready
-        .into_iter()
-        .map(|e| (e.original_index, e))
-        .collect();
+    let mut ready_by_idx = ready;
     let mut devices = init_amd_devices(&mut ready_by_idx, &device_indices)?;
 
     let sample_count = sample_count_for(window);
-    let mut all_device_polls: std::collections::HashMap<u32, Vec<GpuPoll>> =
+    let mut all_device_polls: std::collections::HashMap<u32, PollAggregateState> =
         std::collections::HashMap::new();
     for &d in &device_indices {
-        all_device_polls.insert(d, Vec::with_capacity(sample_count));
+        all_device_polls.insert(d, PollAggregateState::default());
     }
 
     run_sampling_loop(sample_count, |_i| {
         for (slot_idx, &d) in device_indices.iter().enumerate() {
             let tick = poll_amd_device(&mut devices[slot_idx]);
             if let Some(slot) = all_device_polls.get_mut(&d) {
-                slot.push(tick);
+                slot.update(&tick);
             }
         }
         Ok(())
@@ -354,7 +426,10 @@ pub(super) fn collect(
     let mut results = Vec::with_capacity(device_indices.len());
     for (slot_idx, &d) in device_indices.iter().enumerate() {
         let device = &devices[slot_idx];
-        let agg = aggregate_polls(all_device_polls.get(&d).map_or(&[], |v| v));
+        let agg = all_device_polls
+            .get(&d)
+            .map(PollAggregateState::finish)
+            .unwrap_or_else(|| PollAggregateState::default().finish());
         let power_limit_watts = device.sensors.as_ref().and_then(power_limit_watts);
 
         results.push(agg.into_gpu_raw_metrics(
@@ -364,6 +439,23 @@ pub(super) fn collect(
             Some(device.device_path.pci.to_string()),
             power_limit_watts,
         ));
+    }
+
+    for d in devices {
+        ready_by_idx.insert(
+            d.original_index,
+            AmdReadyPath {
+                original_index: d.original_index,
+                device_path: d.device_path,
+                device_handle: d.device_handle,
+            },
+        );
+    }
+    if let Ok(mut guard) = session_state_cell().lock() {
+        *guard = Some(SessionAmdState {
+            signature,
+            ready: ready_by_idx,
+        });
     }
 
     Ok((results, SystemTime::now(), Some(host_count)))

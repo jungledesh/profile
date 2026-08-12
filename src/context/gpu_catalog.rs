@@ -4,8 +4,6 @@
 /// in the normalized GPU name (lowercase, non-alphanumeric → space).
 /// Entries are ordered most-specific to least-specific so the first match wins.
 pub struct GpuCatalogEntry {
-    /// Test-only discriminator to verify token matching order.
-    pub arch: &'static str,
     /// BF16/FP16 Tensor Core TFLOPS. Used for prefill roofline ceiling.
     pub peak_flops_tc_tflops: f64,
     /// Peak memory bandwidth GB/s. Used for decode roofline ceiling.
@@ -25,7 +23,6 @@ static CATALOG: &[GpuEntry] = &[
     GpuEntry {
         tokens: &["h100", "pcie"],
         entry: GpuCatalogEntry {
-            arch: "hopper",
             peak_flops_tc_tflops: 756.0, // dense BF16 (1513 sparse / 2)
             peak_bw_gbps: 2000.0,
         },
@@ -37,7 +34,6 @@ static CATALOG: &[GpuEntry] = &[
     GpuEntry {
         tokens: &["h100", "nvl"],
         entry: GpuCatalogEntry {
-            arch: "hopper",
             peak_flops_tc_tflops: 835.5,
             peak_bw_gbps: 3900.0,
         },
@@ -47,7 +43,6 @@ static CATALOG: &[GpuEntry] = &[
     GpuEntry {
         tokens: &["h100", "hbm3"],
         entry: GpuCatalogEntry {
-            arch: "hopper",
             peak_flops_tc_tflops: 989.0, // dense BF16 (1979 sparse / 2)
             peak_bw_gbps: 3350.0,
         },
@@ -56,7 +51,6 @@ static CATALOG: &[GpuEntry] = &[
     GpuEntry {
         tokens: &["h100", "sxm"],
         entry: GpuCatalogEntry {
-            arch: "hopper",
             peak_flops_tc_tflops: 989.0,
             peak_bw_gbps: 3350.0,
         },
@@ -67,7 +61,6 @@ static CATALOG: &[GpuEntry] = &[
     GpuEntry {
         tokens: &["h200"],
         entry: GpuCatalogEntry {
-            arch: "hopper",
             peak_flops_tc_tflops: 989.0,
             peak_bw_gbps: 4800.0,
         },
@@ -79,7 +72,6 @@ static CATALOG: &[GpuEntry] = &[
     GpuEntry {
         tokens: &["a100", "80gb"],
         entry: GpuCatalogEntry {
-            arch: "ampere",
             peak_flops_tc_tflops: 312.0,
             peak_bw_gbps: 2039.0,
         },
@@ -88,7 +80,6 @@ static CATALOG: &[GpuEntry] = &[
     GpuEntry {
         tokens: &["a100", "40gb"],
         entry: GpuCatalogEntry {
-            arch: "ampere",
             peak_flops_tc_tflops: 312.0,
             peak_bw_gbps: 1555.0,
         },
@@ -102,7 +93,6 @@ static CATALOG: &[GpuEntry] = &[
     GpuEntry {
         tokens: &["b200"],
         entry: GpuCatalogEntry {
-            arch: "blackwell",
             peak_flops_tc_tflops: 2250.0,
             peak_bw_gbps: 7700.0,
         },
@@ -115,7 +105,6 @@ static CATALOG: &[GpuEntry] = &[
     GpuEntry {
         tokens: &["b300"],
         entry: GpuCatalogEntry {
-            arch: "blackwell",
             peak_flops_tc_tflops: 2500.0,
             peak_bw_gbps: 8000.0,
         },
@@ -127,7 +116,6 @@ static CATALOG: &[GpuEntry] = &[
     GpuEntry {
         tokens: &["rtx", "pro", "6000", "blackwell"],
         entry: GpuCatalogEntry {
-            arch: "blackwell",
             peak_flops_tc_tflops: 250.0,
             peak_bw_gbps: 1792.0,
         },
@@ -139,7 +127,6 @@ static CATALOG: &[GpuEntry] = &[
     GpuEntry {
         tokens: &["l40s"],
         entry: GpuCatalogEntry {
-            arch: "ada",
             peak_flops_tc_tflops: 181.03,
             peak_bw_gbps: 864.0,
         },
@@ -149,7 +136,6 @@ static CATALOG: &[GpuEntry] = &[
     GpuEntry {
         tokens: &["rtx", "4090"],
         entry: GpuCatalogEntry {
-            arch: "ada",
             peak_flops_tc_tflops: 165.0,
             peak_bw_gbps: 1008.0,
         },
@@ -159,7 +145,6 @@ static CATALOG: &[GpuEntry] = &[
     GpuEntry {
         tokens: &["rtx", "a6000"],
         entry: GpuCatalogEntry {
-            arch: "ampere",
             peak_flops_tc_tflops: 77.4,
             peak_bw_gbps: 768.0,
         },
@@ -169,7 +154,6 @@ static CATALOG: &[GpuEntry] = &[
     GpuEntry {
         tokens: &["rtx", "3090", "ti"],
         entry: GpuCatalogEntry {
-            arch: "ampere",
             peak_flops_tc_tflops: 80.0,
             peak_bw_gbps: 1008.0,
         },
@@ -179,7 +163,6 @@ static CATALOG: &[GpuEntry] = &[
     GpuEntry {
         tokens: &["rtx", "3090"],
         entry: GpuCatalogEntry {
-            arch: "ampere",
             peak_flops_tc_tflops: 71.16,
             peak_bw_gbps: 936.0,
         },
@@ -189,7 +172,6 @@ static CATALOG: &[GpuEntry] = &[
     GpuEntry {
         tokens: &["rtx", "5090"],
         entry: GpuCatalogEntry {
-            arch: "blackwell",
             peak_flops_tc_tflops: 209.5,
             peak_bw_gbps: 1792.0,
         },
@@ -204,7 +186,6 @@ static CATALOG: &[GpuEntry] = &[
     GpuEntry {
         tokens: &["gb10"],
         entry: GpuCatalogEntry {
-            arch: "blackwell",
             peak_flops_tc_tflops: 212.9, // BF16 Dense TC - measured on production hardware
             peak_bw_gbps: 273.0,         // LPDDR5X system BW - confirmed
         },
@@ -214,7 +195,6 @@ static CATALOG: &[GpuEntry] = &[
     GpuEntry {
         tokens: &["a10g"],
         entry: GpuCatalogEntry {
-            arch: "ampere",
             peak_flops_tc_tflops: 126.0,
             peak_bw_gbps: 600.0,
         },
@@ -224,7 +204,6 @@ static CATALOG: &[GpuEntry] = &[
     GpuEntry {
         tokens: &["mi355x"],
         entry: GpuCatalogEntry {
-            arch: "cdna4",
             peak_flops_tc_tflops: 2500.0, // dense BF16 matrix
             peak_bw_gbps: 8000.0,
         },
@@ -234,7 +213,6 @@ static CATALOG: &[GpuEntry] = &[
     GpuEntry {
         tokens: &["mi350x"],
         entry: GpuCatalogEntry {
-            arch: "cdna4",
             peak_flops_tc_tflops: 2300.0, // dense BF16 matrix
             peak_bw_gbps: 8000.0,
         },
@@ -245,7 +223,6 @@ static CATALOG: &[GpuEntry] = &[
     GpuEntry {
         tokens: &["mi325x"],
         entry: GpuCatalogEntry {
-            arch: "cdna3",
             peak_flops_tc_tflops: 1307.4,
             peak_bw_gbps: 6000.0,
         },
@@ -256,7 +233,6 @@ static CATALOG: &[GpuEntry] = &[
     GpuEntry {
         tokens: &["mi300a"],
         entry: GpuCatalogEntry {
-            arch: "cdna3",
             peak_flops_tc_tflops: 980.6,
             // 5300 GB/s is total HBM3 bandwidth shared with CPU; GPU-available portion depends on workload.
             peak_bw_gbps: 5300.0,
@@ -267,7 +243,6 @@ static CATALOG: &[GpuEntry] = &[
     GpuEntry {
         tokens: &["mi300x"],
         entry: GpuCatalogEntry {
-            arch: "cdna3",
             peak_flops_tc_tflops: 1307.4,
             peak_bw_gbps: 5300.0,
         },
@@ -279,7 +254,6 @@ static CATALOG: &[GpuEntry] = &[
     GpuEntry {
         tokens: &["mi250x"],
         entry: GpuCatalogEntry {
-            arch: "cdna2",
             peak_flops_tc_tflops: 191.5,
             peak_bw_gbps: 1638.4,
         },
@@ -293,7 +267,6 @@ static CATALOG: &[GpuEntry] = &[
     GpuEntry {
         tokens: &["mi250"],
         entry: GpuCatalogEntry {
-            arch: "cdna2",
             peak_flops_tc_tflops: 181.0,
             peak_bw_gbps: 1638.4,
         },
@@ -304,7 +277,6 @@ static CATALOG: &[GpuEntry] = &[
     GpuEntry {
         tokens: &["mi210"],
         entry: GpuCatalogEntry {
-            arch: "cdna2",
             peak_flops_tc_tflops: 181.0,
             peak_bw_gbps: 1638.4,
         },
@@ -317,7 +289,6 @@ static CATALOG: &[GpuEntry] = &[
     GpuEntry {
         tokens: &["rx", "9070", "xt"],
         entry: GpuCatalogEntry {
-            arch: "rdna4",
             peak_flops_tc_tflops: 194.6,
             peak_bw_gbps: 644.0,
         },
@@ -329,7 +300,6 @@ static CATALOG: &[GpuEntry] = &[
     GpuEntry {
         tokens: &["rx", "9070"],
         entry: GpuCatalogEntry {
-            arch: "rdna4",
             peak_flops_tc_tflops: 144.5,
             peak_bw_gbps: 644.0,
         },
@@ -341,7 +311,6 @@ static CATALOG: &[GpuEntry] = &[
     GpuEntry {
         tokens: &["w7900"],
         entry: GpuCatalogEntry {
-            arch: "rdna3",
             peak_flops_tc_tflops: 123.0, // peak FP16 matrix
             peak_bw_gbps: 864.0,
         },
@@ -352,7 +321,6 @@ static CATALOG: &[GpuEntry] = &[
     GpuEntry {
         tokens: &["w7800"],
         entry: GpuCatalogEntry {
-            arch: "rdna3",
             peak_flops_tc_tflops: 90.5,
             peak_bw_gbps: 576.0,
         },
@@ -366,7 +334,6 @@ static CATALOG: &[GpuEntry] = &[
     GpuEntry {
         tokens: &["rx", "7900", "xtx"],
         entry: GpuCatalogEntry {
-            arch: "rdna3",
             peak_flops_tc_tflops: 123.0,
             peak_bw_gbps: 960.0,
         },
@@ -377,7 +344,6 @@ static CATALOG: &[GpuEntry] = &[
     GpuEntry {
         tokens: &["rx", "7900", "gre"],
         entry: GpuCatalogEntry {
-            arch: "rdna3",
             peak_flops_tc_tflops: 92.0,
             peak_bw_gbps: 576.0,
         },
@@ -388,7 +354,6 @@ static CATALOG: &[GpuEntry] = &[
     GpuEntry {
         tokens: &["rx", "7900", "xt"],
         entry: GpuCatalogEntry {
-            arch: "rdna3",
             peak_flops_tc_tflops: 103.0,
             peak_bw_gbps: 800.0,
         },
@@ -398,7 +363,6 @@ static CATALOG: &[GpuEntry] = &[
     GpuEntry {
         tokens: &["rx", "7800", "xt"],
         entry: GpuCatalogEntry {
-            arch: "rdna3",
             peak_flops_tc_tflops: 74.6,
             peak_bw_gbps: 624.0,
         },
@@ -409,7 +373,6 @@ static CATALOG: &[GpuEntry] = &[
     GpuEntry {
         tokens: &["rx", "7700", "xt"],
         entry: GpuCatalogEntry {
-            arch: "rdna3",
             peak_flops_tc_tflops: 70.3,
             peak_bw_gbps: 432.0,
         },
@@ -420,7 +383,6 @@ static CATALOG: &[GpuEntry] = &[
     GpuEntry {
         tokens: &["rx", "7600", "xt"],
         entry: GpuCatalogEntry {
-            arch: "rdna3",
             peak_flops_tc_tflops: 45.1,
             peak_bw_gbps: 288.0,
         },
@@ -461,14 +423,12 @@ mod tests {
     #[test]
     fn h100_sxm_hbm3() {
         let e = lookup_gpu("NVIDIA H100 80GB HBM3").expect("no match");
-        assert_eq!(e.arch, "hopper");
         assert_eq!(e.peak_bw_gbps, 3350.0);
     }
 
     #[test]
     fn h100_sxm_explicit() {
         let e = lookup_gpu("NVIDIA H100-SXM5-80GB").expect("no match");
-        assert_eq!(e.arch, "hopper");
         assert_eq!(e.peak_bw_gbps, 3350.0);
     }
 
@@ -482,7 +442,6 @@ mod tests {
     fn h100_nvl() {
         // NVML name for the 94 GB HBM3 NVL SKU.
         let e = lookup_gpu("NVIDIA H100 NVL").expect("no match");
-        assert_eq!(e.arch, "hopper");
         assert_eq!(e.peak_flops_tc_tflops, 835.5);
         assert_eq!(e.peak_bw_gbps, 3900.0);
     }
@@ -514,7 +473,6 @@ mod tests {
     #[test]
     fn a100_80gb() {
         let e = lookup_gpu("NVIDIA A100-SXM4-80GB").expect("no match");
-        assert_eq!(e.arch, "ampere");
         assert_eq!(e.peak_bw_gbps, 2039.0);
         assert_eq!(e.peak_flops_tc_tflops, 312.0);
     }
@@ -535,7 +493,6 @@ mod tests {
     #[test]
     fn b200() {
         let e = lookup_gpu("NVIDIA B200 SXM").expect("no match");
-        assert_eq!(e.arch, "blackwell");
         assert_eq!(e.peak_bw_gbps, 7700.0);
         assert_eq!(e.peak_flops_tc_tflops, 2250.0);
     }
@@ -543,7 +500,6 @@ mod tests {
     #[test]
     fn b300() {
         let e = lookup_gpu("NVIDIA B300 SXM").expect("no match");
-        assert_eq!(e.arch, "blackwell");
         assert_eq!(e.peak_flops_tc_tflops, 2500.0);
         assert_eq!(e.peak_bw_gbps, 8000.0);
     }
@@ -551,7 +507,6 @@ mod tests {
     #[test]
     fn rtx_pro_6000_blackwell() {
         let e = lookup_gpu("NVIDIA RTX PRO 6000 Blackwell").expect("no match");
-        assert_eq!(e.arch, "blackwell");
         assert_eq!(e.peak_bw_gbps, 1792.0);
         assert_eq!(e.peak_flops_tc_tflops, 250.0);
     }
@@ -559,21 +514,18 @@ mod tests {
     #[test]
     fn l40s() {
         let e = lookup_gpu("NVIDIA L40S").expect("no match");
-        assert_eq!(e.arch, "ada");
         assert_eq!(e.peak_flops_tc_tflops, 181.03);
     }
 
     #[test]
     fn rtx_4090() {
         let e = lookup_gpu("NVIDIA GeForce RTX 4090").expect("no match");
-        assert_eq!(e.arch, "ada");
         assert_eq!(e.peak_flops_tc_tflops, 165.0);
     }
 
     #[test]
     fn rtx_a6000() {
         let e = lookup_gpu("NVIDIA RTX A6000").expect("no match");
-        assert_eq!(e.arch, "ampere");
         assert_eq!(e.peak_flops_tc_tflops, 77.4);
         assert_eq!(e.peak_bw_gbps, 768.0);
     }
@@ -581,7 +533,6 @@ mod tests {
     #[test]
     fn rtx_3090_ti() {
         let e = lookup_gpu("NVIDIA GeForce RTX 3090 Ti").expect("no match");
-        assert_eq!(e.arch, "ampere");
         assert_eq!(e.peak_flops_tc_tflops, 80.0);
         assert_eq!(e.peak_bw_gbps, 1008.0);
     }
@@ -589,7 +540,6 @@ mod tests {
     #[test]
     fn rtx_3090() {
         let e = lookup_gpu("NVIDIA GeForce RTX 3090").expect("no match");
-        assert_eq!(e.arch, "ampere");
         assert_eq!(e.peak_flops_tc_tflops, 71.16);
         assert_eq!(e.peak_bw_gbps, 936.0);
     }
@@ -597,7 +547,6 @@ mod tests {
     #[test]
     fn rtx_5090() {
         let e = lookup_gpu("NVIDIA GeForce RTX 5090").expect("no match");
-        assert_eq!(e.arch, "blackwell");
         assert_eq!(e.peak_flops_tc_tflops, 209.5);
         assert_eq!(e.peak_bw_gbps, 1792.0);
     }
@@ -605,7 +554,6 @@ mod tests {
     #[test]
     fn a10g() {
         let e = lookup_gpu("NVIDIA A10G").expect("no match");
-        assert_eq!(e.arch, "ampere");
         assert_eq!(e.peak_flops_tc_tflops, 126.0);
         assert_eq!(e.peak_bw_gbps, 600.0);
     }
@@ -614,7 +562,6 @@ mod tests {
     fn gb10_dgx_spark() {
         // NVML reports "NVIDIA GB10" on production DGX Spark hardware.
         let e = lookup_gpu("NVIDIA GB10").expect("no match");
-        assert_eq!(e.arch, "blackwell");
         assert_eq!(e.peak_flops_tc_tflops, 212.9);
         assert_eq!(e.peak_bw_gbps, 273.0);
     }
@@ -628,14 +575,12 @@ mod tests {
     fn gb200_matches_b200_entry_via_substring() {
         // GB200 is the superchip (B200 GPU + Grace CPU). Same physics specs as B200.
         let e = lookup_gpu("NVIDIA GB200 NVL72").expect("no match");
-        assert_eq!(e.arch, "blackwell");
         assert_eq!(e.peak_bw_gbps, 7700.0);
     }
 
     #[test]
     fn mi300x() {
         let e = lookup_gpu("AMD Instinct MI300X").expect("no match");
-        assert_eq!(e.arch, "cdna3");
         assert_eq!(e.peak_flops_tc_tflops, 1307.4);
         assert_eq!(e.peak_bw_gbps, 5300.0);
     }
@@ -644,20 +589,18 @@ mod tests {
     fn mi300x_with_variant_suffix() {
         // Some firmware reports "Aqua Vanjaram [Instinct MI300X VF]"
         let e = lookup_gpu("Aqua Vanjaram [Instinct MI300X VF]").expect("no match");
-        assert_eq!(e.arch, "cdna3");
+        assert_eq!(e.peak_bw_gbps, 5300.0);
     }
 
     #[test]
     fn mi325x() {
         let e = lookup_gpu("AMD Instinct MI325X").expect("no match");
-        assert_eq!(e.arch, "cdna3");
         assert_eq!(e.peak_bw_gbps, 6000.0);
     }
 
     #[test]
     fn mi300a() {
         let e = lookup_gpu("AMD Instinct MI300A").expect("no match");
-        assert_eq!(e.arch, "cdna3");
         assert_eq!(e.peak_flops_tc_tflops, 980.6);
     }
 
@@ -665,7 +608,6 @@ mod tests {
     fn mi250x_per_gcd() {
         // Per-GCD values (half of full OAM).
         let e = lookup_gpu("AMD INSTINCT MI250X (MCM) OAM AC MBA MSFT").expect("no match");
-        assert_eq!(e.arch, "cdna2");
         assert_eq!(e.peak_flops_tc_tflops, 191.5);
         assert_eq!(e.peak_bw_gbps, 1638.4);
     }
@@ -673,7 +615,6 @@ mod tests {
     #[test]
     fn rx_7900_xtx() {
         let e = lookup_gpu("AMD Radeon RX 7900 XTX").expect("no match");
-        assert_eq!(e.arch, "rdna3");
         assert_eq!(e.peak_flops_tc_tflops, 123.0);
         assert_eq!(e.peak_bw_gbps, 960.0);
     }
@@ -681,7 +622,6 @@ mod tests {
     #[test]
     fn rx_7900_xt() {
         let e = lookup_gpu("AMD Radeon RX 7900 XT").expect("no match");
-        assert_eq!(e.arch, "rdna3");
         assert_eq!(e.peak_flops_tc_tflops, 103.0);
         assert_eq!(e.peak_bw_gbps, 800.0);
     }
@@ -696,7 +636,6 @@ mod tests {
     #[test]
     fn rx_7800_xt() {
         let e = lookup_gpu("AMD Radeon RX 7800 XT").expect("no match");
-        assert_eq!(e.arch, "rdna3");
         assert_eq!(e.peak_flops_tc_tflops, 74.6);
         assert_eq!(e.peak_bw_gbps, 624.0);
     }
@@ -704,7 +643,6 @@ mod tests {
     #[test]
     fn mi355x() {
         let e = lookup_gpu("AMD Instinct MI355X").expect("no match");
-        assert_eq!(e.arch, "cdna4");
         assert_eq!(e.peak_flops_tc_tflops, 2500.0);
         assert_eq!(e.peak_bw_gbps, 8000.0);
     }
@@ -712,7 +650,6 @@ mod tests {
     #[test]
     fn mi350x() {
         let e = lookup_gpu("AMD Instinct MI350X").expect("no match");
-        assert_eq!(e.arch, "cdna4");
         assert_eq!(e.peak_flops_tc_tflops, 2300.0);
         assert_eq!(e.peak_bw_gbps, 8000.0);
     }
@@ -722,7 +659,6 @@ mod tests {
         // Per-GCD values (half of full OAM).
         // Must not match MI250X entry.
         let e = lookup_gpu("AMD Instinct MI250").expect("no match");
-        assert_eq!(e.arch, "cdna2");
         assert_eq!(e.peak_flops_tc_tflops, 181.0);
         assert_eq!(e.peak_bw_gbps, 1638.4);
     }
@@ -737,7 +673,6 @@ mod tests {
     #[test]
     fn mi210() {
         let e = lookup_gpu("AMD Instinct MI210").expect("no match");
-        assert_eq!(e.arch, "cdna2");
         assert_eq!(e.peak_flops_tc_tflops, 181.0);
         assert_eq!(e.peak_bw_gbps, 1638.4);
     }
@@ -745,7 +680,6 @@ mod tests {
     #[test]
     fn radeon_pro_w7900() {
         let e = lookup_gpu("AMD Radeon PRO W7900").expect("no match");
-        assert_eq!(e.arch, "rdna3");
         assert_eq!(e.peak_flops_tc_tflops, 123.0);
         assert_eq!(e.peak_bw_gbps, 864.0);
     }
@@ -760,7 +694,6 @@ mod tests {
     #[test]
     fn radeon_pro_w7800() {
         let e = lookup_gpu("AMD Radeon PRO W7800").expect("no match");
-        assert_eq!(e.arch, "rdna3");
         assert_eq!(e.peak_flops_tc_tflops, 90.5);
         assert_eq!(e.peak_bw_gbps, 576.0);
     }
@@ -768,7 +701,6 @@ mod tests {
     #[test]
     fn rx_9070_xt() {
         let e = lookup_gpu("AMD Radeon RX 9070 XT").expect("no match");
-        assert_eq!(e.arch, "rdna4");
         assert_eq!(e.peak_flops_tc_tflops, 194.6);
         assert_eq!(e.peak_bw_gbps, 644.0);
     }
@@ -776,7 +708,6 @@ mod tests {
     #[test]
     fn rx_9070() {
         let e = lookup_gpu("AMD Radeon RX 9070").expect("no match");
-        assert_eq!(e.arch, "rdna4");
         assert_eq!(e.peak_flops_tc_tflops, 144.5);
         assert_eq!(e.peak_bw_gbps, 644.0);
     }
@@ -791,7 +722,6 @@ mod tests {
     #[test]
     fn rx_7900_gre() {
         let e = lookup_gpu("AMD Radeon RX 7900 GRE").expect("no match");
-        assert_eq!(e.arch, "rdna3");
         assert_eq!(e.peak_flops_tc_tflops, 92.0);
         assert_eq!(e.peak_bw_gbps, 576.0);
     }
@@ -799,7 +729,6 @@ mod tests {
     #[test]
     fn rx_7700_xt() {
         let e = lookup_gpu("AMD Radeon RX 7700 XT").expect("no match");
-        assert_eq!(e.arch, "rdna3");
         assert_eq!(e.peak_flops_tc_tflops, 70.3);
         assert_eq!(e.peak_bw_gbps, 432.0);
     }
@@ -807,7 +736,6 @@ mod tests {
     #[test]
     fn rx_7600_xt() {
         let e = lookup_gpu("AMD Radeon RX 7600 XT").expect("no match");
-        assert_eq!(e.arch, "rdna3");
         assert_eq!(e.peak_flops_tc_tflops, 45.1);
         assert_eq!(e.peak_bw_gbps, 288.0);
     }

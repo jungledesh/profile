@@ -26,9 +26,14 @@ pub(crate) fn metrics_url(input: &str) -> String {
     }
 }
 
-pub(crate) fn fetch_metrics_body(client: &reqwest::blocking::Client, url: &str) -> Result<String> {
+pub(crate) fn fetch_metrics_body(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    timeout: Duration,
+) -> Result<String> {
     client
         .get(url)
+        .timeout(timeout)
         .send()
         .with_context(|| format!("failed to GET {}", url))?
         .error_for_status()
@@ -248,21 +253,25 @@ fn histogram_window_mass(first: &Scrape, last: &Scrape, base: &str) -> Option<Hi
     })
 }
 
+#[cfg(test)]
 fn histogram_window_mean(first: &Scrape, last: &Scrape, base: &str) -> Option<f64> {
     let m = histogram_window_mass(first, last, base)?;
     let x = m.sum_delta / m.count_delta;
     x.is_finite().then_some(x)
 }
 
+#[cfg(test)]
 fn tpot_window_mass(first: &Scrape, last: &Scrape) -> Option<HistogramWindowMass> {
     histogram_window_mass(first, last, "vllm_request_time_per_output_token_seconds")
         .or_else(|| histogram_window_mass(first, last, "vllm_time_per_output_token_seconds"))
 }
 
+#[cfg(test)]
 fn histogram_window_mean_ms(first: &Scrape, last: &Scrape, base: &str) -> Option<f64> {
     histogram_window_mean(first, last, base).map(|sec| sec * 1000.0)
 }
 
+#[cfg(test)]
 fn tpot_window_ms(first: &Scrape, last: &Scrape) -> Option<f64> {
     tpot_window_mass(first, last).and_then(|m| {
         let sec = m.sum_delta / m.count_delta;
@@ -360,6 +369,7 @@ pub(crate) fn histogram_quantile(q: f64, buckets: &[HistogramCount]) -> Option<Q
 /// Returns None on counter reset (any bucket delta < 0), bucket count mismatch, or zero traffic.
 /// No fallback to cumulative - stale historical p99 is worse than no value.
 /// `value` is in milliseconds; `clamped` preserved from the quantile.
+#[cfg(test)]
 fn histogram_window_p99_ms(first: &Scrape, last: &Scrape, base: &str) -> Option<QuantileEstimate> {
     let delta = histogram_window_delta_buckets(first, last, base);
     histogram_quantile(0.99, &delta).map(|q| QuantileEstimate {
@@ -368,6 +378,7 @@ fn histogram_window_p99_ms(first: &Scrape, last: &Scrape, base: &str) -> Option<
     })
 }
 
+#[cfg(test)]
 fn histogram_window_p95_ms(first: &Scrape, last: &Scrape, base: &str) -> Option<QuantileEstimate> {
     let delta = histogram_window_delta_buckets(first, last, base);
     histogram_quantile(0.95, &delta).map(|q| QuantileEstimate {
@@ -446,30 +457,66 @@ pub(crate) fn merge_p99_bucket_vecs(vecs: &[&[HistogramCount]]) -> Vec<Histogram
 
 /// `first` = scrape from the first sample, `last` = scrape from the final sample in the window.
 fn apply_histogram_window(first: &Scrape, last: &Scrape, m: &mut VllmRawMetrics) {
-    m.ttft_window_mass = histogram_window_mass(first, last, "vllm_time_to_first_token_seconds");
-    m.tpot_window_mass = tpot_window_mass(first, last);
-    m.prefill_window_mass = histogram_window_mass(first, last, "vllm_request_prefill_time_seconds");
-    m.queue_window_mass = histogram_window_mass(first, last, "vllm_request_queue_time_seconds");
-    m.prompt_tokens_window_mass = histogram_window_mass(first, last, "vllm_request_prompt_tokens");
-    m.generation_tokens_window_mass =
-        histogram_window_mass(first, last, "vllm_request_generation_tokens");
+    let ttft_mass = histogram_window_mass(first, last, "vllm_time_to_first_token_seconds");
+    let tpot_mass_primary =
+        histogram_window_mass(first, last, "vllm_request_time_per_output_token_seconds");
+    let tpot_mass_legacy = histogram_window_mass(first, last, "vllm_time_per_output_token_seconds");
+    let prefill_mass = histogram_window_mass(first, last, "vllm_request_prefill_time_seconds");
+    let queue_mass = histogram_window_mass(first, last, "vllm_request_queue_time_seconds");
+    let prompt_mass = histogram_window_mass(first, last, "vllm_request_prompt_tokens");
+    let gen_mass = histogram_window_mass(first, last, "vllm_request_generation_tokens");
+
+    m.ttft_window_mass = ttft_mass;
+    m.tpot_window_mass = tpot_mass_primary.or(tpot_mass_legacy);
+    m.prefill_window_mass = prefill_mass;
+    m.queue_window_mass = queue_mass;
+    m.prompt_tokens_window_mass = prompt_mass;
+    m.generation_tokens_window_mass = gen_mass;
 
     // Prefer Δsum/Δcount over that window; if no new observations, use last-scrape mean.
-    m.ttft_ms = histogram_window_mean_ms(first, last, "vllm_time_to_first_token_seconds")
+    m.ttft_ms = ttft_mass
+        .and_then(|mass| {
+            let sec = mass.sum_delta / mass.count_delta;
+            sec.is_finite().then_some(sec * 1000.0)
+        })
         .or_else(|| histogram_mean_ms_from_scrape(last, "vllm_time_to_first_token_seconds"));
-    m.tpot_ms = tpot_window_ms(first, last).or_else(|| {
-        histogram_mean_ms_from_scrape(last, "vllm_request_time_per_output_token_seconds")
-            .or_else(|| histogram_mean_ms_from_scrape(last, "vllm_time_per_output_token_seconds"))
-    });
-    m.prefill_latency_ms =
-        histogram_window_mean_ms(first, last, "vllm_request_prefill_time_seconds")
-            .or_else(|| histogram_mean_ms_from_scrape(last, "vllm_request_prefill_time_seconds"));
-    m.queue_delay_ms = histogram_window_mean_ms(first, last, "vllm_request_queue_time_seconds")
+    m.tpot_ms = m
+        .tpot_window_mass
+        .and_then(|mass| {
+            let sec = mass.sum_delta / mass.count_delta;
+            sec.is_finite().then_some(sec * 1000.0)
+        })
+        .or_else(|| {
+            histogram_mean_ms_from_scrape(last, "vllm_request_time_per_output_token_seconds")
+                .or_else(|| {
+                    histogram_mean_ms_from_scrape(last, "vllm_time_per_output_token_seconds")
+                })
+        });
+    m.prefill_latency_ms = prefill_mass
+        .and_then(|mass| {
+            let sec = mass.sum_delta / mass.count_delta;
+            sec.is_finite().then_some(sec * 1000.0)
+        })
+        .or_else(|| histogram_mean_ms_from_scrape(last, "vllm_request_prefill_time_seconds"));
+    m.queue_delay_ms = queue_mass
+        .and_then(|mass| {
+            let sec = mass.sum_delta / mass.count_delta;
+            sec.is_finite().then_some(sec * 1000.0)
+        })
         .or_else(|| histogram_mean_ms_from_scrape(last, "vllm_request_queue_time_seconds"));
-    m.prompt_tokens_mean = histogram_window_mean(first, last, "vllm_request_prompt_tokens")
+    m.prompt_tokens_mean = prompt_mass
+        .and_then(|mass| {
+            let mean = mass.sum_delta / mass.count_delta;
+            mean.is_finite().then_some(mean)
+        })
         .or_else(|| histogram_mean_from_scrape(last, "vllm_request_prompt_tokens"));
-    m.generation_tokens_mean = histogram_window_mean(first, last, "vllm_request_generation_tokens")
+    m.generation_tokens_mean = gen_mass
+        .and_then(|mass| {
+            let mean = mass.sum_delta / mass.count_delta;
+            mean.is_finite().then_some(mean)
+        })
         .or_else(|| histogram_mean_from_scrape(last, "vllm_request_generation_tokens"));
+
     let prompt_delta = histogram_window_delta_buckets(first, last, "vllm_request_prompt_tokens");
     m.prompt_tokens_p99 = histogram_quantile(0.99, &prompt_delta).map(|q| q.value);
     m.prompt_tokens_p99_buckets = prompt_delta;
@@ -478,30 +525,57 @@ fn apply_histogram_window(first: &Scrape, last: &Scrape, m: &mut VllmRawMetrics)
     m.generation_tokens_p99 = histogram_quantile(0.99, &gen_delta).map(|q| q.value);
     m.generation_tokens_completed = gen_delta.last().map(|b| b.count).filter(|c| *c > 0.0);
     m.generation_tokens_p99_buckets = gen_delta;
-    let ttft_p99 = histogram_window_p99_ms(first, last, "vllm_time_to_first_token_seconds");
+    let ttft_delta =
+        histogram_window_delta_buckets(first, last, "vllm_time_to_first_token_seconds");
+    let ttft_p99 = histogram_quantile(0.99, &ttft_delta).map(|q| QuantileEstimate {
+        value: q.value * 1000.0,
+        clamped: q.clamped,
+    });
+    let ttft_p95 = histogram_quantile(0.95, &ttft_delta).map(|q| QuantileEstimate {
+        value: q.value * 1000.0,
+        clamped: q.clamped,
+    });
     m.ttft_p99_ms = ttft_p99.map(|q| q.value);
     m.ttft_p99_clamped = ttft_p99.map(|q| q.clamped).unwrap_or(false);
-    let tpot_p99 =
-        histogram_window_p99_ms(first, last, "vllm_request_time_per_output_token_seconds")
-            .or_else(|| histogram_window_p99_ms(first, last, "vllm_time_per_output_token_seconds"));
-    m.tpot_p99_ms = tpot_p99.map(|q| q.value);
-    m.tpot_p99_clamped = tpot_p99.map(|q| q.clamped).unwrap_or(false);
-    let ttft_p95 = histogram_window_p95_ms(first, last, "vllm_time_to_first_token_seconds");
     m.ttft_p95_ms = ttft_p95.map(|q| q.value);
     m.ttft_p95_clamped = ttft_p95.map(|q| q.clamped).unwrap_or(false);
-    let tpot_p95 =
-        histogram_window_p95_ms(first, last, "vllm_request_time_per_output_token_seconds")
-            .or_else(|| histogram_window_p95_ms(first, last, "vllm_time_per_output_token_seconds"));
+    m.ttft_p99_buckets = ttft_delta;
+
+    let tpot_delta_primary =
+        histogram_window_delta_buckets(first, last, "vllm_request_time_per_output_token_seconds");
+    let tpot_delta_legacy =
+        histogram_window_delta_buckets(first, last, "vllm_time_per_output_token_seconds");
+    let tpot_p99_primary =
+        histogram_quantile(0.99, &tpot_delta_primary).map(|q| QuantileEstimate {
+            value: q.value * 1000.0,
+            clamped: q.clamped,
+        });
+    let tpot_p99 = tpot_p99_primary.or_else(|| {
+        histogram_quantile(0.99, &tpot_delta_legacy).map(|q| QuantileEstimate {
+            value: q.value * 1000.0,
+            clamped: q.clamped,
+        })
+    });
+    m.tpot_p99_ms = tpot_p99.map(|q| q.value);
+    m.tpot_p99_clamped = tpot_p99.map(|q| q.clamped).unwrap_or(false);
+    let tpot_p95_primary =
+        histogram_quantile(0.95, &tpot_delta_primary).map(|q| QuantileEstimate {
+            value: q.value * 1000.0,
+            clamped: q.clamped,
+        });
+    let tpot_p95 = tpot_p95_primary.or_else(|| {
+        histogram_quantile(0.95, &tpot_delta_legacy).map(|q| QuantileEstimate {
+            value: q.value * 1000.0,
+            clamped: q.clamped,
+        })
+    });
     m.tpot_p95_ms = tpot_p95.map(|q| q.value);
     m.tpot_p95_clamped = tpot_p95.map(|q| q.clamped).unwrap_or(false);
-    m.ttft_p99_buckets =
-        histogram_window_delta_buckets(first, last, "vllm_time_to_first_token_seconds");
-    m.tpot_p99_buckets =
-        histogram_window_delta_buckets(first, last, "vllm_request_time_per_output_token_seconds");
-    if m.tpot_p99_buckets.is_empty() {
-        m.tpot_p99_buckets =
-            histogram_window_delta_buckets(first, last, "vllm_time_per_output_token_seconds");
-    }
+    m.tpot_p99_buckets = if tpot_delta_primary.is_empty() {
+        tpot_delta_legacy
+    } else {
+        tpot_delta_primary
+    };
 }
 
 pub(crate) fn max_num_seqs_from_scrape(scrape: &Scrape) -> Option<u32> {
@@ -528,14 +602,11 @@ fn u32_gauge_from_scrape(scrape: &Scrape, name: &str) -> Option<u32> {
 }
 
 /// One-shot startup scrape for `--max-num-seqs` before diagnose collection starts.
+/// Full scrape parse (same acceptance rules as in-window `max_num_seqs_from_scrape`).
 pub(crate) fn preflight_max_num_seqs(url: &str, timeout: Duration) -> Option<u32> {
-    let client = reqwest::blocking::Client::builder()
-        .use_rustls_tls()
-        .timeout(timeout)
-        .build()
-        .ok()?;
+    let client = super::shared_http_client()?;
     let metrics_url = metrics_url(url);
-    let body = fetch_metrics_body(&client, &metrics_url).ok()?;
+    let body = fetch_metrics_body(client, &metrics_url, timeout).ok()?;
     let scrape = scrape_from_body(&body).ok()?;
     max_num_seqs_from_scrape(&scrape)
 }
@@ -637,13 +708,11 @@ pub fn collect_vllm_metrics_for(
     window: Duration,
     known_max_num_seqs: Option<u32>,
 ) -> Result<(VllmRawMetrics, SystemTime)> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(REQ_TIMEOUT)
-        .build()
-        .context("failed to build HTTP client")?;
+    let client = super::shared_http_client().context("failed to build HTTP client")?;
     let url = metrics_url(input);
     let sample_count = sample_count_for(window);
-    let mut prefix_samples = Vec::with_capacity(sample_count);
+    let mut prefix_first: Option<PrefixCacheScrapeSample> = None;
+    let mut prefix_last: Option<PrefixCacheScrapeSample> = None;
     let mut window_start: Option<Instant> = None;
     let mut first_scrape: Option<Scrape> = None;
     let mut last_scrape: Option<Scrape> = None;
@@ -655,7 +724,7 @@ pub fn collect_vllm_metrics_for(
     let mut seat_wall_samples: Vec<SeatWallSample> = Vec::with_capacity(sample_count);
 
     run_sampling_loop(sample_count, |i| {
-        let body = fetch_metrics_body(&client, &url)?;
+        let body = fetch_metrics_body(client, &url, REQ_TIMEOUT)?;
         let scrape = scrape_from_body(&body)?;
         if let Some(k) = kv_cache_usage_perc_from_scrape(&scrape).filter(|x| x.is_finite()) {
             kv_cache_peak_perc = Some(kv_cache_peak_perc.map_or(k, |p| p.max(k)));
@@ -680,7 +749,12 @@ pub fn collect_vllm_metrics_for(
                 max_num_seqs: max,
             });
         }
-        prefix_samples.push(prefix_scrape_sample(&scrape));
+        let prefix_sample = prefix_scrape_sample(&scrape);
+        if i == 0 {
+            prefix_first = Some(prefix_sample);
+        } else {
+            prefix_last = Some(prefix_sample);
+        }
 
         if i == 0 {
             window_start = Some(Instant::now());
@@ -710,7 +784,11 @@ pub fn collect_vllm_metrics_for(
     m.generation_tokens_per_sec = rates.generation_tokens_per_sec;
     m.prompt_tokens_per_sec = rates.prompt_tokens_per_sec;
     m.prefix_cache_hit_rate = rates.prefix_cache_hit_rate;
-    m.prefix_cache_scrape_samples = prefix_samples;
+    m.prefix_cache_scrape_samples = match (prefix_first, prefix_last) {
+        (Some(first), Some(last)) => vec![first, last],
+        (Some(first), None) => vec![first],
+        _ => Vec::new(),
+    };
     m.request_success_per_sec = counter_delta_per_sec(
         total_request_success(&first_scrape),
         total_request_success(&last_scrape),
@@ -775,11 +853,6 @@ fn parse_cache_config_labels(scrape: &Scrape) -> CacheConfigLabels {
             .get("gpu_memory_utilization")
             .and_then(|v| v.parse().ok())
             .filter(|v: &f64| v.is_finite() && *v > 0.0),
-        // Allocator-computed (vLLM v0.25.1 cache.py); absent → None, never guessed.
-        kv_cache_size_tokens: s
-            .labels
-            .get("kv_cache_size_tokens")
-            .and_then(|v| v.parse().ok()),
         kv_cache_max_concurrency: s
             .labels
             .get("kv_cache_max_concurrency")
@@ -859,7 +932,6 @@ fn parse_vllm_metrics(scrape: &Scrape) -> Result<VllmRawMetrics> {
         seat_wall_cooccurred: None,
         kv_frac_per_running_peak: None,
         kv_cache_usage_perc,
-        kv_cache_avg_perc: None,
         kv_cache_peak_perc: None,
         ttft_ms,
         tpot_ms,
@@ -1597,7 +1669,6 @@ vllm:cache_config_info{block_size="16",cache_dtype="auto",cpu_offload_gb="0",ena
         assert_eq!(cc.enable_prefix_caching, Some(true));
         assert_eq!(cc.enable_chunked_prefill, Some(false));
         assert_eq!(cc.gpu_memory_utilization, Some(0.9));
-        assert!(cc.kv_cache_size_tokens.is_none());
         assert!(cc.kv_cache_max_concurrency.is_none());
         assert!(cc.mamba_block_size.is_none());
         assert!(cc.mamba_page_size_padded.is_none());
@@ -1617,7 +1688,6 @@ vllm:cache_config_info{block_size="16",cache_dtype="auto",cpu_offload_gb="0",ena
         assert!(cc.cache_dtype.is_none());
         assert!(cc.enable_prefix_caching.is_none());
         assert!(cc.enable_chunked_prefill.is_none());
-        assert!(cc.kv_cache_size_tokens.is_none());
         assert!(cc.kv_cache_max_concurrency.is_none());
         assert!(cc.mamba_block_size.is_none());
         assert!(cc.mamba_page_size_padded.is_none());
@@ -1653,7 +1723,6 @@ vllm:cache_config_info{block_size="16",num_gpu_blocks="4096",cache_dtype="auto",
 "#;
         let scrape = scrape_from_body(body).unwrap();
         let cc = parse_cache_config_labels(&scrape);
-        assert_eq!(cc.kv_cache_size_tokens, Some(201_874));
         assert_eq!(cc.kv_cache_max_concurrency, Some(24.64));
         assert_eq!(cc.mamba_block_size, Some(784));
         assert_eq!(cc.mamba_page_size_padded, Some(25_690_112));

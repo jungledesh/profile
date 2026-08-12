@@ -123,12 +123,7 @@ fn kv_rules_absent_from_fired(fired_names: &HashSet<&'static str>) -> bool {
 }
 
 fn metrics_scrape_url(metrics_input: &str) -> String {
-    let base = metrics_input.trim_end_matches('/');
-    if base.ends_with("/metrics") {
-        base.to_string()
-    } else {
-        format!("{base}/metrics")
-    }
+    crate::collectors::vllm::metrics_url(metrics_input)
 }
 
 /// R2 core metric: KV cache usage gauge from `/metrics`.

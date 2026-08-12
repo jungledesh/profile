@@ -8,8 +8,6 @@
 /// param_count and active_param_count are in raw parameter counts (not billions).
 /// e.g. 8B → 8_000_000_000u64.
 pub struct CatalogEntry {
-    /// Test-only discriminator to verify token matching order.
-    pub family: &'static str,
     /// Total parameter count.
     pub param_count: u64,
     /// Active parameter count for MoE (experts on path) or multimodal LM-only
@@ -56,7 +54,6 @@ pub struct CatalogEntry {
 /// state fields default to `None` inside the expansion.
 macro_rules! catalog_dense {
     (
-        family: $family:expr,
         param_count: $param_count:expr,
         active_param_count: $active_param_count:expr,
         num_layers: $num_layers:expr,
@@ -70,7 +67,6 @@ macro_rules! catalog_dense {
         $(,)?
     ) => {
         CatalogEntry {
-            family: $family,
             param_count: $param_count,
             active_param_count: $active_param_count,
             num_layers: $num_layers,
@@ -102,7 +98,6 @@ macro_rules! catalog_dense {
 /// Hybrid catalog row (linear_* / state_dtype set by name).
 macro_rules! catalog_hybrid {
     (
-        family: $family:expr,
         param_count: $param_count:expr,
         active_param_count: $active_param_count:expr,
         num_layers: $num_layers:expr,
@@ -121,7 +116,6 @@ macro_rules! catalog_hybrid {
         state_dtype: $state_dtype:expr $(,)?
     ) => {
         CatalogEntry {
-            family: $family,
             param_count: $param_count,
             active_param_count: $active_param_count,
             num_layers: $num_layers,
@@ -160,7 +154,6 @@ static CATALOG: &[ModelEntry] = &[
     ModelEntry {
         tokens: &["nemotron", "8b"],
         entry: catalog_dense! {
-            family: "nemotron",
             param_count: 8 * B,
             active_param_count: None,
             num_layers: 32,
@@ -183,7 +176,6 @@ static CATALOG: &[ModelEntry] = &[
     ModelEntry {
         tokens: &["muse", "glimmer", "30b"],
         entry: catalog_dense! {
-            family: "muse_glimmer",
             param_count: 29_600_000_000,
             active_param_count: Some(27_800_000_000),
             num_layers: 52,
@@ -202,7 +194,6 @@ static CATALOG: &[ModelEntry] = &[
     ModelEntry {
         tokens: &["llama", "3", "8b"],
         entry: catalog_dense! {
-            family: "llama3",
             param_count: 8 * B,
             active_param_count: None,
             num_layers: 32,
@@ -221,7 +212,6 @@ static CATALOG: &[ModelEntry] = &[
     ModelEntry {
         tokens: &["qwen3", "30b"],
         entry: catalog_dense! {
-            family: "qwen3",
             param_count: 30 * B,
             active_param_count: Some(3 * B),
             num_layers: 48,
@@ -242,7 +232,6 @@ static CATALOG: &[ModelEntry] = &[
     ModelEntry {
         tokens: &["qwen3.6", "27b"],
         entry: catalog_hybrid! {
-            family: "qwen3.6",
             param_count: 27 * B,
             active_param_count: None,
             num_layers: 64,
@@ -269,7 +258,6 @@ static CATALOG: &[ModelEntry] = &[
     ModelEntry {
         tokens: &["qwen3", "32b"],
         entry: catalog_dense! {
-            family: "qwen3",
             param_count: 32 * B,
             active_param_count: None,
             num_layers: 64,
@@ -285,7 +273,6 @@ static CATALOG: &[ModelEntry] = &[
     ModelEntry {
         tokens: &["qwen3", "14b"],
         entry: catalog_dense! {
-            family: "qwen3",
             param_count: 14 * B,
             active_param_count: None,
             num_layers: 40,
@@ -302,7 +289,6 @@ static CATALOG: &[ModelEntry] = &[
         // https://huggingface.co/Qwen/Qwen3-8B/raw/main/config.json
         tokens: &["qwen3", "8b"],
         entry: catalog_dense! {
-            family: "qwen3",
             param_count: 8 * B,
             active_param_count: None,
             num_layers: 36,
@@ -319,7 +305,6 @@ static CATALOG: &[ModelEntry] = &[
         // https://huggingface.co/Qwen/Qwen3-4B/raw/main/config.json
         tokens: &["qwen3", "4b"],
         entry: catalog_dense! {
-            family: "qwen3",
             param_count: 4 * B,
             active_param_count: None,
             num_layers: 36,
@@ -336,7 +321,6 @@ static CATALOG: &[ModelEntry] = &[
         // https://huggingface.co/Qwen/Qwen3-1.7B/raw/main/config.json
         tokens: &["qwen3", "1.7b"],
         entry: catalog_dense! {
-            family: "qwen3",
             param_count: 1_700_000_000,
             active_param_count: None,
             num_layers: 28,
@@ -353,7 +337,6 @@ static CATALOG: &[ModelEntry] = &[
         // https://huggingface.co/Qwen/Qwen3-0.6B/raw/main/config.json
         tokens: &["qwen3", "0.6b"],
         entry: catalog_dense! {
-            family: "qwen3",
             param_count: 600_000_000,
             active_param_count: None,
             num_layers: 28,
@@ -370,7 +353,6 @@ static CATALOG: &[ModelEntry] = &[
     ModelEntry {
         tokens: &["qwen2.5", "32b"],
         entry: catalog_dense! {
-            family: "qwen2.5",
             param_count: 32 * B,
             active_param_count: None,
             num_layers: 64,
@@ -386,7 +368,6 @@ static CATALOG: &[ModelEntry] = &[
     ModelEntry {
         tokens: &["qwen2.5", "14b"],
         entry: catalog_dense! {
-            family: "qwen2.5",
             param_count: 14 * B,
             active_param_count: None,
             num_layers: 48,
@@ -402,7 +383,6 @@ static CATALOG: &[ModelEntry] = &[
     ModelEntry {
         tokens: &["qwen2.5", "7b"],
         entry: catalog_dense! {
-            family: "qwen2.5",
             param_count: 7 * B,
             active_param_count: None,
             num_layers: 28,
@@ -420,7 +400,6 @@ static CATALOG: &[ModelEntry] = &[
         // https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-32B/raw/main/config.json
         tokens: &["deepseek", "r1", "distill", "32b"],
         entry: catalog_dense! {
-            family: "deepseek",
             param_count: 32 * B,
             active_param_count: None,
             num_layers: 64,
@@ -437,7 +416,6 @@ static CATALOG: &[ModelEntry] = &[
         // https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-14B/raw/main/config.json
         tokens: &["deepseek", "r1", "distill", "14b"],
         entry: catalog_dense! {
-            family: "deepseek",
             param_count: 14 * B,
             active_param_count: None,
             num_layers: 48,
@@ -454,7 +432,6 @@ static CATALOG: &[ModelEntry] = &[
         // https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B/raw/main/config.json
         tokens: &["deepseek", "r1", "distill", "7b"],
         entry: catalog_dense! {
-            family: "deepseek",
             param_count: 7 * B,
             active_param_count: None,
             num_layers: 28,
@@ -471,7 +448,6 @@ static CATALOG: &[ModelEntry] = &[
         // https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Llama-8B/raw/main/config.json
         tokens: &["deepseek", "r1", "distill", "8b"],
         entry: catalog_dense! {
-            family: "deepseek",
             param_count: 8 * B,
             active_param_count: None,
             num_layers: 32,
@@ -488,7 +464,6 @@ static CATALOG: &[ModelEntry] = &[
         // https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B/raw/main/config.json
         tokens: &["deepseek", "r1", "distill", "1.5b"],
         entry: catalog_dense! {
-            family: "deepseek",
             param_count: 1_500_000_000,
             active_param_count: None,
             num_layers: 28,
@@ -504,7 +479,6 @@ static CATALOG: &[ModelEntry] = &[
     ModelEntry {
         tokens: &["deepseek", "7b"],
         entry: catalog_dense! {
-            family: "deepseek",
             param_count: 7 * B,
             active_param_count: None,
             num_layers: 30,
@@ -521,7 +495,6 @@ static CATALOG: &[ModelEntry] = &[
     ModelEntry {
         tokens: &["mistral", "7b"],
         entry: catalog_dense! {
-            family: "mistral",
             param_count: 7 * B,
             active_param_count: None,
             num_layers: 32,
@@ -546,7 +519,6 @@ static CATALOG: &[ModelEntry] = &[
     ModelEntry {
         tokens: &["gemma", "4", "27b"],
         entry: catalog_dense! {
-            family: "gemma4",
             param_count: 31 * B,
             active_param_count: None,
             num_layers: 60,
@@ -562,7 +534,6 @@ static CATALOG: &[ModelEntry] = &[
     ModelEntry {
         tokens: &["gemma", "4", "31b"],
         entry: catalog_dense! {
-            family: "gemma4",
             param_count: 31 * B,
             active_param_count: None,
             num_layers: 60,
@@ -586,7 +557,6 @@ static CATALOG: &[ModelEntry] = &[
     ModelEntry {
         tokens: &["gemma", "4", "26b"],
         entry: catalog_dense! {
-            family: "gemma4",
             param_count: 25_200_000_000,
             active_param_count: Some(3_800_000_000),
             num_layers: 30, // Verified from HF config
@@ -607,7 +577,6 @@ static CATALOG: &[ModelEntry] = &[
         // https://huggingface.co/google/gemma-3-27b-it (text_config)
         tokens: &["gemma 3", "27b"],
         entry: catalog_dense! {
-            family: "gemma3",
             param_count: 27 * B,
             active_param_count: None,
             num_layers: 62,
@@ -625,7 +594,6 @@ static CATALOG: &[ModelEntry] = &[
     ModelEntry {
         tokens: &["gemma3", "27b"],
         entry: catalog_dense! {
-            family: "gemma3",
             param_count: 27 * B,
             active_param_count: None,
             num_layers: 62,
@@ -645,7 +613,6 @@ static CATALOG: &[ModelEntry] = &[
         // from Gemma 3 reference config (gm.nn.Gemma3_12B).
         tokens: &["gemma 3", "12b"],
         entry: catalog_dense! {
-            family: "gemma3",
             param_count: 12 * B,
             active_param_count: None,
             num_layers: 48,
@@ -663,7 +630,6 @@ static CATALOG: &[ModelEntry] = &[
     ModelEntry {
         tokens: &["gemma3", "12b"],
         entry: catalog_dense! {
-            family: "gemma3",
             param_count: 12 * B,
             active_param_count: None,
             num_layers: 48,
@@ -684,7 +650,6 @@ static CATALOG: &[ModelEntry] = &[
         // head_dim=256).
         tokens: &["gemma 3", "4b"],
         entry: catalog_dense! {
-            family: "gemma3",
             param_count: 4 * B,
             active_param_count: None,
             num_layers: 34,
@@ -702,7 +667,6 @@ static CATALOG: &[ModelEntry] = &[
     ModelEntry {
         tokens: &["gemma3", "4b"],
         entry: catalog_dense! {
-            family: "gemma3",
             param_count: 4 * B,
             active_param_count: None,
             num_layers: 34,
@@ -723,7 +687,6 @@ static CATALOG: &[ModelEntry] = &[
         // https://huggingface.co/google/gemma-3-1b-it/raw/main/config.json
         tokens: &["gemma 3", "1b"],
         entry: catalog_dense! {
-            family: "gemma3",
             param_count: B,
             active_param_count: None,
             num_layers: 26,
@@ -743,7 +706,6 @@ static CATALOG: &[ModelEntry] = &[
     ModelEntry {
         tokens: &["gemma3", "1b"],
         entry: catalog_dense! {
-            family: "gemma3",
             param_count: B,
             active_param_count: None,
             num_layers: 26,
@@ -767,7 +729,6 @@ static CATALOG: &[ModelEntry] = &[
     ModelEntry {
         tokens: &["gemma", "27b"],
         entry: catalog_dense! {
-            family: "gemma",
             param_count: 27 * B,
             active_param_count: None,
             num_layers: 46,
@@ -791,7 +752,6 @@ static CATALOG: &[ModelEntry] = &[
     ModelEntry {
         tokens: &["gemma", "9b"],
         entry: catalog_dense! {
-            family: "gemma",
             param_count: 9 * B,
             active_param_count: None,
             num_layers: 42,
@@ -810,7 +770,6 @@ static CATALOG: &[ModelEntry] = &[
     ModelEntry {
         tokens: &["glm", "32b"],
         entry: catalog_dense! {
-            family: "glm",
             param_count: 32 * B,
             active_param_count: None,
             num_layers: 61,
@@ -831,7 +790,6 @@ static CATALOG: &[ModelEntry] = &[
     ModelEntry {
         tokens: &["phi", "4", "mini"],
         entry: catalog_dense! {
-            family: "phi4mini",
             param_count: 3_800_000_000,
             active_param_count: None,
             num_layers: 32,
@@ -848,7 +806,6 @@ static CATALOG: &[ModelEntry] = &[
     ModelEntry {
         tokens: &["phi", "4", "14b"],
         entry: catalog_dense! {
-            family: "phi4",
             param_count: 14 * B,
             active_param_count: None,
             num_layers: 40,
@@ -865,7 +822,6 @@ static CATALOG: &[ModelEntry] = &[
     ModelEntry {
         tokens: &["phi", "4"],
         entry: catalog_dense! {
-            family: "phi4",
             param_count: 14 * B,
             active_param_count: None,
             num_layers: 40,
@@ -981,14 +937,12 @@ mod tests {
     #[test]
     fn phi4_14b() {
         let e = lookup_model("microsoft/phi-4").expect("no match");
-        assert_eq!(e.family, "phi4");
         assert_eq!(e.param_count, 14 * B);
     }
 
     #[test]
     fn phi4_mini_instruct_resolves_to_3_8b() {
         let e = lookup_model("microsoft/Phi-4-mini-instruct").expect("no match");
-        assert_eq!(e.family, "phi4mini");
         assert_eq!(e.param_count, 3_800_000_000);
         assert_eq!(e.num_layers, 32);
         assert_eq!(e.hidden_dim, 3072);
@@ -1000,7 +954,6 @@ mod tests {
     #[test]
     fn glm_32b() {
         let e = lookup_model("zai-org/GLM-4-32B-0414").expect("no match");
-        assert_eq!(e.family, "glm");
         assert_eq!(e.param_count, 32 * B);
         assert_eq!(e.num_layers, 61);
         assert_eq!(e.hidden_dim, 6144);
@@ -1029,7 +982,6 @@ mod tests {
     #[test]
     fn qwen36_27b() {
         let e = lookup_model("Qwen/Qwen3.6-27B").expect("no match");
-        assert_eq!(e.family, "qwen3.6");
         assert_eq!(e.param_count, 27 * B);
         assert!(e.active_param_count.is_none());
         assert_eq!(e.num_layers, 64);
@@ -1050,7 +1002,6 @@ mod tests {
     fn gemma_4_27b_hf_name() {
         // Google's HuggingFace name, must NOT fall through to Gemma 2 27B.
         let e = lookup_model("google/gemma-4-pt-27b-it").expect("no match");
-        assert_eq!(e.family, "gemma4");
         assert_eq!(e.param_count, 31 * B);
         assert_eq!(e.num_layers, 60);
     }
@@ -1058,7 +1009,6 @@ mod tests {
     #[test]
     fn gemma_4_31b() {
         let e = lookup_model("gemma-4-31b-it-bf16.gguf").expect("no match");
-        assert_eq!(e.family, "gemma4");
         assert_eq!(e.param_count, 31 * B);
         assert!(e.active_param_count.is_none());
         assert_eq!(bytes_per_seq(&model_arch(e), 8192, 2), None);
@@ -1067,7 +1017,6 @@ mod tests {
     #[test]
     fn gemma_4_26b() {
         let e = lookup_model("gemma-4-26b-it-bf16.gguf").expect("no match");
-        assert_eq!(e.family, "gemma4");
         assert_eq!(e.param_count, 25_200_000_000);
         assert_eq!(e.active_param_count, Some(3_800_000_000));
     }
@@ -1083,7 +1032,6 @@ mod tests {
     fn muse_glimmer_30b_from_hf_config() {
         // Source: meta-models/Muse-Glimmer-30B text_config (2026-08-10).
         let e = lookup_model("meta-models/Muse-Glimmer-30B").expect("no match");
-        assert_eq!(e.family, "muse_glimmer");
         assert_eq!(e.param_count, 29_600_000_000);
         assert_eq!(e.active_param_count, Some(27_800_000_000)); // LM-only; ViT out of decode roof
         assert_eq!(e.num_layers, 52);
@@ -1155,7 +1103,6 @@ mod tests {
     #[test]
     fn gemma3_27b_not_gemma2() {
         let e = lookup_model("google/gemma-3-27b-it").expect("no match");
-        assert_eq!(e.family, "gemma3");
         assert_eq!(e.param_count, 27 * B);
         assert_eq!(e.num_layers, 62);
         assert_eq!(e.hidden_dim, 5376);
@@ -1168,7 +1115,6 @@ mod tests {
     #[test]
     fn gemma3_compact_name() {
         let e = lookup_model("gemma3-27b").expect("no match");
-        assert_eq!(e.family, "gemma3");
         assert_eq!(e.param_count, 27 * B);
         assert_eq!(e.num_layers, 62);
     }
@@ -1177,27 +1123,26 @@ mod tests {
     fn gemma2_quant_with_3bit_does_not_match_gemma3() {
         // Bare "3" token would false-match "3bit"; spaced "gemma 3" must not.
         let e = lookup_model("google/gemma-2-27b-3bit").expect("gemma2");
-        assert_eq!(e.family, "gemma");
         assert_eq!(e.num_layers, 46);
         assert_eq!(e.hidden_dim, 4608);
     }
 
     #[test]
     fn gemma_27b_v3_does_not_match_gemma3() {
+        // Must resolve to Gemma 2 27B (46 layers), not Gemma 3.
         let e = lookup_model("vendor/gemma-27b-v3").expect("gemma2");
-        assert_eq!(e.family, "gemma");
+        assert_eq!(e.num_layers, 46);
+        assert_eq!(e.hidden_dim, 4608);
     }
 
     #[test]
     fn gemma3_4b_and_1b() {
         let e4 = lookup_model("google/gemma-3-4b-it").expect("4b");
-        assert_eq!(e4.family, "gemma3");
         assert_eq!(e4.num_layers, 34);
         assert_eq!(e4.num_kv_heads, Some(4));
         assert_eq!(e4.swa_window, Some(1024));
         assert_eq!(e4.num_swa_layers, Some(29));
         let e1 = lookup_model("google/gemma-3-1b-it").expect("1b");
-        assert_eq!(e1.family, "gemma3");
         assert_eq!(e1.num_layers, 26);
         assert_eq!(e1.num_kv_heads, Some(1));
         assert_eq!(e1.swa_window, Some(512));
@@ -1215,14 +1160,12 @@ mod tests {
     #[test]
     fn gemma4_still_guarded_after_gemma3() {
         let e = lookup_model("google/gemma-4-pt-27b-it").expect("gemma4");
-        assert_eq!(e.family, "gemma4");
         assert_eq!(e.param_count, 31 * B);
     }
 
     #[test]
     fn gemma2_27b_still_matches() {
         let e = lookup_model("google/gemma-2-27b-it").expect("gemma2");
-        assert_eq!(e.family, "gemma");
         assert_eq!(e.num_layers, 46);
         assert_eq!(e.hidden_dim, 4608);
         assert_eq!(e.swa_window, Some(4096));
@@ -1243,7 +1186,6 @@ mod tests {
         assert!(lookup_model("Qwen/Qwen3-72B").is_none());
         // Explicit Qwen2.5 still works.
         let e = lookup_model("Qwen/Qwen2.5-7B").expect("qwen2.5");
-        assert_eq!(e.family, "qwen2.5");
         assert_eq!(e.param_count, 7 * B);
     }
 

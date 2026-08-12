@@ -203,6 +203,19 @@ fn eval_window_rules(
         spec_flagged: 0,
         spec_strongest: None,
     };
+    let peak_flops = summary.ctx.gpu.peak_flops_tc_tflops;
+    let peak_bw = summary.ctx.gpu.peak_bw_gbps;
+    let weight_params = summary
+        .ctx
+        .model
+        .param_count
+        .or(summary.ctx.model.active_param_count);
+    let static_subset = match (peak_flops, peak_bw, weight_params) {
+        (Some(flops), Some(bw), Some(wp)) => {
+            baseline::static_baseline_subset(summary.ctx, flops, bw, wp)
+        }
+        _ => None,
+    };
 
     for w in windows {
         if !window_is_evaluable(&w.snapshot) {
@@ -314,7 +327,31 @@ fn eval_window_rules(
 
         // Per-window baseline: shared by R1 and R6.
         let win_input = AnalysisInput::new(summary.ctx, w);
-        let win_baseline = baseline::compute(&win_input);
+        let win_baseline = if let (Some(subset), Some(bw)) = (static_subset, peak_bw) {
+            let tp = crate::collectors::effective_tensor_parallel(
+                summary.ctx.config.tensor_parallel_size,
+                w.snapshot.collected_gpu_count(),
+            )
+            .map(f64::from);
+            let roofline_params = summary
+                .ctx
+                .model
+                .active_param_count
+                .or(summary.ctx.model.param_count);
+            match (tp, roofline_params, peak_flops) {
+                (Some(tp), Some(roofline_params), Some(flops)) => baseline::compute_with_subset(
+                    &win_input,
+                    subset,
+                    flops,
+                    bw,
+                    tp,
+                    roofline_params,
+                ),
+                _ => baseline::compute(&win_input),
+            }
+        } else {
+            baseline::compute(&win_input)
+        };
         if let Some(ev) = win_baseline.as_ref().and_then(|b| b.spec_suspected) {
             eval.spec_flagged += 1;
             eval.spec_strongest = Some(match eval.spec_strongest {
@@ -1170,7 +1207,7 @@ mod tests {
             };
             let g = GpuRawMetrics {
                 gpu_name: Some("NVIDIA H100 80GB HBM3".to_string()),
-                gpu_util_pct: Some(40.0),
+                mem_util_pct: Some(40.0),
                 vram_used_mb: Some(20 * 1024),
                 vram_total_mb: Some(80 * 1024),
                 ..Default::default()
@@ -1243,7 +1280,7 @@ mod tests {
         };
         let g = GpuRawMetrics {
             gpu_name: Some("NVIDIA H100 80GB HBM3".to_string()),
-            gpu_util_pct: Some(40.0),
+            mem_util_pct: Some(40.0),
             vram_used_mb: Some(20 * 1024),
             vram_total_mb: Some(80 * 1024),
             ..Default::default()
@@ -1303,7 +1340,7 @@ mod tests {
                 },
                 gpus: vec![GpuRawMetrics {
                     gpu_name: Some("NVIDIA H100 80GB HBM3".to_string()),
-                    gpu_util_pct: Some(40.0),
+                    mem_util_pct: Some(40.0),
                     vram_used_mb: Some(20 * 1024),
                     vram_total_mb: Some(80 * 1024),
                     ..Default::default()

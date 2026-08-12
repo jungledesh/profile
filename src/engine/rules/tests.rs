@@ -93,7 +93,7 @@ fn input_r4_suppresses_r2() -> (StaticContext, RuntimeWindow) {
         gpus: vec![GpuRawMetrics {
             gpu_name: Some("NVIDIA H100 80GB HBM3".to_string()),
             vram_total_mb: Some(80 * 1024),
-            gpu_util_pct: Some(58.0),
+            mem_util_pct: Some(58.0),
             ..Default::default()
         }],
         host_memory: None,
@@ -127,14 +127,14 @@ fn vllm_base() -> VllmRawMetrics {
 
 fn gpu_low() -> GpuRawMetrics {
     GpuRawMetrics {
-        gpu_util_pct: Some(58.0),
+        mem_util_pct: Some(58.0),
         ..Default::default()
     }
 }
 
 fn gpu_busy() -> GpuRawMetrics {
     GpuRawMetrics {
-        gpu_util_pct: Some(75.0),
+        mem_util_pct: Some(75.0),
         ..Default::default()
     }
 }
@@ -142,7 +142,7 @@ fn gpu_busy() -> GpuRawMetrics {
 fn gpu_busy_with_vram() -> GpuRawMetrics {
     GpuRawMetrics {
         gpu_name: Some("NVIDIA H100 80GB HBM3".to_string()),
-        gpu_util_pct: Some(75.0),
+        mem_util_pct: Some(75.0),
         vram_used_mb: Some(40 * 1024),
         vram_total_mb: Some(80 * 1024),
         ..Default::default()
@@ -2260,7 +2260,7 @@ fn format_diagnose_verbose_r1_suppressed_by_r6_when_both_fire() {
 fn format_diagnose_verbose_shows_not_indicated_when_no_issue() {
     let t = SystemTime::UNIX_EPOCH;
     let mut g = gpu_low();
-    g.gpu_util_pct = Some(75.0);
+    g.mem_util_pct = Some(75.0);
     let mut v = vllm_base();
     v.num_requests_running = Some(64.0);
     let s = snap(t, t, v, g);
@@ -2277,7 +2277,7 @@ fn format_diagnose_verbose_shows_not_indicated_when_no_issue() {
 fn format_diagnose_verbose_healthy_shows_not_triggered_and_limiter() {
     let t = SystemTime::UNIX_EPOCH;
     let mut g = gpu_low();
-    g.gpu_util_pct = Some(75.0);
+    g.mem_util_pct = Some(75.0);
     g.gpu_name = Some("NVIDIA H100 80GB HBM3".to_string());
     g.vram_total_mb = Some(80 * 1024);
     let mut v = vllm_base();
@@ -2313,7 +2313,7 @@ fn format_diagnose_verbose_healthy_shows_not_triggered_and_limiter() {
 fn format_diagnose_quiet_healthy_renders_no_issues_and_limiter_only() {
     let t = SystemTime::UNIX_EPOCH;
     let mut g = gpu_low();
-    g.gpu_util_pct = Some(75.0);
+    g.mem_util_pct = Some(75.0);
     g.gpu_name = Some("NVIDIA H100 80GB HBM3".to_string());
     g.vram_total_mb = Some(80 * 1024);
     let mut v = vllm_base();
@@ -2404,7 +2404,7 @@ fn format_low_prefix_hit_rate_fired_matches_template() {
 fn format_diagnose_rules_no_fires_default_is_only_no_issues_line() {
     let t = SystemTime::UNIX_EPOCH;
     let mut g = gpu_low();
-    g.gpu_util_pct = Some(75.0);
+    g.mem_util_pct = Some(75.0);
     g.gpu_name = Some("NVIDIA H100 80GB HBM3".to_string());
     g.vram_total_mb = Some(80 * 1024);
     let mut v = vllm_base();
@@ -2889,7 +2889,7 @@ fn dag_layer2_suppresses_layer4_when_r2_fires() {
             win.snapshot.vllm.num_requests_running = Some(3.1);
             win.snapshot.vllm.num_requests_waiting = Some(0.0);
             win.snapshot.vllm.tpot_ms = Some(35.0);
-            win.snapshot.gpus[0].gpu_util_pct = Some(58.0);
+            win.snapshot.gpus[0].mem_util_pct = Some(58.0);
             win
         };
     }
@@ -3843,7 +3843,7 @@ fn format_diagnose_rules_for_windows_matches_requested_style_when_some_rules_fir
         v.num_requests_running = Some(3.2);
         v.tpot_ms = Some(35.0);
         let mut g = gpu_busy();
-        g.gpu_util_pct = None;
+        g.mem_util_pct = None;
         g.power_watts = Some(312.0);
         g.vram_used_mb = Some(62 * 1024);
         g.vram_total_mb = Some(80 * 1024);
@@ -3887,7 +3887,7 @@ fn format_diagnose_rules_for_windows_no_fires_is_single_no_issues_line() {
     v.generation_tokens_per_sec = Some(100.0);
     v.model_name = Some("meta-llama/Llama-3.1-8B-Instruct".to_string());
     let mut g = gpu_busy();
-    g.gpu_util_pct = Some(74.0);
+    g.mem_util_pct = Some(74.0);
     g.gpu_name = Some("NVIDIA H100 80GB HBM3".to_string());
     g.vram_total_mb = Some(80 * 1024);
     let snap = snap(t, t, v, g);
@@ -3931,7 +3931,7 @@ fn no_rules_with_queue_prints_no_capped_by_line() {
     v.generation_tokens_per_sec = Some(100.0);
     v.model_name = Some("meta-llama/Llama-3.1-8B-Instruct".to_string());
     let mut g = gpu_busy();
-    g.gpu_util_pct = Some(74.0);
+    g.mem_util_pct = Some(74.0);
     g.gpu_name = Some("NVIDIA H100 80GB HBM3".to_string());
     g.vram_total_mb = Some(80 * 1024);
     let snap = snap(t, t, v, g);
@@ -3964,7 +3964,7 @@ fn no_rules_with_queue_prints_no_capped_by_line() {
 fn no_rules_limiter_uses_aggregates_not_last_idle_snapshot() {
     let t = SystemTime::UNIX_EPOCH;
     let mut g = gpu_busy();
-    g.gpu_util_pct = Some(80.0);
+    g.mem_util_pct = Some(80.0);
     g.gpu_name = Some("NVIDIA H100 80GB HBM3".to_string());
     g.vram_total_mb = Some(80 * 1024);
 
