@@ -1837,10 +1837,7 @@ mod tests {
             snap,
         );
         let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
-        assert_eq!(
-            b.weight_dtype_source,
-            WeightDtypeSource::EnvVarQuantization
-        );
+        assert_eq!(b.weight_dtype_source, WeightDtypeSource::EnvVarQuantization);
         assert!((b.weight_gb - 35.0).abs() < 1e-3);
     }
 
@@ -1866,10 +1863,7 @@ mod tests {
             snap,
         );
         let b = compute(&AnalysisInput::new(&ctx, &win)).expect("baseline");
-        assert_eq!(
-            b.weight_dtype_source,
-            WeightDtypeSource::EnvVarQuantization
-        );
+        assert_eq!(b.weight_dtype_source, WeightDtypeSource::EnvVarQuantization);
         assert!((b.weight_gb - 14.8).abs() < 1e-3);
         let expected_decode = math::decode_ceiling_tps(1792.0, 29_600_000_000, 4);
         assert!((b.decode.expected - expected_decode).abs() < 1e-6);
