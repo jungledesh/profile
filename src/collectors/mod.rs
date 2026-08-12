@@ -24,8 +24,25 @@ pub use types::{
 };
 pub(crate) use vllm::merge_p99_bucket_vecs;
 
+use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
+
+/// Shared blocking client. Success is memoized; a failed build is retried next call
+/// (never cache `None` — that would kill the session after a transient failure).
+static SHARED_HTTP_CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+
+pub(crate) fn shared_http_client() -> Option<&'static reqwest::blocking::Client> {
+    if let Some(client) = SHARED_HTTP_CLIENT.get() {
+        return Some(client);
+    }
+    let client = reqwest::blocking::Client::builder()
+        .use_rustls_tls()
+        .build()
+        .ok()?;
+    let _ = SHARED_HTTP_CLIENT.set(client);
+    SHARED_HTTP_CLIENT.get()
+}
 
 pub fn collect_snapshot_for_window(
     vllm_metrics_input: &str,

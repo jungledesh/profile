@@ -1,197 +1,149 @@
 {
-  "note": "on_demand_per_hr from https://www.runpod.io/pricing where the GPU is listed on the Pods page (see per-row as_of). spot_per_hr is a market estimate unless spot_source says otherwise. Rows not on RunPod use market estimate for both.",
+  "note": "on_demand_per_hr from https://www.runpod.io/pricing where the GPU is listed on the Pods page (see per-row as_of). Rows not on RunPod use market estimate.",
   "updated": "2026-07-23",
   "gpus": {
     "h100 pcie": {
       "name": "NVIDIA H100 PCIe",
       "on_demand_per_hr": 2.89,
-      "spot_per_hr": 0.9,
       "source": "https://www.runpod.io/pricing",
-      "spot_source": "market estimate",
       "as_of": "2026-07-16"
     },
     "h100 sxm": {
       "name": "NVIDIA H100 SXM",
       "on_demand_per_hr": 2.99,
-      "spot_per_hr": 1.75,
       "source": "https://www.runpod.io/pricing",
-      "spot_source": "market estimate",
       "as_of": "2026-07-16"
     },
     "h100 hbm3": {
       "name": "NVIDIA H100 SXM (HBM3)",
       "on_demand_per_hr": 2.99,
-      "spot_per_hr": 1.75,
       "source": "https://www.runpod.io/pricing",
-      "spot_source": "market estimate",
       "as_of": "2026-07-16"
     },
     "h100 nvl": {
       "name": "NVIDIA H100 NVL",
       "on_demand_per_hr": 3.19,
-      "spot_per_hr": 1.9,
       "source": "https://www.runpod.io/pricing",
-      "spot_source": "market estimate",
       "as_of": "2026-07-23"
     },
     "h200": {
       "name": "NVIDIA H200",
       "on_demand_per_hr": 4.39,
-      "spot_per_hr": 2.5,
       "source": "https://www.runpod.io/pricing",
-      "spot_source": "market estimate",
       "as_of": "2026-07-16"
     },
     "b200": {
       "name": "NVIDIA B200",
       "on_demand_per_hr": 5.89,
-      "spot_per_hr": 2.0,
       "source": "https://www.runpod.io/pricing",
-      "spot_source": "market estimate",
       "as_of": "2026-07-16"
     },
     "b300": {
       "name": "NVIDIA B300",
       "on_demand_per_hr": 7.39,
-      "spot_per_hr": 7.39,
       "source": "https://www.runpod.io/pricing",
-      "spot_source": "market estimate",
       "as_of": "2026-07-16"
     },
     "rtx pro 6000 blackwell": {
       "name": "NVIDIA RTX PRO 6000 Blackwell",
       "on_demand_per_hr": 1.99,
-      "spot_per_hr": 0.9,
       "source": "https://www.runpod.io/pricing",
-      "spot_source": "market estimate",
       "as_of": "2026-07-16"
     },
     "a100 80gb": {
       "name": "NVIDIA A100 80GB",
       "on_demand_per_hr": 1.49,
-      "spot_per_hr": 0.6,
       "source": "https://www.runpod.io/pricing",
-      "spot_source": "market estimate",
       "as_of": "2026-07-16"
     },
     "l40s": {
       "name": "NVIDIA L40S",
       "on_demand_per_hr": 0.99,
-      "spot_per_hr": 0.8,
       "source": "https://www.runpod.io/pricing",
-      "spot_source": "market estimate",
       "as_of": "2026-07-16"
     },
     "rtx 4090": {
       "name": "NVIDIA RTX 4090",
       "on_demand_per_hr": 0.69,
-      "spot_per_hr": 0.35,
       "source": "https://www.runpod.io/pricing",
-      "spot_source": "market estimate",
       "as_of": "2026-07-16"
     },
     "rtx 5090": {
       "name": "NVIDIA RTX 5090",
       "on_demand_per_hr": 0.99,
-      "spot_per_hr": 0.4,
       "source": "https://www.runpod.io/pricing",
-      "spot_source": "market estimate",
       "as_of": "2026-07-16"
     },
     "rtx 3090": {
       "name": "NVIDIA RTX 3090",
       "on_demand_per_hr": 0.46,
-      "spot_per_hr": 0.14,
       "source": "https://www.runpod.io/pricing",
-      "spot_source": "market estimate",
       "as_of": "2026-07-16"
     },
     "rtx a6000": {
       "name": "NVIDIA RTX A6000",
       "on_demand_per_hr": 0.49,
-      "spot_per_hr": 0.4,
       "source": "https://www.runpod.io/pricing",
-      "spot_source": "market estimate",
       "as_of": "2026-07-16"
     },
     "a10g": {
       "name": "NVIDIA A10G",
       "on_demand_per_hr": 1.0,
-      "spot_per_hr": 0.4,
       "source": "market estimate",
-      "spot_source": "market estimate",
       "as_of": "2026-07-16"
     },
     "a100 40gb": {
       "name": "NVIDIA A100 40GB",
       "on_demand_per_hr": 1.5,
-      "spot_per_hr": 0.7,
       "source": "market estimate",
-      "spot_source": "market estimate",
       "as_of": "2026-07-16"
     },
     "rtx 3090 ti": {
       "name": "NVIDIA RTX 3090 Ti",
       "on_demand_per_hr": 0.22,
-      "spot_per_hr": 0.13,
       "source": "market estimate",
-      "spot_source": "market estimate",
       "as_of": "2026-07-16"
     },
     "gb200": {
       "name": "NVIDIA GB200",
       "on_demand_per_hr": 8.5,
-      "spot_per_hr": 4.0,
       "source": "market estimate",
-      "spot_source": "market estimate",
       "as_of": "2026-07-16"
     },
     "mi300x": {
       "name": "AMD Instinct MI300X",
       "on_demand_per_hr": 3.49,
-      "spot_per_hr": 1.85,
       "source": "market estimate",
-      "spot_source": "market estimate",
       "as_of": "2026-07-16"
     },
     "mi325x": {
       "name": "AMD Instinct MI325X",
       "on_demand_per_hr": 3.5,
-      "spot_per_hr": 2.5,
       "source": "market estimate",
-      "spot_source": "market estimate",
       "as_of": "2026-07-16"
     },
     "mi300a": {
       "name": "AMD Instinct MI300A",
       "on_demand_per_hr": 2.0,
-      "spot_per_hr": 1.5,
       "source": "market estimate",
-      "spot_source": "market estimate",
       "as_of": "2026-07-16"
     },
     "mi250x": {
       "name": "AMD Instinct MI250X",
       "on_demand_per_hr": 1.5,
-      "spot_per_hr": 0.8,
       "source": "market estimate",
-      "spot_source": "market estimate",
       "as_of": "2026-07-16"
     },
     "mi250": {
       "name": "AMD Instinct MI250",
       "on_demand_per_hr": 1.3,
-      "spot_per_hr": 0.7,
       "source": "market estimate",
-      "spot_source": "market estimate",
       "as_of": "2026-07-16"
     },
     "mi210": {
       "name": "AMD Instinct MI210",
       "on_demand_per_hr": 1.0,
-      "spot_per_hr": 0.5,
       "source": "market estimate",
-      "spot_source": "market estimate",
       "as_of": "2026-07-16"
     }
   }

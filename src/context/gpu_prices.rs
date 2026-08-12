@@ -8,7 +8,6 @@ const GPU_PRICES_JSON: &str = include_str!("gpu_prices.json");
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GpuPriceEntry {
     pub on_demand_per_hr: f64,
-    pub spot_per_hr: f64,
 }
 
 static PRICES: OnceLock<HashMap<String, GpuPriceEntry>> = OnceLock::new();
@@ -28,16 +27,10 @@ fn load_prices() -> &'static HashMap<String, GpuPriceEntry> {
                 .and_then(|v| v.as_f64())
                 .filter(|v| v.is_finite() && *v > 0.0)
                 .expect("gpu_prices entry missing on_demand_per_hr");
-            let spot = entry
-                .get("spot_per_hr")
-                .and_then(|v| v.as_f64())
-                .filter(|v| v.is_finite() && *v > 0.0)
-                .expect("gpu_prices entry missing spot_per_hr");
             out.insert(
                 key.clone(),
                 GpuPriceEntry {
                     on_demand_per_hr: on,
-                    spot_per_hr: spot,
                 },
             );
         }
@@ -75,7 +68,6 @@ mod tests {
     fn h200_matches_sxm_name() {
         let p = lookup_gpu_price("NVIDIA H200 SXM5").expect("h200 price");
         assert!((p.on_demand_per_hr - 4.39).abs() < 1e-9);
-        assert!((p.spot_per_hr - 2.50).abs() < 1e-9);
     }
 
     #[test]
@@ -100,7 +92,6 @@ mod tests {
     fn h100_nvl_price() {
         let p = lookup_gpu_price("NVIDIA H100 NVL").expect("h100 nvl price");
         assert!((p.on_demand_per_hr - 3.19).abs() < 1e-9);
-        assert!((p.spot_per_hr - 1.9).abs() < 1e-9);
     }
 
     #[test]
@@ -113,18 +104,16 @@ mod tests {
     fn rtx_4090_price() {
         let p = lookup_gpu_price("NVIDIA GeForce RTX 4090").expect("rtx 4090 price");
         assert!((p.on_demand_per_hr - 0.69).abs() < 1e-9);
-        assert!((p.spot_per_hr - 0.35).abs() < 1e-9);
     }
 
     #[test]
     fn a100_80gb_price() {
         let p = lookup_gpu_price("NVIDIA A100-SXM4-80GB").expect("a100 80gb price");
         assert!((p.on_demand_per_hr - 1.49).abs() < 1e-9);
-        assert!((p.spot_per_hr - 0.60).abs() < 1e-9);
     }
 
     #[test]
-    fn launch_gpus_have_on_demand_and_spot_prices() {
+    fn launch_gpus_have_on_demand_prices() {
         for name in [
             "NVIDIA A100-SXM4-80GB",
             "NVIDIA H100 80GB HBM3",
@@ -136,7 +125,6 @@ mod tests {
             let price =
                 lookup_gpu_price(name).unwrap_or_else(|| panic!("missing price for {name}"));
             assert!(price.on_demand_per_hr > 0.0, "{name} on-demand price");
-            assert!(price.spot_per_hr > 0.0, "{name} spot price");
         }
     }
 
@@ -149,7 +137,6 @@ mod tests {
     fn mi300x_price() {
         let p = lookup_gpu_price("AMD Instinct MI300X").expect("mi300x price");
         assert!((p.on_demand_per_hr - 3.49).abs() < 1e-9);
-        assert!((p.spot_per_hr - 1.85).abs() < 1e-9);
     }
 
     #[test]
@@ -175,14 +162,12 @@ mod tests {
     fn mi210_price() {
         let p = lookup_gpu_price("AMD Instinct MI210").expect("mi210 price");
         assert!((p.on_demand_per_hr - 1.00).abs() < 1e-9);
-        assert!((p.spot_per_hr - 0.50).abs() < 1e-9);
     }
 
     #[test]
     fn mi250_price() {
         let p = lookup_gpu_price("AMD Instinct MI250").expect("mi250 price");
         assert!((p.on_demand_per_hr - 1.30).abs() < 1e-9);
-        assert!((p.spot_per_hr - 0.70).abs() < 1e-9);
     }
 
     #[test]

@@ -104,7 +104,6 @@ pub(super) fn aggregate_windows(
     agg_v.kv_frac_per_running_peak = kv_frac_per_running_peak(&active_pairs);
     let kv_avg = weighted_mean(&evaluable_pairs, |w| w.vllm.kv_cache_usage_perc);
     agg_v.kv_cache_usage_perc = kv_avg;
-    agg_v.kv_cache_avg_perc = kv_avg;
     agg_v.kv_cache_peak_perc = kv_cache_peak_perc(&evaluable_pairs, last);
     agg_v.num_requests_swapped = last.vllm.num_requests_swapped;
     agg_v.cpu_cache_usage_perc = last.vllm.cpu_cache_usage_perc;
@@ -195,16 +194,14 @@ pub(super) fn aggregate_windows(
     agg_v.generation_tokens_total = chronological_last.vllm.generation_tokens_total;
     agg_v.request_success_total = chronological_last.vllm.request_success_total;
     agg_v.num_preemptions_total = chronological_last.vllm.num_preemptions_total;
-    agg_v.prefix_cache_scrape_samples = last.vllm.prefix_cache_scrape_samples.clone();
+    agg_v.prefix_cache_scrape_samples =
+        compact_prefix_samples(&last.vllm.prefix_cache_scrape_samples);
     // Static config labels don't change across windows - carry from last.
     agg_v.cache_config = last.vllm.cache_config.clone();
 
     // Slot index is stable across windows: collect sorts gpus by identity() before storing,
     // so idx N always refers to the same physical GPU in every window.
     for (idx, agg_g) in agg_gpus.iter_mut().enumerate() {
-        agg_g.gpu_util_pct = weighted_mean(&active_pairs, |w| {
-            w.gpus.get(idx).and_then(|g| g.gpu_util_pct)
-        });
         agg_g.mem_util_pct = weighted_mean(&active_pairs, |w| {
             w.gpus.get(idx).and_then(|g| g.mem_util_pct)
         });
@@ -492,6 +489,16 @@ fn prefix_hit_rate_sum_of_deltas(windows: &[&collectors::RawSnapshot]) -> Option
     }
 }
 
+fn compact_prefix_samples(
+    samples: &[collectors::PrefixCacheScrapeSample],
+) -> Vec<collectors::PrefixCacheScrapeSample> {
+    match (samples.first(), samples.last()) {
+        (Some(first), Some(last)) if samples.len() >= 2 => vec![first.clone(), last.clone()],
+        (Some(first), _) => vec![first.clone()],
+        _ => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -691,14 +698,14 @@ mod tests {
     #[test]
     fn aggregate_windows_time_weights_rates_latencies_running_waiting_and_state_from_last() {
         let g1 = GpuRawMetrics {
-            gpu_util_pct: Some(10.0),
+            mem_util_pct: Some(10.0),
             vram_used_mb: Some(1000),
             temperature_c: Some(40.0),
             sm_clock_mhz: Some(1000),
             ..Default::default()
         };
         let g2 = GpuRawMetrics {
-            gpu_util_pct: Some(50.0),
+            mem_util_pct: Some(50.0),
             vram_used_mb: Some(2000),
             temperature_c: Some(60.0),
             sm_clock_mhz: Some(2000),
@@ -736,7 +743,7 @@ mod tests {
         // (10+10)/(80+10) = 20/90 - sum of Δhits / sum of Δqueries, not last window only.
         assert!((agg.vllm.prefix_cache_hit_rate.unwrap() - 20.0 / 90.0).abs() < 1e-9);
         assert!(
-            (agg.gpus.first().and_then(|g| g.gpu_util_pct).unwrap() - (520.0 / 12.0)).abs() < 1e-4
+            (agg.gpus.first().and_then(|g| g.mem_util_pct).unwrap() - (520.0 / 12.0)).abs() < 1e-4
         );
         assert_eq!(agg.gpus.first().and_then(|g| g.vram_used_mb), Some(2000));
         assert!((agg.gpus.first().and_then(|g| g.temperature_c).unwrap() - 60.0).abs() < 1e-9);
@@ -867,7 +874,6 @@ mod tests {
             SystemTime::UNIX_EPOCH,
         );
         assert!((agg.vllm.kv_cache_usage_perc.unwrap() - 25.0).abs() < 1e-9);
-        assert!((agg.vllm.kv_cache_avg_perc.unwrap() - 25.0).abs() < 1e-9);
         assert!((agg.vllm.kv_cache_peak_perc.unwrap() - 92.0).abs() < 1e-9);
         assert_eq!(
             agg.gpus.first().and_then(|g| g.vram_used_mb),
@@ -924,7 +930,6 @@ mod tests {
             SystemTime::UNIX_EPOCH,
         );
         assert!((agg.vllm.kv_cache_usage_perc.unwrap() - 67.5).abs() < 1e-9);
-        assert!((agg.vllm.kv_cache_avg_perc.unwrap() - 67.5).abs() < 1e-9);
         assert!((agg.vllm.kv_cache_peak_perc.unwrap() - 95.0).abs() < 1e-9);
         assert_eq!(
             agg.gpus.first().and_then(|g| g.vram_used_mb),
@@ -1145,21 +1150,21 @@ mod tests {
             mk(
                 idle_v,
                 GpuRawMetrics {
-                    gpu_util_pct: Some(5.0),
+                    mem_util_pct: Some(5.0),
                     ..Default::default()
                 },
             ),
             mk(
                 active_v.clone(),
                 GpuRawMetrics {
-                    gpu_util_pct: Some(60.0),
+                    mem_util_pct: Some(60.0),
                     ..Default::default()
                 },
             ),
             mk(
                 active_v,
                 GpuRawMetrics {
-                    gpu_util_pct: Some(60.0),
+                    mem_util_pct: Some(60.0),
                     ..Default::default()
                 },
             ),
@@ -1172,7 +1177,7 @@ mod tests {
         let (agg, _) = aggregate_windows(&windows, &durations, SystemTime::UNIX_EPOCH);
         assert!((agg.vllm.generation_tokens_per_sec.unwrap() - 100.0).abs() < 1e-9);
         assert!((agg.vllm.num_requests_running.unwrap() - 20.0).abs() < 1e-9);
-        assert!((agg.gpus.first().and_then(|g| g.gpu_util_pct).unwrap() - 60.0).abs() < 1e-9);
+        assert!((agg.gpus.first().and_then(|g| g.mem_util_pct).unwrap() - 60.0).abs() < 1e-9);
         // If idle were included: (0+100+100)/3 = 66.7 tok/s.
         assert!((agg.vllm.generation_tokens_per_sec.unwrap() - (200.0 / 3.0)).abs() > 10.0);
     }
@@ -1193,13 +1198,13 @@ mod tests {
             gpus: vec![
                 GpuRawMetrics {
                     gpu_index: Some(0),
-                    gpu_util_pct: Some(u0),
+                    mem_util_pct: Some(u0),
                     power_watts: Some(p0),
                     ..Default::default()
                 },
                 GpuRawMetrics {
                     gpu_index: Some(1),
-                    gpu_util_pct: Some(u1),
+                    mem_util_pct: Some(u1),
                     power_watts: Some(p1),
                     ..Default::default()
                 },
@@ -1213,8 +1218,8 @@ mod tests {
             SystemTime::UNIX_EPOCH,
         );
         assert_eq!(agg.gpus.len(), 2);
-        assert!((agg.gpus[0].gpu_util_pct.unwrap() - 60.0).abs() < 1e-9);
-        assert!((agg.gpus[1].gpu_util_pct.unwrap() - 40.0).abs() < 1e-9);
+        assert!((agg.gpus[0].mem_util_pct.unwrap() - 60.0).abs() < 1e-9);
+        assert!((agg.gpus[1].mem_util_pct.unwrap() - 40.0).abs() < 1e-9);
         assert!(agg.gpus[0].power_watts.is_none());
         assert!(agg.gpus[1].power_watts.is_none());
         assert!((agg.gpus[0].aligned_power_watts.unwrap() - 200.0).abs() < 1e-9);

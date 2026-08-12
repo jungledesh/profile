@@ -128,6 +128,15 @@ pub struct PhysicsBaseline {
     pub spec_window_counts: Option<(usize, usize)>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct StaticBaselineSubset {
+    bits_per_param: u8,
+    weight_dtype_source: WeightDtypeSource,
+    ridge_batch_size: f64,
+    weight_gb: f64,
+    weight_bytes_per_param: u8,
+}
+
 /// Lower/upper band around roofline ceiling `expected` (conservative / optimistic).
 const CEILING_LOWER_BAND: f64 = 0.85;
 const CEILING_UPPER_BAND: f64 = 1.05;
@@ -153,8 +162,17 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
 
     let roofline_params = ctx.model.active_param_count.or(ctx.model.param_count)?;
     let weight_params = ctx.model.param_count.or(ctx.model.active_param_count)?;
-    let catalog_default_dtype = ctx.model.default_weight_dtype.as_deref();
+    let subset = static_baseline_subset(ctx, peak_flops, peak_bw, weight_params)?;
+    compute_with_subset(input, subset, peak_flops, peak_bw, tp, roofline_params)
+}
 
+pub fn static_baseline_subset(
+    ctx: &crate::context::StaticContext,
+    peak_flops: f64,
+    peak_bw: f64,
+    weight_params: u64,
+) -> Option<StaticBaselineSubset> {
+    let catalog_default_dtype = ctx.model.default_weight_dtype.as_deref();
     let (bits_per_param, weight_dtype_source) = resolve_bits_per_param(
         ctx.config.vllm_reported_dtype.as_deref(),
         ctx.config.vllm_reported_dtype_resolved,
@@ -163,8 +181,35 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
         ctx.config.quantization.as_deref(),
         catalog_default_dtype,
     );
-
     let ridge_batch_size = math::ridge_batch_size(peak_flops, peak_bw, bits_per_param);
+    if !ridge_batch_size.is_finite() {
+        return None;
+    }
+    let weight_gb = math::weight_gb(weight_params, bits_per_param);
+    let weight_bytes_per_param = (bits_per_param / 8).max(1);
+    Some(StaticBaselineSubset {
+        bits_per_param,
+        weight_dtype_source,
+        ridge_batch_size,
+        weight_gb,
+        weight_bytes_per_param,
+    })
+}
+
+pub fn compute_with_subset(
+    input: &AnalysisInput<'_>,
+    subset: StaticBaselineSubset,
+    peak_flops: f64,
+    peak_bw: f64,
+    tp: f64,
+    roofline_params: u64,
+) -> Option<PhysicsBaseline> {
+    let ctx = input.ctx;
+    let bits_per_param = subset.bits_per_param;
+    let weight_dtype_source = subset.weight_dtype_source;
+    let ridge_batch_size = subset.ridge_batch_size;
+    let weight_gb = subset.weight_gb;
+    let weight_bytes_per_param = subset.weight_bytes_per_param;
 
     let decode_expected = math::decode_ceiling_tps(peak_bw * tp, roofline_params, bits_per_param);
     let decode = make_estimate(decode_expected)?;
@@ -247,8 +292,6 @@ pub fn compute(input: &AnalysisInput<'_>) -> Option<PhysicsBaseline> {
         (efficiency_pct, config_relative_efficiency_pct, headroom_pct)
     };
 
-    let weight_gb = math::weight_gb(weight_params, bits_per_param);
-    let weight_bytes_per_param = (bits_per_param / 8).max(1);
     let kv_dtype = math::effective_kv_cache_dtype(
         snap.vllm.cache_config.cache_dtype.as_deref(),
         ctx.config.kv_cache_dtype.as_deref(),

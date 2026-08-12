@@ -113,12 +113,12 @@ pub fn build_config(
 ) -> VllmConfig {
     let mut cfg = config_from_snapshot(snapshot, cli_max_num_seqs);
     let base = base_url_from_metrics(metrics_url);
-    if let Some(client) = blocking_api_client() {
-        let api = fetch_config_from_api(&client, &base);
+    if let Some(client) = super::shared_http_client() {
+        let api = fetch_config_from_api(client, &base);
         cfg.model_name = api.model_name.or(cfg.model_name);
         cfg.model_root = api.model_root.or(cfg.model_root);
         cfg.max_model_len = api.max_model_len.or(cfg.max_model_len);
-        let info = fetch_info(&client, &base);
+        let info = fetch_info(client, &base);
         // Scrape label/gauge often missing on modern vLLM (SchedulerConfig-only).
         apply_info_scheduler_gaps(&mut cfg, &info);
         if (cfg.vllm_reported_dtype.as_deref() == Some("auto") || cfg.vllm_reported_dtype.is_none())
@@ -157,14 +157,16 @@ pub(crate) fn base_url_from_metrics(input: &str) -> String {
 
 /// Startup-only: served model id from GET `/v1/models`. None on any failure.
 pub(crate) fn preflight_served_model_id(url: &str, timeout: Duration) -> Option<String> {
-    let client = reqwest::blocking::Client::builder()
-        .use_rustls_tls()
-        .timeout(timeout)
-        .build()
-        .ok()?;
+    let client = super::shared_http_client()?;
     let base = base_url_from_metrics(url);
     let models_url = format!("{}/v1/models", base.trim_end_matches('/'));
-    let body = client.get(&models_url).send().ok()?.text().ok()?;
+    let body = client
+        .get(&models_url)
+        .timeout(timeout)
+        .send()
+        .ok()?
+        .text()
+        .ok()?;
     let json: serde_json::Value = serde_json::from_str(&body).ok()?;
     json["data"][0]["id"]
         .as_str()
@@ -175,7 +177,12 @@ pub(crate) fn preflight_served_model_id(url: &str, timeout: Duration) -> Option<
 /// GET /v1/models and extract model_name + max_model_len. Returns Default on any failure.
 fn fetch_config_from_api(client: &reqwest::blocking::Client, base_url: &str) -> VllmConfig {
     let url = format!("{}/v1/models", base_url.trim_end_matches('/'));
-    let text = match client.get(&url).send().and_then(|r| r.text()) {
+    let text = match client
+        .get(&url)
+        .timeout(API_TIMEOUT)
+        .send()
+        .and_then(|r| r.text())
+    {
         Ok(t) => t,
         Err(_) => return VllmConfig::default(),
     };
@@ -204,14 +211,6 @@ fn fetch_config_from_api(client: &reqwest::blocking::Client, base_url: &str) -> 
         max_model_len,
         ..VllmConfig::default()
     }
-}
-
-fn blocking_api_client() -> Option<reqwest::blocking::Client> {
-    reqwest::blocking::Client::builder()
-        .use_rustls_tls()
-        .timeout(API_TIMEOUT)
-        .build()
-        .ok()
 }
 
 struct InfoData {
@@ -575,8 +574,8 @@ mod tests {
 
     #[test]
     fn fetch_config_from_api_returns_default_on_bad_url() {
-        let client = blocking_api_client().expect("client");
-        let cfg = fetch_config_from_api(&client, "http://127.0.0.1:1");
+        let client = super::super::shared_http_client().expect("client");
+        let cfg = fetch_config_from_api(client, "http://127.0.0.1:1");
         assert!(cfg.model_name.is_none());
         assert!(cfg.max_model_len.is_none());
     }

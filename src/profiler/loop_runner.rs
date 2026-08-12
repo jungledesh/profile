@@ -96,7 +96,7 @@ pub fn run(input: LoopRunnerInput<'_>) -> anyhow::Result<()> {
     let mut current_max_num_seqs = max_num_seqs;
 
     loop {
-        let (rule_name, prev_result, prev_report, primary_terminal, suppressed_empty) = {
+        let (rule_name, primary_terminal, suppressed_empty) = {
             let Some(last_state) = state.last() else {
                 break;
             };
@@ -129,22 +129,16 @@ pub fn run(input: LoopRunnerInput<'_>) -> anyhow::Result<()> {
                 .first()
                 .is_some_and(|r| r.terminal);
             let suppressed_empty = last_state.report.suppressed_recs.is_empty();
-            (
-                rule_name,
-                last_state.result.clone(),
-                last_state.report.clone(),
-                primary_terminal,
-                suppressed_empty,
-            )
+            (rule_name, primary_terminal, suppressed_empty)
         };
 
         if should_exit_terminal_wall(primary_terminal, suppressed_empty) {
             // Terminal wall with no alternatives: table already printed; exit.
             // No operator prompt: there is no server-local knob to apply.
             println!();
-            let limiter = prev_report
-                .limiter_evidence
-                .as_ref()
+            let limiter = state
+                .last()
+                .and_then(|s| s.report.limiter_evidence.as_ref())
                 .and_then(crate::engine::limiter::limiter_line);
             for line in terminal_wall_close_lines(limiter.as_deref()) {
                 println!("{line}");
@@ -213,6 +207,12 @@ pub fn run(input: LoopRunnerInput<'_>) -> anyhow::Result<()> {
         }
         last_fingerprint = verified_pass_fingerprint(&last_fingerprint, &new_result.snapshot)?;
 
+        let Some(prev_state) = state.last() else {
+            break;
+        };
+        let prev_result = &prev_state.result;
+        let prev_report = &prev_state.report;
+
         let drifted = drift::config_changed(&prev_result.static_ctx, &new_result.static_ctx);
         let non_baseline =
             drift::non_baseline_drifted(&prev_result.static_ctx, &new_result.static_ctx);
@@ -229,8 +229,8 @@ pub fn run(input: LoopRunnerInput<'_>) -> anyhow::Result<()> {
             );
 
         let d = delta::compute(
-            &prev_result,
-            &prev_report,
+            prev_result,
+            prev_report,
             &new_result,
             &new_report,
             drifted,

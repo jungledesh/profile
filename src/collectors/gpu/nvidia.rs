@@ -1,3 +1,4 @@
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
@@ -6,19 +7,33 @@ use nvml_wrapper::enum_wrappers::device::{Clock, ClockId, TemperatureSensor};
 
 use super::super::GpuRawMetrics;
 use super::super::sampling::{run_sampling_loop, sample_count_for};
-use super::polling::{GpuPoll, aggregate_polls, resolve_device_indices};
+use super::polling::{GpuPoll, PollAggregateState, resolve_device_indices};
 
 const MIB: u64 = 1024 * 1024;
 
+static NVML_SESSION: OnceLock<Nvml> = OnceLock::new();
+
+/// Success-only session cache. Init failure is not memoized, so a driver that
+/// comes up after window 1 is retried on the next window (old per-window behavior).
+fn session_nvml() -> Option<&'static Nvml> {
+    if let Some(nvml) = NVML_SESSION.get() {
+        return Some(nvml);
+    }
+    let nvml = Nvml::init().ok()?;
+    let _ = NVML_SESSION.set(nvml);
+    NVML_SESSION.get()
+}
+
+#[cfg(feature = "amd")]
 /// Raw host GPU count from NVML. No CVD filtering, no polling.
 /// Returns None if NVML unavailable.
 pub(super) fn host_gpu_count() -> Option<u32> {
-    Nvml::init().ok()?.device_count().ok()
+    session_nvml()?.device_count().ok()
 }
 
 /// Single-shot NVML scan for gpu_assignment. No polling, no window.
 pub(super) fn scan_host_gpus() -> Option<Vec<super::GpuScanEntry>> {
-    let nvml = Nvml::init().ok()?;
+    let nvml = session_nvml()?;
     let host_count = nvml.device_count().ok()?;
     let mut out = Vec::with_capacity(host_count as usize);
     for idx in 0..host_count {
@@ -56,7 +71,7 @@ pub(super) fn collect(
     window: Duration,
     explicit_indices: Option<&[u32]>,
 ) -> Result<(Vec<GpuRawMetrics>, SystemTime, Option<u32>)> {
-    let Ok(nvml) = Nvml::init() else {
+    let Some(nvml) = session_nvml() else {
         return Ok((vec![], SystemTime::now(), None));
     };
 
@@ -92,10 +107,10 @@ pub(super) fn collect(
     }
 
     let sample_count = sample_count_for(window);
-    let mut all_device_polls: std::collections::HashMap<u32, Vec<GpuPoll>> =
+    let mut all_device_polls: std::collections::HashMap<u32, PollAggregateState> =
         std::collections::HashMap::new();
     for &d in &device_indices {
-        all_device_polls.insert(d, Vec::with_capacity(sample_count));
+        all_device_polls.insert(d, PollAggregateState::default());
     }
 
     run_sampling_loop(sample_count, |_i| {
@@ -128,7 +143,7 @@ pub(super) fn collect(
             }
 
             if let Some(slot) = all_device_polls.get_mut(&d) {
-                slot.push(tick);
+                slot.update(&tick);
             }
         }
         Ok(())
@@ -149,7 +164,10 @@ pub(super) fn collect(
                     .ok()
                     .map(|mw| mw as f64 / 1000.0);
 
-                let agg = aggregate_polls(all_device_polls.get(&d).map_or(&[], |v| v));
+                let agg = all_device_polls
+                    .get(&d)
+                    .map(PollAggregateState::finish)
+                    .unwrap_or_else(|| PollAggregateState::default().finish());
                 results.push(agg.into_gpu_raw_metrics(
                     gpu_name,
                     gpu_index,

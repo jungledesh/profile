@@ -310,7 +310,6 @@ fn push_gpu_advisories(lines: &mut Vec<String>, snapshot: &RawSnapshot) {
 fn aggregate_to_display_gpu(agg: &crate::collectors::AggregateGpuMetrics) -> GpuRawMetrics {
     GpuRawMetrics {
         gpu_name: agg.gpu_name.clone(),
-        gpu_util_pct: agg.gpu_util_pct,
         mem_util_pct: agg.mem_util_pct,
         aligned_power_watts: agg.aligned_power_watts,
         vram_used_mb: agg.vram_used_mb,
@@ -538,7 +537,7 @@ fn print_boxed(lines: &[String]) {
     println!("{}", border);
 }
 
-// gpu_util_pct and mem_util_pct are intentionally absent here and from all top-level display.
+// mem_util_pct is intentionally absent here and from all top-level display.
 // GPU SM util reports "active" regardless of useful work (spin-locks, graph capture, async polling
 // make 99% util compatible with near-zero MFU). Efficiency % is the honest saturation signal.
 fn gpu_gauges_line(
@@ -1123,7 +1122,7 @@ mod tests {
             },
             gpus: vec![GpuRawMetrics {
                 gpu_name: Some("NVIDIA H100 80GB HBM3".into()),
-                gpu_util_pct: Some(80.0),
+                mem_util_pct: Some(80.0),
                 vram_used_mb: Some(20 * 1024),
                 vram_total_mb: Some(80 * 1024),
                 ..Default::default()
@@ -1637,7 +1636,7 @@ mod tests {
     #[test]
     fn gpu_gauges_line_formats_mem_gb() {
         let g = GpuRawMetrics {
-            gpu_util_pct: Some(28.0),
+            mem_util_pct: Some(28.0),
             aligned_power_watts: Some(310.0),
             power_limit_watts: Some(400.0),
             vram_used_mb: Some(72 * 1024),
@@ -1649,7 +1648,7 @@ mod tests {
         assert!(s.contains("power 310W"));
         assert!(s.contains("vRAM 72/80GB"));
         let g_unaligned_only = GpuRawMetrics {
-            gpu_util_pct: Some(28.0),
+            mem_util_pct: Some(28.0),
             power_watts: Some(999.0),
             vram_used_mb: Some(72 * 1024),
             vram_total_mb: Some(80 * 1024),
@@ -1659,7 +1658,7 @@ mod tests {
         assert!(s_dash.contains("power -"));
         assert!(!s_dash.contains("999"));
         let g_peak = GpuRawMetrics {
-            gpu_util_pct: Some(28.0),
+            mem_util_pct: Some(28.0),
             aligned_power_watts: Some(310.0),
             vram_used_mb: Some(60 * 1024),
             vram_peak_mb: Some(78 * 1024),
@@ -1670,7 +1669,7 @@ mod tests {
         assert!(s_peak.contains("vRAM 60/80GB (peak 78GB)"));
         // 70/80 = 87.5% < 90% threshold - peak should be suppressed (noise, not signal)
         let g_peak_below_frac = GpuRawMetrics {
-            gpu_util_pct: Some(28.0),
+            mem_util_pct: Some(28.0),
             aligned_power_watts: Some(310.0),
             vram_used_mb: Some(60 * 1024),
             vram_peak_mb: Some(70 * 1024),
@@ -1679,7 +1678,7 @@ mod tests {
         };
         assert!(!gpu_gauges_line(&g_peak_below_frac, None, None, false).contains("peak 70GB"));
         let g_no_recovery = GpuRawMetrics {
-            gpu_util_pct: Some(28.0),
+            mem_util_pct: Some(28.0),
             aligned_power_watts: Some(310.0),
             vram_used_mb: Some(78 * 1024),
             vram_peak_mb: Some(78 * 1024),
@@ -1990,7 +1989,7 @@ mod tests {
             },
             gpus: vec![GpuRawMetrics {
                 gpu_name: Some("NVIDIA H100 80GB HBM3".to_string()),
-                gpu_util_pct: Some(70.0),
+                mem_util_pct: Some(70.0),
                 ..Default::default()
             }],
             host_memory: None,

@@ -30,7 +30,7 @@ pub struct HostMemoryFacts {
 /// Config fields extracted from the `vllm:cache_config_info` labeled gauge.
 /// All `Option<T>` - absent when the metric isn't present in the scrape.
 ///
-/// `kv_cache_size_tokens`, `kv_cache_max_concurrency`, `mamba_block_size`, and
+/// `kv_cache_max_concurrency`, `mamba_block_size`, and
 /// `mamba_page_size_padded` are allocator-computed in vLLM v0.25.1
 /// (`vllm/config/cache.py`). Their docstring notes that `num_gpu_blocks ×
 /// block_size` can be wrong for hybrid models. Never guess when absent.
@@ -51,8 +51,6 @@ pub struct CacheConfigLabels {
     pub enable_chunked_prefill: Option<bool>,
     /// Fraction of GPU memory reserved for the engine (cache_config_info label).
     pub gpu_memory_utilization: Option<f64>,
-    /// Total KV token capacity reported by the allocator.
-    pub kv_cache_size_tokens: Option<u64>,
     /// Max concurrent full-context sequences at `max_model_len` (may be fractional).
     pub kv_cache_max_concurrency: Option<f64>,
     pub mamba_block_size: Option<u32>,
@@ -82,7 +80,7 @@ pub struct VllmRawMetrics {
     pub model_name: Option<String>,
 
     /// Queue-depth style gauges: **last** `/metrics` scrape in the collection window.
-    /// Multi-window diagnose: **time-weighted mean** across evaluable windows (same as `gpu_util_pct`).
+    /// Multi-window diagnose: **time-weighted mean** across evaluable windows.
     pub num_requests_running: Option<f64>,
     /// Arithmetic mean of finite `num_requests_running` scrapes in this window (same
     /// samples as peak). Multi-window: duration-weighted mean of per-window means
@@ -111,8 +109,6 @@ pub struct VllmRawMetrics {
     pub kv_frac_per_running_peak: Option<f64>,
     /// KV cache usage %: last scrape in a single window; duration-weighted mean across evaluable windows in diagnose aggregate.
     pub kv_cache_usage_perc: Option<f64>,
-    /// Same as `kv_cache_usage_perc` after multi-window aggregate; carried for display clarity.
-    pub kv_cache_avg_perc: Option<f64>,
     /// Max KV cache usage % seen across scrapes in this window (0–100). Multi-window: max over evaluable windows.
     pub kv_cache_peak_perc: Option<f64>,
 
@@ -180,7 +176,8 @@ pub struct VllmRawMetrics {
     pub prompt_tokens_per_sec: Option<f64>,
     /// Prefix cache hit rate. Single window: `(Δhits)/(Δqueries)` first→last scrape. Multi-window aggregate: sum of valid window deltas - see `docs/collection-policy.md`.
     pub prefix_cache_hit_rate: Option<f64>,
-    /// Cumulative prefix counters per scrape (same order as collector: 9 × ~250ms).
+    /// Prefix scrape counters used for hit-rate deltas. Collector stores first and
+    /// last samples only (middle ticks overwrite the last slot).
     pub prefix_cache_scrape_samples: Vec<PrefixCacheScrapeSample>,
 
     // Not always available
@@ -223,7 +220,6 @@ pub struct GpuRawMetrics {
     /// Stable per-device identifier from the driver (e.g. `GPU-xxxxxxxx-xxxx-...`).
     pub gpu_uuid: Option<String>,
     pub pcie_bus_id: Option<String>,
-    pub gpu_util_pct: Option<f64>,
     pub mem_util_pct: Option<f64>,
     /// Per-window raw power draw (W). Cleared on multi-window aggregate so unaligned
     /// last-window power cannot leak into display or energy.
@@ -304,7 +300,6 @@ impl GpuRawMetrics {
 
 #[derive(Debug, Clone, Default)]
 pub struct AggregateGpuMetrics {
-    pub gpu_util_pct: Option<f64>,
     pub mem_util_pct: Option<f64>,
     /// Sum of per-GPU [`GpuRawMetrics::aligned_power_watts`]. Display/energy only.
     ///
@@ -355,8 +350,6 @@ impl RawSnapshot {
 
     pub fn aggregate_gpu(&self) -> AggregateGpuMetrics {
         // util/mem: mean across GPUs - max would overstate cluster saturation
-        let mut sum_util = 0.0_f64;
-        let mut n_util = 0_u32;
         let mut sum_mem = 0.0_f64;
         let mut n_mem = 0_u32;
         let mut sum_power = 0.0;
@@ -371,10 +364,6 @@ impl RawSnapshot {
         for g in &self.gpus {
             if gpu_name.is_none() {
                 gpu_name = g.gpu_name.clone();
-            }
-            if let Some(u) = g.gpu_util_pct {
-                sum_util += u;
-                n_util += 1;
             }
             if let Some(m) = g.mem_util_pct {
                 sum_mem += m;
@@ -400,7 +389,6 @@ impl RawSnapshot {
         }
 
         AggregateGpuMetrics {
-            gpu_util_pct: (n_util > 0).then_some(sum_util / f64::from(n_util)),
             mem_util_pct: (n_mem > 0).then_some(sum_mem / f64::from(n_mem)),
             aligned_power_watts: (n_power > 0).then_some(sum_power),
             vram_used_mb: (n_vram > 0).then_some(sum_vram),
@@ -674,7 +662,7 @@ mod window_active_tests {
     use super::*;
     use std::time::SystemTime;
 
-    fn snap(run: f64, tps: Option<f64>, kv: Option<f64>, gpu: Option<f64>) -> RawSnapshot {
+    fn snap(run: f64, tps: Option<f64>, kv: Option<f64>, mem: Option<f64>) -> RawSnapshot {
         RawSnapshot {
             gpu_observed_at: SystemTime::UNIX_EPOCH,
             vllm_observed_at: SystemTime::UNIX_EPOCH,
@@ -687,7 +675,7 @@ mod window_active_tests {
                 ..Default::default()
             },
             gpus: vec![GpuRawMetrics {
-                gpu_util_pct: gpu,
+                mem_util_pct: mem,
                 ..Default::default()
             }],
             host_memory: None,

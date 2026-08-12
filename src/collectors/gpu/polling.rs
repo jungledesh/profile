@@ -16,13 +16,12 @@ pub(super) struct GpuPoll {
 }
 
 /// Window-aggregated GPU metrics. Aggregation rules:
-/// - util, power: mean across polls
+/// - mem util, power: mean across polls (mem util only over ticks where gpu+mem both read)
 /// - vram_used, temperature, sm_clock: last poll
 /// - vram_peak, temperature_peak: max across polls
 /// - vram_total: last poll (constant)
 #[derive(Debug, PartialEq)]
 pub(super) struct AggregatedPolls {
-    pub(super) gpu_util_pct: Option<f64>,
     pub(super) mem_util_pct: Option<f64>,
     pub(super) power_watts: Option<f64>,
     pub(super) vram_used_mb: Option<u64>,
@@ -49,7 +48,6 @@ impl AggregatedPolls {
             gpu_index,
             gpu_uuid,
             pcie_bus_id,
-            gpu_util_pct: self.gpu_util_pct,
             mem_util_pct: self.mem_util_pct,
             power_watts: self.power_watts,
             aligned_power_watts: None,
@@ -64,71 +62,80 @@ impl AggregatedPolls {
     }
 }
 
-pub(super) fn aggregate_polls(polls: &[GpuPoll]) -> AggregatedPolls {
-    let mut sum_gpu = 0.0f64;
-    let mut sum_mem = 0.0f64;
-    let mut n_util = 0u32;
-    let mut sum_power = 0.0f64;
-    let mut n_power = 0u32;
+#[derive(Default)]
+pub(super) struct PollAggregateState {
+    sum_mem: f64,
+    n_util: u32,
+    sum_power: f64,
+    n_power: u32,
+    vram_used_mb: Option<u64>,
+    vram_peak_mb: Option<u64>,
+    vram_total_mb: Option<u64>,
+    temperature_c: Option<f64>,
+    temperature_peak_c: Option<f64>,
+    sm_clock_mhz: Option<u32>,
+}
 
-    let mut vram_used_mb = None;
-    let mut vram_peak_mb: Option<u64> = None;
-    let mut vram_total_mb = None;
-    let mut temperature_c = None;
-    let mut temperature_peak_c: Option<f64> = None;
-    let mut sm_clock_mhz = None;
-
-    for p in polls {
-        if let (Some(g), Some(m)) = (p.util_gpu, p.util_mem) {
-            sum_gpu += f64::from(g);
-            sum_mem += f64::from(m);
-            n_util += 1;
+impl PollAggregateState {
+    pub(super) fn update(&mut self, p: &GpuPoll) {
+        // Paired gate: average mem util only over ticks where both util reads succeed.
+        // GPU util itself is not retained (no production consumer).
+        if let (Some(_g), Some(m)) = (p.util_gpu, p.util_mem) {
+            self.sum_mem += f64::from(m);
+            self.n_util += 1;
         }
-
         if let Some(w) = p.power_watts {
-            sum_power += w;
-            n_power += 1;
+            self.sum_power += w;
+            self.n_power += 1;
         }
-
         if let Some(u) = p.vram_used_mb {
-            vram_used_mb = Some(u);
-            vram_peak_mb = Some(match vram_peak_mb {
+            self.vram_used_mb = Some(u);
+            self.vram_peak_mb = Some(match self.vram_peak_mb {
                 Some(pk) => pk.max(u),
                 None => u,
             });
         }
         if let Some(t) = p.vram_total_mb {
-            vram_total_mb = Some(t);
+            self.vram_total_mb = Some(t);
         }
         if let Some(t) = p.temperature_c.filter(|x| x.is_finite()) {
-            temperature_c = Some(t);
-            temperature_peak_c = Some(match temperature_peak_c {
+            self.temperature_c = Some(t);
+            self.temperature_peak_c = Some(match self.temperature_peak_c {
                 Some(pk) => pk.max(t),
                 None => t,
             });
         }
         if let Some(c) = p.sm_clock_mhz {
-            sm_clock_mhz = Some(c);
+            self.sm_clock_mhz = Some(c);
         }
     }
 
-    let gpu_util_pct = (n_util > 0).then_some(sum_gpu / f64::from(n_util));
-    let mem_util_pct = (n_util > 0).then_some(sum_mem / f64::from(n_util));
-    let power_watts = (n_power > 0).then_some(sum_power / f64::from(n_power));
-
-    AggregatedPolls {
-        gpu_util_pct,
-        mem_util_pct,
-        power_watts,
-        vram_used_mb,
-        vram_peak_mb,
-        vram_total_mb,
-        temperature_c,
-        temperature_peak_c,
-        sm_clock_mhz,
+    pub(super) fn finish(&self) -> AggregatedPolls {
+        let mem_util_pct = (self.n_util > 0).then_some(self.sum_mem / f64::from(self.n_util));
+        let power_watts = (self.n_power > 0).then_some(self.sum_power / f64::from(self.n_power));
+        AggregatedPolls {
+            mem_util_pct,
+            power_watts,
+            vram_used_mb: self.vram_used_mb,
+            vram_peak_mb: self.vram_peak_mb,
+            vram_total_mb: self.vram_total_mb,
+            temperature_c: self.temperature_c,
+            temperature_peak_c: self.temperature_peak_c,
+            sm_clock_mhz: self.sm_clock_mhz,
+        }
     }
 }
 
+#[cfg(test)]
+pub(super) fn aggregate_polls(polls: &[GpuPoll]) -> AggregatedPolls {
+    let mut state = PollAggregateState::default();
+    for p in polls {
+        state.update(p);
+    }
+    state.finish()
+}
+
+#[cfg(any(test, feature = "nvidia"))]
 /// Device indices to poll. Empty env input means "all GPUs on host."
 /// Scope vs TP is validated after collection in `validate_tensor_parallel_scope`.
 pub(super) fn resolve_device_indices(env_indices: Vec<u32>, host_device_count: u32) -> Vec<u32> {
@@ -203,7 +210,6 @@ mod aggregate_polls_tests {
             .map(|_| sample_poll(80, 20, 300.0, 1000, 8000, 55.0, 2100))
             .collect();
         let a = aggregate_polls(&polls);
-        assert_eq!(a.gpu_util_pct, Some(80.0));
         assert_eq!(a.mem_util_pct, Some(20.0));
         assert_eq!(a.power_watts, Some(300.0));
         assert_eq!(a.vram_used_mb, Some(1000));
@@ -221,7 +227,6 @@ mod aggregate_polls_tests {
             sample_poll(100, 50, 200.0, 200, 8000, 50.0, 2000),
         ];
         let a = aggregate_polls(&polls);
-        assert_eq!(a.gpu_util_pct, Some(50.0));
         assert_eq!(a.mem_util_pct, Some(25.0));
         assert_eq!(a.power_watts, Some(150.0));
         assert_eq!(a.vram_used_mb, Some(200));
@@ -264,7 +269,6 @@ mod aggregate_polls_tests {
             sample_poll(50, 25, 200.0, 1, 2, 3.0, 4),
         ];
         let a = aggregate_polls(&polls);
-        assert_eq!(a.gpu_util_pct, Some(50.0));
         assert_eq!(a.mem_util_pct, Some(25.0));
         assert_eq!(a.power_watts, Some(150.0));
     }
@@ -274,7 +278,6 @@ mod aggregate_polls_tests {
         assert_eq!(
             aggregate_polls(&[]),
             AggregatedPolls {
-                gpu_util_pct: None,
                 mem_util_pct: None,
                 power_watts: None,
                 vram_used_mb: None,

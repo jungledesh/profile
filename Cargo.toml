@@ -7,16 +7,21 @@ description = "A closed loop, physics-grounded, cost-aware optimizer for vLLM."
 license = "Apache-2.0"
 repository = "https://github.com/jungledesh/profile"
 
+[features]
+default = ["nvidia", "amd"]
+nvidia = ["dep:nvml-wrapper"]
+amd = ["dep:libamdgpu_top"]
+
 [[bin]]
 name = "profile"
 path = "src/main.rs"
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.5", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 anyhow = "1.0.103"
-libamdgpu_top = { version = "=0.11.5", default-features = false, features = ["libdrm_dynamic_loading"] }
-nvml-wrapper = "0.12"
+libamdgpu_top = { version = "=0.11.5", optional = true, default-features = false, features = ["libdrm_dynamic_loading"] }
+nvml-wrapper = { version = "0.12", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 serde_json = "1"
 prometheus-parse = "0.2"

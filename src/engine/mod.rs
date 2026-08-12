@@ -204,7 +204,7 @@ mod build_report_tests {
         };
         let g = GpuRawMetrics {
             gpu_name: Some("NVIDIA H100 80GB HBM3".to_string()),
-            gpu_util_pct: Some(58.0),
+            mem_util_pct: Some(58.0),
             ..Default::default()
         };
         let s = RawSnapshot {
@@ -257,7 +257,7 @@ mod build_report_tests {
         let g = GpuRawMetrics {
             gpu_name: Some("NVIDIA H100 80GB HBM3".to_string()),
             vram_total_mb: Some(80 * 1024),
-            gpu_util_pct: Some(58.0),
+            mem_util_pct: Some(58.0),
             ..Default::default()
         };
         let s = RawSnapshot {
@@ -313,7 +313,7 @@ mod build_report_tests {
         };
         let g = GpuRawMetrics {
             gpu_name: Some("NVIDIA H100 80GB HBM3".to_string()),
-            gpu_util_pct: Some(58.0),
+            mem_util_pct: Some(58.0),
             ..Default::default()
         };
         let s = RawSnapshot {
@@ -358,7 +358,7 @@ mod build_report_tests {
         };
         let g = GpuRawMetrics {
             gpu_name: Some("NVIDIA H100 80GB HBM3".to_string()),
-            gpu_util_pct: Some(50.0),
+            mem_util_pct: Some(50.0),
             ..Default::default()
         };
         let s = RawSnapshot {
