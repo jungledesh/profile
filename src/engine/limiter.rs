@@ -32,6 +32,8 @@ const LIMITER_QUEUE_SILENCE_WAITING_MIN: f64 = 2.0;
 /// Quiet-path note when the waiting gauge was never readable.
 pub(crate) const WAITING_UNREAD_LIMITER_LINE: &str = "Waiting unread; cannot name a healthy cap.";
 
+pub use crate::engine::baseline::{SPEC_GUARD_LIMITER_LINE, SPEC_GUARD_WARNING_LINE};
+
 /// Aggregated run evidence, same courtroom as rule evaluation.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct LimiterEvidence {
@@ -62,6 +64,8 @@ pub struct LimiterEvidence {
     pub n_eval: usize,
     /// When baseline is absent and the limiter names CeilingUnknown.
     pub ceiling_unknown_reason: Option<&'static str>,
+    /// Run-level speculation OR: withdraw Physics (headroom / TPOT-floor) claims.
+    pub spec_suspected: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +77,9 @@ pub enum LimiterVerdict {
     CeilingUnknown(CeilingUnknown),
     /// Waiting gauge missing or non-finite. Not a cap: decline naming one.
     WaitingUnread,
+    /// Measured decode beat the one-token-per-read roof. Not a cap: decline
+    /// Physics (headroom / TPOT-floor) while speculation is suspected.
+    SpecSuspected,
 }
 
 /// Outcome of the limiter cascade, including which earlier stages lacked evidence.
@@ -182,6 +189,17 @@ pub fn identify(e: &LimiterEvidence) -> IdentifyResult {
         }
     }
 
+    // Speculation: withdraw Physics (and later PrefillInterference, which would
+    // rest on a TPOT comparison declared unreliable). Capacity/Traffic above are
+    // gauge evidence, untouched.
+    if e.spec_suspected {
+        return IdentifyResult {
+            verdict: Some(LimiterVerdict::SpecSuspected),
+            capacity_skipped,
+            traffic_skipped,
+        };
+    }
+
     // 3. Physics - efficiency headroom exhausted, or TPOT near theoretical floor.
     if e.headroom_pct
         .is_some_and(|h| h.is_finite() && h < HEADROOM_LIMITER_THRESHOLD_PCT)
@@ -252,6 +270,7 @@ pub fn limiter_line(e: &LimiterEvidence) -> Option<String> {
             Some(format!("Hardware ceiling unknown ({reason})."))
         }
         LimiterVerdict::WaitingUnread => Some(WAITING_UNREAD_LIMITER_LINE.to_string()),
+        LimiterVerdict::SpecSuspected => Some(SPEC_GUARD_LIMITER_LINE.to_string()),
         LimiterVerdict::Known(PrimaryLimiter::Capacity) => {
             let mean = e.kv_cache_mean_perc?;
             let peak = e.kv_cache_peak_perc;
@@ -358,6 +377,7 @@ mod tests {
             headroom_pct: headroom,
             n_eval: crate::engine::ENGINE_MIN_PERSISTENT_WINDOWS,
             ceiling_unknown_reason: None,
+            spec_suspected: false,
         }
     }
 
@@ -1033,5 +1053,61 @@ mod tests {
         .expect("line");
         assert!(line.contains("Capped by traffic"));
         assert!(line.contains("Memory unmeasured"));
+    }
+
+    #[test]
+    fn spec_suspected_blocks_physics_headroom() {
+        let mut e = ev(
+            Some(20.0),
+            Some(20.0),
+            Some(50.0),
+            Some(100.0),
+            Some(50.0),
+            Some(10.0),
+            Some(0.2),
+            Some(false),
+            Some(2.0), // would trip Physics via headroom
+        );
+        e.spec_suspected = true;
+        assert_eq!(identify(&e).verdict, Some(LimiterVerdict::SpecSuspected));
+        assert_eq!(limiter_line(&e).as_deref(), Some(SPEC_GUARD_LIMITER_LINE));
+    }
+
+    #[test]
+    fn spec_suspected_blocks_physics_tpot_floor() {
+        let mut e = ev(
+            Some(20.0),
+            Some(20.0),
+            Some(50.0),
+            Some(100.0),
+            Some(5.0), // near floor
+            Some(5.0),
+            Some(0.2),
+            Some(false),
+            Some(50.0), // headroom healthy
+        );
+        e.spec_suspected = true;
+        assert_eq!(identify(&e).verdict, Some(LimiterVerdict::SpecSuspected));
+        assert!(!limiter_line(&e).unwrap().contains("Capped by hardware"));
+    }
+
+    #[test]
+    fn spec_suspected_does_not_override_capacity() {
+        let mut e = ev(
+            Some(85.0),
+            Some(90.0),
+            Some(50.0),
+            Some(100.0),
+            Some(5.0),
+            Some(5.0),
+            Some(0.2),
+            Some(false),
+            Some(2.0),
+        );
+        e.spec_suspected = true;
+        assert_eq!(
+            identify(&e).verdict,
+            Some(LimiterVerdict::Known(PrimaryLimiter::Capacity))
+        );
     }
 }

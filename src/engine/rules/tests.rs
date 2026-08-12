@@ -4127,6 +4127,43 @@ fn r6_fires_as_primary_when_no_other_rules() {
 }
 
 #[test]
+fn r6_primary_decode_eff_dash_when_run_or_speculates() {
+    // Bound prefill primary on most windows; one over-ceiling TPOT window ORs the
+    // run. Decode-efficiency line must print "-" (Transparent vs scoreboard).
+    let mut windows: Vec<_> = (0..11)
+        .map(|_| mk_r6_prefill_window(12.0, 10.0, 100.0, Some(50.0)))
+        .collect();
+    windows.push(mk_r6_prefill_window(12.0, 10.0, 100.0, Some(0.01)));
+    let ctx = mk_llama8b_h100_ctx(&windows[0].snapshot);
+    let summary = ai(&ctx, windows.last().expect("windows"));
+    let report = build_report_for_windows(&windows, summary);
+    assert!(
+        report
+            .baseline
+            .as_ref()
+            .is_some_and(|b| b.spec_suspected.is_some()),
+        "fixture must trip run-level speculation OR"
+    );
+    let r6 = report
+        .recommendations
+        .iter()
+        .find(|r| r.rule_name == rule_names::PREFILL_BOUND)
+        .expect("R6 primary");
+    let text = r6.display_lines.join("\n");
+    assert!(
+        text.lines()
+            .any(|l| l.contains("Decode eff.") && l.contains("-  of HW ceiling")),
+        "R6 must withdraw decode % under OR: {text}"
+    );
+    assert!(
+        !text
+            .lines()
+            .any(|l| l.contains("Decode eff.") && l.contains('%')),
+        "no contradicting decode %: {text}"
+    );
+}
+
+#[test]
 fn r6_primary_fix_sets_default_budget_with_scraped_floor() {
     let mut windows: Vec<_> = (0..10)
         .map(|_| mk_r6_prefill_window(12.0, 10.0, 100.0, Some(50.0)))

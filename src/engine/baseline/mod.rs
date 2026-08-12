@@ -8,6 +8,8 @@ pub use math::{
     observed_state_pages, page_model_fits, resolve_kv_cache_element, state_dtype_bytes, weight_gb,
 };
 pub use roofline::{
-    CeilingEstimate, CostEstimate, CostSource, PhysicsBaseline, WeightDtypeSource,
+    CeilingEstimate, CostEstimate, CostSource, PhysicsBaseline, SPEC_GUARD_LIMITER_LINE,
+    SPEC_GUARD_WARNING_LINE, SpecDetector, SpecEvidence, WeightDtypeSource,
     baseline_missing_reason, compute,
 };
+pub(crate) use roofline::{apply_spec_run_or, stronger_spec_evidence};

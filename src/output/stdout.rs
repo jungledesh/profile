@@ -106,12 +106,26 @@ fn build_diagnose_lines(
         engine::aggregate_prefix_hit_rate_for_diagnose(&result.windows);
     if verbose_rules {
         lines.push(String::new());
+        if report.baseline.is_some_and(|b| b.spec_suspected.is_some()) {
+            lines.push(engine::SPEC_GUARD_WARNING_LINE.to_string());
+        }
         lines.extend(baseline_lines(
             report.baseline,
             &result.static_ctx,
             aggregate_win.snapshot.vllm.num_requests_running,
             aggregate_win.snapshot.vllm.cache_config.num_gpu_blocks,
         ));
+        if let Some(b) = report.baseline.as_ref() {
+            for line in format_spec_guard_verbose_lines(b) {
+                lines.push(format!(
+                    "{:<width$}{}{}",
+                    "",
+                    VLLM_LABEL_METRICS_GAP,
+                    line,
+                    width = GPU_LABEL_W
+                ));
+            }
+        }
         lines.push(String::new());
     }
 
@@ -136,7 +150,12 @@ fn build_diagnose_lines(
     }
 
     if !verbose_rules {
-        lines.extend(quiet_efficiency_fallback_lines(report.baseline.as_ref()));
+        if report.baseline.is_some_and(|b| b.spec_suspected.is_some()) {
+            lines.push(engine::SPEC_GUARD_WARNING_LINE.to_string());
+            lines.push(String::new());
+        } else {
+            lines.extend(quiet_efficiency_fallback_lines(report.baseline.as_ref()));
+        }
         lines.push(String::new());
     }
     lines.push(format!(
@@ -337,6 +356,33 @@ fn duration_short(duration: Duration) -> String {
     }
 }
 
+fn format_spec_guard_verbose_lines(b: &engine::PhysicsBaseline) -> Vec<String> {
+    let Some(ev) = b.spec_suspected else {
+        return Vec::new();
+    };
+    let evidence = match ev.detector {
+        engine::SpecDetector::Tpot => format!(
+            "spec guard: TPOT {:.1}ms beat the {:.1}ms floor (upper-bound est).",
+            ev.measured, ev.bound
+        ),
+        engine::SpecDetector::PerStream => format!(
+            "spec guard: per-request {:.1} tok/s beat the {:.1} tok/s ceiling (upper-bound est).",
+            ev.measured, ev.bound
+        ),
+        engine::SpecDetector::Absolute => format!(
+            "spec guard: {:.1} tok/s beat the {:.1} tok/s absolute ceiling (upper-bound est).",
+            ev.measured, ev.bound
+        ),
+    };
+    let mut lines = vec![evidence];
+    if let Some((flagged, active)) = b.spec_window_counts {
+        lines.push(format!(
+            "spec guard: {flagged} of {active} active windows above ceiling."
+        ));
+    }
+    lines
+}
+
 fn quiet_efficiency_fallback_lines(baseline: Option<&engine::PhysicsBaseline>) -> Vec<String> {
     let Some(b) = baseline else {
         return Vec::new();
@@ -501,11 +547,15 @@ fn gpu_gauges_line(
     actual_tps: Option<f64>,
     verbose: bool,
 ) -> String {
-    let efficiency = format_efficiency_label(
-        baseline.and_then(|b| b.efficiency_pct),
-        actual_tps,
-        baseline.map(|b| b.decode.expected),
-    );
+    let efficiency = if baseline.is_some_and(|b| b.spec_suspected.is_some()) {
+        "decode_eff -".to_string()
+    } else {
+        format_efficiency_label(
+            baseline.and_then(|b| b.efficiency_pct),
+            actual_tps,
+            baseline.map(|b| b.decode.expected),
+        )
+    };
 
     let power = g
         .aligned_power_watts
@@ -1038,6 +1088,169 @@ mod tests {
     }
 
     #[test]
+    fn spec_guard_scoreboard_and_limiter_lines_differ_only_by_note_prefix() {
+        assert_eq!(
+            engine::SPEC_GUARD_WARNING_LINE,
+            "Note: Throughput above the decode ceiling (speculative decoding likely). Efficiency % does not apply."
+        );
+        assert_eq!(
+            engine::SPEC_GUARD_LIMITER_LINE,
+            "Throughput above the decode ceiling (speculative decoding likely). Efficiency % does not apply."
+        );
+        assert_eq!(
+            engine::SPEC_GUARD_WARNING_LINE,
+            format!("Note: {}", engine::SPEC_GUARD_LIMITER_LINE)
+        );
+    }
+
+    fn spec_flag_diagnose_result(running: f64, gen_tps: f64, tpot_ms: f64) -> DiagnoseResult {
+        let snap = RawSnapshot {
+            gpu_observed_at: UNIX_EPOCH,
+            vllm_observed_at: UNIX_EPOCH,
+            timestamp: UNIX_EPOCH,
+            vllm: VllmRawMetrics {
+                model_name: Some("meta-llama/Llama-3.1-8B-Instruct".into()),
+                num_requests_running: Some(running),
+                num_requests_waiting: Some(0.0),
+                max_num_seqs: Some(256),
+                kv_cache_usage_perc: Some(20.0),
+                generation_tokens_per_sec: Some(gen_tps),
+                prompt_tokens_per_sec: Some(gen_tps * 0.2),
+                tpot_ms: Some(tpot_ms),
+                window_duration_secs: Some(2.0),
+                prefix_cache_hit_rate: Some(0.5),
+                ..Default::default()
+            },
+            gpus: vec![GpuRawMetrics {
+                gpu_name: Some("NVIDIA H100 80GB HBM3".into()),
+                gpu_util_pct: Some(80.0),
+                vram_used_mb: Some(20 * 1024),
+                vram_total_mb: Some(80 * 1024),
+                ..Default::default()
+            }],
+            host_memory: None,
+        };
+        let windows: Vec<_> = (0..crate::engine::ENGINE_MIN_PERSISTENT_WINDOWS)
+            .map(|_| RuntimeWindow::from_snapshot(snap.clone()))
+            .collect();
+        let cfg = VllmConfig {
+            dtype: Some("bf16".to_string()),
+            max_model_len: Some(8192),
+            max_num_seqs: Some(256),
+            ..Default::default()
+        };
+        let static_ctx = StaticContext::from_snapshot(&snap, cfg);
+        DiagnoseResult {
+            snapshot: snap,
+            windows,
+            static_ctx,
+            duration: Duration::from_secs(30),
+            started_at: UNIX_EPOCH,
+            any_evaluable: true,
+            all_idle: false,
+            metrics_input: "http://127.0.0.1:8000/metrics".into(),
+            energy_active_windows: 0,
+            energy_pair_windows: 0,
+        }
+    }
+
+    #[test]
+    fn scoreboard_quiet_prints_spec_guard_warning_and_decode_eff_dash() {
+        // Near-ridge occupancy so R1 stays quiet; TPOT below floor flags speculation.
+        let result = spec_flag_diagnose_result(200.0, 400.0, 0.01);
+        let lines = diagnose_lines_for(&result, false);
+        let text = lines.join("\n");
+        assert!(
+            text.contains(engine::SPEC_GUARD_WARNING_LINE),
+            "quiet scoreboard must print the Note: line: {text}"
+        );
+        assert!(
+            text.contains("decode_eff -"),
+            "quiet GPU line must withdraw efficiency %: {text}"
+        );
+        // Quiet path must not reprint the limiter body under Rules clear.
+        assert!(
+            !text.contains(&format!("\n{}", engine::SPEC_GUARD_LIMITER_LINE)),
+            "quiet must not duplicate limiter body after scoreboard Note: {text}"
+        );
+    }
+
+    #[test]
+    fn scoreboard_verbose_prints_spec_guard_warning_and_detector_evidence() {
+        let result = spec_flag_diagnose_result(200.0, 400.0, 0.01);
+        let lines = diagnose_lines_for(&result, true);
+        let text = lines.join("\n");
+        assert!(
+            text.contains(engine::SPEC_GUARD_WARNING_LINE),
+            "verbose scoreboard must print the Note: line: {text}"
+        );
+        assert!(
+            text.contains("spec guard:") && text.contains("TPOT"),
+            "verbose must name the detector: {text}"
+        );
+        assert!(
+            text.contains("decode_eff -") || text.contains("decode_eff - |"),
+            "verbose HW LIMITS / GPU line must withdraw efficiency: {text}"
+        );
+    }
+
+    #[test]
+    fn scoreboard_warning_still_prints_when_a_rule_fires() {
+        // Under-fed + over-ceiling TPOT: R1 can own the page; Note: must remain.
+        let result = spec_flag_diagnose_result(5.0, 80.0, 0.01);
+        let lines = diagnose_lines_for(&result, false);
+        let text = lines.join("\n");
+        assert!(
+            text.contains(engine::SPEC_GUARD_WARNING_LINE),
+            "rules-fired path must keep the scoreboard Note: {text}"
+        );
+        assert!(
+            text.contains("Under-batching") || text.contains("decode_eff -"),
+            "expected R1 and/or withdrawn efficiency: {text}"
+        );
+    }
+
+    #[test]
+    fn format_spec_guard_verbose_lines_names_detector_and_window_counts() {
+        let mut b = engine::PhysicsBaseline {
+            decode: engine::CeilingEstimate {
+                lower: 85.0,
+                expected: 100.0,
+                upper: 105.0,
+            },
+            prefill: None,
+            efficiency_pct: None,
+            headroom_pct: None,
+            weight_dtype_source: engine::WeightDtypeSource::EnvVar,
+            weight_gb: 16.0,
+            weight_bytes_per_param: 2,
+            kv_bytes_per_element: 2,
+            kv_cache_dtype_source: engine::KvCacheDtypeSource::Auto,
+            kv_headroom_gb: Some(8.0),
+            tpot_floor_ms: 10.0,
+            prefill_latency_floor_ms: None,
+            ridge_batch_size: 40.0,
+            config_relative_efficiency_pct: None,
+            cost: None,
+            spec_suspected: Some(engine::SpecEvidence {
+                detector: engine::SpecDetector::Tpot,
+                measured: 0.01,
+                bound: 9.5,
+            }),
+            spec_window_counts: Some((3, 12)),
+        };
+        let lines = format_spec_guard_verbose_lines(&b);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("TPOT") && lines[0].contains("0.0ms"));
+        assert_eq!(
+            lines[1],
+            "spec guard: 3 of 12 active windows above ceiling."
+        );
+        b.spec_suspected = None;
+        assert!(format_spec_guard_verbose_lines(&b).is_empty());
+    }
+
+    #[test]
     fn baseline_lines_efficiency_none_renders_dash() {
         let b = engine::PhysicsBaseline {
             decode: engine::CeilingEstimate {
@@ -1063,6 +1276,8 @@ mod tests {
             ridge_batch_size: 40.0,
             config_relative_efficiency_pct: None,
             cost: None,
+            spec_suspected: None,
+            spec_window_counts: None,
         };
         let lines = baseline_lines(
             Some(b),
@@ -1113,6 +1328,8 @@ mod tests {
             ridge_batch_size: 40.0,
             config_relative_efficiency_pct: None,
             cost: None,
+            spec_suspected: None,
+            spec_window_counts: None,
         };
         let above = baseline_lines(
             Some(base()),
@@ -1169,6 +1386,8 @@ mod tests {
             ridge_batch_size: 40.0,
             config_relative_efficiency_pct: None,
             cost: None,
+            spec_suspected: None,
+            spec_window_counts: None,
         };
         let lines = baseline_lines(
             Some(b),
@@ -1214,6 +1433,8 @@ mod tests {
             ridge_batch_size: 40.0,
             config_relative_efficiency_pct: None,
             cost: None,
+            spec_suspected: None,
+            spec_window_counts: None,
         };
         let lines = baseline_lines(
             Some(b),
@@ -1262,6 +1483,8 @@ mod tests {
             ridge_batch_size: 1.0,
             config_relative_efficiency_pct: None,
             cost: None,
+            spec_suspected: None,
+            spec_window_counts: None,
         }
     }
 
@@ -1300,6 +1523,8 @@ mod tests {
                 cost_per_million_tokens: Some(cpm),
                 cost_source: source,
             }),
+            spec_suspected: None,
+            spec_window_counts: None,
         }
     }
 
@@ -1403,6 +1628,8 @@ mod tests {
             ridge_batch_size: 1.0,
             config_relative_efficiency_pct: None,
             cost: None,
+            spec_suspected: None,
+            spec_window_counts: None,
         };
         assert!(quiet_efficiency_fallback_lines(Some(&b)).is_empty());
     }

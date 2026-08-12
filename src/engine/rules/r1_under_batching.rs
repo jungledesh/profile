@@ -425,7 +425,11 @@ pub(super) fn soft_underfed_recommendation(
     let ridge_batch_size = soft.and_then(|e| e.ridge_batch_size).or(ridge_batch_size);
     let (effective_max, binding_wall) =
         super::effective_max_and_binder(max_n, ridge_batch_size, usable_kv_concurrency(snapshot));
-    let known_gpu = baseline.is_some_and(|b| b.config_relative_efficiency_pct.is_some());
+    let known_gpu = baseline.is_some_and(|b| {
+        // Spec OR clears config_relative on the summary baseline; ridge/spec still
+        // prove the GPU was catalogued. Do not emit the unknown-GPU note then.
+        b.config_relative_efficiency_pct.is_some() || b.spec_suspected.is_some()
+    });
     let confidence = 0.5; // Soft inject: Medium/Low; R1 gates did not pass.
     let fmt = R1FormatCtx::from_snapshot(
         snapshot,
@@ -1549,5 +1553,89 @@ mod tests {
         let text = format_under_batching_fired(&d, 0.8, false, &R1FormatCtx::default()).join("\n");
         assert!(text.contains("(107 seats idle; KV fit unknown)"), "{text}");
         assert!(!text.contains("107 slots idle"));
+    }
+
+    #[test]
+    fn soft_underfed_known_gpu_when_spec_cleared_config_relative() {
+        use crate::engine::KvCacheDtypeSource;
+        use crate::engine::baseline::{
+            CeilingEstimate, SpecDetector, SpecEvidence, WeightDtypeSource,
+        };
+        use crate::engine::limiter::LimiterEvidence;
+
+        let t = std::time::SystemTime::UNIX_EPOCH;
+        let snap = crate::collectors::RawSnapshot {
+            gpu_observed_at: t,
+            vllm_observed_at: t,
+            timestamp: t,
+            vllm: crate::collectors::VllmRawMetrics {
+                num_requests_running: Some(5.0),
+                num_requests_waiting: Some(0.0),
+                max_num_seqs: Some(256),
+                kv_cache_usage_perc: Some(10.0),
+                window_duration_secs: Some(2.0),
+                ..Default::default()
+            },
+            gpus: vec![],
+            host_memory: None,
+        };
+        let baseline = crate::engine::baseline::PhysicsBaseline {
+            decode: CeilingEstimate {
+                lower: 1.0,
+                expected: 1.0,
+                upper: 1.0,
+            },
+            prefill: None,
+            efficiency_pct: None,
+            headroom_pct: None,
+            weight_dtype_source: WeightDtypeSource::EnvVar,
+            weight_gb: 16.0,
+            weight_bytes_per_param: 2,
+            kv_bytes_per_element: 2,
+            kv_cache_dtype_source: KvCacheDtypeSource::Auto,
+            kv_headroom_gb: Some(40.0),
+            tpot_floor_ms: 1.0,
+            prefill_latency_floor_ms: None,
+            ridge_batch_size: 200.0,
+            // Spec OR cleared this; GPU is still known.
+            config_relative_efficiency_pct: None,
+            cost: None,
+            spec_suspected: Some(SpecEvidence {
+                detector: SpecDetector::Tpot,
+                measured: 0.01,
+                bound: 1.0,
+            }),
+            spec_window_counts: Some((1, 12)),
+        };
+        let soft = LimiterEvidence {
+            kv_cache_mean_perc: Some(10.0),
+            kv_cache_peak_perc: Some(10.0),
+            mean_running: Some(5.0),
+            mean_waiting: Some(0.0),
+            ridge_batch_size: Some(200.0),
+            mean_tpot_ms: Some(50.0),
+            tpot_floor_ms: Some(1.0),
+            effective_prompt_decode_ratio: None,
+            chunked_prefill_enabled: None,
+            headroom_pct: None,
+            n_eval: 12,
+            ceiling_unknown_reason: None,
+            spec_suspected: true,
+        };
+        let rec = soft_underfed_recommendation(
+            &snap,
+            Some(256),
+            Some(200.0),
+            Some(&baseline),
+            Some(8192),
+            None,
+            Some(&soft),
+        )
+        .expect("soft underfed");
+        let text = rec.display_lines.join("\n");
+        assert!(
+            !text.contains("GPU not in catalog"),
+            "spec OR must not fake unknown-GPU note: {text}"
+        );
     }
 }

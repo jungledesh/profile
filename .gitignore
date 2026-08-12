@@ -2,6 +2,7 @@ target/
 **/*.rs.bk
 .DS_Store
 ROADMAP.md
+deferred.md
 CLAUDE.md
 .agents/
 __pycache__/

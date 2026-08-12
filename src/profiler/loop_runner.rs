@@ -613,6 +613,9 @@ fn healthy_exit_message(input: HealthyExitInput) -> String {
         Some(engine::limiter::LimiterVerdict::WaitingUnread) => {
             limiter_line.unwrap_or_else(|| engine::limiter::WAITING_UNREAD_LIMITER_LINE.to_string())
         }
+        Some(engine::limiter::LimiterVerdict::SpecSuspected) => {
+            limiter_line.unwrap_or_else(|| engine::SPEC_GUARD_LIMITER_LINE.to_string())
+        }
         None => {
             format!("{eff_str} - insufficient data to identify primary limiter.")
         }
@@ -623,7 +626,9 @@ fn healthy_exit_message(input: HealthyExitInput) -> String {
         | Some(engine::limiter::LimiterVerdict::CeilingUnknown(_)) => {
             "Rules clear. No actionable config fix identified."
         }
-        Some(engine::limiter::LimiterVerdict::WaitingUnread) | None => "Rules clear.",
+        Some(engine::limiter::LimiterVerdict::WaitingUnread)
+        | Some(engine::limiter::LimiterVerdict::SpecSuspected)
+        | None => "Rules clear.",
     };
     format!("{prefix}\n\n{limiter_block}")
 }
@@ -944,6 +949,7 @@ mod tests {
                 headroom_pct: Some(2.0),
                 n_eval: 0,
                 ceiling_unknown_reason: None,
+                spec_suspected: false,
             },
             n_eval: 3,
             enforce_eager: None,
@@ -971,6 +977,7 @@ mod tests {
                 headroom_pct: None,
                 n_eval: 0,
                 ceiling_unknown_reason: None,
+                spec_suspected: false,
             },
             n_eval: 3,
             enforce_eager,
@@ -995,6 +1002,7 @@ mod tests {
                 headroom_pct: None,
                 n_eval: 0,
                 ceiling_unknown_reason: None,
+                spec_suspected: false,
             },
             n_eval: 3,
             enforce_eager: None,
@@ -1019,6 +1027,7 @@ mod tests {
                 headroom_pct: None,
                 n_eval: 0,
                 ceiling_unknown_reason: None,
+                spec_suspected: false,
             },
             n_eval: 3,
             enforce_eager: None,
@@ -1053,6 +1062,7 @@ mod tests {
                 headroom_pct: None,
                 n_eval: 0,
                 ceiling_unknown_reason: None,
+                spec_suspected: false,
             },
             n_eval: 3,
             enforce_eager: None,
@@ -1083,6 +1093,7 @@ mod tests {
                 headroom_pct: None,
                 n_eval: 0,
                 ceiling_unknown_reason: None,
+                spec_suspected: false,
             },
             n_eval: 3,
             enforce_eager: None,
@@ -1111,6 +1122,7 @@ mod tests {
                 headroom_pct: None,
                 n_eval: 0,
                 ceiling_unknown_reason: None,
+                spec_suspected: false,
             },
             n_eval: 3,
             enforce_eager: None,
@@ -1146,6 +1158,7 @@ mod tests {
                 headroom_pct: None,
                 n_eval: 0,
                 ceiling_unknown_reason: None,
+                spec_suspected: false,
             },
             n_eval: 3,
             enforce_eager: None,
@@ -1179,6 +1192,7 @@ mod tests {
             headroom_pct: None,
             n_eval: 3,
             ceiling_unknown_reason: None,
+            spec_suspected: false,
         };
         let line = engine::limiter::limiter_line(&ev).expect("decline line");
         assert_eq!(line, engine::limiter::WAITING_UNREAD_LIMITER_LINE);
@@ -1212,6 +1226,7 @@ mod tests {
             headroom_pct: None,
             n_eval: 3,
             ceiling_unknown_reason: None,
+            spec_suspected: false,
         };
         let line = engine::limiter::limiter_line(&ev).expect("limiter line");
         let msg = healthy_exit_message(HealthyExitInput {
@@ -1378,6 +1393,19 @@ mod tests {
     fn efficiency_delta_near_zero_suppressed() {
         assert!(format_efficiency_delta_line(Some(-0.04)).is_none());
         assert!(format_efficiency_delta_line(Some(0.03)).is_none());
+    }
+
+    #[test]
+    fn remeasure_delta_omits_efficiency_line_when_spec_withdrew_pct() {
+        let mut d = flat_delta();
+        d.efficiency_pct_before = Some(12.0);
+        d.efficiency_pct_after = None;
+        d.efficiency_delta_pp = None;
+        let text = remeasure_delta_lines(&d).join("\n");
+        assert!(
+            !text.contains("Decode eff."),
+            "withdrawn efficiency must not invent a pp line: {text}"
+        );
     }
 
     #[test]
