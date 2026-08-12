@@ -56,6 +56,11 @@ python -m pip install "uv==${UV_VERSION}"
 export VLLM_USE_PRECOMPILED="${VLLM_USE_PRECOMPILED:-1}"
 echo "Installing vLLM from: ${VLLM_PIP_SPEC}"
 uv pip install "${VLLM_PIP_SPEC}"
+# Muse git pins flashinfer==0.6.16.post3; that release crashes on Python 3.10
+# (array.array[int]). Force an older wheel after install; do not co-resolve.
+FLASHINFER_PIN="${FLASHINFER_PIN:-flashinfer-python==0.6.15.post1}"
+uv pip install --force-reinstall --no-deps "${FLASHINFER_PIN}"
+echo "FlashInfer forced: ${FLASHINFER_PIN}"
 
 if [[ -n "${HF_TOKEN:-}" ]]; then
     export HF_TOKEN
