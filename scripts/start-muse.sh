@@ -70,10 +70,20 @@ source "$VENV_DIR/bin/activate"
 
 python -m pip install "pip==${PIP_VERSION}"
 python -m pip install "uv==${UV_VERSION}"
-# Precompiled kernels: avoid a full CUDA compile on the Muse git ref.
-export VLLM_USE_PRECOMPILED="${VLLM_USE_PRECOMPILED:-1}"
-echo "Installing vLLM from: ${VLLM_PIP_SPEC}"
-uv pip install "${VLLM_PIP_SPEC}"
+# Precompiled kernels match CUDA 13. On driver 570 / cu128, compile against the
+# 12.8 image toolkit for Blackwell (sm_120). Override with VLLM_USE_PRECOMPILED=1.
+VLLM_INSTALL_ARGS=()
+if [[ "$TORCH_BACKEND" == "cu128" ]]; then
+    export VLLM_USE_PRECOMPILED="${VLLM_USE_PRECOMPILED:-0}"
+    export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-12.0}"
+    uv pip install --index-url "${TORCH_INDEX}" "${TORCH_PINS[@]}"
+    echo "Torch pre-pinned for compile: ${TORCH_PINS[*]}"
+    VLLM_INSTALL_ARGS+=(--no-build-isolation)
+else
+    export VLLM_USE_PRECOMPILED="${VLLM_USE_PRECOMPILED:-1}"
+fi
+echo "Installing vLLM from: ${VLLM_PIP_SPEC} (VLLM_USE_PRECOMPILED=${VLLM_USE_PRECOMPILED})"
+uv pip install "${VLLM_INSTALL_ARGS[@]}" "${VLLM_PIP_SPEC}"
 # Muse git / PyPI resolve torch 2.13.0+cu130. Re-pin to the driver wheel after.
 # Do not set UV_TORCH_BACKEND during the git install: cu128 has no 2.13 wheel.
 uv pip install --force-reinstall --index-url "${TORCH_INDEX}" "${TORCH_PINS[@]}"
