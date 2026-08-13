@@ -4,6 +4,7 @@ mod diagnose;
 mod gpu_assignment;
 
 use clap::{CommandFactory, Parser, Subcommand};
+use std::io::{self, Write};
 use std::time::Duration;
 
 const DEFAULT_METRICS_URL: &str = "http://localhost:8000/metrics";
@@ -13,44 +14,73 @@ const ABOUT: &str = "Detects inefficiencies. Suggests fixes.";
 const MAX_DURATION: Duration = Duration::from_secs(30 * 60);
 const MIN_DURATION: Duration = Duration::from_secs(30);
 
-/// Shown for `profile diagnose --help` only (root help omits options via template).
-const DIAGNOSE_ABOUT: &str = "Collects metrics. Detects inefficiencies. Suggests fixes.\nPass -v to show per-rule status when no issue is detected.";
+/// Shown for `profile diagnose --help` only (root help omits the loop line).
+const DIAGNOSE_ABOUT: &str = "Collects metrics. Detects inefficiencies. Suggests fixes.\nA loop: collect, you apply a fix, remeasure. Not a one-shot dump.\nPass -v to show rules that did not fire, physics limits, and extra GPU, latency, cache, and config detail.";
 
 #[derive(Debug, Parser)]
 #[command(
     name = "profile",
+    version = env!("CARGO_PKG_VERSION"),
     about = ABOUT,
     arg_required_else_help = true,
     disable_help_subcommand = true,
     override_usage = "profile <COMMAND> [OPTIONS]",
-    help_template = "\n\n{about}\n\n{usage-heading} {usage}\n\nCommands:\n{subcommands}\n",
+    help_template = "\n\n{name} {version}\n\n{about}\n\n{usage-heading} {usage}\n\nCommands:\n{subcommands}\n\nOptions:\n{options}\n",
     disable_help_flag = true,
+    next_help_heading = "Options",
 )]
 pub struct Cli {
     #[arg(
-        short = 'h',
-        long = "help",
+        short = 'u',
+        long,
         global = true,
-        action = clap::ArgAction::Help,
-        help = "Display this message",
-        display_order = 2
+        default_value = DEFAULT_METRICS_URL,
+        env = "PROFILE_URL",
+        hide_env_values = true,
+        help = "vLLM metrics endpoint",
+        display_order = 0
     )]
-    pub help_flag: Option<bool>,
+    pub url: String,
+
+    #[arg(
+        long = "duration",
+        global = true,
+        default_value = DEFAULT_DURATION,
+        value_parser = parse_duration_arg,
+        env = "PROFILE_DURATION",
+        hide_env_values = true,
+        help = "Measurement period (default: 30s, minimum: 30s, maximum: 30m). s=seconds, m=minutes (not ms/mins). Examples: 30s, 2m, 10m, 30m",
+        long_help = "How long to collect metrics before analyzing each iteration (default: 30s).\n\n\
+            Units:\n  \
+              s  seconds\n  \
+              m  minutes (not ms, not \"mins\", not bare m)\n\n\
+            Examples:\n  \
+              30s   minimum (default)\n  \
+              2m    short run\n  \
+              10m   longer run\n  \
+              30m   maximum",
+        display_order = 1
+    )]
+    pub duration: Duration,
 
     #[arg(
         short = 'm',
         long = "max-num-seqs",
         global = true,
+        env = "PROFILE_MAX_NUM_SEQS",
+        hide_env_values = true,
         help = "Engine max_num_seqs (auto-detected from /metrics when available; prompted if absent)",
-        display_order = 1
+        display_order = 2
     )]
     pub max_num_seqs: Option<u32>,
 
     #[arg(
         long = "tensor-parallel-size",
         global = true,
+        env = "PROFILE_TENSOR_PARALLEL_SIZE",
+        hide_env_values = true,
         help = "Tensor parallel degree for this vLLM instance",
-        display_order = 2
+        display_order = 3
     )]
     pub tensor_parallel_size: Option<u32>,
 
@@ -58,29 +88,34 @@ pub struct Cli {
         long = "cost-per-hour",
         global = true,
         value_parser = parse_cost_per_hour_arg,
+        env = "PROFILE_COST_PER_HOUR",
+        hide_env_values = true,
         help = "GPU cost in USD/hr (overrides catalog estimate)",
-        display_order = 3
+        display_order = 4
     )]
     pub cost_per_hour: Option<f64>,
-
-    #[arg(
-        short = 'u',
-        long,
-        global = true,
-        default_value = DEFAULT_METRICS_URL,
-        help = "vLLM metrics endpoint",
-        display_order = 0
-    )]
-    pub url: String,
 
     #[arg(
         short,
         long,
         action = clap::ArgAction::Count,
         global = true,
-        hide = true
+        env = "PROFILE_VERBOSE",
+        hide_env_values = true,
+        help = "Show rules that did not fire, physics limits, and extra GPU, latency, cache, and config detail",
+        display_order = 5
     )]
     pub verbose: u8,
+
+    #[arg(
+        short = 'h',
+        long = "help",
+        global = true,
+        action = clap::ArgAction::Help,
+        help = "Display this message",
+        display_order = 6
+    )]
+    pub help_flag: Option<bool>,
 
     #[command(subcommand)]
     pub command: Commands,
@@ -91,46 +126,59 @@ pub enum Commands {
     #[command(
         about = "Run diagnostics",
         long_about = DIAGNOSE_ABOUT,
+        version = env!("CARGO_PKG_VERSION"),
+        disable_version_flag = true,
         override_usage = "profile diagnose [OPTIONS]",
-        help_template = "\n\n{about}\n\n{usage-heading} {usage}\n\n{all-args}\n",
+        help_template = "\n\nprofile {version}\n\n{about}\n\n{usage-heading} {usage}\n\n{all-args}\n",
         display_order = 0
     )]
-    Diagnose {
-        #[arg(
-            long = "duration",
-            default_value = DEFAULT_DURATION,
-            value_parser = parse_duration_arg,
-            help = "Measurement period (default: 30s, minimum: 30s, maximum: 30m). s=seconds, m=minutes (not ms/mins). Examples: 30s, 2m, 10m, 30m",
-            long_help = "How long to collect metrics before analyzing each iteration (default: 30s).\n\n\
-                Units:\n  \
-                  s  seconds\n  \
-                  m  minutes (not ms, not \"mins\", not bare m)\n\n\
-                Examples:\n  \
-                  30s   minimum (default)\n  \
-                  2m    short run\n  \
-                  10m   longer run\n  \
-                  30m   maximum"
-        )]
-        duration: Duration,
-    },
+    Diagnose,
 
     #[command(about = "Display this message", display_order = 1)]
     Help,
+
+    #[command(
+        about = "Print shell completion script",
+        override_usage = "profile completions <SHELL>",
+        display_order = 2
+    )]
+    Completions {
+        #[arg(value_enum, help = "Shell: bash, elvish, fish, powershell, zsh")]
+        shell: clap_complete::Shell,
+    },
+
+    #[command(
+        about = "Print man page",
+        override_usage = "profile man",
+        display_order = 3
+    )]
+    Man,
 }
 
 pub fn run(cli: Cli) -> anyhow::Result<()> {
     match &cli.command {
-        Commands::Diagnose { duration } => diagnose::execute(
+        Commands::Diagnose => diagnose::execute(
             &cli.url,
             cli.max_num_seqs,
             cli.cost_per_hour,
             cli.tensor_parallel_size,
             cli.verbose > 0,
-            *duration,
+            cli.duration,
         )?,
         Commands::Help => {
             Cli::command().print_long_help()?;
             println!();
+        }
+        Commands::Completions { shell } => {
+            let mut cmd = Cli::command();
+            clap_complete::generate(*shell, &mut cmd, "profile", &mut io::stdout());
+        }
+        Commands::Man => {
+            let cmd = Cli::command();
+            let man = clap_mangen::Man::new(cmd);
+            let mut buf = Vec::new();
+            man.render(&mut buf)?;
+            io::stdout().write_all(&buf)?;
         }
     }
 
