@@ -610,29 +610,49 @@ num_requests_running  is Some (even if zero)</code></pre>
     <p><a href="#home" data-page="home" style="font-size: 0.85rem; color: #666; text-decoration: none;">&larr; Back to Workflow</a></p>
 
     <h2>GPUs</h2>
-    <p>BF16 Tensor Core dense TFLOPs and memory bandwidth feed the roofline math. Prices from <code>src/context/gpu_prices.json</code> (updated 2026-07-23). Use <code>--cost-per-hour</code> for exact rates. Table is a common subset; full list including AMD Instinct and additional Blackwell SKUs is in <code>gpu_catalog.rs</code>.</p>
+    <p>BF16 Tensor Core dense TFLOPs and memory bandwidth feed the roofline math. On-demand prices from <code>src/context/gpu_prices.json</code> (updated 2026-08-13). Use <code>--cost-per-hour</code> for exact rates. A dash means no catalog price.</p>
     <table>
-      <thead><tr><th>GPU</th><th>Arch</th><th>BF16 TC Dense TFLOPs</th><th>Mem BW GB/s</th><th>On-demand $/hr</th><th>Spot $/hr</th></tr></thead>
+      <thead><tr><th>GPU</th><th>Arch</th><th>BF16 TC Dense TFLOPs</th><th>Mem BW GB/s</th><th>On-demand $/hr</th></tr></thead>
       <tbody>
-        <tr><td>H100 PCIe</td><td>Hopper</td><td>756.0</td><td>2,000</td><td>$2.89</td><td>$0.90</td></tr>
-        <tr><td>H100 SXM</td><td>Hopper</td><td>989.0</td><td>3,350</td><td>$2.99</td><td>$1.75</td></tr>
-        <tr><td>H200</td><td>Hopper</td><td>989.0</td><td>4,800</td><td>$4.39</td><td>$2.50</td></tr>
-        <tr><td>A100 80GB</td><td>Ampere</td><td>312.0</td><td>2,039</td><td>$1.49</td><td>$0.60</td></tr>
-        <tr><td>A100 40GB</td><td>Ampere</td><td>312.0</td><td>1,555</td><td>$1.50</td><td>$0.70</td></tr>
-        <tr><td>A10G</td><td>Ampere</td><td>126.0</td><td>600</td><td>$1.00</td><td>$0.40</td></tr>
-        <tr><td>L40S</td><td>Ada</td><td>181.03</td><td>864</td><td>$0.99</td><td>$0.80</td></tr>
-        <tr><td>RTX 5090</td><td>Blackwell</td><td>209.5</td><td>1,792</td><td>$0.99</td><td>$0.40</td></tr>
-        <tr><td>RTX 4090</td><td>Ada</td><td>165.0</td><td>1,008</td><td>$0.69</td><td>$0.35</td></tr>
-        <tr><td>RTX 3090 Ti</td><td>Ampere</td><td>80.0</td><td>1,008</td><td>$0.22</td><td>$0.13</td></tr>
-        <tr><td>RTX 3090</td><td>Ampere</td><td>71.16</td><td>936</td><td>$0.46</td><td>$0.14</td></tr>
-        <tr><td>RTX A6000</td><td>Ampere</td><td>77.4</td><td>768</td><td>$0.49</td><td>$0.40</td></tr>
-        <tr><td>RTX PRO 6000 Blackwell</td><td>Blackwell</td><td>250.0</td><td>1,792</td><td>$1.99</td><td>$0.90</td></tr>
-        <tr><td>B200</td><td>Blackwell</td><td>2,250.0</td><td>7,700</td><td>$5.89</td><td>$2.00</td></tr>
-        <tr><td>B300</td><td>Blackwell</td><td>2,500.0</td><td>8,000</td><td>$7.39</td><td>$7.39</td></tr>
-        <tr><td>GB200</td><td>Blackwell</td><td>2,250.0</td><td>7,700</td><td>$8.50</td><td>$4.00</td></tr>
+        <tr><td>H100 PCIe</td><td>Hopper</td><td>756.0</td><td>2,000</td><td>$2.89</td></tr>
+        <tr><td>H100 NVL</td><td>Hopper</td><td>835.5</td><td>3,900</td><td>$3.19</td></tr>
+        <tr><td>H100 SXM</td><td>Hopper</td><td>989.0</td><td>3,350</td><td>$2.99</td></tr>
+        <tr><td>H200</td><td>Hopper</td><td>989.0</td><td>4,800</td><td>$4.39</td></tr>
+        <tr><td>A100 80GB</td><td>Ampere</td><td>312.0</td><td>2,039</td><td>$1.49</td></tr>
+        <tr><td>A100 40GB</td><td>Ampere</td><td>312.0</td><td>1,555</td><td>$1.50</td></tr>
+        <tr><td>A10G</td><td>Ampere</td><td>126.0</td><td>600</td><td>$1.00</td></tr>
+        <tr><td>L40S</td><td>Ada</td><td>181.03</td><td>864</td><td>$0.99</td></tr>
+        <tr><td>RTX 5090</td><td>Blackwell</td><td>209.5</td><td>1,792</td><td>$0.99</td></tr>
+        <tr><td>RTX 4090</td><td>Ada</td><td>165.0</td><td>1,008</td><td>$0.69</td></tr>
+        <tr><td>RTX 3090 Ti</td><td>Ampere</td><td>80.0</td><td>1,008</td><td>$0.22</td></tr>
+        <tr><td>RTX 3090</td><td>Ampere</td><td>71.16</td><td>936</td><td>$0.46</td></tr>
+        <tr><td>RTX A6000</td><td>Ampere</td><td>77.4</td><td>768</td><td>$0.49</td></tr>
+        <tr><td>RTX PRO 6000 Blackwell</td><td>Blackwell</td><td>250.0</td><td>1,792</td><td>$1.99</td></tr>
+        <tr><td>B200</td><td>Blackwell</td><td>2,250.0</td><td>7,700</td><td>$5.89</td></tr>
+        <tr><td>B300</td><td>Blackwell</td><td>2,500.0</td><td>8,000</td><td>$7.39</td></tr>
+        <tr><td>GB200</td><td>Blackwell</td><td>2,250.0</td><td>7,700</td><td>$8.50</td></tr>
+        <tr><td>GB10 (DGX Spark)</td><td>Blackwell</td><td>212.9</td><td>273</td><td>-</td></tr>
+        <tr><td>MI355X</td><td>CDNA4</td><td>2,500.0</td><td>8,000</td><td>-</td></tr>
+        <tr><td>MI350X</td><td>CDNA4</td><td>2,300.0</td><td>8,000</td><td>-</td></tr>
+        <tr><td>MI325X</td><td>CDNA3</td><td>1,307.4</td><td>6,000</td><td>$3.50</td></tr>
+        <tr><td>MI300A</td><td>CDNA3</td><td>980.6</td><td>5,300</td><td>$2.00</td></tr>
+        <tr><td>MI300X</td><td>CDNA3</td><td>1,307.4</td><td>5,300</td><td>$3.49</td></tr>
+        <tr><td>MI250X (per GCD)</td><td>CDNA2</td><td>191.5</td><td>1,638.4</td><td>$1.50</td></tr>
+        <tr><td>MI250 (per GCD)</td><td>CDNA2</td><td>181.0</td><td>1,638.4</td><td>$1.30</td></tr>
+        <tr><td>MI210</td><td>CDNA2</td><td>181.0</td><td>1,638.4</td><td>$1.00</td></tr>
+        <tr><td>RX 9070 XT</td><td>RDNA4</td><td>194.6</td><td>644</td><td>-</td></tr>
+        <tr><td>RX 9070</td><td>RDNA4</td><td>144.5</td><td>644</td><td>-</td></tr>
+        <tr><td>Radeon PRO W7900</td><td>RDNA3</td><td>123.0</td><td>864</td><td>-</td></tr>
+        <tr><td>Radeon PRO W7800</td><td>RDNA3</td><td>90.5</td><td>576</td><td>-</td></tr>
+        <tr><td>RX 7900 XTX</td><td>RDNA3</td><td>123.0</td><td>960</td><td>-</td></tr>
+        <tr><td>RX 7900 GRE</td><td>RDNA3</td><td>92.0</td><td>576</td><td>-</td></tr>
+        <tr><td>RX 7900 XT</td><td>RDNA3</td><td>103.0</td><td>800</td><td>-</td></tr>
+        <tr><td>RX 7800 XT</td><td>RDNA3</td><td>74.6</td><td>624</td><td>-</td></tr>
+        <tr><td>RX 7700 XT</td><td>RDNA3</td><td>70.3</td><td>432</td><td>-</td></tr>
+        <tr><td>RX 7600 XT</td><td>RDNA3</td><td>45.1</td><td>288</td><td>-</td></tr>
       </tbody>
     </table>
-    <div class="callout">BF16 TC Dense TFLOPs are tensor-core throughput with FP32 accumulate where the catalog distinguishes it (L40S uses 181.03; datasheet 362.05 is FP16-accumulate). GB200 matches B200 physics (superchip name). B300 is Blackwell Ultra at 8 TB/s. A plain "A100" without a size token (80GB or 40GB) will not match. All catalog ceilings labeled <code>(est)</code> in output.</div>
+    <div class="callout">BF16 TC Dense TFLOPs are tensor-core throughput with FP32 accumulate where the catalog distinguishes it (L40S uses 181.03; datasheet 362.05 is FP16-accumulate). GB200 matches B200 physics (superchip name). B300 is Blackwell Ultra at 8 TB/s. H100 NVL is the 94 GB HBM3 SKU (3.9 TB/s). GB10 BW is LPDDR5X system bandwidth, not HBM. MI250 / MI250X values are per GCD (ROCm sees each GCD as a device). A plain "A100" without a size token (80GB or 40GB) will not match. All catalog ceilings labeled <code>(est)</code> in output.</div>
 
     <h2>Models</h2>
     <p>Matched by token against the model name vLLM reports at startup.</p>
@@ -644,38 +664,54 @@ num_requests_running  is Some (even if zero)</code></pre>
         <tr><td>Llama 3 405B</td><td>405B</td><td>-</td><td>No</td></tr>
         <tr><td>Llama 3 70B</td><td>70B</td><td>-</td><td>No</td></tr>
         <tr><td>Llama 3 8B</td><td>8B</td><td>-</td><td>No</td></tr>
+        <tr><td>Llama 3.2 3B</td><td>3B</td><td>-</td><td>No</td></tr>
+        <tr><td>Llama 3.2 1B</td><td>1B</td><td>-</td><td>No</td></tr>
         <tr><td>Nemotron 70B</td><td>70B</td><td>-</td><td>No</td></tr>
         <tr><td>Nemotron 8B</td><td>8B</td><td>-</td><td>No</td></tr>
+        <tr><td>Muse Glimmer 30B</td><td>29.6B</td><td>27.8B (text)</td><td>No</td></tr>
         <tr><td>Qwen3.6 27B</td><td>27B</td><td>-</td><td>No</td></tr>
         <tr><td>Qwen3 235B</td><td>235B</td><td>22B</td><td>Yes</td></tr>
-        <tr><td>Qwen3 72B</td><td>72B</td><td>-</td><td>No</td></tr>
         <tr><td>Qwen3 32B</td><td>32B</td><td>-</td><td>No</td></tr>
         <tr><td>Qwen3 30B</td><td>30B</td><td>3B</td><td>Yes</td></tr>
         <tr><td>Qwen3 14B</td><td>14B</td><td>-</td><td>No</td></tr>
-        <tr><td>Qwen3 7B</td><td>7B</td><td>-</td><td>No</td></tr>
+        <tr><td>Qwen3 8B</td><td>8B</td><td>-</td><td>No</td></tr>
+        <tr><td>Qwen3 4B</td><td>4B</td><td>-</td><td>No</td></tr>
+        <tr><td>Qwen3 1.7B</td><td>1.7B</td><td>-</td><td>No</td></tr>
+        <tr><td>Qwen3 0.6B</td><td>0.6B</td><td>-</td><td>No</td></tr>
         <tr><td>Qwen2.5 72B</td><td>72B</td><td>-</td><td>No</td></tr>
         <tr><td>Qwen2.5 32B</td><td>32B</td><td>-</td><td>No</td></tr>
         <tr><td>Qwen2.5 14B</td><td>14B</td><td>-</td><td>No</td></tr>
         <tr><td>Qwen2.5 7B</td><td>7B</td><td>-</td><td>No</td></tr>
-        <tr><td>DeepSeek 671B / R1 / V3</td><td>671B</td><td>37B</td><td>Yes</td></tr>
+        <tr><td>Qwen2.5 3B</td><td>3B</td><td>-</td><td>No</td></tr>
+        <tr><td>Qwen2.5 1.5B</td><td>1.5B</td><td>-</td><td>No</td></tr>
+        <tr><td>Qwen2.5 0.5B</td><td>0.5B</td><td>-</td><td>No</td></tr>
         <tr><td>DeepSeek 70B</td><td>70B</td><td>-</td><td>No</td></tr>
         <tr><td>DeepSeek 7B</td><td>7B</td><td>-</td><td>No</td></tr>
-        <tr><td>Mistral Large 3 (675B)</td><td>675B</td><td>41B</td><td>Yes</td></tr>
+        <tr><td>DeepSeek R1 Distill Llama 70B</td><td>70B</td><td>-</td><td>No</td></tr>
+        <tr><td>DeepSeek R1 Distill Qwen 32B</td><td>32B</td><td>-</td><td>No</td></tr>
+        <tr><td>DeepSeek R1 Distill Qwen 14B</td><td>14B</td><td>-</td><td>No</td></tr>
+        <tr><td>DeepSeek R1 Distill Qwen 7B</td><td>7B</td><td>-</td><td>No</td></tr>
+        <tr><td>DeepSeek R1 Distill Llama 8B</td><td>8B</td><td>-</td><td>No</td></tr>
+        <tr><td>DeepSeek R1 Distill Qwen 1.5B</td><td>1.5B</td><td>-</td><td>No</td></tr>
         <tr><td>Mistral Large 123B</td><td>123B</td><td>-</td><td>No</td></tr>
         <tr><td>Mixtral 8x22B</td><td>141B</td><td>39B</td><td>Yes</td></tr>
         <tr><td>Mixtral 8x7B</td><td>47B</td><td>13B</td><td>Yes</td></tr>
         <tr><td>Mistral 7B</td><td>7B</td><td>-</td><td>No</td></tr>
         <tr><td>Gemma 4 31B/27B</td><td>31B</td><td>-</td><td>No</td></tr>
-        <tr><td>Gemma 4 26B</td><td>26B</td><td>4B</td><td>Yes</td></tr>
+        <tr><td>Gemma 4 26B-A4B</td><td>25.2B</td><td>3.8B</td><td>Yes</td></tr>
+        <tr><td>Gemma 3 27B</td><td>27B</td><td>-</td><td>No</td></tr>
+        <tr><td>Gemma 3 12B</td><td>12B</td><td>-</td><td>No</td></tr>
+        <tr><td>Gemma 3 4B</td><td>4B</td><td>-</td><td>No</td></tr>
+        <tr><td>Gemma 3 1B</td><td>1B</td><td>-</td><td>No</td></tr>
+        <tr><td>Gemma 2 2B</td><td>2B</td><td>-</td><td>No</td></tr>
         <tr><td>Gemma 27B</td><td>27B</td><td>-</td><td>No</td></tr>
         <tr><td>Gemma 9B</td><td>9B</td><td>-</td><td>No</td></tr>
-        <tr><td>Kimi K2</td><td>1,000B</td><td>32B</td><td>Yes</td></tr>
-        <tr><td>GLM 744B</td><td>744B</td><td>56B</td><td>Yes</td></tr>
         <tr><td>GLM 32B</td><td>32B</td><td>-</td><td>No</td></tr>
+        <tr><td>Phi-4 mini</td><td>3.8B</td><td>-</td><td>No</td></tr>
         <tr><td>Phi 4 14B</td><td>14B</td><td>-</td><td>No</td></tr>
       </tbody>
     </table>
-    <div class="callout">MoE models: <code>active_param_count</code> drives roofline ceilings; <code>param_count</code> (total) drives <code>weight_gb</code> and OOM headroom. Unrecognized models skip roofline entirely. To add a model or GPU, open an issue or submit a PR to the catalog files in <code>src/context/</code>.</div>
+    <div class="callout">MoE models: <code>active_param_count</code> drives roofline ceilings; <code>param_count</code> (total) drives <code>weight_gb</code> and OOM headroom. Catalog includes models whose 4-bit weights fit the largest listed GPU (~288 GB). DeepSeek 671B / R1 / V3, Mistral Large 3 675B, Kimi K2, and GLM 744B are omitted. Qwen3 has no official 7B or 72B dense SKU. Muse Glimmer 30B is dense text plus a vision encoder: 29.6B total, 27.8B text stack on the decode roof. Qwen3.6 27B is hybrid DeltaNet + attention, not MoE. Gemma 4 27B is catalogued as 31B (Google's HF name vs param count). Unrecognized models skip roofline entirely. To add a model or GPU, open an issue or submit a PR to the catalog files in <code>src/context/</code>.</div>
   </article>
 
 <article id="page-math" class="page">

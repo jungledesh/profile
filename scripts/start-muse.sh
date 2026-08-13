@@ -23,8 +23,10 @@ PIP_VERSION="${PIP_VERSION:-26.0.1}"
 UV_VERSION="${UV_VERSION:-0.11.1}"
 # Muse Glimmer is not in any PyPI wheel yet (PR vllm-project/vllm#51655 still open).
 # Same install path as Qwen/Gemma (uv pip into VENV_DIR); different package source.
-# Override with VLLM_PIP_SPEC=vllm==0.25.1 only for debugging non-Muse boots.
-VLLM_PIP_SPEC="${VLLM_PIP_SPEC:-git+https://github.com/xianbaoqian/vllm.git@tiezhen/new-model-support}"
+# Pin: last commit on tiezhen/new-model-support from the Aug 12 5090 demo day.
+# Floating branch tip merged main on Aug 13; pip then resolved torch 2.13.0+cu130
+# which cannot init on driver 570 (CUDA API 12090). Override only to debug.
+VLLM_PIP_SPEC="${VLLM_PIP_SPEC:-git+https://github.com/xianbaoqian/vllm.git@98f86b9c02329200a0390aecfe598e27928cbf40}"
 
 MODEL_REPO="${MODEL_REPO:-Inferact/Muse-Glimmer-30B-NVFP4-W4A4}"
 SERVED_NAME="${SERVED_NAME:-muse-glimmer-30b}"
@@ -42,6 +44,22 @@ LOG_FILE="${APP_DIR}/vllm.log"
 
 echo "Starting container (Muse Glimmer 30B NVFP4, DFlash off)..."
 
+# Pin torch CUDA to the host driver. PyPI torch 2.13 defaults to cu130 (needs
+# driver 580). 5090 needs CUDA >= 12.8. Last Blackwell wheel that loads on
+# driver 570 is 2.11.0+cu128. Do not pin cu126 (no sm_120).
+DRIVER_VER="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 | tr -d '[:space:]')"
+DRIVER_MAJOR="${DRIVER_VER%%.*}"
+if [[ "$DRIVER_MAJOR" =~ ^[0-9]+$ ]] && (( DRIVER_MAJOR >= 580 )); then
+    TORCH_BACKEND=cu130
+    TORCH_INDEX="https://download.pytorch.org/whl/cu130"
+    TORCH_PINS=(torch==2.13.0 torchvision==0.28.0 torchaudio==2.11.0)
+else
+    TORCH_BACKEND=cu128
+    TORCH_INDEX="https://download.pytorch.org/whl/cu128"
+    TORCH_PINS=(torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0)
+fi
+echo "NVIDIA driver ${DRIVER_VER:-unknown}; pinning torch ${TORCH_BACKEND} (${TORCH_PINS[*]})"
+
 mkdir -p "$APP_DIR" "$MODELS_DIR"
 
 if [[ ! -f "$VENV_DIR/bin/activate" ]]; then
@@ -56,6 +74,10 @@ python -m pip install "uv==${UV_VERSION}"
 export VLLM_USE_PRECOMPILED="${VLLM_USE_PRECOMPILED:-1}"
 echo "Installing vLLM from: ${VLLM_PIP_SPEC}"
 uv pip install "${VLLM_PIP_SPEC}"
+# Muse git / PyPI resolve torch 2.13.0+cu130. Re-pin to the driver wheel after.
+# Do not set UV_TORCH_BACKEND during the git install: cu128 has no 2.13 wheel.
+uv pip install --force-reinstall --index-url "${TORCH_INDEX}" "${TORCH_PINS[@]}"
+echo "Torch forced: ${TORCH_PINS[*]} from ${TORCH_INDEX}"
 # Muse git pins flashinfer==0.6.16.post3; that release crashes on Python 3.10
 # (array.array[int]). Force an older wheel after install; do not co-resolve.
 FLASHINFER_PIN="${FLASHINFER_PIN:-flashinfer-python==0.6.15.post1}"
@@ -80,11 +102,15 @@ else
     echo "Model already present."
 fi
 
-# vLLM 0.25.x ships nvidia-cuda-runtime 13.x as a pip package.
-CUDA13_LIB=$(find "$VENV_DIR" -path "*/nvidia/cu13/lib" -type d 2>/dev/null | head -1)
-if [[ -n "$CUDA13_LIB" ]]; then
-    export LD_LIBRARY_PATH="${CUDA13_LIB}:${LD_LIBRARY_PATH:-}"
-    echo "CUDA 13 libs: $CUDA13_LIB"
+# cu130 wheels need libcudart.so.13 on the linker path. Do not prepend cu13
+# libs in front of a cu128 torch; that is the 570 failure mode.
+CUDA13_LIB=""
+if [[ "$TORCH_BACKEND" == "cu130" ]]; then
+    CUDA13_LIB=$(find "$VENV_DIR" -path "*/nvidia/cu13/lib" -type d 2>/dev/null | head -1)
+    if [[ -n "$CUDA13_LIB" ]]; then
+        export LD_LIBRARY_PATH="${CUDA13_LIB}:${LD_LIBRARY_PATH:-}"
+        echo "CUDA 13 libs: $CUDA13_LIB"
+    fi
 fi
 
 if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
@@ -99,10 +125,13 @@ fi
 #   --max-model-len 32768        KV headroom on 32 GB after ~25 GB weights
 # No --speculative-config (DFlash off).
 EXTRA_ARGS="${EXTRA_ARGS:-}"
+TMUX_CUDA_EXPORT=""
+if [[ -n "$CUDA13_LIB" ]]; then
+    TMUX_CUDA_EXPORT="export LD_LIBRARY_PATH=\"${CUDA13_LIB}:\${LD_LIBRARY_PATH:-}\" && "
+fi
 tmux new-session -d -s "$TMUX_SESSION" \
 "bash -lc 'source \"$VENV_DIR/bin/activate\" && \
-export LD_LIBRARY_PATH=\"${CUDA13_LIB}:\${LD_LIBRARY_PATH:-}\" && \
-vllm serve \"$MODEL_PATH\" \
+${TMUX_CUDA_EXPORT}vllm serve \"$MODEL_PATH\" \
   --served-model-name $SERVED_NAME \
   --max-model-len 32768 \
   --trust-remote-code \
