@@ -78,6 +78,12 @@ if [[ "$TORCH_BACKEND" == "cu128" ]]; then
     export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-12.0}"
     uv pip install --index-url "${TORCH_INDEX}" "${TORCH_PINS[@]}"
     echo "Torch pre-pinned for compile: ${TORCH_PINS[*]}"
+    # --no-build-isolation uses the venv, not a pep517 isolated env. Muse
+    # setup.py imports packaging; install the rest of build-system.requires
+    # except torch==2.13.0 (that pin is why we are on 2.11+cu128).
+    uv pip install "packaging>=24.2" "cmake>=3.26.1" ninja \
+        "setuptools>=77.0.3,<81.0.0" "setuptools-scm>=8.0" \
+        "setuptools-rust>=1.9.0" wheel jinja2
     VLLM_INSTALL_ARGS+=(--no-build-isolation)
 else
     export VLLM_USE_PRECOMPILED="${VLLM_USE_PRECOMPILED:-1}"
