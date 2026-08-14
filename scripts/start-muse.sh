@@ -27,10 +27,14 @@ UV_VERSION="${UV_VERSION:-0.11.1}"
 # parsers (vllm/tool_parsers/muse_glimmer_tool_parser.py). Do not pin a mainline
 # SHA that was merged in (98f86b9c has no parsers; serve dies with KeyError).
 # Use the commit tarball, not git+https: uv git fetch pulls ~240k objects and
-# stalls for hours on a slow pod link. Torch CUDA is re-pinned after install
-# for driver 570. Override only to debug.
+# stalls for hours on a slow pod link. GitHub tarballs have no .git metadata;
+# vLLM's version is dynamic via setuptools-scm, so pretend a PEP 440 version
+# or the build raises LookupError. Torch CUDA is re-pinned after install for
+# driver 570. Override only to debug.
 VLLM_SHA="${VLLM_SHA:-1f7f0715848c9acc56ea40faa21c13a02bdc8357}"
 VLLM_PIP_SPEC="${VLLM_PIP_SPEC:-vllm @ https://github.com/xianbaoqian/vllm/archive/${VLLM_SHA}.tar.gz}"
+export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM="${SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM:-0.17.0+muse.${VLLM_SHA:0:7}}"
+export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION:-$SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM}"
 
 MODEL_REPO="${MODEL_REPO:-Inferact/Muse-Glimmer-30B-NVFP4-W4A4}"
 SERVED_NAME="${SERVED_NAME:-muse-glimmer-30b}"
