@@ -22,15 +22,20 @@ trap 'echo "FAILED at line $LINENO"' ERR
 PIP_VERSION="${PIP_VERSION:-26.0.1}"
 UV_VERSION="${UV_VERSION:-0.11.1}"
 # Muse Glimmer is not in any PyPI wheel yet (PR vllm-project/vllm#51655 still open).
-# Same install path as Qwen/Gemma (uv pip into VENV_DIR); different package source.
-# Override with VLLM_PIP_SPEC=vllm==0.25.1 only for debugging non-Muse boots.
-VLLM_PIP_SPEC="${VLLM_PIP_SPEC:-git+https://github.com/xianbaoqian/vllm.git@tiezhen/new-model-support}"
+# Pin a merge commit ON tiezhen/new-model-support whose tree has muse_glimmer
+# parsers. Do not pin mainline 98f86b9c (no parsers; serve dies with KeyError).
+# Commit tarball, not git+https: a full git fetch is ~240k objects and stalls
+# on a slow pod link. GitHub tarballs have no .git metadata; pretend a version
+# for setuptools-scm.
+VLLM_SHA="${VLLM_SHA:-1f7f0715848c9acc56ea40faa21c13a02bdc8357}"
+VLLM_PIP_SPEC="${VLLM_PIP_SPEC:-vllm @ https://github.com/xianbaoqian/vllm/archive/${VLLM_SHA}.tar.gz}"
+export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM="${SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM:-0.17.0+muse.${VLLM_SHA:0:7}}"
+export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION:-$SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM}"
 
 MODEL_REPO="${MODEL_REPO:-Inferact/Muse-Glimmer-30B-NVFP4-W4A4}"
 SERVED_NAME="${SERVED_NAME:-muse-glimmer-30b}"
 export SERVED_NAME
 export PROFILE_MODEL=muse
-# Profile maps modelopt/nvfp4 → 4-bit when /info is unread or scheme is opaque.
 export QUANTIZATION="${QUANTIZATION:-modelopt}"
 
 APP_DIR="${APP_DIR:-/home/appuser/app}"
@@ -42,6 +47,22 @@ LOG_FILE="${APP_DIR}/vllm.log"
 
 echo "Starting container (Muse Glimmer 30B NVFP4, DFlash off)..."
 
+# Pin torch CUDA to the host driver. PyPI torch 2.13 defaults to cu130 (needs
+# driver 580). 5090 needs CUDA >= 12.8. Last Blackwell wheel that loads on
+# driver 570 is 2.11.0+cu128. Do not pin cu126 (no sm_120).
+DRIVER_VER="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 | tr -d '[:space:]' || true)"
+DRIVER_MAJOR="${DRIVER_VER%%.*}"
+if [[ "$DRIVER_MAJOR" =~ ^[0-9]+$ ]] && (( DRIVER_MAJOR >= 580 )); then
+    TORCH_BACKEND=cu130
+    TORCH_INDEX="https://download.pytorch.org/whl/cu130"
+    TORCH_PINS=(torch==2.13.0 torchvision==0.28.0 torchaudio==2.11.0)
+else
+    TORCH_BACKEND=cu128
+    TORCH_INDEX="https://download.pytorch.org/whl/cu128"
+    TORCH_PINS=(torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0)
+fi
+echo "NVIDIA driver ${DRIVER_VER:-unknown}; pinning torch ${TORCH_BACKEND} (${TORCH_PINS[*]})"
+
 mkdir -p "$APP_DIR" "$MODELS_DIR"
 
 if [[ ! -f "$VENV_DIR/bin/activate" ]]; then
@@ -52,12 +73,49 @@ source "$VENV_DIR/bin/activate"
 
 python -m pip install "pip==${PIP_VERSION}"
 python -m pip install "uv==${UV_VERSION}"
-# Precompiled kernels: avoid a full CUDA compile on the Muse git ref.
-export VLLM_USE_PRECOMPILED="${VLLM_USE_PRECOMPILED:-1}"
-echo "Installing vLLM from: ${VLLM_PIP_SPEC}"
-uv pip install "${VLLM_PIP_SPEC}"
-# Muse git pins flashinfer==0.6.16.post3; that release crashes on Python 3.10
-# (array.array[int]). Force an older wheel after install; do not co-resolve.
+# pypi.nvidia.com hosts the cu12 runtime wheels. uv default timeout is 30s.
+export UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT:-600}"
+export UV_CONCURRENT_DOWNLOADS="${UV_CONCURRENT_DOWNLOADS:-2}"
+
+install_torch_pins() {
+    local attempt
+    for attempt in 1 2 3 4 5 6 7 8; do
+        if uv pip install --index-url "${TORCH_INDEX}" "$@"; then
+            return 0
+        fi
+        echo "Torch install failed (attempt ${attempt}/8), retrying in 20s..."
+        sleep 20
+    done
+    echo "ERROR: torch install failed after 8 attempts." >&2
+    return 1
+}
+
+# Muse requirements/cuda.txt hard-pins torch==2.13.0 and torchvision==0.28.0.
+# --constraint intersects those pins and is unsatisfiable on cu128 (2.11 / 0.26).
+# --override replaces them. Do not switch back to --constraint.
+TORCH_OVERRIDES=""
+VLLM_INSTALL_ARGS=()
+if [[ "$TORCH_BACKEND" == "cu128" ]]; then
+    export VLLM_USE_PRECOMPILED="${VLLM_USE_PRECOMPILED:-0}"
+    export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-12.0}"
+    install_torch_pins "${TORCH_PINS[@]}"
+    echo "Torch pre-pinned for compile: ${TORCH_PINS[*]}"
+    uv pip install "packaging>=24.2" "cmake>=3.26.1" ninja \
+        "setuptools>=77.0.3,<81.0.0" "setuptools-scm>=8.0" \
+        "setuptools-rust>=1.9.0" wheel jinja2
+    TORCH_OVERRIDES="$(mktemp)"
+    printf '%s\n' "${TORCH_PINS[@]}" > "$TORCH_OVERRIDES"
+    VLLM_INSTALL_ARGS+=(--no-build-isolation --override "$TORCH_OVERRIDES")
+else
+    export VLLM_USE_PRECOMPILED="${VLLM_USE_PRECOMPILED:-1}"
+fi
+echo "Installing vLLM from: ${VLLM_PIP_SPEC} (VLLM_USE_PRECOMPILED=${VLLM_USE_PRECOMPILED})"
+uv pip install "${VLLM_INSTALL_ARGS[@]}" "${VLLM_PIP_SPEC}"
+if [[ -n "$TORCH_OVERRIDES" ]]; then
+    rm -f "$TORCH_OVERRIDES"
+fi
+install_torch_pins --force-reinstall "${TORCH_PINS[@]}"
+echo "Torch forced: ${TORCH_PINS[*]} from ${TORCH_INDEX}"
 FLASHINFER_PIN="${FLASHINFER_PIN:-flashinfer-python==0.6.15.post1}"
 uv pip install --force-reinstall --no-deps "${FLASHINFER_PIN}"
 echo "FlashInfer forced: ${FLASHINFER_PIN}"
@@ -80,9 +138,14 @@ else
     echo "Model already present."
 fi
 
-# vLLM 0.25.x ships nvidia-cuda-runtime 13.x as a pip package.
-CUDA13_LIB=$(find "$VENV_DIR" -path "*/nvidia/cu13/lib" -type d 2>/dev/null | head -1)
-if [[ -n "$CUDA13_LIB" ]]; then
+# cu130 wheels need libcudart.so.13. Do not prepend cu13 in front of cu128 torch.
+CUDA13_LIB=""
+if [[ "$TORCH_BACKEND" == "cu130" ]]; then
+    CUDA13_LIB=$(find "$VENV_DIR" -path "*/nvidia/cu13/lib" -type d 2>/dev/null | head -1 || true)
+    if [[ -z "$CUDA13_LIB" ]]; then
+        echo "ERROR: cu130 torch needs libcudart.so.13 under $VENV_DIR (nvidia/cu13/lib)." >&2
+        exit 1
+    fi
     export LD_LIBRARY_PATH="${CUDA13_LIB}:${LD_LIBRARY_PATH:-}"
     echo "CUDA 13 libs: $CUDA13_LIB"
 fi
@@ -92,17 +155,18 @@ if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
     tmux kill-session -t "$TMUX_SESSION"
 fi
 
-# Minimal flags; Profile diagnoses seats / memory / batch tokens.
-#   --trust-remote-code          Muse arch
-#   --enable-auto-tool-choice    agent swarm
-#   --tool-call-parser / --reasoning-parser muse_glimmer
-#   --max-model-len 32768        KV headroom on 32 GB after ~25 GB weights
-# No --speculative-config (DFlash off).
+# FlashInfer 0.6.15 JIT for SM120 wants CUDA >= 12.9 nvcc. This image is 12.8.
+export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
+
 EXTRA_ARGS="${EXTRA_ARGS:-}"
+TMUX_CUDA_EXPORT=""
+if [[ -n "$CUDA13_LIB" ]]; then
+    TMUX_CUDA_EXPORT="export LD_LIBRARY_PATH=\"${CUDA13_LIB}:\${LD_LIBRARY_PATH:-}\" && "
+fi
 tmux new-session -d -s "$TMUX_SESSION" \
 "bash -lc 'source \"$VENV_DIR/bin/activate\" && \
-export LD_LIBRARY_PATH=\"${CUDA13_LIB}:\${LD_LIBRARY_PATH:-}\" && \
-vllm serve \"$MODEL_PATH\" \
+export VLLM_USE_FLASHINFER_SAMPLER=\"${VLLM_USE_FLASHINFER_SAMPLER}\" && \
+${TMUX_CUDA_EXPORT}vllm serve \"$MODEL_PATH\" \
   --served-model-name $SERVED_NAME \
   --max-model-len 32768 \
   --trust-remote-code \
