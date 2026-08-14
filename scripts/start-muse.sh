@@ -26,8 +26,11 @@ UV_VERSION="${UV_VERSION:-0.11.1}"
 # Pin a merge commit ON tiezhen/new-model-support whose tree has muse_glimmer
 # parsers (vllm/tool_parsers/muse_glimmer_tool_parser.py). Do not pin a mainline
 # SHA that was merged in (98f86b9c has no parsers; serve dies with KeyError).
-# Torch CUDA is re-pinned after install for driver 570. Override only to debug.
-VLLM_PIP_SPEC="${VLLM_PIP_SPEC:-git+https://github.com/xianbaoqian/vllm.git@1f7f0715848c9acc56ea40faa21c13a02bdc8357}"
+# Use the commit tarball, not git+https: uv git fetch pulls ~240k objects and
+# stalls for hours on a slow pod link. Torch CUDA is re-pinned after install
+# for driver 570. Override only to debug.
+VLLM_SHA="${VLLM_SHA:-1f7f0715848c9acc56ea40faa21c13a02bdc8357}"
+VLLM_PIP_SPEC="${VLLM_PIP_SPEC:-vllm @ https://github.com/xianbaoqian/vllm/archive/${VLLM_SHA}.tar.gz}"
 
 MODEL_REPO="${MODEL_REPO:-Inferact/Muse-Glimmer-30B-NVFP4-W4A4}"
 SERVED_NAME="${SERVED_NAME:-muse-glimmer-30b}"
