@@ -41,7 +41,20 @@ VENV_DIR="${VENV_DIR:-/home/appuser/vllm-env}"
 MODELS_DIR="${MODELS_DIR:-/workspace/models}"
 MODEL_PATH="${MODEL_PATH:-$MODELS_DIR/muse-glimmer-30b-nvfp4}"
 TMUX_SESSION="${TMUX_SESSION:-vllm}"
+SETUP_TMUX="${SETUP_TMUX:-muse-setup}"
 LOG_FILE="${APP_DIR}/vllm.log"
+
+# RunPod SSH (ssh.runpod.io) drops during long uv fetches. Foreground install
+# then gets SIGHUP. Re-exec in tmux when this is an interactive shell. Container
+# entrypoint has no tty, so it is left alone. Distinct from TMUX_SESSION (serve).
+if [[ -z "${TMUX:-}" && -t 0 && "${MUSE_SKIP_TMUX:-}" != "1" ]]; then
+    if tmux has-session -t "$SETUP_TMUX" 2>/dev/null; then
+        echo "Attaching to existing tmux session $SETUP_TMUX"
+        exec tmux attach -t "$SETUP_TMUX"
+    fi
+    echo "Re-exec in tmux session $SETUP_TMUX (SSH drop will not kill the install)"
+    exec tmux new-session -s "$SETUP_TMUX" "$0" "$@"
+fi
 
 echo "Starting container (Muse Glimmer 30B NVFP4, DFlash off)..."
 
@@ -71,6 +84,25 @@ source "$VENV_DIR/bin/activate"
 
 python -m pip install "pip==${PIP_VERSION}"
 python -m pip install "uv==${UV_VERSION}"
+# cu12 runtime wheels live on pypi.nvidia.com. uv's default HTTP timeout is
+# 30s; that CDN times out from a pod. Parallel 200-800 MB fetches make it worse.
+# SSH `export` does not reach this process (container CMD).
+export UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT:-600}"
+export UV_CONCURRENT_DOWNLOADS="${UV_CONCURRENT_DOWNLOADS:-2}"
+
+install_torch_pins() {
+    local attempt
+    for attempt in 1 2 3 4 5 6 7 8; do
+        if uv pip install --index-url "${TORCH_INDEX}" "$@"; then
+            return 0
+        fi
+        echo "Torch install failed (attempt ${attempt}/8), retrying in 20s..."
+        sleep 20
+    done
+    echo "ERROR: torch install failed after 8 attempts." >&2
+    return 1
+}
+
 # Precompiled kernels match CUDA 13. On driver 570 / cu128, compile against the
 # 12.8 image toolkit for Blackwell (sm_120). Override with VLLM_USE_PRECOMPILED=1.
 VLLM_INSTALL_ARGS=()
@@ -78,7 +110,7 @@ TORCH_CONSTRAINTS=""
 if [[ "$TORCH_BACKEND" == "cu128" ]]; then
     export VLLM_USE_PRECOMPILED="${VLLM_USE_PRECOMPILED:-0}"
     export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-12.0}"
-    uv pip install --index-url "${TORCH_INDEX}" "${TORCH_PINS[@]}"
+    install_torch_pins "${TORCH_PINS[@]}"
     echo "Torch pre-pinned for compile: ${TORCH_PINS[*]}"
     # --no-build-isolation uses the venv, not a pep517 isolated env. Muse
     # setup.py imports packaging; install the rest of build-system.requires
@@ -99,7 +131,7 @@ if [[ -n "$TORCH_CONSTRAINTS" ]]; then
 fi
 # Muse git / PyPI resolve torch 2.13.0+cu130. Re-pin to the driver wheel after.
 # Do not set UV_TORCH_BACKEND during the git install: cu128 has no 2.13 wheel.
-uv pip install --force-reinstall --index-url "${TORCH_INDEX}" "${TORCH_PINS[@]}"
+install_torch_pins --force-reinstall "${TORCH_PINS[@]}"
 echo "Torch forced: ${TORCH_PINS[*]} from ${TORCH_INDEX}"
 # Muse git pins flashinfer==0.6.16.post3; that release crashes on Python 3.10
 # (array.array[int]). Force an older wheel after install; do not co-resolve.
