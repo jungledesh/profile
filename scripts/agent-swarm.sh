@@ -101,11 +101,15 @@ export PATH="$HOME/.local/bin:$HOME/.grok/bin:$PATH"
 # local vLLM. x.ai install.sh accepts the version as bash -s <X.Y.Z>.
 GROK_VERSION="${GROK_VERSION:-0.2.111}"
 
-# Installer integrity: sha256 recorded at audit (Jul 24 2026). x.ai publishes
-# no signatures for the installer or the CLI binary it downloads, so this pin
-# protects against endpoint tampering after our audit, not a compromised
-# vendor. If upstream changes install.sh, setup fails closed: re-audit, bump.
-GROK_INSTALLER_SHA256="0465d810453bbf18608ccae310fa79f4c59ae4a0538bd8a3a374ebce749be952"
+# Installer integrity: sha256 recorded at audit (Aug 13 2026). x.ai shipped a
+# new install.sh (parallel byte-range download, GCS fallback at
+# storage.googleapis.com/grok-build-public-artifacts/cli). Downloads stay on
+# x.ai/cli, that GCS bucket, and cli-chat-proxy.grok.com (deployment key only).
+# x.ai still publishes no signatures for the installer or the CLI binary, so
+# this pin protects against endpoint tampering after our audit, not a
+# compromised vendor. If upstream changes install.sh, setup fails closed:
+# re-audit, bump.
+GROK_INSTALLER_SHA256="43d0943123edade1383a476a4f778674877acee7c1f98a00f094c4a0f7349321"
 
 install_grok() {
     if ! command -v grok >/dev/null 2>&1; then

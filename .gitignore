@@ -1,7 +1,7 @@
 target/
 **/*.rs.bk
 .DS_Store
-ROADMAP.md
+/ROADMAP.md
 deferred.md
 CLAUDE.md
 .agents/
