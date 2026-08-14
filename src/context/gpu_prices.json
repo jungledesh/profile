@@ -1,90 +1,90 @@
 {
   "note": "on_demand_per_hr from https://www.runpod.io/pricing where the GPU is listed on the Pods page (see per-row as_of). Rows not on RunPod use market estimate.",
-  "updated": "2026-07-23",
+  "updated": "2026-08-13",
   "gpus": {
     "h100 pcie": {
       "name": "NVIDIA H100 PCIe",
       "on_demand_per_hr": 2.89,
       "source": "https://www.runpod.io/pricing",
-      "as_of": "2026-07-16"
+      "as_of": "2026-08-13"
     },
     "h100 sxm": {
       "name": "NVIDIA H100 SXM",
       "on_demand_per_hr": 2.99,
       "source": "https://www.runpod.io/pricing",
-      "as_of": "2026-07-16"
+      "as_of": "2026-08-13"
     },
     "h100 hbm3": {
       "name": "NVIDIA H100 SXM (HBM3)",
       "on_demand_per_hr": 2.99,
       "source": "https://www.runpod.io/pricing",
-      "as_of": "2026-07-16"
+      "as_of": "2026-08-13"
     },
     "h100 nvl": {
       "name": "NVIDIA H100 NVL",
       "on_demand_per_hr": 3.19,
       "source": "https://www.runpod.io/pricing",
-      "as_of": "2026-07-23"
+      "as_of": "2026-08-13"
     },
     "h200": {
       "name": "NVIDIA H200",
       "on_demand_per_hr": 4.39,
       "source": "https://www.runpod.io/pricing",
-      "as_of": "2026-07-16"
+      "as_of": "2026-08-13"
     },
     "b200": {
       "name": "NVIDIA B200",
       "on_demand_per_hr": 5.89,
       "source": "https://www.runpod.io/pricing",
-      "as_of": "2026-07-16"
+      "as_of": "2026-08-13"
     },
     "b300": {
       "name": "NVIDIA B300",
       "on_demand_per_hr": 7.39,
       "source": "https://www.runpod.io/pricing",
-      "as_of": "2026-07-16"
+      "as_of": "2026-08-13"
     },
     "rtx pro 6000 blackwell": {
       "name": "NVIDIA RTX PRO 6000 Blackwell",
       "on_demand_per_hr": 1.99,
       "source": "https://www.runpod.io/pricing",
-      "as_of": "2026-07-16"
+      "as_of": "2026-08-13"
     },
     "a100 80gb": {
       "name": "NVIDIA A100 80GB",
       "on_demand_per_hr": 1.49,
       "source": "https://www.runpod.io/pricing",
-      "as_of": "2026-07-16"
+      "as_of": "2026-08-13"
     },
     "l40s": {
       "name": "NVIDIA L40S",
       "on_demand_per_hr": 0.99,
       "source": "https://www.runpod.io/pricing",
-      "as_of": "2026-07-16"
+      "as_of": "2026-08-13"
     },
     "rtx 4090": {
       "name": "NVIDIA RTX 4090",
       "on_demand_per_hr": 0.69,
       "source": "https://www.runpod.io/pricing",
-      "as_of": "2026-07-16"
+      "as_of": "2026-08-13"
     },
     "rtx 5090": {
       "name": "NVIDIA RTX 5090",
       "on_demand_per_hr": 0.99,
       "source": "https://www.runpod.io/pricing",
-      "as_of": "2026-07-16"
+      "as_of": "2026-08-13"
     },
     "rtx 3090": {
       "name": "NVIDIA RTX 3090",
       "on_demand_per_hr": 0.46,
       "source": "https://www.runpod.io/pricing",
-      "as_of": "2026-07-16"
+      "as_of": "2026-08-13"
     },
     "rtx a6000": {
       "name": "NVIDIA RTX A6000",
       "on_demand_per_hr": 0.49,
       "source": "https://www.runpod.io/pricing",
-      "as_of": "2026-07-16"
+      "as_of": "2026-08-13"
     },
     "a10g": {
       "name": "NVIDIA A10G",

@@ -26,7 +26,9 @@ RUN touch src/main.rs && cargo build --release --locked
 
 # NVIDIA runtime: CUDA devel image + vLLM installed via pip at container start.
 # Build: docker build --target nvidia -t profile:nvidia .
-FROM nvidia/cuda:12.9.0-devel-ubuntu22.04 AS nvidia
+# 12.8 is the Blackwell floor and matches driver 570. 12.9 made nvidia-container-cli
+# refuse to start on those hosts (cuda>=12.9). Newer drivers still run this image.
+FROM nvidia/cuda:12.8.1-devel-ubuntu22.04 AS nvidia
 
 ENV APP_DIR=/home/appuser/app
 ENV MODELS_DIR=/workspace/models

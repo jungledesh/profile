@@ -147,9 +147,66 @@ struct ModelEntry {
 const B: u64 = 1_000_000_000;
 
 static CATALOG: &[ModelEntry] = &[
-    // Single-GPU launch: models whose resident bf16 weights exceed every
-    // supported card are intentionally omitted from this catalog.
+    // Omitted only when 4-bit weights cannot fit the largest catalog GPU
+    // (~288 GB: B300 / MI355X). bf16 or quantized (fp8 / 4-bit) that fits
+    // at least one supported card stays in. Qwen3 has no official 7B/72B dense SKU.
+    // ── Llama 4 ──────────────────────────────────────────────────────────────
+    // Interleaved attention: standard KV formula does not apply.
+    // Maverick: 17B active / 400B total MoE (model card).
+    // Source: https://huggingface.co/meta-llama/Llama-4-Maverick-17B-128E-Instruct/raw/main/config.json
+    // (gated). Verified 2026-08-13 against Unsloth copy: hidden_size=5120,
+    // num_hidden_layers=48, num_key_value_heads=8, head_dim=128,
+    // attention_chunk_size=8192. KV fields stay None: iRoPE / chunked
+    // attention is not the standard per-head KV formula.
+    ModelEntry {
+        tokens: &["llama", "4", "maverick"],
+        entry: catalog_dense! {
+            param_count: 400 * B,
+            active_param_count: Some(17 * B),
+            num_layers: 48,
+            hidden_dim: 5120,
+            default_weight_dtype: "bf16",
+            num_kv_heads: None,
+            head_dim: None,
+            num_kv_layers: None,
+            attn_flops_coeff: Some(0),
+        },
+    },
+    // Scout: 17B active / 109B total MoE (model card).
+    // Source: https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct/raw/main/config.json
+    // (gated). Verified 2026-08-13 against Unsloth copy: same text geometry
+    // as Maverick (5120 / 48); 16 experts vs 128. KV None for the same reason.
+    ModelEntry {
+        tokens: &["llama", "4", "scout"],
+        entry: catalog_dense! {
+            param_count: 109 * B,
+            active_param_count: Some(17 * B),
+            num_layers: 48,
+            hidden_dim: 5120,
+            default_weight_dtype: "bf16",
+            num_kv_heads: None,
+            head_dim: None,
+            num_kv_layers: None,
+            attn_flops_coeff: Some(0),
+        },
+    },
     // ── Nemotron (before generic llama entries, names contain "llama" + size) ─
+    // Source: https://huggingface.co/nvidia/Llama-3.1-Nemotron-70B-Instruct-HF/raw/main/config.json (accessed 2026-08-13)
+    // (nvidia/Llama-3.1-Nemotron-70B-Instruct 404s; -HF is the public config)
+    ModelEntry {
+        tokens: &["nemotron", "70b"],
+        entry: catalog_dense! {
+            param_count: 70 * B,
+            active_param_count: None,
+            num_layers: 80,
+            hidden_dim: 8192,
+            default_weight_dtype: "bf16",
+            num_kv_heads: Some(8),
+            head_dim: Some(128),
+            num_kv_layers: None,
+            attn_flops_coeff: None,
+        },
+    },
     // Source: https://huggingface.co/nvidia/Llama-3.1-Nemotron-8B-Instruct/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["nemotron", "8b"],
@@ -189,7 +246,75 @@ static CATALOG: &[ModelEntry] = &[
             num_swa_layers: 39,
         },
     },
+    // ── Llama 3.2 (before generic llama 3; "3.2" token, dots kept by normalize) ─
+    // Official config.json is gated. Geometry verified against the Unsloth
+    // copy of Meta's file (same path the Gemma 3 1B entry uses).
+    // 3B: hidden 3072 / 24 attention heads → head_dim=128.
+    // Source: https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct/raw/main/config.json (gated)
+    // Verified: https://huggingface.co/unsloth/Llama-3.2-3B-Instruct/raw/main/config.json (accessed 2026-08-13)
+    ModelEntry {
+        tokens: &["llama", "3.2", "3b"],
+        entry: catalog_dense! {
+            param_count: 3 * B,
+            active_param_count: None,
+            num_layers: 28,
+            hidden_dim: 3072,
+            default_weight_dtype: "bf16",
+            num_kv_heads: Some(8),
+            head_dim: Some(128),
+            num_kv_layers: None,
+            attn_flops_coeff: None,
+        },
+    },
+    // Source: https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/raw/main/config.json (gated)
+    // Verified: https://huggingface.co/unsloth/Llama-3.2-1B-Instruct/raw/main/config.json (accessed 2026-08-13)
+    ModelEntry {
+        tokens: &["llama", "3.2", "1b"],
+        entry: catalog_dense! {
+            param_count: B,
+            active_param_count: None,
+            num_layers: 16,
+            hidden_dim: 2048,
+            default_weight_dtype: "bf16",
+            num_kv_heads: Some(8),
+            head_dim: Some(64),
+            num_kv_layers: None,
+            attn_flops_coeff: None,
+        },
+    },
     // ── Llama 3.x ────────────────────────────────────────────────────────────
+    // "3" token required: "3.1" contains "3"; guards against a hypothetical
+    // "Llama-4-70B" (no version tag) matching as llama3.
+    // Source: https://huggingface.co/meta-llama/Meta-Llama-3.1-405B-Instruct/raw/main/config.json (accessed 2026-07-16)
+    ModelEntry {
+        tokens: &["llama", "3", "405b"],
+        entry: catalog_dense! {
+            param_count: 405 * B,
+            active_param_count: None,
+            num_layers: 126,
+            hidden_dim: 16384,
+            default_weight_dtype: "bf16",
+            num_kv_heads: Some(8),
+            head_dim: Some(128),
+            num_kv_layers: None,
+            attn_flops_coeff: None,
+        },
+    },
+    // Source: https://huggingface.co/meta-llama/Meta-Llama-3.1-70B-Instruct/raw/main/config.json (accessed 2026-07-16)
+    ModelEntry {
+        tokens: &["llama", "3", "70b"],
+        entry: catalog_dense! {
+            param_count: 70 * B,
+            active_param_count: None,
+            num_layers: 80,
+            hidden_dim: 8192,
+            default_weight_dtype: "bf16",
+            num_kv_heads: Some(8),
+            head_dim: Some(128),
+            num_kv_layers: None,
+            attn_flops_coeff: None,
+        },
+    },
     // Source: https://huggingface.co/meta-llama/Meta-Llama-3.1-8B-Instruct/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["llama", "3", "8b"],
@@ -206,6 +331,22 @@ static CATALOG: &[ModelEntry] = &[
         },
     },
     // ── Qwen 3 MoE ───────────────────────────────────────────────────────────
+    // hidden_size=4096, num_attention_heads=64, head_dim=128 (not hidden/heads).
+    // Source: https://huggingface.co/Qwen/Qwen3-235B-A22B/raw/main/config.json (accessed 2026-08-13)
+    ModelEntry {
+        tokens: &["qwen3", "235b"],
+        entry: catalog_dense! {
+            param_count: 235 * B,
+            active_param_count: Some(22 * B),
+            num_layers: 94,
+            hidden_dim: 4096,
+            default_weight_dtype: "bf16",
+            num_kv_heads: Some(4),
+            head_dim: Some(128),
+            num_kv_layers: None,
+            attn_flops_coeff: None,
+        },
+    },
     // Qwen3-30B-A3B MoE.
     // num_key_value_heads=4, head_dim=128, hidden_size=2048, num_hidden_layers=48.
     // Source: https://huggingface.co/Qwen/Qwen3-30B-A3B/raw/main/config.json (accessed 2026-07-16)
@@ -349,6 +490,21 @@ static CATALOG: &[ModelEntry] = &[
         },
     },
     // ── Qwen 2.5 dense ───────────────────────────────────────────────────────
+    // Source: https://huggingface.co/Qwen/Qwen2.5-72B-Instruct/raw/main/config.json (accessed 2026-07-16)
+    ModelEntry {
+        tokens: &["qwen2.5", "72b"],
+        entry: catalog_dense! {
+            param_count: 72 * B,
+            active_param_count: None,
+            num_layers: 80,
+            hidden_dim: 8192,
+            default_weight_dtype: "bf16",
+            num_kv_heads: Some(8),
+            head_dim: Some(128),
+            num_kv_layers: None,
+            attn_flops_coeff: None,
+        },
+    },
     // Source: https://huggingface.co/Qwen/Qwen2.5-32B-Instruct/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["qwen2.5", "32b"],
@@ -394,7 +550,71 @@ static CATALOG: &[ModelEntry] = &[
             attn_flops_coeff: None,
         },
     },
+    // Source: https://huggingface.co/Qwen/Qwen2.5-3B-Instruct/raw/main/config.json (accessed 2026-08-13)
+    // head_dim = hidden_size/num_attention_heads = 2048/16 = 128 (not in config).
+    ModelEntry {
+        tokens: &["qwen2.5", "3b"],
+        entry: catalog_dense! {
+            param_count: 3 * B,
+            active_param_count: None,
+            num_layers: 36,
+            hidden_dim: 2048,
+            default_weight_dtype: "bf16",
+            num_kv_heads: Some(2),
+            head_dim: Some(128),
+            num_kv_layers: None,
+            attn_flops_coeff: None,
+        },
+    },
+    // Source: https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct/raw/main/config.json (accessed 2026-08-13)
+    // head_dim = 1536/12 = 128.
+    ModelEntry {
+        tokens: &["qwen2.5", "1.5b"],
+        entry: catalog_dense! {
+            param_count: 1_500_000_000,
+            active_param_count: None,
+            num_layers: 28,
+            hidden_dim: 1536,
+            default_weight_dtype: "bf16",
+            num_kv_heads: Some(2),
+            head_dim: Some(128),
+            num_kv_layers: None,
+            attn_flops_coeff: None,
+        },
+    },
+    // Source: https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/raw/main/config.json (accessed 2026-08-13)
+    // Card: 0.49B parameters. Family rounding matches Qwen3 0.6B → 600M.
+    // head_dim = 896/14 = 64. use_sliding_window is false; do not set SWA.
+    ModelEntry {
+        tokens: &["qwen2.5", "0.5b"],
+        entry: catalog_dense! {
+            param_count: 500_000_000,
+            active_param_count: None,
+            num_layers: 24,
+            hidden_dim: 896,
+            default_weight_dtype: "bf16",
+            num_kv_heads: Some(2),
+            head_dim: Some(64),
+            num_kv_layers: None,
+            attn_flops_coeff: None,
+        },
+    },
     // ── DeepSeek R1 distills / dense ──────────────────────────────────────────
+    // Source: https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Llama-70B/raw/main/config.json (accessed 2026-07-16)
+    ModelEntry {
+        tokens: &["deepseek", "r1", "distill", "70b"],
+        entry: catalog_dense! {
+            param_count: 70 * B,
+            active_param_count: None,
+            num_layers: 80,
+            hidden_dim: 8192,
+            default_weight_dtype: "bf16",
+            num_kv_heads: Some(8),
+            head_dim: Some(128),
+            num_kv_layers: None,
+            attn_flops_coeff: None,
+        },
+    },
     // Source: https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-32B/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         // https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-32B/raw/main/config.json
@@ -475,6 +695,21 @@ static CATALOG: &[ModelEntry] = &[
             attn_flops_coeff: None,
         },
     },
+    // Source: https://huggingface.co/deepseek-ai/deepseek-llm-70b-chat/raw/main/config.json (accessed 2026-07-16)
+    ModelEntry {
+        tokens: &["deepseek", "70b"],
+        entry: catalog_dense! {
+            param_count: 70 * B,
+            active_param_count: None,
+            num_layers: 80,
+            hidden_dim: 8192,
+            default_weight_dtype: "bf16",
+            num_kv_heads: None,
+            head_dim: None,
+            num_kv_layers: None,
+            attn_flops_coeff: Some(69_632),
+        },
+    },
     // Source: https://huggingface.co/deepseek-ai/deepseek-llm-7b-chat/raw/main/config.json (accessed 2026-07-16)
     ModelEntry {
         tokens: &["deepseek", "7b"],
@@ -488,6 +723,73 @@ static CATALOG: &[ModelEntry] = &[
             head_dim: None,
             num_kv_layers: None,
             attn_flops_coeff: Some(34_816),
+        },
+    },
+    // ── Mistral Large (123B). 675B stays out: 4-bit still exceeds ~288 GB. ──
+    // Source: https://huggingface.co/mistralai/Mistral-Large-Instruct-2407/raw/main/config.json (accessed 2026-07-16)
+    ModelEntry {
+        tokens: &["mistral", "large", "123b"],
+        entry: catalog_dense! {
+            param_count: 123 * B,
+            active_param_count: None,
+            num_layers: 88,
+            hidden_dim: 12288,
+            default_weight_dtype: "bf16",
+            num_kv_heads: Some(8),
+            head_dim: Some(128),
+            num_kv_layers: None,
+            attn_flops_coeff: None,
+        },
+    },
+    // Mistral Large without explicit size, 123B default.
+    // lookup_model refuses 675B / Large-3 names so they cannot land here.
+    // Source: https://huggingface.co/mistralai/Mistral-Large-Instruct-2407/raw/main/config.json (accessed 2026-07-16)
+    ModelEntry {
+        tokens: &["mistral", "large"],
+        entry: catalog_dense! {
+            param_count: 123 * B,
+            active_param_count: None,
+            num_layers: 88,
+            hidden_dim: 12288,
+            default_weight_dtype: "bf16",
+            num_kv_heads: Some(8),
+            head_dim: Some(128),
+            num_kv_layers: None,
+            attn_flops_coeff: None,
+        },
+    },
+    // ── Mixtral MoE ──────────────────────────────────────────────────────────
+    // Before Mistral 7B: "8x7b" contains "7b" and would otherwise steal 7B.
+    // 8x22B: 141B total, ~39B active
+    // Source: https://huggingface.co/mistralai/Mixtral-8x22B-Instruct-v0.1/raw/main/config.json (accessed 2026-07-16)
+    ModelEntry {
+        tokens: &["mixtral", "8x22b"],
+        entry: catalog_dense! {
+            param_count: 141 * B,
+            active_param_count: Some(39 * B),
+            num_layers: 56,
+            hidden_dim: 6144,
+            default_weight_dtype: "bf16",
+            num_kv_heads: Some(8),
+            head_dim: Some(128),
+            num_kv_layers: None,
+            attn_flops_coeff: None,
+        },
+    },
+    // 8x7B: 47B total, ~13B active
+    // Source: https://huggingface.co/mistralai/Mixtral-8x7B-Instruct-v0.1/raw/main/config.json (accessed 2026-07-16)
+    ModelEntry {
+        tokens: &["mixtral", "8x7b"],
+        entry: catalog_dense! {
+            param_count: 47 * B,
+            active_param_count: Some(13 * B),
+            num_layers: 32,
+            hidden_dim: 4096,
+            default_weight_dtype: "bf16",
+            num_kv_heads: Some(8),
+            head_dim: Some(128),
+            num_kv_layers: None,
+            attn_flops_coeff: None,
         },
     },
     // ── Mistral 7B dense ─────────────────────────────────────────────────────
@@ -719,6 +1021,46 @@ static CATALOG: &[ModelEntry] = &[
             num_swa_layers: 22,
         },
     },
+    // Gemma 2 2B. Tokens "gemma 2"+"2b" (and fused "gemma2"+"2b"): bare
+    // "gemma"+"2b" would also match Gemma 3 12B ("12b" contains "2b").
+    // Official config.json is gated. Geometry matches HuggingFace
+    // Gemma2Config defaults (the 2B layout) and the Unsloth copy.
+    // Alternates local/global: 13 of 26 layers are windowed.
+    // Source: https://huggingface.co/google/gemma-2-2b-it/raw/main/config.json (gated)
+    // Verified: https://huggingface.co/unsloth/gemma-2-2b-it/raw/main/config.json (accessed 2026-08-13)
+    // https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma2/configuration_gemma2.py
+    ModelEntry {
+        tokens: &["gemma 2", "2b"],
+        entry: catalog_dense! {
+            param_count: 2 * B,
+            active_param_count: None,
+            num_layers: 26,
+            hidden_dim: 2304,
+            default_weight_dtype: "bf16",
+            num_kv_heads: Some(4),
+            head_dim: Some(256),
+            num_kv_layers: None,
+            attn_flops_coeff: None,
+            swa_window: 4096,
+            num_swa_layers: 13,
+        },
+    },
+    ModelEntry {
+        tokens: &["gemma2", "2b"],
+        entry: catalog_dense! {
+            param_count: 2 * B,
+            active_param_count: None,
+            num_layers: 26,
+            hidden_dim: 2304,
+            default_weight_dtype: "bf16",
+            num_kv_heads: Some(4),
+            head_dim: Some(256),
+            num_kv_layers: None,
+            attn_flops_coeff: None,
+            swa_window: 4096,
+            num_swa_layers: 13,
+        },
+    },
     // Gemma 2 27B: head_dim=128, 32 attn heads, 16 KV heads.
     // sliding_window=4096 from config.json. Gemma 2 alternates local and global
     // attention, so 23 of 46 layers are windowed.
@@ -854,9 +1196,9 @@ fn normalize(name: &str) -> String {
 /// the normalized model name, or `None` if no entry matches.
 pub fn lookup_model(name: &str) -> Option<&'static CatalogEntry> {
     let norm = normalize(name);
-    // Mixtral is excluded from single-GPU launch. Without this guard, the
-    // "mistralai" publisher token plus "7b" in "8x7b" matches Mistral 7B.
-    if norm.contains("mixtral") {
+    // 675B-class weights cannot fit a catalog GPU even at 4-bit (~337 GB).
+    // Without this, "Mistral-Large-3-675B" matches the 123B Mistral Large default.
+    if norm.contains("675b") || norm.contains("mistral large 3") {
         return None;
     }
     CATALOG.iter().find_map(|e| {
@@ -899,7 +1241,7 @@ mod tests {
 
     #[test]
     fn launch_catalog_has_expected_entry_count() {
-        assert_eq!(CATALOG.len(), 38);
+        assert_eq!(CATALOG.len(), 58);
     }
 
     #[test]
@@ -910,26 +1252,13 @@ mod tests {
             "zai-org/GLM-5.2",
             "zai-org/GLM-744B",
             "mistralai/Mistral-Large-3-675B-Instruct-2512",
-            "mistralai/Mistral-Large-Instruct-2407",
-            "mistralai/Mistral-Large-Instruct-2411",
             "deepseek-ai/DeepSeek-671B",
             "deepseek-ai/DeepSeek-R1",
             "deepseek-ai/DeepSeek-V3",
-            "meta-llama/Meta-Llama-3.1-405B-Instruct",
-            "meta-llama/Llama-4-Maverick-17B-128E-Instruct",
-            "meta-llama/Llama-4-Scout-17B-16E-Instruct",
-            "Qwen/Qwen3-235B-A22B",
-            "mistralai/Mixtral-8x22B-Instruct-v0.1",
-            "mistralai/Mixtral-8x7B-Instruct-v0.1",
-            "Qwen/Qwen2.5-72B-Instruct",
-            "nvidia/Llama-3.1-Nemotron-70B-Instruct",
-            "meta-llama/Llama-3.1-70B-Instruct",
-            "deepseek-ai/DeepSeek-R1-Distill-Llama-70B",
-            "deepseek-ai/deepseek-llm-70b-chat",
         ] {
             assert!(
                 lookup_model(name).is_none(),
-                "{name} must stay outside the single-GPU launch catalog"
+                "{name} must stay outside the catalog (4-bit weights exceed ~288 GB)"
             );
         }
     }
@@ -1053,6 +1382,63 @@ mod tests {
     }
 
     #[test]
+    fn llama32_3b_and_1b() {
+        let e3 = lookup_model("meta-llama/Llama-3.2-3B-Instruct").expect("3.2 3b");
+        assert_eq!(e3.param_count, 3 * B);
+        assert_eq!(e3.num_layers, 28);
+        assert_eq!(e3.hidden_dim, 3072);
+        assert_eq!(e3.num_kv_heads, Some(8));
+        assert_eq!(e3.head_dim, Some(128));
+        let e1 = lookup_model("meta-llama/Llama-3.2-1B-Instruct").expect("3.2 1b");
+        assert_eq!(e1.param_count, B);
+        assert_eq!(e1.num_layers, 16);
+        assert_eq!(e1.hidden_dim, 2048);
+        assert_eq!(e1.head_dim, Some(64));
+        // 3.1 8B must not land on 3.2.
+        let e8 = lookup_model("meta-llama/Llama-3.1-8B-Instruct").expect("3.1 8b");
+        assert_eq!(e8.param_count, 8 * B);
+        assert_eq!(e8.num_layers, 32);
+    }
+
+    #[test]
+    fn qwen25_small_sizes() {
+        let e05 = lookup_model("Qwen/Qwen2.5-0.5B-Instruct").expect("0.5b");
+        assert_eq!(e05.param_count, 500_000_000);
+        assert_eq!(e05.hidden_dim, 896);
+        assert_eq!(e05.num_kv_heads, Some(2));
+        assert_eq!(e05.head_dim, Some(64));
+        assert!(e05.swa_window.is_none());
+        let e15 = lookup_model("Qwen/Qwen2.5-1.5B-Instruct").expect("1.5b");
+        assert_eq!(e15.param_count, 1_500_000_000);
+        assert_eq!(e15.hidden_dim, 1536);
+        let e3 = lookup_model("Qwen/Qwen2.5-3B-Instruct").expect("3b");
+        assert_eq!(e3.param_count, 3 * B);
+        assert_eq!(e3.num_layers, 36);
+        assert_eq!(e3.hidden_dim, 2048);
+        // 32B must not land on 3B.
+        let e32 = lookup_model("Qwen/Qwen2.5-32B-Instruct").expect("32b");
+        assert_eq!(e32.param_count, 32 * B);
+    }
+
+    #[test]
+    fn gemma2_2b_not_12b_or_27b() {
+        let e = lookup_model("google/gemma-2-2b-it").expect("gemma2 2b");
+        assert_eq!(e.param_count, 2 * B);
+        assert_eq!(e.num_layers, 26);
+        assert_eq!(e.hidden_dim, 2304);
+        assert_eq!(e.num_kv_heads, Some(4));
+        assert_eq!(e.head_dim, Some(256));
+        assert_eq!(e.swa_window, Some(4096));
+        assert_eq!(e.num_swa_layers, Some(13));
+        let fused = lookup_model("gemma2-2b").expect("fused");
+        assert_eq!(fused.param_count, 2 * B);
+        let g12 = lookup_model("google/gemma-3-12b-it").expect("gemma3 12b");
+        assert_eq!(g12.param_count, 12 * B);
+        let g27 = lookup_model("google/gemma-2-27b-it").expect("gemma2 27b");
+        assert_eq!(g27.param_count, 27 * B);
+    }
+
+    #[test]
     fn llama4_untagged_70b_returns_none() {
         // A hypothetical "Llama-4-70B" (no Scout/Maverick) must NOT match as
         // llama3. Before the "3" token guard this would have returned llama3.
@@ -1060,10 +1446,131 @@ mod tests {
     }
 
     #[test]
+    fn llama3_70b_variants() {
+        for name in [
+            "meta-llama/Llama-3.1-70B-Instruct",
+            "meta-llama/Meta-Llama-3-70B",
+            "llama-3.3-70b-instruct",
+        ] {
+            let e = lookup_model(name).unwrap_or_else(|| panic!("no match for {name}"));
+            assert_eq!(e.param_count, 70 * B);
+            assert!(e.active_param_count.is_none());
+        }
+    }
+
+    #[test]
+    fn llama4_maverick() {
+        let e = lookup_model("meta-llama/Llama-4-Maverick-17B-128E-Instruct")
+            .expect("should match maverick");
+        assert_eq!(e.param_count, 400 * B);
+        assert_eq!(e.active_param_count, Some(17 * B));
+        assert_eq!(e.attn_flops_coeff, Some(0));
+        assert!(e.num_kv_heads.is_none());
+    }
+
+    #[test]
+    fn llama4_scout() {
+        let e =
+            lookup_model("meta-llama/Llama-4-Scout-17B-16E-Instruct").expect("should match scout");
+        assert_eq!(e.param_count, 109 * B);
+        assert_eq!(e.active_param_count, Some(17 * B));
+    }
+
+    #[test]
+    fn llama3_405b() {
+        let e = lookup_model("meta-llama/Meta-Llama-3.1-405B-Instruct").expect("no match");
+        assert_eq!(e.param_count, 405 * B);
+        assert_eq!(e.num_layers, 126);
+    }
+
+    #[test]
+    fn qwen3_moe_235b() {
+        let e = lookup_model("Qwen/Qwen3-235B-A22B").expect("should match qwen3 235b moe");
+        assert_eq!(e.param_count, 235 * B);
+        assert_eq!(e.active_param_count, Some(22 * B));
+        assert_eq!(e.hidden_dim, 4096);
+        assert_eq!(e.num_layers, 94);
+        assert_eq!(e.num_kv_heads, Some(4));
+        assert_eq!(e.head_dim, Some(128));
+    }
+
+    #[test]
+    fn qwen25_72b() {
+        let e = lookup_model("Qwen/Qwen2.5-72B-Instruct").expect("no match");
+        assert_eq!(e.param_count, 72 * B);
+        assert!(e.active_param_count.is_none());
+    }
+
+    #[test]
+    fn mixtral_8x7b_not_mistral_7b() {
+        let e = lookup_model("mistralai/Mixtral-8x7B-Instruct-v0.1").expect("no match");
+        assert_eq!(e.param_count, 47 * B);
+        assert_eq!(e.active_param_count, Some(13 * B));
+    }
+
+    #[test]
+    fn mixtral_8x22b() {
+        let e = lookup_model("mistralai/Mixtral-8x22B-Instruct-v0.1").expect("no match");
+        assert_eq!(e.param_count, 141 * B);
+        assert_eq!(e.active_param_count, Some(39 * B));
+    }
+
+    #[test]
+    fn mistral_large_123b() {
+        let e = lookup_model("mistralai/Mistral-Large-Instruct-2411").expect("no match");
+        assert_eq!(e.param_count, 123 * B);
+        assert_eq!(e.hidden_dim, 12288);
+        assert!(e.active_param_count.is_none());
+    }
+
+    #[test]
+    fn mistral_large_675b_does_not_match_123b() {
+        assert!(lookup_model("mistralai/Mistral-Large-3-675B-Instruct-2512").is_none());
+    }
+
+    #[test]
+    fn nemotron_70b() {
+        for name in [
+            "nvidia/Llama-3.1-Nemotron-70B-Instruct",
+            "nvidia/Llama-3.1-Nemotron-70B-Instruct-HF",
+        ] {
+            let e = lookup_model(name).unwrap_or_else(|| panic!("no match for {name}"));
+            assert_eq!(e.param_count, 70 * B);
+            assert_eq!(e.num_layers, 80);
+            assert_eq!(e.hidden_dim, 8192);
+            assert_eq!(e.num_kv_heads, Some(8));
+            assert_eq!(e.head_dim, Some(128));
+        }
+    }
+
+    #[test]
+    fn r1_distill_llama_70b() {
+        let e = lookup_model("deepseek-ai/DeepSeek-R1-Distill-Llama-70B").expect("no match");
+        assert_eq!(e.param_count, 70 * B);
+        assert_eq!(e.num_layers, 80);
+        assert_eq!(e.num_kv_heads, Some(8));
+    }
+
+    #[test]
+    fn deepseek_70b() {
+        let e = lookup_model("deepseek-ai/deepseek-llm-70b-chat").expect("no match");
+        assert_eq!(e.param_count, 70 * B);
+        assert_eq!(e.attn_flops_coeff, Some(69_632));
+    }
+
+    #[test]
+    fn llama_70b_does_not_match_llama4() {
+        let e = lookup_model("meta-llama/Llama-3.1-70B-Instruct").expect("no match");
+        assert_eq!(e.param_count, 70 * B);
+        assert!(e.active_param_count.is_none());
+        assert_eq!(e.attn_flops_coeff, None);
+    }
+
+    #[test]
     fn standard_models_have_no_attn_flops_coeff() {
         for name in [
             "meta-llama/Llama-3-8B",
-            "Qwen/Qwen2.5-32B",
+            "Qwen/Qwen2.5-72B",
             "mistralai/Mistral-7B",
         ] {
             let e = lookup_model(name).expect("catalog hit");

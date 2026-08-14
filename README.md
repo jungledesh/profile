@@ -6,28 +6,54 @@
 
 *Less words. Less noise. More signal. More value.*
 
-[Website](https://jungledesh.github.io/profile/index.html) · [Docs](https://jungledesh.github.io/profile/docs.html) · [Install](#install-and-run) · [Proof](#proof) · [Roadmap](#roadmap) · [Contributing](#contributing)
+[Install](#install) · [What is Profile](#what-is-profile) · [The engine](#the-engine) · [Proof](#proof) · [Docs](#documentation) · [Website](https://jungledesh.github.io/profile/index.html)
 
 </div>
 
 ---
 
-**Are you getting what your hardware is capable of?** Profile finds what is keeping your GPU below the fastest it could serve your model, its physics ceiling, gives you the flag to change, and measures whether the fix worked.
+```text
+  Throughput          31 → 470 tok/s          15x
+  Cost/1M output tok  $13.26 → $0.89 (est)    93% lower
+```
 
-On one A100, that loop took Qwen3.6-27B from **31 to 470 tok/s** and cut cost from **$13.26 to $0.89 per million tokens**. On an H100, **163 to 631 tok/s** at 74% lower cost. [Both runs, regressions included.](#proof)
+- One A100. Same model, same hardware, different flags.
+- Profile named each bottleneck, gave the flag, measured the delta after every change.
+- Regressions included. [Both runs below.](#proof)
 
 ```text
 ✓ Single binary      ✓ No agent to deploy
 ✓ No config file     ✓ Nothing leaves the machine
 ```
 
-One GPU, NVIDIA or AMD. Reads live `/metrics` and NVML or amdgpu.
+---
+
+## What is Profile
+
+A new kind of tool. Not monitoring, not autotuning: a **diagnostic loop**.
+
+```text
+dashboards:  metrics ---------------------------> you -> guess
+profile:     metrics -> physics ceiling -> cause -> fix -> re-measure
+```
+
+- **The question it answers:** is your GPU serving as fast as physics allows, and if not, what exactly do you change?
+- **Ceiling.** Computes the fastest your GPU can serve your model, from memory bandwidth and FLOPs. Physics, not vibes.
+- **Cause.** Compares the live server against that ceiling and names the one cause holding it back.
+- **Fix.** Gives you the exact vLLM flag. You apply it. Profile never touches your server.
+- **Proof.** Re-measures, prints the delta, labels regressions `worse`.
+
+```text
+✗ Not a dashboard      it reasons, not just reports
+✗ Not an autotuner     no restarts, no synthetic load
+✗ Not a simulator      reads the server you actually run
+```
+
+First of its kind. [Where it sits among every neighbouring tool.](docs/positioning.md)
 
 ---
 
-
-
-## Install and run
+## Install
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
@@ -40,426 +66,147 @@ profile diagnose --url http://localhost:8000/metrics --duration 2m
 
 That is the whole setup. No calibration run, no restart of your server.
 
-Prefer not to pipe curl into sh? Download the binary from the [releases page](https://github.com/jungledesh/profile/releases/latest), or build from source: `cargo install --git https://github.com/jungledesh/profile`
-
-**Requirements**
-
-- **GPU.** NVIDIA through NVML, or AMD through the amdgpu driver. Profile probes NVIDIA first and falls back to AMD.
-- **vLLM** with `/metrics` reachable. Default `http://localhost:8000/metrics`.
-- **Live traffic** during the window. An idle server has no waste to find, and Profile says so rather than invent a number. Trying Profile without production traffic? Drive load with vLLM's own `vllm bench serve`, or any load generator.
-
-Launch scope is a single GPU. `--tensor-parallel-size` greater than 1 is refused today. Multi-GPU is on the [roadmap](#roadmap). Profile still tells you when a model needs tensor parallelism to fit at all.
-
-<details>
-<summary><b>Profile CLI flags</b> (these configure Profile, not vLLM)</summary>
-<br>
-
-
-| Flag                     | Default                         | Description                                                                         |
-| ------------------------ | ------------------------------- | ----------------------------------------------------------------------------------- |
-| `-u, --url`              | `http://localhost:8000/metrics` | vLLM metrics endpoint                                                               |
-| `--duration`             | `30s`                           | Sampling window. Minimum `30s`, maximum `30m`. Units are `s` or `m`.                |
-| `-m, --max-num-seqs`     | Prompted if absent              | Pass to skip the prompt. Read from `/metrics` when available.                       |
-| `--tensor-parallel-size` | Unset                           | Must be 1 today. Values above 1 are refused until multi-GPU ships                   |
-| `--cost-per-hour`        | Catalog estimate                | GPU cost in USD/hr                                                                  |
-| `-v`                     | Off                             | Show rules that did not fire, physics limits, and expanded GPU/latency/CACHE detail |
-
-</details>
+- **Needs:** one GPU (NVIDIA via NVML, or AMD via amdgpu), vLLM with `/metrics` reachable, live traffic.
+- **Idle server?** No waste to find; Profile says so instead of inventing a number. Drive load with `vllm bench serve`.
+- **No curl-pipe?** [Releases page](https://github.com/jungledesh/profile/releases/latest), or `cargo install --git https://github.com/jungledesh/profile`.
+- **Scope:** single GPU at launch; TP > 1 refused ([roadmap](docs/roadmap.md)). Flags: [docs/workflow.md](docs/workflow.md).
 
 ---
 
+## The engine
 
+The center of Profile. Deterministic. Precise.
 
-## What is Profile
+<p align="center">
+  <img src="docs/assets/rule-engine.svg" width="880" alt="Profile's rule engine: eight rules on DAG priority layers. Mutual exclusivity removes explained symptoms; highest surviving layer wins; one primary shown, losers held.">
+</p>
 
-> **TL;DR.** Profile computes the physics ceiling for your GPU and model, compares the live server against it, names the single highest-priority cause, and gives you the exact vLLM flag to change. Then it re-measures. Not a dashboard, not an autotuner, not a simulator.
+- **Eight rules, eight failure modes.** On a struggling server, several fire at once.
+- **Mutual exclusivity** removes symptoms another cause already explains. Weights overflowing VRAM? Then KV pressure is a symptom, and treating it would be malpractice.
+- **Priority DAG:** fix what is broken before tuning what is healthy. A tuning tip can never outrank an active bottleneck.
+- **One primary survives.** A wall of alerts carries the same information as no alert.
+- **Nothing is discarded.** Losing rules are held, and surface exactly when they become the next hypothesis.
+- **Evidence of harm, never heat.** 95% KV with no evictions and no queue is a healthy, busy server. Profile stays quiet.
 
-Your server is slower than your hardware allows. Every monitoring tool will show you that it is slow. None will tell you why.
-
-```text
-dashboards:  metrics -------------------> you -> guess
-profile:     metrics -> physics ceiling -> cause -> fix -> re-measure
-```
-
-**For:** engineers running vLLM who want to know whether their GPU is earning its price, and what to change when it is not.
-
-**Not for you if:** you shard across GPUs today (on the [roadmap](#roadmap)), run an engine other than vLLM, or have no traffic to measure. [Limitations](#limitations) lists every boundary.
-
----
-
-
-
-## What you get
-
-The state of the server, the one thing wrong with it, and the fix. Four things to find in the block below:
-
-```text
-GPU / vLLM header    where the server stands: efficiency vs ceiling, latency, cache, cost
-ISSUES               the one cause that survived ranking, with its evidence and threshold
-Fix                  the flags to change, split by whether applying them costs throughput
-Expected/Confidence  what should happen next, and how sure Profile is
-```
-
-```text
-+----------------------------------------------------------------------------------------------------------------------------+
-|PROFILE v2.1.4 [Qwen3.6-27B] [NVIDIA H100 80GB HBM3] (2m from 2026-07-31 07:13:29 UTC)                                      |
-|                                                                                                                            |
-|GPU =>               decode_eff ~0.9% | power 653W | 3.57 J/tok | $5.09/1M output tok (est) | vRAM 74/80GB (peak 75GB)      |
-|                     mem_util 56%                                                                                           |
-|                                                                                                                            |
-|vLLM =>                                                                                                                     |
-|REQUESTS             run 14 (4.0%) | wait 4 | max 345                                                                       |
-|LATENCY              ttft 8.7s (p95 19.2s) | tpot 97ms (p95 159ms)                                                          |
-|CACHE                kv_cache 93.1% avg (100.0% peak) | pfix_cache -                                                        |
-|THROUGHPUT           163 tok/s                                                                                              |
-|TRAFFIC              qps 0.5 | req_total 112 | gen_total 32368 | preempt/s 0.01 | preempt_total 2                           |
-|                                                                                                                            |
-|ISSUES:                                                                                                                     |
-|                                                                                                                            |
-|[!] KV Cache Pressure                                                                                                       |
-|    Seen in 92% of windows                                                                                                  |
-|    Cause:                                                                                                                  |
-|      KV cache 94% avg in fired windows, 100% peak (threshold: 88%).                                                        |
-|      4 requests queued on KV admission.                                                                                    |
-|                                                                                                                            |
-|    Fix:                                                                                                                    |
-|    Cuts throughput:                                                                                                        |
-|      • Lower --max-model-len (current: 262144). Observed avg 13.9k tokens per request, prompt + generation.                |
-|        Some requests are longer than avg; add buffer to it. Requests over the limit are rejected with a 400, not truncated.|
-|                                                                                                                            |
-|      • Lower --max-num-seqs to reduce KV demand                                                                            |
-|                                                                                                                            |
-|    Safe to apply:                                                                                                          |
-|      • Enable --enable-prefix-caching to share KV blocks across identical prompt prefixes                                  |
-|      • Raise --gpu-memory-utilization (check vRAM header for avail mem) to expand KV pool                                  |
-|      • Switch --kv-cache-dtype fp8 to halve KV memory footprint (affects output quality)                                   |
-|      • Set --kv-offloading-size 4 (est) to hold evicted KV in host memory instead of recomputing it                        |
-|        Host RAM available: 1953 GiB, container limit 234 GiB.                                                              |
-|                                                                                                                            |
-|    Expected: Wait queue drains, TTFT recovers once KV pool has capacity.                                                   |
-|    Confidence: High                                                                                                        |
-+----------------------------------------------------------------------------------------------------------------------------+
-```
-
-Every value is measured or marked. A dash means Profile could not read it. An `(est)` means the number came from the physics model, not the server. A tilde marks a value derived from an estimated ceiling. Gaps are never filled with guesses.
+The full machinery: [docs/engine.md](docs/engine.md).
 
 ---
-
-
-
-## Proof
-
-Two runs, same model, different hardware and different starting configs.
-
-```text
-                                                            tok/s
-A100   before  |██ 31
-       after   |███████████████████████████████ 470               15x
-
-H100   before  |███████████ 163
-       after   |██████████████████████████████████████████ 631    3.9x
-```
-
-**Qwen3.6-27B on an A100-SXM4-80GB.** 15x throughput, 93% lower cost: $13.26 to $0.89 per 1M tokens.
-
-**Qwen3.6-27B on an H100 80GB HBM3.** Seven iterations, 3.9x throughput, 74% lower cost: $5.09 to $1.32 per 1M output tokens. Every output sample on this page is from this run.
-
-[Watch the A100 run](https://www.youtube.com/watch?v=XuPPKBteWH0)
-
-The H100 run is the more honest picture of a working session. Throughput went 163, 328, 545, 543, 482, 610, 545, 631. Two of those steps were regressions, and Profile labelled both.
-
-Your starting point sets your gain. A server already near its ceiling has nothing to recover, and Profile will tell you that rather than manufacture a recommendation.
-
----
-
-
 
 ## The loop
 
-**Apply the fix.** Apply everything in the block together in one restart. One flag per restart spends an hour learning what one restart would have told you.
+1. **Diagnose.** One cause, its evidence, its threshold, the flags to change.
+2. **Apply.** You restart vLLM with the flag. Profile waits, reconnects on its own.
+3. **Delta.** Before → after on every metric that matters. Regressions labelled, not buried.
+
+Real output, shortened (H100 run; full blocks in [docs/workflow.md](docs/workflow.md)):
 
 ```text
-▶  Apply the fix above. Profile re-measures after your change.
-
-Press Enter when done.
+|PROFILE v2.1.4 [Qwen3.6-27B] [NVIDIA H100 80GB HBM3]                  |
+|GPU =>    decode_eff ~0.9% | $5.09/1M output tok (est) | vRAM 74/80GB |
+|REQUESTS  run 14 (4.0%) | wait 4 | max 345                            |
+|CACHE     kv_cache 93.1% avg (100.0% peak)                            |
+|                                                                      |
+|[!] KV Cache Pressure          Seen in 92% of windows                 |
+|    Cause: KV cache 94% avg, 100% peak (threshold: 88%).              |
+|           4 requests queued on KV admission.                         |
+|    Fix:   • Lower --max-model-len (current: 262144). Observed avg    |
+|             13.9k tokens per request.                                |
+|    Expected: Wait queue drains, TTFT recovers.                       |
+|    Confidence: High                                                  |
 ```
 
-**Profile measures.** It reconnects when vLLM returns and computes the delta.
-
 ```text
-Connection restored. Resuming in 5s...
-
-New --max-num-seqs [current: 345]: 170
-
 Measuring delta...
-
-  Config changed.
 
   Throughput          163 → 328 tok/s
   TTFT                8720 → 495ms (p95 19185 → 950ms)
-  TPOT                96.9 → 50.9ms (p95 158.7 → 73.0ms)
-
-ECONOMICS:
   Cost/1M output tok  $5.09 → $2.53 (est)
 ```
 
-**Iterate.** Fixing one bottleneck usually exposes the next. The path is not always upward, and Profile does not pretend otherwise. Regressions are labelled, not buried:
+- A dash means Profile could not read it.
+- `(est)` means the physics model, not the server.
+- A tilde marks a value derived from an estimated ceiling.
+- Gaps are never filled with guesses.
+
+---
+
+## Proof
 
 ```text
-  Throughput          610 → 545 tok/s  worse
-  TTFT                1024 → 6067ms (p95 2407 → 16687ms)  worse
-  TPOT                118.4 → 147.0ms (p95 147.7 → 195.9ms)  worse
-  Decode eff.         -0.4pp
-
-ECONOMICS:
-  Cost/1M output tok  $1.36 → $1.52 (est)  worse
+                                                                 tok/s
+A100   before  |██ 31
+       after   |███████████████████████████████ 470                 15x
+H100   before  |███████████ 163
+       after   |██████████████████████████████████████████ 631     3.9x
 ```
 
-A tool that only reports improvements cannot be trusted when it reports one.
-
-Four things the loop will not do to you:
-
-- **Repeat itself.** When the same primary fires again, Profile lists the rules it was holding behind it. Re-fire alone is enough; there is no flat-delta gate, whether or not you applied a fix in between.
-- **Dead-end you.** When no config lever remains, Profile names the wall, points at scale-out, and surfaces the suppressed alternatives under that block instead of inventing another flag.
-- **Tell you to do what you already did.** Where Profile can read your running config, it skips levers you already set (prefix caching on, fp8 KV already active, chunked prefill on, `--max-num-batched-tokens` already at or above the suggestion, seats already at the target). Exception: `--kv-offloading-size` is re-derived on each R2 fire; if the new size differs from what is set, the flag is offered again.
-- **Ping-pong you.** When KV pressure and concurrency saturation alternate on `--max-num-seqs`, Profile detects the cycle, names the bracket it has tried, and suggests the midpoint. It offers this at most three times, then names the wall instead of guessing again.
-
-**Scale out.** Eventually no flag helps. Profile says the scheduler is at its cap with the pool full, that no config change helps, and that the next move is a replica. That is the answer, not a failure.
+- **A100-SXM4-80GB:** 15x throughput, 93% lower cost, $13.26 to $0.89 per 1M tokens. [Watch the run.](https://www.youtube.com/watch?v=XuPPKBteWH0)
+- **H100 80GB HBM3:** seven iterations, 3.9x, 74% lower cost.
+- The H100 path: 163, 328, 545, 543, 482, 610, 545, 631 tok/s. Two steps regressed. Profile labelled both.
+- That honesty is why the wins are believable.
+- A server already near its ceiling has nothing to recover, and Profile tells you that instead of manufacturing a recommendation.
 
 ---
-
-
-
-## How it works
-
-Profile does three things:
-
-1. **Computes your hardware ceiling.** The fastest your GPU could serve this model, derived from physics.
-2. **Finds the bottleneck.** Eight rules cut everything suppressing the server down to one primary cause.
-3. **Measures whether your fix worked.** The re-measure is what makes the diagnosis causal.
-
-
-
-### The ceiling
-
-Physics gives two hard limits. Profile derives both from your GPU and model.
-
-**Prefill** is compute-bound (prompts/s):
-
-```text
-prefill_ceiling = (peak_flops x tp x 1e12)
-                / (2 x params x seq_len + attn_coeff x layers x seq_len^2)
-```
-
-The first term is the weight math, linear in sequence length. The second is attention, quadratic in it. That is why the prefill ceiling falls as context grows, and why a linear-only roofline overstates long-context capability. TP scales FLOPs the same way decode scales bandwidth; Profile refuses TP > 1 at launch today.
-
-**Decode** is memory-bandwidth-bound (TP scales bandwidth; Profile refuses TP > 1 at launch today, so runtime TP is 1):
-
-```text
-decode_ceiling_tps = (peak_bandwidth_gbps x tp x 1e9) / (params x bytes_per_param)
-```
-
-Efficiency is measured throughput against the decode ceiling times the ridge batch size, the batch size where decode stops being limited by memory and starts being limited by compute.
-
-Ceilings are coarse upper bounds from published specifications, not a hardware simulation. They are marked `(est)`, and values derived from them carry a tilde. An uncatalogued GPU or model gets `Hardware ceiling unknown` with the reason, rather than a wrong number.
-
-Cost works differently. Dollars per million output tokens is `cost_per_hr × 1e6 / (tok/s × 3600)` when enough completions cover mean running (turnover gate); otherwise the cost line is omitted. That keeps the dollar figure independent of the ceiling.
-
-### The rule engine
-
-One cause at a time. Eight rules watch eight failure modes, and on a struggling server several fire at once. A wall of alerts carries the same information as no alert at all, so two filters cut them to one: a mutual exclusivity table removes symptoms another cause already explains, and a priority DAG keeps a tuning suggestion from ever outranking an active bottleneck.
-
-<p align="center">
-  <img src="docs/assets/rule-engine.svg" width="880" alt="Profile's rule engine: eight rules on DAG priority layers L2 to L6. Mutual exclusivity: R4 weights-alone overflow silences R2 and R2b; R6 silences R1 when the box is pressed (not under soft field). Highest surviving layer wins, ranked by impact x confidence, one primary shown, losers held.">
-</p>
-
-**Mutual exclusivity** removes symptoms another cause already explains. If the model weights alone overflow VRAM, your KV cache is under pressure because of that. Telling you to shrink the KV pool would be treating a symptom. A buffer squeeze without weights overflow does not silence R2. Prefill-bound silences Under-batching when the server is pressed (near decode ridge, KV binding, or a queue). Under soft field (no wait, cool KV, running well below ridge), that row is skipped so Under-batching owns first fire and Prefill/Prefix are held for remeasure reveal. Light-load Prefill is not sold as the setup wall.
-
-**The DAG layers** encode one rule: fix what is broken before tuning what is healthy. A tuning suggestion sits structurally below an active bottleneck and can never outrank it.
-
-**Nothing is discarded.** Losing rules are held. They surface when the same primary re-fires, or immediately when the primary has no fix left to offer, so you get the next hypothesis without ever seeing five at once.
-
-Rules fire on evidence of harm, never on heat. A server at 95% KV cache with no evictions and no queue is healthy and busy, and Profile stays quiet.
-
-**The eight rules**
-
-
-| Rule                          | Fires when                                                                                                                                          | Prescribes                                                                                                                                                                |
-| ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **R1 Under-batching**         | Known GPU: config-relative efficiency under 60% with occupancy under 75% and no backlog. Uncatalogued GPU: occupancy under 25%. Soft field (no wait, cool KV, running ≪ ridge): ranks above Prefill/Prefix on first fire. | Batch more requests or raise client concurrency, naming the binding wall: config, compute ridge, or memory                                                                |
-| **R2 KV cache pressure**      | KV at or above 88%, and either an eviction signal (`num_preemptions_per_sec` > 0.02, or swapped ≥ 2) or queue backpressure (waiting > 2)            | Split by cost. Cuts throughput: lower `--max-model-len` or `--max-num-seqs`. Safe: prefix caching, raise `--gpu-memory-utilization`, fp8 KV cache, `--kv-offloading-size` |
-| **R2b KV admission backlog**  | Queue ratio at or above 0.30 with KV near full, scheduler not at the seat cap, and estimated free KV below demand                                   | Same family, without the eviction signal                                                                                                                                  |
-| **R3 Low prefix reuse**       | Active traffic (running > 0.75), mean prompt ≥ 20, and qps × mean prompt ≥ 1000. Caching off: fires on that volume. Caching on: hit rate under 35%. | `--enable-prefix-caching`, or restructure prompts if already on                                                                                                           |
-| **R4 OOM risk**               | Weights overflow VRAM, or weights fit but free VRAM cannot hold one worst-case request                                                              | `--tensor-parallel-size` at the computed minimum, raise `--gpu-memory-utilization`, a smaller model, or the model does not fit on this hardware                           |
-| **R5 Concurrency saturation** | Scheduler at `--max-num-seqs`, at least 2 waiting, queue ratio at or above 0.30                                                                     | Below 80% KV, raise `--max-num-seqs` to a bounded target. Above it, name the wall or add a replica                                                                        |
-| **R6 Prefill-bound**          | Prompt/gen ratio ≥ 5 with decode efficiency under 40%. Muted when TPOT is measured and under 4x its floor. Bound path silences R1; soft field does not. | Chunked prefill, `--max-num-batched-tokens` (no blind Set when unread; never Set down when already above default), shorter prompts; at the compute wall, disaggregate or add a replica |
-| **R7 Config headroom**        | `--max-num-seqs` below 90% of the recommended target, with occupancy at or above 50% and at most 1 waiting                                          | Raise it, and name what binds the target                                                                                                                                  |
-
-
-When nothing fires but efficiency is still low, a fallback names the shape of the underuse. When nothing fires at all, Profile names the boundary capping the server: capacity, traffic, physics, prefill interference, or framework overhead. Where the ceiling itself is unknown, it says that instead of naming a boundary it cannot prove. Full thresholds, confidence scoring, and edge cases are in the [rules documentation](https://jungledesh.github.io/profile/docs.html#rules).
-
----
-
-
-
-## Where Profile sits
-
-```text
-Orchestration        NVIDIA Dynamo, Ray Serve            schedules across nodes
-Monitoring           Grafana, Datadog, vLLM /metrics     reports what happened
->>> PROFILE          is any of this working on your hardware, config, and traffic
-Inference engine     vLLM, SGLang, TensorRT-LLM          serves the requests
-Kernels and runtime  CUDA, ROCm, custom kernels          executes the math
-Silicon              NVIDIA, AMD, Cerebras, Groq         sets the ceiling
-```
-
-Every layer above and below optimises something. None measures whether the result is any good on your machine.
-
-
-|                                    | Profile | Dashboards | Kernel profilers | Autotuners  | Simulators  |
-| ---------------------------------- | ------- | ---------- | ---------------- | ----------- | ----------- |
-| Hardware ceiling from physics      | yes     | no         | no               | no          | predicted   |
-| Live server, real traffic          | yes     | yes        | yes              | no          | no          |
-| Names one root cause               | yes     | no         | no               | no          | no          |
-| Prescribes the change              | yes     | no         | no               | config only | config only |
-| Measures the delta after the fix   | yes     | no         | no               | partial     | no          |
-| Cost per million tokens            | yes     | no         | no               | no          | no          |
-| No auto-restart, no synthetic load | yes     | yes        | yes              | no          | n/a         |
-
-
-Dashboards: Grafana, Datadog, vLLM `/metrics`. Kernel profilers: Nsight Systems, Nsight Compute. Autotuners: vLLM `auto_tune`, SCOOT. Simulators: Vidur, LLMCompass, GenZ.
-
-**What Profile is not.** Not a dashboard: it reasons rather than reports. Not an autotuner: it does not restart your server or search a config space. Not a kernel profiler: that is Nsight's layer and a different question. Not multi-engine: vLLM only. Not autonomous: you apply the fix, Profile owns the measurement and the memory.
-
----
-
-
-
-## Where this came from
-
-Two launches, and the users who tried them told us what was missing. Not more metrics. An answer.
-
-The shape came from [Andrej Karpathy's autoresearch](https://github.com/karpathy/autoresearch): propose a change, run it, measure, keep or revert. We applied it to inference serving and changed who sits in the proposer's seat. Hypotheses come from roofline physics and a deterministic rule engine, which are checkable, not from a model forming guesses. And you apply the change, not the tool. Autonomy is the roadmap, not the pitch.
-
-The research came last. We found it after the design had settled, and it agreed with us. That is a better outcome than finding it first.
-
----
-
-
-
-## Limitations
-
-- **One GPU.** `--tensor-parallel-size` greater than 1 is refused. KV and weight sharding math is single-GPU only.
-- **vLLM only.** The engine boundary is clean, but SGLang is not built.
-- **Ceilings are uncalibrated.** Published specifications overestimate. Every ceiling-derived number is marked.
-- **The overhead-bound regime is named, not measured.** Profile can say the GPU is idling on CPU work but cannot quantify it.
-- **Unknown GPU or model gets no ceiling.** Profile reports `Hardware ceiling unknown` with the reason, rather than guessing.
-- **No load, no answer.** Idle windows are skipped. There is nothing to diagnose on a server at rest.
-- **You apply the fix.** Profile never changes your server.
-
----
-
-
-
-## Roadmap
-
-Tentative, not exhaustive. Demand reorders this list and adds to it: [tell us](https://github.com/jungledesh/profile/issues) what you run and what is missing.
-
-- [ ] Multi-GPU and tensor parallelism
-- [ ] Calibrated ceilings, using a fitted overhead constant
-- [ ] More engines: SGLang first, then llama.cpp and other local runtimes
-- [ ] Cluster aggregation across nodes
-- [ ] OTLP export, so findings land in the observability stack you already run (Grafana, Datadog)
-
-Beyond that: a server that heals itself. Bottlenecks surfaced by physics, fixes applied without a human waiting to press Enter, traffic moved off a node under KV pressure before latency spikes. That is where this goes. None of it is built, and none of it is safe to build until the physics and the engine are right on one node. That is the work happening now.
-
----
-
-
-
-## Research foundation
-
-Profile is not heuristics. Each part is the field's validated answer to a question it has already studied, and each answer has a known weakness Profile is built to survive. The ceiling is a roofline model, the standard for LLM inference analysis; its weakness is that raw spec sheets overestimate, so every ceiling is marked `(est)` and calibration is on the roadmap. The rule engine uses mutual exclusivity under a priority DAG, the structure Intel's Top-down analysis has shipped in `perf` and VTune for a decade; its weakness is non-causal misattribution, and the loop is the remedy: your applied fix is the perturbation, the re-measure is the check. Rules beat learned models here because a single vLLM server is the bounded case where rules hold up, and you can read why one fired. Autotuners and simulators answer adjacent questions, at the price of restarts, synthetic load, or lagging real serving features; Profile reads the live server you already run.
-
-<details>
-<summary><b>The full argument, with citations</b></summary>
-<br>
-
-
-**The ceiling: roofline.** The standard model for LLM inference analysis. The 2024 survey *LLM Inference Unveiled* ([arXiv 2402.16363](https://arxiv.org/abs/2402.16363)) organises the field around it, and RooflineBench ([arXiv 2602.11506](https://arxiv.org/abs/2602.11506)) still builds on it. On a single accelerator, physics offers compute and bandwidth, and time is the maximum of the two. There is no tighter on-device limit to derive. Distributed serving also faces interconnect bandwidth and latency ([GenZ, arXiv 2406.01698](https://arxiv.org/abs/2406.01698)).
-
-*Its weakness:* a raw spec-sheet roofline overestimates. Real servers have a third regime, overhead-bound, where the GPU idles on CPU work. The proven fix is calibration: a fitted overhead constant cut error up to 80% on vLLM and improved fits on Triton in the cited experiments ([NeurIPS 2024 MLforSystems](https://mlforsystems.org/assets/papers/neurips2024/paper28.pdf)), and GenZ reaches 5.82% geomean error among the platforms it evaluated with calibrated efficiency factors. Raw peak specifications can overestimate production performance.
-
-*Where Profile stands:* uncalibrated, and it says so. Ceilings are marked `(est)`, derived values carry a tilde, and an uncatalogued GPU or model gets no ceiling at all. Cost per million output tokens is `cost_per_hr × 1e6 / (tok/s × 3600)`, so the dollar figure never inherits the ceiling's error. Calibration is on the roadmap.
-
-**The engine: DAG and mutual exclusivity.** Intel's Top-down Microarchitecture Analysis ([Yasin, ISPASS 2014](https://ieeexplore.ieee.org/document/6844459)) has shipped in VTune and Linux `perf` for a decade: mutually exclusive failure categories under a hierarchical-safety rule, which is a suppression table. TMA exists because printing every issue at once breaks down when stalls overlap.
-
-*Its weakness:* non-causal misattribution. Counters correlate, they do not establish cause. In one documented case ([arXiv 2412.13207](https://arxiv.org/abs/2412.13207)) TMA reported a region as 44.1% memory-bound and 43.4% core-bound when the real bottleneck was a dependence chain. TMA never catches this, because it reports once and never checks itself.
-
-*Profile's answer:* the loop. The literature's remedy for this failure is perturbation: change one resource and measure the response ([Coz, SOSP 2015](https://arxiv.org/abs/1608.03676)). Profile runs that as a side effect of normal operation. Your applied fix is the perturbation, the re-measure is the response. The loop is what makes the rule engine causal.
-
-**Rules rather than learning.** Rule-based root cause analysis holds up in bounded, rule-defined systems and degrades in sprawling dynamic ones ([arXiv 2408.00803](https://arxiv.org/abs/2408.00803)). A single vLLM server is the bounded case, and rules have the property learning does not: you can read why.
-
-*The cycle objection:* [Murphy (SIGCOMM 2023)](https://dl.acm.org/doi/10.1145/3603269.3604877) left DAGs for Markov Random Fields because a DAG cannot represent cyclic dependencies. That critique targets graph-inference RCA, which propagates blame along edges. Profile's DAG is a priority and suppression ordering and never infers along an edge. Cycles are handled in time by the loop, and the visible symptom, two rules alternating, has an explicit detector with a midpoint escape.
-
-**Not an autotuner.** [SCOOT](https://arxiv.org/abs/2408.04323) (WWW 2025) and SLO-Guard ([arXiv 2604.17627](https://arxiv.org/abs/2604.17627)) search config space with Bayesian optimisation: SCOOT restarts the server across many trials and learns hidden crash constraints; SLO-Guard treats crashes as first-class training observations. [vLLM](https://github.com/vllm-project/vllm/blob/main/benchmarks/auto_tune/README.md) `auto_tune` grid-searches under a latency cap and also needs repeated restarts. Not something to run against production, and they emit a config, not a cause.
-
-*Profile:* reads the live server under its own traffic. It does not restart your process or inject load, and it does not use crashes as training data. Autotuners explore configs nobody tried; you explore at your own pace, with a cause and a measured delta attached to each step.
-
-**Not a simulator.** [Vidur](https://arxiv.org/abs/2405.05465) (MLSys 2024) found the best LLaMA2-70B config in one CPU-hour against an estimated 42,000 GPU-hours of sweep, and [LLMCompass](https://arxiv.org/abs/2312.03134) (ISCA 2024) reports 4.1% error. But those figures are author-reported on narrow validation sets, and simulators lag serving features by generations: the Frontier critique ([arXiv 2605.21312](https://arxiv.org/abs/2605.21312)) finds Vidur missing chunked prefill, CUDA graphs, speculative decoding, disaggregation and MoE, with attention-predictor error up to 376% at p95. Each also needs per-hardware profiling upfront.
-
-*Profile:* measures the server you have. A new vLLM feature is covered the moment its metrics exist.
-
-</details>
-
-
-
----
-
-
-
-## Principles
-
-A diagnostic tool has nothing but its credibility. Five rules protect it.
-
-- **Correct.** Every diagnosis rests on physics and measured evidence, never assumption.
-- **Transparent.** The evidence and the derivation are shown. You can check every claim.
-- **Humble.** Where the evidence is insufficient, Profile declines. A dash for a missing metric, `(est)` on a derived value, silence over a guess.
-- **Useful, and no harm.** Every step is re-measured. A regression is named plainly, never buried.
-- **Legible.** Plain language, every number with its unit, the fix in one line. Every character on screen earns its place. If it does not help you act, it is not there.
-
----
-
-
 
 ## Documentation
 
-Start with the Workflow, then Rules. The rest is reference.
+We did the hard part: a core engine that is precise and deterministic. These pages show the work.
 
-- **[Workflow](https://jungledesh.github.io/profile/docs.html#home)**: usage, output walkthrough, flag mapping.
-- **[Rules](https://jungledesh.github.io/profile/docs.html#rules)**: thresholds, confidence, edge cases.
-- **[Data](https://jungledesh.github.io/profile/docs.html#data)**: metric sources.
-- **[Math](https://jungledesh.github.io/profile/docs.html#math)**: the physics behind efficiency.
-- **[Catalog](https://jungledesh.github.io/profile/docs.html#catalog)**: GPU bandwidth, FLOPs, and prices.
-- **[Limitations](https://jungledesh.github.io/profile/docs.html#limitations)**: where the math is approximate.
-- **[Design](https://jungledesh.github.io/profile/docs.html#design)**: engine design philosophy.
+- **[Workflow](docs/workflow.md)**
+  Every CLI flag, every line of output decoded, the loop step by step.
+  Read this and you can run a full optimization session in one sitting.
+
+- **[Engine](docs/engine.md)**
+  The ceiling math from first principles, all eight rules with their exact thresholds, suppression and ranking.
+  No black box: every threshold that can silence or fire a rule is on this page.
+
+- **[Research](docs/research.md)**
+  Profile is not heuristics. The ceiling is a roofline, the field's standard. The engine descends from Intel's Top-down analysis, a decade in `perf` and VTune. The loop is Coz-style causal perturbation, run as a side effect of normal use.
+  We also list every known weakness of each method ourselves, with citations, before you find them.
+
+- **[Positioning](docs/positioning.md)**
+  The full serving stack, and a straight comparison against dashboards, kernel profilers, autotuners, and simulators.
+  Ends with the only honest column that matters: who measures whether the fix worked.
+
+- **[Limitations](docs/limitations.md)**
+  Every boundary, stated plainly, with the reason it exists.
+  Shorter than you fear, and nothing hidden in it.
+
+- **[Roadmap](docs/roadmap.md)**
+  Multi-GPU, calibrated ceilings, more engines, and the end state: a server that heals itself.
+  Demand reorders it: [tell us what you run](https://github.com/jungledesh/profile/issues).
+
+Deep reference on the [website](https://jungledesh.github.io/profile/docs.html): rule thresholds and edge cases, metric sources, the math, the GPU catalog, and engine design.
 
 ---
 
+## Principles
 
+The tool follows these rules.
 
-## Contributing
-
-Accepted: a new rule, an engine port, a GPU catalog entry, or a bug report from a real server.
-
-Start with [ARCHITECTURE.md](ARCHITECTURE.md) for where code lives and what owns what. [CONTRIBUTING.md](CONTRIBUTING.md) has the build, the merge gate (`cargo fmt`, `clippy`, `audit`, `deny`, `test`, plus OSV-Scanner, Semgrep, and [Socket](https://socket.dev/) supply-chain scanning in CI), and the checklist for adding a rule. If the entry point is unclear, [open an issue](https://github.com/jungledesh/profile/issues) with what you run and what is missing.
+- Every number is measured or marked `(est)`. A missing metric prints `-`. Nothing is invented.
+- One cause at a time. Eight rules, one primary.
+- Regressions are named, never buried. A tool that only reports wins cannot be trusted when it reports one.
+- Every character earns its place. If it does not help you act, it is not there.
+- No jargon. We write to help, not to confuse.
+- Crafted, not just engineered.
 
 ---
 
+## Contributing, license, contact
 
+- **Contributing:** new rules, engine ports, catalog entries, bug reports from real servers. Code map: [ARCHITECTURE.md](ARCHITECTURE.md). Build, merge gate, rule checklist: [CONTRIBUTING.md](CONTRIBUTING.md).
+- **License:** [Apache 2.0](LICENSE). Copyright 2026 Gagandeep Singh.
+- **Contact:** need cluster aggregation, multi-engine support, or a custom hardware catalog? [Open an issue](https://github.com/jungledesh/profile/issues) or email [jungledesh@gmail.com](mailto:jungledesh@gmail.com).
 
-## License
+---
 
-Apache License 2.0. Copyright 2026 Gagandeep Singh.
+<div align="center">
 
-Need cluster aggregation, multi-engine support, or a custom hardware catalog? [Open an issue](https://github.com/jungledesh/profile/issues) or email **[jungledesh@gmail.com](mailto:jungledesh@gmail.com)**.
+**We only show truth.**
+
+*The end state: servers that heal themselves, bottlenecks surfaced by physics, no human in the loop.*
+
+*Until then: close the gap between what you pay for and what your hardware delivers.*
+
+</div>
