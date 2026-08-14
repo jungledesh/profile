@@ -249,7 +249,7 @@ static CATALOG: &[ModelEntry] = &[
     // ── Llama 3.2 (before generic llama 3; "3.2" token, dots kept by normalize) ─
     // Official config.json is gated. Geometry verified against the Unsloth
     // copy of Meta's file (same path the Gemma 3 1B entry uses).
-    // head_dim=64 is explicit in config (2048/32).
+    // 3B: hidden 3072 / 24 attention heads → head_dim=128.
     // Source: https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct/raw/main/config.json (gated)
     // Verified: https://huggingface.co/unsloth/Llama-3.2-3B-Instruct/raw/main/config.json (accessed 2026-08-13)
     ModelEntry {

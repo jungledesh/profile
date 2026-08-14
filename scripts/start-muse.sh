@@ -48,7 +48,7 @@ echo "Starting container (Muse Glimmer 30B NVFP4, DFlash off)..."
 # Pin torch CUDA to the host driver. PyPI torch 2.13 defaults to cu130 (needs
 # driver 580). 5090 needs CUDA >= 12.8. Last Blackwell wheel that loads on
 # driver 570 is 2.11.0+cu128. Do not pin cu126 (no sm_120).
-DRIVER_VER="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 | tr -d '[:space:]')"
+DRIVER_VER="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 | tr -d '[:space:]' || true)"
 DRIVER_MAJOR="${DRIVER_VER%%.*}"
 if [[ "$DRIVER_MAJOR" =~ ^[0-9]+$ ]] && (( DRIVER_MAJOR >= 580 )); then
     TORCH_BACKEND=cu130
@@ -74,6 +74,7 @@ python -m pip install "uv==${UV_VERSION}"
 # Precompiled kernels match CUDA 13. On driver 570 / cu128, compile against the
 # 12.8 image toolkit for Blackwell (sm_120). Override with VLLM_USE_PRECOMPILED=1.
 VLLM_INSTALL_ARGS=()
+TORCH_CONSTRAINTS=""
 if [[ "$TORCH_BACKEND" == "cu128" ]]; then
     export VLLM_USE_PRECOMPILED="${VLLM_USE_PRECOMPILED:-0}"
     export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-12.0}"
@@ -85,12 +86,17 @@ if [[ "$TORCH_BACKEND" == "cu128" ]]; then
     uv pip install "packaging>=24.2" "cmake>=3.26.1" ninja \
         "setuptools>=77.0.3,<81.0.0" "setuptools-scm>=8.0" \
         "setuptools-rust>=1.9.0" wheel jinja2
-    VLLM_INSTALL_ARGS+=(--no-build-isolation)
+    TORCH_CONSTRAINTS="$(mktemp)"
+    printf '%s\n' "${TORCH_PINS[@]}" > "$TORCH_CONSTRAINTS"
+    VLLM_INSTALL_ARGS+=(--no-build-isolation --constraint "$TORCH_CONSTRAINTS")
 else
     export VLLM_USE_PRECOMPILED="${VLLM_USE_PRECOMPILED:-1}"
 fi
 echo "Installing vLLM from: ${VLLM_PIP_SPEC} (VLLM_USE_PRECOMPILED=${VLLM_USE_PRECOMPILED})"
 uv pip install "${VLLM_INSTALL_ARGS[@]}" "${VLLM_PIP_SPEC}"
+if [[ -n "$TORCH_CONSTRAINTS" ]]; then
+    rm -f "$TORCH_CONSTRAINTS"
+fi
 # Muse git / PyPI resolve torch 2.13.0+cu130. Re-pin to the driver wheel after.
 # Do not set UV_TORCH_BACKEND during the git install: cu128 has no 2.13 wheel.
 uv pip install --force-reinstall --index-url "${TORCH_INDEX}" "${TORCH_PINS[@]}"
@@ -123,11 +129,13 @@ fi
 # libs in front of a cu128 torch; that is the 570 failure mode.
 CUDA13_LIB=""
 if [[ "$TORCH_BACKEND" == "cu130" ]]; then
-    CUDA13_LIB=$(find "$VENV_DIR" -path "*/nvidia/cu13/lib" -type d 2>/dev/null | head -1)
-    if [[ -n "$CUDA13_LIB" ]]; then
-        export LD_LIBRARY_PATH="${CUDA13_LIB}:${LD_LIBRARY_PATH:-}"
-        echo "CUDA 13 libs: $CUDA13_LIB"
+    CUDA13_LIB=$(find "$VENV_DIR" -path "*/nvidia/cu13/lib" -type d 2>/dev/null | head -1 || true)
+    if [[ -z "$CUDA13_LIB" ]]; then
+        echo "ERROR: cu130 torch needs libcudart.so.13 under $VENV_DIR (nvidia/cu13/lib)." >&2
+        exit 1
     fi
+    export LD_LIBRARY_PATH="${CUDA13_LIB}:${LD_LIBRARY_PATH:-}"
+    echo "CUDA 13 libs: $CUDA13_LIB"
 fi
 
 if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
