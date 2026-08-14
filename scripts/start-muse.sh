@@ -47,7 +47,20 @@ VENV_DIR="${VENV_DIR:-/home/appuser/vllm-env}"
 MODELS_DIR="${MODELS_DIR:-/workspace/models}"
 MODEL_PATH="${MODEL_PATH:-$MODELS_DIR/muse-glimmer-30b-nvfp4}"
 TMUX_SESSION="${TMUX_SESSION:-vllm}"
+SETUP_TMUX="${SETUP_TMUX:-muse-setup}"
 LOG_FILE="${APP_DIR}/vllm.log"
+
+# RunPod SSH (ssh.runpod.io) drops during long uv fetches. Foreground install
+# then gets SIGHUP. Re-exec in tmux when this is an interactive shell. Container
+# entrypoint has no tty, so it is left alone. Distinct from TMUX_SESSION (serve).
+if [[ -z "${TMUX:-}" && -t 0 && "${MUSE_SKIP_TMUX:-}" != "1" ]]; then
+    if tmux has-session -t "$SETUP_TMUX" 2>/dev/null; then
+        echo "Attaching to existing tmux session $SETUP_TMUX"
+        exec tmux attach -t "$SETUP_TMUX"
+    fi
+    echo "Re-exec in tmux session $SETUP_TMUX (SSH drop will not kill the install)"
+    exec tmux new-session -s "$SETUP_TMUX" "$0" "$@"
+fi
 
 echo "Starting container (Muse Glimmer 30B NVFP4, DFlash off)..."
 
@@ -96,6 +109,8 @@ install_torch_pins() {
     return 1
 }
 
+# Precompiled kernels match CUDA 13. On driver 570 / cu128, compile against the
+# 12.8 image toolkit for Blackwell (sm_120). Override with VLLM_USE_PRECOMPILED=1.
 # Muse requirements/cuda.txt hard-pins torch==2.13.0 and torchvision==0.28.0.
 # --constraint intersects those pins and is unsatisfiable on cu128 (2.11 / 0.26).
 # --override replaces them. Do not switch back to --constraint.
