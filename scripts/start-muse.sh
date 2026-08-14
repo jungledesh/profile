@@ -23,10 +23,11 @@ PIP_VERSION="${PIP_VERSION:-26.0.1}"
 UV_VERSION="${UV_VERSION:-0.11.1}"
 # Muse Glimmer is not in any PyPI wheel yet (PR vllm-project/vllm#51655 still open).
 # Same install path as Qwen/Gemma (uv pip into VENV_DIR); different package source.
-# Pin: last commit on tiezhen/new-model-support from the Aug 12 5090 demo day.
-# Floating branch tip merged main on Aug 13; pip then resolved torch 2.13.0+cu130
-# which cannot init on driver 570 (CUDA API 12090). Override only to debug.
-VLLM_PIP_SPEC="${VLLM_PIP_SPEC:-git+https://github.com/xianbaoqian/vllm.git@98f86b9c02329200a0390aecfe598e27928cbf40}"
+# Pin a merge commit ON tiezhen/new-model-support whose tree has muse_glimmer
+# parsers (vllm/tool_parsers/muse_glimmer_tool_parser.py). Do not pin a mainline
+# SHA that was merged in (98f86b9c has no parsers; serve dies with KeyError).
+# Torch CUDA is re-pinned after install for driver 570. Override only to debug.
+VLLM_PIP_SPEC="${VLLM_PIP_SPEC:-git+https://github.com/xianbaoqian/vllm.git@1f7f0715848c9acc56ea40faa21c13a02bdc8357}"
 
 MODEL_REPO="${MODEL_REPO:-Inferact/Muse-Glimmer-30B-NVFP4-W4A4}"
 SERVED_NAME="${SERVED_NAME:-muse-glimmer-30b}"
@@ -134,6 +135,12 @@ if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
     tmux kill-session -t "$TMUX_SESSION"
 fi
 
+# FlashInfer 0.6.15 JIT for SM120 (5090) requires CUDA >= 12.9 nvcc. This image
+# is 12.8, so _normalize_cuda_arch raises, TARGET_CUDA_ARCHS stays empty, and
+# warmup dies with "FlashInfer requires GPUs with sm75 or higher". The GPU is
+# sm_120. Use the PyTorch sampler instead. Override to 1 on a CUDA 12.9+ image.
+export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
+
 # Minimal flags; Profile diagnoses seats / memory / batch tokens.
 #   --trust-remote-code          Muse arch
 #   --enable-auto-tool-choice    agent swarm
@@ -147,6 +154,7 @@ if [[ -n "$CUDA13_LIB" ]]; then
 fi
 tmux new-session -d -s "$TMUX_SESSION" \
 "bash -lc 'source \"$VENV_DIR/bin/activate\" && \
+export VLLM_USE_FLASHINFER_SAMPLER=\"${VLLM_USE_FLASHINFER_SAMPLER}\" && \
 ${TMUX_CUDA_EXPORT}vllm serve \"$MODEL_PATH\" \
   --served-model-name $SERVED_NAME \
   --max-model-len 32768 \
