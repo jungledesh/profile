@@ -35,6 +35,7 @@ decode_ceiling_tps = (peak_bandwidth_gbps x tp x 1e9) / (params x bytes_per_para
 - Efficiency is measured throughput against the decode ceiling times the ridge batch size: the batch size where decode stops being limited by memory and starts being limited by compute.
 - Ceilings are coarse upper bounds from published specifications, not a hardware simulation. They are marked `(est)`, and values derived from them carry a tilde.
 - An uncatalogued GPU or model gets `Hardware ceiling unknown` with the reason, rather than a wrong number.
+- `params` in both ceilings is the active parameter count when the catalog defines one (MoE experts on path, or multimodal models where decode streams the text stack only). Weight footprint and OOM sizing use the total. One model, two numbers, on purpose.
 
 **Cost works differently.** Dollars per million output tokens is `cost_per_hr × 1e6 / (tok/s × 3600)` when enough completions cover mean running (turnover gate); otherwise the cost line is omitted. That keeps the dollar figure independent of the ceiling.
 

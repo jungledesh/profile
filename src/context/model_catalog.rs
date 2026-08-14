@@ -733,7 +733,7 @@ static CATALOG: &[ModelEntry] = &[
             param_count: 123 * B,
             active_param_count: None,
             num_layers: 88,
-            hidden_dim: 8192,
+            hidden_dim: 12288,
             default_weight_dtype: "bf16",
             num_kv_heads: Some(8),
             head_dim: Some(128),
@@ -750,7 +750,7 @@ static CATALOG: &[ModelEntry] = &[
             param_count: 123 * B,
             active_param_count: None,
             num_layers: 88,
-            hidden_dim: 8192,
+            hidden_dim: 12288,
             default_weight_dtype: "bf16",
             num_kv_heads: Some(8),
             head_dim: Some(128),
@@ -1519,6 +1519,7 @@ mod tests {
     fn mistral_large_123b() {
         let e = lookup_model("mistralai/Mistral-Large-Instruct-2411").expect("no match");
         assert_eq!(e.param_count, 123 * B);
+        assert_eq!(e.hidden_dim, 12288);
         assert!(e.active_param_count.is_none());
     }
 

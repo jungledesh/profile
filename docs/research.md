@@ -22,7 +22,7 @@ Profile is not heuristics. Each part is the field's validated answer to a questi
 
 ## The full argument
 
-**The ceiling: roofline.** The standard model for LLM inference analysis. The 2024 survey *LLM Inference Unveiled* [2] organises the field around it, and RooflineBench [3] still builds on it. On a single accelerator, physics offers compute and bandwidth, and time is the maximum of the two. There is no tighter on-device limit to derive. Distributed serving also faces interconnect bandwidth and latency [4].
+**The ceiling: roofline.** The standard model for LLM inference analysis. The 2024 survey *LLM Inference Unveiled* [2] organises the field around it, and RooflineBench [3] still builds on it. On a single accelerator, the roofline models two limits, compute and bandwidth; time is the maximum of the two, and Profile takes the binding one. Distributed serving also faces interconnect bandwidth and latency [4].
 
 *Its weakness:* a raw spec-sheet roofline overestimates. Real servers have a third regime, overhead-bound, where the GPU idles on CPU work. The proven fix is calibration: a fitted overhead constant cut error up to 80% on vLLM and improved fits on Triton in the cited experiments [5], and GenZ reaches 5.82% geomean error among the platforms it evaluated with calibrated efficiency factors [4]. Raw peak specifications can overestimate production performance.
 
@@ -32,7 +32,7 @@ Profile is not heuristics. Each part is the field's validated answer to a questi
 
 *Its weakness:* non-causal misattribution. Counters correlate, they do not establish cause. In one documented case [7] TMA reported a region as 44.1% memory-bound and 43.4% core-bound when the real bottleneck was a dependence chain. TMA never catches this, because it reports once and never checks itself.
 
-*Profile's answer:* the loop. The literature's remedy for this failure is perturbation: change one resource and measure the response (Coz [8]). Profile runs that as a side effect of normal operation. Your applied fix is the perturbation, the re-measure is the response. The loop is what makes the rule engine causal.
+*Profile's answer:* the loop. The literature's remedy for this failure is perturbation: change one resource and measure the response (Coz [8]). Profile runs that as a side effect of normal operation. Your applied fix is the perturbation, the re-measure is the response. The loop is what makes the rule engine causal. Causal within limits: the delta attributes to everything changed in that restart, under the traffic that ran. Profile detects config drift and never credits a traffic shift as a fix.
 
 **Rules rather than learning.** Rule-based root cause analysis holds up in bounded, rule-defined systems and degrades in sprawling dynamic ones [9]. A single vLLM server is the bounded case, and rules have the property learning does not: you can read why.
 
