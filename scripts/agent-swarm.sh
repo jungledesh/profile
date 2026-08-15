@@ -73,9 +73,9 @@ case "$PROFILE_MODEL" in
         MODEL_DISPLAY="Gemma 4 26B-A4B (vLLM)"
         ;;
     qwen)
-        SERVED_MODEL_NAME="${SERVED_NAME:-Qwen3.6-27B}"
+        SERVED_MODEL_NAME="${SERVED_NAME:-Qwen3.8-27B}"
         MODEL_ALIAS="${MODEL_ALIAS:-qwen-local}"
-        MODEL_DISPLAY="Qwen3.6-27B (vLLM)"
+        MODEL_DISPLAY="Qwen3.8-27B (vLLM)"
         ;;
     *)
         echo "PROFILE_MODEL must be muse, gemma, or qwen (got: $PROFILE_MODEL)" >&2

@@ -29,7 +29,7 @@ VLLM_URL="${VLLM_URL:-http://localhost:8000}"
 PROFILE_MODEL="${PROFILE_MODEL:-qwen}"
 case "$PROFILE_MODEL" in
   gemma) FAMILY_DEFAULT="gemma-4-26b-a4b" ;;
-  qwen)  FAMILY_DEFAULT="Qwen3.6-27B" ;;
+  qwen)  FAMILY_DEFAULT="Qwen3.8-27B" ;;
   llama) FAMILY_DEFAULT="llama3" ;;
   *)
     echo "PROFILE_MODEL must be gemma, qwen, or llama (got: $PROFILE_MODEL)" >&2
