@@ -57,7 +57,7 @@
   <g font-size="10" fill="#8f8f8f">
     <text x="536" y="310">silences</text>
     <text x="700" y="310" text-anchor="end">silences</text>
-    <text x="352" y="222" text-anchor="end">silences</text>
+    <text x="352" y="222" text-anchor="end">silences (when pressed)</text>
   </g>
 
   <!-- core -->
@@ -141,7 +141,7 @@
   <!-- bottom-left: held note -->
   <g font-size="11" fill="#8f8f8f">
     <circle cx="42" cy="640" r="3" fill="none" stroke="#8f8f8f" stroke-width="1"/>
-    <text x="54" y="644">losers are held, released when the same cause returns with no material improvement</text>
+    <text x="54" y="644">losers are held, released when the same cause returns, or at once when it has no fix</text>
   </g>
 
   <!-- bottom-right: sibling note -->
