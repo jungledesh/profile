@@ -392,32 +392,32 @@ static CATALOG: &[ModelEntry] = &[
             state_dtype: Some("fp32"),
         },
     },
-    // Open 27B of Qwen3.8 (not the 2.4T Max). Same hybrid as 3.6: 3:1 DeltaNet /
-    // full attention, 16 KV layers. Multimodal (vision_config).
-    // param_count is the HF safetensors total (ViT included). active_param_count
-    // stays None until a published text-stack count exists for the decode roof.
-    // Source: https://huggingface.co/api/models/Qwen/Qwen3.8-27B (safetensors.total,
-    // accessed 2026-08-15) and text_config in
-    // https://huggingface.co/Qwen/Qwen3.8-27B/raw/main/config.json
+    // Qwen3.8-27B (not the 2.4T Max). Official sources, accessed 2026-08-15:
+    //   config.json text_config:
+    //     https://huggingface.co/Qwen/Qwen3.8-27B/raw/main/config.json
+    //   README Model Overview (Language Model):
+    //     https://huggingface.co/Qwen/Qwen3.8-27B/raw/main/README.md
+    //   safetensors.total (loaded BF16, ViT included):
+    //     https://huggingface.co/api/models/Qwen/Qwen3.8-27B
     ModelEntry {
         tokens: &["qwen3.8", "27b"],
         entry: catalog_hybrid! {
-            param_count: 27_781_427_952,
-            active_param_count: None,
-            num_layers: 64,
-            hidden_dim: 5120,
-            default_weight_dtype: "bf16",
-            num_kv_heads: Some(4),
-            head_dim: Some(256),
-            num_kv_layers: Some(16),
+            param_count: 27_781_427_952, // safetensors.parameters.BF16
+            active_param_count: Some(27 * B), // README: Language Model, Number of Parameters: 27B
+            num_layers: 64,                 // text_config.num_hidden_layers
+            hidden_dim: 5120,               // text_config.hidden_size
+            default_weight_dtype: "bf16",   // text_config.dtype bfloat16
+            num_kv_heads: Some(4),          // text_config.num_key_value_heads
+            head_dim: Some(256),            // text_config.head_dim
+            num_kv_layers: Some(16),        // layer_types count of full_attention
             attn_flops_coeff: None,
-            linear_num_layers: Some(48),
-            linear_key_heads: Some(16),
-            linear_value_heads: Some(48),
-            linear_key_head_dim: Some(128),
-            linear_value_head_dim: Some(128),
-            linear_conv_kernel_dim: Some(4),
-            state_dtype: Some("fp32"),
+            linear_num_layers: Some(48),    // layer_types count of linear_attention
+            linear_key_heads: Some(16),     // text_config.linear_num_key_heads
+            linear_value_heads: Some(48),   // text_config.linear_num_value_heads
+            linear_key_head_dim: Some(128), // text_config.linear_key_head_dim
+            linear_value_head_dim: Some(128), // text_config.linear_value_head_dim
+            linear_conv_kernel_dim: Some(4), // text_config.linear_conv_kernel_dim
+            state_dtype: Some("fp32"),      // text_config.mamba_ssm_dtype float32
         },
     },
     // ── Qwen 3 dense ─────────────────────────────────────────────────────────
@@ -1341,7 +1341,7 @@ mod tests {
         // Source: Qwen/Qwen3.8-27B text_config (2026-08-15). H100 demo serves BF16.
         let e = lookup_model("Qwen/Qwen3.8-27B").expect("no match");
         assert_eq!(e.param_count, 27_781_427_952);
-        assert!(e.active_param_count.is_none());
+        assert_eq!(e.active_param_count, Some(27 * B));
         assert_eq!(e.num_layers, 64);
         assert_eq!(e.hidden_dim, 5120);
         assert_eq!(e.num_kv_heads, Some(4));
