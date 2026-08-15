@@ -1,3 +1,5 @@
+<div align="center">
+
 # Profile
 
 **Inference diagnostics for production vLLM servers.**
@@ -5,6 +7,8 @@
 *Less words. Less noise. More signal. More value.*
 
 [Install](#install) · [What is Profile](#what-is-profile) · [The engine](#the-engine) · [Proof](#proof) · [Docs](#documentation) · [Website](https://jungledesh.github.io/profile/index.html)
+
+</div>
 
 ---
 
@@ -75,6 +79,10 @@ That is the whole setup. No calibration run, no restart of your server.
 ## The engine
 
 Profile's engine. Deterministic. Precise.
+
+<p align="center">
+  <img src="docs/assets/rule-engine.svg" width="880" alt="Profile's rule engine: eight rules on DAG priority layers. Mutual exclusivity removes explained symptoms; highest surviving layer wins; one primary shown, losers held.">
+</p>
 
 - **Eight rules, eight failure modes.** On a struggling server, several fire at once.
 - **Mutual exclusivity** removes symptoms another cause already explains. Weights overflowing VRAM? Then KV pressure is a symptom, and treating it would be malpractice. Profile fires the real cause instead, with its own fix.
@@ -148,23 +156,28 @@ H100   before  |███████████ 163
 We did the hard part: a deterministic core engine. These pages show the work.
 
 - **[Workflow](docs/workflow.md)**
-Every CLI flag, every line of output decoded, the loop step by step.
-Read this and you can run a full optimization session in one sitting.
+  Every CLI flag, every line of output decoded, the loop step by step.
+  Read this and you can run a full optimization session in one sitting.
+
 - **[Engine](docs/engine.md)**
-The ceiling math from first principles, all eight rules with their exact thresholds, suppression and ranking.
-No black box: every threshold that can silence or fire a rule is on this page.
+  The ceiling math from first principles, all eight rules with their exact thresholds, suppression and ranking.
+  No black box: every threshold that can silence or fire a rule is on this page.
+
 - **[Research](docs/research.md)**
-Profile is not heuristics. The ceiling is a roofline, the field's standard. The engine descends from Intel's Top-down analysis, a decade in `perf` and VTune. The loop is Coz-style causal perturbation, run as a side effect of normal use.
-We also list every known weakness of each method ourselves, with citations, before you find them.
+  Profile is not heuristics. The ceiling is a roofline, the field's standard. The engine descends from Intel's Top-down analysis, a decade in `perf` and VTune. The loop is Coz-style causal perturbation, run as a side effect of normal use.
+  We also list every known weakness of each method ourselves, with citations, before you find them.
+
 - **[Positioning](docs/positioning.md)**
-The full serving stack, and a straight comparison against dashboards, kernel profilers, autotuners, and simulators.
-Ends with the only honest column that matters: who measures whether the fix worked.
+  The full serving stack, and a straight comparison against dashboards, kernel profilers, autotuners, and simulators.
+  Ends with the only honest column that matters: who measures whether the fix worked.
+
 - **[Limitations](docs/limitations.md)**
-Every boundary, stated plainly, with the reason it exists.
-Shorter than you fear, and nothing hidden in it.
+  Every boundary, stated plainly, with the reason it exists.
+  Shorter than you fear, and nothing hidden in it.
+
 - **[Roadmap](docs/roadmap.md)**
-Multi-GPU, calibrated ceilings, more engines, and the end state: a server that heals itself.
-Demand reorders it: [tell us what you run](https://github.com/jungledesh/profile/issues).
+  Multi-GPU, calibrated ceilings, more engines, and the end state: a server that heals itself.
+  Demand reorders it: [tell us what you run](https://github.com/jungledesh/profile/issues).
 
 Deep reference on the [website](https://jungledesh.github.io/profile/docs.html): rule thresholds and edge cases, metric sources, the math, the GPU catalog, and engine design.
 
@@ -179,23 +192,28 @@ The tool follows these rules:
 - Regressions are named, never buried. A tool that only reports wins cannot be trusted when it reports one.
 - Every character earns its place. If it does not help you act, it is not there.
 - No jargon. We write to help, not to confuse.
-- Crafted, not just engineered.
+- Crafted, not just engineered. Every byte Profile allocates is taken from the model it profiles, so we delete before we add. A profiler that eats its target is worse than no profiler.
 
 ---
 
 ## Contributing, license, contact
 
 - **Contributing:** new rules, engine ports, catalog entries, bug reports from real servers.
-Code map: [ARCHITECTURE.md](ARCHITECTURE.md).
-Build, merge gate, rule checklist: [CONTRIBUTING.md](CONTRIBUTING.md).
+  Code map: [ARCHITECTURE.md](ARCHITECTURE.md).
+  Build, merge gate, rule checklist: [CONTRIBUTING.md](CONTRIBUTING.md).
 - **License:** [Apache 2.0](LICENSE). Copyright 2026 Gagandeep Singh.
 - **Contact:** need cluster aggregation, multi-engine support, or a custom hardware catalog?
-[Open an issue](https://github.com/jungledesh/profile/issues) or email [jungledesh@gmail.com](mailto:jungledesh@gmail.com).
+  [Open an issue](https://github.com/jungledesh/profile/issues) or email [jungledesh@gmail.com](mailto:jungledesh@gmail.com).
 
 ---
+
+<div align="center">
 
 **We show what your server hides.**
 
 *The end state: servers that heal themselves, bottlenecks surfaced by physics, no human in the loop.*
 
 *Until then: close the gap between what you pay for and what your hardware delivers.*
+
+</div>
+
