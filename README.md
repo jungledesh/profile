@@ -1,3 +1,5 @@
+
+
 # Profile
 
 **Inference diagnostics for production vLLM servers.**
@@ -5,6 +7,8 @@
 *Less words. Less noise. More signal. More value.*
 
 [Install](#install) · [What is Profile](#what-is-profile) · [The engine](#the-engine) · [Proof](#proof) · [Docs](#documentation) · [Website](https://jungledesh.github.io/profile/index.html)
+
+
 
 ---
 
@@ -26,6 +30,8 @@ One A100. Same model, same hardware, different flags.
 ```
 
 ---
+
+
 
 ## What is Profile
 
@@ -52,6 +58,8 @@ Nobody else does this job. [The comparison.](docs/positioning.md)
 
 ---
 
+
+
 ## Install
 
 ```bash
@@ -72,9 +80,13 @@ That is the whole setup. No calibration run, no restart of your server.
 
 ---
 
+
+
 ## The engine
 
 Profile's engine. Deterministic. Precise.
+
+
 
 - **Eight rules, eight failure modes.** On a struggling server, several fire at once.
 - **Mutual exclusivity** removes symptoms another cause already explains. Weights overflowing VRAM? Then KV pressure is a symptom, and treating it would be malpractice. Profile fires the real cause instead, with its own fix.
@@ -86,6 +98,8 @@ Profile's engine. Deterministic. Precise.
 The full machinery: [docs/engine.md](docs/engine.md).
 
 ---
+
+
 
 ## The loop
 
@@ -125,6 +139,8 @@ Measuring delta...
 
 ---
 
+
+
 ## Proof
 
 ```text
@@ -142,6 +158,8 @@ H100   before  |███████████ 163
 - A server already near its ceiling has nothing to recover, and Profile tells you that instead of manufacturing a recommendation.
 
 ---
+
+
 
 ## Documentation
 
@@ -170,6 +188,8 @@ Deep reference on the [website](https://jungledesh.github.io/profile/docs.html):
 
 ---
 
+
+
 ## Principles
 
 The tool follows these rules:
@@ -179,9 +199,11 @@ The tool follows these rules:
 - Regressions are named, never buried. A tool that only reports wins cannot be trusted when it reports one.
 - Every character earns its place. If it does not help you act, it is not there.
 - No jargon. We write to help, not to confuse.
-- Crafted, not just engineered.
+- Crafted, not just engineered. Every byte Profile allocates is taken from the model it profiles, so we delete before we add. A profiler that eats its target is worse than no profiler.
 
 ---
+
+
 
 ## Contributing, license, contact
 
@@ -194,8 +216,11 @@ Build, merge gate, rule checklist: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ---
 
+
+
 **We show what your server hides.**
 
 *The end state: servers that heal themselves, bottlenecks surfaced by physics, no human in the loop.*
 
 *Until then: close the gap between what you pay for and what your hardware delivers.*
+
