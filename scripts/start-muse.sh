@@ -1,4 +1,3 @@
-cat start-muse.sh
 #!/usr/bin/env bash
 # Muse Glimmer 30B on NVIDIA — same pattern as start.sh / start-gemma.sh:
 # pip-install vLLM into the image venv, download weights, serve in tmux.
