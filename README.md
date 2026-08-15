@@ -174,7 +174,7 @@ Deep reference on the [website](https://jungledesh.github.io/profile/docs.html):
 
 The tool follows these rules:
 
-- Every number is measured or marked `(est)`. A missing metric prints `-`. Nothing is invented.
+- Every number is measured or marked with either `(est)` or `~`. A missing metric prints `-`. Nothing is invented.
 - One cause at a time. Eight rules, one primary.
 - Regressions are named, never buried. A tool that only reports wins cannot be trusted when it reports one.
 - Every character earns its place. If it does not help you act, it is not there.
