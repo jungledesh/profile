@@ -58,12 +58,16 @@ All user-facing strings, not only rule output, follow the output rules: prescrip
 
 ## Adding a new rule
 
+Follow this order. Skipping a step creates a rule the DAG cannot see.
+
 1. Create `src/engine/rules/rN_name.rs` with a production evaluator over the snapshot or window evidence. Match the nearest production neighbor. Add a `*_recommendation(...)` helper only when that neighbor exposes one in production code; do not treat test-only helpers (for example `r1_recommendation`) as the API.
-2. Threshold constants at the top of the new file.
-3. Assign the rule to a DAG layer (L2-L6) and define any mutual exclusivity suppressions in the suppression table.
-4. Wire detection and report assembly into `rules::build_report_for_windows` in `src/engine/rules/eval.rs`.
-5. Smoke test with a mock payload in unit tests. Then validate against a live vLLM server with a GPU.
-6. Output is prescriptive: what to change and how, one line, with units. Fire on evidence of harm (evictions, queue growth, latency inflation) or under-use (low occupancy or efficiency). Never on utilization alone.
+2. Threshold constants at the top of that file. Named, not magic numbers in the evaluator.
+3. Assign a DAG layer on the `Recommendation` you push (today: L2 OOM/KV, L3 seats, L4 under-batching, L5 prefill/prefix, L6 config headroom). Add suppression-table rows in `SUPPRESSION_TABLE` in `src/engine/rules/eval.rs` when another rule already explains the same root cause. Cross-layer rows (Prefill → Under-batching) must sit in that table; min-layer alone will drop the higher layer and make the row a no-op.
+4. Wire per-window detection in `eval_window_rules` and report assembly (significance, layer, display) in `build_report_from_eval` in `src/engine/rules/eval.rs`. `build_report_for_windows` is the entry; it is not enough by itself. Significance is at least 3 evaluable non-idle windows and ≥ 25% of those windows (`ENGINE_MIN_PERSISTENT_WINDOWS`, `ENGINE_MIN_WINDOW_PCT`).
+5. Smoke test with a mock payload in the rule file. Confirm ranked output, suppression-table dedup, and the confidence label (High / Medium / Low). Then validate against a live vLLM server with a GPU.
+6. Output is prescriptive: what to change and how, one line, with units. Fire on evidence of harm (evictions, queue growth, latency inflation) or under-use (low occupancy or efficiency). Never on utilization alone. Enable/Set a feature only on `Some(false)`; unread is not off. A named target that already equals the configured value is a no-op (`already_set_u32`).
+
+Do not add a ninth DAG rule by injecting into `maybe_add_massive_underutilization` (`src/engine/mod.rs`). That path is diagnose-only, after windows evaluation, when the recommendation list is empty. Soft-field under-fed inject lives in `eval.rs` and is also not a new layer.
 
 ## Where to start
 

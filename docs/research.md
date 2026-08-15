@@ -14,9 +14,14 @@ The research came last. We found it after the design had settled, and it agreed 
 
 ---
 
-## The argument in one paragraph
+## The argument, in short
 
-Profile is not heuristics. Each part is the field's validated answer to a question it has already studied, and each answer has a known weakness Profile is built to survive. The ceiling is a roofline model, the standard for LLM inference analysis; its weakness is that raw spec sheets overestimate, so every ceiling is marked `(est)` and calibration is on the roadmap. The rule engine uses mutual exclusivity under a priority DAG, the structure Intel's Top-down analysis has shipped in `perf` and VTune for a decade; its weakness is non-causal misattribution, and the loop is the remedy: your applied fix is the perturbation, the re-measure is the check. Rules beat learned models here because a single vLLM server is the bounded case where rules hold up, and you can read why one fired. Autotuners and simulators answer adjacent questions, at the price of restarts, synthetic load, or lagging real serving features; Profile reads the live server you already run.
+Profile is not heuristics. Each part is the field's validated answer to a question it has already studied, and each answer has a known weakness Profile is built to survive.
+
+- **The ceiling** is a roofline model, the standard for LLM inference analysis. Its weakness: raw spec sheets overestimate. So every ceiling is marked `(est)`, and calibration is on the roadmap.
+- **The rule engine** uses mutual exclusivity under a priority DAG, the structure Intel's Top-down analysis has shipped in `perf` and VTune for a decade. Its weakness: non-causal misattribution. The loop is the remedy: your applied fix is the perturbation, the re-measure is the check.
+- **Rules beat learned models** here because a single vLLM server is the bounded case where rules hold up, and you can read why one fired.
+- **Autotuners and simulators** answer adjacent questions, at the price of restarts, synthetic load, or lagging real serving features. Profile reads the live server you already run.
 
 ---
 
@@ -24,7 +29,7 @@ Profile is not heuristics. Each part is the field's validated answer to a questi
 
 **The ceiling: roofline.** The standard model for LLM inference analysis. The 2024 survey *LLM Inference Unveiled* [2] organises the field around it, and RooflineBench [3] still builds on it. On a single accelerator, the roofline models two limits, compute and bandwidth; time is the maximum of the two, and Profile takes the binding one. Distributed serving also faces interconnect bandwidth and latency [4].
 
-*Its weakness:* a raw spec-sheet roofline overestimates. Real servers have a third regime, overhead-bound, where the GPU idles on CPU work. The proven fix is calibration: a fitted overhead constant cut error up to 80% on vLLM and improved fits on Triton in the cited experiments [5], and GenZ reaches 5.82% geomean error among the platforms it evaluated with calibrated efficiency factors [4]. Raw peak specifications can overestimate production performance.
+*Its weakness:* a raw spec-sheet roofline overestimates. Real servers have a third regime, overhead-bound, where the GPU idles on CPU work. The proven fix is calibration: [5] combines a Roofline Model with regression models trained on historical data to capture runtime overhead, reporting MSE reductions of up to 80% on vLLM and 61% on Triton, and GenZ reaches 5.82% geomean error among the platforms it evaluated with calibrated efficiency factors [4]. Raw peak specifications can overestimate production performance.
 
 *Where Profile stands:* uncalibrated, and it says so. Ceilings are marked `(est)`, derived values carry a tilde, and an uncatalogued GPU or model gets no ceiling at all. Cost per million output tokens is `cost_per_hr × 1e6 / (tok/s × 3600)`, so the dollar figure never inherits the ceiling's error. Calibration is on the roadmap.
 
