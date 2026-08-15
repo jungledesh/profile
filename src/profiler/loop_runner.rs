@@ -1071,7 +1071,7 @@ mod tests {
         });
         assert!(msg.contains("Primary Limiter: Traffic"));
         assert!(msg.contains(
-            "Capped by traffic: 5 requests running, hardware has room for ~100. More concurrent requests raises throughput."
+            "Capped by traffic: 5 requests running, no queue. Raise client concurrency in steps; compute ridge ~100, but KV or admission can bind first."
         ));
         assert!(!msg.contains("--max-num-seqs"));
     }

@@ -73,9 +73,9 @@ case "$PROFILE_MODEL" in
         MODEL_DISPLAY="Gemma 4 26B-A4B (vLLM)"
         ;;
     qwen)
-        SERVED_MODEL_NAME="${SERVED_NAME:-Qwen3.6-27B}"
+        SERVED_MODEL_NAME="${SERVED_NAME:-Qwen3.8-27B}"
         MODEL_ALIAS="${MODEL_ALIAS:-qwen-local}"
-        MODEL_DISPLAY="Qwen3.6-27B (vLLM)"
+        MODEL_DISPLAY="Qwen3.8-27B (vLLM)"
         ;;
     *)
         echo "PROFILE_MODEL must be muse, gemma, or qwen (got: $PROFILE_MODEL)" >&2
@@ -425,6 +425,7 @@ run_swarm() {
     command -v timeout >/dev/null 2>&1 || { echo "GNU timeout required" >&2; exit 1; }
     [[ -f "$TASKS_JSON" ]] || { echo "missing $TASKS_JSON" >&2; exit 1; }
     [[ -d "$CHECKOUTS_DIR" ]] || { echo "no checkouts; run: $0 setup" >&2; exit 1; }
+    write_grok_config
 
     mkdir -p "$AGENTS_DIR"
     : > "$SWARM_LOG"

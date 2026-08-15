@@ -109,7 +109,7 @@ USER appuser
 # Default NVIDIA stack is Muse Glimmer NVFP4 (CMD / start-muse.sh) for RTX 5090.
 # Same pattern as Qwen/Gemma: pip vLLM in start-*.sh, download weights, serve.
 # Do not bake SERVED_NAME: each launcher exports PROFILE_MODEL + SERVED_NAME.
-# Qwen: ./start.sh   Gemma: ./start-gemma.sh
+# Qwen3.8-27B BF16 (H100): ./start.sh   Gemma: ./start-gemma.sh
 ENV PROFILE_MODEL=muse
 
 CMD ["bash", "-lc", "/home/appuser/app/start-muse.sh"]

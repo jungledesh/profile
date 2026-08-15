@@ -392,6 +392,34 @@ static CATALOG: &[ModelEntry] = &[
             state_dtype: Some("fp32"),
         },
     },
+    // Qwen3.8-27B (not the 2.4T Max). Official sources, accessed 2026-08-15:
+    //   config.json text_config:
+    //     https://huggingface.co/Qwen/Qwen3.8-27B/raw/main/config.json
+    //   README Model Overview (Language Model):
+    //     https://huggingface.co/Qwen/Qwen3.8-27B/raw/main/README.md
+    //   safetensors.total (loaded BF16, ViT included):
+    //     https://huggingface.co/api/models/Qwen/Qwen3.8-27B
+    ModelEntry {
+        tokens: &["qwen3.8", "27b"],
+        entry: catalog_hybrid! {
+            param_count: 27_781_427_952, // safetensors.parameters.BF16
+            active_param_count: Some(27 * B), // README: Language Model, Number of Parameters: 27B
+            num_layers: 64,                 // text_config.num_hidden_layers
+            hidden_dim: 5120,               // text_config.hidden_size
+            default_weight_dtype: "bf16",   // text_config.dtype bfloat16
+            num_kv_heads: Some(4),          // text_config.num_key_value_heads
+            head_dim: Some(256),            // text_config.head_dim
+            num_kv_layers: Some(16),        // layer_types count of full_attention
+            attn_flops_coeff: None,
+            linear_num_layers: Some(48),    // layer_types count of linear_attention
+            linear_key_heads: Some(16),     // text_config.linear_num_key_heads
+            linear_value_heads: Some(48),   // text_config.linear_num_value_heads
+            linear_key_head_dim: Some(128), // text_config.linear_key_head_dim
+            linear_value_head_dim: Some(128), // text_config.linear_value_head_dim
+            linear_conv_kernel_dim: Some(4), // text_config.linear_conv_kernel_dim
+            state_dtype: Some("fp32"),      // text_config.mamba_ssm_dtype float32
+        },
+    },
     // ── Qwen 3 dense ─────────────────────────────────────────────────────────
     // Official dense SKUs: 0.6B, 1.7B, 4B, 8B, 14B, 32B (no dense 7B/72B).
     // Larger sizes first; first-match wins.
@@ -1241,7 +1269,7 @@ mod tests {
 
     #[test]
     fn launch_catalog_has_expected_entry_count() {
-        assert_eq!(CATALOG.len(), 58);
+        assert_eq!(CATALOG.len(), 59);
     }
 
     #[test]
@@ -1306,6 +1334,37 @@ mod tests {
         assert_eq!(e.linear_value_head_dim, Some(128));
         assert_eq!(e.linear_conv_kernel_dim, Some(4));
         assert_eq!(e.state_dtype, Some("fp32"));
+    }
+
+    #[test]
+    fn qwen38_27b_from_hf_config() {
+        // Source: Qwen/Qwen3.8-27B text_config (2026-08-15). H100 demo serves BF16.
+        let e = lookup_model("Qwen/Qwen3.8-27B").expect("no match");
+        assert_eq!(e.param_count, 27_781_427_952);
+        assert_eq!(e.active_param_count, Some(27 * B));
+        assert_eq!(e.num_layers, 64);
+        assert_eq!(e.hidden_dim, 5120);
+        assert_eq!(e.num_kv_heads, Some(4));
+        assert_eq!(e.head_dim, Some(256));
+        assert_eq!(e.num_kv_layers, Some(16));
+        assert_eq!(e.linear_num_layers, Some(48));
+        assert_eq!(e.linear_key_heads, Some(16));
+        assert_eq!(e.linear_value_heads, Some(48));
+        assert_eq!(e.linear_key_head_dim, Some(128));
+        assert_eq!(e.linear_value_head_dim, Some(128));
+        assert_eq!(e.linear_conv_kernel_dim, Some(4));
+        assert_eq!(e.state_dtype, Some("fp32"));
+        assert!(bytes_per_seq(&model_arch(e), 8192, 2).is_some());
+        let fp8 = lookup_model("Qwen/Qwen3.8-27B-FP8").expect("fp8");
+        assert_eq!(fp8.num_kv_layers, Some(16));
+        let nvfp4 = lookup_model("Inferact/Qwen3.8-27B-NVFP4").expect("nvfp4");
+        assert_eq!(nvfp4.param_count, 27_781_427_952);
+        let qwen38 = lookup_model("Qwen/Qwen3.8-27B").expect("3.8");
+        let qwen36 = lookup_model("Qwen/Qwen3.6-27B").expect("3.6");
+        assert_eq!(qwen38.num_kv_layers, qwen36.num_kv_layers);
+        let qwen3_8b = lookup_model("Qwen/Qwen3-8B").expect("qwen3 8b");
+        assert_eq!(qwen3_8b.param_count, 8 * B);
+        assert_eq!(qwen3_8b.num_layers, 36);
     }
 
     #[test]

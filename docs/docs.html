@@ -669,6 +669,7 @@ num_requests_running  is Some (even if zero)</code></pre>
         <tr><td>Nemotron 70B</td><td>70B</td><td>-</td><td>No</td></tr>
         <tr><td>Nemotron 8B</td><td>8B</td><td>-</td><td>No</td></tr>
         <tr><td>Muse Glimmer 30B</td><td>29.6B</td><td>27.8B (text)</td><td>No</td></tr>
+        <tr><td>Qwen3.8 27B</td><td>27.78B</td><td>27B (text)</td><td>No</td></tr>
         <tr><td>Qwen3.6 27B</td><td>27B</td><td>-</td><td>No</td></tr>
         <tr><td>Qwen3 235B</td><td>235B</td><td>22B</td><td>Yes</td></tr>
         <tr><td>Qwen3 32B</td><td>32B</td><td>-</td><td>No</td></tr>
@@ -711,7 +712,7 @@ num_requests_running  is Some (even if zero)</code></pre>
         <tr><td>Phi 4 14B</td><td>14B</td><td>-</td><td>No</td></tr>
       </tbody>
     </table>
-    <div class="callout">MoE models: <code>active_param_count</code> drives roofline ceilings; <code>param_count</code> (total) drives <code>weight_gb</code> and OOM headroom. Catalog includes models whose 4-bit weights fit the largest listed GPU (~288 GB). DeepSeek 671B / R1 / V3, Mistral Large 3 675B, Kimi K2, and GLM 744B are omitted. Qwen3 has no official 7B or 72B dense SKU. Muse Glimmer 30B is dense text plus a vision encoder: 29.6B total, 27.8B text stack on the decode roof. Qwen3.6 27B is hybrid DeltaNet + attention, not MoE. Gemma 4 27B is catalogued as 31B (Google's HF name vs param count). Unrecognized models skip roofline entirely. To add a model or GPU, open an issue or submit a PR to the catalog files in <code>src/context/</code>.</div>
+    <div class="callout">MoE models: <code>active_param_count</code> drives roofline ceilings; <code>param_count</code> (total) drives <code>weight_gb</code> and OOM headroom. Catalog includes models whose 4-bit weights fit the largest listed GPU (~288 GB). DeepSeek 671B / R1 / V3, Mistral Large 3 675B, Kimi K2, and GLM 744B are omitted. Qwen3 has no official 7B or 72B dense SKU. Muse Glimmer 30B is dense text plus a vision encoder: 29.6B total, 27.8B text stack on the decode roof. Qwen3.8 27B is hybrid DeltaNet + attention: 27.78B loaded (safetensors), 27B text stack on the decode roof. Qwen3.6 27B is the same hybrid class. The 2.4T Qwen3.8 Max is omitted. Gemma 4 27B is catalogued as 31B (Google's HF name vs param count). Unrecognized models skip roofline entirely. To add a model or GPU, open an issue or submit a PR to the catalog files in <code>src/context/</code>.</div>
   </article>
 
 <article id="page-math" class="page">
