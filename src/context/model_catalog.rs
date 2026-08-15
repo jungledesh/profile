@@ -393,14 +393,16 @@ static CATALOG: &[ModelEntry] = &[
         },
     },
     // Open 27B of Qwen3.8 (not the 2.4T Max). Same hybrid as 3.6: 3:1 DeltaNet /
-    // full attention, 16 KV layers. Multimodal (vision_config); catalog 27B matches
-    // the 3.6 sibling. HF safetensors total is 27.78B including the ViT.
-    // text_config: https://huggingface.co/Qwen/Qwen3.8-27B/raw/main/config.json
-    // (accessed 2026-08-15). Tokens before generic qwen3 so 27b cannot fall through.
+    // full attention, 16 KV layers. Multimodal (vision_config).
+    // param_count is the HF safetensors total (ViT included). active_param_count
+    // stays None until a published text-stack count exists for the decode roof.
+    // Source: https://huggingface.co/api/models/Qwen/Qwen3.8-27B (safetensors.total,
+    // accessed 2026-08-15) and text_config in
+    // https://huggingface.co/Qwen/Qwen3.8-27B/raw/main/config.json
     ModelEntry {
         tokens: &["qwen3.8", "27b"],
         entry: catalog_hybrid! {
-            param_count: 27 * B,
+            param_count: 27_781_427_952,
             active_param_count: None,
             num_layers: 64,
             hidden_dim: 5120,
@@ -1338,7 +1340,7 @@ mod tests {
     fn qwen38_27b_from_hf_config() {
         // Source: Qwen/Qwen3.8-27B text_config (2026-08-15). H100 demo serves BF16.
         let e = lookup_model("Qwen/Qwen3.8-27B").expect("no match");
-        assert_eq!(e.param_count, 27 * B);
+        assert_eq!(e.param_count, 27_781_427_952);
         assert!(e.active_param_count.is_none());
         assert_eq!(e.num_layers, 64);
         assert_eq!(e.hidden_dim, 5120);
@@ -1356,7 +1358,7 @@ mod tests {
         let fp8 = lookup_model("Qwen/Qwen3.8-27B-FP8").expect("fp8");
         assert_eq!(fp8.num_kv_layers, Some(16));
         let nvfp4 = lookup_model("Inferact/Qwen3.8-27B-NVFP4").expect("nvfp4");
-        assert_eq!(nvfp4.param_count, 27 * B);
+        assert_eq!(nvfp4.param_count, 27_781_427_952);
         let qwen38 = lookup_model("Qwen/Qwen3.8-27B").expect("3.8");
         let qwen36 = lookup_model("Qwen/Qwen3.6-27B").expect("3.6");
         assert_eq!(qwen38.num_kv_layers, qwen36.num_kv_layers);
