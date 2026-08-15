@@ -284,7 +284,7 @@ pub fn limiter_line(e: &LimiterEvidence) -> Option<String> {
             let running = e.mean_running?;
             let ridge = e.ridge_batch_size?;
             let mut line = format!(
-                "Capped by traffic: {:.0} requests running, hardware has room for ~{ridge:.0}. More concurrent requests raises throughput.",
+                "Capped by traffic: {:.0} requests running, no queue. Raise client concurrency in steps; compute ridge ~{ridge:.0}, but KV or admission can bind first.",
                 running.trunc()
             );
             if result.capacity_skipped {
@@ -879,6 +879,10 @@ mod tests {
         ))
         .expect("line");
         assert!(line.contains("Capped by traffic"));
+        assert!(line.contains("no queue"));
+        assert!(line.contains("compute ridge ~153"));
+        assert!(line.contains("KV or admission can bind first"));
+        assert!(!line.contains("hardware has room for"));
         assert!(!line.contains("--max-num-seqs"));
     }
 

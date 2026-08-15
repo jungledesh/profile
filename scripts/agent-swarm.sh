@@ -425,6 +425,7 @@ run_swarm() {
     command -v timeout >/dev/null 2>&1 || { echo "GNU timeout required" >&2; exit 1; }
     [[ -f "$TASKS_JSON" ]] || { echo "missing $TASKS_JSON" >&2; exit 1; }
     [[ -d "$CHECKOUTS_DIR" ]] || { echo "no checkouts; run: $0 setup" >&2; exit 1; }
+    write_grok_config
 
     mkdir -p "$AGENTS_DIR"
     : > "$SWARM_LOG"
