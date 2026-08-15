@@ -1,6 +1,10 @@
 # Architecture
 
-Structure of the `profile` binary: data flow, module boundaries, key types. How to change the code, and the merge gate (`fmt`, `clippy`, `audit`, `deny`, `test`, plus OSV, Semgrep, and Socket in CI), is in [CONTRIBUTING.md](CONTRIBUTING.md). What the tool does and why is in the [README](README.md).
+Structure of the `profile` binary: data flow, module boundaries, key types.
+
+How to change the code, and the merge gate (`fmt`, `clippy`, `audit`, `deny`, `test`, plus OSV, Semgrep, and Socket in CI): [CONTRIBUTING.md](CONTRIBUTING.md).
+
+What the tool does and why: [README](README.md).
 
 Single Rust binary. `profile diagnose` runs an interactive closed loop: collect, analyze, recommend, wait for the operator to apply the fix, re-collect, compute delta, repeat.
 
@@ -31,6 +35,23 @@ CLI flags
             wait → re-run_diagnose → delta → drift → loop
 ```
 
+## Source tree
+
+```text
+src/
+├── main.rs, lib.rs
+├── cli/            flags, preflight, GPU assignment
+├── collectors/     all I/O: vllm.rs (/metrics), gpu/ (NVML, amdgpu), config.rs, host_memory.rs
+├── context/        catalogs (GPU, model, prices); StaticContext, RuntimeWindow
+├── engine/
+│   ├── baseline/   roofline physics: math.rs, roofline.rs
+│   ├── rules/      r1..r7, eval.rs, format.rs, suppression (mod.rs)
+│   ├── limiter.rs  no-issue verdicts
+│   └── mod.rs      report assembly, post-DAG additions
+├── profiler/       windows, aggregate, loop_runner, delta, drift
+└── output/         stdout rendering
+```
+
 ## Module responsibilities
 
 | Module            | Owns                                                                    | Never touches          |
@@ -46,15 +67,22 @@ CLI flags
 
 ## Key types
 
-- `StaticContext` (`context/types.rs`): `model: ModelArch`, `gpu: GPUModel`, `config: VllmConfig`, `fp8_compiler_available`. Built once per `run_diagnose` from the catalogs; re-baselined on config drift.
-- `RuntimeWindow` (`context/types.rs`): wraps one per-window `RawSnapshot`. The snapshot carries its own timestamp.
-- `AnalysisInput<'a>` (`context/types.rs`): `{ ctx: &StaticContext, window: &RuntimeWindow }`. The engine's input; no copies in the hot loop.
-- `RawSnapshot` (`collectors/types.rs`): result of one collection window. Collectors sample at 250ms inside the window; `run_diagnose` keeps one `RawSnapshot` per window and aggregates them into the run-level reporting snapshot.
-- `PhysicsBaseline` (`engine/baseline/roofline.rs`): decode ceiling as `CeilingEstimate { lower, expected, upper }`; prefill ceiling in prompts/s (`Option`); efficiency and headroom percentages; weight footprint with dtype provenance; KV element width; optional `spec_suspected` / `spec_window_counts` when measured decode beats the one-token-per-read roof (policy guard: clears efficiency claims). Physics only, no causality. The struct's doc comments are canonical for the full field list.
-- `Recommendation` (`engine/rules/`): rule name, DAG layer (2-6), impact (1-5), confidence, pre-formatted display lines, `terminal` (no server-local knob left). Ranked by impact x confidence within the winning layer; the layer filter and suppression table enforce one signal per root cause. Soft field (`limiter::soft_field`) skips the R6→R1 ME row so Under-batching can win first fire; Prefill/Prefix stay in `suppressed_recs` for remeasure reveal. Bound path keeps that ME row and terminals.
-- `LimiterVerdict` (`engine/limiter.rs`): the no-issue path. When no rule fires, names the boundary capping a healthy server (capacity, traffic, physics, prefill interference, framework overhead) from run-level aggregates, or reports the ceiling unknown / waiting unread / speculation suspected rather than guessing a false Physics cap.
-- `Report` (`engine/mod.rs`): recommendations plus baseline and skip counts; produced by `engine::build_report_for_diagnose`, which wraps `rules::build_report_for_windows` and may append post-DAG recommendations; input to stdout formatting.
-- `window_is_evaluable` / `window_is_idle` (`collectors/types.rs`): shared gates. Evaluable means the window has a positive duration and the metrics endpoint answered. Idle means evaluable with no meaningful traffic. Rules skip idle windows; idle is valid telemetry, not a collection failure.
+| Type | Lives in | Job |
+| --- | --- | --- |
+| `StaticContext` | `context/types.rs` | Model, GPU, and vLLM config, resolved once per `run_diagnose` from the catalogs. Re-baselined on config drift. |
+| `RuntimeWindow` | `context/types.rs` | Wraps one per-window `RawSnapshot`; the snapshot carries its own timestamp. |
+| `AnalysisInput<'a>` | `context/types.rs` | `{ ctx: &StaticContext, window: &RuntimeWindow }`. The engine's input; no copies in the hot loop. |
+| `RawSnapshot` | `collectors/types.rs` | One collection window's result (250ms samples inside). One per window, plus a run-level aggregate (`DiagnoseResult.snapshot`). |
+| `PhysicsBaseline` | `engine/baseline/roofline.rs` | The physics: decode and prefill ceilings, efficiency and headroom, weight footprint with dtype provenance, spec-guard fields. No causality. |
+| `Recommendation` | `engine/rules/` | One fired rule: name, DAG layer (2-6), impact (1-5), confidence, display lines, `terminal` (no server-local knob left). |
+| `LimiterVerdict` | `engine/limiter.rs` | The no-issue path: names the boundary capping a healthy server, or declines (ceiling unknown, waiting unread, speculation suspected) rather than guess. |
+| `Report` | `engine/mod.rs` | Recommendations plus baseline and skip counts. Built by `build_report_for_diagnose`, which wraps `rules::build_report_for_windows` and may append post-DAG recommendations. Input to stdout. |
+| `window_is_evaluable`, `window_is_idle` | `collectors/types.rs` | Shared gates. Evaluable: positive duration and the endpoint answered. Idle: evaluable with no meaningful traffic. Rules skip idle windows; idle is valid telemetry, not a failure. |
+
+Semantics that bite:
+
+- `PhysicsBaseline` is physics only; its struct doc comments are canonical for the full field list. `spec_suspected` / `spec_window_counts` clear efficiency claims when measured decode beats the one-token-per-read roof.
+- `Recommendation` ranking: impact x confidence within the winning DAG layer; the layer filter and suppression table enforce one signal per root cause. Soft field (`limiter::soft_field`) skips the R6→R1 ME row so Under-batching can win first fire; Prefill/Prefix stay in `suppressed_recs` for the remeasure reveal. The bound path keeps that ME row and its terminals.
 
 ## Where things go
 

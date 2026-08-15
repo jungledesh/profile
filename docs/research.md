@@ -14,9 +14,14 @@ The research came last. We found it after the design had settled, and it agreed 
 
 ---
 
-## The argument in one paragraph
+## The argument, in short
 
-Profile is not heuristics. Each part is the field's validated answer to a question it has already studied, and each answer has a known weakness Profile is built to survive. The ceiling is a roofline model, the standard for LLM inference analysis; its weakness is that raw spec sheets overestimate, so every ceiling is marked `(est)` and calibration is on the roadmap. The rule engine uses mutual exclusivity under a priority DAG, the structure Intel's Top-down analysis has shipped in `perf` and VTune for a decade; its weakness is non-causal misattribution, and the loop is the remedy: your applied fix is the perturbation, the re-measure is the check. Rules beat learned models here because a single vLLM server is the bounded case where rules hold up, and you can read why one fired. Autotuners and simulators answer adjacent questions, at the price of restarts, synthetic load, or lagging real serving features; Profile reads the live server you already run.
+Profile is not heuristics. Each part is the field's validated answer to a question it has already studied, and each answer has a known weakness Profile is built to survive.
+
+- **The ceiling** is a roofline model, the standard for LLM inference analysis. Its weakness: raw spec sheets overestimate. So every ceiling is marked `(est)`, and calibration is on the roadmap.
+- **The rule engine** uses mutual exclusivity under a priority DAG, the structure Intel's Top-down analysis has shipped in `perf` and VTune for a decade. Its weakness: non-causal misattribution. The loop is the remedy: your applied fix is the perturbation, the re-measure is the check.
+- **Rules beat learned models** here because a single vLLM server is the bounded case where rules hold up, and you can read why one fired.
+- **Autotuners and simulators** answer adjacent questions, at the price of restarts, synthetic load, or lagging real serving features. Profile reads the live server you already run.
 
 ---
 

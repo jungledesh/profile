@@ -13,16 +13,18 @@ Every flag, every line of output, the loop step by step. Back to the [README](..
 
 ## CLI flags
 
-These configure Profile, not vLLM.
+These configure Profile, not vLLM. Each flag also has an env var (`PROFILE_URL`, `PROFILE_DURATION`, `PROFILE_MAX_NUM_SEQS`, `PROFILE_TENSOR_PARALLEL_SIZE`, `PROFILE_COST_PER_HOUR`, `PROFILE_VERBOSE`).
 
-| Flag                     | Default                         | Description                                                                         |
-| ------------------------ | ------------------------------- | ----------------------------------------------------------------------------------- |
-| `-u, --url`              | `http://localhost:8000/metrics` | vLLM metrics endpoint                                                               |
-| `--duration`             | `30s`                           | Sampling window. Minimum `30s`, maximum `30m`. Units are `s` or `m`.                |
-| `-m, --max-num-seqs`     | Prompted if absent              | Pass to skip the prompt. Read from `/metrics` when available.                       |
-| `--tensor-parallel-size` | Unset                           | Must be 1 today. Values above 1 are refused until multi-GPU ships                   |
-| `--cost-per-hour`        | Catalog estimate                | GPU cost in USD/hr                                                                  |
-| `-v`                     | Off                             | Show rules that did not fire, physics limits, and expanded GPU/latency/CACHE detail |
+| Flag                     | Default                         | Description                                                                                          |
+| ------------------------ | ------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `-u, --url`              | `http://localhost:8000/metrics` | vLLM metrics endpoint                                                                                |
+| `--duration`             | `30s`                           | Collection window per iteration. Minimum `30s`, maximum `30m`. Units `s` or `m` only, not `ms`/`mins`. |
+| `-m, --max-num-seqs`     | Prompted if unread              | Skip the prompt. Preflight reads `/metrics` when the gauge is present; otherwise you are asked.      |
+| `--tensor-parallel-size` | Unset                           | Must be 1. Values above 1 are refused. Pass `1` to skip the GPU-assignment prompt.                   |
+| `--cost-per-hour`        | Catalog estimate                | GPU cost in USD/hr. Must be a positive number.                                                       |
+| `-v, --verbose`          | Off                             | Rules that did not fire, physics limits, and extra GPU, latency, cache, and config detail            |
+
+`profile help`, `profile completions <SHELL>`, and `profile man` exist. They are not diagnose flags.
 
 ## What you get
 
@@ -123,7 +125,7 @@ A tool that only reports improvements cannot be trusted when it reports one.
 
 ## Four things the loop will not do to you
 
-- **Repeat itself.** When the same primary fires again, Profile lists the rules it was holding behind it. Re-fire alone is enough; there is no flat-delta gate, whether or not you applied a fix in between.
+- **Repeat itself.** If the same primary fires again after a re-measure, Profile reveals the alternative causes it was holding back. It does not wait for proof that your fix changed nothing; the repeat itself is the signal.
 - **Dead-end you.** When no config lever remains, Profile names the wall, points at scale-out, and surfaces the suppressed alternatives under that block instead of inventing another flag.
 - **Tell you to do what you already did.** Where Profile can read your running config, it skips levers you already set (prefix caching on, fp8 KV already active, chunked prefill on, `--max-num-batched-tokens` already at or above the suggestion, seats already at the target). Exception: `--kv-offloading-size` is re-derived on each R2 fire; if the new size differs from what is set, the flag is offered again.
 - **Ping-pong you.** When KV pressure and concurrency saturation alternate on `--max-num-seqs`, Profile detects the cycle, names the bracket it has tried, and suggests the midpoint. It offers this at most three times, then names the wall instead of guessing again.
