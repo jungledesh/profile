@@ -93,7 +93,6 @@ tmux new-session -d -s "$TMUX_SESSION" \
   --served-model-name $SERVED_NAME \
   --host 0.0.0.0 \
   --port 8000 \
-  --max-model-len 32768 \
   --trust-remote-code \
   $TOOL_ARGS \
   $EXTRA_ARGS \

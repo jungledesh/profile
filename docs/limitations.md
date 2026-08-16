@@ -8,6 +8,7 @@ Every boundary, and why it exists. Back to the [README](../README.md).
 - **The overhead-bound regime is named, not measured.** Profile can say the GPU is idling on CPU work but cannot quantify it.
 - **Unknown GPU or model gets no ceiling.** Profile reports `Hardware ceiling unknown` with the reason, rather than guessing. Missing yours? [Open an issue](https://github.com/jungledesh/profile/issues) with the name; a catalog entry is a quick add.
 - **No load, no answer.** Idle windows are skipped. There is nothing to diagnose on a server at rest. No production traffic yet? Drive load with `vllm bench serve`.
+- **The mean is one window.** Cyclic load can look like a state it is not. Raise `--duration` so several cycles fit, up to `30m`. Load that changes between iterations is not a duration problem. Shapes: [workflow.md](workflow.md#duration-and-traffic-shape).
 - **You apply the fix.** Profile never changes your server.
 
 Where the math is approximate, in detail: [website limitations page](https://jungledesh.github.io/profile/docs.html#limitations).

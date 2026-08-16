@@ -1,8 +1,17 @@
 # Workflow
 
-Every flag, every line of output, the loop step by step. Back to the [README](../README.md).
+How to run a session, then every flag and output line. Back to the [README](../README.md).
 
 ---
+
+## Get started
+
+1. vLLM on one GPU, `/metrics` reachable, live traffic on the box.
+2. Install from the [README](../README.md#get-started), or build with `cargo install --git https://github.com/jungledesh/profile`.
+3. `profile diagnose --url http://localhost:8000/metrics --duration 2m`
+4. Apply the Fix. Press Enter. Read the delta. Repeat until the loop names a wall or goes quiet.
+
+Idle server: drive load with `vllm bench serve`. Match `--duration` to the cycle (table below).
 
 ## Requirements, in full
 
@@ -18,13 +27,22 @@ These configure Profile, not vLLM. Each flag also has an env var (`PROFILE_URL`,
 | Flag                     | Default                         | Description                                                                                          |
 | ------------------------ | ------------------------------- | ---------------------------------------------------------------------------------------------------- |
 | `-u, --url`              | `http://localhost:8000/metrics` | vLLM metrics endpoint                                                                                |
-| `--duration`             | `30s`                           | Collection window per iteration. Minimum `30s`, maximum `30m`. Units `s` or `m` only, not `ms`/`mins`. |
+| `--duration`             | `30s`                           | Collection window per iteration. Minimum `30s`, maximum `30m`. Units `s` or `m` only, not `ms`/`mins`. Match to traffic shape (below). |
 | `-m, --max-num-seqs`     | Prompted if unread              | Skip the prompt. Preflight reads `/metrics` when the gauge is present; otherwise you are asked.      |
 | `--tensor-parallel-size` | Unset                           | Must be 1. Values above 1 are refused. Pass `1` to skip the GPU-assignment prompt.                   |
 | `--cost-per-hour`        | Catalog estimate                | GPU cost in USD/hr. Must be a positive number.                                                       |
 | `-v, --verbose`          | Off                             | Rules that did not fire, physics limits, and extra GPU, latency, cache, and config detail            |
 
 `profile help`, `profile completions <SHELL>`, and `profile man` exist. They are not diagnose flags.
+
+**Duration and traffic shape.** Match `--duration` to the cycle. Default for steady load. Raise it when traffic repeats inside the window. Do not raise it when load changes between iterations.
+
+| Shape | What it looks like | `--duration` |
+| ----- | ------------------ | ------------ |
+| Steady | Load holds still | Default `30s` is enough |
+| Fast bounce | Wobble shorter than a slice (2s at `30s`, 10s above) | Already averaged. Leave it |
+| Cycle near the window | Agents start, time out, and restart together | Raise so several cycles fit, up to `30m`. A ~10 min cycle needs about `30m` |
+| Step between iterations | Flat during a run, different on the next | Not a duration problem |
 
 ## What you get
 
