@@ -6,7 +6,7 @@
 
 *Less words. Less noise. More signal. More value.*
 
-[Install](#install) · [What is Profile](#what-is-profile) · [The engine](#the-engine) · [Proof](#proof) · [Docs](#documentation) · [Website](https://jungledesh.github.io/profile/index.html)
+[Get started](#get-started) · [What is Profile](#what-is-profile) · [The engine](#the-engine) · [Proof](#proof) · [Docs](#documentation) · [Website](https://jungledesh.github.io/profile/index.html)
 
 </div>
 
@@ -22,7 +22,7 @@ One A100. Same model, same hardware, different flags.
 ```
 
 - Profile named each bottleneck, gave the flag, measured the delta after every change.
-- Regressions included. [More recorded runs below.](#proof)
+- A few iterations, not days of guessing. Regressions included. [More recorded runs below.](#proof)
 
 ```text
 ✓ Single binary      ✓ No agent to deploy
@@ -33,11 +33,13 @@ One A100. Same model, same hardware, different flags.
 
 ## What is Profile
 
-A new kind of tool. Not monitoring, not autotuning: a **diagnostic loop**. Profile turns opaque inference into deterministic engineering.
+A **diagnostic loop**. Profile turns opaque inference into deterministic engineering. Reproducible: same server, same traffic, same verdict.
+
+The value is time. You close the gap in a few measured iterations instead of guessing for days.
 
 ```text
-dashboards:  metrics ---------------------------> you -> guess
-profile:     metrics -> physics ceiling -> cause -> fix -> re-measure
+guessing:   metrics ---------------------------> you -> try a flag -> wait
+profile:    metrics -> physics ceiling -> cause -> fix -> re-measure
 ```
 
 - **The question it answers:** what is this setup capable of, what is it delivering, and which flag closes the gap?
@@ -52,33 +54,41 @@ profile:     metrics -> physics ceiling -> cause -> fix -> re-measure
 ✗ Not a simulator      reads the server you actually run
 ```
 
-Nobody else does this job. [The comparison.](docs/positioning.md)
+Stack comparison: [docs/positioning.md](docs/positioning.md).
 
 ---
 
-## Install
+## Get started
+
+vLLM on one GPU, `/metrics` reachable, live traffic. Then:
+
+1. Install.
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/jungledesh/profile/releases/latest/download/profile-installer.sh | sh
 ```
 
+2. Diagnose. Default window is `30s`. Use `2m` on steady load; raise it if traffic cycles inside the window ([shapes](docs/workflow.md#duration-and-traffic-shape)).
+
 ```bash
 profile diagnose --url http://localhost:8000/metrics --duration 2m
 ```
 
-That is the whole setup. No calibration run, no restart of your server.
+3. Apply the Fix. Press Enter. Read the delta. Repeat until the loop names a wall or goes quiet.
 
-- **Needs:** one GPU (NVIDIA via NVML, or AMD via amdgpu), vLLM with `/metrics` reachable, live traffic.
-- **Idle server?** No waste to find; Profile says so instead of inventing a number. Drive load with `vllm bench serve`.
-- **No curl-pipe?** Download the binary from the [releases page](https://github.com/jungledesh/profile/releases/latest), or build from source: `cargo install --git https://github.com/jungledesh/profile`.
-- **Scope:** single GPU at launch; TP > 1 refused ([roadmap](docs/roadmap.md)). Flags: [docs/workflow.md](docs/workflow.md).
+No calibration run. Profile never restarts your server.
+
+- **Idle server?** No waste to find; Profile says so. Drive load with `vllm bench serve`.
+- **No curl-pipe?** Binary from the [releases page](https://github.com/jungledesh/profile/releases/latest), or `cargo install --git https://github.com/jungledesh/profile`.
+- **NVIDIA or AMD.** Single GPU; TP > 1 refused ([roadmap](docs/roadmap.md)).
+- **Every flag and output line:** [docs/workflow.md](docs/workflow.md).
 
 ---
 
 ## The engine
 
-Profile's engine. Deterministic. Precise.
+Profile's engine. Deterministic engineering. Reproducible.
 
 <p align="center">
   <img src="docs/assets/rule-engine.svg" width="880" alt="Profile's rule engine: eight rules on DAG priority layers. Mutual exclusivity removes explained symptoms; highest surviving layer wins; one primary shown, losers held.">
@@ -155,9 +165,9 @@ H100   before  |███████████ 163
 
 We did the hard part: a deterministic core engine. These pages show the work.
 
-- **[Workflow](docs/workflow.md)**
-  Every CLI flag, every line of output decoded, the loop step by step.
-  Read this and you can run a full optimization session in one sitting.
+- **[Get started](docs/workflow.md#get-started)**
+  Install, diagnose, apply the fix, read the delta. Then every flag and output line.
+  Run a full session from this page.
 
 - **[Engine](docs/engine.md)**
   The ceiling math from first principles, all eight rules with their exact thresholds, suppression and ranking.

@@ -20,7 +20,7 @@ Kernels and runtime  CUDA, ROCm, custom kernels          executes the math
 Silicon              NVIDIA, AMD, Cerebras, Groq         sets the ceiling
 ```
 
-Every layer above and below optimises something. None measures whether the result is any good on your machine.
+Every layer above and below optimises something. None measures whether the result is any good on your machine. Profile does that in a few iterations, so you are not guessing for days.
 
 Profile plugs into this stack; it replaces nothing. It reads what your server already emits, and export into the observability tools you already run is on the [roadmap](roadmap.md).
 
@@ -50,5 +50,5 @@ Profile plugs into this stack; it replaces nothing. It reads what your server al
 
 ## Who it is for
 
-- **For:** everyone running vLLM. Tuned or not, Profile tells you what your hardware can still give: a lower cost per token, and a server at its full capability.
+- **For:** everyone running vLLM. Tuned or not, Profile tells you what your hardware can still give, in a few measured iterations instead of days of guessing.
 - **Not yet:** multi-GPU sharding, and engines beyond vLLM. Both on the [roadmap](roadmap.md). Every boundary, with its reason: [limitations](limitations.md).
