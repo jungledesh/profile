@@ -64,16 +64,16 @@ vLLM on one GPU, `/metrics` reachable, live traffic. Then:
 
 1. Install.
 
-```bash
-curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/jungledesh/profile/releases/latest/download/profile-installer.sh | sh
-```
+    ```bash
+    curl --proto '=https' --tlsv1.2 -LsSf \
+      https://github.com/jungledesh/profile/releases/latest/download/profile-installer.sh | sh
+    ```
 
-2. Diagnose. Default window is `30s`. Use `2m` on steady load; raise it if traffic cycles inside the window ([shapes](docs/workflow.md#duration-and-traffic-shape)).
+2. Diagnose. Default window is `30s`. Raise it when traffic repeats inside the window ([shapes](docs/workflow.md#duration-and-traffic-shape)).
 
-```bash
-profile diagnose --url http://localhost:8000/metrics --duration 2m
-```
+    ```bash
+    profile diagnose --url http://localhost:8000/metrics --duration 30s
+    ```
 
 3. Apply the Fix. Press Enter. Read the delta. Repeat until the loop names a wall or goes quiet.
 

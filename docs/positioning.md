@@ -50,5 +50,5 @@ Profile plugs into this stack; it replaces nothing. It reads what your server al
 
 ## Who it is for
 
-- **For:** everyone running vLLM. Tuned or not, Profile tells you what your hardware can still give, in a few measured iterations instead of days of guessing.
+- **For:** everyone running vLLM on one GPU. Tuned or not, Profile tells you what your hardware can still give, in a few measured iterations instead of days of guessing.
 - **Not yet:** multi-GPU sharding, and engines beyond vLLM. Both on the [roadmap](roadmap.md). Every boundary, with its reason: [limitations](limitations.md).
