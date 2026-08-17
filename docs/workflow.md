@@ -115,13 +115,23 @@ Measuring delta...
 
   Config changed. Baseline reset.
 
-  Throughput          174 → 401 tok/s
-  TTFT                44157 → 239ms (p95 77146 → 604ms)
-  TPOT                53.7 → 24.9ms (p95 87.0 → 46.3ms)
+  Throughput          131 → 421 tok/s
+  TTFT                32857 → 224ms (p95 66946 → 500ms)
+  TPOT                58.0ms → 23.0ms (p95 58.0 → 40.0ms)
 
 ECONOMICS:
-  J/tok               3.01 → 1.02
-  Cost/1M output tok  $1.58 → $0.69 (est)
+  J/tok               4.05 → 1.08
+  Cost/1M output tok  $2.10 → $0.65 (est)
+```
+
+```text
+|PROFILE v2.2.1 [muse-glimmer-30b] [NVIDIA GeForce RTX 5090] (5m from 2026-08-14 10:45:47 UTC)              |
+|GPU =>               decode_eff ~11.2% | $0.65/1M output tok (est) | vRAM 30/32GB                          |
+|REQUESTS             run 10 (84.1%) | wait 0 | max 12                                                      |
+|LATENCY              ttft 224ms (p95 500ms) | tpot 23ms (p95 40ms)                                         |
+|THROUGHPUT           421 tok/s                                                                             |
+|No issues detected.                                                                                        |
+|Capped by vLLM overhead: batch healthy, memory free. GPU waits on CPU work between steps.                  |
 ```
 
 **Iterate.** Fixing one bottleneck usually exposes the next. The path is not always upward, and Profile does not pretend otherwise. Regressions are labelled, not buried:

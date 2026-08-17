@@ -236,13 +236,13 @@ Measuring delta...
 
   Config changed. Baseline reset.
 
-  Throughput          174 → 401 tok/s
-  TTFT                44157 → 239ms (p95 77146 → 604ms)
-  TPOT                53.7 → 24.9ms (p95 87.0 → 46.3ms)
+  Throughput          131 → 421 tok/s
+  TTFT                32857 → 224ms (p95 66946 → 500ms)
+  TPOT                58.0ms → 23.0ms (p95 58.0 → 40.0ms)
 
 ECONOMICS:
-  J/tok               3.01 → 1.02
-  Cost/1M output tok  $1.58 → $0.69 (est)</code></pre>
+  J/tok               4.05 → 1.08
+  Cost/1M output tok  $2.10 → $0.65 (est)</code></pre>
 
     <p>Regressions are labelled, not buried:</p>
     <pre><code>  Throughput          183 → 131 tok/s  worse
@@ -815,12 +815,12 @@ prefill_floor_ms = 1000 / prefill_ceiling_tps</code></pre>
     <p>Computed after every re-measure cycle. Each metric line shows <code>before &rarr; after</code>. A <code>worse</code> suffix marks material regressions only (not every negative delta).</p>
     <pre><code>  Config changed. Baseline reset.
 
-  Throughput          174 &rarr; 401 tok/s
-  TTFT                44157 &rarr; 239ms (p95 77146 &rarr; 604ms)
-  TPOT                53.7 &rarr; 24.9ms (p95 87.0 &rarr; 46.3ms)
+  Throughput          131 &rarr; 421 tok/s
+  TTFT                32857 &rarr; 224ms (p95 66946 &rarr; 500ms)
+  TPOT                58.0ms &rarr; 23.0ms (p95 58.0 &rarr; 40.0ms)
 
 ECONOMICS:
-  Cost/1M output tok  $1.58 &rarr; $0.69 (est)</code></pre>
+  Cost/1M output tok  $2.10 &rarr; $0.65 (est)</code></pre>
     <p>When config drifted between windows (vLLM restart detected), the line reads <code>Config changed. Baseline reset.</code> and the efficiency arm of the delta is discounted; throughput alone decides improvement direction after a reset.</p>
     <p>On regression: the degraded state becomes the new baseline and is pushed to the history stack. The loop continues through the normal apply/remeasure wait; there is no extra confirmation step beyond that.</p>
     <table>

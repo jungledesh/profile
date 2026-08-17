@@ -135,9 +135,16 @@ Measuring delta...
 
   Config changed. Baseline reset.
 
-  Throughput          174 → 401 tok/s
-  TTFT                44157 → 239ms (p95 77146 → 604ms)
-  Cost/1M output tok  $1.58 → $0.69 (est)
+  Throughput          131 → 421 tok/s
+  TTFT                32857 → 224ms (p95 66946 → 500ms)
+  Cost/1M output tok  $2.10 → $0.65 (est)
+```
+
+```text
+|PROFILE v2.2.1 [muse-glimmer-30b] [NVIDIA GeForce RTX 5090]           |
+|GPU =>    decode_eff ~11.2% | $0.65/1M output tok (est) | vRAM 30/32GB|
+|THROUGHPUT 421 tok/s                                                  |
+|No issues detected. Capped by vLLM overhead.                          |
 ```
 
 - A dash means Profile could not read it.

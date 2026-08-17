@@ -270,13 +270,13 @@ ISSUES:
         change: "--max-model-len 25000, --max-num-seqs 12, --gpu-memory-utilization 0.98, --kv-cache-dtype fp8. Agents 24 → 10.",
         delta: `  Config changed. Baseline reset.
 
-  Throughput          174 → 401 tok/s
-  TTFT                44157 → 239ms (p95 77146 → 604ms)
-  TPOT                53.7 → 24.9ms (p95 87.0 → 46.3ms)
+  Throughput          131 → 421 tok/s
+  TTFT                32857 → 224ms (p95 66946 → 500ms)
+  TPOT                58.0ms → 23.0ms (p95 58.0 → 40.0ms)
 
 ECONOMICS:
-  J/tok               3.01 → 1.02
-  Cost/1M output tok  $1.58 → $0.69 <span class="dim">(est)</span>`,
+  J/tok               4.05 → 1.08
+  Cost/1M output tok  $2.10 → $0.65 <span class="dim">(est)</span>`,
         block: `<span class="dim">PROFILE v2.2.1 [muse-glimmer-30b] [NVIDIA GeForce RTX 5090]</span>  5m from 2026-08-14 10:45:47 UTC
 
 GPU        decode_eff ~11.2% | power 455W | 1.08 J/tok | $0.65/1M output tok <span class="dim">(est)</span> | vRAM 30/32GB
@@ -419,11 +419,13 @@ function render() {
   ).join("");
   track.innerHTML = data.steps.map((s, i) => {
     const delta = s.delta ? `<div class="delta"><div class="term-bar">Measuring delta...</div><pre>${s.delta}</pre></div>` : "";
+    const note = s.note ? `<p class="change">${s.note}</p>` : "";
     return `<article class="slide">
       <div class="slide-k">ITERATION ${pad(i + 1)} / ${pad(n)}</div>
       <h2>${s.title}</h2>
       <p class="change">${s.change}</p>
       ${delta}
+      ${note}
       <div class="term-bar">profile diagnose --duration 5m</div>
       <pre>${s.block}</pre>
     </article>`;
