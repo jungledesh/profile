@@ -8,7 +8,7 @@ How to run a session, then every flag and output line. Back to the [README](../R
 
 1. vLLM on one GPU, `/metrics` reachable, live traffic on the box.
 2. Install from the [README](../README.md#get-started), or build with `cargo install --git https://github.com/jungledesh/profile`.
-3. `profile diagnose --url http://localhost:8000/metrics --duration 2m`
+3. `profile diagnose --url http://localhost:8000/metrics --duration 30s`
 4. Apply the Fix. Press Enter. Read the delta. Repeat until the loop names a wall or goes quiet.
 
 Idle server: drive load with `vllm bench serve`. Match `--duration` to the cycle (table below).
@@ -57,7 +57,7 @@ Expected/Confidence  what should happen next, and how sure Profile is
 
 ```text
 +----------------------------------------------------------------------------------------------------------------------------+
-|PROFILE v2.1.4 [Qwen3.6-27B] [NVIDIA H100 80GB HBM3] (2m from 2026-07-31 07:13:29 UTC)                                      |
+|PROFILE v2.2.2 [Qwen3.6-27B] [NVIDIA H100 80GB HBM3] (2m from 2026-07-31 07:13:29 UTC)                                      |
 |                                                                                                                            |
 |GPU =>               decode_eff ~0.9% | power 653W | 3.57 J/tok | $5.09/1M output tok (est) | vRAM 74/80GB (peak 75GB)      |
 |                     mem_util 56%                                                                                           |
@@ -141,15 +141,16 @@ ECONOMICS:
 
 A tool that only reports improvements cannot be trusted when it reports one.
 
-## Four things the loop will not do to you
+## What the loop will not do to you
 
 - **Repeat itself.** If the same primary fires again after a re-measure, Profile reveals the alternative causes it was holding back. It does not wait for proof that your fix changed nothing; the repeat itself is the signal.
-- **Dead-end you.** When no config lever remains, Profile names the wall, points at scale-out, and surfaces the suppressed alternatives under that block instead of inventing another flag.
+- **Dead-end you.** When no config lever remains (empty Fix, or a terminal wall such as replica / FLOPs), Profile names the wall, points at scale-out, and surfaces the suppressed alternatives under that block on first fire instead of inventing another flag.
 - **Tell you to do what you already did.** Where Profile can read your running config, it skips levers you already set (prefix caching on, fp8 KV already active, chunked prefill on, `--max-num-batched-tokens` already at or above the suggestion, seats already at the target). Exception: `--kv-offloading-size` is re-derived on each R2 fire; if the new size differs from what is set, the flag is offered again.
 - **Ping-pong you.** When KV pressure and concurrency saturation alternate on `--max-num-seqs`, Profile detects the cycle, names the bracket it has tried, and suggests the midpoint. It offers this at most three times, then names the wall instead of guessing again.
+- **Spin on unread Prefill.** When Prefill is primary twice in a row and both Fix blocks include the unread `--max-num-batched-tokens` guide (common when vLLM never emits the gauge), the second table still prints, then the loop exits: no new server lever to apply. First unread show stays open (Confirm + guide).
 
 **Scale out.** Eventually no flag helps. Profile says the scheduler is at its cap with the pool full, that no config change helps, and that the next move is a replica. That is the answer, not a failure.
 
 ---
 
-Deep reference on the website: [Workflow](https://jungledesh.github.io/profile/docs.html#home) · [Data (metric sources)](https://jungledesh.github.io/profile/docs.html#data)
+Deep reference on the website: [Get started](https://jungledesh.github.io/profile/docs.html#home) · [Data (metric sources)](https://jungledesh.github.io/profile/docs.html#data)
