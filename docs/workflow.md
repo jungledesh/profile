@@ -56,44 +56,40 @@ Expected/Confidence  what should happen next, and how sure Profile is
 ```
 
 ```text
-+----------------------------------------------------------------------------------------------------------------------------+
-|PROFILE v2.2.2 [Qwen3.6-27B] [NVIDIA H100 80GB HBM3] (2m from 2026-07-31 07:13:29 UTC)                                      |
-|                                                                                                                            |
-|GPU =>               decode_eff ~0.9% | power 653W | 3.57 J/tok | $5.09/1M output tok (est) | vRAM 74/80GB (peak 75GB)      |
-|                     mem_util 56%                                                                                           |
-|                                                                                                                            |
-|vLLM =>                                                                                                                     |
-|REQUESTS             run 14 (4.0%) | wait 4 | max 345                                                                       |
-|LATENCY              ttft 8.7s (p95 19.2s) | tpot 97ms (p95 159ms)                                                          |
-|CACHE                kv_cache 93.1% avg (100.0% peak) | pfix_cache -                                                        |
-|THROUGHPUT           163 tok/s                                                                                              |
-|TRAFFIC              qps 0.5 | req_total 112 | gen_total 32368 | preempt/s 0.01 | preempt_total 2                           |
-|                                                                                                                            |
-|ISSUES:                                                                                                                     |
-|                                                                                                                            |
-|[!] KV Cache Pressure                                                                                                       |
-|    Seen in 92% of windows                                                                                                  |
-|    Cause:                                                                                                                  |
-|      KV cache 94% avg in fired windows, 100% peak (threshold: 88%).                                                        |
-|      4 requests queued on KV admission.                                                                                    |
-|                                                                                                                            |
-|    Fix:                                                                                                                    |
-|    Cuts throughput:                                                                                                        |
-|      • Lower --max-model-len (current: 262144). Observed avg 13.9k tokens per request, prompt + generation.                |
-|        Some requests are longer than avg; add buffer to it. Requests over the limit are rejected with a 400, not truncated.|
-|                                                                                                                            |
-|      • Lower --max-num-seqs to reduce KV demand                                                                            |
-|                                                                                                                            |
-|    Safe to apply:                                                                                                          |
-|      • Enable --enable-prefix-caching to share KV blocks across identical prompt prefixes                                  |
-|      • Raise --gpu-memory-utilization (check vRAM header for avail mem) to expand KV pool                                  |
-|      • Switch --kv-cache-dtype fp8 to halve KV memory footprint (affects output quality)                                   |
-|      • Set --kv-offloading-size 4 (est) to hold evicted KV in host memory instead of recomputing it                        |
-|        Host RAM available: 1953 GiB, container limit 234 GiB.                                                              |
-|                                                                                                                            |
-|    Expected: Wait queue drains, TTFT recovers once KV pool has capacity.                                                   |
-|    Confidence: High                                                                                                        |
-+----------------------------------------------------------------------------------------------------------------------------+
++----------------------------------------------------------------------------------------------------------------------+
+|PROFILE v2.2.1 [muse-glimmer-30b] [NVIDIA GeForce RTX 5090] (5m from 2026-08-14 10:30:26 UTC)                         |
+|                                                                                                                      |
+|GPU =>               decode_eff ~3.5% | power 531W | 4.05 J/tok | $2.10/1M output tok (est) | vRAM 29/32GB            |
+|                     mem_util 37%                                                                                     |
+|                                                                                                                      |
+|vLLM =>                                                                                                               |
+|REQUESTS             run 9 (27.4%) | wait 15 | max 32                                                                 |
+|LATENCY              ttft 32.8s (p95 66.9s) | tpot 58ms (p95 89ms)                                                    |
+|CACHE                kv_cache 88.6% avg (99.9% peak) | pfix_cache 22.7%                                               |
+|THROUGHPUT           131 tok/s                                                                                        |
+|TRAFFIC              qps 0.5 | req_total 642 | gen_total 175857 | preempt/s 0.16 | preempt_total 59                   |
+|                                                                                                                      |
+|ISSUES:                                                                                                               |
+|                                                                                                                      |
+|[!] KV Cache Pressure                                                                                                 |
+|    Seen in 100% of windows                                                                                           |
+|    Cause:                                                                                                            |
+|      KV cache 89% avg in fired windows, 100% peak (threshold: 88%).                                                  |
+|      Scheduler evicting; 15 requests queued on KV admission.                                                        |
+|                                                                                                                      |
+|    Fix:                                                                                                              |
+|      • Raise --gpu-memory-utilization (check vRAM header for avail mem) to expand KV pool.                           |
+|      • Switch --kv-cache-dtype fp8 to halve KV memory footprint (affects output quality).                            |
+|      • Lower --max-num-seqs to reduce KV demand.                                                                     |
+|        Cuts throughput. Revert after pressure clears.                                                                |
+|      • Reduce client concurrency toward sustained running (9 in-flight).                                            |
+|        Cuts queue wait, not throughput. Demand exceeds admitted capacity.                                            |
+|      • Lower --max-model-len 32768 → 21933. Observed p99 21.9k tokens per request.                                   |
+|        ~1% of observed requests ran longer; those are rejected with a 400, not truncated.                            |
+|                                                                                                                      |
+|    Expected: TTFT and TPOT recover once evictions stop.                                                              |
+|    Confidence: High                                                                                                  |
++----------------------------------------------------------------------------------------------------------------------+
 ```
 
 Every value is measured or marked. A dash means Profile could not read it. An `(est)` means the number came from the physics model, not the server. A tilde marks a value derived from an estimated ceiling. Gaps are never filled with guesses.
@@ -113,30 +109,32 @@ Press Enter when done.
 ```text
 Connection restored. Resuming in 5s...
 
-New --max-num-seqs [current: 345]: 170
+New --max-num-seqs [current: 32]: 12
 
 Measuring delta...
 
-  Config changed.
+  Config changed. Baseline reset.
 
-  Throughput          163 → 328 tok/s
-  TTFT                8720 → 495ms (p95 19185 → 950ms)
-  TPOT                96.9 → 50.9ms (p95 158.7 → 73.0ms)
+  Throughput          174 → 401 tok/s
+  TTFT                44157 → 239ms (p95 77146 → 604ms)
+  TPOT                53.7 → 24.9ms (p95 87.0 → 46.3ms)
 
 ECONOMICS:
-  Cost/1M output tok  $5.09 → $2.53 (est)
+  J/tok               3.01 → 1.02
+  Cost/1M output tok  $1.58 → $0.69 (est)
 ```
 
 **Iterate.** Fixing one bottleneck usually exposes the next. The path is not always upward, and Profile does not pretend otherwise. Regressions are labelled, not buried:
 
 ```text
-  Throughput          610 → 545 tok/s  worse
-  TTFT                1024 → 6067ms (p95 2407 → 16687ms)  worse
-  TPOT                118.4 → 147.0ms (p95 147.7 → 195.9ms)  worse
-  Decode eff.         -0.4pp
+  Throughput          183 → 131 tok/s  worse
+  TTFT                430 → 32797ms (p95 2108 → 66870ms)  worse
+  TPOT                28.1 → 58.5ms (p95 49.5 → 89.4ms)  worse
+  Decode eff.         -1.4pp
 
 ECONOMICS:
-  Cost/1M output tok  $1.36 → $1.52 (est)  worse
+  J/tok               2.35 → 4.05  worse
+  Cost/1M output tok  $1.50 → $2.10 (est)  worse
 ```
 
 A tool that only reports improvements cannot be trusted when it reports one.
@@ -149,7 +147,7 @@ A tool that only reports improvements cannot be trusted when it reports one.
 - **Ping-pong you.** When KV pressure and concurrency saturation alternate on `--max-num-seqs`, Profile detects the cycle, names the bracket it has tried, and suggests the midpoint. It offers this at most three times, then names the wall instead of guessing again.
 - **Spin on unread Prefill.** When Prefill is primary twice in a row and both Fix blocks include the unread `--max-num-batched-tokens` guide (common when vLLM never emits the gauge), the second table still prints, then the loop exits: no new server lever to apply. First unread show stays open (Confirm + guide).
 
-**Scale out.** Eventually no flag helps. Profile says the scheduler is at its cap with the pool full, that no config change helps, and that the next move is a replica. That is the answer, not a failure.
+**Scale out.** Eventually no flag helps. Profile says the scheduler is at its cap with the pool full, that no config change helps, and that the next move is a replica. That is the answer, not a failure. When the box is healthy and quiet, it names the cap instead: the 5090 Muse run ended `Capped by vLLM overhead` at 421 tok/s; the H100 Qwen3.8 run ended `Capped by traffic` at 490 tok/s.
 
 ---
 

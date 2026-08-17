@@ -110,6 +110,7 @@
     <a class="wordmark" href="index.html">profile</a>
     <nav>
       <a href="index.html">Home</a>
+      <a href="journeys.html">Journeys</a>
       <a href="https://github.com/jungledesh/profile" target="_blank" rel="noopener">GitHub</a>
     </nav>
   </div>
@@ -183,44 +184,40 @@ profile diagnose --url http://localhost:8000/metrics --duration 30s</code></pre>
 
     <h3>Read</h3>
     <p>Profile prints a performance snapshot followed by an <code>ISSUES</code> block. Here is an example. Do exactly what the <code>Fix:</code> section recommends.</p>
-    <pre><code>+----------------------------------------------------------------------------------------------------------------------------+
-|PROFILE v2.2.2 [Qwen3.6-27B] [NVIDIA H100 80GB HBM3] (2m from 2026-07-31 07:13:29 UTC)                                      |
-|                                                                                                                            |
-|GPU =&gt;               decode_eff ~0.9% | power 653W | 3.57 J/tok | $5.09/1M output tok (est) | vRAM 74/80GB (peak 75GB)      |
-|                     mem_util 56%                                                                                           |
-|                                                                                                                            |
-|vLLM =&gt;                                                                                                                     |
-|REQUESTS             run 14 (4.0%) | wait 4 | max 345                                                                       |
-|LATENCY              ttft 8.7s (p95 19.2s) | tpot 97ms (p95 159ms)                                                          |
-|CACHE                kv_cache 93.1% avg (100.0% peak) | pfix_cache -                                                        |
-|THROUGHPUT           163 tok/s                                                                                              |
-|TRAFFIC              qps 0.5 | req_total 112 | gen_total 32368 | preempt/s 0.01 | preempt_total 2                           |
-|                                                                                                                            |
-|ISSUES:                                                                                                                     |
-|                                                                                                                            |
-|[!] KV Cache Pressure                                                                                                       |
-|    Seen in 92% of windows                                                                                                  |
-|    Cause:                                                                                                                  |
-|      KV cache 94% avg in fired windows, 100% peak (threshold: 88%).                                                        |
-|      4 requests queued on KV admission.                                                                                    |
-|                                                                                                                            |
-|    Fix:                                                                                                                    |
-|    Cuts throughput:                                                                                                        |
-|      • Lower --max-model-len (current: 262144). Observed avg 13.9k tokens per request, prompt + generation.                |
-|        Some requests are longer than avg; add buffer to it. Requests over the limit are rejected with a 400, not truncated.|
-|                                                                                                                            |
-|      • Lower --max-num-seqs to reduce KV demand                                                                            |
-|                                                                                                                            |
-|    Safe to apply:                                                                                                          |
-|      • Enable --enable-prefix-caching to share KV blocks across identical prompt prefixes                                  |
-|      • Raise --gpu-memory-utilization (check vRAM header for avail mem) to expand KV pool                                  |
-|      • Switch --kv-cache-dtype fp8 to halve KV memory footprint (affects output quality)                                   |
-|      • Set --kv-offloading-size 4 (est) to hold evicted KV in host memory instead of recomputing it                        |
-|        Host RAM available: 1953 GiB, container limit 234 GiB.                                                              |
-|                                                                                                                            |
-|    Expected: Wait queue drains, TTFT recovers once KV pool has capacity.                                                   |
-|    Confidence: High                                                                                                        |
-+----------------------------------------------------------------------------------------------------------------------------+</code></pre>
+    <pre><code>+----------------------------------------------------------------------------------------------------------------------+
+|PROFILE v2.2.1 [muse-glimmer-30b] [NVIDIA GeForce RTX 5090] (5m from 2026-08-14 10:30:26 UTC)                         |
+|                                                                                                                      |
+|GPU =&gt;               decode_eff ~3.5% | power 531W | 4.05 J/tok | $2.10/1M output tok (est) | vRAM 29/32GB            |
+|                     mem_util 37%                                                                                     |
+|                                                                                                                      |
+|vLLM =&gt;                                                                                                               |
+|REQUESTS             run 9 (27.4%) | wait 15 | max 32                                                                 |
+|LATENCY              ttft 32.8s (p95 66.9s) | tpot 58ms (p95 89ms)                                                    |
+|CACHE                kv_cache 88.6% avg (99.9% peak) | pfix_cache 22.7%                                               |
+|THROUGHPUT           131 tok/s                                                                                        |
+|TRAFFIC              qps 0.5 | req_total 642 | gen_total 175857 | preempt/s 0.16 | preempt_total 59                   |
+|                                                                                                                      |
+|ISSUES:                                                                                                               |
+|                                                                                                                      |
+|[!] KV Cache Pressure                                                                                                 |
+|    Seen in 100% of windows                                                                                           |
+|    Cause:                                                                                                            |
+|      KV cache 89% avg in fired windows, 100% peak (threshold: 88%).                                                  |
+|      Scheduler evicting; 15 requests queued on KV admission.                                                        |
+|                                                                                                                      |
+|    Fix:                                                                                                              |
+|      • Raise --gpu-memory-utilization (check vRAM header for avail mem) to expand KV pool.                           |
+|      • Switch --kv-cache-dtype fp8 to halve KV memory footprint (affects output quality).                            |
+|      • Lower --max-num-seqs to reduce KV demand.                                                                     |
+|        Cuts throughput. Revert after pressure clears.                                                                |
+|      • Reduce client concurrency toward sustained running (9 in-flight).                                            |
+|        Cuts queue wait, not throughput. Demand exceeds admitted capacity.                                            |
+|      • Lower --max-model-len 32768 → 21933. Observed p99 21.9k tokens per request.                                   |
+|        ~1% of observed requests ran longer; those are rejected with a 400, not truncated.                            |
+|                                                                                                                      |
+|    Expected: TTFT and TPOT recover once evictions stop.                                                              |
+|    Confidence: High                                                                                                  |
++----------------------------------------------------------------------------------------------------------------------+</code></pre>
 
     <p>Every value is measured or marked. A dash (<code>-</code>) means the metric was not readable. <code>(est)</code> means the number came from the physics model. A tilde (<code>~</code>) marks a value derived from an estimated ceiling. Gaps are never filled with guesses.</p>
     <blockquote><em>Note: <code>[!] KV Cache Pressure</code> corresponds directly to rule <strong>R2</strong> in the Flag Recommendations Map below.</em></blockquote>
@@ -233,27 +230,29 @@ Press Enter when done.
 
 Connection restored. Resuming in 5s...
 
-New --max-num-seqs [current: 345]: 170
+New --max-num-seqs [current: 32]: 12
 
 Measuring delta...
 
-  Config changed.
+  Config changed. Baseline reset.
 
-  Throughput          163 → 328 tok/s
-  TTFT                8720 → 495ms (p95 19185 → 950ms)
-  TPOT                96.9 → 50.9ms (p95 158.7 → 73.0ms)
+  Throughput          174 → 401 tok/s
+  TTFT                44157 → 239ms (p95 77146 → 604ms)
+  TPOT                53.7 → 24.9ms (p95 87.0 → 46.3ms)
 
 ECONOMICS:
-  Cost/1M output tok  $5.09 → $2.53 (est)</code></pre>
+  J/tok               3.01 → 1.02
+  Cost/1M output tok  $1.58 → $0.69 (est)</code></pre>
 
     <p>Regressions are labelled, not buried:</p>
-    <pre><code>  Throughput          610 → 545 tok/s  worse
-  TTFT                1024 → 6067ms (p95 2407 → 16687ms)  worse
-  TPOT                118.4 → 147.0ms (p95 147.7 → 195.9ms)  worse
-  Decode eff.         -0.4pp
+    <pre><code>  Throughput          183 → 131 tok/s  worse
+  TTFT                430 → 32797ms (p95 2108 → 66870ms)  worse
+  TPOT                28.1 → 58.5ms (p95 49.5 → 89.4ms)  worse
+  Decode eff.         -1.4pp
 
 ECONOMICS:
-  Cost/1M output tok  $1.36 → $1.52 (est)  worse</code></pre>
+  J/tok               2.35 → 4.05  worse
+  Cost/1M output tok  $1.50 → $2.10 (est)  worse</code></pre>
 
     <h3>Iterate</h3>
     <p>Notice the throughput dropped? Profile reports regressions honestly. Fixing one bottleneck often exposes the next. Keep iterating; results improve over multiple restarts.</p>
@@ -268,31 +267,26 @@ ECONOMICS:
       <li><strong>Config-skip.</strong> Where Profile can read your running config, it skips levers you already set: prefix caching on, fp8 KV already active, chunked prefill on, <code>--max-num-batched-tokens</code> already at or above the suggestion, seats already at the target. Exception: <code>--kv-offloading-size</code> is re-derived on each R2 fire; if the new size differs from what is set, the flag is offered again with the new number (host-RAM subline included). If derived equals set, it stays quiet.</li>
     </ul>
 
-    <h3>Scale Out</h3>
-    <p>Eventually, no config change will help. You have hit hardware saturation.</p>
-    <pre><code>+----------------------------------------------------------------------------------------------------------------------------+
-|PROFILE v2.2.2 [Qwen3.6-27B] [NVIDIA H100 80GB HBM3] (2m from 2026-07-31 07:52:11 UTC)                                      |
-|                                                                                                                            |
-|GPU =&gt;               decode_eff ~8.1% | power 653W | 0.83 J/tok | $1.18/1M output tok (est) | vRAM 77/80GB (peak 79GB)      |
-|                                                                                                                            |
-|vLLM =&gt;                                                                                                                     |
-|REQUESTS             run 345 (100%) | wait 149 | max 345                                                                    |
-|LATENCY              ttft 52.9s (p95 129.2s) | tpot 199ms (p95 295ms)                                                       |
-|CACHE                kv_cache 81.5% avg | pfix_cache 61.6%                                                                  |
-|THROUGHPUT           470 tok/s                                                                                              |
-|                                                                                                                            |
-|ISSUES:                                                                                                                     |
-|                                                                                                                            |
-|[!] Concurrency Saturation                                                                                                  |
-|    Seen in 50% of windows                                                                                                  |
-|    Cause:                                                                                                                  |
-|      KV at 81.5%: memory wall reached. No config change helps.                                                             |
-|                                                                                                                            |
-|    Fix:                                                                                                                    |
-|      • Add a replica to scale out.                                                                                         |
-|                                                                                                                            |
-|    Confidence: High                                                                                                        |
-+----------------------------------------------------------------------------------------------------------------------------+</code></pre>
+    <h3>Quiet end</h3>
+    <p>When no rule fires, Profile names the cap and stops inventing flags. RTX 5090 Muse run, after the KV fix:</p>
+    <pre><code>+-----------------------------------------------------------------------------------------------------------+
+|PROFILE v2.2.1 [muse-glimmer-30b] [NVIDIA GeForce RTX 5090] (5m from 2026-08-14 10:45:47 UTC)              |
+|                                                                                                           |
+|GPU =&gt;               decode_eff ~11.2% | power 455W | 1.08 J/tok | $0.65/1M output tok (est) | vRAM 30/32GB|
+|                     mem_util 69%                                                                          |
+|                                                                                                           |
+|vLLM =&gt;                                                                                                    |
+|REQUESTS             run 10 (84.1%) | wait 0 | max 12                                                      |
+|LATENCY              ttft 224ms (p95 500ms) | tpot 23ms (p95 40ms)                                         |
+|CACHE                kv_cache 22.5% avg | pfix_cache 95.0%                                                 |
+|THROUGHPUT           421 tok/s                                                                             |
+|TRAFFIC              qps 1.3 | req_total 660 | gen_total 199567 | preempt/s 0.00 | preempt_total 0         |
+|                                                                                                           |
+|ISSUES:                                                                                                    |
+|                                                                                                           |
+|No issues detected.                                                                                        |
+|Capped by vLLM overhead: batch healthy, memory free. GPU waits on CPU work between steps.                  |
++-----------------------------------------------------------------------------------------------------------+</code></pre>
 
     <h2>vLLM Flag Recommendations Map</h2>
     <p>Profile detects these bottlenecks and recommends the following vLLM flag changes:</p>
@@ -327,9 +321,10 @@ ECONOMICS:
     <p><code>profile help</code>, <code>profile completions &lt;SHELL&gt;</code>, and <code>profile man</code> exist. They are not diagnose flags.</p>
 
     <h2>Proof</h2>
-    <p><strong><a href="https://www.youtube.com/watch?v=XuPPKBteWH0" target="_blank" rel="noopener">Watch the A100 optimization demo</a></strong></p>
-    <p><strong>A100-SXM4-80GB · Qwen3.6-27B:</strong> <code>31 → 470 tok/s</code> (15x). Cost <code>$13.26 → $0.89 / 1M tok</code> (93% lower). Guided flags included <code>--max-num-seqs</code>, prefix caching, FP8 KV cache, and <code>--gpu-memory-utilization</code>, until hardware saturation.</p>
-    <p><strong>H100 80GB HBM3 · Qwen3.6-27B:</strong> <code>163 → 631 tok/s</code> (3.9x). Cost about 74% lower across seven iterations. Path was not monotonic: 163, 328, 545, 543, 482, 610, 545, 631. Profile labelled both regressions.</p>
+    <p><strong><a href="journeys.html#5090-1">Walk the RTX 5090 Muse steps</a></strong> · <strong><a href="https://www.youtube.com/watch?v=gdrXGgfa7lA&t=39s" target="_blank" rel="noopener">Watch the run</a></strong></p>
+    <p><strong><a href="journeys.html#h100-1">Walk the H100 Qwen3.8 steps</a></strong> · <strong><a href="https://www.youtube.com/watch?v=w15RezkRijM" target="_blank" rel="noopener">Watch the run</a></strong></p>
+    <p><strong>RTX 5090 · Muse Glimmer 30B (NVFP4):</strong> <code>81 → 421 tok/s</code> (5.2x). Cost <code>$3.41 → $0.65 / 1M tok</code> (81% lower). SWE-Bench agents. Flags: <code>--max-model-len 25000</code>, <code>--max-num-seqs 12</code>, <code>--gpu-memory-utilization 0.98</code>, <code>--kv-cache-dtype fp8</code>. Ended quiet, capped by vLLM overhead.</p>
+    <p><strong>H100 80GB HBM3 · Qwen3.8-27B:</strong> <code>257 → 490 tok/s</code> (1.9x). Cost <code>$3.23 → $1.69 / 1M tok</code> (48% lower). TTFT <code>1.9s → 539ms</code>. Path 257, 278, 490. The flood step labelled <code>worse</code> (TTFT 172s), then prefix + fp8 KV + seats 22 recovered it. Ended capped by traffic.</p>
     <p>Your starting point sets your gain. A server already near its ceiling has nothing to recover, and Profile says so.</p>
 
     <h2>Why Profile?</h2>
@@ -818,14 +813,14 @@ prefill_floor_ms = 1000 / prefill_ceiling_tps</code></pre>
 
     <h2>Closed-loop delta</h2>
     <p>Computed after every re-measure cycle. Each metric line shows <code>before &rarr; after</code>. A <code>worse</code> suffix marks material regressions only (not every negative delta).</p>
-    <pre><code>  Config changed.
+    <pre><code>  Config changed. Baseline reset.
 
-  Throughput          163 &rarr; 328 tok/s
-  TTFT                8720 &rarr; 495ms (p95 19185 &rarr; 950ms)
-  TPOT                96.9 &rarr; 50.9ms (p95 158.7 &rarr; 73.0ms)
+  Throughput          174 &rarr; 401 tok/s
+  TTFT                44157 &rarr; 239ms (p95 77146 &rarr; 604ms)
+  TPOT                53.7 &rarr; 24.9ms (p95 87.0 &rarr; 46.3ms)
 
 ECONOMICS:
-  Cost/1M output tok  $5.09 &rarr; $2.53 (est)</code></pre>
+  Cost/1M output tok  $1.58 &rarr; $0.69 (est)</code></pre>
     <p>When config drifted between windows (vLLM restart detected), the line reads <code>Config changed. Baseline reset.</code> and the efficiency arm of the delta is discounted; throughput alone decides improvement direction after a reset.</p>
     <p>On regression: the degraded state becomes the new baseline and is pushed to the history stack. The loop continues through the normal apply/remeasure wait; there is no extra confirmation step beyond that.</p>
     <table>

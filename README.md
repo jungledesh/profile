@@ -14,15 +14,15 @@
 
 **Are you getting what your hardware is capable of?**
 
-One A100. Same model, same hardware, different flags.
+One RTX 5090. Muse Glimmer 30B. SWE-Bench agents. Same hardware, different flags.
 
 ```text
-  Throughput          31 → 470 tok/s          15x
-  Cost/1M output tok  $13.26 → $0.89 (est)    93% lower
+  Throughput          81 → 421 tok/s          5.2x
+  Cost/1M output tok  $3.41 → $0.65 (est)     81% lower
 ```
 
 - Profile named each bottleneck, gave the flag, measured the delta after every change.
-- A few iterations, not days of guessing. Regressions included. [More recorded runs below.](#proof)
+- A few iterations, not days of guessing. Regressions included. [Walk the steps.](docs/journeys.html#5090-1) [Watch the run.](https://www.youtube.com/watch?v=gdrXGgfa7lA&t=39s) [More recorded runs below.](#proof)
 
 ```text
 ✓ Single binary      ✓ No agent to deploy
@@ -111,29 +111,33 @@ The full machinery: [docs/engine.md](docs/engine.md).
 2. **Apply.** You restart vLLM with the flag. Profile waits, reconnects on its own.
 3. **Delta.** Before → after on every metric that matters. Regressions labelled, not buried.
 
-Real output, shortened (H100 run; full blocks in [docs/workflow.md](docs/workflow.md)):
+Real output, shortened (RTX 5090 Muse Glimmer 30B run; full blocks in [docs/workflow.md](docs/workflow.md)):
 
 ```text
-|PROFILE v2.2.2 [Qwen3.6-27B] [NVIDIA H100 80GB HBM3]                  |
-|GPU =>    decode_eff ~0.9% | $5.09/1M output tok (est) | vRAM 74/80GB |
-|REQUESTS  run 14 (4.0%) | wait 4 | max 345                            |
-|CACHE     kv_cache 93.1% avg (100.0% peak)                            |
+|PROFILE v2.2.1 [muse-glimmer-30b] [NVIDIA GeForce RTX 5090]           |
+|GPU =>    decode_eff ~3.5% | $2.10/1M output tok (est) | vRAM 29/32GB |
+|REQUESTS  run 9 (27.4%) | wait 15 | max 32                             |
+|CACHE     kv_cache 88.6% avg (99.9% peak)                             |
+|THROUGHPUT 131 tok/s                                                  |
 |                                                                      |
-|[!] KV Cache Pressure          Seen in 92% of windows                 |
-|    Cause: KV cache 94% avg, 100% peak (threshold: 88%).              |
-|           4 requests queued on KV admission.                         |
-|    Fix:   • Lower --max-model-len (current: 262144). Observed avg    |
-|             13.9k tokens per request.                                |
-|    Expected: Wait queue drains, TTFT recovers.                       |
+|[!] KV Cache Pressure          Seen in 100% of windows                |
+|    Cause: KV cache 89% avg, 100% peak (threshold: 88%).              |
+|           Scheduler evicting; 15 requests queued on KV admission.    |
+|    Fix:   • Raise --gpu-memory-utilization.                          |
+|           • Switch --kv-cache-dtype fp8.                             |
+|           • Lower --max-model-len 32768 → 21933. Observed p99 21.9k. |
+|    Expected: TTFT and TPOT recover once evictions stop.              |
 |    Confidence: High                                                  |
 ```
 
 ```text
 Measuring delta...
 
-  Throughput          163 → 328 tok/s
-  TTFT                8720 → 495ms (p95 19185 → 950ms)
-  Cost/1M output tok  $5.09 → $2.53 (est)
+  Config changed. Baseline reset.
+
+  Throughput          174 → 401 tok/s
+  TTFT                44157 → 239ms (p95 77146 → 604ms)
+  Cost/1M output tok  $1.58 → $0.69 (est)
 ```
 
 - A dash means Profile could not read it.
@@ -146,16 +150,18 @@ Measuring delta...
 ## Proof
 
 ```text
-                                                                 tok/s
-A100   before  |██ 31
-       after   |███████████████████████████████ 470                 15x
-H100   before  |███████████ 163
-       after   |██████████████████████████████████████████ 631     3.9x
+                                                                       tok/s
+                                                                       
+5090   before  |████████ 81
+       after   |██████████████████████████████████████████ 421         5.2x
+
+       
+H100   before  |█████████████████████████ 257
+       after   |████████████████████████████████████████████████ 490   1.9x
 ```
 
-- **A100-SXM4-80GB:** 15x throughput, 93% lower cost, $13.26 to $0.89 per 1M tokens. [Watch the run.](https://www.youtube.com/watch?v=XuPPKBteWH0)
-- **H100 80GB HBM3:** seven iterations, 3.9x, 74% lower cost.
-- The H100 path: 163, 328, 545, 543, 482, 610, 545, 631 tok/s. Two steps regressed. Profile labelled both.
+- **RTX 5090 · Muse Glimmer 30B (NVFP4):** 5.2x throughput, 81% lower cost, $3.41 to $0.65 per 1M tokens. SWE-Bench agents. Ended quiet, capped by vLLM overhead. [Walk the steps.](docs/journeys.html#5090-1) [Watch the run.](https://www.youtube.com/watch?v=gdrXGgfa7lA&t=39s)
+- **H100 80GB HBM3 · Qwen3.8-27B:** 1.9x throughput, 48% lower cost, TTFT 1.9s to 539ms. Same agent swarm. Path: 257, 278, 490 tok/s. The flood step labelled `worse` (TTFT 172s), then the flags recovered it. [Walk the steps.](docs/journeys.html#h100-1) [Watch the run.](https://www.youtube.com/watch?v=w15RezkRijM)
 - That honesty is why the wins are believable.
 - A server already near its ceiling has nothing to recover, and Profile tells you that instead of manufacturing a recommendation.
 
