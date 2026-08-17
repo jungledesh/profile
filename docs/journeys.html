@@ -163,7 +163,6 @@
 </footer>
 
 <script>
-const CANON = "https://jungledesh.github.io/profile/journeys.html";
 const RUNS = {
   "5090": {
     watch: "https://www.youtube.com/watch?v=gdrXGgfa7lA&t=39s",
@@ -385,7 +384,7 @@ function parseHash() {
 }
 
 function hashFor(r, i) { return "#" + r + "-" + (i + 1); }
-function permalink() { return CANON + hashFor(run, idx); }
+function permalink() { return location.origin + location.pathname + hashFor(run, idx); }
 
 function paint() {
   const data = RUNS[run];

@@ -22,7 +22,7 @@ One RTX 5090. Muse Glimmer 30B. SWE-Bench agents. Same hardware, different flags
 ```
 
 - Profile named each bottleneck, gave the flag, measured the delta after every change.
-- A few iterations, not days of guessing. Regressions included. [Every iteration](https://jungledesh.github.io/profile/journeys.html#5090-1) · [Video](https://www.youtube.com/watch?v=gdrXGgfa7lA&t=39s) · [Both GPUs](#proof)
+- A few iterations, not days of guessing. Regressions included. [Slides](https://jungledesh.github.io/profile/journeys.html#5090-1) · [Video](https://www.youtube.com/watch?v=gdrXGgfa7lA&t=39s) · [Proof](#proof)
 
 ```text
 ✓ Single binary      ✓ No agent to deploy
@@ -168,9 +168,9 @@ H100   before  |█████████████████████�
 ```
 
 - **RTX 5090 · Muse Glimmer 30B (NVFP4):** 5.2x throughput, 81% lower cost, $3.41 to $0.65 per 1M tokens. SWE-Bench agents. Ended quiet, capped by vLLM overhead.
-  [Every iteration](https://jungledesh.github.io/profile/journeys.html#5090-1) · [Video](https://www.youtube.com/watch?v=gdrXGgfa7lA&t=39s)
+  [Slides](https://jungledesh.github.io/profile/journeys.html#5090-1) · [Video](https://www.youtube.com/watch?v=gdrXGgfa7lA&t=39s)
 - **H100 80GB HBM3 · Qwen3.8-27B:** 1.9x throughput, 48% lower cost, TTFT 1.9s to 539ms. Same agent swarm. Path: 257, 278, 490 tok/s. Raising agents without a KV fix sent TTFT to 172s; Profile labelled it `worse`, then the flags recovered it.
-  [Every iteration](https://jungledesh.github.io/profile/journeys.html#h100-1) · [Video](https://www.youtube.com/watch?v=w15RezkRijM)
+  [Slides](https://jungledesh.github.io/profile/journeys.html#h100-1) · [Video](https://www.youtube.com/watch?v=w15RezkRijM)
 - The flood is in the record on purpose. A server already near its ceiling has nothing to recover, and Profile says so instead of inventing a flag.
 
 ---
