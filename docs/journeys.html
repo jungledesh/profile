@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Journeys | Profile</title>
+<meta name="description" content="Recorded diagnose loops: RTX 5090 Muse Glimmer 30B and H100 Qwen3.8-27B, one iteration per slide.">
+<style>
+  :root {
+    --bg: #000; --ink: #ececec; --ink-2: #9a9a9a; --ink-3: #5c5c5c;
+    --line: #1e1e1e; --line-2: #2c2c2c; --card: #0a0a0a;
+    --mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body { background: var(--bg); color: var(--ink); font-family: var(--sans); font-size: 16px; line-height: 1.65; -webkit-font-smoothing: antialiased; }
+  a { color: var(--ink); text-decoration: none; }
+  .wrap { max-width: 1060px; margin: 0 auto; padding: 0 24px; }
+
+  header { position: sticky; top: 0; z-index: 20; background: rgba(0,0,0,0.85); backdrop-filter: blur(8px); border-bottom: 1px solid var(--line); }
+  header .wrap { display: flex; align-items: center; justify-content: space-between; height: 56px; }
+  .wordmark { font-family: var(--mono); font-size: 15px; letter-spacing: 0.08em; color: #fff; }
+  header nav { display: flex; gap: 26px; }
+  header nav a { font-family: var(--mono); font-size: 13px; color: var(--ink-2); letter-spacing: 0.04em; }
+  header nav a:hover { color: #fff; }
+
+  .page { padding: 64px 0 80px; }
+  .k { font-family: var(--mono); font-size: 12px; letter-spacing: 0.2em; color: var(--ink-3); margin-bottom: 14px; }
+  h1 { font-size: clamp(28px, 4vw, 42px); font-weight: 600; letter-spacing: -0.015em; color: #fff; line-height: 1.12; }
+  .lede { margin: 16px 0 0; color: var(--ink-2); max-width: 640px; }
+
+  .run-bar { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 40px; flex-wrap: wrap; }
+  .tabs { display: flex; gap: 8px; }
+  .tab {
+    font-family: var(--mono); font-size: 13px; color: var(--ink-2);
+    background: transparent; border: 1px solid var(--line-2); border-radius: 6px;
+    padding: 10px 16px; cursor: pointer;
+  }
+  .tab:hover { color: #fff; border-color: #6a6a6a; }
+  .tab.on { color: #000; background: #fff; border-color: #fff; }
+  .watch { font-family: var(--mono); font-size: 13px; color: var(--ink-2); border-bottom: 1px solid var(--line-2); padding-bottom: 1px; }
+  .watch:hover { color: #fff; border-color: #fff; }
+
+  .rail { display: grid; gap: 8px; margin-top: 28px; }
+  .rail[data-run="5090"] { grid-template-columns: repeat(4, 1fr); }
+  .rail[data-run="h100"] { grid-template-columns: repeat(3, 1fr); }
+  .dot {
+    text-align: left; background: var(--card); border: 1px solid var(--line); border-radius: 8px;
+    padding: 12px 14px; cursor: pointer; color: inherit;
+  }
+  .dot:hover { border-color: #6a6a6a; }
+  .dot.on { border-color: #fff; }
+  .dot b { display: block; font-family: var(--mono); font-size: 18px; color: #fff; font-weight: 600; }
+  .dot span { display: block; font-family: var(--mono); font-size: 11px; color: var(--ink-3); margin-top: 4px; letter-spacing: 0.04em; }
+
+  .stage { margin-top: 20px; position: relative; }
+  .arr {
+    position: absolute; top: 50%; transform: translateY(-50%);
+    width: 44px; height: 44px; border-radius: 6px;
+    background: #000; border: 1px solid var(--line-2); color: #fff;
+    font-size: 22px; line-height: 1; cursor: pointer; z-index: 2;
+  }
+  .arr:hover { border-color: #fff; }
+  .arr:disabled { color: var(--ink-3); border-color: var(--line); cursor: default; }
+  .arr.prev { left: -56px; }
+  .arr.next { right: -56px; }
+
+  .viewport { overflow: hidden; border: 1px solid var(--line-2); border-radius: 10px; background: var(--card); }
+  .track { display: flex; width: 100%; transition: transform 0.32s ease; }
+  .slide { flex: 0 0 100%; min-width: 0; padding: 22px 24px 26px; }
+  .slide-k { font-family: var(--mono); font-size: 11px; letter-spacing: 0.16em; color: var(--ink-3); }
+  .slide h2 { font-size: 22px; color: #fff; font-weight: 600; margin: 6px 0 8px; letter-spacing: -0.01em; }
+  .change { color: var(--ink-2); font-size: 15px; margin-bottom: 16px; }
+  .term-bar { font-family: var(--mono); font-size: 12px; color: var(--ink-3); margin-bottom: 8px; }
+  .slide pre {
+    font-family: var(--mono); font-size: 12.5px; line-height: 1.55; color: #cfcfcf;
+    overflow-x: auto; white-space: pre;
+  }
+  .slide .dim { color: var(--ink-3); }
+  .slide .hi { color: #fff; font-weight: 600; }
+  .slide .worse { color: #fff; border-bottom: 1px dotted #666; }
+  .delta { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); }
+  .delta .term-bar { margin-bottom: 8px; }
+
+  .foot-nav { display: flex; justify-content: space-between; align-items: center; margin-top: 16px; font-family: var(--mono); font-size: 12px; color: var(--ink-3); }
+  .copy-link { background: none; border: none; color: var(--ink-2); font-family: var(--mono); font-size: 12px; cursor: pointer; border-bottom: 1px solid var(--line-2); padding: 0 0 1px; }
+  .copy-link:hover { color: #fff; border-color: #fff; }
+
+  footer { padding: 40px 0 60px; border-top: 1px solid var(--line); }
+  footer .wrap { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px; }
+  footer, footer a { font-family: var(--mono); font-size: 12px; color: var(--ink-3); }
+  footer a:hover { color: #fff; }
+
+  @media (max-width: 1180px) {
+    .arr.prev { left: 8px; }
+    .arr.next { right: 8px; }
+    .arr { background: rgba(0,0,0,0.75); }
+  }
+  @media (max-width: 820px) {
+    .page { padding: 40px 0 56px; }
+    .rail, .rail[data-run="5090"], .rail[data-run="h100"] { grid-template-columns: 1fr 1fr; }
+    .slide { padding: 18px 16px 22px; }
+    .arr { top: auto; bottom: 12px; transform: none; }
+    .arr.prev { left: 12px; }
+    .arr.next { right: 12px; }
+    .viewport { padding-bottom: 56px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .track { transition: none; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <a class="wordmark" href="index.html">profile</a>
+    <nav>
+      <a href="docs.html">Docs</a>
+      <a href="journeys.html">Journeys</a>
+      <a href="index.html#get-started">Get started</a>
+      <a href="https://github.com/jungledesh/profile" target="_blank" rel="noopener">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="page">
+  <div class="wrap">
+    <div class="k">JOURNEYS</div>
+    <h1>The loop, one step at a time.</h1>
+    <p class="lede">Two recorded diagnose sessions. SWE-Bench agents, live traffic, no synthetic load. Each slide is one iteration: the change, the block Profile printed, the delta. Left and right move through the path. The hash is the permalink.</p>
+
+    <div class="run-bar">
+      <div class="tabs" role="tablist">
+        <button class="tab on" type="button" data-run="5090" aria-selected="true">RTX 5090 · Muse Glimmer 30B</button>
+        <button class="tab" type="button" data-run="h100" aria-selected="false">H100 · Qwen3.8-27B</button>
+      </div>
+      <a class="watch" id="watch" href="https://www.youtube.com/watch?v=gdrXGgfa7lA&t=39s" target="_blank" rel="noopener">Watch this run →</a>
+    </div>
+
+    <div class="rail" id="rail" data-run="5090"></div>
+
+    <div class="stage">
+      <button class="arr prev" type="button" aria-label="Previous iteration">‹</button>
+      <button class="arr next" type="button" aria-label="Next iteration">›</button>
+      <div class="viewport" id="viewport">
+        <div class="track" id="track"></div>
+      </div>
+    </div>
+
+    <div class="foot-nav">
+      <span id="step-label">01 / 04</span>
+      <button class="copy-link" type="button" id="copy-link">Copy link to this step</button>
+    </div>
+  </div>
+</div>
+
+<footer>
+  <div class="wrap">
+    <div>© 2026 · Apache 2.0</div>
+    <div>
+      <a href="index.html">Home</a> ·
+      <a href="docs.html">Docs</a> ·
+      <a href="https://github.com/jungledesh/profile">GitHub</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+const RUNS = {
+  "5090": {
+    watch: "https://www.youtube.com/watch?v=gdrXGgfa7lA&t=39s",
+    steps: [
+      {
+        tok: "81 tok/s",
+        rail: "Under-batching",
+        title: "Under-batching",
+        change: "Start. --max-model-len 32768, --max-num-seqs 32. Agents 2.",
+        block: `<span class="dim">PROFILE v2.2.1 [muse-glimmer-30b] [NVIDIA GeForce RTX 5090]</span>  5m from 2026-08-14 10:14:11 UTC
+
+GPU        decode_eff ~2.1% | power 381W | 4.72 J/tok | $3.41/1M output tok <span class="dim">(est)</span> | vRAM 29/32GB
+REQUESTS   run 2 (6.1%) | wait 0 | max 32
+LATENCY    ttft 198ms (p95 478ms) | tpot 24ms (p95 24ms)
+CACHE      kv_cache 23.3% avg | pfix_cache 97.1%
+THROUGHPUT 81 tok/s
+
+ISSUES:
+
+<span class="hi">[!] Under-batching: Insufficient Concurrency</span>   <span class="dim">seen in 100% of windows</span>
+    Requests (avg when starved)   2 running, 0 waiting  (max: 32)
+    Cause:  Hardware capacity under-fed by client. Not enough requests arriving to keep the server busy.
+    Fix:    Batch more requests or increase client concurrency.
+            Fits 4 at the full 32.8k window; ~5 at observed request sizes <span class="dim">(est)</span>.
+    Expected: Higher throughput. TPOT stable until the GPU is fully fed, then it starts to rise.
+    Confidence: High`
+      },
+      {
+        tok: "183 tok/s",
+        rail: "Under-batching",
+        title: "Under-batching",
+        change: "Agents 2 → 5. vLLM flags unchanged.",
+        delta: `  No change detected.
+
+  Throughput          81 → 183 tok/s
+  TTFT                190 → 430ms (p95 478 → 2108ms)  <span class="worse">worse</span>
+  TPOT                23.8 → 28.1ms (p95 24.2 → 49.5ms)  <span class="worse">worse</span>
+  Decode eff. +2.7pp
+
+ECONOMICS:
+  J/tok               4.72 → 2.35
+  Cost/1M output tok  $3.41 → $1.50 <span class="dim">(est)</span>`,
+        block: `<span class="dim">PROFILE v2.2.1 [muse-glimmer-30b] [NVIDIA GeForce RTX 5090]</span>  5m from 2026-08-14 10:22:10 UTC
+
+GPU        decode_eff ~4.8% | power 430W | 2.35 J/tok | $1.50/1M output tok <span class="dim">(est)</span> | vRAM 29/32GB
+REQUESTS   run 5 (16.9%) | wait 0 | max 32
+LATENCY    ttft 430ms (p95 2.1s) | tpot 28ms (p95 49ms)
+CACHE      kv_cache 56.3% avg (77.5% peak) | pfix_cache 83.4%
+THROUGHPUT 183 tok/s
+
+ISSUES:
+
+<span class="hi">[!] Under-batching: Insufficient Concurrency</span>   <span class="dim">seen in 100% of windows</span>
+    Requests (avg when starved)   5 running, 0 waiting  (max: 32)
+    Cause:  Hardware capacity under-fed by client. Not enough requests arriving to keep the server busy.
+    Fix:    Batch more requests or increase client concurrency (24 seats idle before hardware degrades TPOT; KV fit unknown)
+    Expected: Higher throughput. TPOT stable until the GPU is fully fed, then it starts to rise.
+    Confidence: High`
+      },
+      {
+        tok: "131 tok/s",
+        rail: "KV pressure",
+        title: "KV Cache Pressure",
+        change: "Agents 5 → 24. vLLM flags unchanged.",
+        delta: `  No change detected.
+
+  Throughput          183 → 131 tok/s  <span class="worse">worse</span>
+  TTFT                430 → 32797ms (p95 2108 → 66870ms)  <span class="worse">worse</span>
+  TPOT                28.1 → 58.5ms (p95 49.5 → 89.4ms)  <span class="worse">worse</span>
+  Decode eff. -1.4pp
+
+ECONOMICS:
+  J/tok               2.35 → 4.05  <span class="worse">worse</span>
+  Cost/1M output tok  $1.50 → $2.10 <span class="dim">(est)</span>`,
+        block: `<span class="dim">PROFILE v2.2.1 [muse-glimmer-30b] [NVIDIA GeForce RTX 5090]</span>  5m from 2026-08-14 10:30:26 UTC
+
+GPU        decode_eff ~3.5% | power 531W | 4.05 J/tok | $2.10/1M output tok <span class="dim">(est)</span> | vRAM 29/32GB
+REQUESTS   run 9 (27.4%) | wait 15 | max 32
+LATENCY    ttft 32.8s (p95 66.9s) | tpot 58ms (p95 89ms)
+CACHE      kv_cache 88.6% avg (99.9% peak) | pfix_cache 22.7%
+THROUGHPUT 131 tok/s
+
+ISSUES:
+
+<span class="hi">[!] KV Cache Pressure</span>   <span class="dim">seen in 100% of windows</span>
+    Cause:  KV cache 89% avg in fired windows, 100% peak (threshold: 88%).
+            Scheduler evicting; 15 requests queued on KV admission.
+    Fix:    Raise --gpu-memory-utilization to expand KV pool.
+            Switch --kv-cache-dtype fp8 to halve KV memory footprint (affects output quality).
+            Lower --max-num-seqs to reduce KV demand. Cuts throughput. Revert after pressure clears.
+            Reduce client concurrency toward sustained running (9 in-flight).
+            Lower --max-model-len 32768 → 21933. Observed p99 21.9k tokens per request.
+    Expected: TTFT and TPOT recover once evictions stop.
+    Confidence: High`
+      },
+      {
+        tok: "421 tok/s",
+        rail: "Quiet",
+        title: "No issues detected",
+        change: "--max-model-len 25000, --max-num-seqs 12, --gpu-memory-utilization 0.98, --kv-cache-dtype fp8. Agents 24 → 10.",
+        delta: `  Config changed. Baseline reset.
+
+  Throughput          131 → 421 tok/s
+  TTFT                32857 → 224ms (p95 66946 → 500ms)
+  TPOT                58.0ms → 23.0ms (p95 58.0 → 40.0ms)
+
+ECONOMICS:
+  J/tok               4.05 → 1.08
+  Cost/1M output tok  $2.10 → $0.65 <span class="dim">(est)</span>`,
+        block: `<span class="dim">PROFILE v2.2.1 [muse-glimmer-30b] [NVIDIA GeForce RTX 5090]</span>  5m from 2026-08-14 10:45:47 UTC
+
+GPU        decode_eff ~11.2% | power 455W | 1.08 J/tok | $0.65/1M output tok <span class="dim">(est)</span> | vRAM 30/32GB
+REQUESTS   run 10 (84.1%) | wait 0 | max 12
+LATENCY    ttft 224ms (p95 500ms) | tpot 23ms (p95 40ms)
+CACHE      kv_cache 22.5% avg | pfix_cache 95.0%
+THROUGHPUT 421 tok/s
+
+ISSUES:
+
+No issues detected.
+Capped by vLLM overhead: batch healthy, memory free. GPU waits on CPU work between steps.`
+      }
+    ]
+  },
+  "h100": {
+    watch: "https://www.youtube.com/watch?v=w15RezkRijM",
+    steps: [
+      {
+        tok: "257 tok/s",
+        rail: "Under-batching",
+        title: "Under-batching",
+        change: "Start. --max-model-len 32768, --max-num-seqs 345. Agents 10.",
+        block: `<span class="dim">PROFILE v2.2.1 [Qwen3.8-27B] [NVIDIA H100 80GB HBM3]</span>  5m from 2026-08-15 18:32:02 UTC
+
+GPU        decode_eff ~1.4% | power 600W | 2.39 J/tok | $3.23/1M output tok <span class="dim">(est)</span> | vRAM 74/80GB
+REQUESTS   run 10 (2.9%) | wait 0 | max 345
+LATENCY    ttft 1.9s (p95 4.2s) | tpot 37ms (p95 50ms)
+CACHE      kv_cache 76.4% avg | pfix_cache -
+THROUGHPUT 257 tok/s
+
+ISSUES:
+
+<span class="hi">[!] Under-batching: Insufficient Concurrency</span>   <span class="dim">seen in 100% of windows</span>
+    Requests (avg when starved)   10 running, 0 waiting  (max: 345)
+    Cause:  Hardware capacity under-fed by client. Not enough requests arriving to keep the server busy.
+    Fix:    Batch more requests or increase client concurrency (285 seats idle before hardware degrades TPOT; KV fit unknown).
+            Monitor KV cache when scaling up.
+    Expected: Higher throughput. TPOT stable until the GPU is fully fed, then it starts to rise.
+    Confidence: High`
+      },
+      {
+        tok: "278 tok/s",
+        rail: "KV pressure",
+        title: "KV Cache Pressure",
+        change: "Agents 10 → 285. vLLM flags unchanged.",
+        delta: `  No change detected.
+
+  Throughput          257 → 278 tok/s
+  TTFT                1914 → 172333ms (p95 4250 → 593728ms)  <span class="worse">worse</span>
+  TPOT                37.1 → 91.0ms (p95 49.6 → 149.4ms)  <span class="worse">worse</span>
+  Decode eff. +0.1pp
+
+ECONOMICS:
+  J/tok               2.39 → 2.13
+  Cost/1M output tok  $3.23 → $2.99 <span class="dim">(est)</span>`,
+        block: `<span class="dim">PROFILE v2.2.1 [Qwen3.8-27B] [NVIDIA H100 80GB HBM3]</span>  5m from 2026-08-15 18:40:15 UTC
+
+GPU        decode_eff ~1.5% | power 646W | 2.13 J/tok | $2.99/1M output tok <span class="dim">(est)</span> | vRAM 74/80GB
+REQUESTS   run 20 (5.9%) | wait 266 | max 345
+LATENCY    ttft 172.3s (p95 593.7s) | tpot 91ms (p95 149ms)
+CACHE      kv_cache 96.6% avg (100.0% peak) | pfix_cache -
+THROUGHPUT 278 tok/s
+
+ISSUES:
+
+<span class="hi">[!] KV Cache Pressure</span>   <span class="dim">seen in 100% of windows</span>
+    Cause:  KV cache 97% avg in fired windows, 100% peak (threshold: 88%).
+            266 requests queued on KV admission.
+    Fix:    Enable --enable-prefix-caching.
+            Raise --gpu-memory-utilization to expand KV pool.
+            Switch --kv-cache-dtype fp8 to halve KV memory footprint (affects output quality).
+            Lower --max-num-seqs to reduce KV demand.
+            Reduce client concurrency toward sustained running (20 in-flight).
+            Lower --max-model-len 32768 → 24141. Observed p99 24.1k tokens per request.
+    Expected: Wait queue drains, TTFT recovers once KV pool has capacity.
+    Confidence: High`
+      },
+      {
+        tok: "490 tok/s",
+        rail: "Quiet",
+        title: "No issues detected",
+        change: "--max-model-len 27141, --enable-prefix-caching, --kv-cache-dtype fp8, --gpu-memory-utilization 0.98, --max-num-seqs 22. Agents 285.",
+        delta: `  Config changed. Baseline reset.
+
+  Throughput          278 → 490 tok/s
+  TTFT                172333 → 539ms (p95 593728 → 1873ms)
+  TPOT                91.0 → 42.1ms (p95 149.4 → 64.4ms)
+
+ECONOMICS:
+  J/tok               2.13 → 1.00
+  Cost/1M output tok  $2.99 → $1.69 <span class="dim">(est)</span>`,
+        block: `<span class="dim">PROFILE v2.2.1 [Qwen3.8-27B] [NVIDIA H100 80GB HBM3]</span>  5m from 2026-08-15 18:54:32 UTC
+
+GPU        decode_eff ~2.7% | power 485W | 1.00 J/tok | $1.69/1M output tok <span class="dim">(est)</span> | vRAM 79/80GB
+REQUESTS   run 20 (91.4%) | wait 0 | max 22
+LATENCY    ttft 539ms (p95 1.9s) | tpot 42ms (p95 65ms)
+CACHE      kv_cache 44.5% avg | pfix_cache 81.7%
+THROUGHPUT 490 tok/s
+
+ISSUES:
+
+No issues detected.
+Capped by traffic: 20 requests running, no queue. Raise client concurrency in steps; compute ridge ~295, but KV or admission can bind first.`
+      }
+    ]
+  }
+};
+
+const pad = n => String(n).padStart(2, "0");
+let run = "5090";
+let idx = 0;
+
+const track = document.getElementById("track");
+const rail = document.getElementById("rail");
+const watch = document.getElementById("watch");
+const stepLabel = document.getElementById("step-label");
+const prevBtn = document.querySelector(".arr.prev");
+const nextBtn = document.querySelector(".arr.next");
+
+function parseHash() {
+  const h = (location.hash || "").replace(/^#/, "");
+  const m = h.match(/^(5090|h100)(?:-(\d+))?$/);
+  if (!m) return { run: "5090", idx: 0 };
+  const r = m[1];
+  const n = m[2] ? parseInt(m[2], 10) : 1;
+  const max = RUNS[r].steps.length;
+  return { run: r, idx: Math.min(Math.max(n, 1), max) - 1 };
+}
+
+function hashFor(r, i) { return "#" + r + "-" + (i + 1); }
+
+function render() {
+  const data = RUNS[run];
+  const n = data.steps.length;
+  watch.href = data.watch;
+  rail.dataset.run = run;
+  rail.innerHTML = data.steps.map((s, i) =>
+    `<button class="dot${i === idx ? " on" : ""}" type="button" data-i="${i}"><b>${s.tok}</b><span>${pad(i + 1)} · ${s.rail}</span></button>`
+  ).join("");
+  track.innerHTML = data.steps.map((s, i) => {
+    const delta = s.delta ? `<div class="delta"><div class="term-bar">Measuring delta...</div><pre>${s.delta}</pre></div>` : "";
+    const note = s.note ? `<p class="change">${s.note}</p>` : "";
+    return `<article class="slide">
+      <div class="slide-k">ITERATION ${pad(i + 1)} / ${pad(n)}</div>
+      <h2>${s.title}</h2>
+      <p class="change">${s.change}</p>
+      ${delta}
+      ${note}
+      <div class="term-bar">profile diagnose --duration 5m</div>
+      <pre>${s.block}</pre>
+    </article>`;
+  }).join("");
+  document.querySelectorAll(".tab").forEach(t => {
+    const on = t.dataset.run === run;
+    t.classList.toggle("on", on);
+    t.setAttribute("aria-selected", on ? "true" : "false");
+  });
+  go(idx, true);
+}
+
+function go(i, instant) {
+  const n = RUNS[run].steps.length;
+  idx = Math.min(Math.max(i, 0), n - 1);
+  if (instant) track.style.transition = "none";
+  track.style.transform = "translateX(" + (-idx * 100) + "%)";
+  if (instant) requestAnimationFrame(() => { track.style.transition = ""; });
+  rail.querySelectorAll(".dot").forEach((d, j) => d.classList.toggle("on", j === idx));
+  prevBtn.disabled = idx === 0;
+  nextBtn.disabled = idx === n - 1;
+  stepLabel.textContent = pad(idx + 1) + " / " + pad(n);
+  const nextHash = hashFor(run, idx);
+  if (location.hash !== nextHash) history.replaceState(null, "", nextHash);
+}
+
+document.querySelectorAll(".tab").forEach(t => {
+  t.onclick = () => {
+    if (t.dataset.run === run) return;
+    run = t.dataset.run;
+    idx = 0;
+    render();
+  };
+});
+rail.addEventListener("click", e => {
+  const b = e.target.closest(".dot");
+  if (b) go(parseInt(b.dataset.i, 10));
+});
+prevBtn.onclick = () => go(idx - 1);
+nextBtn.onclick = () => go(idx + 1);
+
+document.addEventListener("keydown", e => {
+  if (e.target.matches("input, textarea, button.tab")) return;
+  if (e.key === "ArrowLeft") go(idx - 1);
+  if (e.key === "ArrowRight") go(idx + 1);
+});
+
+let x0 = null;
+document.getElementById("viewport").addEventListener("touchstart", e => { x0 = e.changedTouches[0].clientX; }, { passive: true });
+document.getElementById("viewport").addEventListener("touchend", e => {
+  if (x0 == null) return;
+  const dx = e.changedTouches[0].clientX - x0;
+  if (dx > 40) go(idx - 1);
+  if (dx < -40) go(idx + 1);
+  x0 = null;
+}, { passive: true });
+
+document.getElementById("copy-link").onclick = function () {
+  const url = location.href;
+  navigator.clipboard.writeText(url).then(() => {
+    this.textContent = "Copied";
+    setTimeout(() => { this.textContent = "Copy link to this step"; }, 1400);
+  });
+};
+
+window.addEventListener("hashchange", () => {
+  const p = parseHash();
+  if (p.run !== run) { run = p.run; idx = p.idx; render(); }
+  else go(p.idx);
+});
+
+({ run, idx } = parseHash());
+render();
+</script>
+
+</body>
+</html>

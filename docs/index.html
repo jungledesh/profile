@@ -117,6 +117,7 @@
     <a class="wordmark" href="index.html">profile</a>
     <nav>
       <a href="docs.html">Docs</a>
+      <a href="journeys.html">Journeys</a>
       <a href="#proof">Proof</a>
       <a href="#get-started">Get started</a>
       <a href="https://github.com/jungledesh/profile" target="_blank" rel="noopener">GitHub</a>
@@ -132,12 +133,13 @@
     <div class="motto">Less words. Less noise. More signal. More value.</div>
     <div class="cta-row">
       <a class="btn primary" href="#get-started">Get started</a>
+      <a class="btn" href="https://www.youtube.com/watch?v=gdrXGgfa7lA&t=39s" target="_blank" rel="noopener">Watch the 5090 run</a>
       <a class="btn" href="docs.html">Read the docs</a>
     </div>
     <div class="stats">
-      <div class="stat"><b>15x</b><span>throughput, A100 run</span></div>
-      <div class="stat"><b>3.9x</b><span>throughput, H100 run</span></div>
-      <div class="stat"><b>93%</b><span>lower $/1M tok, A100 run</span></div>
+      <div class="stat"><b>5.2x</b><span>throughput, RTX 5090 run</span></div>
+      <div class="stat"><b>81%</b><span>lower $/1M tok, RTX 5090 run</span></div>
+      <div class="stat"><b>1.9x</b><span>throughput, H100 run</span></div>
       <div class="stat"><b>1</b><span>binary, nothing leaves the machine</span></div>
     </div>
     <div class="hero-fig">
@@ -152,23 +154,23 @@
     <h2>The state of the server, the one thing wrong with it, and the fix.</h2>
     <p class="sub">Every value is measured or marked. A dash means Profile could not read it. An <span style="font-family:var(--mono)">(est)</span> means the number came from the physics model, not the server.</p>
     <div class="term">
-      <div class="term-bar">profile diagnose --url http://localhost:8000/metrics --duration 30s</div>
+      <div class="term-bar">profile diagnose --url http://localhost:8000/metrics --duration 5m</div>
       <pre>
-<span class="dim">PROFILE v2.2.2 [Qwen3.6-27B] [NVIDIA H100 80GB HBM3]</span>
+<span class="dim">PROFILE v2.2.1 [muse-glimmer-30b] [NVIDIA GeForce RTX 5090]</span>
 
-GPU        decode_eff <span class="hi">~0.9%</span> | power 653W | $5.09/1M output tok <span class="dim">(est)</span> | vRAM 74/80GB
-REQUESTS   run 14 (4.0%) | wait 4 | max 345
-LATENCY    ttft 8.7s (p95 19.2s) | tpot 97ms (p95 159ms)
-CACHE      kv_cache 93.1% avg <span class="hi">(100.0% peak)</span> | pfix_cache -
-THROUGHPUT 163 tok/s
+GPU        decode_eff <span class="hi">~3.5%</span> | power 531W | $2.10/1M output tok <span class="dim">(est)</span> | vRAM 29/32GB
+REQUESTS   run 9 (27.4%) | wait 15 | max 32
+LATENCY    ttft 32.8s (p95 66.9s) | tpot 58ms (p95 89ms)
+CACHE      kv_cache 88.6% avg <span class="hi">(99.9% peak)</span> | pfix_cache 22.7%
+THROUGHPUT 131 tok/s
 
 ISSUES:
 
-<span class="hi">[!] KV Cache Pressure</span>   <span class="dim">seen in 92% of windows</span>
-    Cause:  KV cache 94% avg in fired windows, 100% peak (threshold: 88%)
-            4 requests queued on KV admission
-    Fix:    Lower --max-model-len (current: 262144). Observed avg 13.9k tok/request.
-            Enable --enable-prefix-caching to share KV blocks across prefixes.
+<span class="hi">[!] KV Cache Pressure</span>   <span class="dim">seen in 100% of windows</span>
+    Cause:  KV cache 89% avg in fired windows, 100% peak (threshold: 88%)
+            Scheduler evicting; 15 requests queued on KV admission
+    Fix:    Raise --gpu-memory-utilization. Switch --kv-cache-dtype fp8.
+            Lower --max-model-len 32768 → 21933. Observed p99 21.9k tok/request.
     Confidence: High<span class="cursor"></span></pre>
     </div>
   </div>
@@ -197,18 +199,18 @@ ISSUES:
         <div class="n">02</div>
         <h3>Apply the fix</h3>
         <p>Everything in the block, one restart. Profile reconnects when vLLM returns.</p>
-        <pre>New --max-num-seqs [current: 345]: 170</pre>
+        <pre>New --max-num-seqs [current: 32]: 12</pre>
       </div>
       <div class="card">
         <div class="n">03</div>
         <h3>Measure the delta</h3>
         <p>Regressions are labelled, not buried. A tool that only reports improvements cannot be trusted when it reports one.</p>
-        <pre>Throughput   610 → 545 tok/s  <span class="worse">worse</span>
-TTFT         1024 → 6067ms  <span class="worse">worse</span>
-TPOT         118.4 → 147.0ms  <span class="worse">worse</span>
+        <pre>Throughput   183 → 131 tok/s  <span class="worse">worse</span>
+TTFT         430 → 32797ms  <span class="worse">worse</span>
+TPOT         28.1 → 58.5ms  <span class="worse">worse</span>
 
 ECONOMICS:
-Cost/1M      $1.36 → $1.52 <span class="dim">(est)</span>  <span class="worse">worse</span></pre>
+Cost/1M      $1.50 → $2.10 <span class="dim">(est)</span>  <span class="worse">worse</span></pre>
       </div>
     </div>
   </div>
@@ -217,26 +219,29 @@ Cost/1M      $1.36 → $1.52 <span class="dim">(est)</span>  <span class="worse"
 <section id="proof">
   <div class="wrap">
     <div class="k">PROOF</div>
-    <h2>Two runs. Same model, different hardware.</h2>
+    <h2>Two runs. Live SWE-Bench agents.</h2>
     <div class="proof-grid">
       <div class="run">
-        <div class="k">A100-SXM4-80GB · QWEN3.6-27B</div>
+        <div class="k">RTX 5090 · MUSE GLIMMER 30B</div>
         <table>
-          <tr><td>Throughput</td><td>31 → 470 tok/s</td></tr>
-          <tr><td>Cost</td><td>$13.26 → $0.89 / 1M tok</td></tr>
+          <tr><td>Throughput</td><td>81 → 421 tok/s</td></tr>
+          <tr><td>Cost</td><td>$3.41 → $0.65 / 1M tok</td></tr>
         </table>
-        <div class="mult">15x throughput · 93% lower cost</div>
+        <div class="mult">5.2x throughput · 81% lower cost</div>
+        <p style="margin-top:12px"><a class="video-link" href="journeys.html#5090-1">Walk the steps →</a> · <a class="video-link" href="https://www.youtube.com/watch?v=gdrXGgfa7lA&t=39s" target="_blank" rel="noopener">Watch the run →</a></p>
       </div>
       <div class="run">
-        <div class="k">H100 80GB HBM3 · QWEN3.6-27B</div>
+        <div class="k">H100 80GB HBM3 · QWEN3.8-27B</div>
         <table>
-          <tr><td>Throughput</td><td>163 → 631 tok/s</td></tr>
-          <tr><td>Cost</td><td>$5.09 → $1.32 / 1M output tok</td></tr>
+          <tr><td>Throughput</td><td>257 → 490 tok/s</td></tr>
+          <tr><td>Cost</td><td>$3.23 → $1.69 / 1M output tok</td></tr>
+          <tr><td>TTFT</td><td>1.9s → 539ms</td></tr>
         </table>
-        <div class="mult">3.9x throughput · 74% lower cost · 7 iterations, 2 labelled regressions</div>
+        <div class="mult">1.9x throughput · 48% lower cost · flood step labelled worse</div>
+        <p style="margin-top:12px"><a class="video-link" href="journeys.html#h100-1">Walk the steps →</a> · <a class="video-link" href="https://www.youtube.com/watch?v=w15RezkRijM" target="_blank" rel="noopener">Watch the run →</a></p>
       </div>
     </div>
-    <p class="proof-note">The H100 sequence was not monotonic: 163, 328, 545, 543, 482, 610, 545, 631. Profile labelled both regressions. Your starting point sets your gain; a server already near its ceiling has nothing to recover, and Profile says so. <a class="video-link" href="https://www.youtube.com/watch?v=XuPPKBteWH0" target="_blank" rel="noopener">Watch the A100 run →</a></p>
+    <p class="proof-note">The 5090 path was 81, 183, 131, 421 tok/s. Raising agents without a KV fix dropped throughput and sent TTFT to 33s; Profile labelled it <span style="font-family:var(--mono)">worse</span>, then the flags recovered it. The H100 path was 257, 278, 490 tok/s, with a 172s flood step labelled the same way. Your starting point sets your gain; a server already near its ceiling has nothing to recover, and Profile says so.</p>
   </div>
 </section>
 
@@ -273,6 +278,7 @@ Cost/1M      $1.36 → $1.52 <span class="dim">(est)</span>  <span class="worse"
     <div>© 2026 · Apache 2.0</div>
     <div>
       <a href="docs.html">Docs</a> ·
+      <a href="journeys.html">Journeys</a> ·
       <a href="https://github.com/jungledesh/profile">GitHub</a> ·
       <a href="mailto:jungledesh@gmail.com">Contact</a>
     </div>
