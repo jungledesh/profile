@@ -447,10 +447,18 @@ document.addEventListener("keydown", e => {
 });
 
 document.getElementById("copy-link").onclick = function () {
-  navigator.clipboard.writeText(permalink()).then(() => {
-    this.textContent = "Copied";
-    setTimeout(() => { this.textContent = "Copy link to this step"; }, 1400);
-  });
+  const btn = this;
+  const reset = () => { btn.textContent = "Copy link to this step"; };
+  const flash = label => {
+    btn.textContent = label;
+    setTimeout(reset, 1400);
+  };
+  const clip = navigator.clipboard;
+  if (!clip || typeof clip.writeText !== "function") {
+    flash("Copy failed");
+    return;
+  }
+  clip.writeText(permalink()).then(() => flash("Copied")).catch(() => flash("Copy failed"));
 };
 
 window.addEventListener("hashchange", () => {
