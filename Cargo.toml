@@ -1,6 +1,6 @@
 [package]
 name = "profile"
-version = "2.2.1"
+version = "2.2.2"
 edition = "2024"
 authors = ["Gagandeep Singh <jungledesh@gmail.com>"]
 description = "A closed loop, physics-grounded, cost-aware optimizer for vLLM."
