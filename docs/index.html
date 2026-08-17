@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Profile — inference diagnostics for vLLM</title>
+<title>Profile: inference diagnostics for vLLM</title>
 <meta name="description" content="Profile computes the physics ceiling for your GPU and model, measures the live server against it, names the one cause holding it back, and gives you the flag to change.">
 <style>
   :root {
@@ -118,7 +118,7 @@
     <nav>
       <a href="docs.html">Docs</a>
       <a href="#proof">Proof</a>
-      <a href="#install">Install</a>
+      <a href="#get-started">Get started</a>
       <a href="https://github.com/jungledesh/profile" target="_blank" rel="noopener">GitHub</a>
     </nav>
   </div>
@@ -128,10 +128,10 @@
   <div class="wrap">
     <div class="eyebrow">INFERENCE DIAGNOSTICS FOR vLLM</div>
     <h1>Are you getting what your hardware is capable of?</h1>
-    <p class="lede">Profile computes the physics ceiling for your GPU and model, measures the live server against it, names the one cause holding it back, and gives you the flag to change. Then it measures whether the fix worked.</p>
+    <p class="lede">Profile computes the physics ceiling for your GPU and model, measures the live server against it, names the one cause holding it back, and gives you the flag to change. Then it measures whether the fix worked. Close the gap in a few measured iterations instead of guessing for days.</p>
     <div class="motto">Less words. Less noise. More signal. More value.</div>
     <div class="cta-row">
-      <a class="btn primary" href="#install">Install</a>
+      <a class="btn primary" href="#get-started">Get started</a>
       <a class="btn" href="docs.html">Read the docs</a>
     </div>
     <div class="stats">
@@ -152,9 +152,9 @@
     <h2>The state of the server, the one thing wrong with it, and the fix.</h2>
     <p class="sub">Every value is measured or marked. A dash means Profile could not read it. An <span style="font-family:var(--mono)">(est)</span> means the number came from the physics model, not the server.</p>
     <div class="term">
-      <div class="term-bar">profile diagnose --url http://localhost:8000/metrics --duration 2m</div>
+      <div class="term-bar">profile diagnose --url http://localhost:8000/metrics --duration 30s</div>
       <pre>
-<span class="dim">PROFILE v2.1.4 [Qwen3.6-27B] [NVIDIA H100 80GB HBM3]</span>
+<span class="dim">PROFILE v2.2.2 [Qwen3.6-27B] [NVIDIA H100 80GB HBM3]</span>
 
 GPU        decode_eff <span class="hi">~0.9%</span> | power 653W | $5.09/1M output tok <span class="dim">(est)</span> | vRAM 74/80GB
 REQUESTS   run 14 (4.0%) | wait 4 | max 345
@@ -250,20 +250,21 @@ Cost/1M      $1.36 → $1.52 <span class="dim">(est)</span>  <span class="worse"
   </div>
 </section>
 
-<section id="install">
+<section id="get-started">
   <div class="wrap">
-    <div class="k">INSTALL</div>
+    <div class="k">GET STARTED</div>
     <h2>One binary. No agent, no config, no calibration.</h2>
+    <p class="sub">vLLM on one GPU, <span style="font-family:var(--mono)">/metrics</span> reachable, live traffic. Then install, diagnose, apply the Fix, read the delta. Repeat until the loop names a wall or goes quiet. Profile never restarts your server.</p>
     <div class="code">
       <pre id="c1">curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/jungledesh/profile/releases/latest/download/profile-installer.sh | sh</pre>
       <button class="copy" data-t="c1">copy</button>
     </div>
     <div class="code">
-      <pre id="c2">profile diagnose --url http://localhost:8000/metrics --duration 2m</pre>
+      <pre id="c2">profile diagnose --url http://localhost:8000/metrics --duration 30s</pre>
       <button class="copy" data-t="c2">copy</button>
     </div>
-    <p class="install-note">NVIDIA or AMD, one GPU. Requires vLLM with /metrics reachable and live traffic. Nothing leaves the machine. Binaries on the <a href="https://github.com/jungledesh/profile/releases/latest" style="color:inherit;text-decoration:underline">releases page</a>.</p>
+    <p class="install-note">Default window is 30s. Raise <span style="font-family:var(--mono)">--duration</span> when traffic repeats inside the window (up to 30m). Idle server: drive load with <span style="font-family:var(--mono)">vllm bench serve</span>. No curl-pipe: binary from the <a href="https://github.com/jungledesh/profile/releases/latest" style="color:inherit;text-decoration:underline">releases page</a>, or <span style="font-family:var(--mono)">cargo install --git https://github.com/jungledesh/profile</span>. NVIDIA or AMD, one GPU. Nothing leaves the machine. Full flag and output guide: <a href="docs.html#home" style="color:inherit;text-decoration:underline">docs</a>.</p>
   </div>
 </section>
 

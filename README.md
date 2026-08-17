@@ -114,7 +114,7 @@ The full machinery: [docs/engine.md](docs/engine.md).
 Real output, shortened (H100 run; full blocks in [docs/workflow.md](docs/workflow.md)):
 
 ```text
-|PROFILE v2.1.4 [Qwen3.6-27B] [NVIDIA H100 80GB HBM3]                  |
+|PROFILE v2.2.2 [Qwen3.6-27B] [NVIDIA H100 80GB HBM3]                  |
 |GPU =>    decode_eff ~0.9% | $5.09/1M output tok (est) | vRAM 74/80GB |
 |REQUESTS  run 14 (4.0%) | wait 4 | max 345                            |
 |CACHE     kv_cache 93.1% avg (100.0% peak)                            |
@@ -170,8 +170,8 @@ We did the hard part: a deterministic core engine. These pages show the work.
   Run a full session from this page.
 
 - **[Engine](docs/engine.md)**
-  The ceiling math from first principles, all eight rules with their exact thresholds, suppression and ranking.
-  No black box: every threshold that can silence or fire a rule is on this page.
+  The ceiling math from first principles, all eight rules with their fire conditions and fixes, suppression and ranking.
+  Thresholds and edge cases in depth: [website Rules](https://jungledesh.github.io/profile/docs.html#rules).
 
 - **[Research](docs/research.md)**
   Profile is not heuristics. The ceiling is a roofline, the field's standard. The engine descends from Intel's Top-down analysis, a decade in `perf` and VTune. The loop is Coz-style causal perturbation, run as a side effect of normal use.
