@@ -1,6 +1,6 @@
 <div align="center">
 
-# <img src="docs/assets/diagram.svg" width="720" alt="Profile">
+<h1><img src="docs/assets/icon.svg" width="88" alt="Profile"></h1>
 
 **Inference diagnostics for production vLLM servers.**
 
