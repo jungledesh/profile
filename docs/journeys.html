@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>The loop | Profile</title>
+<link rel="icon" href="assets/diagram.svg" type="image/svg+xml">
 <meta name="description" content="Recorded diagnose loops: RTX 5090 Muse Glimmer 30B and H100 Qwen3.8-27B, one iteration at a time.">
 <style>
   :root {
@@ -20,7 +21,8 @@
 
   header { position: sticky; top: 0; z-index: 20; background: rgba(0,0,0,0.85); backdrop-filter: blur(8px); border-bottom: 1px solid var(--line); }
   header .wrap { display: flex; align-items: center; justify-content: space-between; height: 56px; }
-  .wordmark { font-family: var(--mono); font-size: 15px; letter-spacing: 0.08em; color: #fff; }
+  .wordmark { display: flex; align-items: center; }
+  .wordmark img { height: 22px; width: auto; display: block; }
   header nav { display: flex; gap: 26px; }
   header nav a { font-family: var(--mono); font-size: 13px; color: var(--ink-2); letter-spacing: 0.04em; }
   header nav a:hover { color: #fff; }
@@ -99,7 +101,7 @@
 
 <header>
   <div class="wrap">
-    <a class="wordmark" href="index.html">profile</a>
+    <a class="wordmark" href="index.html"><img src="assets/icon.svg" alt="profile"></a>
     <nav>
       <a href="docs.html">Docs</a>
       <a href="journeys.html">Loop</a>
