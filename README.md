@@ -1,6 +1,6 @@
 <div align="center">
 
-# Profile
+# <img src="docs/assets/icon.svg" height="32" alt=""> Profile
 
 **Inference diagnostics for production vLLM servers.**
 
