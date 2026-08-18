@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Profile: inference diagnostics for vLLM</title>
+<link rel="icon" href="assets/diagram.svg" type="image/svg+xml">
 <meta name="description" content="Profile computes the physics ceiling for your GPU and model, measures the live server against it, names the one cause holding it back, and gives you the flag to change.">
 <style>
   :root {
@@ -21,7 +22,8 @@
   /* nav */
   header { position: sticky; top: 0; z-index: 20; background: rgba(0,0,0,0.85); backdrop-filter: blur(8px); border-bottom: 1px solid var(--line); }
   header .wrap { display: flex; align-items: center; justify-content: space-between; height: 56px; }
-  .wordmark { font-family: var(--mono); font-size: 15px; letter-spacing: 0.08em; color: #fff; }
+  .wordmark { display: flex; align-items: center; }
+  .wordmark img { height: 32px; width: auto; display: block; }
   header nav { display: flex; gap: 26px; }
   header nav a { font-family: var(--mono); font-size: 13px; color: var(--ink-2); letter-spacing: 0.04em; }
   header nav a:hover { color: #fff; }
@@ -114,7 +116,7 @@
 
 <header>
   <div class="wrap">
-    <a class="wordmark" href="index.html">profile</a>
+    <a class="wordmark" href="index.html"><img src="assets/diagram.svg" alt="profile"></a>
     <nav>
       <a href="docs.html">Docs</a>
       <a href="journeys.html">Loop</a>
