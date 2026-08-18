@@ -1,5 +1,7 @@
 <div align="center">
 
+# Profile
+
 **Inference diagnostics for production vLLM servers.**
 
 *Less words. Less noise. More signal. More value.*
