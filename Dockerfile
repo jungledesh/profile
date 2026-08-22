@@ -114,7 +114,7 @@ USER appuser
 # Qwen3.8-27B NVFP4 (5090): ./start-qwen-5090.sh   Gemma: ./start-gemma.sh
 ENV PROFILE_MODEL=muse
 
-CMD ["bash", "-lc", "/home/appuser/app/start-muse.sh"]
+CMD ["bash", "-lc", "sleep infinity"]
 
 # AMD runtime: official vLLM ROCm image (includes ROCm + Python 3.12 + vLLM + PyTorch).
 # Build: docker build --target amd -t profile:amd .
