@@ -40,7 +40,7 @@
 # shell needs e.g. PROFILE_MODEL=gemma ./agent-swarm.sh run
 #
 # Requires: vLLM on localhost:8000 serving the PROFILE_MODEL target
-# (start-muse.sh / start.sh / start-gemma.sh); jq; git. Tool-call flags come
+# (start-muse.sh / start.sh / start-qwen-5090.sh / start-gemma.sh); jq; git. Tool-call flags come
 # from the matching start script.
 #
 # Smoke gate (non-negotiable, from the plan): on the pod, run ONE agent on ONE
